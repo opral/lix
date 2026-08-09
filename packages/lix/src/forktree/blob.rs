@@ -4,6 +4,7 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::storage::StorageError;
 use crate::storage_adapter::StorageAdapterRead;
@@ -479,6 +480,147 @@ where
         entries.push(Some(bytes));
     }
     Ok(crate::binary_cas::BlobBytesBatch::new(entries))
+}
+
+/// Authenticates a complete fixed-chunk blob without materializing its
+/// payload. The manifest and each child chunk are read through the same
+/// retained StorageRead; every child is decoded and checked against its
+/// domain/object identity, declared length, manifest digest, and canonical
+/// BlobId before its bytes are dropped. Only unchanged prefix/suffix slices
+/// are compared with the requested successor payload.
+pub(super) async fn authenticate_blob_for_splice_on_read<R>(
+    read: &R,
+    branch_id: CanonicalBranchId,
+    view_id: [u8; 32],
+    view_instance_id: u64,
+    reference: &AuthenticatedBlobRef,
+    successor_bytes: &[u8],
+    prefix_len: usize,
+    replacement_len: usize,
+    suffix_len: usize,
+) -> Result<[u8; 32], crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    validate_blob_ref_views(
+        branch_id,
+        view_id,
+        view_instance_id,
+        [reference].into_iter(),
+    )?;
+    let manifests = load_manifests(read, std::slice::from_ref(reference)).await?;
+    let manifest = required_manifest(&manifests, reference.manifest_object_id)?;
+    validate_manifest_owner(manifest, reference)?;
+    let expected_len = usize::try_from(manifest.logical_bytes)
+        .map_err(|_| corruption("blob payload length cannot be represented by this process"))?;
+    if successor_bytes.len() != expected_len {
+        return Err(corruption("verified blob splice successor length is invalid").into());
+    }
+    let replace_end = prefix_len
+        .checked_add(replacement_len)
+        .ok_or_else(|| corruption("verified blob splice replacement range overflows"))?;
+    if replacement_len == 0
+        || prefix_len > expected_len
+        || replace_end > expected_len
+        || suffix_len != expected_len - replace_end
+    {
+        return Err(corruption("verified blob splice comparison range is invalid").into());
+    }
+    let expected_chunk_count = expected_len.div_ceil(CANONICAL_BLOB_CHUNK_BYTES);
+    if manifest.ordered_chunks.len() != expected_chunk_count {
+        return Err(corruption(
+            "verified blob splice base manifest is not canonical fixed-chunk layout",
+        )
+        .into());
+    }
+
+    let mut sha256 = Sha256::new();
+    let mut content_digest = blake3::Hasher::new();
+    let mut semantic_id = CanonicalBlobIdBuilder::default();
+    let mut offset = 0usize;
+    for (index, chunk_ref) in manifest.ordered_chunks.iter().enumerate() {
+        let chunk_start = index
+            .checked_mul(CANONICAL_BLOB_CHUNK_BYTES)
+            .ok_or_else(|| corruption("verified blob splice chunk offset overflows"))?;
+        if chunk_start != offset {
+            return Err(
+                corruption("verified blob splice chunk ordinals are not contiguous").into(),
+            );
+        }
+        let declared_len = usize::try_from(chunk_ref.declared_len)
+            .map_err(|_| corruption("verified blob splice chunk length overflows"))?;
+        let chunk_end = chunk_start
+            .checked_add(declared_len)
+            .ok_or_else(|| corruption("verified blob splice chunk end overflows"))?;
+        let expected_chunk_len = chunk_end.min(expected_len) - chunk_start;
+        if chunk_ref.declared_len != expected_chunk_len as u64
+            || (index + 1 < expected_chunk_count
+                && expected_chunk_len != CANONICAL_BLOB_CHUNK_BYTES)
+        {
+            return Err(corruption(
+                "verified blob splice base manifest has a noncanonical chunk length",
+            )
+            .into());
+        }
+        let chunk_bytes = load_object_bytes(read, chunk_ref.chunk_object_id).await?;
+        let chunk = BlobChunkV1::decode(chunk_ref.chunk_object_id, &chunk_bytes)?;
+        if chunk.bytes.len() as u64 != chunk_ref.declared_len {
+            return Err(corruption(
+                "verified blob splice child bytes do not match declared length",
+            )
+            .into());
+        }
+        compare_successor_slice(&chunk.bytes, chunk_start, successor_bytes, 0, prefix_len)?;
+        compare_successor_slice(
+            &chunk.bytes,
+            chunk_start,
+            successor_bytes,
+            replace_end,
+            expected_len,
+        )?;
+        sha256.update(&chunk.bytes);
+        content_digest.update(&chunk.bytes);
+        semantic_id.update(&chunk.bytes)?;
+        offset = chunk_end;
+    }
+    if offset != expected_len {
+        return Err(corruption("verified blob splice manifest length is invalid").into());
+    }
+    if content_digest.finalize().as_bytes() != &manifest.content_digest {
+        return Err(corruption("blob manifest payload digest is invalid").into());
+    }
+    if semantic_id.finish() != reference.semantic_id {
+        return Err(corruption(
+            "authenticated state blob identity does not match its manifest payload",
+        )
+        .into());
+    }
+    Ok(sha256.finalize().into())
+}
+
+fn compare_successor_slice(
+    chunk: &[u8],
+    chunk_start: usize,
+    successor: &[u8],
+    range_start: usize,
+    range_end: usize,
+) -> Result<(), crate::LixError> {
+    let chunk_end = chunk_start
+        .checked_add(chunk.len())
+        .ok_or_else(|| corruption("verified blob splice chunk range overflows"))?;
+    let start = chunk_start.max(range_start);
+    let end = chunk_end.min(range_end);
+    if start < end {
+        let chunk_start_index = start - chunk_start;
+        let chunk_end_index = end - chunk_start;
+        if chunk[chunk_start_index..chunk_end_index] != successor[start..end] {
+            return Err(corruption(
+                "verified blob splice unchanged bytes do not match authenticated base",
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Loads historical file payloads from exact ForkTree state keys. The state
