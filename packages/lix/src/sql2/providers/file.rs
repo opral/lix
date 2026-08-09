@@ -750,8 +750,10 @@ pub(crate) async fn execute_exact_lix_file_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(column == ExactLixFileReadColumn::Content),
+                // Public payloads are loaded through the operation-owned
+                // authenticated StateKey reader; this request only selects
+                // descriptor/blob-ref rows and never hydrates a payload cache.
+                .with_blob_refs(true),
         )
         .await?;
     let matches = match selector {
@@ -902,8 +904,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(data_range.is_none()),
+                .with_blob_refs(true),
         )
         .await?;
     let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
@@ -992,8 +993,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(true),
+                .with_blob_refs(true),
         )
         .await?;
     let matches = indexed_file_id_matches(index, file_ids, &FilePathPredicate::All);
@@ -1125,6 +1125,8 @@ impl TableSpec for LixFileSpec {
             || matches!(&target_file_ids, FileIdConstraint::Ids(_))
             || matches!(&target_directory_ids, FileIdConstraint::Ids(_))
             || root_directory_filter;
+        let cache_small_blob_data =
+            needs_data && matches!(&self.blob_reader, LixFilePayloadReader::Write(_));
         let indexed_matches = if !use_path_index {
             None
         } else {
@@ -1133,7 +1135,7 @@ impl TableSpec for LixFileSpec {
                 .path_index(
                     &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
                         .with_blob_refs(needs_blob_rows)
-                        .with_cached_blob_data(needs_data),
+                        .with_cached_blob_data(cache_small_blob_data),
                 )
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
@@ -5354,15 +5356,8 @@ async fn load_authenticated_blob_ranges_for_files(
         if let Some(row) = blob_rows.get(&key) {
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
-                if let Some(data) = &row.inline_data {
-                    bytes_by_key.insert(
-                        key.clone(),
-                        Some(materialize_vec_range(data.clone(), range.clone())?),
-                    );
-                } else {
-                    keys.push(key);
-                    requests.push((row.state_key.clone(), range.clone()));
-                }
+                keys.push(key);
+                requests.push((row.state_key.clone(), range.clone()));
             }
             *remaining += 1;
         }
@@ -5408,12 +5403,8 @@ async fn load_authenticated_blob_bytes_for_files(
         if let Some(row) = blob_rows.get(&key) {
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
-                if let Some(data) = &row.inline_data {
-                    bytes_by_key.insert(key.clone(), Some(data.clone()));
-                } else {
-                    keys.push(key);
-                    rows.push(row.state_key.clone());
-                }
+                keys.push(key);
+                rows.push(row.state_key.clone());
             }
             *remaining += 1;
         }
