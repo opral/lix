@@ -13,6 +13,7 @@ use super::model::{
     RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::ObjectId;
+use super::pack::EntityStatePackV1;
 use super::state::{
     HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
 };
@@ -89,7 +90,7 @@ pub(crate) struct VisibleStateRow {
     pub(crate) encoded_key: Vec<u8>,
     pub(crate) value: StateValue,
     pub(crate) source: StateSource,
-    pub(super) view_instance_id: u64,
+    pub(crate) view_instance_id: u64,
 }
 
 impl PartialEq for VisibleStateRow {
@@ -138,6 +139,7 @@ pub(crate) struct StateTreeEdit {
     entry_count: u64,
     copied_nodes: usize,
     pub(crate) added_blob_roots: BTreeMap<ObjectId, ()>,
+    pub(crate) entity_pack_root: ObjectId,
     pub(super) wrote_tombstone: bool,
     pub(super) written_commit_ids: BTreeSet<[u8; 16]>,
     pub(super) objects: ImmutableObjectSet,
@@ -1619,6 +1621,359 @@ where
     Ok(output)
 }
 
+/// Reads the canonical current-state packs for one authenticated global/local
+/// root pair. Pack edges are checked against the state roots before any row is
+/// exposed, then the local overlay wins by exact encoded state key.
+pub(crate) async fn entity_pack_on_roots<R>(
+    global_state_root: ObjectId,
+    global_pack_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    local_pack_root: Option<ObjectId>,
+    read: &R,
+) -> Result<Vec<(Vec<u8>, StateValue, StateSource)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let global = load_entity_pack(read, global_pack_root, global_state_root).await?;
+    let local = match (local_state_root, local_pack_root) {
+        (Some(state_root), Some(pack_root)) => {
+            Some(load_entity_pack(read, pack_root, state_root).await?)
+        }
+        (None, None) => None,
+        _ => return Err(corruption("current state pack/root edges are incomplete")),
+    };
+    let mut by_key = BTreeMap::new();
+    for page in global.pages {
+        for (key, value) in page.rows {
+            by_key.insert(key, (value, StateSource::Global));
+        }
+    }
+    if let Some(local) = local {
+        for page in local.pages {
+            for (key, value) in page.rows {
+                by_key.insert(key, (value, StateSource::Branch));
+            }
+        }
+    }
+    Ok(by_key
+        .into_iter()
+        .map(|(key, (value, source))| {
+            (
+                super::state::encode_state_key(super::state::StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                }),
+                value,
+                source,
+            )
+        })
+        .collect())
+}
+
+struct LoadedEntityStatePack {
+    pages: Vec<super::pack::EntityStatePackPageV1>,
+}
+
+async fn load_entity_pack<R>(
+    read: &R,
+    pack_root: ObjectId,
+    state_root: ObjectId,
+) -> Result<LoadedEntityStatePack, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let manifest = load_entity_pack_manifest(read, pack_root, state_root).await?;
+    let mut pages = Vec::with_capacity(manifest.pages.len());
+    for page in &manifest.pages {
+        pages.push(load_entity_pack_page(read, page).await?);
+    }
+    Ok(LoadedEntityStatePack { pages })
+}
+
+async fn load_entity_pack_manifest<R>(
+    read: &R,
+    pack_root: ObjectId,
+    state_root: ObjectId,
+) -> Result<EntityStatePackV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let bytes = super::view::load_object_bytes(read, pack_root).await?;
+    let pack = EntityStatePackV1::decode(pack_root, &bytes)?;
+    if pack.state_root != state_root {
+        return Err(corruption(
+            "entity state pack is bound to another state root",
+        ));
+    }
+    Ok(pack)
+}
+
+async fn load_entity_pack_page<R>(
+    read: &R,
+    page_ref: &super::pack::EntityStatePackPageRef,
+) -> Result<super::pack::EntityStatePackPageV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let bytes = super::view::load_object_bytes(read, page_ref.object_id).await?;
+    let page = super::pack::EntityStatePackPageV1::decode(page_ref.object_id, &bytes)?;
+    if page.rows.len() != page_ref.row_count
+        || page.rows.first().map(|row| &row.0) != Some(&page_ref.first_key)
+        || page.rows.last().map(|row| &row.0) != Some(&page_ref.last_key)
+    {
+        return Err(corruption("entity state pack page does not match manifest"));
+    }
+    Ok(page)
+}
+
+/// Resolves a correlated batch of current-state keys through the persisted
+/// pack summaries. Only the manifest and the pages containing requested keys
+/// are read; all slots retain their caller order and local state overrides
+/// global state by the canonical encoded identity.
+pub(crate) async fn entity_pack_exact_on_roots<R>(
+    global_state_root: ObjectId,
+    global_pack_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    local_pack_root: Option<ObjectId>,
+    keys: &[super::state::StateKey],
+    include_tombstone: bool,
+    read: &R,
+) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let global = load_entity_pack_manifest(read, global_pack_root, global_state_root).await?;
+    let local = match (local_state_root, local_pack_root) {
+        (Some(state_root), Some(pack_root)) => {
+            Some(load_entity_pack_manifest(read, pack_root, state_root).await?)
+        }
+        (None, None) => None,
+        _ => return Err(corruption("current state pack/root edges are incomplete")),
+    };
+    let mut page_refs = BTreeMap::<ObjectId, super::pack::EntityStatePackPageRef>::new();
+    for key in keys {
+        if let Some(page) = entity_pack_page_for_key(&global, key) {
+            page_refs
+                .entry(page.object_id)
+                .or_insert_with(|| page.clone());
+        }
+        if let Some(local) = local.as_ref()
+            && let Some(page) = entity_pack_page_for_key(local, key)
+        {
+            page_refs
+                .entry(page.object_id)
+                .or_insert_with(|| page.clone());
+        }
+    }
+    let objects = super::view::load_object_map(read, page_refs.keys().copied()).await?;
+    let mut pages = BTreeMap::new();
+    for (page_id, page_ref) in page_refs {
+        let bytes = objects
+            .get(&page_id)
+            .ok_or_else(|| corruption(format!("entity state pack page {page_id} is absent")))?;
+        pages.insert(page_id, decode_entity_pack_page(page_id, bytes, &page_ref)?);
+    }
+
+    keys.iter()
+        .map(|key| {
+            let local_value = local
+                .as_ref()
+                .map(|manifest| find_entity_pack_row(manifest, &pages, key))
+                .transpose()?
+                .flatten()
+                .map(|value| (value.clone(), StateSource::Branch));
+            let global_value = find_entity_pack_row(&global, &pages, key)?
+                .map(|value| (value.clone(), StateSource::Global));
+            let value = local_value.or(global_value);
+            Ok(value.filter(|(value, _)| include_tombstone || !value.cell.deleted()))
+        })
+        .collect()
+}
+
+fn entity_pack_page_for_key<'a>(
+    manifest: &'a super::pack::EntityStatePackV1,
+    key: &super::state::StateKey,
+) -> Option<&'a super::pack::EntityStatePackPageRef> {
+    let page = manifest.pages.get(manifest.page_index_for_key(key))?;
+    (page.first_key.cmp(key) != std::cmp::Ordering::Greater
+        && key.cmp(&page.last_key) != std::cmp::Ordering::Greater)
+        .then_some(page)
+}
+
+fn find_entity_pack_row<'a>(
+    manifest: &super::pack::EntityStatePackV1,
+    pages: &'a BTreeMap<ObjectId, super::pack::EntityStatePackPageV1>,
+    key: &super::state::StateKey,
+) -> Result<Option<&'a StateValue>, StorageError> {
+    let Some(page_ref) = entity_pack_page_for_key(manifest, key) else {
+        return Ok(None);
+    };
+    let page = pages
+        .get(&page_ref.object_id)
+        .ok_or_else(|| corruption("requested entity state pack page was not loaded"))?;
+    Ok(page
+        .rows
+        .binary_search_by(|(row_key, _)| row_key.cmp(key))
+        .ok()
+        .map(|index| &page.rows[index].1))
+}
+
+fn decode_entity_pack_page(
+    page_id: ObjectId,
+    bytes: &[u8],
+    page_ref: &super::pack::EntityStatePackPageRef,
+) -> Result<super::pack::EntityStatePackPageV1, StorageError> {
+    let page = super::pack::EntityStatePackPageV1::decode(page_id, bytes)?;
+    if page.rows.len() != page_ref.row_count
+        || page.rows.first().map(|row| &row.0) != Some(&page_ref.first_key)
+        || page.rows.last().map(|row| &row.0) != Some(&page_ref.last_key)
+    {
+        return Err(corruption("entity state pack page does not match manifest"));
+    }
+    Ok(page)
+}
+
+pub(crate) async fn state_rows_for_entity_pack<R>(
+    root: ObjectId,
+    read: &R,
+) -> Result<Vec<(Vec<u8>, StateValue)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut cursor = None;
+    let mut rows = Vec::new();
+    loop {
+        let page =
+            scan_bounded_page_on_read(root, "state", None, None, cursor.as_deref(), 256, read)
+                .await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(|(key, _)| key.clone());
+        for (key, value) in page {
+            rows.push((key, decode_state_value_storage(&value)?));
+        }
+        if rows.len() > EntityStatePackV1::MAX_ROWS {
+            return Err(corruption(
+                "entity state pack exceeds its bounded row contract",
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+async fn update_entity_pack<R>(
+    base_pack_root: ObjectId,
+    old_state_root: ObjectId,
+    new_state_root: ObjectId,
+    mutations: &[StateTreeMutation],
+    read: &R,
+) -> Result<super::pack::EncodedEntityStatePack, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let manifest = load_entity_pack_manifest(read, base_pack_root, old_state_root).await?;
+    let mut changed_pages = BTreeMap::new();
+    let mut changed_indices = BTreeSet::new();
+    for mutation in mutations {
+        let (encoded_key, encoded_value) = match mutation {
+            StateTreeMutation::Insert { key, value } | StateTreeMutation::Update { key, value } => {
+                (key, Some(value))
+            }
+            StateTreeMutation::Remove { key } => (key, None),
+        };
+        let key = decode_state_key(encoded_key).map_err(|error| corruption(error.to_string()))?;
+        let index = if manifest.pages.is_empty() {
+            0
+        } else {
+            manifest.page_index_for_key(&key)
+        };
+        if !changed_pages.contains_key(&index) {
+            let page = if let Some(page_ref) = manifest.pages.get(index) {
+                load_entity_pack_page(read, page_ref).await?
+            } else {
+                super::pack::EntityStatePackPageV1 { rows: Vec::new() }
+            };
+            changed_pages.insert(index, page);
+        }
+        changed_indices.insert(index);
+        let rows = &mut changed_pages
+            .get_mut(&index)
+            .ok_or_else(|| corruption("changed entity state pack page disappeared"))?
+            .rows;
+        match encoded_value {
+            Some(value) => {
+                let value = decode_state_value_storage(value)?;
+                match rows.binary_search_by(|(row_key, _)| row_key.cmp(&key)) {
+                    Ok(position) => rows[position].1 = value,
+                    Err(position) => rows.insert(position, (key, value)),
+                }
+            }
+            None => {
+                if let Ok(position) = rows.binary_search_by(|(row_key, _)| row_key.cmp(&key)) {
+                    rows.remove(position);
+                }
+            }
+        }
+    }
+
+    let mut page_refs = manifest.pages;
+    let mut page_objects = Vec::new();
+    for index in changed_indices.into_iter().rev() {
+        let page = changed_pages
+            .remove(&index)
+            .ok_or_else(|| corruption("changed entity state pack page is absent"))?;
+        let replacement = page
+            .rows
+            .chunks(EntityStatePackV1::PAGE_ROWS)
+            .map(|chunk| {
+                let page = super::pack::EntityStatePackPageV1 {
+                    rows: chunk.to_vec(),
+                };
+                let first_key = chunk
+                    .first()
+                    .ok_or_else(|| corruption("empty entity state pack replacement"))?
+                    .0
+                    .clone();
+                let last_key = chunk
+                    .last()
+                    .ok_or_else(|| corruption("empty entity state pack replacement"))?
+                    .0
+                    .clone();
+                let row_count = chunk.len();
+                let (object_id, bytes) = page.encode()?;
+                page_objects.push((object_id, bytes));
+                Ok(super::pack::EntityStatePackPageRef {
+                    object_id,
+                    first_key,
+                    last_key,
+                    row_count,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let start = index.min(page_refs.len());
+        let end = if index < page_refs.len() {
+            index + 1
+        } else {
+            index
+        };
+        page_refs.splice(start..end, replacement);
+    }
+    let row_count = page_refs.iter().map(|page| page.row_count).sum();
+    let manifest = EntityStatePackV1 {
+        state_root: new_state_root,
+        pages: page_refs,
+        row_count,
+    };
+    let (root_id, root_bytes) = manifest.encode_root()?;
+    Ok(super::pack::EncodedEntityStatePack {
+        root_id,
+        root_bytes,
+        page_objects,
+    })
+}
+
 /// Loads the complete authenticated state overlay for one historical commit.
 /// A missing commit/catalog/root is an error; an absent key is represented by
 /// the absence of a row in the returned ordered stream.
@@ -1696,6 +2051,18 @@ pub(crate) async fn edit_state_tree<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    edit_state_tree_with_pack(root, None, mutations, read).await
+}
+
+pub(crate) async fn edit_state_tree_with_pack<R>(
+    root: ObjectId,
+    base_pack_root: Option<ObjectId>,
+    mutations: Vec<StateTreeMutation>,
+    read: &R,
+) -> Result<StateTreeEdit, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     let root = validate_root_on_read(root, "state", read).await?;
     let mut added_blob_roots = BTreeMap::new();
     let mut wrote_tombstone = false;
@@ -1720,20 +2087,53 @@ where
             );
         }
     }
+    let pack_mutations = mutations.clone();
     let mutations = mutations
         .into_iter()
         .map(StateTreeMutation::into_ordered)
         .collect::<Vec<_>>();
     let edit = apply_ordered_mutations(root, "state", &mutations, read).await?;
+    let encoded_pack = if let Some(base_pack_root) = base_pack_root {
+        update_entity_pack(
+            base_pack_root,
+            root.object_id,
+            edit.root.object_id,
+            &pack_mutations,
+            read,
+        )
+        .await?
+    } else {
+        let overlay = ObjectOverlayRead {
+            read,
+            objects: &edit.objects,
+        };
+        let packed_rows = state_rows_for_entity_pack(edit.root.object_id, &overlay)
+            .await?
+            .into_iter()
+            .map(|(encoded_key, value)| {
+                Ok((
+                    decode_state_key(&encoded_key).map_err(|e| corruption(e.to_string()))?,
+                    value,
+                ))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        EntityStatePackV1::from_rows(edit.root.object_id, packed_rows)?
+    };
+    let mut objects = edit.objects;
+    objects.insert(encoded_pack.root_id, encoded_pack.root_bytes)?;
+    for (id, bytes) in encoded_pack.page_objects {
+        objects.insert(id, bytes)?;
+    }
     Ok(StateTreeEdit {
         base_root: root.object_id,
         root: edit.root.object_id,
         entry_count: edit.root.entry_count,
         copied_nodes: edit.copied_nodes,
         added_blob_roots,
+        entity_pack_root: encoded_pack.root_id,
         wrote_tombstone,
         written_commit_ids,
-        objects: edit.objects,
+        objects,
     })
 }
 
@@ -1743,7 +2143,19 @@ where
 /// operation-local nodes are accumulated rather than pruned as transient
 /// publication scratch.
 pub(crate) async fn edit_state_tree_sequence<R>(
+    root: ObjectId,
+    mutation_batches: Vec<Vec<StateTreeMutation>>,
+    read: &R,
+) -> Result<Vec<StateTreeEdit>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    edit_state_tree_sequence_with_pack(root, None, mutation_batches, read).await
+}
+
+pub(crate) async fn edit_state_tree_sequence_with_pack<R>(
     mut root: ObjectId,
+    mut base_pack_root: Option<ObjectId>,
     mutation_batches: Vec<Vec<StateTreeMutation>>,
     read: &R,
 ) -> Result<Vec<StateTreeEdit>, StorageError>
@@ -1757,8 +2169,9 @@ where
             read,
             objects: &accumulated,
         };
-        let edit = edit_state_tree(root, mutations, &overlay).await?;
+        let edit = edit_state_tree_with_pack(root, base_pack_root, mutations, &overlay).await?;
         root = edit.root;
+        base_pack_root = Some(edit.entity_pack_root);
         accumulated.extend(edit.objects.clone())?;
         edits.push(edit);
     }

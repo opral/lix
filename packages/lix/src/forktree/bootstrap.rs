@@ -30,6 +30,7 @@ use super::model::{
     RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
+use super::pack::EntityStatePackV1;
 use super::state::{
     StateCellRef, StateKeyRef, StateValueRef, UNTRACKED_ROW_SPACE, UntrackedValueRef,
     encode_state_key, encode_state_value, encode_untracked_key, encode_untracked_value,
@@ -192,6 +193,12 @@ where
     // branch-local copy gives ordinary branch-scoped catalog queries their
     // exact branch identity instead of forcing them through a global owner.
     let local_state = build_state_tree(&global_entries).map_err(LixError::from)?;
+    let global_entity_pack =
+        EntityStatePackV1::from_encoded_rows(global_state.root.object_id, &global_entries)
+            .map_err(LixError::from)?;
+    let local_entity_pack =
+        EntityStatePackV1::from_encoded_rows(local_state.root.object_id, &global_entries)
+            .map_err(LixError::from)?;
     let retention = build_retention_tree(&[]).map_err(LixError::from)?;
 
     let mut objects = ImmutableObjectSet::default();
@@ -201,6 +208,20 @@ where
     objects
         .extend(local_state.objects)
         .map_err(LixError::from)?;
+    objects
+        .insert(global_entity_pack.root_id, global_entity_pack.root_bytes)
+        .map_err(LixError::from)?;
+    for (id, bytes) in global_entity_pack.page_objects {
+        objects.insert(id, bytes).map_err(LixError::from)?;
+    }
+    objects
+        .insert(local_entity_pack.root_id, local_entity_pack.root_bytes)
+        .map_err(LixError::from)?;
+    for (id, bytes) in local_entity_pack.page_objects {
+        objects.insert(id, bytes).map_err(LixError::from)?;
+    }
+    let global_entity_pack_root = global_entity_pack.root_id;
+    let local_entity_pack_root = local_entity_pack.root_id;
     objects.extend(retention.objects).map_err(LixError::from)?;
 
     let mut semantic_members = Vec::with_capacity(rows.len());
@@ -326,6 +347,7 @@ where
         .map_err(LixError::from)?;
     let repository = RepositoryRootV1 {
         global_state_root: global_state.root.object_id,
+        global_entity_pack_root: Some(global_entity_pack_root),
         commit_catalog_root: commit_catalog.root.object_id,
         change_catalog_root: change_catalog.root.object_id,
         retention_policy_root: retention.root.object_id,
@@ -337,6 +359,7 @@ where
     let global_snapshot = BranchSnapshotV1 {
         branch_id: global_branch,
         local_state_root: local_state.root.object_id,
+        local_entity_pack_root: Some(local_entity_pack_root),
         semantic_head_commit_object_id: commit_object_id,
         latest_ref_change_object_id: Some(global_ref_object_id),
         historical_global_state_root: global_state.root.object_id,
@@ -344,6 +367,7 @@ where
     let main_snapshot = BranchSnapshotV1 {
         branch_id: main_branch_id,
         local_state_root: local_state.root.object_id,
+        local_entity_pack_root: Some(local_entity_pack_root),
         semantic_head_commit_object_id: commit_object_id,
         latest_ref_change_object_id: Some(main_ref_object_id),
         historical_global_state_root: global_state.root.object_id,
@@ -563,6 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_accepts_first_repository_and_rejects_second() {
+        let _race_test_lock = race_test_lock();
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await

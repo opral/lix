@@ -481,6 +481,9 @@ where
         view.branch_snapshot().local_state_root
     };
     let state_edit = view.edit_state_tree(state_base, state_mutations).await?;
+    let edited_entity_pack_root = state_edit.entity_pack_root;
+    let prior_global_entity_pack_root = view.repository_root().global_entity_pack_root;
+    let prior_local_entity_pack_root = view.branch_snapshot().local_entity_pack_root;
 
     let expected_parent = commit_parent_heads
         .get(&branch_id)
@@ -637,6 +640,12 @@ where
         .await?;
     let repository_root = RepositoryRootV1 {
         global_state_root,
+        global_entity_pack_root: Some(if global {
+            edited_entity_pack_root
+        } else {
+            prior_global_entity_pack_root
+                .ok_or_else(|| writer_error("selected repository has no current entity pack"))?
+        }),
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
         retention_policy_root: view.repository_root().retention_policy_root,
@@ -650,6 +659,12 @@ where
         branch_snapshot: BranchSnapshotV1 {
             branch_id: publication_branch_id,
             local_state_root,
+            local_entity_pack_root: Some(if global {
+                prior_local_entity_pack_root
+                    .ok_or_else(|| writer_error("selected branch has no current entity pack"))?
+            } else {
+                edited_entity_pack_root
+            }),
             semantic_head_commit_object_id: commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: global_state_root,
@@ -1239,6 +1254,10 @@ where
     let (final_commit_object_id, _) = final_commit.encode()?;
     let final_global_state_root = final_commit.global_state_root;
     let final_local_state_root = final_commit.local_state_root;
+    let final_entity_pack_root = state_edits
+        .last()
+        .ok_or_else(|| writer_error("ordered history has no final state edit"))?
+        .entity_pack_root;
     let ref_payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
         format_version: 2,
         change_id: final_content.draft.branch_ref_change_id,
@@ -1294,6 +1313,11 @@ where
         .await?;
     let repository_root = RepositoryRootV1 {
         global_state_root: final_global_state_root,
+        global_entity_pack_root: if state_domain.unwrap_or(false) {
+            Some(final_entity_pack_root)
+        } else {
+            view.repository_root().global_entity_pack_root
+        },
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
         retention_policy_root: view.repository_root().retention_policy_root,
@@ -1309,6 +1333,13 @@ where
         branch_snapshot: BranchSnapshotV1 {
             branch_id: view.branch_id(),
             local_state_root: final_local_state_root,
+            local_entity_pack_root: Some(if state_domain.unwrap_or(false) {
+                view.branch_snapshot()
+                    .local_entity_pack_root
+                    .ok_or_else(|| writer_error("selected branch has no current entity pack"))?
+            } else {
+                final_entity_pack_root
+            }),
             semantic_head_commit_object_id: final_commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: final_global_state_root,

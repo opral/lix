@@ -628,9 +628,17 @@ impl TableSpec for EntitySpec {
         let direct_entity_snapshot = direct_entity_batch_eligible(&schema, &request, &row_filters);
         let direct_primary_key_projection =
             direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
+        let ordering = canonical_scan_ordering(
+            &self.spec,
+            &schema,
+            &request,
+            &row_filters,
+            &self.branch_binding,
+            direct_entity_snapshot,
+        );
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
-            ordering: None,
+            ordering,
             source: scan_row_source(
                 Arc::clone(&schema),
                 (
@@ -2050,6 +2058,41 @@ fn direct_entity_batch_eligible(
             .fields()
             .iter()
             .all(|field| !field.name().starts_with("lixcol_"))
+}
+
+/// The authenticated current-state scan is encoded in canonical state-key
+/// order. For an active single-branch entity surface with a one-component
+/// string primary key and no file-id dimension, that is also the public
+/// primary-key order. Advertise only this exact shape so DataFusion can omit a
+/// redundant sort while all other surfaces retain their existing ordering
+/// plan.
+fn canonical_scan_ordering(
+    spec: &EntitySurfaceSpec,
+    schema: &Schema,
+    request: &LiveStateScanRequest,
+    row_filters: &[EntityRowFilter],
+    branch_binding: &BranchBinding,
+    direct_entity_snapshot: bool,
+) -> Option<String> {
+    if !direct_entity_snapshot
+        || !matches!(branch_binding, BranchBinding::Active { .. })
+        || request.filter.branch_ids.len() != 1
+        || !request.filter.entity_pks.is_empty()
+        || !request.filter.file_ids.is_empty()
+        || !row_filters.is_empty()
+        || spec.primary_key_paths.len() != 1
+        || spec.primary_key_component_types != [crate::entity_pk::EntityPkComponentType::String]
+    {
+        return None;
+    }
+    let [path] = spec.primary_key_paths.as_slice() else {
+        return None;
+    };
+    let [column] = path.as_slice() else {
+        return None;
+    };
+    (schema.index_of(column).is_ok() && spec.visible_column(column).is_some())
+        .then(|| column.clone())
 }
 
 /// A provider-level physical projection: all requested columns are simple

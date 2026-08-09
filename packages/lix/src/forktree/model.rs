@@ -77,6 +77,7 @@ impl CanonicalUploadId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RepositoryRootV1 {
     pub(crate) global_state_root: ObjectId,
+    pub(crate) global_entity_pack_root: Option<ObjectId>,
     pub(crate) commit_catalog_root: ObjectId,
     pub(crate) change_catalog_root: ObjectId,
     pub(crate) retention_policy_root: ObjectId,
@@ -95,6 +96,7 @@ impl RepositoryRootV1 {
         )?;
         encode_object(ObjectDomain::RepositoryRoot, |encoder| {
             encode_id(encoder, self.global_state_root);
+            encode_optional_id(encoder, self.global_entity_pack_root);
             encode_id(encoder, self.commit_catalog_root);
             encode_id(encoder, self.change_catalog_root);
             encode_id(encoder, self.retention_policy_root);
@@ -106,6 +108,7 @@ impl RepositoryRootV1 {
         let mut decoder = decode_object(id, ObjectDomain::RepositoryRoot, bytes)?;
         let value = Self {
             global_state_root: decode_id(&mut decoder)?,
+            global_entity_pack_root: decode_optional_id(&mut decoder, "global entity pack root")?,
             commit_catalog_root: decode_id(&mut decoder)?,
             change_catalog_root: decode_id(&mut decoder)?,
             retention_policy_root: decode_id(&mut decoder)?,
@@ -128,6 +131,7 @@ impl RepositoryRootV1 {
 pub(crate) struct BranchSnapshotV1 {
     pub(crate) branch_id: CanonicalBranchId,
     pub(crate) local_state_root: ObjectId,
+    pub(crate) local_entity_pack_root: Option<ObjectId>,
     pub(crate) semantic_head_commit_object_id: ObjectId,
     pub(crate) latest_ref_change_object_id: Option<ObjectId>,
     pub(crate) historical_global_state_root: ObjectId,
@@ -149,6 +153,7 @@ impl BranchSnapshotV1 {
         encode_object(ObjectDomain::BranchSnapshot, |encoder| {
             encoder.fixed(self.branch_id.as_bytes());
             encode_id(encoder, self.local_state_root);
+            encode_optional_id(encoder, self.local_entity_pack_root);
             encode_id(encoder, self.semantic_head_commit_object_id);
             encode_optional_id(encoder, self.latest_ref_change_object_id);
             encode_id(encoder, self.historical_global_state_root);
@@ -161,6 +166,7 @@ impl BranchSnapshotV1 {
         let value = Self {
             branch_id: CanonicalBranchId::from_bytes(decoder.fixed()?),
             local_state_root: decode_id(&mut decoder)?,
+            local_entity_pack_root: decode_optional_id(&mut decoder, "local entity pack root")?,
             semantic_head_commit_object_id: decode_id(&mut decoder)?,
             latest_ref_change_object_id: decode_optional_id(&mut decoder, "ref-change edge")?,
             historical_global_state_root: decode_id(&mut decoder)?,

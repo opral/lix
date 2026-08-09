@@ -10,6 +10,7 @@ mod codec;
 mod gc_index;
 mod model;
 mod object;
+mod pack;
 mod publication;
 mod reachability;
 mod serving;
@@ -31,6 +32,7 @@ pub(crate) use model::{
     UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
 pub(crate) use object::{OBJECT_SPACE, ObjectId};
+pub(crate) use pack::EntityStatePackV1;
 pub(crate) use publication::{
     BranchStateTransition, OrderedBranchHistoryTransition, PreparedPublication, SelectorExpectation,
 };
@@ -45,6 +47,8 @@ pub(crate) use serving::{
     scan_commit_records, scan_commit_topologies, select_historical_commit_member, state_point,
     state_point_on_read, state_range,
 };
+#[cfg(test)]
+pub(crate) use state::encode_state_schema_bounds;
 pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
     UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
