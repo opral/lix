@@ -1004,13 +1004,14 @@ where
         // retain the zero-reconstruction direct path.
         let journal_descriptors = prepared_writes.ordered_mutation_journal_descriptors();
         if !journal_descriptors.is_empty() {
-            let base = self
-                .live_state
-                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+            // `opening_read` is rebound to the commit-boundary read before
+            // reconciliation begins. Keep predecessor hydration on the same
+            // operation-owned ForkTree facade as the stale classifier.
+            let forktree = self.forktree_read_facade();
             let mut predecessors_by_commit = BTreeMap::new();
             for descriptor in journal_descriptors {
                 let predecessors = load_immutable_mutation_predecessors(
-                    &base,
+                    &forktree,
                     &descriptor.schema_key,
                     &descriptor.branch_id,
                     &descriptor.entity_pk_chunks,
@@ -6972,6 +6973,7 @@ where
             .map(|chunk| chunk.len())
             .sum();
         let mut predecessors = Vec::with_capacity(row_count);
+        let forktree = self.forktree_read_facade();
         for entity_pks in descriptor.entity_pk_chunks() {
             let request = LiveStateExactBatchRequest {
                 rows: entity_pks
@@ -6988,13 +6990,7 @@ where
                 untracked: Some(false),
                 include_tombstones: false,
             };
-            let current = load_opening_exact_live_state_batch(
-                self.opening_read(),
-                Arc::clone(&self.live_state),
-                Arc::clone(&self.branch_head_control_cache),
-                &request,
-            )
-            .await?;
+            let current = load_opening_exact_live_state_batch(&forktree, &request).await?;
             for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
                 let row = current.row(slot).ok_or_else(|| {
                     LixError::new(
@@ -7044,13 +7040,8 @@ where
             untracked: Some(false),
             include_tombstones: false,
         };
-        let current = load_opening_exact_live_state_batch(
-            self.opening_read(),
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.branch_head_control_cache),
-            &request,
-        )
-        .await?;
+        let forktree = self.forktree_read_facade();
+        let current = load_opening_exact_live_state_batch(&forktree, &request).await?;
         let mut predecessors = Vec::with_capacity(entity_pks.len());
         for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
             let row = current.row(slot).ok_or_else(|| {
@@ -7959,13 +7950,10 @@ async fn resolve_prepared_mutation_collection_generation(
 }
 
 async fn load_opening_exact_live_state_batch(
-    read: impl StorageAdapterRead + Send,
-    live_state: Arc<LiveStateContext>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
+    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + 'static>,
     request: &LiveStateExactBatchRequest,
 ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-    let base = live_state.transaction_reader(read, branch_head_control_cache);
-    base.load_exact_batch(request).await
+    forktree.load_exact_batch(request).await
 }
 
 fn diff_record_identity(record: &ChangeRecord) -> (String, EntityPk, Option<String>) {
@@ -8485,6 +8473,33 @@ mod transaction_validation_reader_tests {
         assert!(!reader.contains("transaction_reader("));
         assert!(reader.contains("overlay_scan_batch(&self.forktree"));
         assert!(reader.contains("overlay_load_exact_batch(&self.forktree"));
+    }
+
+    #[test]
+    fn transaction_predecessor_exact_reads_use_the_operation_forktree_owner() {
+        let source = include_str!("context.rs");
+        let helper_start = source
+            .find("async fn load_opening_exact_live_state_batch")
+            .expect("opening exact-batch helper");
+        let helper = &source[helper_start..];
+        let helper_end = helper
+            .find("fn diff_record_identity")
+            .expect("opening exact-batch helper end");
+        let helper = &helper[..helper_end];
+        assert!(helper.contains("ForkTreeReadFacade<impl StorageAdapterRead + 'static>"));
+        assert!(helper.contains("forktree.load_exact_batch(request)"));
+        assert!(!helper.contains("transaction_reader("));
+
+        let predecessor_start = source
+            .find("async fn load_immutable_mutation_predecessors")
+            .expect("mutation predecessor helper");
+        let predecessor_end = source
+            .find("fn conflict_resolution_limits")
+            .expect("mutation predecessor helper end");
+        let predecessor = &source[predecessor_start..predecessor_end];
+        assert!(predecessor.contains("reader.load_exact_batch(&request)"));
+        assert!(!predecessor.contains("LiveStateStoreReader"));
+        assert!(!predecessor.contains("transaction_reader("));
     }
 }
 
