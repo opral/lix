@@ -12,8 +12,8 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
-    CanonicalBranchId, StateCell, StateKeyRef, StateSource, decode_state_key, encode_state_key,
-    open_coherent_view_on_read, state_point, state_range,
+    CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
+    encode_state_key, open_coherent_view_on_read, state_point, state_range,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -22,7 +22,7 @@ use crate::live_state::{
 };
 use crate::storage_adapter::StorageAdapterRead;
 
-use super::derived::{is_derived_schema, request_may_include_derived};
+use super::derived::is_derived_schema;
 
 pub(crate) async fn scan_view<R>(
     view: &crate::forktree::CoherentView<R>,
@@ -37,6 +37,23 @@ where
         Some(false) => scan_tracked_view(view, request).await,
         None => scan_combined_view(view, request).await,
     }
+}
+
+/// Runs a current-state scan through an operation-owned ForkTree facade. The
+/// facade retains the caller's immutable read; this helper only authenticates
+/// the requested branch view and never acquires a second storage read.
+pub(crate) async fn scan_facade<R>(
+    facade: &ForkTreeReadFacade<R>,
+    request: &LiveStateScanRequest,
+) -> Result<MaterializedLiveStateBatch, LixError>
+where
+    R: StorageAdapterRead,
+{
+    let branch_id = request_branch_id(request)?;
+    let mut fork_tree_request = request.clone();
+    fork_tree_request.filter.branch_ids = vec![branch_id.to_owned()];
+    let view = facade.branch(branch_id).await?;
+    scan_view(&view, &fork_tree_request).await
 }
 
 async fn scan_tracked_view<R>(
@@ -280,6 +297,34 @@ where
     }
     let branch_id = parse_branch_id(&request.rows[0].branch_id)?;
     let view = open_coherent_view_on_read(read, branch_id).await?;
+    load_exact_view(&view, request).await
+}
+
+/// Loads correlated current-state identities from a view borrowed from an
+/// operation-owned facade. This is the exact-batch counterpart to
+/// [`scan_facade`]; request slots and duplicate identities remain aligned.
+pub(crate) async fn load_exact_facade<R>(
+    facade: &ForkTreeReadFacade<R>,
+    request: &LiveStateExactBatchRequest,
+) -> Result<MaterializedLiveStateExactBatch, LixError>
+where
+    R: StorageAdapterRead,
+{
+    validate_exact_request(request)?;
+    if request.rows.is_empty() {
+        return Ok(MaterializedLiveStateExactBatch::default());
+    }
+    let view = facade.branch(&request.rows[0].branch_id).await?;
+    load_exact_view(&view, request).await
+}
+
+async fn load_exact_view<R>(
+    view: &crate::forktree::CoherentView<R>,
+    request: &LiveStateExactBatchRequest,
+) -> Result<MaterializedLiveStateExactBatch, LixError>
+where
+    R: StorageAdapterRead,
+{
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
     let mut slots = Vec::with_capacity(request.rows.len());
 
@@ -344,8 +389,43 @@ where
     MaterializedLiveStateExactBatch::new(builder.finish(), slots)
 }
 
+fn request_branch_id(request: &LiveStateScanRequest) -> Result<&str, LixError> {
+    let branch_ids = &request.filter.branch_ids;
+    let non_global_branch_ids = branch_ids
+        .iter()
+        .filter(|branch_id| branch_id.as_str() != crate::GLOBAL_BRANCH_ID)
+        .collect::<Vec<_>>();
+    let has_global = branch_ids
+        .iter()
+        .any(|branch_id| branch_id.as_str() == crate::GLOBAL_BRANCH_ID);
+    let valid_branch_scope = match non_global_branch_ids.as_slice() {
+        [] => branch_ids.len() == 1 && has_global,
+        [branch_id] => {
+            branch_ids.len() == 1 + usize::from(has_global)
+                && branch_ids.iter().all(|candidate| {
+                    candidate.as_str() == crate::GLOBAL_BRANCH_ID || candidate == *branch_id
+                })
+        }
+        _ => false,
+    };
+    if !valid_branch_scope {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "ForkTree live-state operation requires exactly one branch",
+        ));
+    }
+    Ok(non_global_branch_ids
+        .first()
+        .map_or(crate::GLOBAL_BRANCH_ID, |branch_id| branch_id.as_str()))
+}
+
 fn validate_scan_request(request: &LiveStateScanRequest) -> Result<(), LixError> {
-    if request_may_include_derived(request) {
+    if request
+        .filter
+        .schema_keys
+        .iter()
+        .any(|schema_key| is_derived_schema(schema_key))
+    {
         return Err(unsupported(
             "current ForkTree reader does not serve derived or history schemas",
         ));

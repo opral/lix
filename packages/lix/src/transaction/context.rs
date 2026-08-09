@@ -57,9 +57,10 @@ use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
     BranchHeadControlCache, CertifiedCurrentStatePredecessor, LiveStateContext,
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateReader, LiveStateScanRequest, LiveStateStoreReader, MaterializedLiveStateBatch,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-    StagedLiveStateRows, overlay_load_exact_batch, overlay_scan_batch,
+    LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
+    MaterializedLiveStateRowRef, StagedLiveStateRows, is_derived_schema, overlay_load_exact_batch,
+    overlay_scan_batch,
 };
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
@@ -6301,7 +6302,7 @@ where
         let branch_ref: Arc<dyn BranchRefReader> =
             Arc::new(self.branch_ctx.ref_reader(read.clone()));
         TransactionValidationLiveStateReader {
-            current: self.live_state.reader(read.clone()),
+            forktree: ForkTreeReadFacade::new(read.clone()),
             commit: CommitGraphLiveStateReader::new(
                 "lix_commit",
                 Arc::clone(&graph),
@@ -8064,8 +8065,8 @@ async fn load_transaction_blob_bytes(
     Ok(BlobBytesBatch::new(entries))
 }
 
-struct TransactionValidationLiveStateReader<R: crate::storage_adapter::StorageAdapterRead> {
-    current: LiveStateStoreReader<R>,
+struct TransactionValidationLiveStateReader<R: StorageAdapterRead> {
+    forktree: ForkTreeReadFacade<R>,
     commit: CommitGraphLiveStateReader,
     commit_edge: CommitGraphLiveStateReader,
     branch_ref: CommitGraphLiveStateReader,
@@ -8088,61 +8089,279 @@ fn derived_validation_reader<'a>(
 #[async_trait]
 impl<R> LiveStateReader for TransactionValidationLiveStateReader<R>
 where
-    R: crate::storage_adapter::StorageAdapterRead + 'static,
+    R: StorageAdapterRead + 'static,
 {
     async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        if let Some(reader) =
-            derived_validation_reader(request, &self.commit, &self.commit_edge, &self.branch_ref)
-        {
-            return reader.scan_batch(request).await;
+        let (current_schema_keys, derived_schema_keys) = validation_schema_partition(request);
+        if derived_schema_keys.is_empty() {
+            return crate::live_state::scan_forktree_facade(&self.forktree, request).await;
         }
-        self.current.scan_batch(request).await
+        let mut rows = Vec::new();
+        if !current_schema_keys.is_empty() {
+            let mut current_request = request.clone();
+            current_request.filter.schema_keys = current_schema_keys;
+            current_request.limit = None;
+            rows.extend(
+                crate::live_state::scan_forktree_facade(&self.forktree, &current_request)
+                    .await?
+                    .into_rows(),
+            );
+        }
+        for schema_key in derived_schema_keys {
+            let mut derived_request = request.clone();
+            derived_request.filter.schema_keys = vec![schema_key];
+            derived_request.limit = None;
+            let reader = derived_validation_reader(
+                &derived_request,
+                &self.commit,
+                &self.commit_edge,
+                &self.branch_ref,
+            )
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "validation request contains an unsupported derived schema",
+                )
+            })?;
+            rows.extend(reader.scan_batch(&derived_request).await?.into_rows());
+        }
+        rows.sort_by(|left, right| {
+            left.schema_key
+                .cmp(&right.schema_key)
+                .then_with(|| left.file_id.cmp(&right.file_id))
+                .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+                .then_with(|| left.branch_id.cmp(&right.branch_id))
+        });
+        if let Some(limit) = request.limit {
+            rows.truncate(limit);
+        }
+        Ok(MaterializedLiveStateBatch::from_rows(rows))
     }
 
     async fn scan_constraint_batch(
         &self,
         request: &LiveStateScanRequest,
-        tracked_only: bool,
+        _tracked_only: bool,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        if let Some(reader) =
-            derived_validation_reader(request, &self.commit, &self.commit_edge, &self.branch_ref)
-        {
-            let _ = tracked_only;
-            return reader.scan_batch(request).await;
-        }
-        self.current
-            .scan_constraint_batch(request, tracked_only)
-            .await
+        self.scan_batch(request).await
     }
 
     async fn scan_tracked_batch(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        if let Some(reader) =
-            derived_validation_reader(request, &self.commit, &self.commit_edge, &self.branch_ref)
-        {
-            return reader.scan_batch(request).await;
-        }
-        self.current.scan_tracked_batch(request).await
+        self.scan_batch(request).await
     }
 
     async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        if !request.rows.is_empty()
-            && request
-                .rows
-                .iter()
-                .all(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
-        {
-            return self.branch_ref.load_exact_batch(request).await;
+        let mut output = vec![None; request.rows.len()];
+        let mut current_positions = Vec::new();
+        let mut derived_positions = BTreeMap::<String, Vec<usize>>::new();
+        for (index, row) in request.rows.iter().enumerate() {
+            if is_derived_schema(&row.schema_key) {
+                derived_positions
+                    .entry(row.schema_key.clone())
+                    .or_default()
+                    .push(index);
+            } else {
+                current_positions.push(index);
+            }
         }
-        self.current.load_exact_batch(request).await
+
+        if !current_positions.is_empty() {
+            let current_request = LiveStateExactBatchRequest {
+                rows: current_positions
+                    .iter()
+                    .map(|&index| request.rows[index].clone())
+                    .collect(),
+                projection: request.projection.clone(),
+                untracked: request.untracked,
+                include_tombstones: request.include_tombstones,
+            };
+            let current =
+                crate::live_state::load_forktree_exact_facade(&self.forktree, &current_request)
+                    .await?
+                    .into_rows();
+            for (index, row) in current_positions.into_iter().zip(current) {
+                output[index] = row;
+            }
+        }
+
+        for (schema_key, positions) in derived_positions {
+            let mut derived_request = request.clone();
+            derived_request.rows = positions
+                .iter()
+                .map(|&index| request.rows[index].clone())
+                .collect();
+            let scan_request = LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![schema_key.clone()],
+                    entity_pks: derived_request
+                        .rows
+                        .iter()
+                        .map(|row| row.entity_pk.clone())
+                        .collect(),
+                    branch_ids: derived_request
+                        .rows
+                        .iter()
+                        .map(|row| row.branch_id.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    untracked: derived_request.untracked,
+                    include_tombstones: derived_request.include_tombstones,
+                    ..Default::default()
+                },
+                projection: derived_request.projection.clone(),
+                limit: None,
+            };
+            let reader = derived_validation_reader(
+                &scan_request,
+                &self.commit,
+                &self.commit_edge,
+                &self.branch_ref,
+            )
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "validation exact request contains an unsupported derived schema",
+                )
+            })?;
+            let rows = reader.scan_batch(&scan_request).await?.into_rows();
+            for (position, requested) in positions.into_iter().zip(derived_request.rows) {
+                output[position] = rows
+                    .iter()
+                    .find_map(|row| exact_row_matches(row, &requested).then(|| row.clone()));
+            }
+        }
+
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(output.len());
+        let mut slots = Vec::with_capacity(output.len());
+        for row in output {
+            let Some(row) = row else {
+                slots.push(None);
+                continue;
+            };
+            let ordinal = u32::try_from(builder.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "validation exact result exceeds u32 rows",
+                )
+            })?;
+            builder.push_owned(row);
+            slots.push(Some(ordinal));
+        }
+        MaterializedLiveStateExactBatch::new(builder.finish(), slots)
+    }
+}
+
+fn validation_schema_partition(request: &LiveStateScanRequest) -> (Vec<String>, Vec<String>) {
+    if request.filter.schema_keys.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut current = Vec::new();
+    let mut derived = Vec::new();
+    for schema_key in &request.filter.schema_keys {
+        if is_derived_schema(schema_key) {
+            if !derived.iter().any(|candidate| candidate == schema_key) {
+                derived.push(schema_key.clone());
+            }
+        } else if !current.iter().any(|candidate| candidate == schema_key) {
+            current.push(schema_key.clone());
+        }
+    }
+    (current, derived)
+}
+
+fn exact_row_matches(row: &MaterializedLiveStateRow, requested: &LiveStateExactRowRequest) -> bool {
+    row.schema_key == requested.schema_key
+        && row.branch_id.as_ref() == requested.branch_id.as_str()
+        && row.entity_pk == requested.entity_pk
+        && row.file_id == requested.file_id
+}
+
+#[cfg(test)]
+mod transaction_validation_reader_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_validation_requests_partition_current_and_authenticated_derived_schemas() {
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![
+                    "app.entity".to_owned(),
+                    "lix_commit".to_owned(),
+                    "app.entity".to_owned(),
+                    BRANCH_REF_SCHEMA_KEY.to_owned(),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            validation_schema_partition(&request),
+            (
+                vec!["app.entity".to_owned()],
+                vec!["lix_commit".to_owned(), BRANCH_REF_SCHEMA_KEY.to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn empty_schema_validation_request_stays_current_state_only() {
+        let request = LiveStateScanRequest::default();
+        assert_eq!(
+            validation_schema_partition(&request),
+            (Vec::new(), Vec::new())
+        );
+        assert!(!is_derived_schema("app.entity"));
+    }
+
+    #[test]
+    fn exact_validation_identity_requires_schema_branch_entity_and_file() {
+        let row = MaterializedLiveStateRow {
+            entity_pk: EntityPk::single("entity"),
+            schema_key: "app.entity".to_owned(),
+            file_id: Some("file".to_owned()),
+            snapshot_content: None,
+            metadata: None,
+            deleted: false,
+            created_at: LixTimestamp::expect_parse("created", "2026-01-01T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("updated", "2026-01-01T00:00:00Z"),
+            global: false,
+            change_id: None,
+            commit_id: None,
+            untracked: false,
+            branch_id: "branch".into(),
+        };
+        let requested = LiveStateExactRowRequest {
+            schema_key: "app.entity".to_owned(),
+            branch_id: "branch".to_owned(),
+            entity_pk: EntityPk::single("entity"),
+            file_id: Some("file".to_owned()),
+        };
+        assert!(exact_row_matches(&row, &requested));
+        assert!(!exact_row_matches(
+            &row,
+            &LiveStateExactRowRequest {
+                file_id: Some("other-file".to_owned()),
+                ..requested
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_reader_has_no_legacy_current_fallback_field() {
+        let source = include_str!("context.rs");
+        assert!(!source.contains(&format!("{}: LiveStateStoreReader", "current")));
+        assert!(!source.contains(concat!("self.", "current.scan_batch")));
+        assert!(!source.contains(concat!("self.", "current.load_exact_batch")));
     }
 }
 
