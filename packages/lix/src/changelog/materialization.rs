@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
 use bytes::Bytes;
 
 use crate::LixError;
 use crate::common::SharedStr;
-use crate::json_store::{
-    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonStoreContext,
-};
+use crate::forktree::ForkTreeReadFacade;
+#[cfg(test)]
+use crate::json_store::JsonRef;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::{ChangeId, ChangeRecord};
@@ -68,7 +69,7 @@ pub(crate) async fn load_change_records<S>(
     change_ids: impl Iterator<Item = ChangeId>,
 ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError>
 where
-    S: StorageAdapterRead + ?Sized,
+    S: StorageAdapterRead,
 {
     let mut unique = Vec::new();
     let mut seen = HashSet::new();
@@ -95,15 +96,15 @@ where
 /// publication never discard commit-local payloads and fall back to the
 /// standalone changelog namespace.
 pub(crate) async fn materialize_known_change_payloads<S>(
-    store: &S,
+    reader: &mut ForkTreeReadFacade<S>,
     changes: impl Iterator<Item = ChangeRecord>,
     projection: ChangeRecordProjection,
 ) -> Result<HashMap<ChangeId, MaterializedChangePayload>, LixError>
 where
-    S: StorageAdapterRead + ?Sized,
+    S: StorageAdapterRead,
 {
     Ok(
-        materialize_known_change_payloads_in_order(store, changes, projection)
+        materialize_known_change_payloads_in_order(reader, changes, projection)
             .await?
             .into_iter()
             .collect(),
@@ -116,12 +117,12 @@ where
 /// one source change. Lifecycle operations such as checkpoints must preserve
 /// each identity-specific payload even though those rows share a change id.
 pub(crate) async fn materialize_known_change_payloads_in_order<S>(
-    store: &S,
+    reader: &mut ForkTreeReadFacade<S>,
     changes: impl Iterator<Item = ChangeRecord>,
     projection: ChangeRecordProjection,
 ) -> Result<Vec<(ChangeId, MaterializedChangePayload)>, LixError>
 where
-    S: StorageAdapterRead + ?Sized,
+    S: StorageAdapterRead,
 {
     let changes = changes.collect::<Vec<_>>();
     if !projection.requires_payload() {
@@ -140,89 +141,49 @@ where
             .collect());
     }
 
-    let mut json_refs = Vec::new();
-    let mut plans = Vec::with_capacity(changes.len());
+    let mut payloads = Vec::with_capacity(changes.len());
     for change in changes {
         let change_id = change.change_id;
-        plans.push((
+        let snapshot_content = if projection.snapshot_content {
+            reader
+                .load_json_slot(&change.snapshot)
+                .await?
+                .map(SharedStr::from)
+        } else {
+            None
+        };
+        let metadata = if projection.metadata {
+            reader
+                .load_json_slot(&change.metadata)
+                .await?
+                .map(SharedStr::from)
+        } else {
+            None
+        };
+        payloads.push((
             change_id,
-            MaterializedChangeIdentity {
-                schema_key: change.schema_key,
-                entity_pk: change.entity_pk,
-                file_id: change.file_id,
+            MaterializedChangePayload {
+                identity: Some(MaterializedChangeIdentity {
+                    schema_key: change.schema_key,
+                    entity_pk: change.entity_pk,
+                    file_id: change.file_id,
+                }),
+                snapshot_content,
+                metadata,
             },
-            materialized_json_slot(projection.snapshot_content, change.snapshot, &mut json_refs),
-            materialized_json_slot(projection.metadata, change.metadata, &mut json_refs),
         ));
     }
-
-    let mut json_values = load_json_values(store, &json_refs).await?;
-    plans
-        .into_iter()
-        .map(|(change_id, identity, snapshot, metadata)| {
-            Ok((
-                change_id,
-                MaterializedChangePayload {
-                    identity: Some(identity),
-                    snapshot_content: materialized_json_string(
-                        snapshot,
-                        &json_refs,
-                        &mut json_values,
-                    )?,
-                    metadata: materialized_json_string(metadata, &json_refs, &mut json_values)?,
-                },
-            ))
-        })
-        .collect()
+    Ok(payloads)
 }
 
+#[cfg(test)]
 enum MaterializedJsonSlot {
     None,
     Inline(Box<str>),
     Loaded(usize),
 }
 
-fn materialized_json_slot(
-    include: bool,
-    slot: JsonSlot,
-    json_refs: &mut Vec<JsonRef>,
-) -> MaterializedJsonSlot {
-    if !include {
-        return MaterializedJsonSlot::None;
-    }
-    match slot {
-        JsonSlot::None => MaterializedJsonSlot::None,
-        JsonSlot::Inline(json) => MaterializedJsonSlot::Inline(json),
-        JsonSlot::Ref(json_ref) => {
-            let index = json_refs.len();
-            json_refs.push(json_ref);
-            MaterializedJsonSlot::Loaded(index)
-        }
-    }
-}
-
-async fn load_json_values<S>(
-    store: &S,
-    json_refs: &[JsonRef],
-) -> Result<Vec<Option<Bytes>>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if json_refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(JsonStoreContext::new()
-        .load_bytes_many(
-            store,
-            JsonLoadRequestRef {
-                refs: json_refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            },
-        )
-        .await?
-        .into_values())
-}
-
+#[cfg(test)]
 fn materialized_json_string(
     slot: MaterializedJsonSlot,
     json_refs: &[JsonRef],
@@ -330,13 +291,14 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
+        let mut reader = ForkTreeReadFacade::new(&read);
         let first = test_change_record();
         let mut second = first.clone();
         second.schema_key = "derived-row".to_owned();
         second.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
 
         let payloads = materialize_known_change_payloads_in_order(
-            &read,
+            &mut reader,
             [first.clone(), second.clone()].into_iter(),
             ChangeRecordProjection::full(),
         )

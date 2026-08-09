@@ -18,7 +18,6 @@ use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::JsonStoreContext;
 use crate::live_state::{
     LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateProjection,
     LiveStateReader,
@@ -726,7 +725,6 @@ where
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
             forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
         }
     }

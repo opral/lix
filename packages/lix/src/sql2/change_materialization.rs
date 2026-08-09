@@ -1,9 +1,80 @@
 use crate::changelog::ChangeRecord;
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
-use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
+use crate::forktree::ForkTreeReadFacade;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{LixError, parse_row_metadata};
+
+#[async_trait::async_trait]
+pub(crate) trait JsonPayloadReader {
+    async fn load_slot(
+        &mut self,
+        slot: &crate::json_store::JsonSlot,
+        field: &str,
+    ) -> Result<Option<SharedStr>, LixError>;
+}
+
+#[async_trait::async_trait]
+impl<S> JsonPayloadReader for ForkTreeReadFacade<S>
+where
+    S: StorageAdapterRead,
+{
+    async fn load_slot(
+        &mut self,
+        slot: &crate::json_store::JsonSlot,
+        _field: &str,
+    ) -> Result<Option<SharedStr>, LixError> {
+        self.load_json_slot(slot)
+            .await
+            .map(|value| value.map(Into::into))
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl<S> JsonPayloadReader for crate::json_store::JsonStoreReader<S>
+where
+    S: StorageAdapterRead,
+{
+    async fn load_slot(
+        &mut self,
+        slot: &crate::json_store::JsonSlot,
+        field: &str,
+    ) -> Result<Option<SharedStr>, LixError> {
+        let json_ref = match slot {
+            crate::json_store::JsonSlot::None => return Ok(None),
+            crate::json_store::JsonSlot::Inline(json) => return Ok(Some(json.to_string().into())),
+            crate::json_store::JsonSlot::ForkTreeObject(_) => {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("{field} ForkTree object requires a retained ForkTree view"),
+                ));
+            }
+            crate::json_store::JsonSlot::Ref(json_ref) => json_ref,
+        };
+        let batch = self
+            .load_bytes_many(crate::json_store::JsonLoadRequestRef {
+                refs: std::slice::from_ref(json_ref),
+                scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+            })
+            .await?;
+        let Some(bytes) = batch.into_values().into_iter().next().flatten() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "changelog change {field} '{}' is missing",
+                    json_ref.to_hex()
+                ),
+            ));
+        };
+        SharedStr::from_utf8(bytes).map(Some).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("changelog change {field} is not UTF-8 JSON: {error}"),
+            )
+        })
+    }
+}
 
 /// Read-boundary view of a changelog change with JSON refs resolved.
 ///
@@ -42,23 +113,23 @@ impl ChangePayloadProjection {
     };
 }
 
-pub(crate) async fn materialize_located_history_change<S>(
-    json_reader: &mut JsonStoreReader<S>,
+pub(crate) async fn materialize_located_history_change<R>(
+    json_reader: &mut R,
     change: crate::commit_graph::CommitGraphChange,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageAdapterRead,
+    R: JsonPayloadReader + Sync,
 {
     materialize_commit_graph_change(json_reader, change, ChangePayloadProjection::ALL).await
 }
 
-pub(crate) async fn materialize_changelog_change_record<S>(
-    json_reader: &mut JsonStoreReader<S>,
+pub(crate) async fn materialize_changelog_change_record<R>(
+    json_reader: &mut R,
     change: ChangeRecord,
     payload_projection: ChangePayloadProjection,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageAdapterRead,
+    R: JsonPayloadReader + Sync,
 {
     materialize_commit_graph_change(
         json_reader,
@@ -78,21 +149,21 @@ where
     .await
 }
 
-pub(crate) async fn materialize_commit_graph_change<S>(
-    json_reader: &mut JsonStoreReader<S>,
+pub(crate) async fn materialize_commit_graph_change<R>(
+    json_reader: &mut R,
     change: crate::commit_graph::CommitGraphChange,
     payload_projection: ChangePayloadProjection,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageAdapterRead,
+    R: JsonPayloadReader + Sync,
 {
     let snapshot_content = if payload_projection.snapshot_content {
-        load_changelog_json_slot(json_reader, &change.snapshot, "snapshot").await?
+        json_reader.load_slot(&change.snapshot, "snapshot").await?
     } else {
         None
     };
     let metadata = if payload_projection.metadata {
-        match load_changelog_json_slot(json_reader, &change.metadata, "metadata").await? {
+        match json_reader.load_slot(&change.metadata, "metadata").await? {
             Some(value) => {
                 Some(parse_row_metadata(&value, "changelog change metadata_ref")?.into())
             }
@@ -111,44 +182,6 @@ where
         metadata,
         created_at: change.created_at.to_string(),
         origin_key: change.origin_key,
-    })
-}
-
-async fn load_changelog_json_slot<S>(
-    json_reader: &mut JsonStoreReader<S>,
-    slot: &crate::json_store::JsonSlot,
-    field: &str,
-) -> Result<Option<SharedStr>, LixError>
-where
-    S: StorageAdapterRead,
-{
-    let json_ref = match slot {
-        crate::json_store::JsonSlot::None => return Ok(None),
-        crate::json_store::JsonSlot::Inline(json) => {
-            return Ok(Some(json.to_string().into()));
-        }
-        crate::json_store::JsonSlot::Ref(json_ref) => json_ref,
-    };
-    let batch = json_reader
-        .load_bytes_many(JsonLoadRequestRef {
-            refs: std::slice::from_ref(json_ref),
-            scope: JsonReadScopeRef::OutOfBand,
-        })
-        .await?;
-    let Some(bytes) = batch.into_values().into_iter().next().flatten() else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "changelog change {field} '{}' is missing",
-                json_ref.to_hex()
-            ),
-        ));
-    };
-    SharedStr::from_utf8(bytes).map(Some).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog change {field} is not UTF-8 JSON: {error}"),
-        )
     })
 }
 

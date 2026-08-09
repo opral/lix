@@ -366,8 +366,7 @@ where
         ));
     }
     let as_of_commit_ids = route.as_of_commit_ids.as_slice();
-    let mut json_reader = query_source.json_reader;
-
+    let mut forktree_reader = query_source.forktree_reader;
     let mut rows = Vec::new();
     for as_of_commit_id in as_of_commit_ids {
         let as_of_commit_id =
@@ -428,7 +427,8 @@ where
         };
 
         for entry in entries {
-            let change = materialize_located_history_change(&mut json_reader, entry.change).await?;
+            let change =
+                materialize_located_history_change(&mut forktree_reader, entry.change).await?;
             let commit_created_at = if metadata_projection.commit_created_at {
                 Some(
                     reachable_by_id
@@ -516,8 +516,7 @@ where
                         format!("certified commit '{certified_commit_id}' has no account"),
                     )
                 })?;
-            let certified_rows = query_source
-                .forktree_reader
+            let certified_rows = forktree_reader
                 .scan_state_rows_at_commit(certified_commit_id)
                 .await?;
             for row in certified_rows {
@@ -1255,7 +1254,6 @@ mod tests {
             .expect("read should open");
         let read_scope = SharedStorageAdapterRead::new(read_scope);
         ChangelogQuerySource {
-            json_reader: JsonStoreContext::new().reader(read_scope.clone()),
             forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
         }
     }

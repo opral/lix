@@ -1007,12 +1007,19 @@ where
             ]);
         }
         ObjectDomain::SemanticChange => {
-            if !matches!(
-                ChangeObjectV1::decode(id, bytes)?,
-                ChangeObjectV1::Semantic { .. }
-            ) {
+            let change = ChangeObjectV1::decode(id, bytes)?;
+            let ChangeObjectV1::Semantic {
+                json_payload_object_ids,
+                ..
+            } = change
+            else {
                 return Err(corruption("semantic Change decoded as another domain"));
-            }
+            };
+            edges.extend(
+                json_payload_object_ids
+                    .into_iter()
+                    .map(|id| typed(id, ObjectDomain::BlobChunk)),
+            );
         }
         ObjectDomain::BranchRefChange => {
             let change = ChangeObjectV1::decode(id, bytes)?;
@@ -1022,6 +1029,7 @@ where
                 before_semantic_head_commit_object_id,
                 after_semantic_head_commit_object_id,
                 previous_ref_change_object_id,
+                json_payload_object_ids,
                 ..
             } = change
             else {
@@ -1036,6 +1044,11 @@ where
             if let Some(id) = previous_ref_change_object_id {
                 edges.push(typed(id, ObjectDomain::BranchRefChange));
             }
+            edges.extend(
+                json_payload_object_ids
+                    .into_iter()
+                    .map(|id| typed(id, ObjectDomain::BlobChunk)),
+            );
         }
         ObjectDomain::OrderedTreeNode => {
             let tree = ordered_tree_edges(id, bytes)?;

@@ -16,7 +16,6 @@ use crate::filesystem::{
     UncachedFilesystemPathIndexReader,
 };
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::JsonStoreReader;
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
     MaterializedLiveStateExactBatch,
@@ -48,7 +47,6 @@ pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 
 #[derive(Clone)]
 pub(crate) struct ChangelogQuerySource<S> {
-    pub(crate) json_reader: JsonStoreReader<S>,
     pub(crate) forktree_reader: crate::forktree::ForkTreeReadFacade<S>,
 }
 

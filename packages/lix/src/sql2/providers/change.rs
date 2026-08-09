@@ -91,28 +91,26 @@ where
                 Arc::clone(&schema),
                 (self.query_source.clone(), schema),
                 move |(query_source, schema)| async move {
-                    let mut json_reader = query_source.json_reader;
+                    let mut forktree_reader = query_source.forktree_reader;
                     let canonical_changes = match route {
                         ChangeScanRoute::Exact(change_id) => {
-                            load_exact_change(&query_source.forktree_reader, change_id)
+                            load_exact_change(&forktree_reader, change_id)
                                 .await
                                 .map(|change| change.into_iter().collect())
                                 .map_err(lix_error_to_datafusion_error)?
                         }
-                        ChangeScanRoute::All | ChangeScanRoute::Empty => scan_changelog_changes(
-                            &query_source.forktree_reader,
-                            pushed_limit,
-                            route,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?,
+                        ChangeScanRoute::All | ChangeScanRoute::Empty => {
+                            scan_changelog_changes(&forktree_reader, pushed_limit, route)
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?
+                        }
                     };
                     let mut changes = Vec::with_capacity(canonical_changes.len());
                     for change in canonical_changes {
                         match change {
                             LixChangeRow::Direct(change) => changes.push(
                                 materialize_changelog_change_record(
-                                    &mut json_reader,
+                                    &mut forktree_reader,
                                     change,
                                     payload_projection,
                                 )
@@ -121,7 +119,7 @@ where
                             ),
                             LixChangeRow::DerivedCommit(change) => changes.push(
                                 materialize_commit_graph_change(
-                                    &mut json_reader,
+                                    &mut forktree_reader,
                                     change,
                                     payload_projection,
                                 )

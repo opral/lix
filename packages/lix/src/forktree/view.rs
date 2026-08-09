@@ -12,8 +12,8 @@ use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
 use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
-    BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeId,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
+    BlobChunkV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry,
+    ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
     RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
@@ -710,24 +710,17 @@ where
             crate::json_store::JsonSlot::None => Ok(None),
             crate::json_store::JsonSlot::Inline(value) => Ok(Some(value.to_string())),
             crate::json_store::JsonSlot::Ref(json_ref) => {
-                let refs = [*json_ref];
-                let values = crate::json_store::JsonStoreContext::new()
-                    .load_bytes_many(
-                        &self.read,
-                        crate::json_store::JsonLoadRequestRef {
-                            refs: &refs,
-                            scope: crate::json_store::JsonReadScopeRef::OutOfBand,
-                        },
-                    )
-                    .await?
-                    .into_values();
-                let Some(Some(bytes)) = values.into_iter().next() else {
-                    return Err(crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        "authenticated change snapshot payload is missing",
-                    ));
-                };
-                String::from_utf8(bytes.to_vec())
+                let _ = json_ref;
+                Err(crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "ForkTree change snapshot contains a legacy JSON side-plane reference",
+                ))
+            }
+            crate::json_store::JsonSlot::ForkTreeObject(object_id) => {
+                let id = ObjectId::from_bytes(*object_id);
+                let bytes = load_object_bytes(&self.read, id).await?;
+                let chunk = BlobChunkV1::decode(id, &bytes)?;
+                String::from_utf8(chunk.bytes.to_vec())
                     .map(Some)
                     .map_err(|error| {
                         crate::LixError::new(

@@ -16,7 +16,7 @@ use crate::common::LixTimestamp;
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::transaction::staging::PreparedWriteSet;
-use crate::transaction::types::PreparedStateRowRef;
+use crate::transaction::types::{PreparedStateRowRef, StageJson};
 
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
@@ -59,6 +59,45 @@ pub(crate) fn take_direct_journal_replacement_publications(_schema_key: &str) ->
 }
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
+
+/// Converts transaction JSON into the representation owned by a ForkTree
+/// change. Small values retain their inline semantics; large values are
+/// staged as authenticated immutable objects before the change envelope is
+/// encoded. A ForkTree change never persists a legacy JsonRef.
+fn stage_forktree_json_slot(
+    publication: &mut PreparedPublication,
+    value: Option<&StageJson>,
+) -> Result<JsonSlot, LixError> {
+    let Some(value) = value else {
+        return Ok(JsonSlot::None);
+    };
+    if value.is_inline() {
+        return Ok(JsonSlot::Inline(value.normalized().into()));
+    }
+    let object_id = publication
+        .stage_json_payload(value.normalized())
+        .map_err(LixError::from)?;
+    Ok(JsonSlot::ForkTreeObject(*object_id.as_bytes()))
+}
+
+fn json_payload_object_ids(
+    snapshot: &JsonSlot,
+    metadata: &JsonSlot,
+) -> Result<Vec<ObjectId>, LixError> {
+    let mut ids = Vec::new();
+    for slot in [snapshot, metadata] {
+        match slot {
+            JsonSlot::ForkTreeObject(bytes) => ids.push(ObjectId::from_bytes(*bytes)),
+            JsonSlot::Ref(_) => {
+                return Err(writer_error(
+                    "ForkTree change contains an unlowered JSON side-plane reference",
+                ));
+            }
+            JsonSlot::None | JsonSlot::Inline(_) => {}
+        }
+    }
+    Ok(ids)
+}
 
 /// Complete result of classifying one transaction's currently supported
 /// ForkTree publication intent.
@@ -372,6 +411,9 @@ where
             entity_pk: row.entity_pk,
         });
         let previous = state_point(&view, &key, true).await?;
+        let snapshot = stage_forktree_json_slot(&mut publication, row.snapshot)?;
+        let metadata = stage_forktree_json_slot(&mut publication, row.metadata)?;
+        let json_payload_object_ids = json_payload_object_ids(&snapshot, &metadata)?;
         let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
             format_version: 2,
             change_id,
@@ -379,18 +421,15 @@ where
             schema_key: row.schema_key.to_string(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.map(ToString::to_string),
-            snapshot: row.snapshot.map_or(JsonSlot::None, |value| {
-                JsonSlot::from_json(value.normalized())
-            }),
-            metadata: row.metadata.map_or(JsonSlot::None, |value| {
-                JsonSlot::from_json(value.normalized())
-            }),
+            snapshot,
+            metadata,
             created_at: row.created_at,
             origin_key: row.origin_key.map(ToString::to_string),
         })?;
         changes.push(ChangeObjectV1::Semantic {
             change_id: forktree_change_id(change_id),
             payload,
+            json_payload_object_ids,
         });
 
         let mutation = if global && row.snapshot.is_none() {
@@ -538,6 +577,7 @@ where
         after_semantic_head_commit_object_id: Some(commit_object_id),
         previous_ref_change_object_id: view.branch_snapshot().latest_ref_change_object_id,
         payload: ref_payload,
+        json_payload_object_ids: Vec::new(),
     };
     let (ref_object_id, _) = ref_change.encode()?;
     changes.push(ref_change);
@@ -797,6 +837,9 @@ where
                     "ordered history repeats one logical state identity",
                 ));
             }
+            let snapshot = stage_forktree_json_slot(&mut publication, row.snapshot)?;
+            let metadata = stage_forktree_json_slot(&mut publication, row.metadata)?;
+            let json_payload_object_ids = json_payload_object_ids(&snapshot, &metadata)?;
             let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
                 format_version: 2,
                 change_id,
@@ -804,18 +847,15 @@ where
                 schema_key: row.schema_key.to_string(),
                 entity_pk: row.entity_pk.clone(),
                 file_id: row.file_id.map(ToString::to_string),
-                snapshot: row.snapshot.map_or(JsonSlot::None, |value| {
-                    JsonSlot::from_json(value.normalized())
-                }),
-                metadata: row.metadata.map_or(JsonSlot::None, |value| {
-                    JsonSlot::from_json(value.normalized())
-                }),
+                snapshot,
+                metadata,
                 created_at: row.created_at,
                 origin_key: row.origin_key.map(ToString::to_string),
             })?;
             let change = ChangeObjectV1::Semantic {
                 change_id: forktree_change_id(change_id),
                 payload,
+                json_payload_object_ids,
             };
             let (change_object_id, _) = change.encode()?;
             members.push(CommitMemberV1::introduced(change_object_id));
@@ -1109,6 +1149,7 @@ where
         after_semantic_head_commit_object_id: Some(final_commit_object_id),
         previous_ref_change_object_id: view.branch_snapshot().latest_ref_change_object_id,
         payload: ref_payload,
+        json_payload_object_ids: Vec::new(),
     };
     let (ref_object_id, _) = branch_ref_change.encode()?;
     fresh_owner_rows.push((
