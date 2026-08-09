@@ -1,5 +1,6 @@
 use crate::LixError;
 use crate::common::LixTimestamp;
+#[cfg(test)]
 use crate::common::{ExactBatch, ExactValue};
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonSlot;
@@ -304,12 +305,6 @@ macro_rules! impl_uuid_id {
 impl_uuid_id!(CommitId, "commit id");
 impl_uuid_id!(ChangeId, "change id");
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ChangelogAppend {
-    pub(crate) commits: Vec<CommitRecord>,
-    pub(crate) changes: Vec<ChangeRecord>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitRecord {
@@ -323,31 +318,6 @@ pub(crate) struct CommitRecord {
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CommitLoadRequest<'a> {
-    pub(crate) commit_ids: &'a [CommitId],
-}
-
-pub(crate) type CommitLoadBatch<'a> = ExactBatch<'a, CommitId, CommitRecord>;
-
-impl ExactValue<CommitId> for CommitRecord {
-    fn matches_exact_key(&self, key: &CommitId) -> bool {
-        self.commit_id == *key
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CommitScanRequest<'a> {
-    pub(crate) start_after: Option<&'a str>,
-    pub(crate) limit: Option<usize>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitScanBatch {
-    pub(crate) entries: Vec<CommitRecord>,
-    pub(crate) next_start_after: Option<CommitId>,
 }
 
 /// In-memory change record. The stored form (`ChangeRecordRef` /
@@ -365,6 +335,16 @@ pub(crate) struct ChangeRecord {
     pub(crate) metadata: JsonSlot,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) type ChangeLoadBatch<'a> = ExactBatch<'a, ChangeId, ChangeRecord>;
+
+#[cfg(test)]
+impl ExactValue<ChangeId> for ChangeRecord {
+    fn matches_exact_key(&self, key: &ChangeId) -> bool {
+        self.change_id == *key
+    }
 }
 
 #[derive(musli::Encode)]
@@ -477,31 +457,6 @@ pub(crate) fn forktree_change_json_payload_ids(record: &ChangeRecord) -> Vec<[u8
             _ => None,
         })
         .collect()
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ChangeLoadRequest<'a> {
-    pub(crate) change_ids: &'a [ChangeId],
-}
-
-pub(crate) type ChangeLoadBatch<'a> = ExactBatch<'a, ChangeId, ChangeRecord>;
-
-impl ExactValue<ChangeId> for ChangeRecord {
-    fn matches_exact_key(&self, key: &ChangeId) -> bool {
-        self.change_id == *key
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ChangeScanRequest<'a> {
-    pub(crate) start_after: Option<&'a str>,
-    pub(crate) limit: Option<usize>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ChangeScanBatch {
-    pub(crate) entries: Vec<ChangeRecord>,
-    pub(crate) next_start_after: Option<ChangeId>,
 }
 
 /// Canonical derived `lix_commit` row snapshot.

@@ -719,11 +719,6 @@ impl<S> CommitGraphStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    #[cfg(feature = "storage-benches")]
-    pub(crate) fn store(&self) -> &S {
-        self.topology.read()
-    }
-
     /// Loads one topology node without reading its member delta or payloads.
     pub(crate) async fn load_node(
         &mut self,
