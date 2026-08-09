@@ -11,11 +11,11 @@ use super::codec::corruption;
 use super::model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     ChangeCatalogEntry, ChangeCatalogOwner, ChangeObjectV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
-    snapshot_selector_key, upload_selector_key,
+    RepositoryRootV1, SemanticChangePageV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1,
+    UploadProgressV1, UploadSelectorV1, branch_selector_key, gc_progress_selector_key,
+    global_selector_key, snapshot_selector_key, upload_selector_key,
 };
-use super::object::{OBJECT_SPACE, ObjectId};
+use super::object::{OBJECT_SPACE, ObjectId, authenticate_object_domain};
 use super::serving::{CatalogTreeEdit, StateTreeEdit};
 use super::state::{
     StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
@@ -55,6 +55,7 @@ pub(crate) struct OrderedBranchHistoryTransition {
     pub(crate) change_catalog_edit: CatalogTreeEdit,
     pub(crate) semantic_commits: Vec<CommitObjectV1>,
     pub(crate) fresh_changes: Vec<ChangeObjectV1>,
+    pub(crate) semantic_change_pages: ImmutableObjectSet,
     pub(crate) branch_ref_change: ChangeObjectV1,
     pub(crate) branch_snapshot: BranchSnapshotV1,
     pub(crate) repository_root: super::model::RepositoryRootV1,
@@ -925,11 +926,23 @@ impl PreparedPublication {
             }
         }
 
+        let semantic_changes = changes
+            .iter()
+            .filter(|change| matches!(change, ChangeObjectV1::Semantic { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        let (semantic_page_objects, semantic_refs) = if semantic_changes.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            SemanticChangePageV1::encode_chain(semantic_commit.commit_id, &semantic_changes)?
+        };
         let mut encoded_changes = BTreeMap::new();
         for change in &changes {
-            let (id, bytes) = change.encode()?;
-            if encoded_changes.insert(id, (change, bytes)).is_some() {
-                return Err(corruption("state transition repeats one Change object"));
+            if matches!(change, ChangeObjectV1::BranchRef { .. }) {
+                let (id, bytes) = change.encode()?;
+                if encoded_changes.insert(id, (change, bytes)).is_some() {
+                    return Err(corruption("state transition repeats one Change object"));
+                }
             }
         }
         let mut expected_changes = BTreeSet::new();
@@ -940,16 +953,23 @@ impl PreparedPublication {
                     "single-transition publication cannot introduce selected history",
                 ));
             }
-            if !expected_changes.insert(member_id) {
+            if !expected_changes.insert(member.change_ref()) {
                 return Err(corruption("semantic commit repeats one member Change"));
             }
-            let Some((ChangeObjectV1::Semantic { change_id, .. }, _)) =
-                encoded_changes.get(&member_id)
-            else {
+            let Some(change) = semantic_changes.get(ordinal) else {
                 return Err(corruption(
-                    "semantic commit member is absent or is a branch RefChange",
+                    "semantic commit member is absent from the semantic page batch",
                 ));
             };
+            let Some(expected_ref) = semantic_refs.get(ordinal).copied() else {
+                return Err(corruption("semantic page reference is absent"));
+            };
+            if member.change_ref() != expected_ref {
+                return Err(corruption(
+                    "semantic commit member disagrees with its page ordinal",
+                ));
+            }
+            let change_id = change.change_id();
             let expected = super::model::ChangeCatalogEntry {
                 change_object_id: member_id,
                 owner: super::model::ChangeCatalogOwner::CommitMember {
@@ -958,7 +978,7 @@ impl PreparedPublication {
                         .map_err(|_| corruption("semantic commit ordinal exceeds u32"))?,
                 },
             };
-            if change_catalog_edit.change_entries.get(change_id) != Some(&expected) {
+            if change_catalog_edit.change_entries.get(&change_id) != Some(&expected) {
                 return Err(corruption(
                     "semantic ChangeCatalog owner does not match commit ordinal",
                 ));
@@ -1001,8 +1021,17 @@ impl PreparedPublication {
                 "branch RefChange/catalog/head edge is inconsistent",
             ));
         }
-        expected_changes.insert(ref_id);
-        if encoded_changes.keys().copied().collect::<BTreeSet<_>>() != expected_changes {
+        expected_changes.insert((ref_id, 0));
+        let ref_change_id = encoded_changes
+            .get(&ref_id)
+            .map(|(change, _)| change.change_id())
+            .ok_or_else(|| corruption("branch RefChange object is absent"))?;
+        if changes
+            .iter()
+            .filter(|change| change.change_id() == ref_change_id)
+            .count()
+            != 1
+        {
             return Err(corruption(
                 "state transition Change set is not exactly the commit members and RefChange",
             ));
@@ -1012,6 +1041,9 @@ impl PreparedPublication {
         self.stage_catalog_edit(commit_catalog_edit)?;
         self.stage_catalog_edit(change_catalog_edit)?;
         for (page_id, page_bytes) in member_pages {
+            self.stage_encoded_object(page_id, page_bytes)?;
+        }
+        for (page_id, page_bytes) in semantic_page_objects {
             self.stage_encoded_object(page_id, page_bytes)?;
         }
         self.stage_encoded_object(commit_id, commit_bytes)?;
@@ -1043,6 +1075,7 @@ impl PreparedPublication {
             change_catalog_edit,
             mut semantic_commits,
             fresh_changes,
+            semantic_change_pages,
             branch_ref_change,
             branch_snapshot,
             repository_root,
@@ -1090,17 +1123,30 @@ impl PreparedPublication {
         }
 
         let mut encoded_fresh_changes = BTreeMap::new();
-        for change in &fresh_changes {
-            let (object_id, bytes) = change.encode()?;
-            if !matches!(change, ChangeObjectV1::Semantic { .. })
-                || encoded_fresh_changes
-                    .insert(object_id, (change, bytes))
+        for (page_id, page_bytes) in semantic_change_pages.iter() {
+            let page = SemanticChangePageV1::decode(page_id, page_bytes)?;
+            for (offset, change) in page.changes.iter().cloned().enumerate() {
+                let ordinal = page
+                    .start_ordinal
+                    .checked_add(
+                        u32::try_from(offset)
+                            .map_err(|_| corruption("semantic page ordinal exceeds u32"))?,
+                    )
+                    .ok_or_else(|| corruption("semantic page ordinal overflows u32"))?;
+                if encoded_fresh_changes
+                    .insert((page_id, ordinal), (change.change_id(), change))
                     .is_some()
-            {
-                return Err(corruption(
-                    "ordered history repeats or misclassifies one fresh Change object",
-                ));
+                {
+                    return Err(corruption(
+                        "ordered history repeats one semantic page member",
+                    ));
+                }
             }
+        }
+        if encoded_fresh_changes.len() != fresh_changes.len() {
+            return Err(corruption(
+                "ordered history fresh Changes do not match the staged semantic pages",
+            ));
         }
 
         let is_global = state_domain_global;
@@ -1164,13 +1210,13 @@ impl PreparedPublication {
             let mut member_ids = BTreeSet::new();
             for (ordinal, member) in commit.members.iter().copied().enumerate() {
                 let change_object_id = member.change_object_id();
-                if !member_ids.insert(change_object_id) {
+                if !member_ids.insert(member.change_ref()) {
                     return Err(corruption("ordered Commit repeats one Change member"));
                 }
                 match member.source() {
                     None => {
-                        let Some((ChangeObjectV1::Semantic { change_id, .. }, _)) =
-                            encoded_fresh_changes.get(&change_object_id)
+                        let Some((change_id, ChangeObjectV1::Semantic { .. })) =
+                            encoded_fresh_changes.get(&member.change_ref())
                         else {
                             return Err(corruption(
                                 "introduced member is absent from fresh semantic Changes",
@@ -1192,8 +1238,12 @@ impl PreparedPublication {
                         }
                     }
                     Some(_) => {
-                        let bytes = view.load_object_bytes(change_object_id).await?;
-                        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
+                        let change = super::serving::load_change_for_member_of_commit(
+                            view.retained_read(),
+                            commit.commit_id,
+                            member,
+                        )
+                        .await?;
                         if !matches!(change, ChangeObjectV1::Semantic { .. }) {
                             return Err(corruption(
                                 "selected history member names a non-semantic Change",
@@ -1279,8 +1329,8 @@ impl PreparedPublication {
         for (object_id, (_, bytes)) in encoded_commits {
             self.stage_encoded_object(object_id, bytes)?;
         }
-        for (object_id, (_, bytes)) in encoded_fresh_changes {
-            self.stage_encoded_object(object_id, bytes)?;
+        for (object_id, bytes) in semantic_change_pages.iter() {
+            self.stage_encoded_object(object_id, bytes.clone())?;
         }
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
@@ -1491,6 +1541,21 @@ impl PreparedPublication {
     pub(crate) fn into_storage_plan(
         self,
     ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), StorageError> {
+        if std::env::var_os("LIX_FORKTREE_OBJECT_DOMAIN_STATS").is_some() {
+            let mut counts = BTreeMap::<u16, (usize, usize, usize)>::new();
+            for (id, bytes) in self.object_puts.iter() {
+                let domain = authenticate_object_domain(id, bytes)?.code();
+                let entry = counts.entry(domain).or_default();
+                entry.0 += 1;
+                entry.1 += id.as_bytes().len();
+                entry.2 += bytes.len();
+            }
+            for (domain, (puts, key_bytes, value_bytes)) in counts {
+                eprintln!(
+                    "forktree-object-domain domain={domain} puts={puts} key_bytes={key_bytes} value_bytes={value_bytes}"
+                );
+            }
+        }
         let mut preconditions = Vec::with_capacity(1 + self.selector_expectations.len());
         preconditions.push(Precondition::KeyValueEquals {
             space: SELECTOR_SPACE,

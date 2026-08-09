@@ -27,8 +27,8 @@ pub(crate) use model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
     ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
-    UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    RepositoryRootV1, SemanticChangePageV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1,
+    SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
 pub(crate) use object::{OBJECT_SPACE, ObjectId};
 pub(crate) use publication::{
@@ -52,7 +52,8 @@ pub(crate) use state::{
     encode_state_value, encode_untracked_key, encode_untracked_value,
 };
 pub(crate) use tree::{
-    RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
+    ImmutableObjectSet, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
+    ReceiptTreeRoot,
 };
 pub(crate) use view::{
     CoherentView, ForkTreeReadFacade, open_coherent_view, open_coherent_view_on_read,

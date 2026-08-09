@@ -1001,7 +1001,7 @@ where
             for member in members {
                 edges.push(typed(
                     member.change_object_id(),
-                    ObjectDomain::SemanticChange,
+                    ObjectDomain::SemanticChangePageV1,
                 ));
                 if let Some((source_commit_object_id, _)) = member.source() {
                     edges.push(typed(source_commit_object_id, ObjectDomain::Commit));
@@ -1017,7 +1017,7 @@ where
             for member in page.members {
                 edges.push(typed(
                     member.change_object_id(),
-                    ObjectDomain::SemanticChange,
+                    ObjectDomain::SemanticChangePageV1,
                 ));
                 if let Some((source_commit_object_id, _)) = member.source() {
                     edges.push(typed(source_commit_object_id, ObjectDomain::Commit));
@@ -1027,20 +1027,25 @@ where
                 edges.push(typed(next, ObjectDomain::CommitMemberPageV1));
             }
         }
-        ObjectDomain::SemanticChange => {
-            let change = ChangeObjectV1::decode(id, bytes)?;
-            let ChangeObjectV1::Semantic {
-                json_payload_object_ids,
-                ..
-            } = change
-            else {
-                return Err(corruption("semantic Change decoded as another domain"));
-            };
-            edges.extend(
-                json_payload_object_ids
-                    .into_iter()
-                    .map(|id| typed(id, ObjectDomain::BlobChunk)),
-            );
+        ObjectDomain::SemanticChangePageV1 => {
+            let page = super::model::SemanticChangePageV1::decode(id, bytes)?;
+            for change in page.changes {
+                let ChangeObjectV1::Semantic {
+                    json_payload_object_ids,
+                    ..
+                } = change
+                else {
+                    return Err(corruption("semantic page contains a non-semantic Change"));
+                };
+                edges.extend(
+                    json_payload_object_ids
+                        .into_iter()
+                        .map(|id| typed(id, ObjectDomain::BlobChunk)),
+                );
+            }
+            if let Some(next) = page.next_page_object_id {
+                edges.push(typed(next, ObjectDomain::SemanticChangePageV1));
+            }
         }
         ObjectDomain::BranchRefChange => {
             let change = ChangeObjectV1::decode(id, bytes)?;
@@ -1233,8 +1238,7 @@ where
         }
     }
     for (key, entry) in changes {
-        let bytes = load_object_bytes(read, entry.change_object_id).await?;
-        let change = ChangeObjectV1::decode(entry.change_object_id, &bytes)?;
+        let change = super::serving::load_change_for_catalog_entry(read, *entry).await?;
         if change.change_id() != *key {
             return Err(corruption("ChangeCatalog key/object identity mismatch"));
         }
@@ -1249,11 +1253,11 @@ where
                 let bytes = load_object_bytes(read, commit_object_id).await?;
                 let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
                 let members = super::serving::load_commit_members(read, &commit).await?;
-                if members.get(ordinal as usize)
-                    != Some(&super::model::CommitMemberV1::introduced(
-                        entry.change_object_id,
-                    ))
-                {
+                let member = members
+                    .get(ordinal as usize)
+                    .copied()
+                    .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
+                if member.change_object_id() != entry.change_object_id {
                     return Err(corruption(
                         "ChangeCatalog commit ordinal back-edge mismatch",
                     ));

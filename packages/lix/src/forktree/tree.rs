@@ -9,14 +9,17 @@ use crate::storage_adapter::StorageAdapterRead;
 use super::codec::{Decoder, Encoder, corruption};
 use super::model::{
     BlobChunkV1, BranchSnapshotV1, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1,
+    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, SemanticChangePageV1,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
 use super::object::{ObjectDomain, ObjectId, decode_id, decode_object, encode_id, encode_object};
 
 pub(crate) const RECEIPT_TREE_LEAF_ENTRIES: usize = 64;
 pub(crate) const RECEIPT_TREE_FANOUT: usize = 32;
-const CATALOG_TREE_LEAF_ENTRIES: usize = 64;
+// Catalog and state leaves are authenticated as bounded pages.  Keeping the
+// page below the existing 256-edge traversal envelope removes per-row path
+// copies without changing the node codec or introducing a second layout.
+const CATALOG_TREE_LEAF_ENTRIES: usize = 256;
 const CATALOG_TREE_FANOUT: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,7 +255,7 @@ pub(super) fn ordered_tree_edges(
                                 commit_object_id, ..
                             } => {
                                 object_ids.push((commit_object_id, ObjectDomain::Commit));
-                                ObjectDomain::SemanticChange
+                                ObjectDomain::SemanticChangePageV1
                             }
                             ChangeCatalogOwner::BranchRef {
                                 ref_change_object_id,
@@ -1135,7 +1138,32 @@ pub(super) fn validate_change_catalog_back_edge(
     entry: ChangeCatalogEntry,
     load: impl Fn(ObjectId) -> Result<Bytes, StorageError>,
 ) -> Result<ChangeObjectV1, StorageError> {
-    let change = ChangeObjectV1::decode(entry.change_object_id, &load(entry.change_object_id)?)?;
+    let change = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            let commit = CommitObjectV1::decode(commit_object_id, &load(commit_object_id)?)?;
+            let members = commit.load_members_with(&load)?;
+            let member = members
+                .get(ordinal as usize)
+                .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
+            if member.change_object_id() != entry.change_object_id {
+                return Err(corruption(
+                    "ChangeCatalog commit ordinal does not point back to its page",
+                ));
+            }
+            let page = SemanticChangePageV1::decode(
+                member.change_object_id(),
+                &load(member.change_object_id())?,
+            )?;
+            page.change_at(member.change_ordinal())?.clone()
+        }
+        ChangeCatalogOwner::BranchRef {
+            ref_change_object_id,
+            ..
+        } => ChangeObjectV1::decode(ref_change_object_id, &load(ref_change_object_id)?)?,
+    };
     if change.change_id() != key {
         return Err(corruption(
             "ChangeCatalog key does not match embedded ChangeId",
@@ -1154,9 +1182,9 @@ pub(super) fn validate_change_catalog_back_edge(
             let member = members
                 .get(ordinal as usize)
                 .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
-            if *member != super::model::CommitMemberV1::introduced(entry.change_object_id) {
+            if member.change_object_id() != entry.change_object_id {
                 return Err(corruption(
-                    "ChangeCatalog commit ordinal does not point back to its Change object",
+                    "ChangeCatalog commit ordinal does not point back to its page",
                 ));
             }
         }

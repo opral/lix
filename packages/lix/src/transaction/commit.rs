@@ -21,9 +21,9 @@ use crate::transaction::types::{PreparedStateRowRef, StageJson};
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
-    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
-    StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
+    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ImmutableObjectSet, ObjectId,
+    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, SemanticChangePageV1,
+    StateCellRef, StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
     encode_state_key, encode_state_value, load_commit, load_commit_summary,
     open_coherent_view_on_read, select_historical_commit_member, state_point, state_points,
 };
@@ -534,13 +534,23 @@ where
         .checked_add(1)
         .ok_or_else(|| writer_error("commit generation overflows u64"))?;
 
-    let mut encoded_semantic_changes = Vec::with_capacity(changes.len());
-    let mut member_object_ids = Vec::with_capacity(changes.len());
-    for change in &changes {
-        let (object_id, _) = change.encode()?;
-        member_object_ids.push(object_id);
-        encoded_semantic_changes.push((change.change_id(), object_id));
-    }
+    let (_, semantic_refs) =
+        SemanticChangePageV1::encode_chain(forktree_commit_id(commit_id), &changes)?;
+    let encoded_semantic_changes = changes
+        .iter()
+        .zip(semantic_refs.iter().copied())
+        .map(|(change, (page_id, _))| (change.change_id(), page_id))
+        .collect::<Vec<_>>();
+    let member_object_ids = semantic_refs
+        .iter()
+        .copied()
+        .map(|(page_id, _)| page_id)
+        .collect::<Vec<_>>();
+    let member_ordinals = semantic_refs
+        .iter()
+        .copied()
+        .map(|(_, ordinal)| ordinal)
+        .collect::<Vec<_>>();
     let global_state_root = if global {
         state_edit.root
     } else {
@@ -566,7 +576,8 @@ where
         parent_commit_object_ids: parent_object_ids,
         members: member_object_ids
             .into_iter()
-            .map(CommitMemberV1::introduced)
+            .zip(member_ordinals)
+            .map(|(page_id, ordinal)| CommitMemberV1::introduced_at(page_id, ordinal))
             .collect(),
         member_page_root: None,
         global_state_root,
@@ -794,6 +805,8 @@ struct OrderedCommitContent {
     draft: OrderedCommitDraft,
     mutations: Vec<StateTreeMutation>,
     fresh_changes: Vec<ChangeObjectV1>,
+    fresh_change_refs: Vec<(ObjectId, u32)>,
+    semantic_change_pages: Vec<(ObjectId, bytes::Bytes)>,
     members: Vec<CommitMemberV1>,
     max_selected_source_generation: Option<u64>,
 }
@@ -929,6 +942,8 @@ where
         let mut seen_identities = BTreeSet::<Vec<u8>>::new();
         let mut mutations = Vec::new();
         let mut fresh_changes = Vec::new();
+        let mut fresh_change_refs = Vec::new();
+        let mut semantic_change_pages = Vec::new();
         let mut members = Vec::new();
         let mut max_selected_source_generation: Option<u64> = None;
         let fresh_rows = prepared
@@ -988,8 +1003,6 @@ where
                 payload,
                 json_payload_object_ids,
             };
-            let (change_object_id, _) = change.encode()?;
-            members.push(CommitMemberV1::introduced(change_object_id));
             fresh_changes.push(change);
 
             let existed = match touched_presence.get(&key) {
@@ -1026,6 +1039,20 @@ where
                 }
             };
             mutations.push(mutation);
+        }
+
+        if !fresh_changes.is_empty() {
+            let (pages, refs) = SemanticChangePageV1::encode_chain(
+                forktree_commit_id(draft.commit_id),
+                &fresh_changes,
+            )?;
+            members.extend(
+                refs.iter()
+                    .copied()
+                    .map(|(page_id, ordinal)| CommitMemberV1::introduced_at(page_id, ordinal)),
+            );
+            fresh_change_refs = refs;
+            semantic_change_pages = pages;
         }
 
         for batch in &draft.selected_change_batches {
@@ -1141,6 +1168,8 @@ where
             draft,
             mutations,
             fresh_changes,
+            fresh_change_refs,
+            semantic_change_pages,
             members,
             max_selected_source_generation,
         });
@@ -1224,7 +1253,11 @@ where
         staged_commits.insert(content.draft.commit_id, (commit_object_id, commit.clone()));
         commit_entries.push((commit.commit_id, CommitCatalogEntry { commit_object_id }));
         for (ordinal, change) in content.fresh_changes.iter().enumerate() {
-            let (change_object_id, _) = change.encode()?;
+            let (change_object_id, _) = content
+                .fresh_change_refs
+                .get(ordinal)
+                .copied()
+                .ok_or_else(|| writer_error("fresh semantic page reference is absent"))?;
             fresh_owner_rows.push((
                 change.change_id(),
                 ChangeCatalogEntry {
@@ -1312,6 +1345,12 @@ where
         change_catalog_root: change_catalog_edit.root,
         retention_policy_root: view.repository_root().retention_policy_root,
     };
+    let mut semantic_change_pages = ImmutableObjectSet::default();
+    for content in &contents {
+        for (object_id, bytes) in &content.semantic_change_pages {
+            semantic_change_pages.insert(*object_id, bytes.clone())?;
+        }
+    }
     let transition = OrderedBranchHistoryTransition {
         state_edits,
         state_domain_global: state_domain.unwrap_or(false),
@@ -1319,6 +1358,7 @@ where
         change_catalog_edit,
         semantic_commits,
         fresh_changes,
+        semantic_change_pages,
         branch_ref_change,
         branch_snapshot: BranchSnapshotV1 {
             branch_id: view.branch_id(),

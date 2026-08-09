@@ -27,7 +27,7 @@ use crate::storage_adapter::{
 use super::model::{
     BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
     ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, branch_selector_key, global_selector_key,
+    RepositoryRootV1, SemanticChangePageV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::state::{
@@ -203,8 +203,7 @@ where
         .map_err(LixError::from)?;
     objects.extend(retention.objects).map_err(LixError::from)?;
 
-    let mut semantic_members = Vec::with_capacity(rows.len());
-    let mut changes = Vec::with_capacity(rows.len() + 2);
+    let mut semantic_changes = Vec::with_capacity(rows.len());
     for row in &rows {
         let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
             format_version: 2,
@@ -223,11 +222,22 @@ where
             payload,
             json_payload_object_ids: Vec::new(),
         };
-        let (object_id, bytes) = change.encode().map_err(LixError::from)?;
-        objects.insert(object_id, bytes).map_err(LixError::from)?;
-        semantic_members.push(CommitMemberV1::introduced(object_id));
-        changes.push((row.change_id, object_id));
+        semantic_changes.push(change);
     }
+
+    let (semantic_page_objects, semantic_refs) =
+        SemanticChangePageV1::encode_chain(model_commit, &semantic_changes)
+            .map_err(LixError::from)?;
+    for (page_id, page_bytes) in semantic_page_objects {
+        objects
+            .insert(page_id, page_bytes)
+            .map_err(LixError::from)?;
+    }
+    let semantic_members = semantic_refs
+        .iter()
+        .copied()
+        .map(|(page_id, ordinal)| CommitMemberV1::introduced_at(page_id, ordinal))
+        .collect::<Vec<_>>();
 
     let mut commit = CommitObjectV1 {
         commit_id: model_commit,
@@ -284,14 +294,15 @@ where
     let commit_catalog =
         build_commit_catalog(&[(model_commit, CommitCatalogEntry { commit_object_id })])
             .map_err(LixError::from)?;
-    let mut change_catalog_entries = changes
+    let mut change_catalog_entries = rows
         .iter()
         .enumerate()
-        .map(|(ordinal, (change_id, object_id))| {
+        .map(|(ordinal, row)| {
+            let (page_id, _) = semantic_refs[ordinal];
             (
-                super::model::ChangeId::from_bytes(*change_id.as_uuid().as_bytes()),
+                super::model::ChangeId::from_bytes(*row.change_id.as_uuid().as_bytes()),
                 ChangeCatalogEntry {
-                    change_object_id: *object_id,
+                    change_object_id: page_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
                         ordinal: u32::try_from(ordinal).expect("bootstrap ordinal fits u32"),

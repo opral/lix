@@ -36,14 +36,15 @@ use super::{
     ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView, CommitCatalogEntry, CommitId,
     CommitMemberV1, CommitObjectV1, ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1,
     ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
-    ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
-    SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
-    StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef,
-    UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
-    advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
-    load_commit_member_records, load_commit_summary, load_commit_topologies, open_coherent_view,
-    page_changes, page_commits, prepare_upload_completion, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_points, state_range,
+    ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SemanticChangePageV1, SnapshotRole,
+    SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey,
+    StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
+    UploadBindingRef, UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow,
+    abort_corrupt_gc, advance_gc, edit_state_tree, encode_state_key, encode_state_value,
+    load_change, load_commit, load_commit_member_records, load_commit_summary,
+    load_commit_topologies, open_coherent_view, page_changes, page_commits,
+    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    state_points, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -521,8 +522,14 @@ fn build_seed() -> SeedData {
         payload: b"semantic-change".to_vec(),
         json_payload_object_ids: Vec::new(),
     };
+    let semantic_page = SemanticChangePageV1 {
+        commit_id,
+        start_ordinal: 0,
+        changes: vec![semantic_change],
+        next_page_object_id: None,
+    };
     let (semantic_change_object_id, semantic_change_bytes) =
-        semantic_change.encode().expect("semantic change");
+        semantic_page.encode().expect("semantic change page");
     objects
         .insert(semantic_change_object_id, semantic_change_bytes)
         .expect("semantic object");
@@ -530,7 +537,7 @@ fn build_seed() -> SeedData {
         commit_id,
         generation: 1,
         parent_commit_object_ids: Vec::new(),
-        members: vec![CommitMemberV1::introduced(semantic_change_object_id)],
+        members: vec![CommitMemberV1::introduced_at(semantic_change_object_id, 0)],
         member_page_root: None,
         global_state_root,
         local_state_root,
@@ -616,7 +623,13 @@ fn build_seed() -> SeedData {
         payload: b"unreachable".to_vec(),
         json_payload_object_ids: Vec::new(),
     };
-    let (orphan_object_id, orphan_object_bytes) = orphan.encode().expect("orphan");
+    let orphan_page = SemanticChangePageV1 {
+        commit_id,
+        start_ordinal: 99,
+        changes: vec![orphan],
+        next_page_object_id: None,
+    };
+    let (orphan_object_id, orphan_object_bytes) = orphan_page.encode().expect("orphan");
     objects
         .insert(orphan_object_id, orphan_object_bytes.clone())
         .expect("orphan object");
@@ -1164,15 +1177,19 @@ fn catalogs_use_one_raw_uuid_tree_and_fail_closed_on_owner_mismatch() {
         },
     };
     assert!(validate_change_catalog_back_edge(seed.semantic_change_id, bad, &load).is_err());
-    let semantic = ChangeObjectV1::decode(
+    let semantic_page = SemanticChangePageV1::decode(
         seed.semantic_change_object_id,
         seed.objects
             .get(seed.semantic_change_object_id)
             .expect("semantic bytes"),
     )
-    .expect("semantic");
+    .expect("semantic page");
+    assert!(matches!(
+        semantic_page.change_at(0).expect("semantic ordinal"),
+        ChangeObjectV1::Semantic { .. }
+    ));
     assert_eq!(
-        semantic.encode().expect("re-encode").0,
+        semantic_page.encode().expect("re-encode page").0,
         seed.semantic_change_object_id
     );
 }

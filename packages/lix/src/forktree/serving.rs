@@ -10,7 +10,7 @@ use super::codec::corruption;
 use super::model::{
     BranchSelectorV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
     ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, branch_selector_key, global_selector_key,
+    RepositoryRootV1, SemanticChangePageV1, branch_selector_key, global_selector_key,
 };
 use super::object::ObjectId;
 use super::state::{
@@ -76,6 +76,75 @@ where
         }
     }
     Ok(members)
+}
+
+/// Loads one semantic Change while binding its packed page to the Commit that
+/// owns the member edge.  The page ObjectId authenticates its bytes, but the
+/// embedded commit binding is a separate anti-transplant check.
+pub(crate) async fn load_change_for_member_of_commit<R>(
+    read: &R,
+    commit_id: CommitId,
+    member: CommitMemberV1,
+) -> Result<ChangeObjectV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let page_id = member.change_object_id();
+    let bytes = super::view::load_object_bytes(read, page_id).await?;
+    let page = SemanticChangePageV1::decode(page_id, &bytes)?;
+    if page.commit_id != commit_id {
+        return Err(corruption(
+            "semantic change page is transplanted across Commit objects",
+        ));
+    }
+    let change = page.change_at(member.change_ordinal())?.clone();
+    if !matches!(change, ChangeObjectV1::Semantic { .. }) {
+        return Err(corruption(
+            "semantic page member has the wrong Change domain",
+        ));
+    }
+    Ok(change)
+}
+
+pub(crate) async fn load_change_for_catalog_entry<R>(
+    read: &R,
+    entry: ChangeCatalogEntry,
+) -> Result<ChangeObjectV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+            let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+            let members = load_commit_members(read, &commit).await?;
+            let member = members
+                .get(ordinal as usize)
+                .copied()
+                .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
+            if member.change_object_id() != entry.change_object_id {
+                return Err(corruption(
+                    "ChangeCatalog page identity disagrees with its member",
+                ));
+            }
+            load_change_for_member_of_commit(read, commit.commit_id, member).await
+        }
+        ChangeCatalogOwner::BranchRef {
+            ref_change_object_id,
+            ..
+        } => {
+            if ref_change_object_id != entry.change_object_id {
+                return Err(corruption(
+                    "branch-ref catalog owner does not equal its object",
+                ));
+            }
+            let bytes = super::view::load_object_bytes(read, ref_change_object_id).await?;
+            ChangeObjectV1::decode(ref_change_object_id, &bytes)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -809,8 +878,7 @@ where
     let mut records = Vec::with_capacity(members.len());
     for (ordinal, member) in members.iter().copied().enumerate() {
         let change_object_id = member.change_object_id();
-        let bytes = super::view::load_object_bytes(read, change_object_id).await?;
-        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
+        let change = load_change_for_member_of_commit(read, commit.commit_id, member).await?;
         let change_id = change.change_id();
         let value = lookup_on_read(
             repository.change_catalog_root,
@@ -1153,8 +1221,7 @@ async fn semantic_change_record<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let bytes = super::view::load_object_bytes(read, entry.change_object_id).await?;
-    let change = ChangeObjectV1::decode(entry.change_object_id, &bytes)?;
+    let change = load_change_for_catalog_entry(read, entry).await?;
     if change.change_id() != id {
         return Err(corruption("ChangeCatalog key does not match Change object").into());
     }
@@ -1169,9 +1236,11 @@ where
             let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
             let members = load_commit_members(read, &commit).await?;
-            if members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(entry.change_object_id))
-            {
+            let member = members
+                .get(ordinal as usize)
+                .copied()
+                .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
+            if member.change_object_id() != entry.change_object_id {
                 return Err(corruption("ChangeCatalog owner/ordinal back-edge is invalid").into());
             }
         }
@@ -1291,9 +1360,11 @@ where
             )
             .await?;
             let introduction_members = load_commit_members(read, &introduction).await?;
-            if introduction_members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(member.change_object_id()))
-            {
+            let introduction_member = introduction_members
+                .get(ordinal as usize)
+                .copied()
+                .ok_or_else(|| corruption("ChangeCatalog introduction ordinal is out of bounds"))?;
+            if introduction_member.change_ref() != member.change_ref() {
                 return Err(corruption(
                     "ChangeCatalog canonical introduction owner/ordinal is invalid",
                 ));
@@ -1361,8 +1432,9 @@ where
     let source_members = view.load_commit_members(&source).await?;
     for (source_ordinal, source_member) in source_members.iter().copied().enumerate() {
         let change_object_id = source_member.change_object_id();
-        let bytes = view.load_object_bytes(change_object_id).await?;
-        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
+        let change =
+            load_change_for_member_of_commit(view.retained_read(), source.commit_id, source_member)
+                .await?;
         if change.change_id() != change_id {
             continue;
         }
@@ -1385,8 +1457,9 @@ where
         )
         .await?;
         return Ok((
-            CommitMemberV1::selected(
+            CommitMemberV1::selected_at(
                 change_object_id,
+                source_member.change_ordinal(),
                 source_commit_object_id,
                 u32::try_from(source_ordinal)
                     .map_err(|_| corruption("selected source ordinal exceeds u32"))?,
@@ -2179,8 +2252,7 @@ async fn validate_change_entry<R>(
 where
     R: StorageAdapterRead,
 {
-    let bytes = view.load_object_bytes(entry.change_object_id).await?;
-    let change = ChangeObjectV1::decode(entry.change_object_id, &bytes)?;
+    let change = load_change_for_catalog_entry(view.retained_read(), entry).await?;
     if change.change_id() != id {
         return Err(corruption(
             "ChangeCatalog key does not match embedded ChangeId",
@@ -2197,9 +2269,11 @@ where
             let bytes = view.load_object_bytes(commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
             let members = view.load_commit_members(&commit).await?;
-            if members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(entry.change_object_id))
-            {
+            let member = members
+                .get(ordinal as usize)
+                .copied()
+                .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
+            if member.change_object_id() != entry.change_object_id {
                 return Err(corruption(
                     "ChangeCatalog commit owner does not point back at its ordinal member",
                 ));
@@ -2252,8 +2326,7 @@ where
     let members = load_commit_members(read, commit).await?;
     for (ordinal, member) in members.iter().copied().enumerate() {
         let change_object_id = member.change_object_id();
-        let bytes = super::view::load_object_bytes(read, change_object_id).await?;
-        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
+        let change = load_change_for_member_of_commit(read, commit.commit_id, member).await?;
         if !matches!(change, ChangeObjectV1::Semantic { .. }) {
             return Err(corruption("commit member edge names a RefChange object"));
         }
