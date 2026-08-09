@@ -1516,37 +1516,62 @@ where
     if keys.is_empty() {
         return Ok(Vec::new());
     }
+
+    // Deduplicate before either tree is traversed. A local value, including a
+    // tombstone that is omitted from the public result, resolves the key and
+    // must suppress the global overlay. Only keys genuinely absent from the
+    // local tree may be observed in the global tree.
+    let mut unique_indices = BTreeMap::new();
+    let mut unique_keys = Vec::new();
+    for key in keys {
+        if !unique_indices.contains_key(key) {
+            let index = unique_keys.len();
+            unique_indices.insert(key.clone(), index);
+            unique_keys.push(key.clone());
+        }
+    }
     let local_values = match local_state_root {
-        Some(local_root) => lookup_many_on_read(local_root, "state", keys, read).await?,
-        None => vec![None; keys.len()],
+        Some(local_root) => lookup_many_on_read(local_root, "state", &unique_keys, read).await?,
+        None => vec![None; unique_keys.len()],
     };
-    let global_values = if local_state_root == Some(global_state_root) {
-        local_values.clone()
-    } else {
-        lookup_many_on_read(global_state_root, "state", keys, read).await?
-    };
-    local_values
-        .into_iter()
-        .zip(global_values)
-        .map(|(local, global)| {
-            if let Some(encoded) = local {
-                let value = decode_state_value_storage(&encoded)?;
-                return if value.cell.deleted() && !include_tombstones {
-                    Ok(None)
-                } else {
-                    Ok(Some((value, StateSource::Branch)))
-                };
+    let mut resolved = vec![None; unique_keys.len()];
+    let mut unresolved_indices = Vec::new();
+    for (index, local) in local_values.into_iter().enumerate() {
+        let Some(encoded) = local else {
+            if local_state_root != Some(global_state_root) {
+                unresolved_indices.push(index);
             }
+            continue;
+        };
+        let value = decode_state_value_storage(&encoded)?;
+        resolved[index] = if value.cell.deleted() && !include_tombstones {
+            None
+        } else {
+            Some((value, StateSource::Branch))
+        };
+    }
+    if local_state_root != Some(global_state_root) && !unresolved_indices.is_empty() {
+        let unresolved_keys = unresolved_indices
+            .iter()
+            .map(|&index| unique_keys[index].clone())
+            .collect::<Vec<_>>();
+        let global_values =
+            lookup_many_on_read(global_state_root, "state", &unresolved_keys, read).await?;
+        for (index, global) in unresolved_indices.into_iter().zip(global_values) {
             let Some(encoded) = global else {
-                return Ok(None);
+                continue;
             };
             let value = decode_state_value_storage(&encoded)?;
             if matches!(value.cell, StateCell::Tombstone) {
                 return Err(corruption("global state tree contains a tombstone"));
             }
-            Ok(Some((value, StateSource::Global)))
-        })
-        .collect()
+            resolved[index] = Some((value, StateSource::Global));
+        }
+    }
+    Ok(keys
+        .iter()
+        .map(|key| resolved[*unique_indices.get(key).expect("unique state key index")].clone())
+        .collect())
 }
 
 pub(crate) async fn state_range<R>(

@@ -990,6 +990,68 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
 }
 
 #[tokio::test]
+async fn batched_state_points_only_walks_global_for_local_absence() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let local_root_reads = Arc::new(AtomicUsize::new(0));
+    let global_root_reads = Arc::new(AtomicUsize::new(0));
+    let read = StateRootCountingRead {
+        inner: StorageAdapterReadScope::new(
+            storage
+                .begin_read(ReadOptions::default())
+                .await
+                .expect("state-point read"),
+        ),
+        local_root: seed.local_state_root,
+        global_root: seed.global_state_root,
+        local_root_reads: Arc::clone(&local_root_reads),
+        global_root_reads: Arc::clone(&global_root_reads),
+    };
+    let view = super::open_coherent_view_on_read(read, seed.branch_id)
+        .await
+        .expect("coherent state-point view");
+    local_root_reads.store(0, Ordering::Relaxed);
+    global_root_reads.store(0, Ordering::Relaxed);
+
+    let mixed = view
+        .state_points(
+            &[
+                seed.state_keys[0].clone(),
+                seed.state_keys[0].clone(),
+                seed.state_keys[1].clone(),
+                seed.state_keys[2].clone(),
+            ],
+            false,
+        )
+        .await
+        .expect("mixed state points");
+    assert_eq!(mixed.len(), 4);
+    assert_eq!(mixed[0], mixed[1]);
+    assert!(mixed[2].is_none(), "local tombstone masks global value");
+    assert_eq!(
+        mixed[3].as_ref().map(|row| row.source),
+        Some(StateSource::Global)
+    );
+    assert!(local_root_reads.load(Ordering::Relaxed) > 0);
+    assert!(global_root_reads.load(Ordering::Relaxed) > 0);
+
+    local_root_reads.store(0, Ordering::Relaxed);
+    global_root_reads.store(0, Ordering::Relaxed);
+    let local_only = view
+        .state_points(
+            &[seed.state_keys[0].clone(), seed.state_keys[1].clone()],
+            false,
+        )
+        .await
+        .expect("local-only state points");
+    assert_eq!(local_only.len(), 2);
+    assert!(local_only[1].is_none());
+    assert!(local_root_reads.load(Ordering::Relaxed) > 0);
+    assert_eq!(global_root_reads.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn historical_absence_requires_authenticated_commit_and_root() {
     let seed = build_seed();
     let storage = Memory::new();
@@ -1260,6 +1322,52 @@ struct SharedParentCountingRead<R> {
     parent_object_reads: Arc<AtomicUsize>,
     grandparent_object_reads: Arc<AtomicUsize>,
     member_object_reads: Arc<AtomicUsize>,
+}
+
+struct StateRootCountingRead<R> {
+    inner: R,
+    local_root: ObjectId,
+    global_root: ObjectId,
+    local_root_reads: Arc<AtomicUsize>,
+    global_root_reads: Arc<AtomicUsize>,
+}
+
+impl<R> StorageAdapterRead for StateRootCountingRead<R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.inner.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        for request in requests {
+            if request.space != OBJECT_SPACE {
+                continue;
+            }
+            for key in request.keys {
+                if key.0.as_ref() == self.local_root.as_bytes() {
+                    self.local_root_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                if key.0.as_ref() == self.global_root.as_bytes() {
+                    self.global_root_reads.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        self.inner.get_many(requests)
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.inner.begin_scan(space, range, opts)
+    }
 }
 
 impl<R> StorageAdapterRead for SharedParentCountingRead<R>
