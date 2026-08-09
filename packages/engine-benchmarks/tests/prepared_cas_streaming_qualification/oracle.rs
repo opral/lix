@@ -412,6 +412,10 @@ fn run_success(adapter: Adapter, page_size: usize) -> (ModelStore, Counters, u64
     assert_eq!(counters.semantic_markers, 1);
     assert_eq!(counters.commits, 1);
     assert_eq!(counters.file_content_writes_payload_bytes, 0);
+    assert!(counters.file_content_writes_metadata_bytes > 0);
+    assert!(counters.prepared_receipt_bytes > 0);
+    assert!(counters.prepared_object_metadata_bytes > 0);
+    assert!(counters.peak_prepared_object_payload_bytes <= CHUNK_BYTES);
     assert!(counters.peak_file_content_writes_bytes <= Counters::receipt_bound(page_size));
     assert!(counters.peak_prepared_receipt_bytes <= Counters::receipt_bound(page_size));
     assert!(counters.peak_transaction_retained_payload_bytes <= Counters::receipt_bound(page_size));
