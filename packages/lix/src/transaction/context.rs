@@ -3552,9 +3552,7 @@ where
         }
 
         let staged = self.staged_writes.staging_overlay()?;
-        let storage = self.storage.clone();
-        let read =
-            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+        let read = self.opening_read();
         let base = ForkTreeReadFacade::new(read.clone());
 
         if !lifecycle_schema_rows.is_empty() {
@@ -4981,11 +4979,7 @@ where
                             && observation_matches_visible_root
                         {
                             let staged = self.staged_writes.staging_overlay()?;
-                            let read = SharedStorageAdapterRead::new(
-                                self.storage
-                                    .begin_read(StorageReadOptions::default())
-                                    .await?,
-                            );
+                            let read = self.opening_read();
                             let base = ForkTreeReadFacade::new(read.clone());
                             let (
                                 cold_before,
@@ -6306,11 +6300,7 @@ where
             return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
         }
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let live_state = ForkTreeReadFacade::new(read.clone());
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
@@ -6555,12 +6545,7 @@ where
         &mut self,
         write: &TransactionWrite,
     ) -> Result<(), LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let reader = self.branch_ctx.ref_reader(read);
+        let reader = self.branch_ref_reader_on_opening_read();
         for branch_id in transaction_write_branch_ids(write) {
             if branch_id == GLOBAL_BRANCH_ID {
                 continue;
@@ -7316,34 +7301,11 @@ where
         load_checkpoint_publication_state(&read, branch_id).await
     }
 
-    /// Creates a branch-ref reader scoped to this write transaction.
-    pub(crate) async fn branch_ref_reader(&mut self) -> impl BranchRefReader + '_ {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        self.branch_ctx
-            .ref_reader(SharedStorageAdapterRead::new(read))
-    }
-
     /// Creates a branch-ref reader over this transaction's retained opening
     /// read. Merge planning must not acquire a second snapshot just to resolve
     /// branch selectors.
     pub(crate) fn branch_ref_reader_on_opening_read(&self) -> impl BranchRefReader + '_ {
         self.branch_ctx.ref_reader(&self.opening_read)
-    }
-
-    /// Creates a commit-graph reader scoped to this write transaction.
-    pub(crate) async fn commit_graph_reader(
-        &mut self,
-    ) -> CommitGraphStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
     }
 
     /// Creates a commit-graph reader over the same immutable read that opened
@@ -7545,11 +7507,7 @@ where
             .flat_map(|(_, sides)| [sides.before, sides.after])
             .flatten()
             .collect::<BTreeSet<_>>();
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let records = load_change_records(&read, change_ids.into_iter()).await?;
         let mut forktree_reader = ForkTreeReadFacade::new(read.clone());
         let mut payloads = materialize_known_change_payloads(
