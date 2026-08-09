@@ -19,7 +19,7 @@ prepared-receipt owner boundary:
 
 The model uses 65 one-MiB logical files and page sizes 1, 8, 32, and 64.
 Inputs are reversed while authenticated publication order is canonical. It
-checks identical tree/plugin digests, rollback, orphan reclamation,
+checks identical tree/plugin/semantic digests, rollback, orphan reclamation,
 owner/manifest/chunk/size/digest/view corruption, duplicate receipts, and
 simulated cold reopen for Memory, RocksDB, and SlateDB. Those adapter cases
 are model coverage only until a compatible private implementation composes.
