@@ -45,7 +45,7 @@ mod git_replay {
 
 use cli::exp::{ExpGitReplayArgs, GitReplayParentTree, GitReplayPlugins, GitReplayStorage};
 use lix::storage::Storage;
-use lix::{Lix, Value, open_lix};
+use lix::{Value, open_lix};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -149,7 +149,7 @@ impl ReplayDriverArgs {
     }
 }
 
-fn required(args: &mut std::env::Args, flag: &str) -> String {
+fn required(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
     args.next()
         .unwrap_or_else(|| usage(&format!("missing value for {flag}")))
 }
@@ -403,7 +403,7 @@ fn disk_free_bytes(path: &Path) -> u64 {
         return 0;
     }
     let stat = unsafe { stat.assume_init() };
-    (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+    stat.f_bavail.saturating_mul(stat.f_frsize)
 }
 
 fn hex(bytes: &[u8]) -> String {
