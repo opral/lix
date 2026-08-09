@@ -56,12 +56,11 @@ use crate::gc::{
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
-    BranchHeadControlCache, CertifiedCurrentStatePredecessor, LiveStateContext,
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef, StagedLiveStateRows, is_derived_schema, overlay_load_exact_batch,
-    overlay_scan_batch,
+    CertifiedCurrentStatePredecessor, LiveStateContext, LiveStateExactBatchRequest,
+    LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    StagedLiveStateRows, is_derived_schema, overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
@@ -559,7 +558,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
     /// Coherent storage snapshot retained for explicit transaction reads.
     /// This field is declared before `storage` so it is dropped first.
     opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
@@ -1577,7 +1575,6 @@ where
                     staged_writes,
                     filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                     filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
-                    branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
                     opening_read,
                     storage,
                     functions,
@@ -8532,7 +8529,6 @@ mod transaction_validation_reader_tests {
         assert!(resolver.contains("forktree\n        .collection_generation("));
         assert!(!resolver.contains("transaction_reader("));
         assert!(!resolver.contains("LiveStateContext"));
-        assert!(!resolver.contains("BranchHeadControlCache"));
 
         let loader_start = source
             .rfind("async fn load_collection_generation(")
