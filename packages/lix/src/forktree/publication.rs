@@ -41,7 +41,7 @@ pub(crate) struct BranchStateTransition {
     pub(crate) semantic_commit: CommitObjectV1,
     pub(crate) changes: Vec<ChangeObjectV1>,
     pub(crate) branch_snapshot: BranchSnapshotV1,
-    pub(crate) repository_root: super::model::RepositoryRootV1,
+    pub(crate) repository_root: RepositoryRootV1,
 }
 
 /// One ordered single-branch history publication. Intermediate commits and
@@ -57,7 +57,7 @@ pub(crate) struct OrderedBranchHistoryTransition {
     pub(crate) fresh_changes: Vec<ChangeObjectV1>,
     pub(crate) branch_ref_change: ChangeObjectV1,
     pub(crate) branch_snapshot: BranchSnapshotV1,
-    pub(crate) repository_root: super::model::RepositoryRootV1,
+    pub(crate) repository_root: RepositoryRootV1,
 }
 
 /// One prepared atomic publication. It always exact-CASes and rotates the
@@ -306,7 +306,7 @@ impl PreparedPublication {
 
     pub(super) fn stage_repository_root(
         &mut self,
-        root: super::model::RepositoryRootV1,
+        root: RepositoryRootV1,
     ) -> Result<ObjectId, StorageError> {
         let (id, bytes) = root.encode()?;
         self.stage_encoded_object(id, bytes)?;
@@ -397,7 +397,7 @@ impl PreparedPublication {
         &mut self,
         view: &CoherentView<R>,
         branch_id: super::model::CanonicalBranchId,
-        source_commit: &super::model::CommitObjectV1,
+        source_commit: &CommitObjectV1,
         change_id: super::model::ChangeId,
         updated_at: crate::common::LixTimestamp,
     ) -> Result<ObjectId, StorageError>
@@ -790,7 +790,7 @@ impl PreparedPublication {
         raw_selector: Bytes,
         commit_catalog_edit: CatalogTreeEdit,
         change_catalog_edit: CatalogTreeEdit,
-        repository_root: super::model::RepositoryRootV1,
+        repository_root: RepositoryRootV1,
     ) -> Result<(), StorageError>
     where
         R: StorageAdapterRead,
@@ -950,9 +950,9 @@ impl PreparedPublication {
                     "semantic commit member is absent or is a branch RefChange",
                 ));
             };
-            let expected = super::model::ChangeCatalogEntry {
+            let expected = ChangeCatalogEntry {
                 change_object_id: member_id,
-                owner: super::model::ChangeCatalogOwner::CommitMember {
+                owner: ChangeCatalogOwner::CommitMember {
                     commit_object_id: commit_id,
                     ordinal: u32::try_from(ordinal)
                         .map_err(|_| corruption("semantic commit ordinal exceeds u32"))?,
@@ -983,9 +983,9 @@ impl PreparedPublication {
                 "new branch RefChange edge has no typed Change object",
             ));
         };
-        let expected = super::model::ChangeCatalogEntry {
+        let expected = ChangeCatalogEntry {
             change_object_id: ref_id,
-            owner: super::model::ChangeCatalogOwner::BranchRef {
+            owner: ChangeCatalogOwner::BranchRef {
                 ref_change_object_id: ref_id,
                 branch_id: *branch_id,
             },
@@ -1176,9 +1176,9 @@ impl PreparedPublication {
                                 "introduced member is absent from fresh semantic Changes",
                             ));
                         };
-                        let expected = super::model::ChangeCatalogEntry {
+                        let expected = ChangeCatalogEntry {
                             change_object_id,
-                            owner: super::model::ChangeCatalogOwner::CommitMember {
+                            owner: ChangeCatalogOwner::CommitMember {
                                 commit_object_id,
                                 ordinal: u32::try_from(ordinal).map_err(|_| {
                                     corruption("ordered Commit member ordinal exceeds u32")
@@ -1215,7 +1215,7 @@ impl PreparedPublication {
                             commit.generation,
                             ordinal,
                             member,
-                            super::model::ChangeCatalogEntry::decode(&raw_entry)?,
+                            ChangeCatalogEntry::decode(&raw_entry)?,
                         )
                         .await?;
                     }
@@ -1248,9 +1248,9 @@ impl PreparedPublication {
                 "ordered history final ref fact has wrong domain",
             ));
         };
-        let expected_ref_entry = super::model::ChangeCatalogEntry {
+        let expected_ref_entry = ChangeCatalogEntry {
             change_object_id: ref_object_id,
-            owner: super::model::ChangeCatalogOwner::BranchRef {
+            owner: ChangeCatalogOwner::BranchRef {
                 ref_change_object_id: ref_object_id,
                 branch_id: *branch_id,
             },
@@ -1462,7 +1462,7 @@ impl PreparedPublication {
         view: &CoherentView<R>,
         commit_catalog_edit: CatalogTreeEdit,
         change_catalog_edit: CatalogTreeEdit,
-        repository_root: super::model::RepositoryRootV1,
+        repository_root: RepositoryRootV1,
     ) -> Result<(), StorageError>
     where
         R: StorageAdapterRead,

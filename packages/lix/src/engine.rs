@@ -16,8 +16,6 @@ use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions};
 use crate::storage_adapter::{Storage, StorageAdapter};
-#[cfg(test)]
-use crate::storage_adapter::{StorageWriteOptions, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;

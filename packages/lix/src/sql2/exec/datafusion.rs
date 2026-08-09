@@ -3075,7 +3075,6 @@ mod tests {
     };
     use crate::common::LixTimestamp;
     use crate::functions::FunctionProviderHandle;
-    use crate::json_store::JsonStoreContext;
     use crate::live_state::{LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::sql2::{ChangelogQuerySource, EntitySnapshotReader, SqlChangelogQuerySource};
     use crate::sql2::{

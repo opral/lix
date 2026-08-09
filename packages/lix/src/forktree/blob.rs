@@ -1454,7 +1454,7 @@ mod canonical_blob_id_tests {
         }
     }
 
-    fn value(id: &str, cell: StateCell, manifest_count: usize) -> StateValue {
+    fn value(_id: &str, cell: StateCell, manifest_count: usize) -> StateValue {
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         StateValue {
             change_id: crate::changelog::ChangeId::for_test_label("change"),

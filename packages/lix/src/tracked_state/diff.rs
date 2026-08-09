@@ -9,7 +9,6 @@ use std::sync::{Arc, OnceLock};
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::entity_pk::EntityPk;
 use crate::json_store::JsonSlot;
 use crate::tracked_state::TrackedStateFilter;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};

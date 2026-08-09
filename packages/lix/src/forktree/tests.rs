@@ -875,7 +875,7 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
         );
     }
     let (key, _) = state_entry("typed-key", StateCellRef::Null, 7, &[]);
-    let decoded_key: super::StateKey = super::decode_state_key(&key).expect("typed key");
+    let decoded_key: StateKey = super::decode_state_key(&key).expect("typed key");
     assert_eq!(decoded_key.schema_key, "app.row");
     assert!(super::encode_state_prefix("app.row", Some("file")).len() < key.len());
     assert!(build_state_tree(&[(b"opaque".to_vec(), b"opaque".to_vec())]).is_err());
@@ -1747,7 +1747,6 @@ async fn coherent_open_requires_latest_ref_change_catalog_owner() {
     let semantic_change_object_id = orphan.semantic_change_object_id;
     let commit_id = orphan.commit_id;
     let commit_object_id = orphan.commit_object_id;
-    let ref_change_id = orphan.ref_change_id;
     let ref_change_object_id = orphan.ref_change_object_id;
     let branch_id = orphan.branch_id;
     replace_selected_history_graph(

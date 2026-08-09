@@ -169,7 +169,7 @@ pub(crate) fn host_entity_with_lazy_snapshot(
 pub(crate) fn host_entity_change_with_lazy_snapshot(
     key: WasmEntityKey,
     snapshot: Bytes,
-    effect: crate::wasm::WasmChangeEffect,
+    effect: WasmChangeEffect,
     limits: WasmTransitionLimits,
 ) -> Result<WasmEntityChange<WasmHostBytes>, LixError> {
     let limits = limits.validate()?;

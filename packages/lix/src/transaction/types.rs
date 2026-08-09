@@ -77,12 +77,6 @@ impl TransactionJson {
             .expect("serializing serde_json::Value should not fail")
     }
 
-    #[cfg(feature = "storage-benches")]
-    pub(crate) fn from_shared_value_unchecked(value: Arc<JsonValue>) -> Self {
-        Self::from_shared_value(value, "transaction JSON")
-            .expect("serializing serde_json::Value should not fail")
-    }
-
     #[cfg(test)]
     pub(crate) fn from_value_for_test(value: JsonValue) -> Self {
         Self::from_value(value, "test transaction JSON").expect("test JSON should normalize")
@@ -1995,10 +1989,6 @@ impl TransactionFileContent {
         self.stage_payload_at_commit = false;
     }
 
-    pub(crate) fn stage_payload_at_commit(&self) -> bool {
-        self.stage_payload_at_commit && matches!(self.content, FileContent::Inline(_))
-    }
-
     pub(crate) fn inline_data(&self) -> Option<&[u8]> {
         self.content.inline_bytes()
     }
@@ -2300,14 +2290,6 @@ impl StageJson {
     /// Whether this payload inlines into values instead of the json store.
     pub(crate) fn is_inline(&self) -> bool {
         self.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES
-    }
-
-    pub(crate) fn slot_ref(&self) -> crate::json_store::JsonSlotRef<'_> {
-        if self.is_inline() {
-            crate::json_store::JsonSlotRef::Inline(self.normalized())
-        } else {
-            crate::json_store::JsonSlotRef::Ref(&self.json_ref)
-        }
     }
 }
 
@@ -2927,37 +2909,6 @@ impl PreparedStateBatch {
         self.dense_certified_parameter
             .as_ref()
             .map_or_else(|| self.slots.len(), |dense| dense.len)
-    }
-
-    #[cfg(feature = "storage-benches")]
-    pub(crate) fn record_ownership(&self, stage: usize) {
-        let mut key_bytes = 0usize;
-        let mut value_bytes = 0usize;
-        let mut string_entries = 0usize;
-        for row in self.iter() {
-            key_bytes = key_bytes
-                .saturating_add(row.entity_pk.estimated_heap_bytes())
-                .saturating_add(row.schema_key.len())
-                .saturating_add(row.file_id.map_or(0, |value| value.len()))
-                .saturating_add(row.origin_key.map_or(0, |value| value.len()))
-                .saturating_add(row.branch_id.len());
-            value_bytes = value_bytes
-                .saturating_add(row.snapshot.map_or(0, |value| value.normalized().len()))
-                .saturating_add(row.metadata.map_or(0, |value| value.normalized().len()));
-            string_entries = string_entries
-                .saturating_add(2)
-                .saturating_add(usize::from(row.file_id.is_some()))
-                .saturating_add(usize::from(row.origin_key.is_some()));
-        }
-        crate::storage_bench::record_crud_ownership(
-            stage,
-            self.len(),
-            key_bytes,
-            value_bytes,
-            self.len().saturating_mul(6),
-            string_entries,
-            self.len().saturating_mul(2),
-        );
     }
 
     pub(crate) fn is_empty(&self) -> bool {

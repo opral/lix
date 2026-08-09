@@ -47,7 +47,7 @@ pub(crate) use materializer::plugin_state_live_state_projection;
 pub(crate) use registry::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
     PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
-    collect_gc_wasm_blob_roots, load_plugin_registry_at_commit,
+    load_plugin_registry_at_commit,
 };
 #[cfg(test)]
 pub(crate) use storage::plugin_storage_archive_path;

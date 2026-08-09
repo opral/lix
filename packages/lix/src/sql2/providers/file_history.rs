@@ -2544,7 +2544,6 @@ mod tests {
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 
-    use crate::LixError;
     use crate::binary_cas::BlobId;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};

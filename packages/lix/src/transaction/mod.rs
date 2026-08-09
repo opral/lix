@@ -8,18 +8,6 @@ mod stale_commit;
 pub(crate) mod types;
 mod validation;
 
-#[cfg(test)]
-pub(crate) use commit::take_certified_columnar_current_base_publications;
-#[cfg(test)]
-pub(crate) use commit::take_complete_replacement_packed_current_base_publications;
-#[cfg(test)]
-pub(crate) use commit::take_complete_replacement_packed_current_base_retirements;
-#[cfg(test)]
-pub(crate) use commit::take_direct_journal_replacement_publications;
-#[cfg(test)]
-pub(crate) use commit::take_ordered_packed_current_base_publications;
-#[cfg(test)]
-pub(crate) use commit::take_rootless_replacement_generation_publications;
 pub(crate) use commit_coordinator::CommitCoordinator;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;
