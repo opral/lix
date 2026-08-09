@@ -357,12 +357,20 @@ where
 #[async_trait]
 impl<R> crate::live_state::LiveStateReader for ForkTreeReadFacade<R>
 where
-    R: StorageAdapterRead,
+    R: StorageAdapterRead + 'static,
 {
     async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
+        if request
+            .filter
+            .schema_keys
+            .iter()
+            .any(|schema_key| is_derived_schema(schema_key))
+        {
+            return self.validation_scan_batch(request).await;
+        }
         scan_facade(self, request).await
     }
 
@@ -370,6 +378,13 @@ where
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        if request
+            .rows
+            .iter()
+            .any(|row| is_derived_schema(&row.schema_key))
+        {
+            return self.validation_load_exact_batch(request).await;
+        }
         load_exact_facade(self, request).await
     }
 

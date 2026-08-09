@@ -6453,15 +6453,8 @@ where
 
     fn validation_live_state_reader(
         &self,
-    ) -> TransactionValidationLiveStateReader<SharedStorageAdapterRead<StorageImpl::Read<'static>>>
-    {
-        let read = self.opening_read();
-        TransactionValidationLiveStateReader {
-            forktree: ForkTreeReadFacade::new(read.clone()),
-            graph: Arc::new(tokio::sync::Mutex::new(
-                CommitGraphContext::new().reader(ForkTreeReadFacade::new(read)),
-            )),
-        }
+    ) -> ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
+        ForkTreeReadFacade::new(self.opening_read())
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
@@ -8202,14 +8195,14 @@ where
     Ok(BlobBytesBatch::new(entries))
 }
 
-struct TransactionValidationLiveStateReader<R: StorageAdapterRead + Clone> {
-    forktree: ForkTreeReadFacade<R>,
-    graph: Arc<tokio::sync::Mutex<CommitGraphStoreReader<ForkTreeReadFacade<R>>>>,
+struct ForkTreeValidationReader<'a, R: StorageAdapterRead> {
+    forktree: &'a ForkTreeReadFacade<R>,
+    graph: Arc<tokio::sync::Mutex<CommitGraphStoreReader<&'a ForkTreeReadFacade<R>>>>,
 }
 
-impl<R> TransactionValidationLiveStateReader<R>
+impl<'a, R> ForkTreeValidationReader<'a, R>
 where
-    R: StorageAdapterRead + Clone + 'static,
+    R: StorageAdapterRead + 'static,
 {
     async fn scan_derived_rows(
         &self,
@@ -8464,9 +8457,9 @@ where
 }
 
 #[async_trait]
-impl<R> LiveStateReader for TransactionValidationLiveStateReader<R>
+impl<'a, R> LiveStateReader for ForkTreeValidationReader<'a, R>
 where
-    R: StorageAdapterRead + Clone + 'static,
+    R: StorageAdapterRead + 'static,
 {
     async fn scan_batch(
         &self,
@@ -8639,6 +8632,43 @@ fn exact_row_matches(row: &MaterializedLiveStateRow, requested: &LiveStateExactR
         && row.file_id == requested.file_id
 }
 
+/// Runs validation-only derived projections through the caller-owned facade.
+///
+/// The adapter below is deliberately constructed from this facade, so it can
+/// never acquire a storage read of its own. It is not a second current-state
+/// owner: ordinary rows, commit rows, commit edges, and branch refs all remain
+/// bound to the same opening read and its authenticated ForkTree identity.
+impl<R> ForkTreeReadFacade<R>
+where
+    R: StorageAdapterRead + 'static,
+{
+    pub(crate) async fn validation_scan_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        let reader = ForkTreeValidationReader {
+            forktree: self,
+            graph: Arc::new(tokio::sync::Mutex::new(
+                CommitGraphContext::new().reader(self),
+            )),
+        };
+        reader.scan_batch(request).await
+    }
+
+    pub(crate) async fn validation_load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        let reader = ForkTreeValidationReader {
+            forktree: self,
+            graph: Arc::new(tokio::sync::Mutex::new(
+                CommitGraphContext::new().reader(self),
+            )),
+        };
+        reader.load_exact_batch(request).await
+    }
+}
+
 #[cfg(test)]
 mod transaction_validation_reader_tests {
     use super::*;
@@ -8720,20 +8750,27 @@ mod transaction_validation_reader_tests {
     fn validation_reader_uses_only_the_operation_forktree_capability() {
         let source = include_str!("context.rs");
         let start = source
-            .find("struct TransactionValidationLiveStateReader")
+            .find("struct ForkTreeValidationReader")
             .expect("validation reader definition");
         let end = source[start..]
             .find("fn validation_schema_partition")
             .map(|offset| start + offset)
             .expect("validation reader end");
         let reader = &source[start..end];
-        assert!(reader.contains("forktree: ForkTreeReadFacade"));
-        assert!(reader.contains("CommitGraphStoreReader<ForkTreeReadFacade"));
+        assert!(reader.contains("forktree: &'a ForkTreeReadFacade"));
+        assert!(reader.contains("CommitGraphStoreReader<&'a ForkTreeReadFacade"));
         assert!(reader.contains("scan_derived_rows"));
         assert!(!reader.contains("CommitGraphLiveStateReader"));
         assert!(!reader.contains("derived_validation_reader"));
         assert!(!reader.contains("branch_ctx.ref_reader"));
         assert!(!reader.contains("LiveStateStoreReader"));
+
+        let owner_start = source
+            .find("fn validation_live_state_reader")
+            .expect("validation facade owner");
+        let owner = &source[owner_start..owner_start + 300];
+        assert!(owner.contains("-> ForkTreeReadFacade"));
+        assert!(!owner.contains("ForkTreeValidationReader"));
     }
 
     #[test]
