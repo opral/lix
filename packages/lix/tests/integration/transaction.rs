@@ -162,11 +162,13 @@ async fn stale_transaction_reports_overlapping_ordinary_insert_atomically() {
 
 #[tokio::test]
 async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
-    let storage = Memory::new();
+    let storage = RecordingStorage::new();
     Engine::initialize(storage.clone())
         .await
         .expect("storage should initialize");
-    let engine = Engine::new(storage).await.expect("engine should open");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should open");
     let transaction_session = engine.open_workspace_session().await.unwrap();
     let concurrent_session = engine.open_workspace_session().await.unwrap();
     concurrent_session
@@ -200,6 +202,7 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
         .await
         .unwrap();
 
+    let before_stable_read = storage.stats();
     let stable = transaction
         .execute(
             "SELECT value FROM lix_key_value WHERE key = 'snapshot-key'",
@@ -210,6 +213,11 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
     assert_eq!(
         stable.rows()[0].get::<serde_json::Value>("value").unwrap(),
         serde_json::json!("base")
+    );
+    let stable_read_delta = storage.stats().delta_since(&before_stable_read);
+    assert_eq!(
+        stable_read_delta.read_opened, 0,
+        "a transaction query after a concurrent commit must reuse its retained read"
     );
     transaction
         .execute(
