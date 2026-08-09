@@ -1726,15 +1726,20 @@ mod intent_tests {
     }
 
     #[test]
-    fn ref_only_and_selected_history_fail_before_publication() {
+    fn ref_only_publication_and_unsupported_history_boundaries() {
         let mut ref_only = empty_writes();
         ref_only.commit_change_refs_by_branch.insert(
             crate::GLOBAL_BRANCH_ID.to_string(),
             StagedCommitChangeRefs::default(),
         );
-        let error = classify_publication_intent(&ref_only, None)
-            .expect_err("ref-only intent must not be dropped");
-        assert!(error.message.contains("ref-only commit intent"));
+        assert_eq!(
+            classify_publication_intent(&ref_only, None).expect("ref-only intent is lowered"),
+            PublicationIntent::Ordinary {
+                branch_id: canonical_branch_id(crate::GLOBAL_BRANCH_ID)
+                    .expect("canonical global branch"),
+                semantic_commit: true,
+            }
+        );
 
         let mut selected = empty_writes();
         let mut refs = StagedCommitChangeRefs::default();
@@ -1755,9 +1760,28 @@ mod intent_tests {
         selected
             .commit_change_refs_by_branch
             .insert(crate::GLOBAL_BRANCH_ID.to_string(), refs);
-        let error = classify_publication_intent(&selected, None)
-            .expect_err("selected history must not be dropped");
-        assert!(error.message.contains("selected historical members"));
+        assert_eq!(
+            classify_publication_intent(&selected, None)
+                .expect("selected history is lowered by the ordered publisher"),
+            PublicationIntent::Ordinary {
+                branch_id: canonical_branch_id(crate::GLOBAL_BRANCH_ID)
+                    .expect("canonical global branch"),
+                semantic_commit: true,
+            }
+        );
+
+        let mut unsupported = empty_writes();
+        unsupported.extra_commit_parents_by_branch.insert(
+            crate::GLOBAL_BRANCH_ID.to_string(),
+            vec![CommitId::for_test_label("unsupported-parent")],
+        );
+        let error = classify_publication_intent(&unsupported, None)
+            .expect_err("parent-only history must fail before publication");
+        assert!(
+            error
+                .message
+                .contains("extra parent intent is missing its semantic commit owner")
+        );
     }
 
     #[test]
