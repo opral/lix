@@ -2747,6 +2747,22 @@ pub(crate) async fn execute_fast_lix_file_prepared_id_path_writes_batch(
     .await
 }
 
+pub(crate) async fn execute_fast_lix_file_seed_writes_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    writes: Vec<(String, String, FileContent, Option<TransactionJson>)>,
+) -> Result<Option<u64>, LixError> {
+    execute_fast_lix_file_id_path_writes_inner(
+        ctx,
+        writes
+            .into_iter()
+            .map(|(id, path, data, metadata)| (Some(id), path, data, metadata, None))
+            .collect(),
+        FastLixFilePathWriteConflict::IdUpdateContentAndMetadata,
+        None,
+    )
+    .await
+}
+
 async fn execute_fast_lix_file_id_path_writes_inner(
     ctx: &mut dyn SqlWriteExecutionContext,
     writes: Vec<(

@@ -630,6 +630,36 @@ where
             .await
     }
 
+    /// Publishes an ordered parent-tree seed through the one authenticated
+    /// filesystem owner. `None` denotes an empty inline file; `Some` carries
+    /// the already-authenticated receipt. Both forms remain in the caller's
+    /// one transaction and preserve the supplied path/metadata order.
+    pub async fn seed_prepared_file_content_batch(
+        &mut self,
+        writes: Vec<(
+            String,
+            String,
+            Option<PreparedFileContent>,
+            Option<serde_json::Value>,
+        )>,
+    ) -> Result<u64, LixError> {
+        self.inner
+            .seed_prepared_file_content_batch(
+                writes
+                    .into_iter()
+                    .map(|(id, path, prepared, metadata)| {
+                        (
+                            id,
+                            path,
+                            prepared.map(|prepared| prepared.receipt),
+                            metadata,
+                        )
+                    })
+                    .collect(),
+            )
+            .await
+    }
+
     /// Executes one SQL statement inside this transaction.
     ///
     /// Writes are staged until `commit()`. Reads use the transaction overlay,

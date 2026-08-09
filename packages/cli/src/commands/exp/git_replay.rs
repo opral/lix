@@ -1278,11 +1278,18 @@ where
         execute_statements_in_transaction(&mut transaction, &mut statements, parent_commit)?;
     }
 
-    for (is_insert, row) in planned
+    let mut seed_writes = Vec::<(
+        String,
+        String,
+        Option<PreparedFileContent>,
+        Option<serde_json::Value>,
+    )>::new();
+    seed_writes.reserve(planned.inserts.len() + planned.updates.len());
+
+    for row in planned
         .inserts
         .into_iter()
-        .map(|row| (true, row))
-        .chain(planned.updates.into_iter().map(|row| (false, row)))
+        .chain(planned.updates.into_iter())
     {
         let upload_key = format!("git-replay/seed/{parent_commit}/{}", row.id);
         let mut prepared = None;
@@ -1306,47 +1313,25 @@ where
         })?;
 
         if let Some(receipt) = prepared {
-            db::block_on(transaction.upsert_prepared_file_content(
+            seed_writes.push((
                 row.id,
                 row.path,
-                receipt,
+                Some(receipt),
                 Some(json!({
                     "git_mode": row.git_mode,
                     "git_oid": row.git_oid,
                 })),
-            ))
-            .map_err(|error| {
-                CliError::msg(format!(
-                    "failed to bind prepared parent-tree blob {}: {error}",
-                    row.blob_oid
-                ))
-            })?;
+            ));
         } else if streamed_bytes == 0 {
-            let mut empty_batch = if is_insert {
-                PreparedBatch {
-                    inserts: vec![WriteRow {
-                        id: row.id,
-                        path: row.path,
-                        data: Some(Vec::new()),
-                        git_mode: row.git_mode,
-                        git_oid: row.git_oid,
-                    }],
-                    ..PreparedBatch::default()
-                }
-            } else {
-                PreparedBatch {
-                    updates: vec![WriteRow {
-                        id: row.id,
-                        path: row.path,
-                        data: Some(Vec::new()),
-                        git_mode: row.git_mode,
-                        git_oid: row.git_oid,
-                    }],
-                    ..PreparedBatch::default()
-                }
-            };
-            let mut statements = build_replay_commit_statements(&mut empty_batch, 1);
-            execute_statements_in_transaction(&mut transaction, &mut statements, parent_commit)?;
+            seed_writes.push((
+                row.id,
+                row.path,
+                None,
+                Some(json!({
+                    "git_mode": row.git_mode,
+                    "git_oid": row.git_oid,
+                })),
+            ));
         } else {
             return Err(CliError::msg(format!(
                 "prepared parent-tree blob {} produced no receipt after non-empty streaming",
@@ -1354,6 +1339,12 @@ where
             )));
         }
     }
+
+    db::block_on(transaction.seed_prepared_file_content_batch(seed_writes)).map_err(|error| {
+        CliError::msg(format!(
+            "failed to publish parent-tree receipt batch {parent_commit}: {error}"
+        ))
+    })?;
 
     db::block_on(transaction.commit()).map_err(|error| {
         CliError::msg(format!(

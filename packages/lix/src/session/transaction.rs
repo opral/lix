@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 use crate::LixError;
 #[cfg(test)]
 use crate::transaction::CommitBoundaryGuard;
-use crate::transaction::types::TransactionJson;
+use crate::transaction::types::{FileContent, TransactionJson};
 use crate::transaction::{
     CommitBoundaryState, Transaction, TransactionCommitBoundary,
     open_transaction_with_runtime_boundary,
@@ -156,6 +156,46 @@ where
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 format!("prepared file content owner applied {applied} of {write_count} rows"),
+            ));
+        }
+        Ok(applied)
+    }
+
+    pub(crate) async fn seed_prepared_file_content_batch(
+        &mut self,
+        writes: Vec<(
+            String,
+            String,
+            Option<crate::binary_cas::BlobWriteReceipt>,
+            Option<serde_json::Value>,
+        )>,
+    ) -> Result<u64, LixError> {
+        let write_count = writes.len();
+        let writes = writes
+            .into_iter()
+            .map(|(id, path, receipt, metadata)| -> Result<_, LixError> {
+                let content = receipt
+                    .map(FileContent::PreparedCas)
+                    .unwrap_or_else(|| FileContent::inline(Vec::<u8>::new()));
+                let metadata = metadata
+                    .map(|value| TransactionJson::from_value(value, "prepared file metadata"))
+                    .transpose()?;
+                Ok((id, path, content, metadata))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let applied =
+            crate::sql2::execute_fast_lix_file_seed_writes_batch(self.transaction_mut()?, writes)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        "prepared parent-tree seed path was not handled by the ForkTree owner",
+                    )
+                })?;
+        if applied != write_count as u64 {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!("prepared parent-tree seed owner applied {applied} of {write_count} rows"),
             ));
         }
         Ok(applied)
