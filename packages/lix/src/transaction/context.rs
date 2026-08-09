@@ -1610,11 +1610,6 @@ where
                 .map(MaterializedLiveStateRow::from)
                 .collect::<Vec<_>>()
         };
-        let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
-            None
-        } else {
-            load_path_index_revision(&read).await.ok().flatten()
-        };
         let prepared_forktree_plan = match commit::prepare_forktree_publication_with_parent_heads(
             &transaction.active_account_id,
             &commit_parent_heads,
@@ -1722,23 +1717,16 @@ where
             "lix.perf.transaction_storage_commit"
         ))
         .await?;
-        let post_commit_read_storage = transaction.storage.clone();
         if rebuild_filesystem_path_index {
             transaction.live_state.clear_filesystem_path_indexes();
-        } else if !filesystem_delta_rows.is_empty()
-            && incremental_filesystem_index_enabled()
-            && let Ok(next_read) = post_commit_read_storage
-                .begin_read(StorageReadOptions::default())
-                .await
-        {
-            let next_read = SharedStorageAdapterRead::new(next_read);
-            if let Ok(next_revision) = load_path_index_revision(&next_read).await {
-                transaction.live_state.advance_filesystem_path_indexes(
-                    previous_filesystem_revision.as_deref(),
-                    next_revision.as_deref(),
-                    &filesystem_delta_rows,
-                );
-            }
+        } else if !filesystem_delta_rows.is_empty() {
+            // The path index is rebuildable derived state.  Do not acquire a
+            // second post-commit snapshot merely to update it: the commit
+            // read is pre-commit and the transaction's retained read cannot
+            // observe the newly committed revision.  Clearing it preserves
+            // correctness and makes the next operation rebuild from its own
+            // coherent view.
+            transaction.live_state.clear_filesystem_path_indexes();
         }
         for publication in std::mem::take(&mut transaction.pending_plugin_actor_publications) {
             let session_key = publication.session_key().clone();
@@ -2425,11 +2413,7 @@ where
         let cache = self.plugin_host.actor_cache();
         let _cold_open_guard = cache.cold_open_guard().await;
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let base = self.live_state.reader(read.clone());
         let file_key = PluginFileWriteKey {
             branch_id: actor_key.branch_id.clone(),
@@ -2656,11 +2640,7 @@ where
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let base = self
             .live_state
             .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
@@ -3371,9 +3351,7 @@ where
         }
 
         let staged = self.staged_writes.staging_overlay()?;
-        let storage = self.storage.clone();
-        let read =
-            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+        let read = self.opening_read();
         let base = self.live_state.reader(read.clone());
 
         if !lifecycle_schema_rows.is_empty() {
@@ -4766,11 +4744,7 @@ where
                             && observation_matches_visible_root
                         {
                             let staged = self.staged_writes.staging_overlay()?;
-                            let read = SharedStorageAdapterRead::new(
-                                self.storage
-                                    .begin_read(StorageReadOptions::default())
-                                    .await?,
-                            );
+                            let read = self.opening_read();
                             let base = self.live_state.reader(read.clone());
                             let (
                                 cold_before,
@@ -6069,11 +6043,7 @@ where
             return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
         }
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let live_state = self.live_state.reader(&read);
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
