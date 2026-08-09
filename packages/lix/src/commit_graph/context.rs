@@ -688,6 +688,18 @@ impl LiveStateReader for CommitGraphLiveStateReader {
             let mut requested_branch_ids = Vec::with_capacity(request.rows.len());
             let mut seen = BTreeSet::new();
             for requested in &request.rows {
+                if requested.schema_key != BRANCH_REF_SCHEMA_KEY {
+                    return Err(LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        "ForkTree branch-ref exact reads require the branch-ref schema",
+                    ));
+                }
+                if requested.file_id.is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        "ForkTree branch-ref exact reads require a NULL file_id",
+                    ));
+                }
                 if requested.branch_id != crate::GLOBAL_BRANCH_ID {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
@@ -1822,6 +1834,86 @@ mod tests {
                 .lock()
                 .expect("batch call log is not poisoned"),
             vec![vec![branch_id]]
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_ref_exact_batch_rejects_non_branch_ref_schema() {
+        let branch_ref = Arc::new(CountingBatchBranchRefReader::new(1));
+        let graph = Arc::new(tokio::sync::Mutex::new(
+            Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
+        ));
+        let reader = CommitGraphLiveStateReader::new(
+            BRANCH_REF_SCHEMA_KEY,
+            graph,
+            branch_ref.clone(),
+            None,
+            false,
+            false,
+        );
+        let branch_id = branch_ref.rows[0].0.branch_id.clone();
+        let request = LiveStateExactBatchRequest {
+            rows: vec![LiveStateExactRowRequest {
+                schema_key: "not_lix_branch_ref".to_owned(),
+                branch_id: crate::GLOBAL_BRANCH_ID.to_owned(),
+                entity_pk: EntityPk::uuid_from_canonical(&branch_id).expect("test UUID"),
+                file_id: None,
+            }],
+            untracked: Some(true),
+            ..Default::default()
+        };
+
+        let error = reader
+            .load_exact_batch(&request)
+            .await
+            .expect_err("branch-ref exact reads must reject another schema");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(
+            branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_ref_exact_batch_rejects_non_null_file_id() {
+        let branch_ref = Arc::new(CountingBatchBranchRefReader::new(1));
+        let graph = Arc::new(tokio::sync::Mutex::new(
+            Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
+        ));
+        let reader = CommitGraphLiveStateReader::new(
+            BRANCH_REF_SCHEMA_KEY,
+            graph,
+            branch_ref.clone(),
+            None,
+            false,
+            false,
+        );
+        let branch_id = branch_ref.rows[0].0.branch_id.clone();
+        let request = LiveStateExactBatchRequest {
+            rows: vec![LiveStateExactRowRequest {
+                schema_key: BRANCH_REF_SCHEMA_KEY.to_owned(),
+                branch_id: crate::GLOBAL_BRANCH_ID.to_owned(),
+                entity_pk: EntityPk::uuid_from_canonical(&branch_id).expect("test UUID"),
+                file_id: Some("unexpected-file".to_owned()),
+            }],
+            untracked: Some(true),
+            ..Default::default()
+        };
+
+        let error = reader
+            .load_exact_batch(&request)
+            .await
+            .expect_err("branch-ref exact reads must reject a file identity");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(
+            branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned")
+                .is_empty()
         );
     }
 }
