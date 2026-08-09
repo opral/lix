@@ -21,7 +21,7 @@ use super::tree::{
 };
 use super::view::{CoherentView, load_object_bytes, load_object_map};
 
-const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+pub(super) const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const UPLOAD_PART_BYTES: u64 = CANONICAL_BLOB_CHUNK_BYTES as u64 * 16;
 const UPLOAD_PART_WINDOW: u64 = 4;
 
@@ -37,7 +37,7 @@ pub(super) struct CanonicalBlobIdBuilder {
 }
 
 impl CanonicalBlobIdBuilder {
-    fn update(&mut self, mut bytes: &[u8]) -> Result<(), StorageError> {
+    pub(super) fn update(&mut self, mut bytes: &[u8]) -> Result<(), StorageError> {
         self.total_size = self
             .total_size
             .checked_add(
@@ -61,7 +61,37 @@ impl CanonicalBlobIdBuilder {
         Ok(())
     }
 
-    fn finish(mut self) -> crate::binary_cas::BlobId {
+    /// Adds one already canonical fixed-width chunk without copying it into
+    /// the streaming pending buffer. Inline publication owns these boundaries
+    /// and rejects a partial non-final chunk on the following update.
+    pub(super) fn update_fixed_chunk(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
+        if chunk.is_empty()
+            || chunk.len() > CANONICAL_BLOB_CHUNK_BYTES
+            || !self.pending.is_empty()
+            || self
+                .chunks
+                .last()
+                .is_some_and(|(_, size)| *size != CANONICAL_BLOB_CHUNK_BYTES as u64)
+        {
+            return Err(corruption(
+                "inline blob identity update is not canonically chunked",
+            ));
+        }
+        self.total_size = self
+            .total_size
+            .checked_add(
+                u64::try_from(chunk.len())
+                    .map_err(|_| corruption("blob fragment length exceeds u64"))?,
+            )
+            .ok_or_else(|| corruption("blob length overflows u64"))?;
+        self.chunks.push((
+            crate::binary_cas::ChunkHash::from_content(chunk),
+            chunk.len() as u64,
+        ));
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self) -> crate::binary_cas::BlobId {
         if self.total_size <= CANONICAL_BLOB_CHUNK_BYTES as u64 {
             let hash = self
                 .chunks
@@ -1481,6 +1511,52 @@ mod canonical_blob_id_tests {
             builder.finish(),
             crate::binary_cas::BlobId::from_content(&payload)
         );
+    }
+
+    #[test]
+    fn inline_identity_vectors_match_legacy_ids_and_digest() {
+        for size in [0, 1024, 1024 * 1024, 1024 * 1024 + 1, 64 * 1024 * 1024] {
+            let payload: Vec<u8> = (0..size)
+                .map(|index| (index as u64).wrapping_mul(37).wrapping_add(11) as u8)
+                .collect();
+            let mut builder = CanonicalBlobIdBuilder::default();
+            let mut digest = blake3::Hasher::new();
+            for chunk in payload.chunks(CANONICAL_BLOB_CHUNK_BYTES) {
+                builder
+                    .update_fixed_chunk(chunk)
+                    .expect("inline identity update");
+                digest.update(chunk);
+            }
+            assert_eq!(
+                builder.finish(),
+                crate::binary_cas::BlobId::from_content(&payload),
+                "fixed-chunk BlobId changed at {size} bytes"
+            );
+            assert_eq!(
+                *digest.finalize().as_bytes(),
+                *blake3::hash(&payload).as_bytes(),
+                "content digest changed at {size} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_same_size_substitution_changes_both_identity_claims() {
+        let first = vec![0x11; CANONICAL_BLOB_CHUNK_BYTES + 1];
+        let mut second = first.clone();
+        second[CANONICAL_BLOB_CHUNK_BYTES] = 0x22;
+
+        let identity = |payload: &[u8]| {
+            let mut builder = CanonicalBlobIdBuilder::default();
+            let mut digest = blake3::Hasher::new();
+            for chunk in payload.chunks(CANONICAL_BLOB_CHUNK_BYTES) {
+                builder.update_fixed_chunk(chunk).expect("identity update");
+                digest.update(chunk);
+            }
+            (builder.finish(), *digest.finalize().as_bytes())
+        };
+
+        assert_ne!(identity(&first), identity(&second));
     }
 
     #[test]

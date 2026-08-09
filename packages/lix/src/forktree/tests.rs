@@ -137,6 +137,7 @@ fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
     let model = include_str!("model.rs");
     let blob = include_str!("blob.rs");
     let facade = include_str!("mod.rs");
+    let publication = include_str!("publication.rs");
     assert!(model.contains("pub(super) canonical_blob_id: BlobId"));
     assert!(!model.contains("pub(crate) canonical_blob_id"));
     assert!(!facade.contains("canonical_blob_id"));
@@ -144,6 +145,17 @@ fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
     assert!(blob.contains("manifest.canonical_blob_id != semantic_id"));
     assert!(!blob.contains("BTreeMap<crate::binary_cas::BlobId"));
     assert!(!blob.contains("fn canonical_blob_id"));
+    let inline = publication
+        .split_once("pub(crate) fn stage_inline_blob_payload")
+        .and_then(|(_, rest)| rest.split_once("pub(super) fn stage_json_payload"))
+        .map(|(body, _)| body)
+        .expect("inline publication body");
+    assert!(inline.contains("semantic_id_builder.update_fixed_chunk(chunk_bytes)"));
+    assert!(inline.contains("content_digest.update(chunk_bytes)"));
+    assert!(inline.contains("semantic_id_builder.finish()"));
+    assert!(inline.contains("content_digest.finalize()"));
+    assert!(!inline.contains("BlobId::from_content(bytes)"));
+    assert!(!inline.contains("blake3::hash(bytes)"));
 }
 
 #[tokio::test]

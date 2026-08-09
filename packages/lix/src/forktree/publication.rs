@@ -587,8 +587,16 @@ impl PreparedPublication {
                 "empty inline payload has no blob manifest; omit its BlobRef row",
             ));
         }
-        let mut ordered_chunks = Vec::with_capacity(bytes.len().div_ceil(1024 * 1024));
-        for chunk_bytes in bytes.chunks(1024 * 1024) {
+        let mut semantic_id_builder = super::blob::CanonicalBlobIdBuilder::default();
+        let mut content_digest = blake3::Hasher::new();
+        let mut ordered_chunks = Vec::with_capacity(
+            bytes
+                .len()
+                .div_ceil(super::blob::CANONICAL_BLOB_CHUNK_BYTES),
+        );
+        for chunk_bytes in bytes.chunks(super::blob::CANONICAL_BLOB_CHUNK_BYTES) {
+            semantic_id_builder.update_fixed_chunk(chunk_bytes)?;
+            content_digest.update(chunk_bytes);
             let chunk = BlobChunkV1 {
                 bytes: Bytes::copy_from_slice(chunk_bytes),
             };
@@ -602,8 +610,8 @@ impl PreparedPublication {
         let manifest = BlobManifestV1::from_authenticated_chunks(
             bytes.len() as u64,
             ordered_chunks,
-            crate::binary_cas::BlobId::from_content(bytes),
-            *blake3::hash(bytes).as_bytes(),
+            semantic_id_builder.finish(),
+            *content_digest.finalize().as_bytes(),
         );
         self.stage_blob_manifest(&manifest)
     }
