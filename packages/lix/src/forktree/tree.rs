@@ -570,19 +570,47 @@ pub(super) async fn scan_page_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let mut cache = OrderedTreeReadCache::default();
+    scan_page_on_read_with_cache(
+        root,
+        expected_kind,
+        start_after,
+        page_size,
+        read,
+        &mut cache,
+    )
+    .await
+}
+
+/// Paged ordered-tree scan with a caller-owned, operation-local node cache.
+/// Cached nodes are still checked against the expected parent edge and tree
+/// kind on every traversal; the cache only avoids repeating authenticated
+/// object decode when adjacent pages revisit the same path.
+pub(super) async fn scan_page_on_read_with_cache<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    start_after: Option<&[u8]>,
+    page_size: usize,
+    read: &R,
+    cache: &mut OrderedTreeReadCache,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     if page_size == 0 {
         return Err(corruption("ordered-tree page size must be nonzero"));
     }
     let requested = page_size
         .checked_add(usize::from(start_after.is_some()))
         .ok_or_else(|| corruption("ordered-tree page size overflows usize"))?;
-    let mut rows = scan_range_on_read(
+    let mut rows = scan_range_on_read_with_cache(
         root,
         expected_kind,
         start_after,
         None,
         Some(requested),
         read,
+        cache,
     )
     .await?;
     if let Some(start_after) = start_after {
@@ -604,6 +632,33 @@ pub(super) async fn scan_bounded_page_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let mut cache = OrderedTreeReadCache::default();
+    scan_bounded_page_on_read_with_cache(
+        root,
+        expected_kind,
+        lower,
+        upper,
+        start_after,
+        page_size,
+        read,
+        &mut cache,
+    )
+    .await
+}
+
+pub(super) async fn scan_bounded_page_on_read_with_cache<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+    start_after: Option<&[u8]>,
+    page_size: usize,
+    read: &R,
+    cache: &mut OrderedTreeReadCache,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     if page_size == 0 {
         return Err(corruption("ordered-tree page size must be nonzero"));
     }
@@ -616,13 +671,14 @@ where
     let requested = page_size
         .checked_add(usize::from(start_after.is_some()))
         .ok_or_else(|| corruption("ordered-tree page size overflows usize"))?;
-    let mut rows = scan_range_on_read(
+    let mut rows = scan_range_on_read_with_cache(
         root,
         expected_kind,
         effective_lower,
         upper,
         Some(requested),
         read,
+        cache,
     )
     .await?;
     if let Some(start_after) = start_after {
@@ -646,6 +702,22 @@ pub(super) async fn scan_range_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let mut cache = OrderedTreeReadCache::default();
+    scan_range_on_read_with_cache(root, expected_kind, lower, upper, limit, read, &mut cache).await
+}
+
+async fn scan_range_on_read_with_cache<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+    limit: Option<usize>,
+    read: &R,
+    cache: &mut OrderedTreeReadCache,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     if lower.zip(upper).is_some_and(|(lower, upper)| lower > upper) {
         return Err(corruption("ordered-tree range bounds are inverted"));
     }
@@ -656,7 +728,13 @@ where
         if limit.is_some_and(|limit| output.len() >= limit) {
             break;
         }
-        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+        let node = if let Some(node) = cache.nodes.get(&id) {
+            node.clone()
+        } else {
+            let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+            cache.nodes.insert(id, node.clone());
+            node
+        };
         validate_loaded_node(id, &node, kind, expected.as_ref())?;
         match node.body {
             NodeBody::Leaf(entries) => {

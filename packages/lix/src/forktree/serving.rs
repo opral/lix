@@ -18,8 +18,8 @@ use super::state::{
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, OrderedTreeReadCache, apply_ordered_mutations,
-    lookup_on_read, lookup_on_read_with_cache, scan_bounded_page_on_read, scan_page_on_read,
-    validate_root_on_read,
+    lookup_on_read, lookup_on_read_with_cache, scan_bounded_page_on_read,
+    scan_bounded_page_on_read_with_cache, scan_page_on_read, validate_root_on_read,
 };
 use super::view::{
     CoherentView, IdentityBoundRead, ReadIdentity, ReadIdentitySource, SELECTOR_SPACE,
@@ -1793,6 +1793,7 @@ where
     let mut local_cursor = None;
     let mut global = std::collections::VecDeque::new();
     let mut local = std::collections::VecDeque::new();
+    let mut tree_cache = OrderedTreeReadCache::default();
     let mut global_done = false;
     let mut local_done = local_state_root.is_none();
     loop {
@@ -1800,7 +1801,7 @@ where
             break;
         }
         if global.is_empty() && !global_done {
-            let page = scan_bounded_page_on_read(
+            let page = scan_bounded_page_on_read_with_cache(
                 global_state_root,
                 "state",
                 lower,
@@ -1808,6 +1809,7 @@ where
                 global_cursor.as_deref(),
                 page_size,
                 read,
+                &mut tree_cache,
             )
             .await?;
             global_done = page.len() < page_size;
@@ -1815,7 +1817,7 @@ where
             global.extend(page);
         }
         if local.is_empty() && !local_done {
-            let page = scan_bounded_page_on_read(
+            let page = scan_bounded_page_on_read_with_cache(
                 local_state_root.expect("local state root is present while scanning"),
                 "state",
                 lower,
@@ -1823,6 +1825,7 @@ where
                 local_cursor.as_deref(),
                 page_size,
                 read,
+                &mut tree_cache,
             )
             .await?;
             local_done = page.len() < page_size;
