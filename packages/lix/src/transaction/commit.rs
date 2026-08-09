@@ -24,8 +24,8 @@ use crate::forktree::{
     CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
     StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
-    encode_state_key, encode_state_value, load_commit, open_coherent_view_on_read,
-    select_historical_commit_member, state_point,
+    encode_state_key, encode_state_value, load_commit, load_commit_summary,
+    open_coherent_view_on_read, select_historical_commit_member, state_point,
 };
 
 #[cfg(test)]
@@ -487,7 +487,7 @@ where
         .copied()
         .flatten()
         .ok_or_else(|| writer_error("branch commit has no selected parent"))?;
-    let selected_parent = load_commit(&view, forktree_commit_id(expected_parent))
+    let selected_parent = load_commit_summary(&view, forktree_commit_id(expected_parent))
         .await?
         .ok_or_else(|| writer_error("selected branch parent is absent from CommitCatalog"))?;
     let (selected_parent_object_id, _) = selected_parent.encode()?;

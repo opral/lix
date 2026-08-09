@@ -436,6 +436,16 @@ where
         .await
     }
 
+    pub(crate) async fn validate_commit_topology(
+        &self,
+        commit_catalog_root: ObjectId,
+        commit_id: CommitId,
+        commit: &CommitObjectV1,
+    ) -> Result<super::serving::CommitTopology, crate::LixError> {
+        super::serving::validate_commit_topology(&self.read, commit_catalog_root, commit_id, commit)
+            .await
+    }
+
     pub(crate) async fn validate_retained_ref_change(
         &self,
         change_catalog_root: ObjectId,
