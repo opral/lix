@@ -295,16 +295,15 @@ impl CommitGraphLiveStateReader {
         // the authenticated branch-selector set here for these two ForkTree
         // owned schemas.  The by-branch surfaces deliberately keep their
         // caller-provided branch scope below.
-        let branch_ids = if matches!(self.schema_key.as_str(), "lix_commit" | "lix_commit_edge")
-            && self.include_recovery_roots
-            && self.include_retained_nodes
-        {
-            self.branch_ref
-                .scan_heads()
-                .await?
-                .into_iter()
-                .map(|head| head.branch_id)
-                .collect::<Vec<_>>()
+        let global_commit_surface =
+            matches!(self.schema_key.as_str(), "lix_commit" | "lix_commit_edge")
+                && self.include_recovery_roots
+                && self.include_retained_nodes;
+        let branch_ids = if global_commit_surface {
+            // Global commit entities are facts of the one authenticated
+            // ForkTree topology, not one projection per branch selector. The
+            // branch column is the global scope marker for this surface.
+            vec![crate::GLOBAL_BRANCH_ID.to_owned()]
         } else if request.filter.branch_ids.is_empty() {
             self.branch_ref
                 .scan_heads()
@@ -334,7 +333,21 @@ impl CommitGraphLiveStateReader {
                     )
                 })?;
             let mut reachable_by_id = BTreeMap::new();
-            if self.include_retained_nodes && retained_nodes_until_gc {
+            if global_commit_surface {
+                // `retained_nodes` is the existing authenticated complete
+                // topology scan. Read it once for the global surface and let
+                // the entity identity/order below provide the sole stream;
+                // never rebuild the same stream once per branch selector.
+                let retained = {
+                    let mut graph = self.commit_graph.lock().await;
+                    graph.retained_nodes().await?
+                };
+                for commit in retained {
+                    reachable_by_id
+                        .entry(commit.commit_id)
+                        .or_insert(ReachableCommitGraphNode { commit, depth: 0 });
+                }
+            } else if self.include_retained_nodes && retained_nodes_until_gc {
                 let retained = {
                     let mut graph = self.commit_graph.lock().await;
                     graph.retained_nodes().await?
