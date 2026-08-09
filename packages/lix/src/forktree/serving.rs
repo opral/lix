@@ -1376,7 +1376,7 @@ fn decode_change_record(
 fn decode_validated_change_record(
     id: ChangeId,
     change: ChangeObjectV1,
-) -> Result<crate::changelog::ChangeRecord, crate::LixError> {
+) -> Result<Option<crate::changelog::ChangeRecord>, crate::LixError> {
     decode_change_record(id, change)
 }
 
@@ -1549,13 +1549,13 @@ where
         .await?
         .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
     let (source_commit_object_id, _) = source.encode()?;
-    let closure = load_authenticated_member_closure(
-        view.storage_read(),
-        view.repository_root().commit_catalog_root,
-        source_commit_object_id,
-        &source,
-    )
-    .await?;
+    let closure = view
+        .load_authenticated_member_closure(
+            view.repository_root().commit_catalog_root,
+            source_commit_object_id,
+            &source,
+        )
+        .await?;
     let source_members = &closure.members;
     for (source_ordinal, source_member) in source_members.iter().copied().enumerate() {
         let change_object_id = source_member.change_object_id();
@@ -1573,7 +1573,7 @@ where
             .await?
             .ok_or_else(|| corruption("selected Change has no ChangeCatalog introduction owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
-        view.validate_member_catalog_owner(
+        view.validate_member_catalog_owner_with_context(
             view.repository_root().commit_catalog_root,
             source_commit_object_id,
             source.generation,
@@ -2168,13 +2168,13 @@ pub(crate) async fn load_commit_for_publication<R>(
 where
     R: StorageAdapterRead,
 {
-    let Some(value) = lookup_on_read(
-        view.repository_root().commit_catalog_root,
-        "commit",
-        id.as_bytes(),
-        view.storage_read(),
-    )
-    .await?
+    let Some(value) = view
+        .lookup_tree_value(
+            view.repository_root().commit_catalog_root,
+            "commit",
+            id.as_bytes(),
+        )
+        .await?
     else {
         return Ok(None);
     };
@@ -2186,29 +2186,22 @@ where
             "CommitCatalog key does not match embedded CommitId",
         ));
     }
-    validate_commit_catalog_identity(
-        view.storage_read(),
+    view.validate_commit_catalog_identity(
         view.repository_root().commit_catalog_root,
         entry.commit_object_id,
         &commit,
     )
     .await?;
-    validate_publication_parent_edges(
-        view.storage_read(),
-        view.repository_root().commit_catalog_root,
-        &commit,
-    )
-    .await?;
+    validate_publication_parent_edges_on_view(view, &commit).await?;
     Ok(Some((entry.commit_object_id, commit)))
 }
 
-async fn validate_publication_parent_edges<R>(
-    read: &R,
-    commit_catalog_root: ObjectId,
+async fn validate_publication_parent_edges_on_view<R>(
+    view: &CoherentView<R>,
     commit: &CommitObjectV1,
 ) -> Result<(), StorageError>
 where
-    R: StorageAdapterRead + ?Sized,
+    R: StorageAdapterRead,
 {
     let mut unique_parent_objects = BTreeSet::new();
     if commit
@@ -2220,14 +2213,10 @@ where
             "publication parent envelope contains duplicate parent object edges",
         ));
     }
-    let parent_objects =
-        super::view::load_object_map(read, commit.parent_commit_object_ids.iter().copied()).await?;
     let mut unique_parent_ids = BTreeSet::new();
     for parent_object_id in &commit.parent_commit_object_ids {
-        let bytes = parent_objects
-            .get(parent_object_id)
-            .ok_or_else(|| corruption("publication parent object is absent"))?;
-        let parent = CommitObjectV1::decode(*parent_object_id, bytes)?;
+        let bytes = view.load_object_bytes(*parent_object_id).await?;
+        let parent = CommitObjectV1::decode(*parent_object_id, &bytes)?;
         if parent.generation >= commit.generation {
             return Err(corruption(
                 "publication parent generation is not strictly earlier",
@@ -2238,14 +2227,14 @@ where
                 "publication parent envelope contains duplicate parent CommitIds",
             ));
         }
-        let catalog_value = lookup_on_read(
-            commit_catalog_root,
-            "commit",
-            parent.commit_id.as_bytes(),
-            read,
-        )
-        .await?
-        .ok_or_else(|| corruption("publication parent has no CommitCatalog back-edge"))?;
+        let catalog_value = view
+            .lookup_tree_value(
+                view.repository_root().commit_catalog_root,
+                "commit",
+                parent.commit_id.as_bytes(),
+            )
+            .await?
+            .ok_or_else(|| corruption("publication parent has no CommitCatalog back-edge"))?;
         let catalog_entry = CommitCatalogEntry::decode(&catalog_value)?;
         if catalog_entry.commit_object_id != *parent_object_id {
             return Err(corruption(
@@ -2274,7 +2263,7 @@ where
         return Ok(None);
     };
     let entry = ChangeCatalogEntry::decode(&value)?;
-    validate_change_entry(view, id, entry, None).await.map(Some)
+    validate_change_entry(view, id, entry).await.map(Some)
 }
 
 pub(crate) async fn page_commits<R>(
@@ -2346,7 +2335,7 @@ where
                 .map_err(|_| corruption("ChangeCatalog key is not a raw UUID"))?,
         );
         let entry = ChangeCatalogEntry::decode(value)?;
-        entries.push((id, validate_change_entry(view, id, entry, None).await?));
+        entries.push((id, validate_change_entry(view, id, entry).await?));
     }
     Ok(CatalogPage {
         resume_token: (rows.len() == page_size)
@@ -2381,7 +2370,6 @@ async fn validate_change_entry<R>(
     view: &CoherentView<R>,
     id: ChangeId,
     entry: ChangeCatalogEntry,
-    context: Option<&AuthenticatedMemberClosure<'_, R>>,
 ) -> Result<ChangeObjectV1, StorageError>
 where
     R: StorageAdapterRead,
@@ -2403,16 +2391,13 @@ where
         ) => {
             let bytes = view.load_object_bytes(commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            validate_member_at_ordinal_with_context(
-                view.storage_read(),
-                commit_object_id,
-                &commit,
+            let members = view.load_commit_members(&commit).await?;
+            validate_member_at_ordinal(
+                &members,
                 ordinal,
                 CommitMemberV1::introduced(entry.change_object_id),
-                context,
                 "ChangeCatalog commit owner does not point back at its ordinal member",
-            )
-            .await?;
+            )?;
         }
         (
             ChangeCatalogOwner::BranchRef {
