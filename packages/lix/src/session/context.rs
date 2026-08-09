@@ -713,8 +713,7 @@ where
 
     fn entity_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::EntitySnapshotReader>> {
         Some(Arc::new(crate::sql2::CurrentEntitySnapshotReader::new(
-            Arc::clone(&self.live_state),
-            self.read_store.clone(),
+            crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
         )))
     }
 
