@@ -24,10 +24,11 @@ use sha2::{Digest, Sha256};
 
 const SIZE: usize = 64 * 1024 * 1024;
 const CANONICAL_CHUNK_BYTES: usize = 1024 * 1024;
-const APPEND_SIZE: usize = SIZE + 1024 * 1024;
+const APPEND_SIZE: usize = 1024 * 1024;
 const EDIT_START: usize = SIZE / 2;
 const EDIT_LEN: usize = 1024 * 1024;
 const PATH: &str = "/media/foreground.mov";
+const APPEND_PATH: &str = "/media/append.mov";
 const BRANCH_ID: &str = "01980000-0000-7000-8000-000000000064";
 
 struct CountingAllocator;
@@ -319,7 +320,10 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .expect("session");
     let base = payload(SIZE, 0x1234);
     let edited = edited_payload(&base);
-    let appended = payload(APPEND_SIZE, 0x5678);
+    let append_suffix = payload(APPEND_SIZE, 0x5678);
+    let mut appended = Vec::with_capacity(SIZE + APPEND_SIZE);
+    appended.extend_from_slice(&base);
+    appended.extend_from_slice(&append_suffix);
 
     let chunks = base
         .chunks(FILE_UPLOAD_PART_BYTES)
@@ -365,6 +369,23 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .rows()[0]
         .get::<String>("id")
         .expect("file id")
+        .to_owned();
+    // Keep append independent from the middle-overwrite file so its
+    // authenticated base is exactly the original 64 MiB payload.
+    session
+        .upsert_file_content(APPEND_PATH.to_owned(), base.clone().into())
+        .await
+        .expect("seed append file");
+    let append_file_id = session
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text(APPEND_PATH.to_owned())],
+        )
+        .await
+        .expect("append file id query")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("append file id")
         .to_owned();
     let first = timed(
         &format!("{label}/exact_read_64m"),
@@ -501,14 +522,54 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     assert_eq!(digest(preserved.content()), digest(&edited));
     drop(preserved);
 
+    let appended_blob: lix::Blob = appended.clone().into();
+    let append_provenance = RequestBlobSpliceProvenance::new_validated(
+        &base,
+        &appended_blob,
+        &sha256_hex(&base),
+        &sha256_hex(&appended_blob),
+        SIZE,
+        0,
+        append_suffix.clone(),
+    )
+    .expect("authenticated append provenance");
+    lix::storage_bench::begin_verified_inline_blob_splice_accounting();
     let _append = timed(
         &format!("{label}/append_1m"),
         &counted,
         &path,
-        session.upsert_file_content(PATH.to_owned(), appended.clone().into()),
+        session.execute_with_options_and_metadata(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[
+                Value::Blob(appended_blob),
+                Value::Text(append_file_id.clone()),
+            ],
+            ExecuteOptions::default(),
+            ExecuteStatementMetadata {
+                parameter_blob_splices: vec![Some(append_provenance), None],
+                ..ExecuteStatementMetadata::default()
+            },
+        ),
     )
     .await
     .expect("append");
+    let append_accounting = lix::storage_bench::take_verified_inline_blob_splice_accounting();
+    assert_eq!(
+        append_accounting.calls, 1,
+        "append must consume verified splice"
+    );
+    assert_eq!(append_accounting.changed_chunks, 1);
+    assert_eq!(
+        append_accounting.total_chunks,
+        ((SIZE + APPEND_SIZE) / CANONICAL_CHUNK_BYTES) as u64
+    );
+    let appended_file = session
+        .read_file_content(APPEND_PATH.to_owned(), None)
+        .await
+        .expect("append file read")
+        .expect("append file");
+    assert_eq!(digest(appended_file.content()), digest(&appended));
+    drop(appended_file);
     session.create_checkpoint().await.expect("checkpoint");
     let branch = session
         .create_branch(CreateBranchOptions {
@@ -526,7 +587,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         &format!("{label}/branch_read"),
         &counted,
         &path,
-        branch_session.read_file_content(PATH.to_owned(), None),
+        branch_session.read_file_content(APPEND_PATH.to_owned(), None),
     )
     .await
     .expect("branch read")
@@ -549,7 +610,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         &format!("{label}/cold_reopen_exact_read"),
         &reopened,
         &path,
-        reopened_session.read_file_content(PATH.to_owned(), None),
+        reopened_session.read_file_content(APPEND_PATH.to_owned(), None),
     )
     .await
     .expect("cold read")
@@ -562,18 +623,25 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         &path,
         reopened_session.execute(
             "DELETE FROM lix_file WHERE path = $1",
-            &[Value::Text(PATH.to_owned())],
+            &[Value::Text(APPEND_PATH.to_owned())],
         ),
     )
     .await
     .expect("final reference deletion");
     assert!(
         reopened_session
-            .read_file_content(PATH.to_owned(), None)
+            .read_file_content(APPEND_PATH.to_owned(), None)
             .await
             .expect("deleted file read")
             .is_none()
     );
+    reopened_session
+        .execute(
+            "DELETE FROM lix_file WHERE path = $1",
+            &[Value::Text(PATH.to_owned())],
+        )
+        .await
+        .expect("delete append file");
     reopened_session.close().await.expect("close reopened");
     println!(
         "{}",

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 
 use crate::RequestBlobSpliceProvenance;
-use crate::binary_cas::{BlobPayload, BlobSameLengthSplice};
+use crate::binary_cas::{BlobEditSplice, BlobPayload, BlobSameLengthSplice};
 use crate::storage::{Key, Precondition, StorageError};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
@@ -658,6 +658,181 @@ impl PreparedPublication {
             .await
     }
 
+    /// Authenticates and lowers an append, truncate, or chunk-aligned middle
+    /// edit against the exact StateKey-selected BlobRef.  The edit builder
+    /// copies old subtree identities and stages only boundary/insert chunks
+    /// plus new internal path objects; it never calls the full-payload writer.
+    pub(crate) async fn stage_verified_inline_blob_edit<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        state_key: &StateKey,
+        payload: &BlobPayload,
+        edit: BlobEditSplice,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead + Sync,
+    {
+        let reference = view
+            .bind_blob_at_state_key(state_key)
+            .await
+            .map_err(|error| StorageError::Corruption(error.to_string()))?
+            .ok_or_else(|| corruption("variable blob splice base owner is absent"))?;
+        if reference.semantic_id() != edit.base_blob_hash {
+            return Err(corruption(
+                "variable blob splice base identity does not match its StateKey owner",
+            ));
+        }
+        let base_manifest_object_id = reference.manifest_object_id();
+        let base_manifest_bytes = view.load_object_bytes(base_manifest_object_id).await?;
+        let base_manifest = BlobManifestV1::decode(base_manifest_object_id, &base_manifest_bytes)?;
+        if base_manifest.canonical_blob_id != edit.base_blob_hash
+            || base_manifest.logical_bytes != reference.expected_size()
+        {
+            return Err(corruption(
+                "variable blob splice base manifest is not bound to its BlobRef owner",
+            ));
+        }
+        let base_len = usize::try_from(base_manifest.logical_bytes)
+            .map_err(|_| corruption("variable blob splice base length is invalid"))?;
+        let old_end = edit
+            .offset
+            .checked_add(edit.delete_len)
+            .ok_or_else(|| corruption("variable blob splice end overflows"))?;
+        let expected_len = base_len
+            .checked_sub(edit.delete_len)
+            .and_then(|len| len.checked_add(edit.insert_len))
+            .ok_or_else(|| corruption("variable blob splice output length overflows"))?;
+        if edit.offset > base_len || old_end > base_len || payload.len() != expected_len {
+            return Err(corruption(
+                "variable blob splice bounds do not match output",
+            ));
+        }
+
+        let chunk = super::blob::CANONICAL_BLOB_CHUNK_BYTES;
+        let is_append = edit.offset == base_len && old_end == base_len;
+        let is_truncate = edit.insert_len == 0 && old_end == base_len;
+        let prefix_ordinal: u64 = if is_append {
+            (base_len / chunk).saturating_sub(1) as u64
+        } else if is_truncate {
+            if payload.len() == 0 {
+                0
+            } else if payload.len() % chunk == 0 {
+                (payload.len() / chunk - 1) as u64
+            } else {
+                (payload.len() / chunk) as u64
+            }
+        } else if edit.offset == 0 {
+            0
+        } else {
+            (edit.offset / chunk - 1) as u64
+        };
+        let prefix_needed = if is_append {
+            base_len > 0
+        } else if is_truncate {
+            payload.len() > 0
+        } else {
+            edit.offset > 0
+        };
+        let prefix_proof = if prefix_needed {
+            Some(
+                view.load_blob_merkle_proof(
+                    base_manifest,
+                    state_key,
+                    prefix_ordinal..prefix_ordinal + 1,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let suffix_needed = !is_append && !is_truncate && old_end < base_len;
+        let suffix_proof = if suffix_needed {
+            let suffix_ordinal = (old_end / chunk) as u64;
+            Some(
+                view.load_blob_merkle_proof(
+                    base_manifest,
+                    state_key,
+                    suffix_ordinal..suffix_ordinal + 1,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        // A partial edge edit must prove the bytes retained from the old
+        // boundary chunk before the replacement leaf is staged.
+        if is_append && base_len > 0 && base_len % chunk != 0 {
+            let ordinal = (base_len / chunk) as u64;
+            let proof = view
+                .load_blob_merkle_proof(base_manifest, state_key, ordinal..ordinal + 1)
+                .await?;
+            let old_boundary = super::merkle::materialize_blob_merkle_range(
+                &proof,
+                state_key,
+                base_manifest,
+                ordinal * chunk as u64..base_len as u64,
+            )?;
+            if payload.bytes().get(ordinal as usize * chunk..base_len)
+                != Some(old_boundary.as_slice())
+            {
+                return Err(corruption(
+                    "append does not preserve its authenticated base tail",
+                ));
+            }
+        }
+        if is_truncate && payload.len() > 0 && payload.len() % chunk != 0 {
+            let ordinal = (payload.len() / chunk) as u64;
+            let proof = prefix_proof
+                .as_ref()
+                .ok_or_else(|| corruption("truncate boundary proof is missing"))?;
+            let old_boundary = super::merkle::materialize_blob_merkle_range(
+                proof,
+                state_key,
+                base_manifest,
+                ordinal * chunk as u64..((ordinal + 1) * chunk as u64).min(base_len as u64),
+            )?;
+            let keep = payload.len() - ordinal as usize * chunk;
+            if payload.bytes().get(ordinal as usize * chunk..payload.len())
+                != Some(&old_boundary[..keep])
+            {
+                return Err(corruption(
+                    "truncate does not preserve its authenticated base boundary",
+                ));
+            }
+        }
+
+        let successor = super::merkle::build_blob_merkle_edit_successor(
+            base_manifest,
+            prefix_proof.as_ref(),
+            suffix_proof.as_ref(),
+            state_key,
+            payload.bytes(),
+            edit,
+        )?;
+        self.stage_immutable_objects(&successor.objects)?;
+        #[cfg(feature = "storage-benches")]
+        {
+            let changed_chunks = if is_append {
+                let affected_start = base_len / chunk * chunk;
+                payload
+                    .len()
+                    .saturating_sub(affected_start)
+                    .div_ceil(chunk)
+                    .max(1)
+            } else if is_truncate {
+                1
+            } else {
+                edit.insert_len.div_ceil(chunk).max(1)
+            };
+            crate::storage_bench::record_verified_inline_blob_splice(
+                changed_chunks,
+                successor.manifest.leaf_count as usize,
+            );
+        }
+        self.stage_blob_manifest(&successor.manifest)
+    }
+
     /// Promotes SQL's transport-side splice proof at the publication owner.
     /// The proof is re-bound to the exact BlobRef StateKey on this retained
     /// coherent view, and the authenticated base payload is checked against
@@ -689,33 +864,48 @@ impl PreparedPublication {
         let suffix = provenance.suffix_bytes();
         if prefix > base_len
             || suffix > base_len.saturating_sub(prefix)
-            || prefix
-                .checked_add(suffix)
-                .is_none_or(|bound| bound >= base_len)
+            || !provenance.matches_result(payload.bytes())
         {
             return Err(corruption("request blob splice bounds are invalid"));
         }
         let replacement_len = base_len - prefix - suffix;
         let insert = provenance.insert();
-        if insert.len() != replacement_len || payload.len() != base_len {
-            return Err(corruption(
-                "request blob splice is not a same-length fixed-width replacement",
-            ));
-        }
-        let insert_end = prefix + insert.len();
-        if payload.bytes().get(prefix..insert_end) != Some(insert)
-            || insert_end != base_len - suffix
+        let insert_end = prefix
+            .checked_add(insert.len())
+            .ok_or_else(|| corruption("request blob splice insert range overflows"))?;
+        let expected_output_len = prefix
+            .checked_add(insert.len())
+            .and_then(|length| length.checked_add(suffix))
+            .ok_or_else(|| corruption("request blob splice output length overflows"))?;
+        if payload.len() != expected_output_len
+            || payload.bytes().get(prefix..insert_end) != Some(insert)
         {
             return Err(corruption(
                 "request blob splice bytes do not match its authenticated base",
             ));
         }
+        if insert.len() == replacement_len && payload.len() == base_len {
+            // Preserve the established fixed-width path and its exact
+            // authenticated boundary checks for same-size edits.
+            let splice =
+                BlobSameLengthSplice::new(reference.semantic_id(), prefix, replacement_len);
+            return self
+                .stage_verified_inline_blob_splice_bound(
+                    view, state_key, payload, splice, reference,
+                )
+                .await;
+        }
         // SHA-256 remains transport metadata. The canonical Merkle identity
         // derived from those verified bytes was matched to the exact
         // StateKey-selected BlobRef above; the proof below binds that owner to
         // its manifest root without a backend whole-file witness pass.
-        let splice = BlobSameLengthSplice::new(reference.semantic_id(), prefix, replacement_len);
-        self.stage_verified_inline_blob_splice_bound(view, state_key, payload, splice, reference)
+        let edit = BlobEditSplice {
+            base_blob_hash: reference.semantic_id(),
+            offset: prefix,
+            delete_len: replacement_len,
+            insert_len: insert.len(),
+        };
+        self.stage_verified_inline_blob_edit(view, state_key, payload, edit)
             .await
     }
 

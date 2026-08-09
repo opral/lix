@@ -2085,7 +2085,6 @@ impl TransactionFileContent {
         self.same_length_blob_splice
     }
 
-    #[cfg(test)]
     pub(crate) fn edit_blob_splice(&self) -> Option<BlobEditSplice> {
         self.edit_blob_splice
     }

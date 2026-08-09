@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 
-use crate::binary_cas::BlobId;
+use crate::binary_cas::{BlobEditSplice, BlobId};
 use crate::storage::StorageError;
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -42,6 +42,42 @@ impl NodeSummary {
             leaf_count: self.leaf_count,
             logical_bytes: self.logical_bytes,
         }
+    }
+
+    fn shifted(self, delta: i64) -> Result<Self, StorageError> {
+        let first_ordinal = self
+            .first_ordinal
+            .checked_add_signed(delta)
+            .ok_or_else(|| corruption("Merkle ordinal shift underflows or overflows"))?;
+        Ok(Self {
+            first_ordinal,
+            ..self
+        })
+    }
+}
+
+fn shift_ref(value: BlobMerkleNodeRefV1, delta: i64) -> Result<BlobMerkleNodeRefV1, StorageError> {
+    Ok(NodeSummary {
+        object_id: value.object_id,
+        height: value.height,
+        first_ordinal: value.first_ordinal,
+        leaf_count: value.leaf_count,
+        logical_bytes: value.logical_bytes,
+    }
+    .shifted(delta)?
+    .as_ref())
+}
+
+fn infer_parent_shift(
+    internal: BlobMerkleInternalV1,
+    raw_left: NodeSummary,
+    raw_right: NodeSummary,
+    node_shift: i64,
+) -> i64 {
+    if internal.left == raw_left.as_ref() && internal.right == raw_right.as_ref() {
+        node_shift
+    } else {
+        0
     }
 }
 
@@ -91,6 +127,7 @@ pub(crate) struct BlobMerkleTreeBuild {
 struct BlobMerkleProofPathV1 {
     leaf_object_id: ObjectId,
     leaf_ordinal: u64,
+    ordinal_shift: i64,
     steps: Vec<BlobMerkleProofStepV1>,
 }
 
@@ -99,6 +136,8 @@ struct BlobMerkleProofStepV1 {
     parent_object_id: ObjectId,
     sibling_object_id: ObjectId,
     sibling_is_left: bool,
+    sibling_shift: i64,
+    parent_shift: i64,
 }
 
 /// A bounded range proof containing only requested leaves, their chunk objects,
@@ -301,7 +340,16 @@ where
         loop {
             let node_bytes = load_proof_object(read, &mut loaded, node_id).await?;
             let node = decode_node(node_id, &node_bytes)?;
-            let summary = node.summary(node_id);
+            let raw_summary = node.summary(node_id);
+            let ordinal_shift = i64::try_from(expected_ref.first_ordinal)
+                .ok()
+                .and_then(|expected| {
+                    i64::try_from(raw_summary.first_ordinal)
+                        .ok()
+                        .and_then(|raw| expected.checked_sub(raw))
+                })
+                .ok_or_else(|| corruption("Merkle ordinal shift exceeds i64"))?;
+            let summary = raw_summary.shifted(ordinal_shift)?;
             if summary.as_ref() != expected_ref {
                 return Err(corruption(
                     "Merkle node does not match its authenticated parent summary",
@@ -309,7 +357,7 @@ where
             }
             match node {
                 DecodedNode::Leaf(leaf) => {
-                    if leaf.ordinal != ordinal {
+                    if leaf.ordinal.checked_add_signed(ordinal_shift) != Some(ordinal) {
                         return Err(corruption("Merkle leaf ordinal is not canonical"));
                     }
                     objects.insert(node_id, node_bytes)?;
@@ -319,38 +367,60 @@ where
                     paths.push(BlobMerkleProofPathV1 {
                         leaf_object_id: node_id,
                         leaf_ordinal: ordinal,
+                        ordinal_shift,
                         steps,
                     });
                     break;
                 }
                 DecodedNode::Internal(internal) => {
-                    let in_left = ordinal >= internal.left.first_ordinal
-                        && ordinal < internal.left.first_ordinal + internal.left.leaf_count;
-                    let in_right = ordinal >= internal.right.first_ordinal
-                        && ordinal < internal.right.first_ordinal + internal.right.leaf_count;
+                    let left = shift_ref(internal.left, ordinal_shift)?;
+                    let right = shift_ref(internal.right, ordinal_shift)?;
+                    let in_left = ordinal >= left.first_ordinal
+                        && ordinal < left.first_ordinal + left.leaf_count;
+                    let in_right = ordinal >= right.first_ordinal
+                        && ordinal < right.first_ordinal + right.leaf_count;
                     if in_left == in_right {
                         return Err(corruption(
                             "Merkle ordinal is not covered by exactly one child",
                         ));
                     }
                     let (child, sibling, sibling_is_left) = if in_left {
-                        (internal.left, internal.right, false)
+                        (left, right, false)
                     } else {
-                        (internal.right, internal.left, true)
+                        (right, left, true)
                     };
                     let sibling_bytes =
                         load_proof_object(read, &mut loaded, sibling.object_id).await?;
                     let sibling_node = decode_node(sibling.object_id, &sibling_bytes)?;
-                    if sibling_node.summary(sibling.object_id).as_ref() != sibling {
+                    let raw_sibling = sibling_node.summary(sibling.object_id);
+                    let sibling_shift = i64::try_from(sibling.first_ordinal)
+                        .ok()
+                        .and_then(|expected| {
+                            i64::try_from(raw_sibling.first_ordinal)
+                                .ok()
+                                .and_then(|raw| expected.checked_sub(raw))
+                        })
+                        .ok_or_else(|| corruption("Merkle sibling shift exceeds i64"))?;
+                    if raw_sibling.shifted(sibling_shift)?.as_ref() != sibling {
                         return Err(corruption(
                             "Merkle sibling does not match its authenticated parent summary",
                         ));
                     }
+                    let child_bytes = load_proof_object(read, &mut loaded, child.object_id).await?;
+                    let child_node = decode_node(child.object_id, &child_bytes)?;
+                    let raw_child = child_node.summary(child.object_id);
+                    let parent_shift = if sibling_is_left {
+                        infer_parent_shift(internal, raw_sibling, raw_child, ordinal_shift)
+                    } else {
+                        infer_parent_shift(internal, raw_child, raw_sibling, ordinal_shift)
+                    };
                     objects.insert(sibling.object_id, sibling_bytes)?;
                     steps.push(BlobMerkleProofStepV1 {
                         parent_object_id: node_id,
                         sibling_object_id: sibling.object_id,
                         sibling_is_left,
+                        sibling_shift,
+                        parent_shift,
                     });
                     node_id = child.object_id;
                     expected_ref = child;
@@ -423,7 +493,11 @@ pub(crate) fn materialize_blob_merkle_range(
                 .get(leaf.chunk_object_id)
                 .ok_or_else(|| corruption("Merkle materialization chunk is missing"))?,
         )?;
-        let chunk_start = leaf.ordinal * u64::from(BLOB_MERKLE_CHUNK_BYTES);
+        // The leaf payload may be retained from a subtree whose encoded
+        // ordinal starts at zero.  The proof path carries its authenticated
+        // successor placement; byte materialization must use that logical
+        // ordinal rather than the raw leaf coordinate.
+        let chunk_start = path.leaf_ordinal * u64::from(BLOB_MERKLE_CHUNK_BYTES);
         let start = requested.start.saturating_sub(chunk_start) as usize;
         let end = (requested.end.min(chunk_start + leaf.declared_len) - chunk_start) as usize;
         output.extend_from_slice(&chunk[start..end]);
@@ -447,15 +521,34 @@ pub(crate) fn prove_blob_merkle_range(
     let mut paths = Vec::with_capacity((requested_range.end - requested_range.start) as usize);
     for ordinal in requested_range.clone() {
         let mut steps = Vec::new();
+        let mut leaf_shift = 0_i64;
         collect_path(
             &build.objects,
             build.manifest.root_object_id,
             ordinal,
             &mut objects,
             &mut steps,
+            BlobMerkleNodeRefV1 {
+                object_id: build.manifest.root_object_id,
+                height: build.manifest.root_height,
+                first_ordinal: 0,
+                leaf_count: build.manifest.leaf_count,
+                logical_bytes: build.manifest.logical_bytes,
+            },
+            &mut leaf_shift,
         )?;
-        let leaf_object_id =
-            leaf_id_from_path(&build.objects, build.manifest.root_object_id, ordinal)?;
+        let leaf_object_id = leaf_id_from_path(
+            &build.objects,
+            build.manifest.root_object_id,
+            ordinal,
+            BlobMerkleNodeRefV1 {
+                object_id: build.manifest.root_object_id,
+                height: build.manifest.root_height,
+                first_ordinal: 0,
+                leaf_count: build.manifest.leaf_count,
+                logical_bytes: build.manifest.logical_bytes,
+            },
+        )?;
         let leaf_bytes = build
             .objects
             .get(leaf_object_id)
@@ -470,6 +563,7 @@ pub(crate) fn prove_blob_merkle_range(
         paths.push(BlobMerkleProofPathV1 {
             leaf_object_id,
             leaf_ordinal: ordinal,
+            ordinal_shift: leaf_shift,
             steps,
         });
     }
@@ -521,7 +615,7 @@ pub(crate) fn verify_blob_merkle_range(
             .get(path.leaf_object_id)
             .ok_or_else(|| corruption("Merkle proof leaf object is missing"))?;
         let leaf = decode_leaf(path.leaf_object_id, leaf_bytes)?;
-        if leaf.ordinal != path.leaf_ordinal {
+        if leaf.ordinal.checked_add_signed(path.ordinal_shift) != Some(path.leaf_ordinal) {
             return Err(corruption("Merkle proof leaf ordinal is not object-bound"));
         }
         if leaf.declared_len == 0
@@ -547,7 +641,9 @@ pub(crate) fn verify_blob_merkle_range(
             ));
         }
 
-        let mut current = DecodedNode::Leaf(leaf).summary(path.leaf_object_id);
+        let mut current = DecodedNode::Leaf(leaf)
+            .summary(path.leaf_object_id)
+            .shifted(path.ordinal_shift)?;
         let mut visited_parents = BTreeSet::new();
         if path.steps.len() > MAX_PROOF_DEPTH {
             return Err(corruption("Merkle proof exceeds the maximum tree depth"));
@@ -562,10 +658,20 @@ pub(crate) fn verify_blob_merkle_range(
                 .ok_or_else(|| corruption("Merkle proof sibling object is missing"))?;
             let sibling = decode_node(step.sibling_object_id, sibling_bytes)?;
             let sibling_summary = sibling.summary(step.sibling_object_id);
+            let local_shift = step
+                .sibling_shift
+                .checked_sub(step.parent_shift)
+                .ok_or_else(|| corruption("Merkle proof sibling shift overflows"))?;
+            let sibling_local = sibling_summary.shifted(local_shift)?;
+            let current_local = current.shifted(
+                step.parent_shift
+                    .checked_neg()
+                    .ok_or_else(|| corruption("Merkle proof parent shift overflows"))?,
+            )?;
             let (left, right) = if step.sibling_is_left {
-                (sibling_summary, current)
+                (sibling_local, current_local)
             } else {
-                (current, sibling_summary)
+                (current_local, sibling_local)
             };
             let parent = encode_internal(left, right)?;
             if parent.object_id != step.parent_object_id {
@@ -577,7 +683,8 @@ pub(crate) fn verify_blob_merkle_range(
                 first_ordinal: parent.value.first_ordinal,
                 leaf_count: parent.value.leaf_count,
                 logical_bytes: parent.value.logical_bytes,
-            };
+            }
+            .shifted(step.parent_shift)?;
         }
         if current.object_id != expected_manifest.root_object_id
             || current.first_ordinal != 0
@@ -734,6 +841,338 @@ pub(crate) fn build_blob_merkle_successor(
     if manifest.canonical_blob_id != canonical_blob_id_from_summary(root) {
         return Err(corruption("Merkle successor identity is inconsistent"));
     }
+    Ok(BlobMerkleTreeBuild { manifest, objects })
+}
+
+/// Builds a variable-length successor without materializing the base file.
+///
+/// The existing fixed-chunk tree is treated as a persistent sequence.  The
+/// prefix and suffix are recovered from one-leaf authenticated paths; only
+/// boundary/insert chunks and the new internal path objects are encoded.  A
+/// shifted child summary is an authenticated placement change, not a copied
+/// subtree: the child ObjectId and all of its bytes remain unchanged.
+pub(crate) fn build_blob_merkle_edit_successor(
+    base_manifest: BlobManifestV1,
+    prefix_proof: Option<&BlobMerkleProofV1>,
+    suffix_proof: Option<&BlobMerkleProofV1>,
+    state_key: &StateKey,
+    output: &[u8],
+    edit: BlobEditSplice,
+) -> Result<BlobMerkleTreeBuild, StorageError> {
+    let base_len = usize::try_from(base_manifest.logical_bytes)
+        .map_err(|_| corruption("Merkle base length exceeds usize"))?;
+    let expected_len = base_len
+        .checked_sub(edit.delete_len)
+        .and_then(|length| length.checked_add(edit.insert_len))
+        .ok_or_else(|| corruption("variable blob splice length overflows"))?;
+    if edit.base_blob_hash != base_manifest.canonical_blob_id
+        || output.len() != expected_len
+        || edit.offset > base_len
+        || edit.delete_len > base_len.saturating_sub(edit.offset)
+    {
+        return Err(corruption("variable blob splice is not bound to its base"));
+    }
+    if let Some(proof) = prefix_proof {
+        verify_blob_merkle_range(
+            proof,
+            state_key,
+            base_manifest,
+            proof.requested_range.clone(),
+        )?;
+    }
+    if let Some(proof) = suffix_proof {
+        verify_blob_merkle_range(
+            proof,
+            state_key,
+            base_manifest,
+            proof.requested_range.clone(),
+        )?;
+    }
+    let chunk = CANONICAL_BLOB_CHUNK_BYTES;
+
+    // Empty output has one canonical empty leaf and no old closure to retain.
+    if output.is_empty() {
+        return build_blob_merkle_tree(&[BlobChunkV1 {
+            bytes: Bytes::new(),
+        }]);
+    }
+
+    let old_end = edit
+        .offset
+        .checked_add(edit.delete_len)
+        .ok_or_else(|| corruption("variable blob splice end overflows"))?;
+    let is_append = old_end == base_len && edit.offset == base_len;
+    let is_truncate = edit.insert_len == 0 && old_end == base_len;
+
+    // Append and truncate can always preserve the existing fixed geometry,
+    // including a short final chunk.  The affected suffix is rebuilt from the
+    // submitted bytes; the preceding root is path-copied.
+    if is_append || is_truncate {
+        if is_append {
+            let affected_start = if base_len == 0 {
+                0
+            } else {
+                base_len / chunk * chunk
+            };
+            let affected_ordinal = (affected_start / chunk) as u64;
+            let prefix = if affected_ordinal == 0 {
+                None
+            } else {
+                let proof =
+                    prefix_proof.ok_or_else(|| corruption("append prefix proof is missing"))?;
+                Some(prefix_root_from_path(proof, None, 0)?)
+            };
+            let suffix = build_fragment(&output[affected_start..], affected_ordinal)?;
+            return join_edit_parts(output.len() as u64, vec![prefix, Some(suffix)]);
+        }
+
+        let affected_start = output.len() / chunk * chunk;
+        let affected_ordinal = (affected_start / chunk) as u64;
+        if affected_ordinal == 0 {
+            return build_blob_merkle_tree(&[BlobChunkV1 {
+                bytes: Bytes::copy_from_slice(output),
+            }]);
+        }
+        let proof = prefix_proof.ok_or_else(|| corruption("truncate prefix proof is missing"))?;
+        let replacement = if output.len() % chunk == 0 {
+            None
+        } else {
+            Some(BlobChunkV1 {
+                bytes: Bytes::copy_from_slice(&output[affected_start..]),
+            })
+        };
+        let prefix = prefix_root_from_path(proof, replacement, 0)?;
+        let result = join_edit_parts(output.len() as u64, vec![Some(prefix)])?;
+        return Ok(result);
+    }
+
+    // Reusing fixed chunks across a middle edit is only authenticated when the
+    // edit preserves chunk boundaries.  Rejecting other edits is intentional:
+    // it prevents the old full-payload staging path from becoming a hidden
+    // compatibility fallback.
+    if edit.offset % chunk != 0 || edit.delete_len % chunk != 0 || edit.insert_len % chunk != 0 {
+        return Err(corruption(
+            "unaligned middle blob splice has no authenticated chunk-preserving lowering",
+        ));
+    }
+    let prefix_chunks = edit.offset / chunk;
+    let suffix_old_start = old_end;
+    let prefix = if prefix_chunks == 0 {
+        None
+    } else {
+        let proof =
+            prefix_proof.ok_or_else(|| corruption("middle splice prefix proof is missing"))?;
+        Some(prefix_root_from_path(proof, None, 0)?)
+    };
+    let insert = if edit.insert_len == 0 {
+        None
+    } else {
+        let build = build_fragment(
+            &output[edit.offset..edit.offset + edit.insert_len],
+            prefix_chunks as u64,
+        )?;
+        Some(build)
+    };
+    let suffix = if suffix_old_start == base_len {
+        None
+    } else {
+        let proof =
+            suffix_proof.ok_or_else(|| corruption("middle splice suffix proof is missing"))?;
+        let root = suffix_root_from_path(proof, None)?;
+        let shift = (edit.insert_len as i64 - edit.delete_len as i64) / chunk as i64;
+        Some((root.0.shifted(shift)?, root.1))
+    };
+    let mut parts = Vec::new();
+    parts.push(prefix);
+    parts.push(insert);
+    parts.push(suffix);
+    let _ = base_manifest;
+    join_edit_parts(output.len() as u64, parts)
+}
+
+fn build_fragment(
+    bytes: &[u8],
+    first_ordinal: u64,
+) -> Result<(NodeSummary, ImmutableObjectSet), StorageError> {
+    let chunks = if bytes.is_empty() {
+        return Err(corruption("empty Merkle fragment is not a tree part"));
+    } else {
+        bytes
+            .chunks(CANONICAL_BLOB_CHUNK_BYTES)
+            .map(|bytes| BlobChunkV1 {
+                bytes: Bytes::copy_from_slice(bytes),
+            })
+            .collect::<Vec<_>>()
+    };
+    let build = build_blob_merkle_tree(&chunks)?;
+    let root = NodeSummary {
+        object_id: build.manifest.root_object_id,
+        height: build.manifest.root_height,
+        first_ordinal: first_ordinal,
+        leaf_count: build.manifest.leaf_count,
+        logical_bytes: build.manifest.logical_bytes,
+    };
+    let objects = build.objects;
+    Ok((root, objects))
+}
+
+fn prefix_root_from_path(
+    proof: &BlobMerkleProofV1,
+    replacement: Option<BlobChunkV1>,
+    _shift: i64,
+) -> Result<(NodeSummary, ImmutableObjectSet), StorageError> {
+    let path = proof
+        .paths
+        .first()
+        .ok_or_else(|| corruption("prefix proof has no path"))?;
+    let leaf_bytes = proof
+        .objects
+        .get(path.leaf_object_id)
+        .ok_or_else(|| corruption("prefix proof leaf is missing"))?;
+    let old_leaf = decode_leaf(path.leaf_object_id, leaf_bytes)?;
+    let mut objects = ImmutableObjectSet::default();
+    let mut current = if let Some(replacement) = replacement {
+        let (chunk_id, chunk_bytes) = replacement.encode()?;
+        objects.insert(chunk_id, chunk_bytes)?;
+        let leaf = BlobMerkleLeafV1 {
+            ordinal: old_leaf.ordinal,
+            chunk_object_id: chunk_id,
+            declared_len: replacement.bytes.len() as u64,
+            chunk_digest: *blake3::hash(&replacement.bytes).as_bytes(),
+        };
+        let (leaf_id, leaf_bytes) = encode_leaf(&leaf)?;
+        objects.insert(leaf_id, leaf_bytes)?;
+        NodeSummary {
+            object_id: leaf_id,
+            height: 0,
+            first_ordinal: leaf.ordinal,
+            leaf_count: 1,
+            logical_bytes: leaf.declared_len,
+        }
+    } else {
+        DecodedNode::Leaf(old_leaf).summary(path.leaf_object_id)
+    };
+    let mut removed_leaves = 0_i64;
+    for step in path.steps.iter().rev() {
+        let sibling_bytes = proof
+            .objects
+            .get(step.sibling_object_id)
+            .ok_or_else(|| corruption("prefix proof sibling is missing"))?;
+        let sibling =
+            decode_node(step.sibling_object_id, sibling_bytes)?.summary(step.sibling_object_id);
+        if step.sibling_is_left {
+            let encoded = encode_internal(sibling, current)?;
+            objects.insert(encoded.object_id, encoded.bytes.clone())?;
+            current = encoded_summary(encoded);
+        } else {
+            removed_leaves = removed_leaves.saturating_add(sibling.leaf_count as i64);
+        }
+    }
+    let _ = removed_leaves;
+    Ok((current, objects))
+}
+
+fn suffix_root_from_path(
+    proof: &BlobMerkleProofV1,
+    replacement: Option<BlobChunkV1>,
+) -> Result<(NodeSummary, ImmutableObjectSet), StorageError> {
+    let path = proof
+        .paths
+        .first()
+        .ok_or_else(|| corruption("suffix proof has no path"))?;
+    let leaf_bytes = proof
+        .objects
+        .get(path.leaf_object_id)
+        .ok_or_else(|| corruption("suffix proof leaf is missing"))?;
+    let old_leaf = decode_leaf(path.leaf_object_id, leaf_bytes)?;
+    let mut current = if let Some(replacement) = replacement {
+        let (chunk_id, _) = replacement.encode()?;
+        let leaf = BlobMerkleLeafV1 {
+            ordinal: old_leaf.ordinal,
+            chunk_object_id: chunk_id,
+            declared_len: replacement.bytes.len() as u64,
+            chunk_digest: *blake3::hash(&replacement.bytes).as_bytes(),
+        };
+        let (leaf_id, _) = encode_leaf(&leaf)?;
+        NodeSummary {
+            object_id: leaf_id,
+            height: 0,
+            first_ordinal: leaf.ordinal,
+            leaf_count: 1,
+            logical_bytes: leaf.declared_len,
+        }
+    } else {
+        DecodedNode::Leaf(old_leaf).summary(path.leaf_object_id)
+    };
+    let mut objects = ImmutableObjectSet::default();
+    for step in path.steps.iter().rev() {
+        if step.sibling_is_left {
+            continue;
+        }
+        let sibling_bytes = proof
+            .objects
+            .get(step.sibling_object_id)
+            .ok_or_else(|| corruption("suffix proof sibling is missing"))?;
+        let sibling =
+            decode_node(step.sibling_object_id, sibling_bytes)?.summary(step.sibling_object_id);
+        let encoded = encode_internal(current, sibling)?;
+        objects.insert(encoded.object_id, encoded.bytes.clone())?;
+        current = encoded_summary(encoded);
+    }
+    Ok((current, objects))
+}
+
+fn encoded_summary(value: EncodedInternal) -> NodeSummary {
+    NodeSummary {
+        object_id: value.object_id,
+        height: value.value.height,
+        first_ordinal: value.value.first_ordinal,
+        leaf_count: value.value.leaf_count,
+        logical_bytes: value.value.logical_bytes,
+    }
+}
+
+fn join_edit_parts(
+    logical_bytes: u64,
+    parts: Vec<Option<(NodeSummary, ImmutableObjectSet)>>,
+) -> Result<BlobMerkleTreeBuild, StorageError> {
+    let mut parts = parts.into_iter().flatten();
+    let (mut root, mut objects) = parts
+        .next()
+        .ok_or_else(|| corruption("variable blob splice produced no tree parts"))?;
+    // A deletion/replacement beginning at byte zero can retain a suffix
+    // subtree as the complete successor. Its authenticated raw coordinates
+    // still begin at the old ordinal; the manifest's implicit root coordinate
+    // is zero, so carry the placement as proof metadata rather than rewriting
+    // the retained subtree.
+    if root.first_ordinal != 0 {
+        let shift = i64::try_from(root.first_ordinal)
+            .ok()
+            .and_then(i64::checked_neg)
+            .ok_or_else(|| corruption("variable blob splice root shift overflows"))?;
+        root = root.shifted(shift)?;
+    }
+    for (part, part_objects) in parts {
+        objects.extend(part_objects)?;
+        let encoded = encode_internal(root, part)?;
+        objects.insert(encoded.object_id, encoded.bytes.clone())?;
+        root = encoded_summary(encoded);
+    }
+    let expected_count = logical_bytes
+        .div_ceil(CANONICAL_BLOB_CHUNK_BYTES as u64)
+        .max(1);
+    if root.first_ordinal != 0
+        || root.logical_bytes != logical_bytes
+        || root.leaf_count != expected_count
+    {
+        return Err(corruption("variable blob splice root geometry is invalid"));
+    }
+    let manifest = BlobManifestV1::from_merkle_root(
+        logical_bytes,
+        root.leaf_count,
+        root.object_id,
+        root.height,
+    );
     Ok(BlobMerkleTreeBuild { manifest, objects })
 }
 
@@ -991,33 +1430,76 @@ fn collect_path(
     target_ordinal: u64,
     proof_objects: &mut ImmutableObjectSet,
     steps: &mut Vec<BlobMerkleProofStepV1>,
+    expected_ref: BlobMerkleNodeRefV1,
+    leaf_shift: &mut i64,
 ) -> Result<(), StorageError> {
     let bytes = objects
         .get(node_id)
         .ok_or_else(|| corruption("Merkle tree node is missing during proof build"))?;
-    match decode_node(node_id, bytes)? {
+    let node = decode_node(node_id, bytes)?;
+    let raw_summary = node.summary(node_id);
+    let ordinal_shift = i64::try_from(expected_ref.first_ordinal)
+        .ok()
+        .and_then(|expected| {
+            i64::try_from(raw_summary.first_ordinal)
+                .ok()
+                .and_then(|raw| expected.checked_sub(raw))
+        })
+        .ok_or_else(|| corruption("Merkle ordinal shift exceeds i64"))?;
+    if raw_summary.shifted(ordinal_shift)?.as_ref() != expected_ref {
+        return Err(corruption("Merkle tree node summary is not authenticated"));
+    }
+    match node {
         DecodedNode::Leaf(leaf) => {
-            if leaf.ordinal != target_ordinal {
+            if leaf.ordinal.checked_add_signed(ordinal_shift) != Some(target_ordinal) {
                 return Err(corruption("Merkle tree leaf ordinal is not canonical"));
             }
+            *leaf_shift = ordinal_shift;
             Ok(())
         }
         DecodedNode::Internal(internal) => {
-            let in_left = target_ordinal >= internal.left.first_ordinal
-                && target_ordinal < internal.left.first_ordinal + internal.left.leaf_count;
+            let left = shift_ref(internal.left, ordinal_shift)?;
+            let right = shift_ref(internal.right, ordinal_shift)?;
+            let in_left = target_ordinal >= left.first_ordinal
+                && target_ordinal < left.first_ordinal + left.leaf_count;
             let (child, sibling, sibling_is_left) = if in_left {
-                (internal.left, internal.right, false)
+                (left, right, false)
             } else {
-                (internal.right, internal.left, true)
+                (right, left, true)
             };
             let sibling_bytes = objects
                 .get(sibling.object_id)
                 .ok_or_else(|| corruption("Merkle sibling is missing during proof build"))?;
             proof_objects.insert(sibling.object_id, sibling_bytes.clone())?;
+            let sibling_node = decode_node(sibling.object_id, sibling_bytes)?;
+            let raw_sibling = sibling_node.summary(sibling.object_id);
+            let sibling_shift = i64::try_from(sibling.first_ordinal)
+                .ok()
+                .and_then(|expected| {
+                    i64::try_from(raw_sibling.first_ordinal)
+                        .ok()
+                        .and_then(|raw| expected.checked_sub(raw))
+                })
+                .ok_or_else(|| corruption("Merkle sibling shift exceeds i64"))?;
+            if raw_sibling.shifted(sibling_shift)?.as_ref() != sibling {
+                return Err(corruption("Merkle sibling summary is not authenticated"));
+            }
+            let child_bytes = objects
+                .get(child.object_id)
+                .ok_or_else(|| corruption("Merkle child is missing during proof build"))?;
+            let child_node = decode_node(child.object_id, child_bytes)?;
+            let raw_child = child_node.summary(child.object_id);
+            let parent_shift = if sibling_is_left {
+                infer_parent_shift(internal, raw_sibling, raw_child, ordinal_shift)
+            } else {
+                infer_parent_shift(internal, raw_child, raw_sibling, ordinal_shift)
+            };
             steps.push(BlobMerkleProofStepV1 {
                 parent_object_id: node_id,
                 sibling_object_id: sibling.object_id,
                 sibling_is_left,
+                sibling_shift,
+                parent_shift,
             });
             collect_path(
                 objects,
@@ -1025,6 +1507,8 @@ fn collect_path(
                 target_ordinal,
                 proof_objects,
                 steps,
+                child,
+                leaf_shift,
             )
         }
     }
@@ -1034,22 +1518,42 @@ fn leaf_id_from_path(
     objects: &ImmutableObjectSet,
     node_id: ObjectId,
     target_ordinal: u64,
+    expected_ref: BlobMerkleNodeRefV1,
 ) -> Result<ObjectId, StorageError> {
     let bytes = objects
         .get(node_id)
         .ok_or_else(|| corruption("Merkle root is missing during leaf lookup"))?;
-    match decode_node(node_id, bytes)? {
-        DecodedNode::Leaf(leaf) if leaf.ordinal == target_ordinal => Ok(node_id),
+    let node = decode_node(node_id, bytes)?;
+    let raw_summary = node.summary(node_id);
+    let ordinal_shift = i64::try_from(expected_ref.first_ordinal)
+        .ok()
+        .and_then(|expected| {
+            i64::try_from(raw_summary.first_ordinal)
+                .ok()
+                .and_then(|raw| expected.checked_sub(raw))
+        })
+        .ok_or_else(|| corruption("Merkle ordinal shift exceeds i64"))?;
+    if raw_summary.shifted(ordinal_shift)?.as_ref() != expected_ref {
+        return Err(corruption("Merkle tree node summary is not authenticated"));
+    }
+    match node {
+        DecodedNode::Leaf(leaf)
+            if leaf.ordinal.checked_add_signed(ordinal_shift) == Some(target_ordinal) =>
+        {
+            Ok(node_id)
+        }
         DecodedNode::Leaf(_) => Err(corruption("Merkle leaf ordinal is not canonical")),
         DecodedNode::Internal(internal) => {
-            let child = if target_ordinal >= internal.left.first_ordinal
-                && target_ordinal < internal.left.first_ordinal + internal.left.leaf_count
+            let left = shift_ref(internal.left, ordinal_shift)?;
+            let right = shift_ref(internal.right, ordinal_shift)?;
+            let child = if target_ordinal >= left.first_ordinal
+                && target_ordinal < left.first_ordinal + left.leaf_count
             {
-                internal.left.object_id
+                left
             } else {
-                internal.right.object_id
+                right
             };
-            leaf_id_from_path(objects, child, target_ordinal)
+            leaf_id_from_path(objects, child.object_id, target_ordinal, child)
         }
     }
 }
@@ -1102,6 +1606,32 @@ mod tests {
             .collect()
     }
 
+    fn assert_edit_materializes(
+        expected: &[u8],
+        build: BlobMerkleTreeBuild,
+        base: &BlobMerkleTreeBuild,
+    ) {
+        let key = state_key();
+        let mut objects = base.objects.clone();
+        objects.extend(build.objects.clone()).unwrap();
+        let combined = BlobMerkleTreeBuild {
+            manifest: build.manifest,
+            objects,
+        };
+        let proof =
+            prove_blob_merkle_range(&combined, &key, 0..combined.manifest.leaf_count).unwrap();
+        assert_eq!(
+            materialize_blob_merkle_range(
+                &proof,
+                &key,
+                combined.manifest,
+                0..expected.len() as u64,
+            )
+            .unwrap(),
+            expected
+        );
+    }
+
     #[test]
     fn empty_blob_has_one_canonical_authenticated_leaf() {
         let build = build_blob_merkle_tree(&[BlobChunkV1 {
@@ -1148,10 +1678,8 @@ mod tests {
         let mut substituted = nonempty.clone();
         substituted.manifest =
             BlobManifestV1::from_merkle_root(0, 1, nonempty.manifest.root_object_id, 0);
-        let substituted_proof = prove_blob_merkle_range(&substituted, &key, 0..1).unwrap();
         assert!(
-            verify_blob_merkle_range(&substituted_proof, &key, substituted.manifest, 0..1,)
-                .is_err(),
+            prove_blob_merkle_range(&substituted, &key, 0..1).is_err(),
             "a non-empty leaf cannot substitute for the canonical empty root"
         );
     }
@@ -1374,5 +1902,112 @@ mod tests {
         let mut wrong_manifest = base.manifest;
         wrong_manifest.root_object_id = ObjectId::from_bytes([0xefu8; 32]);
         assert!(verify_blob_merkle_range(&proof, &key, wrong_manifest, 1..2).is_err());
+    }
+
+    #[test]
+    fn variable_append_and_aligned_middle_edit_reuse_authenticated_subtrees() {
+        let base = build_blob_merkle_tree(&chunks(4)).unwrap();
+        let key = state_key();
+        let mut base_bytes = Vec::new();
+        for chunk in chunks(4) {
+            base_bytes.extend_from_slice(&chunk.bytes);
+        }
+
+        let suffix = vec![0x55; CANONICAL_BLOB_CHUNK_BYTES];
+        let mut appended = base_bytes.clone();
+        appended.extend_from_slice(&suffix);
+        let append_proof = prove_blob_merkle_range(&base, &key, 3..4).unwrap();
+        let append = build_blob_merkle_edit_successor(
+            base.manifest,
+            Some(&append_proof),
+            None,
+            &key,
+            &appended,
+            BlobEditSplice {
+                base_blob_hash: base.manifest.canonical_blob_id,
+                offset: base_bytes.len(),
+                delete_len: 0,
+                insert_len: suffix.len(),
+            },
+        )
+        .unwrap();
+        assert_edit_materializes(&appended, append, &base);
+
+        let truncated_len = CANONICAL_BLOB_CHUNK_BYTES * 2 + 123;
+        let truncated = base_bytes[..truncated_len].to_vec();
+        let truncate_proof = prove_blob_merkle_range(&base, &key, 2..3).unwrap();
+        let truncate = build_blob_merkle_edit_successor(
+            base.manifest,
+            Some(&truncate_proof),
+            None,
+            &key,
+            &truncated,
+            BlobEditSplice {
+                base_blob_hash: base.manifest.canonical_blob_id,
+                offset: truncated_len,
+                delete_len: base_bytes.len() - truncated_len,
+                insert_len: 0,
+            },
+        )
+        .unwrap();
+        assert_edit_materializes(&truncated, truncate, &base);
+
+        let inserted = vec![0x77; CANONICAL_BLOB_CHUNK_BYTES * 2];
+        let mut middle = base_bytes[..CANONICAL_BLOB_CHUNK_BYTES].to_vec();
+        middle.extend_from_slice(&inserted);
+        middle.extend_from_slice(&base_bytes[CANONICAL_BLOB_CHUNK_BYTES * 2..]);
+        let prefix_proof = prove_blob_merkle_range(&base, &key, 0..1).unwrap();
+        let suffix_proof = prove_blob_merkle_range(&base, &key, 2..3).unwrap();
+        let middle_build = build_blob_merkle_edit_successor(
+            base.manifest,
+            Some(&prefix_proof),
+            Some(&suffix_proof),
+            &key,
+            &middle,
+            BlobEditSplice {
+                base_blob_hash: base.manifest.canonical_blob_id,
+                offset: CANONICAL_BLOB_CHUNK_BYTES,
+                delete_len: CANONICAL_BLOB_CHUNK_BYTES,
+                insert_len: inserted.len(),
+            },
+        )
+        .unwrap();
+        assert_edit_materializes(&middle, middle_build, &base);
+
+        let suffix_only = base_bytes[CANONICAL_BLOB_CHUNK_BYTES * 2..].to_vec();
+        let suffix_proof = prove_blob_merkle_range(&base, &key, 2..3).unwrap();
+        let suffix_delete = build_blob_merkle_edit_successor(
+            base.manifest,
+            None,
+            Some(&suffix_proof),
+            &key,
+            &suffix_only,
+            BlobEditSplice {
+                base_blob_hash: base.manifest.canonical_blob_id,
+                offset: 0,
+                delete_len: CANONICAL_BLOB_CHUNK_BYTES * 2,
+                insert_len: 0,
+            },
+        )
+        .unwrap();
+        assert_edit_materializes(&suffix_only, suffix_delete, &base);
+
+        let unaligned = BlobEditSplice {
+            base_blob_hash: base.manifest.canonical_blob_id,
+            offset: 1,
+            delete_len: 1,
+            insert_len: 2,
+        };
+        assert!(
+            build_blob_merkle_edit_successor(
+                base.manifest,
+                None,
+                None,
+                &key,
+                &base_bytes,
+                unaligned,
+            )
+            .is_err()
+        );
     }
 }
