@@ -6491,11 +6491,11 @@ where
         &self,
     ) -> TransactionValidationLiveStateReader<SharedStorageAdapterRead<StorageImpl::Read<'static>>>
     {
-        let read = self.opening_read();
+        let forktree = self.forktree_read_facade();
         TransactionValidationLiveStateReader {
-            forktree: ForkTreeReadFacade::new(read.clone()),
+            forktree: forktree.clone(),
             graph: Arc::new(tokio::sync::Mutex::new(
-                CommitGraphContext::new().reader(ForkTreeReadFacade::new(read)),
+                CommitGraphContext::new().reader(forktree),
             )),
         }
     }
@@ -8772,6 +8772,27 @@ mod transaction_validation_reader_tests {
         assert!(!reader.contains("derived_validation_reader"));
         assert!(!reader.contains("branch_ctx.ref_reader"));
         assert!(!reader.contains("LiveStateStoreReader"));
+    }
+
+    #[test]
+    fn validation_reader_reuses_one_forktree_facade_for_graph_and_state() {
+        let source = include_str!("context.rs");
+        let start = source
+            .find("fn validation_live_state_reader(")
+            .expect("validation reader constructor");
+        let end = source[start..]
+            .find("/// Convenience helper for programmatic APIs")
+            .map(|offset| start + offset)
+            .expect("validation reader constructor end");
+        let constructor = &source[start..end];
+        assert!(constructor.contains("let forktree = self.forktree_read_facade();"));
+        assert!(constructor.contains("forktree: forktree.clone()"));
+        assert!(constructor.contains("CommitGraphContext::new().reader(forktree)"));
+        assert_eq!(
+            constructor.matches("ForkTreeReadFacade::new").count(),
+            0,
+            "validation must use the existing typed operation facade"
+        );
     }
 
     #[test]
