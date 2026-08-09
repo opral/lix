@@ -382,7 +382,16 @@ fn plugin_digest(rows: &BTreeMap<String, VisibleRow>) -> u64 {
     })
 }
 
-fn run_success(adapter: Adapter, page_size: usize) -> (ModelStore, Counters, u64, u64) {
+fn semantic_digest(rows: &BTreeMap<String, VisibleRow>) -> u64 {
+    rows.values().fold(0xcbf29ce484222325, |hash, row| {
+        digest(&format!(
+            "{hash}:semantic:{}:{}:{}",
+            row.file_id, row.size, row.digest
+        ))
+    })
+}
+
+fn run_success(adapter: Adapter, page_size: usize) -> (ModelStore, Counters, u64, u64, u64) {
     let payloads = fixture();
     let total_payload = payloads.iter().map(|payload| payload.size).sum::<usize>();
     let mut store = ModelStore::new(adapter);
@@ -405,6 +414,10 @@ fn run_success(adapter: Adapter, page_size: usize) -> (ModelStore, Counters, u64
     let counters = store.commit(transaction).expect("one semantic commit");
     let reopened = store.cold_reopen();
     assert_eq!(tree_digest(&store.rows), tree_digest(&reopened.rows));
+    assert_eq!(
+        semantic_digest(&store.rows),
+        semantic_digest(&reopened.rows)
+    );
     assert_eq!(store.marker, Some("commit-65".to_owned()));
     assert_eq!(reopened.marker, store.marker);
     assert_eq!(store.rows.len(), FILES);
@@ -422,7 +435,8 @@ fn run_success(adapter: Adapter, page_size: usize) -> (ModelStore, Counters, u64
     assert!(counters.prepared_object_payload_bytes >= total_payload);
     let tree = tree_digest(&store.rows);
     let plugin = plugin_digest(&store.rows);
-    (reopened, counters, tree, plugin)
+    let semantic = semantic_digest(&store.rows);
+    (reopened, counters, tree, plugin, semantic)
 }
 
 fn corrupt(receipt: &mut PreparedReceipt, fault: Fault) {
@@ -484,14 +498,15 @@ mod tests {
             .collect::<Vec<_>>();
         let mut reference = None;
         for page_size in [1, 8, 32, 64] {
-            let (store, counters, tree, plugin) = run_success(Adapter::Memory, page_size);
+            let (store, counters, tree, plugin, semantic) = run_success(Adapter::Memory, page_size);
             assert_eq!(store.rows.keys().cloned().collect::<Vec<_>>(), expected_ids);
             assert!(counters.peak_transaction_retained_payload_bytes < PAYLOAD_BYTES * FILES);
-            if let Some((expected_tree, expected_plugin)) = reference {
+            if let Some((expected_tree, expected_plugin, expected_semantic)) = reference {
                 assert_eq!(tree, expected_tree);
                 assert_eq!(plugin, expected_plugin);
+                assert_eq!(semantic, expected_semantic);
             } else {
-                reference = Some((tree, plugin));
+                reference = Some((tree, plugin, semantic));
             }
         }
     }
@@ -500,13 +515,13 @@ mod tests {
     fn simulated_memory_rocks_and_slate_cold_reopen_are_identical() {
         let mut digests = None;
         for adapter in [Adapter::Memory, Adapter::RocksDb, Adapter::SlateDb] {
-            let (store, counters, tree, plugin) = run_success(adapter, 8);
+            let (store, counters, tree, plugin, semantic) = run_success(adapter, 8);
             assert_eq!(store.adapter, adapter);
             assert_eq!(counters.semantic_markers, 1);
             if let Some(expected) = digests {
-                assert_eq!((tree, plugin), expected);
+                assert_eq!((tree, plugin, semantic), expected);
             } else {
-                digests = Some((tree, plugin));
+                digests = Some((tree, plugin, semantic));
             }
         }
     }
