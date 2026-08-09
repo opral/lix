@@ -1781,6 +1781,7 @@ impl PreparedPublication {
     /// catalog pruning under the same epoch. The path-copied catalog edits are
     /// the retirement proof; immutable branch/commit/state objects become
     /// sweep candidates only after this selector/catalog move commits.
+    #[cfg(test)]
     pub(crate) fn publish_branch_retirement<R>(
         &mut self,
         view: &CoherentView<R>,
