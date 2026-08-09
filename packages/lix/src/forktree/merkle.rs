@@ -9,7 +9,8 @@ use crate::storage::StorageError;
 use super::blob::CANONICAL_BLOB_CHUNK_BYTES;
 use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
-    BlobChunkV1, BlobMerkleInternalV1, BlobMerkleLeafV1, BlobMerkleManifestV1, BlobMerkleNodeRefV1,
+    BLOB_MERKLE_CHUNK_BYTES, BlobChunkV1, BlobManifestV1, BlobMerkleInternalV1, BlobMerkleLeafV1,
+    BlobMerkleNodeRefV1, canonical_merkle_blob_id,
 };
 use super::object::{
     ObjectDomain, ObjectId, authenticate_object_domain, decode_id, decode_object, encode_id,
@@ -19,8 +20,6 @@ use super::state::{StateKey, StateKeyRef, encode_state_key};
 use super::tree::ImmutableObjectSet;
 
 const MERKLE_STATE_BINDING_DOMAIN: &str = "lix forktree blob merkle state binding v1";
-const MERKLE_BLOB_ID_DOMAIN: &str = "lix binary blob canonical merkle identity v1";
-const MERKLE_BLOB_ID_MAGIC: &[u8; 8] = b"LIXBMRK\0";
 const MAX_PROOF_DEPTH: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +81,7 @@ impl DecodedNode {
 /// objects into its existing PreparedPublication.
 #[derive(Clone, Debug)]
 pub(crate) struct BlobMerkleTreeBuild {
-    pub(crate) manifest: BlobMerkleManifestV1,
+    pub(crate) manifest: BlobManifestV1,
     pub(crate) objects: ImmutableObjectSet,
 }
 
@@ -105,7 +104,7 @@ struct BlobMerkleProofStepV1 {
 /// storage handle, cache, or writer capability.
 #[derive(Clone, Debug)]
 pub(crate) struct BlobMerkleProofV1 {
-    pub(crate) manifest: BlobMerkleManifestV1,
+    pub(crate) manifest: BlobManifestV1,
     pub(crate) requested_range: Range<u64>,
     state_binding: [u8; 32],
     paths: Vec<BlobMerkleProofPathV1>,
@@ -113,7 +112,7 @@ pub(crate) struct BlobMerkleProofV1 {
 }
 
 impl BlobMerkleProofV1 {
-    pub(crate) fn manifest(&self) -> BlobMerkleManifestV1 {
+    pub(crate) fn manifest(&self) -> BlobManifestV1 {
         self.manifest
     }
 
@@ -170,13 +169,12 @@ pub(crate) fn build_blob_merkle_tree(
     if root.first_ordinal != 0 || root.leaf_count != leaves.len() as u64 {
         return Err(corruption("Merkle root does not cover every leaf"));
     }
-    let canonical_blob_id = canonical_blob_id_from_summary(root);
-    let manifest = BlobMerkleManifestV1 {
+    let manifest = BlobManifestV1::from_merkle_root(
         logical_bytes,
-        leaf_count: leaves.len() as u64,
-        root_object_id: root.object_id,
-        canonical_blob_id,
-    };
+        leaves.len() as u64,
+        root.object_id,
+        root.height,
+    );
     Ok(BlobMerkleTreeBuild { manifest, objects })
 }
 
@@ -234,7 +232,7 @@ pub(crate) fn prove_blob_merkle_range(
 pub(crate) fn verify_blob_merkle_range(
     proof: &BlobMerkleProofV1,
     state_key: &StateKey,
-    expected_manifest: BlobMerkleManifestV1,
+    expected_manifest: BlobManifestV1,
     requested_range: Range<u64>,
 ) -> Result<(), StorageError> {
     if proof.manifest != expected_manifest || proof.requested_range != requested_range {
@@ -346,7 +344,7 @@ pub(crate) fn verify_blob_merkle_range(
 pub(crate) fn derive_blob_merkle_successor_id(
     proof: &BlobMerkleProofV1,
     state_key: &StateKey,
-    expected_manifest: BlobMerkleManifestV1,
+    expected_manifest: BlobManifestV1,
     requested_range: Range<u64>,
     replacements: &BTreeMap<u64, BlobChunkV1>,
 ) -> Result<BlobId, StorageError> {
@@ -459,13 +457,13 @@ fn validate_fixed_chunk_layout(
 }
 
 fn canonical_blob_id_from_summary(summary: NodeSummary) -> BlobId {
-    let mut encoder = Encoder::with_prefix(MERKLE_BLOB_ID_MAGIC);
-    encoder.u64(summary.logical_bytes);
-    encoder.u64(summary.leaf_count);
-    encoder.u32(summary.height);
-    encoder.u64(CANONICAL_BLOB_CHUNK_BYTES as u64);
-    encode_id(&mut encoder, summary.object_id);
-    BlobId::from_bytes(keyed_hash(MERKLE_BLOB_ID_DOMAIN, &encoder.into_vec()))
+    canonical_merkle_blob_id(
+        summary.object_id,
+        summary.logical_bytes,
+        summary.leaf_count,
+        summary.height,
+        BLOB_MERKLE_CHUNK_BYTES,
+    )
 }
 
 fn build_node(
@@ -747,7 +745,7 @@ fn leaf_id_from_path(
 }
 
 fn validate_requested_range(
-    manifest: &BlobMerkleManifestV1,
+    manifest: &BlobManifestV1,
     requested_range: &Range<u64>,
 ) -> Result<(), StorageError> {
     if requested_range.start >= requested_range.end
@@ -761,7 +759,7 @@ fn validate_requested_range(
     Ok(())
 }
 
-fn state_binding(state_key: &StateKey, manifest: &BlobMerkleManifestV1) -> [u8; 32] {
+fn state_binding(state_key: &StateKey, manifest: &BlobManifestV1) -> [u8; 32] {
     let mut bytes = encode_state_key(StateKeyRef {
         schema_key: &state_key.schema_key,
         file_id: state_key.file_id.as_deref(),
@@ -923,5 +921,95 @@ mod tests {
             derive_blob_merkle_successor_id(&proof, &key, base.manifest, 1..2, &replacements,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn manifest_root_round_trip_and_cold_root_authentication() {
+        let base = build_blob_merkle_tree(&chunks(4)).unwrap();
+        let (manifest_id, manifest_bytes) = base.manifest.encode().unwrap();
+        let decoded = BlobManifestV1::decode(manifest_id, &manifest_bytes).unwrap();
+        assert_eq!(decoded, base.manifest);
+
+        let root_bytes = base.objects.get(base.manifest.root_object_id).unwrap();
+        let root_edges =
+            authenticated_merkle_edges(base.manifest.root_object_id, root_bytes).unwrap();
+        assert_eq!(root_edges.len(), 2);
+        assert!(root_edges.iter().all(|(_, domain)| {
+            matches!(
+                domain,
+                ObjectDomain::BlobMerkleLeafV1 | ObjectDomain::BlobMerkleInternalV1
+            )
+        }));
+
+        let key = state_key();
+        let proof = prove_blob_merkle_range(&base, &key, 1..3).unwrap();
+        verify_blob_merkle_range(&proof, &key, decoded, 1..3).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_missing_wrong_domain_geometry_and_root_substitution() {
+        let base = build_blob_merkle_tree(&chunks(2)).unwrap();
+        let (manifest_id, manifest_bytes) = base.manifest.encode().unwrap();
+        assert!(BlobManifestV1::decode(manifest_id, &[]).is_err());
+        assert!(
+            BlobManifestV1::decode(
+                manifest_id,
+                base.objects.get(base.manifest.root_object_id).unwrap(),
+            )
+            .is_err()
+        );
+
+        let mut wrong_geometry = base.manifest;
+        wrong_geometry.chunk_bytes += 1;
+        assert!(wrong_geometry.encode().is_err());
+
+        let mut missing_root = base.manifest;
+        missing_root.root_object_id = ObjectId::ZERO;
+        assert!(missing_root.encode().is_err());
+
+        let mut substituted_root = base.manifest;
+        substituted_root.root_object_id = ObjectId::from_bytes([0xabu8; 32]);
+        assert!(substituted_root.encode().is_err());
+
+        let mut substituted_blob_id = base.manifest;
+        substituted_blob_id.canonical_blob_id = BlobId::from_bytes([0xcdu8; 32]);
+        assert!(substituted_blob_id.encode().is_err());
+        assert!(BlobManifestV1::decode(manifest_id, &manifest_bytes).is_ok());
+    }
+
+    #[test]
+    fn proof_rejects_missing_wrong_domain_and_cycle_edges() {
+        let base = build_blob_merkle_tree(&chunks(4)).unwrap();
+        let key = state_key();
+
+        let mut missing = prove_blob_merkle_range(&base, &key, 1..2).unwrap();
+        missing.paths[0].steps[0].sibling_object_id = ObjectId::ZERO;
+        assert!(verify_blob_merkle_range(&missing, &key, base.manifest, 1..2).is_err());
+
+        let mut wrong_domain = prove_blob_merkle_range(&base, &key, 1..2).unwrap();
+        let leaf = decode_leaf(
+            wrong_domain.paths[0].leaf_object_id,
+            wrong_domain
+                .objects
+                .get(wrong_domain.paths[0].leaf_object_id)
+                .unwrap(),
+        )
+        .unwrap();
+        wrong_domain.paths[0].steps[0].sibling_object_id = leaf.chunk_object_id;
+        assert!(verify_blob_merkle_range(&wrong_domain, &key, base.manifest, 1..2).is_err());
+
+        let mut cycle = prove_blob_merkle_range(&base, &key, 1..2).unwrap();
+        cycle.paths[0].steps[1].parent_object_id = cycle.paths[0].steps[0].parent_object_id;
+        assert!(verify_blob_merkle_range(&cycle, &key, base.manifest, 1..2).is_err());
+    }
+
+    #[test]
+    fn final_reference_root_substitution_fails_before_range_acceptance() {
+        let base = build_blob_merkle_tree(&chunks(4)).unwrap();
+        let key = state_key();
+        let proof = prove_blob_merkle_range(&base, &key, 1..2).unwrap();
+        let mut wrong_manifest = base.manifest;
+        wrong_manifest.root_object_id = ObjectId::from_bytes([0xefu8; 32]);
+        assert!(verify_blob_merkle_range(&proof, &key, wrong_manifest, 1..2).is_err());
     }
 }
