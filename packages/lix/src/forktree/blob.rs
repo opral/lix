@@ -563,24 +563,24 @@ where
             .into());
         }
         let chunk_bytes = load_object_bytes(read, chunk_ref.chunk_object_id).await?;
-        let chunk = BlobChunkV1::decode(chunk_ref.chunk_object_id, &chunk_bytes)?;
-        if chunk.bytes.len() as u64 != chunk_ref.declared_len {
+        let chunk = BlobChunkV1::decode_borrowed(chunk_ref.chunk_object_id, &chunk_bytes)?;
+        if chunk.len() as u64 != chunk_ref.declared_len {
             return Err(corruption(
                 "verified blob splice child bytes do not match declared length",
             )
             .into());
         }
-        compare_successor_slice(&chunk.bytes, chunk_start, successor_bytes, 0, prefix_len)?;
+        compare_successor_slice(chunk, chunk_start, successor_bytes, 0, prefix_len)?;
         compare_successor_slice(
-            &chunk.bytes,
+            chunk,
             chunk_start,
             successor_bytes,
             replace_end,
             expected_len,
         )?;
-        sha256.update(&chunk.bytes);
-        content_digest.update(&chunk.bytes);
-        semantic_id.update(&chunk.bytes)?;
+        sha256.update(chunk);
+        content_digest.update(chunk);
+        semantic_id.update(chunk)?;
         offset = chunk_end;
     }
     if offset != expected_len {

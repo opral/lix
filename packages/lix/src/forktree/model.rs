@@ -1061,6 +1061,16 @@ impl BlobChunkV1 {
         decoder.finish()?;
         Ok(value)
     }
+
+    pub(crate) fn decode_borrowed<'a>(
+        id: ObjectId,
+        bytes: &'a [u8],
+    ) -> Result<&'a [u8], StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::BlobChunk, bytes)?;
+        let value = decoder.bytes_borrowed("blob chunk bytes")?;
+        decoder.finish()?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
