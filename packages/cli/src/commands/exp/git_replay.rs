@@ -23,6 +23,9 @@ use zip::write::SimpleFileOptions;
 use lix::Memory;
 
 const PROGRESS_EVERY: usize = 10;
+const REPLAY_DML_PAGE_ROWS: usize = 64;
+const REPLAY_DELETE_PAGE_ROWS: usize = 500;
+#[cfg(test)]
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
 const TREE_BLOB_READ_BATCH_ROWS: usize = 8;
 const TREE_TRANSACTION_TARGET_BYTES: usize = 128 * 1024 * 1024;
@@ -437,7 +440,8 @@ where
         let changes = diff_reader.read_commit(commit_sha)?;
         let read_diff_ms = duration_to_ms(read_diff_started.elapsed());
         phase_totals.read_diff_ms += read_diff_ms;
-        changed_paths += changes.len();
+        let changed_paths_in_commit = changes.len();
+        changed_paths += changed_paths_in_commit;
 
         let read_blobs_started = Instant::now();
         let wanted_blob_ids = collect_wanted_blob_ids(&changes);
@@ -451,25 +455,32 @@ where
         phase_totals.prepare_ms += prepare_ms;
 
         let build_sql_started = Instant::now();
-        let mut statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
-        statements.push(git_replay_marker_statement(commit));
-        let build_sql_ms = duration_to_ms(build_sql_started.elapsed());
-        phase_totals.build_sql_ms += build_sql_ms;
-
-        let logical_statement_count = statements.len();
-        let sql_chars = total_statement_sql_chars(&statements);
+        let logical_statement_count = replay_commit_statement_count(&prepared, true);
+        let sql_chars = replay_commit_sql_chars(&prepared, Some(commit));
         let blob_bytes = prepared_blob_bytes(&prepared);
         let inserts = prepared.inserts.len();
         let updates = prepared.updates.len();
         let deletes = prepared.deletes.len();
-        if prepared.deletes.is_empty() && prepared.inserts.is_empty() && prepared.updates.is_empty()
-        {
+        let is_marker_only = prepared.deletes.is_empty()
+            && prepared.inserts.is_empty()
+            && prepared.updates.is_empty();
+        let build_sql_ms = duration_to_ms(build_sql_started.elapsed());
+        phase_totals.build_sql_ms += build_sql_ms;
+
+        if is_marker_only {
             marker_only += 1;
         }
+        // The prepared rows own the only replay payload copy. Do not retain
+        // the per-commit Git change/blob maps while the transaction stages
+        // the same rows.
+        drop(wanted_blob_ids);
+        drop(blob_by_oid);
+        drop(changes);
         lix.reset_plugin_transition_counters();
         let execute_started = Instant::now();
         let physical_execution_groups =
-            execute_statements_as_transaction(&lix, &statements, commit_sha)?;
+            execute_prepared_replay_batch(&lix, &prepared, Some(commit), commit_sha)?;
+        drop(prepared);
         let execute_ms = duration_to_ms(execute_started.elapsed());
         let plugin_counters = lix.plugin_transition_counters().into();
         phase_totals.execute_ms += execute_ms;
@@ -493,7 +504,7 @@ where
         phase_totals.total_ms += total_ms;
         commit_profiles.push(ReplayCommitProfile {
             commit_sha: commit_sha.clone(),
-            changed_paths: changes.len(),
+            changed_paths: changed_paths_in_commit,
             inserts,
             updates,
             deletes,
@@ -501,9 +512,7 @@ where
             physical_execution_groups,
             sql_chars,
             blob_bytes,
-            marker_only: prepared.deletes.is_empty()
-                && prepared.inserts.is_empty()
-                && prepared.updates.is_empty(),
+            marker_only: is_marker_only,
             read_diff_ms,
             read_blobs_ms,
             prepare_ms,
@@ -621,6 +630,102 @@ where
     Ok(())
 }
 
+/// Execute one replay commit without materializing a second whole-commit
+/// `SqlStatement` graph. Pages are still part of one transaction, so the
+/// Git marker and all row mutations retain the original atomic boundary.
+fn execute_prepared_replay_batch<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    prepared: &PreparedBatch,
+    marker: Option<&ReplayCommit>,
+    commit_sha: &str,
+) -> Result<usize, CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let mut transaction = db::block_on(lix.begin_transaction()).map_err(|error| {
+        CliError::msg(format!(
+            "failed to begin replay transaction {commit_sha}: {error}"
+        ))
+    })?;
+    let mut physical_execution_groups = 0usize;
+
+    for delete_chunk in prepared.deletes.chunks(REPLAY_DELETE_PAGE_ROWS) {
+        if delete_chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; delete_chunk.len()].join(", ");
+        let sql = format!("DELETE FROM lix_file WHERE id IN ({placeholders})");
+        let params = delete_chunk
+            .iter()
+            .cloned()
+            .map(Value::Text)
+            .collect::<Vec<_>>();
+        db::block_on(transaction.execute(&sql, &params)).map_err(|error| {
+            CliError::msg(format!(
+                "failed at commit {commit_sha} while executing replay delete page: {error}"
+            ))
+        })?;
+        physical_execution_groups += 1;
+    }
+
+    let insert_sql =
+        "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)";
+    let update_sql = "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET content = excluded.content, \
+         lixcol_metadata = excluded.lixcol_metadata";
+    for (rows, sql) in [
+        (&prepared.inserts, insert_sql),
+        (&prepared.updates, update_sql),
+    ] {
+        for row_page in rows.chunks(REPLAY_DML_PAGE_ROWS) {
+            if row_page.is_empty() {
+                continue;
+            }
+            let parameter_batch =
+                PreparedDmlParameterBatch::from_rows(row_page.iter().map(|row| {
+                    vec![
+                        Value::Text(row.id.clone()),
+                        Value::Text(row.path.clone()),
+                        value_from_optional_blob(row.data.as_ref()),
+                        git_file_metadata_value(row),
+                    ]
+                }))
+                .map_err(|error| {
+                    CliError::msg(format!(
+                        "failed at commit {commit_sha} while packing replay page: {error}"
+                    ))
+                })?;
+            db::block_on(
+                transaction.execute_prepared_dml_batch(Arc::<str>::from(sql), parameter_batch),
+            )
+            .map_err(|error| {
+                CliError::msg(format!(
+                    "failed at commit {commit_sha} while executing replay page: {error}"
+                ))
+            })?;
+            physical_execution_groups += 1;
+        }
+    }
+
+    if let Some(commit) = marker {
+        let statement = git_replay_marker_statement(commit);
+        db::block_on(transaction.execute(&statement.sql, &statement.params)).map_err(|error| {
+            CliError::msg(format!(
+                "failed at commit {commit_sha} while executing replay marker: {error}"
+            ))
+        })?;
+        physical_execution_groups += 1;
+    }
+
+    db::block_on(transaction.commit()).map_err(|error| {
+        CliError::msg(format!(
+            "failed to commit replay transaction {commit_sha}: {error}"
+        ))
+    })?;
+    Ok(physical_execution_groups)
+}
+
+#[cfg(test)]
 fn execute_statements_as_transaction<StorageImpl>(
     lix: &Lix<StorageImpl>,
     statements: &[SqlStatement],
@@ -693,6 +798,7 @@ where
     Ok(physical_execution_groups)
 }
 
+#[cfg(test)]
 fn is_prepared_replay_shape(sql: &str) -> bool {
     sql.starts_with("INSERT INTO lix_file (")
 }
@@ -722,8 +828,37 @@ fn prepared_blob_bytes(prepared: &PreparedBatch) -> usize {
         .sum()
 }
 
-fn total_statement_sql_chars(statements: &[SqlStatement]) -> usize {
-    statements.iter().map(|statement| statement.sql.len()).sum()
+fn replay_commit_statement_count(prepared: &PreparedBatch, marker: bool) -> usize {
+    prepared.deletes.chunks(REPLAY_DELETE_PAGE_ROWS).count()
+        + prepared.inserts.len()
+        + prepared.updates.len()
+        + usize::from(marker)
+}
+
+fn replay_commit_sql_chars(prepared: &PreparedBatch, marker: Option<&ReplayCommit>) -> usize {
+    let delete_prefix_len = "DELETE FROM lix_file WHERE id IN (".len();
+    let delete_suffix_len = 1; // ')'
+    let delete_chars = prepared
+        .deletes
+        .chunks(REPLAY_DELETE_PAGE_ROWS)
+        .map(|chunk| {
+            let placeholders = chunk.len().saturating_mul(3).saturating_sub(2);
+            delete_prefix_len + placeholders + delete_suffix_len
+        })
+        .sum::<usize>();
+    let insert_chars = prepared.inserts.len()
+        * "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)".len();
+    let update_chars = prepared.updates.len()
+        * "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?) \
+           ON CONFLICT(id) DO UPDATE SET content = excluded.content, \
+           lixcol_metadata = excluded.lixcol_metadata"
+            .len();
+    delete_chars
+        + insert_chars
+        + update_chars
+        + marker
+            .map(|commit| git_replay_marker_statement(commit).sql.len())
+            .unwrap_or(0)
 }
 
 fn duration_to_ms(duration: Duration) -> f64 {
@@ -958,8 +1093,7 @@ where
         return Ok(0);
     }
     let prepared = std::mem::take(pending);
-    let statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
-    execute_statements_as_transaction(lix, &statements, parent_commit)?;
+    execute_prepared_replay_batch(lix, &prepared, None, parent_commit)?;
     Ok(prepared.inserts.len())
 }
 
@@ -1880,6 +2014,7 @@ fn resolve_write_target(state: &mut ReplayState, change: &Change) -> Result<Writ
     })
 }
 
+#[cfg(test)]
 fn build_replay_commit_statements(
     batch: &PreparedBatch,
     _max_insert_rows: usize,
@@ -2614,6 +2749,56 @@ mod tests {
             &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
         ))
         .expect("marker should be visible after atomic replay");
+        assert_eq!(marker.rows().len(), 1);
+    }
+
+    #[test]
+    fn prepared_replay_pages_bound_transient_rows_and_keep_marker_in_transaction() {
+        let before = PreparedDmlParameterBatch::take_execution_counters();
+        let lix =
+            db::block_on(open_lix().with_storage(Memory::new())).expect("memory Lix should open");
+        let prepared = PreparedBatch {
+            inserts: (0..65)
+                .map(|index| WriteRow {
+                    id: stable_file_id(&git_path(format!("replay-{index}").as_bytes())),
+                    path: format!("/replay/{index}"),
+                    data: Some(vec![index as u8]),
+                    git_mode: "100644".to_string(),
+                    git_oid: format!("oid-{index}"),
+                })
+                .collect(),
+            ..PreparedBatch::default()
+        };
+        let physical_execution_groups = execute_prepared_replay_batch(
+            &lix,
+            &prepared,
+            Some(&ReplayCommit {
+                sha: "commit-65".to_string(),
+                first_parent: None,
+            }),
+            "commit-65",
+        )
+        .expect("paged replay transaction should commit");
+        assert_eq!(physical_execution_groups, 3);
+        let after = PreparedDmlParameterBatch::take_execution_counters();
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (2, 65),
+            "65 rows must use two bounded prepared pages"
+        );
+
+        let rows = db::block_on(lix.execute(
+            "SELECT COUNT(*) FROM lix_file WHERE path LIKE '/replay/%'",
+            &[],
+        ))
+        .expect("paged replay rows should be readable");
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(rows.rows()[0].get_index(0), Some(&Value::Integer(65)));
+        let marker = db::block_on(lix.execute(
+            "SELECT value FROM lix_key_value WHERE key = ?",
+            &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
+        ))
+        .expect("marker should be visible after paged replay");
         assert_eq!(marker.rows().len(), 1);
     }
 
