@@ -185,7 +185,6 @@ const _: () = {
         let _ = PreparedPublication::publish_completed_upload::<R>;
         let _ = PreparedPublication::put_untracked_row;
         let _ = PreparedPublication::delete_untracked_row;
-        let _ = PreparedPublication::publish_branch_retirement::<R>;
         let _ = PreparedPublication::into_storage_plan;
         let _ = StateTreeMutation::insert;
         let _ = StateTreeMutation::update;
