@@ -113,9 +113,7 @@ impl PreparedReceipt {
     }
 
     fn metadata_bytes(&self) -> usize {
-        RECEIPT_METADATA_BYTES
-            + MANIFEST_METADATA_BYTES
-            + self.chunks.len() * CHUNK_METADATA_BYTES
+        RECEIPT_METADATA_BYTES + MANIFEST_METADATA_BYTES + self.chunks.len() * CHUNK_METADATA_BYTES
     }
 }
 
@@ -244,12 +242,13 @@ impl ModelTransaction {
         if page.len() > self.page_size {
             return Err("receipt page exceeds configured page size".to_owned());
         }
-        let page_metadata = page.iter().map(PreparedReceipt::metadata_bytes).sum::<usize>();
+        let page_metadata = page
+            .iter()
+            .map(PreparedReceipt::metadata_bytes)
+            .sum::<usize>();
         self.counters.prepared_receipt_bytes += page_metadata;
-        self.counters.peak_prepared_receipt_bytes = self
-            .counters
-            .peak_prepared_receipt_bytes
-            .max(page_metadata);
+        self.counters.peak_prepared_receipt_bytes =
+            self.counters.peak_prepared_receipt_bytes.max(page_metadata);
         self.counters.file_content_writes_metadata_bytes += page_metadata;
         self.counters.peak_file_content_writes_bytes = self
             .counters
@@ -370,7 +369,10 @@ fn fixture() -> Vec<Payload> {
 
 fn tree_digest(rows: &BTreeMap<String, VisibleRow>) -> u64 {
     rows.values().fold(0xcbf29ce484222325, |hash, row| {
-        digest(&format!("{hash}:{}:{}:{}", row.file_id, row.size, row.digest))
+        digest(&format!(
+            "{hash}:{}:{}:{}",
+            row.file_id, row.size, row.digest
+        ))
     })
 }
 
@@ -397,7 +399,9 @@ fn run_success(adapter: Adapter, page_size: usize) -> (ModelStore, Counters, u64
             "transaction payload must not grow with total payload"
         );
     }
-    transaction.stage_marker("commit-65").expect("one marker stages");
+    transaction
+        .stage_marker("commit-65")
+        .expect("one marker stages");
     let counters = store.commit(transaction).expect("one semantic commit");
     let reopened = store.cold_reopen();
     assert_eq!(tree_digest(&store.rows), tree_digest(&reopened.rows));
@@ -439,7 +443,9 @@ fn run_fault(fault: Fault) {
         transaction.rollback(&mut store);
     } else if fault == Fault::DuplicateReceipt {
         let valid = PreparedReceipt::for_payload(&payload);
-        transaction.stage_page(std::slice::from_ref(&valid)).expect("first receipt");
+        transaction
+            .stage_page(std::slice::from_ref(&valid))
+            .expect("first receipt");
         transaction
             .stage_page(std::slice::from_ref(&valid))
             .expect_err("duplicate receipt must fail closed");
@@ -523,7 +529,9 @@ mod tests {
         let mut store = ModelStore::new(Adapter::Memory);
         let mut transaction = store.begin("branch-main", 7, 1);
         let receipt = PreparedReceipt::for_payload(&payload);
-        transaction.stage_page(std::slice::from_ref(&receipt)).unwrap();
+        transaction
+            .stage_page(std::slice::from_ref(&receipt))
+            .unwrap();
         transaction.stage_marker("commit-rollback").unwrap();
         transaction.rollback(&mut store);
         assert!(store.rows.is_empty());
