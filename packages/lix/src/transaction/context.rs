@@ -7889,15 +7889,12 @@ where
     }
 }
 
-async fn load_immutable_mutation_predecessors<R>(
-    reader: &R,
+async fn load_immutable_mutation_predecessors(
+    reader: &ForkTreeReadFacade<impl StorageAdapterRead + 'static>,
     schema_key: &str,
     branch_id: &str,
     entity_pk_chunks: &[Arc<[EntityPk]>],
-) -> Result<Vec<CertifiedCurrentStatePredecessor>, LixError>
-where
-    R: LiveStateReader + ?Sized,
-{
+) -> Result<Vec<CertifiedCurrentStatePredecessor>, LixError> {
     let row_count = entity_pk_chunks.iter().map(|chunk| chunk.len()).sum();
     let mut predecessors = Vec::with_capacity(row_count);
     for entity_pks in entity_pk_chunks {
@@ -8894,6 +8891,7 @@ mod transaction_validation_reader_tests {
             .find("fn conflict_resolution_limits")
             .expect("mutation predecessor helper end");
         let predecessor = &source[predecessor_start..predecessor_end];
+        assert!(predecessor.contains("ForkTreeReadFacade<impl StorageAdapterRead + 'static>"));
         assert!(predecessor.contains("reader.load_exact_batch(&request)"));
         assert!(!predecessor.contains("transaction_reader("));
     }
