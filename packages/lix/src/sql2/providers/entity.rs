@@ -362,6 +362,14 @@ impl EntitySpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
+        if self.spec.schema_key == crate::branch::BRANCH_REF_SCHEMA_KEY
+            && matches!(self.branch_binding, BranchBinding::Active { .. })
+        {
+            // Branch-ref rows are authenticated in the global selector scope;
+            // an active SQL branch is only the caller's session context and
+            // must not be mistaken for the row's storage domain.
+            request.filter.branch_ids = vec![crate::GLOBAL_BRANCH_ID.to_string()];
+        }
         apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
         Ok((projected_schema, request, row_filters))
