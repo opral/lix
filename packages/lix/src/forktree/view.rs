@@ -43,6 +43,7 @@ pub(crate) struct CoherentView<R> {
     branch_snapshot: BranchSnapshotV1,
     view_id: [u8; 32],
     view_instance_id: u64,
+    commit_member_cache: super::serving::CommitMemberCache,
 }
 
 impl<R> CoherentView<R>
@@ -388,6 +389,20 @@ where
         &self,
         commit: &CommitObjectV1,
     ) -> Result<Vec<super::model::CommitMemberV1>, StorageError> {
+        let (commit_object_id, _) = commit.encode()?;
+        self.load_commit_members_at(commit_object_id, commit).await
+    }
+
+    pub(crate) async fn load_commit_members_at(
+        &self,
+        commit_object_id: ObjectId,
+        commit: &CommitObjectV1,
+    ) -> Result<Vec<super::model::CommitMemberV1>, StorageError> {
+        if let Some(cached) =
+            super::serving::cached_commit_members(&self.commit_member_cache, commit_object_id)?
+        {
+            return Ok(cached.members.clone());
+        }
         super::serving::load_commit_members(&self.read, commit).await
     }
 
@@ -430,8 +445,9 @@ where
         commit_object_id: ObjectId,
         commit: &CommitObjectV1,
     ) -> Result<(), StorageError> {
-        super::serving::validate_retained_commit(
+        super::serving::validate_retained_commit_with_cache(
             &self.read,
+            &self.commit_member_cache,
             commit_catalog_root,
             change_catalog_root,
             commit_object_id,
@@ -1243,6 +1259,7 @@ where
         branch_snapshot,
         view_id,
         view_instance_id,
+        commit_member_cache: super::serving::CommitMemberCache::default(),
     })
 }
 

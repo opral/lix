@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
@@ -26,6 +27,51 @@ use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
 const CATALOG_SCAN_PAGE_ROWS: usize = 1024;
+
+/// A member page chain whose commit identity, ordinals, cycle freedom, and
+/// change-object uniqueness have already been authenticated. Entries are
+/// installed in a coherent view only after the enclosing retained commit has
+/// also passed its catalog/back-edge validation.
+#[derive(Clone, Debug)]
+pub(super) struct ValidatedCommitMembers {
+    pub(super) members: Vec<CommitMemberV1>,
+}
+
+#[derive(Default)]
+pub(super) struct CommitMemberCacheData {
+    entries: BTreeMap<ObjectId, Arc<ValidatedCommitMembers>>,
+}
+
+pub(super) type CommitMemberCache = std::sync::Mutex<CommitMemberCacheData>;
+
+pub(super) fn cached_commit_members(
+    cache: &CommitMemberCache,
+    commit_object_id: ObjectId,
+) -> Result<Option<Arc<ValidatedCommitMembers>>, StorageError> {
+    cache
+        .lock()
+        .map_err(|_| corruption("commit member validation cache is poisoned"))
+        .map(|cache| cache.entries.get(&commit_object_id).cloned())
+}
+
+async fn load_commit_members_for_validation<R>(
+    read: &R,
+    pending: &mut BTreeMap<ObjectId, Arc<ValidatedCommitMembers>>,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<Arc<ValidatedCommitMembers>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(members) = pending.get(&commit_object_id) {
+        return Ok(Arc::clone(members));
+    }
+    let members = Arc::new(ValidatedCommitMembers {
+        members: load_commit_members(read, commit).await?,
+    });
+    pending.insert(commit_object_id, Arc::clone(&members));
+    Ok(members)
+}
 
 /// Loads a commit's complete authenticated member closure. Small commits keep
 /// the original inline representation; larger commits resolve the immutable
@@ -1346,6 +1392,103 @@ where
     Ok(())
 }
 
+async fn validate_member_catalog_owner_pending<R>(
+    read: &R,
+    pending: &mut BTreeMap<ObjectId, Arc<ValidatedCommitMembers>>,
+    commit_catalog_root: ObjectId,
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+    member: CommitMemberV1,
+    entry: ChangeCatalogEntry,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if entry.change_object_id != member.change_object_id() {
+        return Err(corruption(
+            "commit membership edge disagrees with ChangeCatalog object identity",
+        ));
+    }
+    let canonical_owner = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+            let introduction = CommitObjectV1::decode(commit_object_id, &bytes)?;
+            validate_commit_catalog_identity(
+                read,
+                commit_catalog_root,
+                commit_object_id,
+                &introduction,
+            )
+            .await?;
+            let introduction_members =
+                load_commit_members_for_validation(read, pending, commit_object_id, &introduction)
+                    .await?;
+            if introduction_members.members.get(ordinal as usize)
+                != Some(&CommitMemberV1::introduced(member.change_object_id()))
+            {
+                return Err(corruption(
+                    "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                ));
+            }
+            (commit_object_id, ordinal)
+        }
+        ChangeCatalogOwner::BranchRef { .. } => {
+            return Err(corruption(
+                "semantic commit member resolves to a branch-ref catalog owner",
+            ));
+        }
+    };
+    match member.source() {
+        None => {
+            let target_ordinal = u32::try_from(target_ordinal)
+                .map_err(|_| corruption("commit member ordinal exceeds u32"))?;
+            if canonical_owner != (target_commit_object_id, target_ordinal) {
+                return Err(corruption(
+                    "introduced membership is not the canonical ChangeCatalog owner",
+                ));
+            }
+        }
+        Some((source_commit_object_id, source_ordinal)) => {
+            let bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
+            let source_commit = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
+            validate_commit_catalog_identity(
+                read,
+                commit_catalog_root,
+                source_commit_object_id,
+                &source_commit,
+            )
+            .await?;
+            if source_commit.generation >= target_generation {
+                return Err(corruption(
+                    "selected membership source generation is not earlier than its target",
+                ));
+            }
+            let source_members = load_commit_members_for_validation(
+                read,
+                pending,
+                source_commit_object_id,
+                &source_commit,
+            )
+            .await?;
+            if source_members
+                .members
+                .get(source_ordinal as usize)
+                .map(|source| source.change_object_id())
+                != Some(member.change_object_id())
+            {
+                return Err(corruption(
+                    "selected membership source commit/ordinal back-edge is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn select_historical_commit_member<R>(
     view: &CoherentView<R>,
     source_commit_id: CommitId,
@@ -1358,7 +1501,9 @@ where
         .await?
         .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
     let (source_commit_object_id, _) = source.encode()?;
-    let source_members = view.load_commit_members(&source).await?;
+    let source_members = view
+        .load_commit_members_at(source_commit_object_id, &source)
+        .await?;
     for (source_ordinal, source_member) in source_members.iter().copied().enumerate() {
         let change_object_id = source_member.change_object_id();
         let bytes = view.load_object_bytes(change_object_id).await?;
@@ -2196,7 +2341,9 @@ where
         ) => {
             let bytes = view.load_object_bytes(commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            let members = view.load_commit_members(&commit).await?;
+            let members = view
+                .load_commit_members_at(commit_object_id, &commit)
+                .await?;
             if members.get(ordinal as usize)
                 != Some(&CommitMemberV1::introduced(entry.change_object_id))
             {
@@ -2276,6 +2423,75 @@ where
             entry,
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// Authenticates a retained commit while reusing its complete member-page
+/// closure for every owner/source back-edge in this coherent view. The local
+/// map is discarded on any error; only a fully successful validation is merged
+/// into the view-local cache.
+pub(super) async fn validate_retained_commit_with_cache<R>(
+    read: &R,
+    cache: &CommitMemberCache,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if cached_commit_members(cache, commit_object_id)?.is_some() {
+        return Ok(());
+    }
+
+    let mut pending = BTreeMap::new();
+    for parent_id in &commit.parent_commit_object_ids {
+        let bytes = super::view::load_object_bytes(read, *parent_id).await?;
+        let parent = CommitObjectV1::decode(*parent_id, &bytes)?;
+        if parent.generation >= commit.generation {
+            return Err(corruption(
+                "retained commit parent generation is not strictly earlier",
+            ));
+        }
+    }
+    let members =
+        load_commit_members_for_validation(read, &mut pending, commit_object_id, commit).await?;
+    for (ordinal, member) in members.members.iter().copied().enumerate() {
+        let change_object_id = member.change_object_id();
+        let bytes = super::view::load_object_bytes(read, change_object_id).await?;
+        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
+        if !matches!(change, ChangeObjectV1::Semantic { .. }) {
+            return Err(corruption("commit member edge names a RefChange object"));
+        }
+        let value = lookup_on_read(
+            change_catalog_root,
+            "change",
+            change.change_id().as_bytes(),
+            read,
+        )
+        .await?
+        .ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        validate_member_catalog_owner_pending(
+            read,
+            &mut pending,
+            commit_catalog_root,
+            commit_object_id,
+            commit.generation,
+            ordinal,
+            member,
+            entry,
+        )
+        .await?;
+    }
+
+    let mut entries = cache
+        .lock()
+        .map_err(|_| corruption("commit member validation cache is poisoned"))?;
+    for (object_id, members) in pending {
+        entries.entries.entry(object_id).or_insert(members);
     }
     Ok(())
 }
