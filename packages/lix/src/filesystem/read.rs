@@ -26,20 +26,16 @@ pub(crate) async fn collect_gc_binary_blob_roots<O, C>(
 where
     O: crate::storage_adapter::StorageAdapterRead + Clone,
 {
-    let facade = crate::forktree::ForkTreeReadFacade::new(retained.clone());
-    let historical_facade =
-        controls
-            .first()
-            .map(|(branch_id, _)| branch_id)
-            .map(|branch_id| async {
-                crate::forktree::ForkTreeReadFacade::from_read_on_branch(
-                    retained.clone(),
-                    branch_id,
-                )
-                .await
-            });
-    let historical_facade = match historical_facade {
-        Some(future) => Some(future.await?),
+    let mut control_facades = Vec::with_capacity(controls.len());
+    for (branch_id, _) in controls {
+        control_facades.push((
+            branch_id.clone(),
+            crate::forktree::ForkTreeReadFacade::from_read_on_branch(retained.clone(), branch_id)
+                .await?,
+        ));
+    }
+    let historical_facade = match control_facades.first() {
+        Some((_, facade)) => Some(facade.clone()),
         None if retained_commits.is_empty() => None,
         None => {
             return Err(LixError::new(
@@ -49,7 +45,7 @@ where
         }
     };
     let mut roots = BTreeSet::new();
-    for (branch_id, _) in controls {
+    for (branch_id, facade) in &control_facades {
         let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
         let rows = scan_forktree_view(
             &view,

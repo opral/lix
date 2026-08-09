@@ -587,6 +587,10 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// Coherent storage snapshot retained for explicit transaction reads.
     /// This field is declared before `storage` so it is dropped first.
     opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+    /// Branch-bound ForkTree owner derived once from the same opening read.
+    /// Every transaction-visible ForkTree consumer clones this capability;
+    /// none constructs a second unbound facade over the same snapshot.
+    opening_forktree: ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>>,
     storage: Arc<StorageAdapter<StorageImpl>>,
     functions: FunctionProviderHandle,
     /// Raw authenticated ForkTree selector pair observed by the coherent
@@ -952,13 +956,13 @@ where
         self.opening_read()
     }
 
-    /// Creates the opaque ForkTree operation owner from this transaction's
-    /// already-retained opening read. This does not acquire or refresh a
-    /// storage read and does not expose the underlying handle.
+    /// Clones the opaque ForkTree operation owner created from this
+    /// transaction's already-retained opening read. This does not acquire or
+    /// refresh a storage read and does not expose the underlying handle.
     pub(crate) fn forktree_read_facade(
         &self,
     ) -> ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
-        ForkTreeReadFacade::new(self.opening_read())
+        self.opening_forktree.clone()
     }
 
     async fn reconcile_stale_disjoint_writes<S>(
@@ -1581,6 +1585,9 @@ where
             }
         };
         drop(read);
+        let opening_forktree =
+            ForkTreeReadFacade::from_read_on_branch(opening_read.clone(), &active_branch_id)
+                .await?;
         let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
         schema_resolver.remember_compiled_catalog(
             &Domain::schema_catalog(active_branch_id.clone(), true),
@@ -1611,6 +1618,7 @@ where
                     filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                     filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
                     opening_read,
+                    opening_forktree,
                     storage,
                     functions,
                     opening_selector_fence,
@@ -6529,11 +6537,11 @@ where
         &self,
     ) -> TransactionValidationLiveStateReader<SharedStorageAdapterRead<StorageImpl::Read<'static>>>
     {
-        let read = self.opening_read();
+        let forktree = self.forktree_read_facade();
         TransactionValidationLiveStateReader {
-            forktree: ForkTreeReadFacade::new(read.clone()),
+            forktree: forktree.clone(),
             graph: Arc::new(tokio::sync::Mutex::new(
-                CommitGraphContext::new().reader(ForkTreeReadFacade::new(read)),
+                CommitGraphContext::new().reader(forktree),
             )),
         }
     }
@@ -7183,8 +7191,7 @@ where
     ) -> Result<SqlQueryResult, LixError> {
         let read_store = self.opening_read();
         let active_branch_id = self.active_branch_id.clone();
-        let forktree =
-            ForkTreeReadFacade::from_read_on_branch(read_store.clone(), &active_branch_id).await?;
+        let forktree = self.forktree_read_facade();
         let branch_ctx = Arc::clone(&self.branch_ctx);
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
@@ -8817,6 +8824,34 @@ mod transaction_validation_reader_tests {
         assert!(!reader.contains("derived_validation_reader"));
         assert!(!reader.contains("branch_ctx.ref_reader"));
         assert!(!reader.contains("LiveStateStoreReader"));
+    }
+
+    #[test]
+    fn transaction_validation_reuses_the_opening_forktree_capability() {
+        let source = include_str!("context.rs");
+        let validation_start = source
+            .find("fn validation_live_state_reader(")
+            .expect("validation facade factory");
+        let validation_end = source[validation_start..]
+            .find("/// Convenience helper")
+            .map(|offset| validation_start + offset)
+            .expect("validation facade factory end");
+        let validation = &source[validation_start..validation_end];
+        assert!(validation.contains("let forktree = self.forktree_read_facade()"));
+        assert!(validation.contains("forktree: forktree.clone()"));
+        assert!(validation.contains("reader(forktree)"));
+        assert!(!validation.contains("ForkTreeReadFacade::new"));
+
+        let facade_start = source
+            .find("pub(crate) fn forktree_read_facade(")
+            .expect("transaction ForkTree facade accessor");
+        let facade_end = source[facade_start..]
+            .find("async fn reconcile_stale_disjoint_writes")
+            .map(|offset| facade_start + offset)
+            .expect("transaction ForkTree facade accessor end");
+        let facade = &source[facade_start..facade_end];
+        assert!(facade.contains("self.opening_forktree.clone()"));
+        assert!(!facade.contains("ForkTreeReadFacade::new"));
     }
 
     #[test]
