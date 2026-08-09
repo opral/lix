@@ -1153,6 +1153,78 @@ pub(super) async fn validate_member_catalog_owner<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let mut member_closure_cache = MemberClosureCache::default();
+    validate_member_catalog_owner_with_cache(
+        read,
+        commit_catalog_root,
+        target_commit_object_id,
+        target_generation,
+        target_ordinal,
+        member,
+        entry,
+        &mut member_closure_cache,
+    )
+    .await
+}
+
+#[derive(Default)]
+struct MemberClosureCache {
+    entries: BTreeMap<ObjectId, Vec<CommitMemberV1>>,
+    #[cfg(test)]
+    loads: usize,
+}
+
+impl MemberClosureCache {
+    fn contains(&self, commit_object_id: ObjectId) -> bool {
+        self.entries.contains_key(&commit_object_id)
+    }
+
+    fn insert(&mut self, commit_object_id: ObjectId, members: Vec<CommitMemberV1>) {
+        self.entries.insert(commit_object_id, members);
+    }
+
+    fn get(&self, commit_object_id: ObjectId) -> Option<&[CommitMemberV1]> {
+        self.entries.get(&commit_object_id).map(Vec::as_slice)
+    }
+
+    #[cfg(test)]
+    fn record_load(&mut self) {
+        self.loads += 1;
+    }
+}
+
+async fn load_member_closure_cached<R>(
+    read: &R,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+    cache: &mut MemberClosureCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if cache.contains(commit_object_id) {
+        return Ok(());
+    }
+    let members = load_commit_members(read, commit).await?;
+    cache.insert(commit_object_id, members);
+    #[cfg(test)]
+    cache.record_load();
+    Ok(())
+}
+
+async fn validate_member_catalog_owner_with_cache<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+    member: CommitMemberV1,
+    entry: ChangeCatalogEntry,
+    member_closure_cache: &mut MemberClosureCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     if entry.change_object_id != member.change_object_id() {
         return Err(corruption(
             "commit membership edge disagrees with ChangeCatalog object identity",
@@ -1172,7 +1244,11 @@ where
                 &introduction,
             )
             .await?;
-            let introduction_members = load_commit_members(read, &introduction).await?;
+            load_member_closure_cached(read, commit_object_id, &introduction, member_closure_cache)
+                .await?;
+            let introduction_members = member_closure_cache
+                .get(commit_object_id)
+                .expect("cached introduction member closure");
             if introduction_members.get(ordinal as usize)
                 != Some(&CommitMemberV1::introduced(member.change_object_id()))
             {
@@ -1213,7 +1289,16 @@ where
                     "selected membership source generation is not earlier than its target",
                 ));
             }
-            let source_members = load_commit_members(read, &source_commit).await?;
+            load_member_closure_cached(
+                read,
+                source_commit_object_id,
+                &source_commit,
+                member_closure_cache,
+            )
+            .await?;
+            let source_members = member_closure_cache
+                .get(source_commit_object_id)
+                .expect("cached source member closure");
             if source_members
                 .get(source_ordinal as usize)
                 .map(|source| source.change_object_id())
@@ -2046,6 +2131,53 @@ pub(super) async fn validate_retained_commit<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let mut member_closure_cache = MemberClosureCache::default();
+    validate_retained_commit_with_cache(
+        read,
+        commit_catalog_root,
+        change_catalog_root,
+        commit_object_id,
+        commit,
+        &mut member_closure_cache,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn validate_retained_commit_counted<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<usize, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut member_closure_cache = MemberClosureCache::default();
+    validate_retained_commit_with_cache(
+        read,
+        commit_catalog_root,
+        change_catalog_root,
+        commit_object_id,
+        commit,
+        &mut member_closure_cache,
+    )
+    .await?;
+    Ok(member_closure_cache.loads)
+}
+
+async fn validate_retained_commit_with_cache<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+    member_closure_cache: &mut MemberClosureCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     for parent_id in &commit.parent_commit_object_ids {
         let bytes = super::view::load_object_bytes(read, *parent_id).await?;
         let parent = CommitObjectV1::decode(*parent_id, &bytes)?;
@@ -2056,6 +2188,9 @@ where
         }
     }
     let members = load_commit_members(read, commit).await?;
+    member_closure_cache.insert(commit_object_id, members.clone());
+    #[cfg(test)]
+    member_closure_cache.record_load();
     for (ordinal, member) in members.iter().copied().enumerate() {
         let change_object_id = member.change_object_id();
         let bytes = super::view::load_object_bytes(read, change_object_id).await?;
@@ -2072,7 +2207,7 @@ where
         .await?
         .ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
-        validate_member_catalog_owner(
+        validate_member_catalog_owner_with_cache(
             read,
             commit_catalog_root,
             commit_object_id,
@@ -2080,6 +2215,7 @@ where
             ordinal,
             member,
             entry,
+            member_closure_cache,
         )
         .await?;
     }

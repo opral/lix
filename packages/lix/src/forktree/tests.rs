@@ -3770,3 +3770,141 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     };
     assert!(zero_successor.encode().is_err());
 }
+
+#[tokio::test]
+async fn retained_commit_validation_reuses_one_1k_member_closure_and_keeps_corruption_fail_closed()
+{
+    const MEMBER_COUNT: usize = 1_000;
+    let commit_id = CommitId::from_bytes(raw_id(0xb0));
+    let mut members = Vec::with_capacity(MEMBER_COUNT);
+    let mut semantic_objects = Vec::with_capacity(MEMBER_COUNT);
+    for ordinal in 0..MEMBER_COUNT {
+        let change_id = ChangeId::from_bytes((ordinal as u128 + 1).to_be_bytes());
+        let change = ChangeObjectV1::Semantic {
+            change_id,
+            payload: ordinal.to_be_bytes().to_vec(),
+        };
+        let (change_object_id, change_bytes) = change.encode().expect("semantic change");
+        members.push(CommitMemberV1::introduced(change_object_id));
+        semantic_objects.push((change_id, change_object_id, change_bytes));
+    }
+
+    let mut commit = CommitObjectV1 {
+        commit_id,
+        generation: 1,
+        parent_commit_object_ids: Vec::new(),
+        members,
+        member_page_root: None,
+        global_state_root: content_id(0xb1),
+        local_state_root: content_id(0xb2),
+        metadata: b"1k-member-closure".to_vec(),
+    };
+    let member_pages = commit.prepare_member_pages().expect("1k member pages");
+    assert_eq!(member_pages.len(), 4);
+    // The authenticated page root is the persisted member closure for a
+    // paged commit; keep the inline vector only on the writer-side fixture.
+    commit.members.clear();
+    let (commit_object_id, commit_bytes) = commit.encode().expect("1k commit");
+    let change_entries = semantic_objects
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (change_id, change_object_id, _))| {
+            (
+                *change_id,
+                ChangeCatalogEntry {
+                    change_object_id: *change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: u32::try_from(ordinal).expect("test ordinal fits u32"),
+                    },
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let commit_catalog =
+        build_commit_catalog(&[(commit_id, CommitCatalogEntry { commit_object_id })])
+            .expect("commit catalog");
+    let change_catalog = build_change_catalog(&change_entries).expect("change catalog");
+
+    let storage = Memory::new();
+    let mut writes = StorageWriteSet::new();
+    for (change_object_id, change_bytes) in semantic_objects
+        .iter()
+        .map(|(_, change_object_id, change_bytes)| (*change_object_id, change_bytes))
+    {
+        writes.put(
+            OBJECT_SPACE,
+            change_object_id.as_bytes().to_vec(),
+            change_bytes.to_vec(),
+        );
+    }
+    for (page_object_id, page_bytes) in member_pages {
+        writes.put(
+            OBJECT_SPACE,
+            page_object_id.as_bytes().to_vec(),
+            page_bytes.to_vec(),
+        );
+    }
+    writes.put(
+        OBJECT_SPACE,
+        commit_object_id.as_bytes().to_vec(),
+        commit_bytes.to_vec(),
+    );
+    for (object_id, bytes) in commit_catalog.objects.iter() {
+        writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    for (object_id, bytes) in change_catalog.objects.iter() {
+        writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(writes, &storage).await;
+
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("1k closure read"),
+    );
+    let closure_loads = super::serving::validate_retained_commit_counted(
+        &read,
+        commit_catalog.root.object_id,
+        change_catalog.root.object_id,
+        commit_object_id,
+        &commit,
+    )
+    .await
+    .expect("1k retained commit validates");
+    assert_eq!(
+        closure_loads, 1,
+        "one retained validation loads one closure"
+    );
+
+    let mut corrupted_entries = change_entries;
+    corrupted_entries[777].1.owner = ChangeCatalogOwner::CommitMember {
+        commit_object_id,
+        ordinal: 778,
+    };
+    let corrupted_catalog = build_change_catalog(&corrupted_entries).expect("corrupt catalog");
+    let mut corruption_writes = StorageWriteSet::new();
+    for (object_id, bytes) in corrupted_catalog.objects.iter() {
+        corruption_writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(corruption_writes, &storage).await;
+    let corrupted_read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("corrupt closure read"),
+    );
+    assert!(
+        super::serving::validate_retained_commit(
+            &corrupted_read,
+            commit_catalog.root.object_id,
+            corrupted_catalog.root.object_id,
+            commit_object_id,
+            &commit,
+        )
+        .await
+        .is_err(),
+        "cached closure must not mask a wrong ChangeCatalog ordinal"
+    );
+}
