@@ -116,13 +116,12 @@ use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
-    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
-    CertifiedRawWriteBatchPreparation, PreparedRowFacts, PreparedStateBatch,
-    PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
-    StagedCommitChangeBatchBuilder, TransactionFileContent, TransactionJson, TransactionWrite,
-    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
-    TransactionWriteOutcome, TransactionWriteRow, TypedMutationJournalBatch,
-    canonicalize_transaction_json_batch, stage_json_from_value,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
+    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
+    TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
 };
 
 use crate::transaction::validation::{
@@ -8210,9 +8209,7 @@ where
         Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
     }
 
-    fn authenticated_blob_reader(
-        &self,
-    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+    fn authenticated_blob_reader(&self) -> Result<Arc<dyn AuthenticatedBlobReader>, LixError> {
         Ok(Arc::new(crate::forktree::blob_reader_on_read(
             self.read_store.clone(),
             &self.active_branch_id,
@@ -8527,6 +8524,8 @@ fn assign_certified_tracked_change_ids(
 
 #[cfg(test)]
 mod certified_change_id_tests {
+    use crate::transaction::types::CertifiedRawWriteBatchPreparation;
+
     use super::*;
 
     fn prepared_rows() -> PreparedStateBatch {
