@@ -32,6 +32,8 @@ use super::serving::{validate_retained_commit, validate_retained_ref_change};
 use super::state::{UNTRACKED_ROW_SPACE, decode_untracked_key, decode_untracked_value};
 use super::tree::ordered_tree_edges;
 use super::view::{SELECTOR_SPACE, load_object_bytes};
+#[cfg(feature = "prepared-cas-observability")]
+use crate::prepared_cas_observability;
 
 const SELECTOR_PAGE_ROWS: usize = 256;
 const UNTRACKED_PAGE_ROWS: usize = 1;
@@ -691,6 +693,8 @@ where
     let page = cursor.next_page(SWEEP_PAGE_ROWS).await?;
     let edit = MaintenanceEdit::default();
     let mut sweep = SweepBatch::default();
+    #[cfg(feature = "prepared-cas-observability")]
+    let mut reclaimed_bytes = 0usize;
     let mut resume_after = progress.object_resume_after;
     let mut processed_all = true;
     if let (Some(first), Some(last)) = (page.entries.first(), page.entries.last()) {
@@ -723,6 +727,10 @@ where
                 break;
             }
             sweep.push(id, delete_limit)?;
+            #[cfg(feature = "prepared-cas-observability")]
+            {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(bytes.len());
+            }
             resume_after = Some(id);
             progress.reclaimed_count = progress
                 .reclaimed_count
@@ -743,6 +751,13 @@ where
     }
     drop(cursor);
     commit_progress(storage, snapshot, progress.clone(), edit, sweep, false).await?;
+    #[cfg(feature = "prepared-cas-observability")]
+    if reclaimed_bytes > 0 {
+        prepared_cas_observability::record_reclaimed(
+            progress.reclaimed_count as usize,
+            reclaimed_bytes,
+        );
+    }
     Ok(status(progress))
 }
 

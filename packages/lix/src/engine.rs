@@ -184,6 +184,13 @@ where
         self.storage.clone()
     }
 
+    #[cfg(feature = "prepared-cas-observability")]
+    pub(crate) async fn prepared_cas_observability_reclaim_orphans(&self) -> Result<(), LixError> {
+        self.storage
+            .prepared_cas_observability_reclaim_orphans()
+            .await
+    }
+
     /// Loads the current commit head for a branch.
     ///
     /// This is the public engine-level form of the typed `branch_ref` context:

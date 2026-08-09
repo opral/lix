@@ -3,12 +3,12 @@
 //! This intentionally stays outside production crates. It proves the public
 //! receipt path, one visible semantic transaction, deterministic materialized
 //! bytes, rollback invisibility, malformed chunk rejection, and cold reopen on
-//! all three adapters. Private retained-byte and GC counters remain a separate
-//! required owner-side gate; this test records them as unobserved rather than
-//! fabricating measurements.
+//! all three adapters. Feature-gated owner counters make the retained-byte and
+//! reclamation assertions executable without retaining payloads or authority.
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use lix::storage::Storage;
 use lix::{Lix, Memory, Value, open_lix};
@@ -23,6 +23,7 @@ use uuid::Uuid;
 const FILES: usize = 65;
 const CHUNK_BYTES: usize = 1024 * 1024;
 const MARKER_KEY: &str = "prepared-cas-streaming-adapter-marker";
+static OBSERVABILITY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_cas_streaming_memory() {
@@ -76,10 +77,15 @@ where
     R: FnOnce(S) -> F,
     F: Future<Output = S>,
 {
+    let _observability_guard = OBSERVABILITY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("prepared-CAS observability lock");
     let lix = open_lix()
         .with_storage(storage.clone())
         .await
         .expect("initialize prepared-CAS adapter");
+    lix.reset_prepared_cas_observability();
     let expected_digest = expected_digest();
     let mut transaction = lix
         .begin_transaction()
@@ -154,7 +160,10 @@ where
         )
         .await
         .expect("stage rollback row");
-    drop(rollback);
+    rollback
+        .rollback()
+        .await
+        .expect("rollback prepared-CAS transaction");
     assert_eq!(read_path_count(&lix, "/prepared-cas/rollback.bin").await, 0);
 
     let mut malformed = lix
@@ -176,6 +185,29 @@ where
     );
     drop(malformed);
 
+    lix.prepared_cas_observability_reclaim_orphans()
+        .await
+        .expect("reclaim rolled-back prepared-CAS objects");
+    let counters = lix.prepared_cas_observability();
+    assert!(counters.peak_transaction_resident_payload_bytes > 0);
+    assert!(counters.peak_transaction_resident_payload_bytes <= 2 * CHUNK_BYTES as u64);
+    assert!(counters.peak_transaction_resident_payload_bytes < (FILES * CHUNK_BYTES) as u64);
+    assert!(counters.page_bytes_before_flush > 0);
+    assert_eq!(counters.page_bytes_after_flush, 0);
+    assert!(counters.page_flushes >= FILES as u64);
+    assert!(counters.prepared_receipt_count >= FILES as u64);
+    assert!(counters.prepared_receipt_metadata_bytes > 0);
+    assert_eq!(counters.final_transaction_payload_bytes, 0);
+    assert!(counters.unreferenced_object_ids_before_publish > 0);
+    assert!(counters.unreferenced_object_bytes_before_publish > 0);
+    assert!(counters.reachable_object_ids_after_publish > 0);
+    assert!(counters.reachable_object_bytes_after_publish > 0);
+    assert!(counters.orphan_object_ids_after_rollback > 0);
+    assert!(counters.orphan_object_bytes_after_rollback > 0);
+    assert!(counters.reclaimed_object_ids > 0);
+    assert!(counters.reclaimed_object_bytes > 0);
+    assert!(counters.corrupted_receipts_rejected > 0);
+
     let reopened_storage = reopen(storage).await;
     let reopened = open_lix()
         .with_storage(reopened_storage)
@@ -184,7 +216,7 @@ where
     assert_eq!(read_file_count(&reopened).await, FILES);
     assert_eq!(read_file_digest(&reopened).await, expected_digest);
     assert_eq!(read_marker_count(&reopened).await, 1);
-    append_observable_result(adapter, &expected_digest);
+    append_observable_result(adapter, &expected_digest, counters);
     reopened
         .close()
         .await
@@ -265,7 +297,11 @@ fn hex_digest(bytes: &[u8]) -> String {
     output
 }
 
-fn append_observable_result(adapter: &str, digest: &str) {
+fn append_observable_result(
+    adapter: &str,
+    digest: &str,
+    counters: lix::prepared_cas_observability::PreparedCasCounters,
+) {
     let dir = std::env::var_os("PREPARED_CAS_RESULT_DIR").map(PathBuf::from);
     let Some(dir) = dir else { return };
     std::fs::create_dir_all(&dir).expect("create prepared-CAS result directory");
@@ -280,15 +316,30 @@ fn append_observable_result(adapter: &str, digest: &str) {
         use std::io::Write as _;
         writeln!(
             file,
-            "adapter\tfiles\tpayload_bytes\tsemantic_commits\tmarker_rows\ttree_digest\trollback_visible_rows\tmalformed_chunk_failures\tcold_reopen\tstrict_retained_bytes\torphan_reclamation"
+            "adapter\tfiles\tpayload_bytes\tsemantic_commits\tmarker_rows\ttree_digest\trollback_visible_rows\tmalformed_chunk_failures\tcold_reopen\tcurrent_transaction_resident_payload_bytes\tpeak_transaction_resident_payload_bytes\tpage_bytes_before_flush\tpage_bytes_after_flush\tprepared_receipt_metadata_bytes\tfinal_transaction_payload_bytes\tunreferenced_object_ids\tunreferenced_object_bytes\treachable_object_ids\treachable_object_bytes\torphan_object_ids\torphan_object_bytes\treclaimed_object_ids\treclaimed_object_bytes\tcorrupted_receipts_rejected"
         )
         .expect("write prepared-CAS result header");
     }
     use std::io::Write as _;
     writeln!(
         file,
-        "{adapter}\t{FILES}\t{}\t1\t1\t{digest}\t0\t1\ttrue\tUNOBSERVED\tUNOBSERVED",
-        FILES * CHUNK_BYTES
+        "{adapter}\t{FILES}\t{payload_bytes}\t1\t1\t{digest}\t0\t1\ttrue\t{current}\t{peak}\t{page_before}\t{page_after}\t{receipt_metadata}\t{final_payload}\t{unreferenced_ids}\t{unreferenced_bytes}\t{reachable_ids}\t{reachable_bytes}\t{orphan_ids}\t{orphan_bytes}\t{reclaimed_ids}\t{reclaimed_bytes}\t{corrupted}",
+        payload_bytes = FILES * CHUNK_BYTES,
+        current = counters.current_transaction_resident_payload_bytes,
+        peak = counters.peak_transaction_resident_payload_bytes,
+        page_before = counters.page_bytes_before_flush,
+        page_after = counters.page_bytes_after_flush,
+        receipt_metadata = counters.prepared_receipt_metadata_bytes,
+        final_payload = counters.final_transaction_payload_bytes,
+        unreferenced_ids = counters.unreferenced_object_ids_before_publish,
+        unreferenced_bytes = counters.unreferenced_object_bytes_before_publish,
+        reachable_ids = counters.reachable_object_ids_after_publish,
+        reachable_bytes = counters.reachable_object_bytes_after_publish,
+        orphan_ids = counters.orphan_object_ids_after_rollback,
+        orphan_bytes = counters.orphan_object_bytes_after_rollback,
+        reclaimed_ids = counters.reclaimed_object_ids,
+        reclaimed_bytes = counters.reclaimed_object_bytes,
+        corrupted = counters.corrupted_receipts_rejected,
     )
     .expect("write prepared-CAS public result row");
 }

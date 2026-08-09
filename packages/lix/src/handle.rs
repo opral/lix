@@ -517,6 +517,28 @@ where
     pub fn reset_plugin_transition_counters(&self) {
         self.engine.reset_plugin_transition_counters();
     }
+
+    #[cfg(feature = "prepared-cas-observability")]
+    #[doc(hidden)]
+    pub fn reset_prepared_cas_observability(&self) {
+        crate::prepared_cas_observability::reset();
+    }
+
+    #[cfg(feature = "prepared-cas-observability")]
+    #[doc(hidden)]
+    pub fn prepared_cas_observability(
+        &self,
+    ) -> crate::prepared_cas_observability::PreparedCasCounters {
+        crate::prepared_cas_observability::snapshot()
+    }
+
+    #[cfg(feature = "prepared-cas-observability")]
+    #[doc(hidden)]
+    pub async fn prepared_cas_observability_reclaim_orphans(&self) -> Result<(), LixError> {
+        self.engine
+            .prepared_cas_observability_reclaim_orphans()
+            .await
+    }
 }
 
 #[expect(missing_debug_implementations)]

@@ -40,6 +40,33 @@ where
         Self { storage }
     }
 
+    #[cfg(feature = "prepared-cas-observability")]
+    pub(crate) async fn prepared_cas_observability_reclaim_orphans(
+        &self,
+    ) -> Result<(), crate::LixError>
+    where
+        StorageImpl: Clone + Send + Sync + 'static,
+    {
+        for _ in 0..4096 {
+            match crate::forktree::advance_gc(&self.storage, crate::forktree::GcBudget::default())
+                .await
+            {
+                Ok(crate::forktree::GcStepStatus::Complete { .. }) => return Ok(()),
+                Ok(_) => continue,
+                Err(error) => {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+        Err(crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            "prepared-CAS observability GC did not complete within bound",
+        ))
+    }
+
     pub async fn begin_read(
         &self,
         opts: ReadOptions,

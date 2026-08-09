@@ -17,6 +17,7 @@ default = ["rocksdb"]
 rocksdb = ["dep:lix_storage_rocksdb"]
 slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix/storage-benches", "rocksdb"]
+prepared-cas-observability = ["lix/prepared-cas-observability"]
 plugin-wasm-tests = ["lix/default_wasm_runtime"]
 tpch = ["dep:duckdb", "dep:tpchgen"]
 # Opt-in profiling build that routes Rust allocations through libc so tools
@@ -96,6 +97,11 @@ required-features = ["rocksdb", "slatedb"]
 name = "plugin_blobref_reopen"
 path = "tests/plugin_blobref_reopen.rs"
 required-features = ["rocksdb", "slatedb", "plugin-wasm-tests"]
+
+[[test]]
+name = "prepared_cas_streaming_adapter"
+path = "tests/prepared_cas_streaming_adapter.rs"
+required-features = ["rocksdb", "slatedb", "prepared-cas-observability"]
 
 [[test]]
 name = "tpch_overlay_helpers"
