@@ -747,6 +747,392 @@ where
     }
     Ok(output)
 }
+#[derive(Clone, Debug, Default)]
+struct TreeDiffBounds {
+    /// The lower bound is exclusive because an internal child starts after
+    /// the previous child's authenticated maximum key.
+    lower_exclusive: Option<Vec<u8>>,
+    /// The upper bound is inclusive because it is the child node's
+    /// authenticated maximum key.
+    upper_inclusive: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+struct TreeDiffSegment {
+    node: NodeRef,
+    bounds: TreeDiffBounds,
+}
+
+/// Returns only key/value changes between two authenticated ordered trees.
+/// Equal content-addressed subtrees are skipped before their bodies are
+/// loaded; changed paths are descended through the same retained read and
+/// every visited child reference is checked against its parent summary.
+pub(super) async fn diff_ordered_tree_on_read<R>(
+    before: ObjectId,
+    after: ObjectId,
+    expected_kind: &'static str,
+    read: &R,
+) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut changed = BTreeMap::new();
+    diff_nodes_on_read(
+        before,
+        after,
+        None,
+        None,
+        TreeDiffBounds::default(),
+        parse_kind(expected_kind)?,
+        read,
+        &mut changed,
+    )
+    .await?;
+    Ok(changed
+        .into_iter()
+        .filter_map(|(key, (before, after))| (before != after).then_some((key, before, after)))
+        .collect())
+}
+
+fn diff_nodes_on_read<'a, R>(
+    before_id: ObjectId,
+    after_id: ObjectId,
+    before_expected: Option<NodeRef>,
+    after_expected: Option<NodeRef>,
+    bounds: TreeDiffBounds,
+    kind: TreeKind,
+    read: &'a R,
+    changed: &'a mut BTreeMap<Vec<u8>, (Option<Vec<u8>>, Option<Vec<u8>>)>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
+where
+    R: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(async move {
+        if before_id == after_id {
+            let bytes = load_object_on_read(read, before_id).await?;
+            let node = decode_node(before_id, &bytes)?;
+            validate_loaded_node(before_id, &node, kind, before_expected.as_ref())?;
+            validate_loaded_node(after_id, &node, kind, after_expected.as_ref())?;
+            return Ok(());
+        }
+        let before = decode_node(before_id, &load_object_on_read(read, before_id).await?)?;
+        let after = decode_node(after_id, &load_object_on_read(read, after_id).await?)?;
+        validate_loaded_node(before_id, &before, kind, before_expected.as_ref())?;
+        validate_loaded_node(after_id, &after, kind, after_expected.as_ref())?;
+
+        match (&before.body, &after.body) {
+            (NodeBody::Leaf(before_entries), NodeBody::Leaf(after_entries)) => {
+                record_leaf_diff(before_entries, after_entries, &bounds, changed);
+                Ok(())
+            }
+            (NodeBody::Internal(before_children), NodeBody::Internal(after_children)) => {
+                let before_segments = child_segments(before_children, &bounds);
+                let after_segments = child_segments(after_children, &bounds);
+                diff_segments_on_read(&before_segments, &after_segments, kind, read, changed).await
+            }
+            (NodeBody::Leaf(before_entries), NodeBody::Internal(after_children)) => {
+                let mut before_values = BTreeMap::new();
+                record_side_entries(before_entries, &bounds, &mut before_values);
+                let after_segments = child_segments(after_children, &bounds);
+                let mut after_values = BTreeMap::new();
+                collect_segments_on_read(&after_segments, kind, read, &mut after_values).await?;
+                merge_side_values(before_values, after_values, changed);
+                Ok(())
+            }
+            (NodeBody::Internal(before_children), NodeBody::Leaf(after_entries)) => {
+                let before_segments = child_segments(before_children, &bounds);
+                let mut before_values = BTreeMap::new();
+                collect_segments_on_read(&before_segments, kind, read, &mut before_values).await?;
+                let mut after_values = BTreeMap::new();
+                record_side_entries(after_entries, &bounds, &mut after_values);
+                merge_side_values(before_values, after_values, changed);
+                Ok(())
+            }
+        }
+    })
+}
+
+async fn diff_segments_on_read<R>(
+    before: &[TreeDiffSegment],
+    after: &[TreeDiffSegment],
+    kind: TreeKind,
+    read: &R,
+    changed: &mut BTreeMap<Vec<u8>, (Option<Vec<u8>>, Option<Vec<u8>>)>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut before_index = 0;
+    let mut after_index = 0;
+    while before_index < before.len() && after_index < after.len() {
+        let left = &before[before_index];
+        let right = &after[after_index];
+
+        if segment_is_before(left, right) {
+            collect_segment_on_read(left, kind, read, true, changed).await?;
+            before_index += 1;
+            continue;
+        }
+        if segment_is_before(right, left) {
+            collect_segment_on_read(right, kind, read, false, changed).await?;
+            after_index += 1;
+            continue;
+        }
+
+        let overlap = TreeDiffBounds {
+            lower_exclusive: max_lower(
+                left.bounds.lower_exclusive.as_deref(),
+                right.bounds.lower_exclusive.as_deref(),
+            ),
+            upper_inclusive: min_upper(
+                left.bounds.upper_inclusive.as_deref(),
+                right.bounds.upper_inclusive.as_deref(),
+            ),
+        };
+        if bounds_have_values(&overlap) {
+            diff_nodes_on_read(
+                left.node.id,
+                right.node.id,
+                Some(left.node.clone()),
+                Some(right.node.clone()),
+                overlap,
+                kind,
+                read,
+                changed,
+            )
+            .await?;
+        }
+
+        let left_done = upper_is_at_or_before(
+            left.bounds.upper_inclusive.as_deref(),
+            right.bounds.upper_inclusive.as_deref(),
+        );
+        let right_done = upper_is_at_or_before(
+            right.bounds.upper_inclusive.as_deref(),
+            left.bounds.upper_inclusive.as_deref(),
+        );
+        if left_done {
+            before_index += 1;
+        }
+        if right_done {
+            after_index += 1;
+        }
+    }
+    while before_index < before.len() {
+        collect_segment_on_read(&before[before_index], kind, read, true, changed).await?;
+        before_index += 1;
+    }
+    while after_index < after.len() {
+        collect_segment_on_read(&after[after_index], kind, read, false, changed).await?;
+        after_index += 1;
+    }
+    Ok(())
+}
+
+async fn collect_segments_on_read<R>(
+    segments: &[TreeDiffSegment],
+    kind: TreeKind,
+    read: &R,
+    values: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    for segment in segments {
+        collect_segment_on_read_into(segment, kind, read, values).await?;
+    }
+    Ok(())
+}
+
+async fn collect_segment_on_read<R>(
+    segment: &TreeDiffSegment,
+    kind: TreeKind,
+    read: &R,
+    before_side: bool,
+    changed: &mut BTreeMap<Vec<u8>, (Option<Vec<u8>>, Option<Vec<u8>>)>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut values = BTreeMap::new();
+    collect_segment_on_read_into(segment, kind, read, &mut values).await?;
+    for (key, value) in values {
+        let entry = changed.entry(key).or_insert((None, None));
+        if before_side {
+            entry.0 = value;
+        } else {
+            entry.1 = value;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_segment_on_read_into<R>(
+    segment: &TreeDiffSegment,
+    kind: TreeKind,
+    read: &R,
+    values: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut pending = vec![segment.clone()];
+    while let Some(segment) = pending.pop() {
+        let node = decode_node(
+            segment.node.id,
+            &load_object_on_read(read, segment.node.id).await?,
+        )?;
+        validate_loaded_node(segment.node.id, &node, kind, Some(&segment.node))?;
+        match node.body {
+            NodeBody::Leaf(entries) => {
+                for entry in entries {
+                    if key_in_bounds(&entry.key, &segment.bounds) {
+                        values.insert(entry.key, Some(entry.value));
+                    }
+                }
+            }
+            NodeBody::Internal(children) => {
+                pending.extend(child_segments(&children, &segment.bounds));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_leaf_diff(
+    before: &[LeafEntry],
+    after: &[LeafEntry],
+    bounds: &TreeDiffBounds,
+    changed: &mut BTreeMap<Vec<u8>, (Option<Vec<u8>>, Option<Vec<u8>>)>,
+) {
+    let mut before_values = BTreeMap::new();
+    let mut after_values = BTreeMap::new();
+    for entry in before {
+        if key_in_bounds(&entry.key, bounds) {
+            before_values.insert(entry.key.clone(), entry.value.clone());
+        }
+    }
+    for entry in after {
+        if key_in_bounds(&entry.key, bounds) {
+            after_values.insert(entry.key.clone(), entry.value.clone());
+        }
+    }
+    merge_side_values(
+        before_values
+            .into_iter()
+            .map(|(key, value)| (key, Some(value)))
+            .collect(),
+        after_values
+            .into_iter()
+            .map(|(key, value)| (key, Some(value)))
+            .collect(),
+        changed,
+    );
+}
+
+fn record_side_entries(
+    entries: &[LeafEntry],
+    bounds: &TreeDiffBounds,
+    values: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+) {
+    for entry in entries {
+        if key_in_bounds(&entry.key, bounds) {
+            values.insert(entry.key.clone(), Some(entry.value.clone()));
+        }
+    }
+}
+
+fn merge_side_values(
+    before: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    after: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    changed: &mut BTreeMap<Vec<u8>, (Option<Vec<u8>>, Option<Vec<u8>>)>,
+) {
+    let mut keys = BTreeSet::new();
+    keys.extend(before.keys().cloned());
+    keys.extend(after.keys().cloned());
+    for key in keys {
+        changed.insert(
+            key.clone(),
+            (
+                before.get(&key).cloned().flatten(),
+                after.get(&key).cloned().flatten(),
+            ),
+        );
+    }
+}
+
+fn child_segments(children: &[NodeRef], bounds: &TreeDiffBounds) -> Vec<TreeDiffSegment> {
+    let mut segments = Vec::with_capacity(children.len());
+    let mut previous_max = None;
+    for child in children {
+        let child_bounds = TreeDiffBounds {
+            lower_exclusive: max_lower(bounds.lower_exclusive.as_deref(), previous_max.as_deref()),
+            upper_inclusive: min_upper(
+                bounds.upper_inclusive.as_deref(),
+                Some(child.max_key.as_slice()),
+            ),
+        };
+        if bounds_have_values(&child_bounds) {
+            segments.push(TreeDiffSegment {
+                node: child.clone(),
+                bounds: child_bounds,
+            });
+        }
+        previous_max = Some(child.max_key.clone());
+    }
+    segments
+}
+
+fn segment_is_before(left: &TreeDiffSegment, right: &TreeDiffSegment) -> bool {
+    left.bounds
+        .upper_inclusive
+        .as_deref()
+        .zip(right.bounds.lower_exclusive.as_deref())
+        .is_some_and(|(upper, lower)| upper <= lower)
+}
+
+fn bounds_have_values(bounds: &TreeDiffBounds) -> bool {
+    bounds
+        .lower_exclusive
+        .as_deref()
+        .zip(bounds.upper_inclusive.as_deref())
+        .is_none_or(|(lower, upper)| lower < upper)
+}
+
+fn key_in_bounds(key: &[u8], bounds: &TreeDiffBounds) -> bool {
+    bounds
+        .lower_exclusive
+        .as_deref()
+        .is_none_or(|lower| key > lower)
+        && bounds
+            .upper_inclusive
+            .as_deref()
+            .is_none_or(|upper| key <= upper)
+}
+
+fn max_lower(left: Option<&[u8]>, right: Option<&[u8]>) -> Option<Vec<u8>> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value.to_vec()),
+        (Some(left), Some(right)) => Some(left.max(right).to_vec()),
+    }
+}
+
+fn min_upper(left: Option<&[u8]>, right: Option<&[u8]>) -> Option<Vec<u8>> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value.to_vec()),
+        (Some(left), Some(right)) => Some(left.min(right).to_vec()),
+    }
+}
+
+fn upper_is_at_or_before(left: Option<&[u8]>, right: Option<&[u8]>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left <= right,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
 
 pub(super) async fn validate_root_on_read<R>(
     root: ObjectId,
@@ -2073,4 +2459,22 @@ fn parse_kind(value: &str) -> Result<TreeKind, StorageError> {
         "retention" => Ok(TreeKind::Retention),
         _ => Err(corruption(format!("unknown tree lookup kind {value}"))),
     }
+}
+
+#[cfg(test)]
+pub(super) fn rewrite_first_internal_child_summary_for_test(
+    id: ObjectId,
+    bytes: &[u8],
+) -> Result<(ObjectId, Bytes), StorageError> {
+    let mut node = decode_node(id, bytes)?;
+    let NodeBody::Internal(children) = &mut node.body else {
+        return Err(corruption("test tree root is not internal"));
+    };
+    children[0].summary.logical_bytes = children[0]
+        .summary
+        .logical_bytes
+        .checked_add(1)
+        .ok_or_else(|| corruption("test child summary overflow"))?;
+    node.summary = summary_from_children(node.kind, children)?;
+    encode_node(&node)
 }

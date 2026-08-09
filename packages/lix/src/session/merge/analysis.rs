@@ -168,29 +168,7 @@ where
                     format!("merge state row lost change payload '{}", row.change_id),
                 )
             })?;
-            let snapshot = row.snapshot_content.as_deref().map_or(
-                crate::json_store::JsonSlot::None,
-                crate::json_store::JsonSlot::from_json,
-            );
-            let metadata = row.metadata.as_deref().map_or(
-                crate::json_store::JsonSlot::None,
-                crate::json_store::JsonSlot::from_json,
-            );
-            if record.schema_key != row.key.schema_key
-                || record.file_id != row.key.file_id
-                || record.entity_pk != row.key.entity_pk
-                || record.created_at != row.created_at
-                || record.snapshot != snapshot
-                || record.metadata != metadata
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "merge change '{}' does not authenticate its state row",
-                        row.change_id
-                    ),
-                ));
-            }
+            crate::forktree::validate_historical_state_row(view, row, record).await?;
         }
     }
     let payloads = authenticated

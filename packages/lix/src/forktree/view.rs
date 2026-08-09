@@ -557,6 +557,34 @@ where
     }
 }
 
+/// A coherent view delegates reads to its already-retained storage handle.
+/// This is the same authority as the facade; it does not open or refresh a
+/// second read while authenticating a diff or merge payload.
+impl<R> StorageAdapterRead for CoherentView<R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.read.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<crate::storage::GetManyResult, StorageError>> + Send {
+        self.read.get_many(requests)
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.read.begin_scan(space, range, opts)
+    }
+}
+
 /// ForkTree-owned first-parent checkpoint chronology. The state marker is
 /// authenticated from the same retained read as the commit envelope; an
 /// inherited marker never reclassifies a descendant ordinary commit.
@@ -841,7 +869,7 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, false).await
+        super::serving::diff_state_rows_for_working_diff(&self.read, before, after, false).await
     }
 
     /// Returns authenticated state-write identity changes separately from
@@ -1019,31 +1047,23 @@ async fn diff_state_rows_between_commits_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let mut before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
-    let mut after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
-    if !include_global {
-        before_rows.retain(|row| !row.global);
-        after_rows.retain(|row| !row.global);
-    }
-    let mut by_key = BTreeMap::new();
-    for row in before_rows {
-        by_key.entry(row.key.clone()).or_insert((Some(row), None));
-    }
-    for row in after_rows {
-        by_key
-            .entry(row.key.clone())
-            .and_modify(|entry| entry.1 = Some(row.clone()))
-            .or_insert((None, Some(row)));
-    }
-    Ok(by_key
-        .into_values()
-        .filter_map(|(before, after)| {
-            let changed = historical_state_payloads_differ(before.as_ref(), after.as_ref());
-            changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
-        })
-        .collect())
+    super::serving::diff_state_rows_between_commits(read, before, after, include_global).await
 }
 
+fn historical_state_identity_changed(
+    before: Option<&super::state::HistoricalStateRow>,
+    after: Option<&super::state::HistoricalStateRow>,
+) -> bool {
+    match (before, after) {
+        (Some(left), Some(right)) => {
+            left.change_id != right.change_id || left.commit_id != right.commit_id
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
+}
+
+#[cfg(test)]
 fn historical_state_payloads_differ(
     before: Option<&super::state::HistoricalStateRow>,
     after: Option<&super::state::HistoricalStateRow>,
@@ -1060,19 +1080,6 @@ fn historical_state_payloads_differ(
     }
 }
 
-fn historical_state_identity_changed(
-    before: Option<&super::state::HistoricalStateRow>,
-    after: Option<&super::state::HistoricalStateRow>,
-) -> bool {
-    match (before, after) {
-        (Some(left), Some(right)) => {
-            left.change_id != right.change_id || left.commit_id != right.commit_id
-        }
-        (Some(_), None) | (None, Some(_)) => true,
-        (None, None) => false,
-    }
-}
-
 async fn touched_state_identities_between_commits_on_read<R>(
     read: &R,
     before: crate::changelog::CommitId,
@@ -1081,17 +1088,24 @@ async fn touched_state_identities_between_commits_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
-    let after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
+    let entries =
+        super::serving::diff_state_rows_between_commits(read, before, after, true).await?;
     let mut by_key = BTreeMap::new();
-    for row in before_rows {
-        by_key.entry(row.key.clone()).or_insert((Some(row), None));
-    }
-    for row in after_rows {
-        by_key
-            .entry(row.key.clone())
-            .and_modify(|entry| entry.1 = Some(row.clone()))
-            .or_insert((None, Some(row)));
+    for entry in entries {
+        by_key.insert(
+            entry.before.as_ref().map_or_else(
+                || {
+                    entry
+                        .after
+                        .as_ref()
+                        .expect("diff entry has an endpoint")
+                        .key
+                        .clone()
+                },
+                |row| row.key.clone(),
+            ),
+            (entry.before, entry.after),
+        );
     }
     Ok(by_key
         .into_values()

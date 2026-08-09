@@ -43,7 +43,7 @@ pub(crate) use serving::{
     load_commit_summary, load_commit_topologies, page_changes, page_commits,
     put_change_catalog_entries, put_commit_catalog_entries, scan_branch_heads, scan_change_records,
     scan_commit_records, scan_commit_topologies, select_historical_commit_member, state_point,
-    state_point_on_read, state_points, state_range,
+    state_point_on_read, state_points, state_range, validate_historical_state_row,
 };
 pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
