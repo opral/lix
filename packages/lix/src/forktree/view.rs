@@ -90,6 +90,16 @@ where
         &self.read
     }
 
+    /// Builds the publication's temporary object overlay without exposing
+    /// this view's retained storage handle to callers. Staged objects must
+    /// still be read through the same authenticated view identity.
+    pub(super) fn object_overlay<'a>(
+        &'a self,
+        objects: &'a super::tree::ImmutableObjectSet,
+    ) -> super::serving::ObjectOverlayRead<'a, R> {
+        super::serving::ObjectOverlayRead::new(&self.read, objects)
+    }
+
     /// Applies an authenticated state-tree edit using this view's retained
     /// read. The storage handle never leaves the ForkTree owner.
     pub(crate) async fn edit_state_tree(

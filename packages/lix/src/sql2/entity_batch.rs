@@ -4,6 +4,8 @@
 //! operation-owned `LiveStateReader::scan_batch` for the visible rows once and
 //! projects that authenticated batch into snapshot bytes or primary keys.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -45,6 +47,42 @@ pub(crate) struct CurrentEntitySnapshotReader<S> {
 impl<S> CurrentEntitySnapshotReader<S> {
     pub(crate) fn new(forktree: ForkTreeReadFacade<S>) -> Self {
         Self { forktree }
+    }
+}
+
+/// Terminal projection over an already operation-owned live-state reader.
+/// This adapter only projects the authenticated batch; it does not acquire a
+/// storage read, expose a store, or provide a second visibility authority.
+pub(crate) struct CanonicalEntitySnapshotProjection {
+    live_state: Arc<dyn LiveStateReader>,
+}
+
+impl CanonicalEntitySnapshotProjection {
+    pub(crate) fn new(live_state: Arc<dyn LiveStateReader>) -> Self {
+        Self { live_state }
+    }
+}
+
+#[async_trait]
+impl EntitySnapshotReader for CanonicalEntitySnapshotProjection {
+    async fn scan_entity_snapshots(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        validate_terminal_projection_request(&request)?;
+        Ok(Some(
+            canonical_snapshot_projection(self.live_state.as_ref(), &request).await?,
+        ))
+    }
+
+    async fn scan_entity_primary_keys(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        validate_terminal_projection_request(&request)?;
+        Ok(Some(
+            canonical_primary_key_projection(self.live_state.as_ref(), &request).await?,
+        ))
     }
 }
 

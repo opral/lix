@@ -16,7 +16,7 @@ use super::model::{
     snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::serving::{CatalogTreeEdit, ObjectOverlayRead, StateTreeEdit};
+use super::serving::{CatalogTreeEdit, StateTreeEdit};
 use super::state::{
     StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
     encode_untracked_value,
@@ -422,7 +422,7 @@ impl PreparedPublication {
         };
         let (ref_object_id, ref_bytes) = branch_ref.encode()?;
         let base_repository_root = self.next_repository_root.unwrap_or(view.repository_root());
-        let overlay = ObjectOverlayRead::new(view.storage_read(), &self.object_puts);
+        let overlay = view.object_overlay(&self.object_puts);
         let change_catalog_edit = super::serving::put_change_catalog_entries(
             base_repository_root.change_catalog_root,
             &[(
@@ -508,7 +508,7 @@ impl PreparedPublication {
         // in this same PreparedPublication. Read those immutable path-copy
         // nodes through the publication overlay; the retained operation read
         // alone cannot see staged objects.
-        let overlay = ObjectOverlayRead::new(view.storage_read(), &self.object_puts);
+        let overlay = view.object_overlay(&self.object_puts);
         let change_catalog_edit = super::serving::put_change_catalog_entries(
             base_repository_root.change_catalog_root,
             &[(

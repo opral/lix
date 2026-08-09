@@ -48,7 +48,7 @@ pub(crate) use context::{
     WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 pub(crate) use entity_batch::{
-    CurrentEntitySnapshotReader, EntitySnapshotReader, LiveStateEntitySnapshotReader,
+    CanonicalEntitySnapshotProjection, CurrentEntitySnapshotReader, EntitySnapshotReader,
 };
 pub(crate) use entity_projection::EntityProjectionDecoder;
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;

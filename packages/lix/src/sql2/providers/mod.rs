@@ -479,7 +479,7 @@ where
     let entity_live_state: Arc<dyn LiveStateReader> =
         Arc::new(changelog_query_source.forktree_reader.clone());
     let entity_snapshot_reader: Arc<dyn crate::sql2::EntitySnapshotReader> = Arc::new(
-        crate::sql2::LiveStateEntitySnapshotReader::new(Arc::clone(&entity_live_state)),
+        crate::sql2::CanonicalEntitySnapshotProjection::new(Arc::clone(&entity_live_state)),
     );
     entity::register_entity_providers(
         session,
