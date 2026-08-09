@@ -81,7 +81,12 @@ impl ObjectDomain {
             16 => Ok(Self::GcLiveBranchPackV1),
             17 => Ok(Self::CommitMemberPageV1),
             18 => Ok(Self::HotObjectPackV1),
-            _ => Err(corruption(format!("unknown object domain {value}"))),
+            _ => {
+                let unknown_domain = value;
+                Err(corruption(format!(
+                    "unknown object domain {unknown_domain}"
+                )))
+            }
         }
     }
 
@@ -109,7 +114,22 @@ pub(super) fn authenticate_object_domain(
 pub(super) const fn hot_packable_domain(domain: ObjectDomain) -> bool {
     matches!(
         domain,
-        ObjectDomain::RepositoryRoot | ObjectDomain::SemanticChange
+        ObjectDomain::RepositoryRoot
+            | ObjectDomain::Commit
+            | ObjectDomain::SemanticChange
+            | ObjectDomain::OrderedTreeNode
+            | ObjectDomain::CommitMemberPageV1
+    )
+}
+
+/// Explicit control-plane domains are authenticated from the retained
+/// selector/read path and are never silently admitted to the payload pack.
+pub(super) const fn retained_control_domain(domain: ObjectDomain) -> bool {
+    matches!(
+        domain,
+        ObjectDomain::BranchSnapshot
+            | ObjectDomain::BranchRefChange
+            | ObjectDomain::HotObjectPackV1
     )
 }
 
@@ -180,4 +200,20 @@ pub(super) fn decode_optional_id(
     label: &str,
 ) -> Result<Option<ObjectId>, StorageError> {
     decoder.optional_fixed(label).map(|id| id.map(ObjectId))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectDomain, hot_packable_domain, retained_control_domain};
+
+    #[test]
+    fn object_domain_classification_rejects_unknown_and_keeps_controls_out_of_pack() {
+        assert!(ObjectDomain::decode(u16::MAX).is_err());
+        assert!(hot_packable_domain(ObjectDomain::Commit));
+        assert!(hot_packable_domain(ObjectDomain::OrderedTreeNode));
+        assert!(!hot_packable_domain(ObjectDomain::BranchSnapshot));
+        assert!(!hot_packable_domain(ObjectDomain::BranchRefChange));
+        assert!(retained_control_domain(ObjectDomain::BranchSnapshot));
+        assert!(retained_control_domain(ObjectDomain::BranchRefChange));
+    }
 }

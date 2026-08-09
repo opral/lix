@@ -576,6 +576,38 @@ where
     }
 }
 
+/// Walks one authenticated ordered-tree closure and returns every node ID.
+/// The walk uses the caller's retained read, so a packed-read caller can make
+/// missing closure members fail closed without consulting the raw object
+/// space.
+pub(super) async fn collect_reachable_node_ids<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    read: &R,
+) -> Result<BTreeSet<ObjectId>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let kind = parse_kind(expected_kind)?;
+    let mut pending = vec![(root, None)];
+    let mut visited = BTreeSet::new();
+    while let Some((id, expected_parent)) = pending.pop() {
+        if !visited.insert(id) {
+            return Err(corruption(
+                "ordered-tree closure contains a cycle or duplicate edge",
+            ));
+        }
+        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+        validate_loaded_node(id, &node, kind, expected_parent.as_ref())?;
+        if let NodeBody::Internal(children) = node.body {
+            for child in children.into_iter().rev() {
+                pending.push((child.id, Some(child)));
+            }
+        }
+    }
+    Ok(visited)
+}
+
 pub(super) async fn validate_root_on_read<R>(
     root: ObjectId,
     expected_kind: &'static str,

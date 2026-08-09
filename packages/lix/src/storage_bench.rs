@@ -22,6 +22,42 @@ static FORKTREE_COMMIT_VALIDATION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FORKTREE_COMMIT_VALIDATION_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static FORKTREE_COMMIT_VALIDATION_MEMO_HITS: AtomicU64 = AtomicU64::new(0);
 static FORKTREE_COMMIT_VALIDATION_MEMBER_BINDINGS: AtomicU64 = AtomicU64::new(0);
+static FORKTREE_HOT_PACK_INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
+static FORKTREE_HOT_PACK_INDEX_HITS: AtomicU64 = AtomicU64::new(0);
+static FORKTREE_HOT_PACK_CLOSURE_PROOFS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForkTreeHotPackAccounting {
+    pub index_builds: u64,
+    pub index_hits: u64,
+    pub closure_proofs: u64,
+}
+
+pub fn begin_forktree_hot_pack_accounting() {
+    FORKTREE_HOT_PACK_INDEX_BUILDS.store(0, Ordering::Relaxed);
+    FORKTREE_HOT_PACK_INDEX_HITS.store(0, Ordering::Relaxed);
+    FORKTREE_HOT_PACK_CLOSURE_PROOFS.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn record_forktree_hot_pack_index_build() {
+    FORKTREE_HOT_PACK_INDEX_BUILDS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_forktree_hot_pack_index_hit() {
+    FORKTREE_HOT_PACK_INDEX_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_forktree_hot_pack_closure_proof() {
+    FORKTREE_HOT_PACK_CLOSURE_PROOFS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_forktree_hot_pack_accounting() -> ForkTreeHotPackAccounting {
+    ForkTreeHotPackAccounting {
+        index_builds: FORKTREE_HOT_PACK_INDEX_BUILDS.swap(0, Ordering::Relaxed),
+        index_hits: FORKTREE_HOT_PACK_INDEX_HITS.swap(0, Ordering::Relaxed),
+        closure_proofs: FORKTREE_HOT_PACK_CLOSURE_PROOFS.swap(0, Ordering::Relaxed),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrudCommitValidationAccounting {

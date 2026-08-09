@@ -1,7 +1,6 @@
-use std::sync::Arc;
-
-#[cfg(feature = "storage-benches")]
+use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, ScanCursor, StorageError,
@@ -75,6 +74,10 @@ pub trait StorageAdapterRead: Send + Sync {
         None
     }
 
+    fn operation_cache(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+
     fn get_many(
         &self,
         requests: &[GetManyRequest<'_>],
@@ -88,18 +91,77 @@ pub trait StorageAdapterRead: Send + Sync {
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send;
 }
 
+/// Type-erased state attached to one retained read scope. Domain-specific
+/// readers may place an operation-local authenticated index here without
+/// making this neutral adapter layer own that index's schema or bytes.
+pub(crate) struct OperationReadCache {
+    read_identity: u128,
+    values: Mutex<Vec<Arc<dyn Any + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for OperationReadCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperationReadCache")
+            .field("read_identity", &self.read_identity)
+            .finish_non_exhaustive()
+    }
+}
+
+static NEXT_OPERATION_READ_ID: AtomicU64 = AtomicU64::new(1);
+
+impl OperationReadCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            read_identity: u128::from(NEXT_OPERATION_READ_ID.fetch_add(1, Ordering::Relaxed)),
+            values: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn read_identity(&self) -> u128 {
+        self.read_identity
+    }
+
+    pub(crate) fn get_all<T>(&self) -> Vec<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        self.values
+            .lock()
+            .expect("operation read cache mutex is not poisoned")
+            .iter()
+            .filter_map(|value| Arc::downcast::<T>(value.clone()).ok())
+            .collect()
+    }
+
+    pub(crate) fn install<T>(&self, value: Arc<T>) -> bool
+    where
+        T: Any + Send + Sync,
+    {
+        self.values
+            .lock()
+            .expect("operation read cache mutex is not poisoned")
+            .push(value);
+        true
+    }
+}
+
 #[derive(Debug)]
 pub struct StorageAdapterReadScope<R> {
     read: R,
+    operation_cache: Arc<OperationReadCache>,
 }
 
 impl<R> StorageAdapterReadScope<R> {
     pub fn new(read: R) -> Self {
-        Self { read }
+        Self {
+            read,
+            operation_cache: Arc::new(OperationReadCache::new()),
+        }
     }
 
-    fn into_inner(self) -> R {
-        self.read
+    fn into_parts(self) -> (R, Arc<OperationReadCache>) {
+        (self.read, self.operation_cache)
     }
 }
 
@@ -112,6 +174,7 @@ where
     R: StorageRead,
 {
     read: Arc<R>,
+    operation_cache: Arc<OperationReadCache>,
 }
 
 impl<R> SharedStorageAdapterRead<R>
@@ -119,9 +182,15 @@ where
     R: StorageRead,
 {
     pub(crate) fn new(read: StorageAdapterReadScope<R>) -> Self {
+        let (read, operation_cache) = read.into_parts();
         Self {
-            read: Arc::new(read.into_inner()),
+            read: Arc::new(read),
+            operation_cache,
         }
+    }
+
+    pub(crate) fn operation_cache(&self) -> Arc<OperationReadCache> {
+        Arc::clone(&self.operation_cache)
     }
 
     pub(crate) fn finish(self) -> Result<(), StorageError> {
@@ -143,6 +212,7 @@ where
     fn clone(&self) -> Self {
         Self {
             read: Arc::clone(&self.read),
+            operation_cache: Arc::clone(&self.operation_cache),
         }
     }
 }
@@ -151,6 +221,11 @@ impl<R> StorageAdapterRead for StorageAdapterReadScope<R>
 where
     R: StorageRead,
 {
+    fn operation_cache(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        let cache: Arc<dyn Any + Send + Sync> = self.operation_cache.clone();
+        Some(cache)
+    }
+
     fn snapshot_cache_key(&self) -> Option<u128> {
         self.read.snapshot_cache_key()
     }
@@ -188,6 +263,10 @@ where
         self.read.snapshot_cache_key()
     }
 
+    fn operation_cache(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        Some(self.operation_cache())
+    }
+
     fn get_many(
         &self,
         requests: &[GetManyRequest<'_>],
@@ -221,6 +300,10 @@ where
         (*self).snapshot_cache_key()
     }
 
+    fn operation_cache(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        (*self).operation_cache()
+    }
+
     fn get_many(
         &self,
         requests: &[GetManyRequest<'_>],
@@ -244,6 +327,10 @@ where
 {
     fn snapshot_cache_key(&self) -> Option<u128> {
         (**self).snapshot_cache_key()
+    }
+
+    fn operation_cache(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        (**self).operation_cache()
     }
 
     fn get_many(

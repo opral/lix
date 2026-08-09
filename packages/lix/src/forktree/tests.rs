@@ -1091,7 +1091,10 @@ async fn historical_absence_requires_authenticated_commit_and_root() {
             .await
             .expect("historical absence read"),
     );
-    let facade = ForkTreeReadFacade::new(read);
+    let facade = ForkTreeReadFacade::new_for_branch(
+        read,
+        uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string(),
+    );
     let public_commit_id = public_commit_id(0x20);
     let absent_key = encode_state_key(StateKeyRef {
         schema_key: "app.row",
@@ -1105,6 +1108,77 @@ async fn historical_absence_requires_authenticated_commit_and_root() {
             .expect("authenticated absent key")
             .is_none(),
         "a missing key is None only after commit and roots authenticate"
+    );
+}
+
+#[tokio::test]
+async fn unbound_facade_rejects_packed_history_without_retained_identity() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("unbound facade read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    let error = facade
+        .load_state_value_at_commit(public_commit_id(0x20), &seed.state_keys[0], true)
+        .await
+        .expect_err("unbound historical facade must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("branch-bound retained view identity"),
+        "unexpected unbound historical error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn branch_bound_facade_rejects_cross_branch_reuse_and_generic_scan_is_mixed_branch() {
+    let storage = Memory::new();
+    let seed = build_seed();
+    seed_storage(&storage, &seed).await;
+    let seed_branch = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
+    let other_branch = uuid::Uuid::from_bytes(raw_id(0x12)).to_string();
+    let read = SharedStorageAdapterRead::new(StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("mixed-branch retained read"),
+    ));
+
+    let bound = ForkTreeReadFacade::new_for_branch(read.clone(), seed_branch.clone());
+    let error = match bound.branch(&other_branch).await {
+        Ok(_) => panic!("a branch-bound facade must not reuse another branch's index"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("branch-bound ForkTree facade cannot serve another branch"),
+        "unexpected cross-branch error: {error}"
+    );
+
+    let generic = ForkTreeReadFacade::new(read);
+    let error = crate::live_state::scan_forktree_facade(
+        &generic,
+        &crate::live_state::LiveStateScanRequest {
+            filter: crate::live_state::LiveStateFilter {
+                branch_ids: vec![seed_branch, other_branch],
+                untracked: Some(false),
+                include_tombstones: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("generic retained read must not bind an absent branch to the first branch");
+    assert!(
+        error.to_string().contains("branch selector is absent"),
+        "unexpected mixed-branch absence error: {error}"
     );
 }
 
@@ -1124,7 +1198,10 @@ async fn historical_missing_commit_catalog_fails_for_point_and_batch() {
             .await
             .expect("missing catalog read"),
     );
-    let facade = ForkTreeReadFacade::new(read);
+    let facade = ForkTreeReadFacade::new_for_branch(
+        read,
+        uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string(),
+    );
     let public_commit_id = public_commit_id(0x20);
     assert!(
         facade
@@ -1209,7 +1286,10 @@ async fn historical_missing_state_root_fails_before_empty_result() {
             .await
             .expect("missing state root read"),
     );
-    let facade = ForkTreeReadFacade::new(read);
+    let facade = ForkTreeReadFacade::new_for_branch(
+        read,
+        uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string(),
+    );
     assert!(
         facade
             .load_state_value_at_commit(public_commit_id(0x20), &seed.state_keys[2], true)

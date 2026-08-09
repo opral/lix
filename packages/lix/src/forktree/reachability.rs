@@ -31,7 +31,9 @@ use super::publication::PreparedPublication;
 use super::serving::{validate_retained_commit, validate_retained_ref_change};
 use super::state::{UNTRACKED_ROW_SPACE, decode_untracked_key, decode_untracked_value};
 use super::tree::ordered_tree_edges;
-use super::view::{PackedRead, SELECTOR_SPACE, load_facade_hot_objects, load_object_bytes};
+use super::view::{
+    PackedRead, SELECTOR_SPACE, gc_view_token, load_facade_hot_objects, load_object_bytes,
+};
 
 const SELECTOR_PAGE_ROWS: usize = 256;
 const UNTRACKED_PAGE_ROWS: usize = 1;
@@ -75,6 +77,7 @@ pub(crate) enum GcStepStatus {
 struct GcSnapshot<R> {
     read: R,
     hot_objects: BTreeMap<ObjectId, Bytes>,
+    view_token: super::view::ViewToken,
     raw_global: Bytes,
     global: GlobalSelectorV1,
     raw_progress_selector: Option<Bytes>,
@@ -206,6 +209,7 @@ where
     }
     let raw_global = required_full(loaded.values[0].clone(), "global selector is absent")?;
     let global = GlobalSelectorV1::decode(&raw_global)?;
+    let view_token = gc_view_token(&read, &raw_global, global.repository_root);
     let hot_objects = load_facade_hot_objects(&read).await?;
     let raw_progress_selector = match loaded.values[1].clone() {
         None => None,
@@ -235,6 +239,7 @@ where
     Ok(GcSnapshot {
         read,
         hot_objects,
+        view_token,
         raw_global,
         global,
         raw_progress_selector,
@@ -591,7 +596,12 @@ where
     R: StorageAdapterRead,
 {
     let mut edit = MaintenanceEdit::default();
-    let packed = PackedRead::new(&snapshot.read, &snapshot.hot_objects, ObjectId::ZERO);
+    let packed = PackedRead::new_bound(
+        &snapshot.read,
+        &snapshot.hot_objects,
+        ObjectId::ZERO,
+        snapshot.view_token,
+    );
     let work = budget.max_claims.min(TRAVERSAL_BATCH_CLAIMS).max(1);
     let mut paged_edges = 0_usize;
     for _ in 0..work {

@@ -138,6 +138,7 @@ async fn run(
         assert_same_digest("baseline", &baseline_lix, &baseline_sqlite);
 
         lix::storage_adapter::reset_storage_adapter_read_counters();
+        lix::storage_bench::begin_forktree_hot_pack_accounting();
 
         let (lix_result, lix_elapsed) = if verify_only {
             (run_lix(&lix_fixture, operation).await, None)
@@ -162,13 +163,14 @@ async fn run(
         assert_same_digest("operation", &lix_result, &sqlite_result);
 
         let read_counters = lix::storage_adapter::storage_adapter_read_counters();
+        let hot_pack_counters = lix::storage_bench::take_forktree_hot_pack_accounting();
 
         let final_lix = lix_fixture.read_all_result().await;
         let final_sqlite = sqlite_fixture.read_all_public_result();
         assert_same_digest("final", &final_lix, &final_sqlite);
 
         println!(
-            "sample={sample} verified=true operation_digest={} final_digest={} lix_wall_us={} sqlite_wall_us={} adapter_get_many_calls={} adapter_requested_keys={} adapter_returned_values={} adapter_returned_bytes={}",
+            "sample={sample} verified=true operation_digest={} final_digest={} lix_wall_us={} sqlite_wall_us={} adapter_get_many_calls={} adapter_requested_keys={} adapter_returned_values={} adapter_returned_bytes={} hot_pack_index_builds={} hot_pack_index_hits={} hot_pack_closure_proofs={}",
             digest(&lix_result),
             digest(&final_lix),
             lix_elapsed.map_or(0, |value| value.as_micros()),
@@ -177,6 +179,9 @@ async fn run(
             read_counters.requested_keys,
             read_counters.returned_values,
             read_counters.returned_bytes,
+            hot_pack_counters.index_builds,
+            hot_pack_counters.index_hits,
+            hot_pack_counters.closure_proofs,
         );
     }
 }

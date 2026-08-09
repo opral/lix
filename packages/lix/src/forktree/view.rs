@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 
@@ -10,13 +11,14 @@ use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
     ReadOptions, ScanCursor, ScanOrder, Storage, StorageError,
 };
-use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
+use crate::storage_adapter::{OperationReadCache, StorageAdapterRead, StorageAdapterReadScope};
 
 use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
     BlobChunkV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1,
-    GlobalSelectorV1, HotObjectPackV1, RepositoryRootV1, branch_selector_key, global_selector_key,
+    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberPageV1,
+    CommitObjectV1, GlobalSelectorV1, HotObjectPackV1, RepositoryRootV1, branch_selector_key,
+    global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId, authenticate_object_domain};
 
@@ -27,22 +29,172 @@ pub(super) const SELECTOR_SPACE: crate::storage::StorageSpace =
         crate::storage::ValueSemantics::Mutable,
     );
 
+#[cfg(feature = "storage-benches")]
+fn note_hot_pack_ready() {
+    trace_hot_pack("index_build");
+    crate::storage_bench::record_forktree_hot_pack_index_build();
+}
+
+#[cfg(not(feature = "storage-benches"))]
+fn note_hot_pack_ready() {
+    trace_hot_pack("index_build");
+}
+
+#[cfg(feature = "storage-benches")]
+fn record_hot_pack_index_hit() {
+    crate::storage_bench::record_forktree_hot_pack_index_hit();
+}
+
+#[cfg(not(feature = "storage-benches"))]
+fn record_hot_pack_index_hit() {}
+
+#[cfg(feature = "storage-benches")]
+fn record_hot_pack_closure_proof() {
+    crate::storage_bench::record_forktree_hot_pack_closure_proof();
+}
+
+#[cfg(not(feature = "storage-benches"))]
+fn record_hot_pack_closure_proof() {}
+
+fn trace_hot_pack(message: impl std::fmt::Display) {
+    let _ = message;
+}
+
+const VIEW_ID_DOMAIN: &str = "lix forktree coherent selector view v1";
+static NEXT_VIEW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Value identity for one retained authenticated read.  This is deliberately
+/// independent of wrapper addresses: clones of one read share the same
+/// authenticated selector/root/snapshot identity, while another read or a
+/// reopened repository receives a different read epoch when the backend
+/// exposes one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ViewIdentity {
+    pub(crate) storage_read_epoch: Option<u128>,
+    pub(crate) repository_root_id: ObjectId,
+    pub(crate) global_root: ObjectId,
+    pub(crate) raw_global_selector: Bytes,
+    pub(crate) branch_root: ObjectId,
+    pub(crate) raw_branch_selector: Bytes,
+    pub(crate) selected_snapshot_commit: ObjectId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ViewToken([u8; 32]);
+
+impl ViewToken {
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl ViewIdentity {
+    fn new<R: StorageAdapterRead + ?Sized>(
+        read: &R,
+        raw_global_selector: &Bytes,
+        raw_branch_selector: &Bytes,
+        repository_root_id: ObjectId,
+        branch_root: ObjectId,
+        selected_snapshot_commit: ObjectId,
+    ) -> Self {
+        Self {
+            storage_read_epoch: read
+                .operation_cache()
+                .and_then(|cache| Arc::downcast::<OperationReadCache>(cache).ok())
+                .map(|cache| cache.read_identity())
+                .or_else(|| read.snapshot_cache_key()),
+            repository_root_id,
+            global_root: repository_root_id,
+            raw_global_selector: raw_global_selector.clone(),
+            branch_root,
+            raw_branch_selector: raw_branch_selector.clone(),
+            selected_snapshot_commit,
+        }
+    }
+
+    fn token(&self) -> ViewToken {
+        let mut encoder = Encoder::with_prefix(b"LIXFTR-VIEW\\0\\x01");
+        match self.storage_read_epoch {
+            Some(epoch) => {
+                encoder.u8(1);
+                encoder.fixed(&epoch.to_be_bytes());
+            }
+            None => encoder.u8(0),
+        }
+        encoder.fixed(self.repository_root_id.as_bytes());
+        encoder.fixed(self.global_root.as_bytes());
+        encoder
+            .bytes(&self.raw_global_selector)
+            .expect("selector values fit the canonical view identity envelope");
+        encoder.fixed(self.branch_root.as_bytes());
+        encoder
+            .bytes(&self.raw_branch_selector)
+            .expect("selector values fit the canonical view identity envelope");
+        encoder.fixed(self.selected_snapshot_commit.as_bytes());
+        ViewToken(keyed_hash(VIEW_ID_DOMAIN, &encoder.into_vec()))
+    }
+}
+
+pub(super) fn gc_view_token<R: StorageAdapterRead + ?Sized>(
+    read: &R,
+    raw_global_selector: &Bytes,
+    repository_root_id: ObjectId,
+) -> ViewToken {
+    let mut encoder = Encoder::with_prefix(b"LIXFTR-GC-VIEW\0\x01");
+    match read
+        .operation_cache()
+        .and_then(|cache| Arc::downcast::<OperationReadCache>(cache).ok())
+        .map(|cache| cache.read_identity())
+        .or_else(|| read.snapshot_cache_key())
+    {
+        Some(identity) => {
+            encoder.u8(1);
+            encoder.fixed(&identity.to_be_bytes());
+        }
+        None => encoder.u8(0),
+    }
+    encoder.fixed(repository_root_id.as_bytes());
+    encoder
+        .bytes(raw_global_selector)
+        .expect("global selector values fit the GC view identity envelope");
+    ViewToken(keyed_hash(
+        "lix forktree GC retained read v1",
+        &encoder.into_vec(),
+    ))
+}
+
+fn shared_retained_view_identity(
+    raw_control_read: &ViewIdentity,
+    packed_read: &ViewIdentity,
+    view_token: ViewToken,
+) -> Result<ViewToken, StorageError> {
+    if raw_control_read != packed_read || raw_control_read.token() != view_token {
+        return Err(corruption(
+            "raw control and packed readers do not share the retained view identity",
+        ));
+    }
+    Ok(view_token)
+}
+
 pub(crate) struct PackedRead<'a, R: ?Sized> {
     read: &'a R,
     objects: &'a BTreeMap<ObjectId, Bytes>,
     pack_id: ObjectId,
+    view_token: Option<ViewToken>,
 }
 
 impl<'a, R: ?Sized> PackedRead<'a, R> {
-    pub(super) fn new(
+    pub(super) fn new_bound(
         read: &'a R,
         objects: &'a BTreeMap<ObjectId, Bytes>,
         pack_id: ObjectId,
+        view_token: ViewToken,
     ) -> Self {
         Self {
             read,
             objects,
             pack_id,
+            view_token: Some(view_token),
         }
     }
 }
@@ -51,6 +203,10 @@ impl<'a, R: ?Sized> StorageAdapterRead for PackedRead<'a, R>
 where
     R: StorageAdapterRead,
 {
+    fn operation_cache(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.read.operation_cache()
+    }
+
     fn snapshot_cache_key(&self) -> Option<u128> {
         self.read.snapshot_cache_key()
     }
@@ -62,6 +218,11 @@ where
         async move {
             let has_objects = requests.iter().any(|request| request.space == OBJECT_SPACE);
             if has_objects {
+                if self.pack_id != ObjectId::ZERO && self.view_token.is_none() {
+                    return Err(corruption(
+                        "strict hot-pack read is not bound to a retained view identity",
+                    ));
+                }
                 if requests.iter().any(|request| request.space != OBJECT_SPACE) {
                     return Err(corruption(
                         "hot pack read mixed object and non-object spaces",
@@ -75,15 +236,41 @@ where
                                 corruption("hot pack object key has the wrong length")
                             })?);
                         let bytes = if let Some(bytes) = self.objects.get(&id) {
+                            let domain = authenticate_object_domain(id, bytes)?;
+                            if self.view_token.is_none()
+                                && super::object::hot_packable_domain(domain)
+                            {
+                                return Err(corruption(format!(
+                                    "unbound zero-pack read cannot serve packed object domain {domain:?}"
+                                )));
+                            }
                             bytes.clone()
+                        } else if self.pack_id != ObjectId::ZERO {
+                            return Err(corruption(format!(
+                                "hot-pack payload object {id} is absent from the authenticated pack (pack={}, entries={})",
+                                self.pack_id,
+                                self.objects.len(),
+                            )));
                         } else {
                             let canonical = load_object_bytes(self.read, id).await?;
                             let domain = authenticate_object_domain(id, &canonical)?;
-                            if super::object::hot_packable_object(id, &canonical)? {
+                            let structural_tree_control = domain == ObjectDomain::OrderedTreeNode
+                                && !super::tree::is_serving_tree_node(id, &canonical)?;
+                            if super::object::hot_packable_domain(domain)
+                                && !structural_tree_control
+                            {
                                 return Err(corruption(format!(
                                     "hot pack object {id} is absent for authenticated domain {domain:?} (pack={}, entries={})",
                                     self.pack_id,
                                     self.objects.len(),
+                                )));
+                            }
+                            if self.view_token.is_none()
+                                && !super::object::retained_control_domain(domain)
+                                && !structural_tree_control
+                            {
+                                return Err(corruption(format!(
+                                    "unbound zero-pack read cannot serve object domain {domain:?}"
                                 )));
                             }
                             canonical
@@ -115,9 +302,6 @@ where
     }
 }
 
-const VIEW_ID_DOMAIN: &str = "lix forktree coherent selector view v1";
-static NEXT_VIEW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
 /// One authenticated branch/global state pair acquired from one immutable
 /// storage read. The owned read handle is retained for every later object and
 /// catalog traversal, so a caller cannot silently refresh either selector.
@@ -131,6 +315,8 @@ pub(crate) struct CoherentView<R> {
     branch_selector: BranchSelectorV1,
     repository_root: RepositoryRootV1,
     branch_snapshot: BranchSnapshotV1,
+    view_identity: ViewIdentity,
+    view_token: ViewToken,
     view_id: [u8; 32],
     view_instance_id: u64,
 }
@@ -145,6 +331,33 @@ where
 
     pub(crate) fn view_id(&self) -> [u8; 32] {
         self.view_id
+    }
+
+    pub(crate) fn view_token(&self) -> ViewToken {
+        self.view_token
+    }
+
+    pub(crate) fn view_identity(&self) -> &ViewIdentity {
+        &self.view_identity
+    }
+
+    /// Returns the raw control capability and the strict hot reader together
+    /// with the same value-bound token. Both capabilities borrow this view's
+    /// one retained read; neither helper can acquire or refresh a read.
+    fn retained_view_readers(&self) -> Result<(&R, PackedRead<'_, R>, ViewToken), StorageError> {
+        let raw_control_read = &self.read;
+        let view_token = shared_retained_view_identity(
+            &self.view_identity,
+            &self.view_identity,
+            self.view_token,
+        )?;
+        let packed_hot_read = PackedRead {
+            read: raw_control_read,
+            objects: &self.hot_objects,
+            pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
+        };
+        Ok((raw_control_read, packed_hot_read, view_token))
     }
 
     pub(super) fn view_instance_id(&self) -> u64 {
@@ -183,7 +396,12 @@ where
         PackedRead {
             read: &self.read,
             objects: &self.hot_objects,
-            pack_id: self.branch_snapshot.hot_pack_object_id,
+            // A coherent view uses the pack as an operation-local overlay,
+            // while ordinary non-packable objects remain readable from the
+            // authenticated retained read.  The non-zero pack ID is reserved
+            // for the install-time strict proof below.
+            pack_id: ObjectId::ZERO,
+            view_token: Some(self.view_token),
         }
     }
 
@@ -203,7 +421,7 @@ where
         &'a self,
         objects: &'a super::tree::ImmutableObjectSet,
     ) -> super::serving::ObjectOverlayRead<'a, R> {
-        super::serving::ObjectOverlayRead::new(&self.read, objects)
+        super::serving::ObjectOverlayRead::with_hot_objects(&self.read, objects, &self.hot_objects)
     }
 
     /// Applies an authenticated state-tree edit using this view's retained
@@ -302,8 +520,8 @@ where
     > {
         let global_branch_id = uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
             .expect("GLOBAL_BRANCH_ID must be a UUID");
-        let mut cursor = self
-            .read
+        let (raw_control_read, _packed_hot_read, _view_token) = self.retained_view_readers()?;
+        let mut cursor = raw_control_read
             .begin_scan(
                 super::state::UNTRACKED_ROW_SPACE,
                 KeyRange {
@@ -386,7 +604,7 @@ where
         Ok(last_key)
     }
     pub(crate) async fn load_object_bytes(&self, id: ObjectId) -> Result<Bytes, StorageError> {
-        let read = self.packed_read();
+        let (_raw_control_read, read, _view_token) = self.retained_view_readers()?;
         load_object_bytes(&read, id).await
     }
 
@@ -398,8 +616,8 @@ where
         &self,
         key: &[u8],
     ) -> Result<Option<Bytes>, StorageError> {
-        let loaded = self
-            .read
+        let (raw_control_read, _packed_hot_read, _view_token) = self.retained_view_readers()?;
+        let loaded = raw_control_read
             .get_many(&[GetManyRequest {
                 space: SELECTOR_SPACE,
                 keys: &[Key(key.to_vec().into())],
@@ -631,6 +849,40 @@ where
 #[derive(Clone)]
 pub(crate) struct ForkTreeReadFacade<R> {
     read: R,
+    hot_objects: Arc<OnceLock<Arc<BTreeMap<ObjectId, Bytes>>>>,
+    view_identity: Arc<OnceLock<ViewIdentity>>,
+    branch_id: Option<String>,
+}
+
+struct FacadeHotObjects {
+    objects: BTreeMap<ObjectId, Bytes>,
+    view_identity: ViewIdentity,
+}
+
+#[derive(Clone)]
+struct InstalledHotPackIndex {
+    binding: HotPackBinding,
+    objects: Arc<BTreeMap<ObjectId, Bytes>>,
+}
+
+#[derive(Clone)]
+struct InstalledHotPackCollection {
+    repository_root_id: ObjectId,
+    raw_global_selector: Bytes,
+    objects: Arc<BTreeMap<ObjectId, Bytes>>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct HotPackBinding {
+    view_token: ViewToken,
+    repository_root_id: ObjectId,
+    raw_global_selector: Bytes,
+    raw_branch_selector: Bytes,
+    branch_id: CanonicalBranchId,
+    branch_snapshot_object_id: ObjectId,
+    semantic_head_commit_object_id: ObjectId,
+    epoch: u64,
+    selector_generation: u64,
 }
 
 /// Let snapshot-bound ForkTree serving primitives consume the operation-owned
@@ -639,6 +891,10 @@ impl<R> StorageAdapterRead for ForkTreeReadFacade<R>
 where
     R: StorageAdapterRead,
 {
+    fn operation_cache(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.read.operation_cache()
+    }
+
     fn snapshot_cache_key(&self) -> Option<u128> {
         self.read.snapshot_cache_key()
     }
@@ -649,8 +905,13 @@ where
     ) -> impl Future<Output = Result<crate::storage::GetManyResult, StorageError>> + Send {
         async move {
             if requests.iter().any(|request| request.space == OBJECT_SPACE) {
-                let objects = load_facade_hot_objects(&self.read).await?;
-                let read = PackedRead::new(&self.read, &objects, ObjectId::ZERO);
+                let objects = self.hot_objects().await?;
+                let read = PackedRead {
+                    read: &self.read,
+                    objects: &objects,
+                    pack_id: ObjectId::ZERO,
+                    view_token: self.view_identity.get().map(ViewIdentity::token),
+                };
                 return read.get_many(requests).await;
             }
             self.read.get_many(requests).await
@@ -696,7 +957,74 @@ where
     R: StorageAdapterRead,
 {
     pub(crate) fn new(read: R) -> Self {
-        Self { read }
+        Self {
+            read,
+            hot_objects: Arc::new(OnceLock::new()),
+            view_identity: Arc::new(OnceLock::new()),
+            branch_id: None,
+        }
+    }
+
+    pub(crate) fn new_for_branch(read: R, branch_id: impl Into<String>) -> Self {
+        Self {
+            read,
+            hot_objects: Arc::new(OnceLock::new()),
+            view_identity: Arc::new(OnceLock::new()),
+            branch_id: Some(branch_id.into()),
+        }
+    }
+
+    async fn hot_objects(&self) -> Result<Arc<BTreeMap<ObjectId, Bytes>>, StorageError> {
+        if let Some(objects) = self.hot_objects.get() {
+            record_hot_pack_index_hit();
+            return Ok(Arc::clone(objects));
+        }
+        let read_identity = self
+            .read
+            .operation_cache()
+            .and_then(|cache| Arc::downcast::<OperationReadCache>(cache).ok())
+            .map(|cache| cache.read_identity());
+        trace_hot_pack(format!(
+            "facade_build branch={:?} read_identity={read_identity:?}",
+            self.branch_id
+        ));
+        let (objects, view_identity) = match &self.branch_id {
+            Some(branch_id) => {
+                let uuid = uuid::Uuid::parse_str(branch_id)
+                    .map_err(|error| corruption(format!("branch ID must be a UUID: {error}")))?;
+                let loaded = load_facade_hot_objects_for_branch(
+                    &self.read,
+                    CanonicalBranchId::from_bytes(*uuid.as_bytes()),
+                )
+                .await?;
+                (loaded.objects, Some(loaded.view_identity))
+            }
+            None => (load_facade_hot_objects(&self.read).await?, None),
+        };
+        if let Some(view_identity) = view_identity {
+            self.view_identity
+                .set(view_identity)
+                .map_err(|_| corruption("retained facade identity was initialized twice"))?;
+        }
+        let objects = Arc::new(objects);
+        if self.hot_objects.set(Arc::clone(&objects)).is_ok() {
+            Ok(objects)
+        } else {
+            record_hot_pack_index_hit();
+            Ok(Arc::clone(self.hot_objects.get().expect(
+                "hot object index set after losing initialization race",
+            )))
+        }
+    }
+
+    async fn historical_packed_read(
+        &self,
+    ) -> Result<(Arc<BTreeMap<ObjectId, Bytes>>, ViewToken), StorageError> {
+        let objects = self.hot_objects().await?;
+        let view_identity = self.view_identity.get().ok_or_else(|| {
+            corruption("historical ForkTree reads require a branch-bound retained view identity")
+        })?;
+        Ok((objects, view_identity.token()))
     }
 
     pub(crate) async fn branch(
@@ -709,25 +1037,48 @@ where
                 format!("branch ID must be a UUID: {error}"),
             )
         })?;
+        let branch_id = CanonicalBranchId::from_bytes(*uuid.as_bytes());
+        if let Some(bound_branch_id) = self.branch_id.as_deref() {
+            let bound_uuid = uuid::Uuid::parse_str(bound_branch_id).map_err(|error| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INVALID_PARAM,
+                    format!("bound branch ID must be a UUID: {error}"),
+                )
+            })?;
+            let bound_branch_id = CanonicalBranchId::from_bytes(*bound_uuid.as_bytes());
+            if bound_branch_id != branch_id {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_CONSTRAINT_VIOLATION,
+                    "branch-bound ForkTree facade cannot serve another branch",
+                ));
+            }
+        }
+        let hot_objects = self.hot_objects().await.map_err(crate::LixError::from)?;
         let view =
-            open_coherent_view_on_read(&self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
+            open_coherent_view_on_read_with_objects(&self.read, branch_id, Some(hot_objects))
                 .await
                 .map_err(crate::LixError::from)?;
-        let _view_identity = view.view_id();
+        let _view_identity = view.view_identity();
+        let _view_token = view.view_token();
         let _resume_identity_validator = CoherentView::<&R>::validate_resume_key;
         let _ = _resume_identity_validator;
         Ok(view)
+    }
+
+    pub(crate) fn bound_branch_id(&self) -> Option<&str> {
+        self.branch_id.as_deref()
     }
 
     pub(crate) async fn load_commit_member_records(
         &self,
         commit_id: crate::changelog::CommitId,
     ) -> Result<Option<Vec<crate::changelog::ChangeRecord>>, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::serving::load_commit_member_records(&read, commit_id).await
     }
@@ -739,11 +1090,12 @@ where
         Option<Vec<(crate::changelog::CommitId, crate::changelog::ChangeRecord)>>,
         crate::LixError,
     > {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::serving::load_commit_member_sources(&read, commit_id).await
     }
@@ -752,11 +1104,12 @@ where
         &self,
         ids: &[crate::changelog::ChangeId],
     ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::serving::load_change_records(&read, ids).await
     }
@@ -766,11 +1119,12 @@ where
         start_after: Option<crate::changelog::ChangeId>,
         limit: usize,
     ) -> Result<Vec<crate::changelog::ChangeRecord>, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::serving::scan_change_records(&read, start_after, limit).await
     }
@@ -780,11 +1134,12 @@ where
         start_after: Option<crate::changelog::CommitId>,
         limit: usize,
     ) -> Result<Vec<crate::changelog::CommitRecord>, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::serving::scan_commit_records(&read, start_after, limit).await
     }
@@ -796,11 +1151,12 @@ where
         include_tombstone: bool,
     ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, crate::LixError>
     {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::serving::load_state_value_at_commit(&read, commit_id, key, include_tombstone).await
     }
@@ -878,11 +1234,12 @@ where
                 })?;
             values.push((key.clone(), value));
         }
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::blob::load_historical_blob_bytes_for_state_values(&read, &values).await
     }
@@ -975,11 +1332,12 @@ where
         &self,
         commit_id: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::serving::scan_state_rows_at_commit(&read, commit_id).await
     }
@@ -993,11 +1351,12 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         diff_state_rows_between_commits_on_read(&read, before, after, true).await
     }
@@ -1010,11 +1369,12 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         diff_state_rows_between_commits_on_read(&read, before, after, false).await
     }
@@ -1028,11 +1388,12 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateIdentityChange>, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         touched_state_identities_between_commits_on_read(&read, before, after).await
     }
@@ -1043,11 +1404,12 @@ where
         &self,
         commit_id: crate::changelog::CommitId,
     ) -> Result<crate::changelog::CommitRecord, crate::LixError> {
-        let objects = load_facade_hot_objects(&self.read).await?;
+        let (objects, view_token) = self.historical_packed_read().await?;
         let read = PackedRead {
             read: &self.read,
             objects: &objects,
             pack_id: ObjectId::ZERO,
+            view_token: Some(view_token),
         };
         super::serving::load_required_commit_record(&read, commit_id).await
     }
@@ -1330,6 +1692,17 @@ pub(crate) async fn open_coherent_view_on_read<R>(
 where
     R: StorageAdapterRead,
 {
+    open_coherent_view_on_read_with_objects(read, branch_id, None).await
+}
+
+async fn open_coherent_view_on_read_with_objects<R>(
+    read: R,
+    branch_id: CanonicalBranchId,
+    preloaded_hot_objects: Option<Arc<BTreeMap<ObjectId, Bytes>>>,
+) -> Result<CoherentView<R>, StorageError>
+where
+    R: StorageAdapterRead,
+{
     let selector_keys = [
         Key(global_selector_key()),
         Key(branch_selector_key(branch_id)),
@@ -1405,37 +1778,94 @@ where
             "branch snapshot does not match the selected branch id",
         ));
     }
-    let view_id = derive_view_id(&raw_global_selector, &raw_branch_selector);
-    let hot_objects = load_hot_object_map(
+    let view_identity = ViewIdentity::new(
         &read,
-        branch_snapshot.hot_pack_object_id,
-        branch_id,
-        global_selector.repository_root,
-        global_selector.epoch,
-        branch_selector.selector_generation,
-    )
-    .await?;
-    validate_hot_pack_closure(
-        &read,
-        global_selector.repository_root,
-        repository_root,
-        branch_snapshot,
-        &hot_objects,
-    )
-    .await?;
-    let packed_read = PackedRead {
-        read: &read,
-        objects: &hot_objects,
-        pack_id: branch_snapshot.hot_pack_object_id,
-    };
-    authenticate_selected_graph(
-        &packed_read,
+        &raw_global_selector,
+        &raw_branch_selector,
         global_selector.repository_root,
         branch_selector.branch_snapshot_object_id,
-        repository_root,
-        branch_snapshot,
-    )
-    .await?;
+        branch_snapshot.semantic_head_commit_object_id,
+    );
+    let view_token = view_identity.token();
+    let view_id = *view_token.as_bytes();
+    let binding = HotPackBinding {
+        view_token,
+        repository_root_id: global_selector.repository_root,
+        raw_global_selector: raw_global_selector.clone(),
+        raw_branch_selector: raw_branch_selector.clone(),
+        branch_id,
+        branch_snapshot_object_id: branch_selector.branch_snapshot_object_id,
+        semantic_head_commit_object_id: branch_snapshot.semantic_head_commit_object_id,
+        epoch: global_selector.epoch,
+        selector_generation: branch_selector.selector_generation,
+    };
+    let operation_cache = read
+        .operation_cache()
+        .and_then(|cache| Arc::downcast::<OperationReadCache>(cache).ok());
+    let cached_hot_objects = operation_cache.as_ref().and_then(|cache| {
+        cache
+            .get_all::<InstalledHotPackIndex>()
+            .into_iter()
+            .find(|index| index.binding == binding)
+    });
+    let preloaded_hot_objects =
+        preloaded_hot_objects.or_else(|| cached_hot_objects.map(|index| index.objects.clone()));
+    let hot_objects = match preloaded_hot_objects {
+        Some(objects) => (*objects).clone(),
+        None => {
+            let hot_objects = load_hot_object_map(
+                &read,
+                branch_snapshot.hot_pack_object_id,
+                branch_id,
+                global_selector.repository_root,
+                global_selector.epoch,
+                branch_selector.selector_generation,
+            )
+            .await?;
+            validate_hot_pack_closure(
+                &read,
+                global_selector.repository_root,
+                repository_root,
+                branch_snapshot,
+                view_token,
+                &hot_objects,
+            )
+            .await?;
+            let packed_read =
+                PackedRead::new_bound(&read, &hot_objects, ObjectId::ZERO, view_token);
+            authenticate_selected_graph(
+                &packed_read,
+                global_selector.repository_root,
+                branch_selector.branch_snapshot_object_id,
+                repository_root,
+                branch_snapshot,
+            )
+            .await?;
+            if let Some(cache) = &operation_cache {
+                let objects = Arc::new(hot_objects.clone());
+                let index = Arc::new(InstalledHotPackIndex {
+                    binding: binding.clone(),
+                    objects: Arc::clone(&objects),
+                });
+                if cache.install(index) {
+                    note_hot_pack_ready();
+                    hot_objects
+                } else {
+                    let existing = cache
+                        .get_all::<InstalledHotPackIndex>()
+                        .into_iter()
+                        .find(|index| index.binding == binding)
+                        .ok_or_else(|| {
+                            corruption("retained read hot-pack index was not installed")
+                        })?;
+                    record_hot_pack_index_hit();
+                    (*existing.objects).clone()
+                }
+            } else {
+                hot_objects
+            }
+        }
+    };
     let view_instance_id = NEXT_VIEW_INSTANCE_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
@@ -1451,6 +1881,8 @@ where
         branch_selector,
         repository_root,
         branch_snapshot,
+        view_identity,
+        view_token,
         view_id,
         view_instance_id,
     })
@@ -1564,6 +1996,31 @@ where
         "global selector is absent while collecting hot objects",
     )?;
     let global = GlobalSelectorV1::decode(&global_bytes)?;
+    let operation_cache = read
+        .operation_cache()
+        .and_then(|cache| Arc::downcast::<OperationReadCache>(cache).ok());
+    if let Some(cache) = &operation_cache {
+        if let Some(index) = cache
+            .get_all::<InstalledHotPackCollection>()
+            .into_iter()
+            .find(|index| {
+                index.repository_root_id == global.repository_root
+                    && index.raw_global_selector == global_bytes
+            })
+        {
+            trace_hot_pack(format!(
+                "generic_cache_hit read_identity={:?} objects={}",
+                Some(cache.read_identity()),
+                index.objects.len()
+            ));
+            record_hot_pack_index_hit();
+            return Ok((*index.objects).clone());
+        }
+    }
+    trace_hot_pack(format!(
+        "generic_build read_identity={:?}",
+        operation_cache.as_ref().map(|cache| cache.read_identity())
+    ));
     let repository_bytes = load_object_bytes(read, global.repository_root).await?;
     let repository = RepositoryRootV1::decode(global.repository_root, &repository_bytes)?;
     let mut cursor = read
@@ -1634,6 +2091,15 @@ where
                 global.repository_root,
                 repository,
                 snapshot,
+                ViewIdentity::new(
+                    read,
+                    &global_bytes,
+                    selector_bytes,
+                    global.repository_root,
+                    snapshot_id,
+                    snapshot.semantic_head_commit_object_id,
+                )
+                .token(),
                 &branch_objects,
             )
             .await?;
@@ -1656,7 +2122,191 @@ where
             ));
         }
     }
-    Ok(objects)
+    let objects = Arc::new(objects);
+    if let Some(cache) = operation_cache {
+        let index = Arc::new(InstalledHotPackCollection {
+            repository_root_id: global.repository_root,
+            raw_global_selector: global_bytes,
+            objects: Arc::clone(&objects),
+        });
+        if cache.install(index) {
+            note_hot_pack_ready();
+            return Ok((*objects).clone());
+        }
+        let existing = cache
+            .get_all::<InstalledHotPackCollection>()
+            .into_iter()
+            .find(|index| index.repository_root_id == global.repository_root)
+            .ok_or_else(|| corruption("retained read hot-pack collection was not installed"))?;
+        record_hot_pack_index_hit();
+        return Ok((*existing.objects).clone());
+    }
+    note_hot_pack_ready();
+    Ok((*objects).clone())
+}
+
+/// Collects and authenticates only the hot pack selected for one branch.  A
+/// generic facade has no branch selection input and retains the conservative
+/// selector scan above; production session/transaction facades use this
+/// branch-bound path so opening the operation-local index does not walk every
+/// branch's pack closure.
+async fn load_facade_hot_objects_for_branch<R>(
+    read: &R,
+    branch_id: CanonicalBranchId,
+) -> Result<FacadeHotObjects, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let selector_keys = [
+        Key(global_selector_key()),
+        Key(branch_selector_key(branch_id)),
+    ];
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &selector_keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    let mut values = loaded.values.into_iter();
+    let global_bytes = projected_required(
+        values.next().flatten(),
+        "global selector is absent while opening a branch-bound hot index",
+    )?;
+    let branch_bytes = projected_required(
+        values.next().flatten(),
+        "branch selector is absent while opening a branch-bound hot index",
+    )?;
+    let global = GlobalSelectorV1::decode(&global_bytes)?;
+    let branch_key = branch_selector_key(branch_id);
+    let branch = BranchSelectorV1::decode(&branch_bytes)?;
+    if branch.branch_id != branch_id {
+        return Err(corruption(
+            "branch selector identity does not match requested branch",
+        ));
+    }
+    let repository_bytes = load_object_bytes(read, global.repository_root).await?;
+    let repository = RepositoryRootV1::decode(global.repository_root, &repository_bytes)?;
+    let snapshot_bytes = load_object_bytes(read, branch.branch_snapshot_object_id).await?;
+    let snapshot = BranchSnapshotV1::decode(branch.branch_snapshot_object_id, &snapshot_bytes)?;
+    if snapshot.branch_id != branch_id {
+        return Err(corruption(
+            "branch snapshot identity does not match requested branch",
+        ));
+    }
+    let view_identity = ViewIdentity::new(
+        read,
+        &global_bytes,
+        &branch_bytes,
+        global.repository_root,
+        branch.branch_snapshot_object_id,
+        snapshot.semantic_head_commit_object_id,
+    );
+    let binding = HotPackBinding {
+        view_token: view_identity.token(),
+        repository_root_id: global.repository_root,
+        raw_global_selector: global_bytes.clone(),
+        raw_branch_selector: branch_bytes.clone(),
+        branch_id,
+        branch_snapshot_object_id: branch.branch_snapshot_object_id,
+        semantic_head_commit_object_id: snapshot.semantic_head_commit_object_id,
+        epoch: global.epoch,
+        selector_generation: branch.selector_generation,
+    };
+    let operation_cache = read
+        .operation_cache()
+        .and_then(|cache| Arc::downcast::<OperationReadCache>(cache).ok());
+    if let Some(cache) = &operation_cache {
+        if let Some(index) = cache
+            .get_all::<InstalledHotPackIndex>()
+            .into_iter()
+            .find(|index| index.binding == binding)
+        {
+            trace_hot_pack(format!(
+                "branch_cache_hit branch={branch_id:?} read_identity={} objects={}",
+                cache.read_identity(),
+                index.objects.len()
+            ));
+            record_hot_pack_index_hit();
+            return Ok(FacadeHotObjects {
+                objects: (*index.objects).clone(),
+                view_identity,
+            });
+        }
+    }
+    trace_hot_pack(format!(
+        "branch_build branch={branch_id:?} read_identity={:?} binding={:02x?}",
+        operation_cache.as_ref().map(|cache| cache.read_identity()),
+        binding.view_token.as_bytes()
+    ));
+    let mut objects = load_hot_object_map(
+        read,
+        snapshot.hot_pack_object_id,
+        branch_id,
+        global.repository_root,
+        global.epoch,
+        branch.selector_generation,
+    )
+    .await?;
+    // RefChange and selector-side control objects are authenticated through
+    // the retained read; the pack proof itself remains strict for hot
+    // domains.  This graph check must not turn a control object into a pack
+    // fallback authority.
+    let packed = PackedRead::new_bound(read, &objects, ObjectId::ZERO, view_identity.token());
+    validate_hot_pack_closure(
+        read,
+        global.repository_root,
+        repository,
+        snapshot,
+        view_identity.token(),
+        &objects,
+    )
+    .await?;
+    authenticate_selected_graph(
+        &packed,
+        global.repository_root,
+        branch.branch_snapshot_object_id,
+        repository,
+        snapshot,
+    )
+    .await?;
+    // Keep the selector key consumed above structurally tied to the request;
+    // this prevents a future multi-key projection from silently accepting a
+    // value returned under a different selector key.
+    if branch_key != branch_selector_key(branch.branch_id) {
+        return Err(corruption("branch selector key authentication failed"));
+    }
+    if let Some(cache) = &operation_cache {
+        let objects = Arc::new(std::mem::take(&mut objects));
+        if cache.install(Arc::new(InstalledHotPackIndex {
+            binding: binding.clone(),
+            objects: Arc::clone(&objects),
+        })) {
+            note_hot_pack_ready();
+            return Ok(FacadeHotObjects {
+                objects: (*objects).clone(),
+                view_identity,
+            });
+        }
+        if let Some(existing) = cache
+            .get_all::<InstalledHotPackIndex>()
+            .into_iter()
+            .find(|index| index.binding == binding)
+        {
+            record_hot_pack_index_hit();
+            return Ok(FacadeHotObjects {
+                objects: (*existing.objects).clone(),
+                view_identity,
+            });
+        }
+        return Err(corruption("retained read hot-pack index was not installed"));
+    }
+    Ok(FacadeHotObjects {
+        objects,
+        view_identity,
+    })
 }
 
 async fn validate_hot_pack_closure<R>(
@@ -1664,18 +2314,26 @@ async fn validate_hot_pack_closure<R>(
     repository_root_id: ObjectId,
     repository: RepositoryRootV1,
     branch: BranchSnapshotV1,
+    view_token: ViewToken,
     objects: &BTreeMap<ObjectId, Bytes>,
 ) -> Result<(), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    // The pack contains only SemanticChange objects. Authenticate their
-    // reachability through the selected branch's commit/member/catalog
-    // edges, rather than walking every ordered-tree node in the repository.
-    // This is still a same-read proof, but remains proportional to the
-    // selected commit/source closure and pack contents instead of O(N) in the
-    // repository's state and catalog trees.
-    let packed = PackedRead::new(read, objects, branch.hot_pack_object_id);
+    record_hot_pack_closure_proof();
+    trace_hot_pack(format!(
+        "closure read_identity={:?} pack={} objects={}",
+        read.operation_cache()
+            .and_then(|cache| Arc::downcast::<OperationReadCache>(cache).ok())
+            .map(|cache| cache.read_identity()),
+        branch.hot_pack_object_id,
+        objects.len()
+    ));
+    // Install-time validation is strict: every object needed to prove a pack
+    // edge must already be in the candidate pack. The non-zero pack marker is
+    // reserved for this proof; normal serving keeps the retained read for
+    // non-hot payloads after the proof has installed the index.
+    let packed = PackedRead::new_bound(read, objects, branch.hot_pack_object_id, view_token);
     let root_bytes = load_object_bytes(&packed, repository_root_id).await?;
     if RepositoryRootV1::decode(repository_root_id, &root_bytes)? != repository {
         return Err(corruption(
@@ -1685,6 +2343,9 @@ where
     let mut pending = vec![branch.semantic_head_commit_object_id];
     let mut reachable_commits = BTreeSet::new();
     let mut commits = BTreeMap::new();
+    let mut commit_members = BTreeMap::new();
+    let mut reachable_member_pages = BTreeSet::new();
+    let mut reachable_member_edges = BTreeSet::new();
     while let Some(commit_object_id) = pending.pop() {
         if !reachable_commits.insert(commit_object_id) {
             continue;
@@ -1720,12 +2381,31 @@ where
             }
             pending.push(*parent_object_id);
         }
-        for member in super::serving::load_commit_members(&packed, &commit).await? {
+        let (members, page_ids) = load_commit_members_with_page_ids(&packed, &commit).await?;
+        reachable_member_pages.extend(page_ids);
+        for (ordinal, member) in members.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| corruption("hot pack commit member ordinal exceeds u32"))?;
+            reachable_member_edges.insert((commit_object_id, ordinal, member.change_object_id()));
             if let Some((source_commit_object_id, _)) = member.source() {
                 pending.push(source_commit_object_id);
             }
         }
+        commit_members.insert(commit_object_id, members);
         commits.insert(commit_object_id, commit);
+    }
+
+    let mut reachable_tree_nodes = BTreeSet::new();
+    for (root, kind) in [
+        (repository.global_state_root, "state"),
+        (repository.commit_catalog_root, "commit"),
+        (repository.change_catalog_root, "change"),
+        (repository.retention_policy_root, "retention"),
+        (branch.local_state_root, "state"),
+        (branch.historical_global_state_root, "state"),
+    ] {
+        reachable_tree_nodes
+            .extend(super::tree::collect_reachable_node_ids(root, kind, &packed).await?);
     }
 
     for (id, bytes) in objects {
@@ -1738,60 +2418,142 @@ where
             }
             continue;
         }
-        if domain != ObjectDomain::SemanticChange {
-            return Err(corruption(format!(
-                "hot pack object {id} is outside the authenticated pack domains"
-            )));
-        }
-        let change = ChangeObjectV1::decode(*id, bytes)?;
-        let change_id = match change {
-            ChangeObjectV1::Semantic { change_id, .. } => change_id,
-            ChangeObjectV1::BranchRef { .. } => {
-                return Err(corruption("hot pack contains a BranchRef change"));
+        match domain {
+            ObjectDomain::Commit => {
+                if !reachable_commits.contains(id) {
+                    return Err(corruption(format!(
+                        "hot pack Commit {id} is outside the authenticated selector closure"
+                    )));
+                }
+                let _ = CommitObjectV1::decode(*id, bytes)?;
             }
-        };
-        let catalog_value = super::tree::lookup_on_read(
-            repository.change_catalog_root,
-            "change",
-            change_id.as_bytes(),
-            &packed,
-        )
-        .await?
-        .ok_or_else(|| corruption("hot pack semantic object has no ChangeCatalog owner"))?;
-        let catalog_entry = ChangeCatalogEntry::decode(&catalog_value)?;
-        if catalog_entry.change_object_id != *id {
-            return Err(corruption(
-                "hot pack semantic object has a substituted ChangeCatalog owner",
-            ));
-        }
-        let ChangeCatalogOwner::CommitMember {
-            commit_object_id,
-            ordinal,
-        } = catalog_entry.owner
-        else {
-            return Err(corruption(
-                "hot pack semantic object has a non-commit catalog owner",
-            ));
-        };
-        if !reachable_commits.contains(&commit_object_id) {
-            return Err(corruption(format!(
-                "hot pack object {id} is outside the authenticated selector closure"
-            )));
-        }
-        let commit = commits
-            .get(&commit_object_id)
-            .ok_or_else(|| corruption("hot pack ChangeCatalog owner commit was not decoded"))?;
-        let members = super::serving::load_commit_members(&packed, commit).await?;
-        let member = members
-            .get(ordinal as usize)
-            .ok_or_else(|| corruption("hot pack ChangeCatalog owner ordinal is absent"))?;
-        if member.change_object_id() != *id || member.source().is_some() {
-            return Err(corruption(
-                "hot pack semantic object does not match its canonical introduction member",
-            ));
+            ObjectDomain::CommitMemberPageV1 => {
+                if !reachable_member_pages.contains(id) {
+                    return Err(corruption(format!(
+                        "hot pack member page {id} is outside the authenticated selector closure"
+                    )));
+                }
+                let _ = CommitMemberPageV1::decode(*id, bytes)?;
+            }
+            ObjectDomain::OrderedTreeNode => {
+                if !reachable_tree_nodes.contains(id) {
+                    return Err(corruption(format!(
+                        "hot pack ordered-tree node {id} is outside the authenticated selector closure"
+                    )));
+                }
+            }
+            ObjectDomain::SemanticChange => {
+                let change = ChangeObjectV1::decode(*id, bytes)?;
+                let change_id = change.change_id();
+                let catalog_value = super::tree::lookup_on_read(
+                    repository.change_catalog_root,
+                    "change",
+                    change_id.as_bytes(),
+                    &packed,
+                )
+                .await?
+                .ok_or_else(|| corruption("hot pack semantic object has no ChangeCatalog owner"))?;
+                let catalog_entry = ChangeCatalogEntry::decode(&catalog_value)?;
+                if catalog_entry.change_object_id != *id {
+                    return Err(corruption(
+                        "hot pack semantic object has a substituted ChangeCatalog owner",
+                    ));
+                }
+                let ChangeCatalogOwner::CommitMember {
+                    commit_object_id,
+                    ordinal,
+                } = catalog_entry.owner
+                else {
+                    return Err(corruption(
+                        "hot pack semantic object has a non-commit catalog owner",
+                    ));
+                };
+                if !reachable_commits.contains(&commit_object_id)
+                    || !reachable_member_edges.contains(&(commit_object_id, ordinal, *id))
+                {
+                    return Err(corruption(format!(
+                        "hot pack object {id} is outside the authenticated selector closure"
+                    )));
+                }
+                let member = commit_members
+                    .get(&commit_object_id)
+                    .and_then(|members| members.get(ordinal as usize))
+                    .ok_or_else(|| corruption("hot pack semantic member ordinal is absent"))?;
+                if member.change_object_id() != *id {
+                    return Err(corruption(
+                        "hot pack semantic object does not match its authenticated member",
+                    ));
+                }
+                if let Some((source_commit_object_id, source_ordinal)) = member.source() {
+                    if !reachable_commits.contains(&source_commit_object_id) {
+                        return Err(corruption(
+                            "hot pack selected semantic source is outside the selector closure",
+                        ));
+                    }
+                    let source_member = commit_members
+                        .get(&source_commit_object_id)
+                        .and_then(|members| members.get(source_ordinal as usize))
+                        .ok_or_else(|| corruption("hot pack selected source ordinal is absent"))?;
+                    if source_member.change_object_id() != *id {
+                        return Err(corruption("hot pack selected source member is substituted"));
+                    }
+                }
+            }
+            other => {
+                return Err(corruption(format!(
+                    "hot pack object {id} uses unsupported domain {other:?}"
+                )));
+            }
         }
     }
     Ok(())
+}
+
+async fn load_commit_members_with_page_ids<R>(
+    read: &R,
+    commit: &CommitObjectV1,
+) -> Result<(Vec<super::model::CommitMemberV1>, BTreeSet<ObjectId>), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let Some(mut page_id) = commit.member_page_root else {
+        return Ok((commit.members.clone(), BTreeSet::new()));
+    };
+    if !commit.members.is_empty() {
+        return Err(corruption("paged commit carries an inline member closure"));
+    }
+    let mut members = Vec::new();
+    let mut pages = BTreeSet::new();
+    loop {
+        if !pages.insert(page_id) {
+            return Err(corruption("commit member page chain contains a cycle"));
+        }
+        let bytes = load_object_bytes(read, page_id).await?;
+        let page = CommitMemberPageV1::decode(page_id, &bytes)?;
+        if page.commit_id != commit.commit_id
+            || page.start_ordinal
+                != u32::try_from(members.len())
+                    .map_err(|_| corruption("commit member page ordinal exceeds u32"))?
+        {
+            return Err(corruption(
+                "commit member page chain has a mismatched commit or ordinal",
+            ));
+        }
+        members.extend(page.members);
+        match page.next_page_object_id {
+            Some(next) => page_id = next,
+            None => break,
+        }
+    }
+    let mut unique_changes = BTreeSet::new();
+    for member in &members {
+        if !unique_changes.insert(member.change_object_id()) {
+            return Err(corruption(
+                "commit member page chain repeats a change object",
+            ));
+        }
+    }
+    Ok((members, pages))
 }
 
 pub(super) async fn load_object_bytes(
@@ -1945,17 +2707,6 @@ fn required_object(
     objects
         .get(&id)
         .ok_or_else(|| corruption(format!("selected object {id} is absent")))
-}
-
-pub(super) fn derive_view_id(raw_global: &[u8], raw_branch: &[u8]) -> [u8; 32] {
-    let mut encoder = Encoder::default();
-    encoder
-        .bytes(raw_global)
-        .expect("selector value necessarily fits canonical u32 length");
-    encoder
-        .bytes(raw_branch)
-        .expect("selector value necessarily fits canonical u32 length");
-    keyed_hash(VIEW_ID_DOMAIN, &encoder.into_vec())
 }
 
 pub(super) fn derive_pack_view_id(

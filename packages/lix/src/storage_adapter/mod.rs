@@ -42,7 +42,7 @@ pub use crate::storage::{
 pub use context::StorageAdapter;
 pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
-pub(crate) use read_scope::SharedStorageAdapterRead;
+pub(crate) use read_scope::{OperationReadCache, SharedStorageAdapterRead};
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
 #[cfg(feature = "storage-benches")]
 pub use read_scope::{

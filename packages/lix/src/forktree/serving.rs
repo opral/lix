@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
+
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
     Prefix, ProjectedValue, ScanCursor, ScanOrder, StorageError, StorageSpace,
@@ -448,7 +450,7 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let range = Prefix {
-        bytes: bytes::Bytes::from_static(BRANCH_SELECTOR_PREFIX),
+        bytes: Bytes::from_static(BRANCH_SELECTOR_PREFIX),
     }
     .to_range()?;
     let mut cursor = read
@@ -1681,7 +1683,7 @@ where
 fn required_full_value(
     value: Option<ProjectedValue>,
     missing: &'static str,
-) -> Result<bytes::Bytes, crate::LixError> {
+) -> Result<Bytes, crate::LixError> {
     match value {
         Some(ProjectedValue::FullValue(bytes)) => Ok(bytes),
         Some(ProjectedValue::KeyOnly) => {
@@ -2035,6 +2037,7 @@ where
         let overlay = ObjectOverlayRead {
             read,
             objects: &accumulated,
+            hot_objects: None,
         };
         let edit = edit_state_tree(root, mutations, &overlay).await?;
         root = edit.root;
@@ -2047,11 +2050,20 @@ where
 pub(super) struct ObjectOverlayRead<'a, R: ?Sized> {
     read: &'a R,
     objects: &'a ImmutableObjectSet,
+    hot_objects: Option<&'a BTreeMap<ObjectId, Bytes>>,
 }
 
 impl<'a, R: ?Sized> ObjectOverlayRead<'a, R> {
-    pub(super) fn new(read: &'a R, objects: &'a ImmutableObjectSet) -> Self {
-        Self { read, objects }
+    pub(super) fn with_hot_objects(
+        read: &'a R,
+        objects: &'a ImmutableObjectSet,
+        hot_objects: &'a BTreeMap<ObjectId, Bytes>,
+    ) -> Self {
+        Self {
+            read,
+            objects,
+            hot_objects: Some(hot_objects),
+        }
     }
 }
 
@@ -2059,6 +2071,10 @@ impl<R> StorageAdapterRead for ObjectOverlayRead<'_, R>
 where
     R: StorageAdapterRead + ?Sized,
 {
+    fn operation_cache(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.read.operation_cache()
+    }
+
     fn snapshot_cache_key(&self) -> Option<u128> {
         self.read.snapshot_cache_key()
     }
@@ -2074,7 +2090,11 @@ where
                 if request.space == super::object::OBJECT_SPACE {
                     if let Ok(raw_id) = <[u8; 32]>::try_from(key.0.as_ref()) {
                         let id = ObjectId::from_bytes(raw_id);
-                        if let Some(bytes) = self.objects.get(id) {
+                        if let Some(bytes) = self
+                            .objects
+                            .get(id)
+                            .or_else(|| self.hot_objects.and_then(|objects| objects.get(&id)))
+                        {
                             loaded.values[value_index] = Some(match request.opts.projection {
                                 CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
                                 CoreProjection::FullValue => {

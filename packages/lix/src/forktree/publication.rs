@@ -13,10 +13,11 @@ use super::blob::{CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
-    ChangeCatalogEntry, ChangeCatalogOwner, ChangeObjectV1, CommitObjectV1, GlobalSelectorV1,
-    HotObjectPackEntry, HotObjectPackV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorV1,
-    SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1, branch_selector_key,
-    gc_progress_selector_key, global_selector_key, snapshot_selector_key, upload_selector_key,
+    ChangeCatalogEntry, ChangeCatalogOwner, ChangeObjectV1, CommitMemberPageV1, CommitObjectV1,
+    GlobalSelectorV1, HotObjectPackEntry, HotObjectPackV1, RepositoryRootV1, SnapshotRole,
+    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
+    upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId};
 use super::serving::{CatalogTreeEdit, StateTreeEdit};
@@ -31,6 +32,136 @@ use super::view::{CoherentView, SELECTOR_SPACE};
 pub(crate) enum SelectorExpectation {
     Absent,
     Equals(Bytes),
+}
+
+fn insert_pack_closure_entry(
+    entries: &mut BTreeMap<ObjectId, HotObjectPackEntry>,
+    object_id: ObjectId,
+    bytes: Bytes,
+) -> Result<(), StorageError> {
+    let domain = super::object::authenticate_object_domain(object_id, &bytes)?;
+    if super::object::retained_control_domain(domain) {
+        // RefChange is an authenticated control-plane edge of the selected
+        // snapshot. It is intentionally not a payload-pack member.
+        return Ok(());
+    }
+    if !super::object::hot_packable_domain(domain) {
+        return Err(corruption(format!(
+            "selected commit closure uses non-packable object domain {domain:?}"
+        )));
+    }
+    if let Some(existing) = entries.get(&object_id) {
+        if existing.bytes != bytes || existing.domain != domain {
+            return Err(corruption(
+                "selected commit closure reuses an object ID with different bytes/domain",
+            ));
+        }
+    } else {
+        entries.insert(
+            object_id,
+            HotObjectPackEntry {
+                object_id,
+                domain,
+                bytes,
+            },
+        );
+    }
+    Ok(())
+}
+
+async fn add_selected_commit_closure<R>(
+    view: &CoherentView<R>,
+    branch_snapshot: &BranchSnapshotV1,
+    staged_objects: &ImmutableObjectSet,
+    entries: &mut BTreeMap<ObjectId, HotObjectPackEntry>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let overlay = view.object_overlay(staged_objects);
+    let mut pending = vec![branch_snapshot.semantic_head_commit_object_id];
+    let mut visited_commits = BTreeSet::new();
+    let mut visited_pages = BTreeSet::new();
+    while let Some(commit_id) = pending.pop() {
+        if !visited_commits.insert(commit_id) {
+            continue;
+        }
+        let commit_bytes = super::view::load_object_bytes(&overlay, commit_id).await?;
+        insert_pack_closure_entry(entries, commit_id, commit_bytes.clone())?;
+        let commit = CommitObjectV1::decode(commit_id, &commit_bytes)?;
+        for parent_id in &commit.parent_commit_object_ids {
+            pending.push(*parent_id);
+        }
+        let mut members = commit.members.clone();
+        let mut next_page = commit.member_page_root;
+        if next_page.is_some() && !members.is_empty() {
+            return Err(corruption("paged commit carries an inline member closure"));
+        }
+        while let Some(page_id) = next_page {
+            if !visited_pages.insert(page_id) {
+                return Err(corruption("selected commit member pages contain a cycle"));
+            }
+            let page_bytes = super::view::load_object_bytes(&overlay, page_id).await?;
+            insert_pack_closure_entry(entries, page_id, page_bytes.clone())?;
+            let page = CommitMemberPageV1::decode(page_id, &page_bytes)?;
+            if page.commit_id != commit.commit_id
+                || page.start_ordinal
+                    != u32::try_from(members.len())
+                        .map_err(|_| corruption("selected member page ordinal exceeds u32"))?
+            {
+                return Err(corruption(
+                    "selected commit member page has a mismatched commit or ordinal",
+                ));
+            }
+            members.extend(page.members);
+            next_page = page.next_page_object_id;
+        }
+        for member in members {
+            if let Some((source_id, _)) = member.source() {
+                pending.push(source_id);
+            }
+            let change_id = member.change_object_id();
+            let change_bytes = super::view::load_object_bytes(&overlay, change_id).await?;
+            insert_pack_closure_entry(entries, change_id, change_bytes)?;
+        }
+    }
+    Ok(())
+}
+
+async fn prune_unreachable_tree_nodes<R>(
+    view: &CoherentView<R>,
+    repository: RepositoryRootV1,
+    branch_snapshot: &BranchSnapshotV1,
+    entries: &mut BTreeMap<ObjectId, HotObjectPackEntry>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let bytes = entries
+        .iter()
+        .map(|(id, entry)| (*id, entry.bytes.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let packed = super::view::PackedRead::new_bound(
+        view.operation_read(),
+        &bytes,
+        branch_snapshot.hot_pack_object_id,
+        view.view_token(),
+    );
+    let mut reachable = BTreeSet::new();
+    for (root, kind) in [
+        (repository.global_state_root, "state"),
+        (repository.commit_catalog_root, "commit"),
+        (repository.change_catalog_root, "change"),
+        (repository.retention_policy_root, "retention"),
+        (branch_snapshot.local_state_root, "state"),
+        (branch_snapshot.historical_global_state_root, "state"),
+    ] {
+        reachable.extend(super::tree::collect_reachable_node_ids(root, kind, &packed).await?);
+    }
+    entries.retain(|id, entry| {
+        entry.domain != ObjectDomain::OrderedTreeNode || reachable.contains(id)
+    });
+    Ok(())
 }
 
 /// All typed objects required to move one selected branch to a new semantic
@@ -379,6 +510,8 @@ impl PreparedPublication {
         &mut self,
         view: &CoherentView<R>,
         repository_root_id: ObjectId,
+        repository: RepositoryRootV1,
+        branch_snapshot: &BranchSnapshotV1,
         branch_id: super::model::CanonicalBranchId,
         selector_generation: u64,
         semantic_ids: &BTreeSet<ObjectId>,
@@ -404,7 +537,7 @@ impl PreparedPublication {
             ));
         }
         let mut entries = BTreeMap::new();
-        let compact = current.base_pack_object_id.is_some()
+        let mut compact = current.base_pack_object_id.is_some()
             || current.repository_root_id != repository_root_id;
         let mut base_pack_object_id = None;
         if let Some(base_id) = current.base_pack_object_id {
@@ -471,16 +604,83 @@ impl PreparedPublication {
                 staged.push(entry);
             }
         }
+        // The selected-commit closure is rebuilt below.  Retaining only the
+        // prior ordered-tree closure here prevents a source-branch commit or
+        // semantic object from leaking into the new selector-bound pack.
+        entries.retain(|id, entry| {
+            entry.domain == ObjectDomain::OrderedTreeNode
+                || (entry.domain == ObjectDomain::RepositoryRoot && *id == repository_root_id)
+        });
+        staged.retain(|entry| {
+            entry.domain == ObjectDomain::OrderedTreeNode
+                || (entry.domain == ObjectDomain::RepositoryRoot
+                    && entry.object_id == repository_root_id)
+        });
+        compact = true;
+        let existing_entry_ids = entries.keys().copied().collect::<BTreeSet<_>>();
+        add_selected_commit_closure(view, branch_snapshot, &self.object_puts, &mut entries).await?;
+        for (object_id, entry) in &entries {
+            if !existing_entry_ids.contains(object_id)
+                && !staged.iter().any(|staged| staged.object_id == *object_id)
+            {
+                staged.push(entry.clone());
+            }
+        }
         if compact {
             entries.extend(staged.into_iter().map(|entry| (entry.object_id, entry)));
-            staged = entries.into_values().collect();
+            staged = entries.values().cloned().collect();
             base_pack_object_id = None;
         } else if staged.is_empty() {
             // A selector-only publication still needs a new binding, but it
             // must not emit an empty pack merely because no new semantic
             // object was introduced. Re-materialize the authenticated
             // semantic entries under the next selector generation.
-            staged = entries.into_values().collect();
+            staged = entries.values().cloned().collect();
+            base_pack_object_id = None;
+        }
+
+        // A publication may carry objects for a source branch or for a
+        // previous path-copy root.  Before retaining a base/delta chain,
+        // authenticate the candidate tree-node set against the exact next
+        // repository/branch roots.  If stale or foreign valid nodes are
+        // present, compact the candidate and omit them; the next open then
+        // sees exactly the selector-bound closure rather than an all-branch
+        // object bag.
+        let mut candidate = entries.clone();
+        for entry in &staged {
+            candidate.insert(entry.object_id, entry.clone());
+        }
+        let candidate_bytes = candidate
+            .iter()
+            .map(|(id, entry)| (*id, entry.bytes.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let candidate_read = super::view::PackedRead::new_bound(
+            view.operation_read(),
+            &candidate_bytes,
+            current_id,
+            view.view_token(),
+        );
+        let mut reachable_tree_nodes = BTreeSet::new();
+        for (root, kind) in [
+            (repository.global_state_root, "state"),
+            (repository.commit_catalog_root, "commit"),
+            (repository.change_catalog_root, "change"),
+            (repository.retention_policy_root, "retention"),
+            (branch_snapshot.local_state_root, "state"),
+            (branch_snapshot.historical_global_state_root, "state"),
+        ] {
+            reachable_tree_nodes.extend(
+                super::tree::collect_reachable_node_ids(root, kind, &candidate_read).await?,
+            );
+        }
+        let has_stale_tree_nodes = candidate.iter().any(|(id, entry)| {
+            entry.domain == ObjectDomain::OrderedTreeNode && !reachable_tree_nodes.contains(id)
+        });
+        if has_stale_tree_nodes {
+            candidate.retain(|id, entry| {
+                entry.domain != ObjectDomain::OrderedTreeNode || reachable_tree_nodes.contains(id)
+            });
+            staged = candidate.into_values().collect();
             base_pack_object_id = None;
         }
         staged.sort_by_key(|entry| entry.object_id);
@@ -578,17 +778,20 @@ impl PreparedPublication {
         };
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
         self.stage_catalog_edit(change_catalog_edit)?;
-        let repository_root_id = self.stage_repository_root(RepositoryRootV1 {
+        let next_repository = RepositoryRootV1 {
             global_state_root: base_repository_root.global_state_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
             retention_policy_root: base_repository_root.retention_policy_root,
-        })?;
+        };
+        let repository_root_id = self.stage_repository_root(next_repository)?;
         let no_new_semantic_changes = BTreeSet::new();
         let pack_id = self
             .stage_hot_pack(
                 view,
                 repository_root_id,
+                next_repository,
+                &branch_snapshot,
                 branch_id,
                 1,
                 &no_new_semantic_changes,
@@ -677,12 +880,13 @@ impl PreparedPublication {
         let next_change_catalog_root = change_catalog_edit.root;
         self.stage_catalog_edit(change_catalog_edit)?;
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
-        let repository_root_id = self.stage_repository_root(RepositoryRootV1 {
+        let next_repository = RepositoryRootV1 {
             global_state_root: base_repository_root.global_state_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
             retention_policy_root: base_repository_root.retention_policy_root,
-        })?;
+        };
+        let repository_root_id = self.stage_repository_root(next_repository)?;
         let selector_generation = view
             .branch_selector()
             .selector_generation
@@ -693,6 +897,8 @@ impl PreparedPublication {
             .stage_hot_pack(
                 view,
                 repository_root_id,
+                next_repository,
+                &branch_snapshot,
                 branch_snapshot.branch_id,
                 selector_generation,
                 &no_new_semantic_changes,
@@ -1210,6 +1416,8 @@ impl PreparedPublication {
             .stage_hot_pack(
                 view,
                 repository_root_id,
+                repository_root,
+                &branch_snapshot,
                 branch_snapshot.branch_id,
                 selector_generation,
                 &semantic_ids,
@@ -1515,6 +1723,8 @@ impl PreparedPublication {
             .stage_hot_pack(
                 view,
                 repository_root_id,
+                repository_root,
+                &branch_snapshot,
                 branch_snapshot.branch_id,
                 selector_generation,
                 &semantic_ids,
@@ -1744,7 +1954,7 @@ impl PreparedPublication {
         repository_root_id: ObjectId,
         repository_root: RepositoryRootV1,
         _retired_commit_ids: &BTreeSet<super::model::CommitId>,
-        retired_change_ids: &BTreeSet<super::model::ChangeId>,
+        _retired_change_ids: &BTreeSet<super::model::ChangeId>,
         skip_branch: Option<super::model::CanonicalBranchId>,
     ) -> Result<(), StorageError>
     where
@@ -1877,14 +2087,13 @@ impl PreparedPublication {
                 }
                 entries.retain(|object_id, entry| match entry.domain {
                     ObjectDomain::RepositoryRoot => *object_id == repository_root_id,
-                    ObjectDomain::SemanticChange => {
-                        let Ok(change) = ChangeObjectV1::decode(*object_id, &entry.bytes) else {
-                            return false;
-                        };
-                        !retired_change_ids.contains(&change.change_id())
-                    }
+                    ObjectDomain::OrderedTreeNode => true,
                     _ => false,
                 });
+                add_selected_commit_closure(view, &snapshot, &self.object_puts, &mut entries)
+                    .await?;
+                prune_unreachable_tree_nodes(view, repository_root, &snapshot, &mut entries)
+                    .await?;
                 let rebound = HotObjectPackV1 {
                     branch_id: selector.branch_id,
                     repository_root_id,

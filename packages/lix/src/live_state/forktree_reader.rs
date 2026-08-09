@@ -18,7 +18,7 @@ use crate::forktree::{
     encode_state_key, state_point, state_range,
 };
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateRowFilter, LiveStateScanRequest,
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
     MaterializedLiveStateRow,
 };
@@ -58,9 +58,34 @@ where
             "current ForkTree reader requires an authenticated branch scope",
         ));
     }
-    if branch_ids.len() == 1 {
-        let view = facade.branch(&branch_ids[0]).await?;
-        return scan_view(&view, request).await;
+    let concrete_branch_ids = branch_ids
+        .iter()
+        .filter(|branch_id| branch_id.as_str() != crate::GLOBAL_BRANCH_ID)
+        .collect::<Vec<_>>();
+    if concrete_branch_ids.is_empty() {
+        return Err(unsupported(
+            "current ForkTree reader requires a concrete branch scope",
+        ));
+    }
+    if let Some(bound_branch_id) = facade.bound_branch_id() {
+        if concrete_branch_ids
+            .iter()
+            .any(|branch_id| branch_id.as_str() != bound_branch_id)
+        {
+            return Err(unsupported(
+                "branch-bound ForkTree reader cannot serve multiple branch identities",
+            ));
+        }
+        let view = facade.branch(bound_branch_id).await?;
+        let mut branch_request = request.clone();
+        branch_request.filter.branch_ids = vec![bound_branch_id.to_owned()];
+        return scan_view(&view, &branch_request).await;
+    }
+    if concrete_branch_ids.len() == 1 {
+        let view = facade.branch(concrete_branch_ids[0]).await?;
+        let mut branch_request = request.clone();
+        branch_request.filter.branch_ids = vec![concrete_branch_ids[0].to_string()];
+        return scan_view(&view, &branch_request).await;
     }
 
     // An explicit by-branch surface may enumerate several authenticated
@@ -69,7 +94,7 @@ where
     // the public lix_file_by_branch identity contract. Apply LIMIT only after
     // the ordered branch streams have been concatenated.
     let mut rows = Vec::new();
-    for branch_id in branch_ids {
+    for branch_id in concrete_branch_ids {
         let view = facade.branch(branch_id).await?;
         let mut branch_request = request.clone();
         branch_request.filter.branch_ids = vec![branch_id.clone()];
@@ -319,8 +344,57 @@ where
     if request.rows.is_empty() {
         return Ok(MaterializedLiveStateExactBatch::default());
     }
-    let view = facade.branch(&request.rows[0].branch_id).await?;
-    load_exact_view(&view, request).await
+    if let Some(bound_branch_id) = facade.bound_branch_id()
+        && request
+            .rows
+            .iter()
+            .any(|row| row.branch_id != bound_branch_id)
+    {
+        return Err(unsupported(
+            "branch-bound ForkTree exact reader cannot serve multiple branch identities",
+        ));
+    }
+    let mut grouped = BTreeMap::<String, Vec<(usize, LiveStateExactRowRequest)>>::new();
+    for (index, row) in request.rows.iter().cloned().enumerate() {
+        grouped
+            .entry(row.branch_id.clone())
+            .or_default()
+            .push((index, row));
+    }
+    if grouped.len() == 1 {
+        let rows = grouped
+            .into_values()
+            .next()
+            .expect("one exact branch group");
+        let branch_id = rows[0].1.branch_id.clone();
+        let view = facade.branch(&branch_id).await?;
+        let mut branch_request = request.clone();
+        branch_request.rows = rows.into_iter().map(|(_, row)| row).collect();
+        return load_exact_view(&view, &branch_request).await;
+    }
+
+    let mut output = vec![None; request.rows.len()];
+    for rows in grouped.into_values() {
+        let branch_id = rows[0].1.branch_id.clone();
+        let view = facade.branch(&branch_id).await?;
+        let mut branch_request = request.clone();
+        branch_request.rows = rows.iter().map(|(_, row)| row.clone()).collect();
+        let branch_output = load_exact_view(&view, &branch_request).await?;
+        for ((original_index, _), row) in rows.into_iter().zip(branch_output.into_rows()) {
+            output[original_index] = row;
+        }
+    }
+    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(output.len());
+    let mut slots = Vec::with_capacity(output.len());
+    for row in output {
+        slots.push(row.map(|row| {
+            let ordinal = u32::try_from(builder.len())
+                .expect("exact live-state row count exceeds u32 ordinals");
+            builder.push_owned(row);
+            ordinal
+        }));
+    }
+    MaterializedLiveStateExactBatch::new(builder.finish(), slots)
 }
 
 /// The ForkTree owner itself satisfies the engine read capability. This keeps
@@ -628,9 +702,9 @@ fn merge_untracked_overlay_rows(
 }
 
 fn validate_exact_request(request: &LiveStateExactBatchRequest) -> Result<(), LixError> {
-    let Some(first) = request.rows.first() else {
+    if request.rows.is_empty() {
         return Ok(());
-    };
+    }
     if request
         .rows
         .iter()
@@ -638,15 +712,6 @@ fn validate_exact_request(request: &LiveStateExactBatchRequest) -> Result<(), Li
     {
         return Err(unsupported(
             "current ForkTree reader does not serve derived or history schemas",
-        ));
-    }
-    if request
-        .rows
-        .iter()
-        .any(|row| row.branch_id != first.branch_id)
-    {
-        return Err(unsupported(
-            "current ForkTree exact reader requires one branch per coherent view",
         ));
     }
     Ok(())

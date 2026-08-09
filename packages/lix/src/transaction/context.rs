@@ -158,7 +158,7 @@ async fn load_forktree_selector_fence<R>(
 where
     R: StorageAdapterRead + Clone,
 {
-    let facade = ForkTreeReadFacade::new(read.clone());
+    let facade = ForkTreeReadFacade::new_for_branch(read.clone(), branch_id);
     let view = facade.branch(branch_id).await?;
     Ok(ForkTreeSelectorFence {
         global: view.raw_global_selector().clone(),
@@ -925,7 +925,7 @@ where
     pub(crate) fn forktree_read_facade(
         &self,
     ) -> ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
-        ForkTreeReadFacade::new(self.opening_read())
+        ForkTreeReadFacade::new_for_branch(self.opening_read(), self.active_branch_id.clone())
     }
 
     async fn reconcile_stale_disjoint_writes<S>(
@@ -1483,7 +1483,8 @@ where
             let functions = runtime_functions.provider();
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let catalog_revision = load_catalog_revision(&read).await?;
-                let visible_live_state = ForkTreeReadFacade::new(read.clone());
+                let visible_live_state =
+                    ForkTreeReadFacade::new_for_branch(read.clone(), active_branch_id.clone());
                 let sql_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
                         &visible_live_state,
@@ -2536,7 +2537,7 @@ where
         let _cold_open_guard = cache.cold_open_guard().await;
         let staged = self.staged_writes.staging_overlay()?;
         let read = self.opening_read();
-        let base = ForkTreeReadFacade::new(read.clone());
+        let base = ForkTreeReadFacade::new_for_branch(read.clone(), actor_key.branch_id.clone());
         let file_key = PluginFileWriteKey {
             branch_id: actor_key.branch_id.clone(),
             global: false,
@@ -3524,7 +3525,16 @@ where
 
         let staged = self.staged_writes.staging_overlay()?;
         let read = self.opening_read();
-        let base = ForkTreeReadFacade::new(read.clone());
+        let base = if branch_ids.len() == 1 {
+            ForkTreeReadFacade::new_for_branch(read.clone(), self.active_branch_id.clone())
+        } else {
+            // Lifecycle reconciliation may legitimately inspect several
+            // concrete branch registries in one retained read. Keep that
+            // scope explicit: the generic facade is used only for this
+            // enumerated multi-branch current-state request and never for
+            // branch-bound historical reads.
+            ForkTreeReadFacade::new(read.clone())
+        };
 
         if !lifecycle_schema_rows.is_empty() {
             let mut desired_schemas = BTreeMap::<(String, EntityPk), (String, JsonValue)>::new();
@@ -4951,7 +4961,10 @@ where
                         {
                             let staged = self.staged_writes.staging_overlay()?;
                             let read = self.opening_read();
-                            let base = ForkTreeReadFacade::new(read.clone());
+                            let base = ForkTreeReadFacade::new_for_branch(
+                                read.clone(),
+                                actor_key.branch_id.clone(),
+                            );
                             let (
                                 cold_before,
                                 checkpoint_accepted_bytes,
@@ -6272,7 +6285,8 @@ where
         }
         let staged = self.staged_writes.staging_overlay()?;
         let read = self.opening_read();
-        let live_state = ForkTreeReadFacade::new(read.clone());
+        let live_state =
+            ForkTreeReadFacade::new_for_branch(read.clone(), self.active_branch_id.clone());
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
             let catalog = self
@@ -6493,10 +6507,13 @@ where
     {
         let read = self.opening_read();
         TransactionValidationLiveStateReader {
-            forktree: ForkTreeReadFacade::new(read.clone()),
-            graph: Arc::new(tokio::sync::Mutex::new(
-                CommitGraphContext::new().reader(ForkTreeReadFacade::new(read)),
-            )),
+            forktree: ForkTreeReadFacade::new_for_branch(
+                read.clone(),
+                self.active_branch_id.clone(),
+            ),
+            graph: Arc::new(tokio::sync::Mutex::new(CommitGraphContext::new().reader(
+                ForkTreeReadFacade::new_for_branch(read, self.active_branch_id.clone()),
+            ))),
         }
     }
 
@@ -7144,8 +7161,9 @@ where
         params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
         let read_store = self.opening_read();
-        let forktree = ForkTreeReadFacade::new(read_store.clone());
         let active_branch_id = self.active_branch_id.clone();
+        let forktree =
+            ForkTreeReadFacade::new_for_branch(read_store.clone(), active_branch_id.clone());
         let branch_ctx = Arc::clone(&self.branch_ctx);
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
@@ -7479,7 +7497,8 @@ where
             .collect::<BTreeSet<_>>();
         let read = self.opening_read();
         let records = load_change_records(&read, change_ids.into_iter()).await?;
-        let mut forktree_reader = ForkTreeReadFacade::new(read.clone());
+        let mut forktree_reader =
+            ForkTreeReadFacade::new_for_branch(read.clone(), self.active_branch_id.clone());
         let mut payloads = materialize_known_change_payloads(
             &mut forktree_reader,
             records.values().cloned(),
@@ -8127,7 +8146,7 @@ where
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            forktree_reader: ForkTreeReadFacade::new(self.read_store.clone()),
+            forktree_reader: self.forktree.clone(),
         }
     }
 
