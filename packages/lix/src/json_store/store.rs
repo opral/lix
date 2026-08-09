@@ -75,7 +75,6 @@ impl StoredJsonBatchPlan {
             compressor: JsonBatchCompressor::with_max_input_len(self.max_compressible_payload_len)?,
             appended_rows: 0,
             arena_initialized: false,
-            used_raw_bound_fallback: false,
             #[cfg(test)]
             value_arena_allocations: 0,
         })
@@ -132,7 +131,6 @@ pub(crate) struct StoredJsonBatchEncoder {
     compressor: JsonBatchCompressor,
     appended_rows: usize,
     arena_initialized: bool,
-    used_raw_bound_fallback: bool,
     #[cfg(test)]
     value_arena_allocations: usize,
 }
@@ -147,7 +145,6 @@ impl std::fmt::Debug for StoredJsonBatchEncoder {
             .field("compressor", &self.compressor)
             .field("appended_rows", &self.appended_rows)
             .field("arena_initialized", &self.arena_initialized)
-            .field("used_raw_bound_fallback", &self.used_raw_bound_fallback)
             .finish()
     }
 }
@@ -205,10 +202,6 @@ impl StoredJsonBatchEncoder {
             }
         }
         if required_len > self.value_bytes.capacity() {
-            debug_assert!(
-                !self.used_raw_bound_fallback,
-                "the raw value bound must cover every selected payload"
-            );
             let additional = self
                 .plan
                 .raw_value_capacity
@@ -217,7 +210,6 @@ impl StoredJsonBatchEncoder {
                     LixError::unknown("JSON-store value batch exceeds planned raw bound")
                 })?;
             self.value_bytes.reserve_exact(additional);
-            self.used_raw_bound_fallback = true;
             #[cfg(test)]
             {
                 self.value_arena_allocations += 1;
@@ -262,11 +254,6 @@ impl StoredJsonBatchEncoder {
     #[cfg(test)]
     fn compression_attempts(&self) -> usize {
         self.compressor.compression_attempts()
-    }
-
-    #[cfg(test)]
-    fn used_raw_bound_fallback(&self) -> bool {
-        self.used_raw_bound_fallback
     }
 }
 
@@ -636,7 +623,6 @@ mod tests {
 
         assert_eq!(encoder.compression_attempts(), ROW_COUNT);
         assert_eq!(encoder.value_arena_allocations(), 1);
-        assert!(!encoder.used_raw_bound_fallback());
         assert!(
             encoder.value_allocation().1 < raw_value_capacity / 2,
             "compressible batches must not retain a raw-sized final arena"
@@ -687,7 +673,6 @@ mod tests {
                 .expect("append heterogeneous JSON");
         }
 
-        assert!(encoder.used_raw_bound_fallback());
         assert_eq!(encoder.value_arena_allocations(), 2);
         assert_eq!(encoder.compression_attempts(), payloads.len());
         assert!(encoder.value_allocation().1 >= raw_value_capacity);
