@@ -12,10 +12,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::LixError;
+use crate::common::NullableKeyFilter;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_key, state_point, state_range,
+    encode_state_key, encode_state_prefix, state_point, state_range,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -106,7 +107,64 @@ where
             "current ForkTree reader view does not match requested branch",
         ));
     }
-    let rows = state_range(&view, None, None, None, true).await?;
+    // The common plugin/file lanes already carry one exact file identity and
+    // one or more schema keys.  Lower those identities into the authenticated
+    // state-key order before traversal; the previous whole-tree scan loaded
+    // every state leaf and discarded unrelated rows afterward.  Each prefix
+    // remains served by the same coherent global/local overlay and retained
+    // read, so this is a physical traversal bound, not a second authority.
+    let rows = if let [schema_key] = request.filter.schema_keys.as_slice()
+        && !request.filter.entity_pks.is_empty()
+        && let [file_id] = request.filter.file_ids.as_slice()
+        && !matches!(file_id, NullableKeyFilter::Any)
+    {
+        let file_id = match file_id {
+            NullableKeyFilter::Null => None,
+            NullableKeyFilter::Value(file_id) => Some(file_id.as_str()),
+            NullableKeyFilter::Any => unreachable!("Any was excluded above"),
+        };
+        let mut rows = Vec::with_capacity(request.filter.entity_pks.len());
+        for entity_pk in &request.filter.entity_pks {
+            let key = encode_state_key(StateKeyRef {
+                schema_key,
+                file_id,
+                entity_pk,
+            });
+            if let Some(row) = state_point(&view, &key, true).await? {
+                rows.push(row);
+            }
+        }
+        rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+        rows
+    } else if !request.filter.schema_keys.is_empty()
+        && !request.filter.file_ids.is_empty()
+        && request
+            .filter
+            .file_ids
+            .iter()
+            .all(|file_id| !matches!(file_id, NullableKeyFilter::Any))
+    {
+        let mut rows = Vec::new();
+        for schema_key in &request.filter.schema_keys {
+            for file_id in &request.filter.file_ids {
+                let file_id = match file_id {
+                    NullableKeyFilter::Null => None,
+                    NullableKeyFilter::Value(file_id) => Some(file_id.as_str()),
+                    NullableKeyFilter::Any => unreachable!("Any was excluded above"),
+                };
+                let lower = encode_state_prefix(schema_key, file_id);
+                let upper = exclusive_prefix_end(&lower);
+                rows.extend(
+                    state_range(&view, Some(lower.as_slice()), upper.as_deref(), None, true)
+                        .await?,
+                );
+            }
+        }
+        rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+        rows
+    } else {
+        state_range(&view, None, None, None, true).await?
+    };
     let mut output = Vec::with_capacity(rows.len());
     for row in rows {
         let key = decode_state_key(&row.encoded_key)?;
@@ -154,6 +212,18 @@ where
         }
     }
     Ok(MaterializedLiveStateBatch::from_rows(output))
+}
+
+fn exclusive_prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for index in (0..upper.len()).rev() {
+        if upper[index] != u8::MAX {
+            upper[index] += 1;
+            upper.truncate(index + 1);
+            return Some(upper);
+        }
+    }
+    None
 }
 
 /// Resolves the complete current logical overlay while borrowing the one view
