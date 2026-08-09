@@ -1150,6 +1150,16 @@ async fn historical_missing_state_root_fails_before_empty_result() {
             .is_err(),
         "missing selected state root must not become an empty historical result"
     );
+    assert!(
+        facade
+            .touched_state_identities_between_commits(
+                public_commit_id(0x20),
+                public_commit_id(0x20)
+            )
+            .await
+            .is_err(),
+        "physical identity discovery must fail closed on a missing state root"
+    );
 }
 
 #[tokio::test]

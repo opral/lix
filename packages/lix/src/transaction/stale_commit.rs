@@ -162,6 +162,40 @@ mod tests {
             .collect()
     }
 
+    fn prepared_plugin_write(file_id: &str) -> PreparedWriteSet {
+        let mut state_rows = PreparedStateBatch::with_capacity(1);
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("row-a"),
+            "plugin_entity".to_owned().into(),
+            Some(file_id.to_owned().into()),
+            None,
+            None,
+            None,
+            None,
+            LixTimestamp::from_unix_millis_utc_lossy(0),
+            LixTimestamp::from_unix_millis_utc_lossy(0),
+            false,
+            None,
+            false,
+            None,
+            false,
+            "main".to_owned().into(),
+        );
+        PreparedWriteSet {
+            state_rows,
+            insert_selection: super::super::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: Default::default(),
+            first_commit_parent_override_by_branch: Default::default(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: Default::default(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+            branch_ref_intents: Vec::new(),
+        }
+    }
+
     #[test]
     fn indexed_overlap_discovery_matches_legacy_order_and_membership() {
         let (prepared, concurrent) = overlap_fixture(257);
@@ -180,37 +214,7 @@ mod tests {
 
     #[test]
     fn unrelated_owner_does_not_enter_stale_plan() {
-        let mut state_rows = PreparedStateBatch::with_capacity(1);
-        state_rows.push_parts_with_change_addressability(
-            SchemaPlanId::for_test(0),
-            PreparedRowFacts::default(),
-            EntityPk::single("row-a"),
-            "plugin_entity".to_owned().into(),
-            Some("file-a".to_owned().into()),
-            None,
-            None,
-            None,
-            None,
-            LixTimestamp::from_unix_millis_utc_lossy(0),
-            LixTimestamp::from_unix_millis_utc_lossy(0),
-            false,
-            None,
-            false,
-            None,
-            false,
-            "main".to_owned().into(),
-        );
-        let prepared = PreparedWriteSet {
-            state_rows,
-            insert_selection: super::super::staging::PreparedInsertSelection::new(),
-            commit_change_refs_by_branch: Default::default(),
-            first_commit_parent_override_by_branch: Default::default(),
-            checkpoint_publications: Vec::new(),
-            extra_commit_parents_by_branch: Default::default(),
-            intermediate_commits: Vec::new(),
-            file_content_writes: Vec::new(),
-            branch_ref_intents: Vec::new(),
-        };
+        let prepared = prepared_plugin_write("file-a");
         let unrelated = TrackedStateKey {
             schema_key: "plugin_entity".to_owned(),
             file_id: Some("file-b".to_owned()),
@@ -220,6 +224,23 @@ mod tests {
         assert_eq!(
             classify_stale_commit(&prepared, std::iter::once(test_key_ref(&unrelated))),
             StaleCommitPlan::Direct
+        );
+    }
+
+    #[test]
+    fn same_owner_physical_identity_enters_stale_plan() {
+        let prepared = prepared_plugin_write("file-a");
+        let same_owner = TrackedStateKey {
+            schema_key: "plugin_entity".to_owned(),
+            file_id: Some("file-a".to_owned()),
+            entity_pk: EntityPk::single("row-a"),
+        };
+        assert_eq!(
+            classify_stale_commit(&prepared, std::iter::once(test_key_ref(&same_owner))),
+            StaleCommitPlan::ReconcilePlugin(StalePluginReconciliationPlan {
+                semantic_conflict_indices: vec![0],
+                file_ids: ["file-a".to_owned()].into_iter().collect(),
+            })
         );
     }
 
