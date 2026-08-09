@@ -8195,17 +8195,13 @@ where
     Ok(BlobBytesBatch::new(entries))
 }
 
-struct ForkTreeValidationReader<'a, R: StorageAdapterRead> {
-    forktree: &'a ForkTreeReadFacade<R>,
-    graph: Arc<tokio::sync::Mutex<CommitGraphStoreReader<&'a ForkTreeReadFacade<R>>>>,
-}
-
-impl<'a, R> ForkTreeValidationReader<'a, R>
+impl<R> ForkTreeReadFacade<R>
 where
     R: StorageAdapterRead + 'static,
 {
-    async fn scan_derived_rows(
-        &self,
+    async fn scan_validation_derived_rows<'a>(
+        &'a self,
+        graph: &mut CommitGraphStoreReader<&'a ForkTreeReadFacade<R>>,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let [schema_key] = request.filter.schema_keys.as_slice() else {
@@ -8239,9 +8235,7 @@ where
                 return Ok(Vec::new());
             }
             let mut rows = Vec::new();
-            for row in
-                crate::forktree::load_branch_heads_with_metadata(&self.forktree, None).await?
-            {
+            for row in crate::forktree::load_branch_heads_with_metadata(self, None).await? {
                 let entity_pk = EntityPk::uuid_from_canonical(&row.branch_id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_STORAGE_ERROR,
@@ -8307,8 +8301,7 @@ where
             Some(request.filter.branch_ids.as_slice())
         };
         let branch_rows =
-            crate::forktree::load_branch_heads_with_metadata(&self.forktree, requested_branch_ids)
-                .await?;
+            crate::forktree::load_branch_heads_with_metadata(self, requested_branch_ids).await?;
         if let Some(requested) = requested_branch_ids {
             for branch_id in requested {
                 if !branch_rows.iter().any(|row| row.branch_id == *branch_id) {
@@ -8326,7 +8319,6 @@ where
             .collect::<Vec<_>>();
 
         let mut rows = Vec::new();
-        let mut graph = self.graph.lock().await;
         for (branch_id, head) in heads {
             let mut roots = BTreeSet::from([head]);
             if schema_key == "lix_commit" {
@@ -8456,18 +8448,18 @@ where
     }
 }
 
-#[async_trait]
-impl<'a, R> LiveStateReader for ForkTreeValidationReader<'a, R>
+impl<R> ForkTreeReadFacade<R>
 where
     R: StorageAdapterRead + 'static,
 {
-    async fn scan_batch(
-        &self,
+    async fn scan_validation_rows<'a>(
+        &'a self,
+        graph: &mut CommitGraphStoreReader<&'a ForkTreeReadFacade<R>>,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let (current_schema_keys, derived_schema_keys) = validation_schema_partition(request);
         if derived_schema_keys.is_empty() {
-            return crate::live_state::scan_forktree_facade(&self.forktree, request).await;
+            return crate::live_state::scan_forktree_facade(self, request).await;
         }
         let mut rows = Vec::new();
         if !current_schema_keys.is_empty() {
@@ -8475,7 +8467,7 @@ where
             current_request.filter.schema_keys = current_schema_keys;
             current_request.limit = None;
             rows.extend(
-                crate::live_state::scan_forktree_facade(&self.forktree, &current_request)
+                crate::live_state::scan_forktree_facade(self, &current_request)
                     .await?
                     .into_rows(),
             );
@@ -8484,7 +8476,10 @@ where
             let mut derived_request = request.clone();
             derived_request.filter.schema_keys = vec![schema_key];
             derived_request.limit = None;
-            rows.extend(self.scan_derived_rows(&derived_request).await?);
+            rows.extend(
+                self.scan_validation_derived_rows(graph, &derived_request)
+                    .await?,
+            );
         }
         rows.sort_by(|left, right| {
             left.schema_key
@@ -8499,23 +8494,9 @@ where
         Ok(MaterializedLiveStateBatch::from_rows(rows))
     }
 
-    async fn scan_constraint_batch(
-        &self,
-        request: &LiveStateScanRequest,
-        _tracked_only: bool,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_batch(request).await
-    }
-
-    async fn scan_tracked_batch(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_batch(request).await
-    }
-
-    async fn load_exact_batch(
-        &self,
+    async fn load_exact_validation_rows<'a>(
+        &'a self,
+        graph: &mut CommitGraphStoreReader<&'a ForkTreeReadFacade<R>>,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         let mut output = vec![None; request.rows.len()];
@@ -8542,10 +8523,9 @@ where
                 untracked: request.untracked,
                 include_tombstones: request.include_tombstones,
             };
-            let current =
-                crate::live_state::load_forktree_exact_facade(&self.forktree, &current_request)
-                    .await?
-                    .into_rows();
+            let current = crate::live_state::load_forktree_exact_facade(self, &current_request)
+                .await?
+                .into_rows();
             for (index, row) in current_positions.into_iter().zip(current) {
                 output[index] = row;
             }
@@ -8579,7 +8559,9 @@ where
                 projection: derived_request.projection.clone(),
                 limit: None,
             };
-            let rows = self.scan_derived_rows(&scan_request).await?;
+            let rows = self
+                .scan_validation_derived_rows(graph, &scan_request)
+                .await?;
             for (position, requested) in positions.into_iter().zip(derived_request.rows) {
                 output[position] = rows
                     .iter()
@@ -8634,10 +8616,10 @@ fn exact_row_matches(row: &MaterializedLiveStateRow, requested: &LiveStateExactR
 
 /// Runs validation-only derived projections through the caller-owned facade.
 ///
-/// The adapter below is deliberately constructed from this facade, so it can
-/// never acquire a storage read of its own. It is not a second current-state
-/// owner: ordinary rows, commit rows, commit edges, and branch refs all remain
-/// bound to the same opening read and its authenticated ForkTree identity.
+/// One request-local graph reader borrows this facade directly, so it cannot
+/// acquire a storage read or become a second current-state owner. Ordinary
+/// rows, commit rows, commit edges, and branch refs all remain bound to the
+/// same opening read and its authenticated ForkTree identity.
 impl<R> ForkTreeReadFacade<R>
 where
     R: StorageAdapterRead + 'static,
@@ -8646,26 +8628,16 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let reader = ForkTreeValidationReader {
-            forktree: self,
-            graph: Arc::new(tokio::sync::Mutex::new(
-                CommitGraphContext::new().reader(self),
-            )),
-        };
-        reader.scan_batch(request).await
+        let mut graph = CommitGraphContext::new().reader(self);
+        self.scan_validation_rows(&mut graph, request).await
     }
 
     pub(crate) async fn validation_load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        let reader = ForkTreeValidationReader {
-            forktree: self,
-            graph: Arc::new(tokio::sync::Mutex::new(
-                CommitGraphContext::new().reader(self),
-            )),
-        };
-        reader.load_exact_batch(request).await
+        let mut graph = CommitGraphContext::new().reader(self);
+        self.load_exact_validation_rows(&mut graph, request).await
     }
 }
 
@@ -8747,23 +8719,24 @@ mod transaction_validation_reader_tests {
     }
 
     #[test]
-    fn validation_reader_uses_only_the_operation_forktree_capability() {
+    fn validation_projection_uses_only_the_operation_forktree_capability() {
         let source = include_str!("context.rs");
         let start = source
-            .find("struct ForkTreeValidationReader")
-            .expect("validation reader definition");
+            .find("async fn scan_validation_derived_rows")
+            .expect("validation projection definition");
         let end = source[start..]
             .find("fn validation_schema_partition")
             .map(|offset| start + offset)
-            .expect("validation reader end");
-        let reader = &source[start..end];
-        assert!(reader.contains("forktree: &'a ForkTreeReadFacade"));
-        assert!(reader.contains("CommitGraphStoreReader<&'a ForkTreeReadFacade"));
-        assert!(reader.contains("scan_derived_rows"));
-        assert!(!reader.contains("CommitGraphLiveStateReader"));
-        assert!(!reader.contains("derived_validation_reader"));
-        assert!(!reader.contains("branch_ctx.ref_reader"));
-        assert!(!reader.contains("LiveStateStoreReader"));
+            .expect("validation projection end");
+        let projection = &source[start..end];
+        assert!(projection.contains("&'a self"));
+        assert!(projection.contains("CommitGraphStoreReader<&'a ForkTreeReadFacade"));
+        assert!(projection.contains("scan_validation_derived_rows"));
+        assert!(!projection.contains("CommitGraphLiveStateReader"));
+        assert!(!projection.contains("derived_validation_reader"));
+        assert!(!projection.contains("branch_ctx.ref_reader"));
+        assert!(!projection.contains("LiveStateStoreReader"));
+        assert!(!source.contains(concat!("struct ForkTree", "ValidationReader")));
 
         let owner_start = source
             .find("fn validation_live_state_reader")
