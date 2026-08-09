@@ -38,3 +38,12 @@ the first failure:
 No runtime result is implied by this package. A candidate that reports growing
 `file_content_writes` payload bytes across pages is a hard BLOCKER even when
 the marker and publication remain atomic.
+
+The dormant adapter runner is
+`run_adapter_qualification.sh CANDIDATE_ROOT TARGET_DIR RESULTS_DIR`. It runs
+exactly three 1,200-second cells, in order: Memory, RocksDB, and SlateDB. Each
+implementation test must emit the 20-column `results.csv` schema checked by
+`verify_adapter_results.sh`; that validator rejects O(total) retained payload,
+nonzero `file_content_writes` payload, missing marker/commit, visible rollback
+state, or a missing adapter/page row. No runner cell was invoked when this
+package was frozen because the implementation ref was unavailable.
