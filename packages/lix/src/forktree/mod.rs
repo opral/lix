@@ -39,7 +39,7 @@ pub(crate) use object::ObjectId;
 pub(crate) use publication::{
     BranchStateTransition, OrderedBranchHistoryTransition, PreparedPublication, SelectorExpectation,
 };
-pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
+pub(crate) use reachability::{GcBudget, GcStepStatus, advance_gc};
 pub(crate) use serving::{
     CommitTopology, CommitTopologyReader, StateMutationAudit, StateSource, StateTreeMutation,
     VisibleStateRow, edit_state_tree, edit_state_tree_sequence, load_branch_heads_with_metadata,

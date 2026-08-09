@@ -13,7 +13,7 @@ where
     /// The checkpoint transaction has already atomically published both the
     /// new branch head and its rotated recovery root. This follow-up pass takes
     /// the same repository write gate as ordinary implicit writes, plans from
-    /// one pinned read, and commits the entire sweep as one write set.
+    /// one pinned read, and commits at most one bounded epoch-fenced page.
     async fn collect_checkpoint_garbage(&self) -> Result<GcStepStatus, LixError> {
         let write_access = self.begin_session_write_access().await?;
         let status = self

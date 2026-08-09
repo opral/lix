@@ -70,7 +70,6 @@ pub(crate) enum GcStepStatus {
     Complete {
         reclaimed: u64,
     },
-    AbortedCorruptProgress,
 }
 
 struct GcSnapshot<R> {
@@ -143,45 +142,6 @@ where
         GcPhaseV2::Sweep => advance_sweep(storage, snapshot, &mut progress, budget).await,
         GcPhaseV2::Cleanup => advance_cleanup(storage, snapshot, &mut progress, budget).await,
     }
-}
-
-/// Removes only a malformed GC selector/progress edge under the exact current
-/// global epoch. It never accepts semantic object IDs and cannot stage a
-/// semantic deletion. Orphaned maintenance objects are reclaimed by a later
-/// complete cycle.
-pub(crate) async fn abort_corrupt_gc<S>(storage: &S) -> Result<GcStepStatus, StorageError>
-where
-    S: Storage,
-{
-    let read = StorageAdapterReadScope::new(storage.begin_read(ReadOptions::default()).await?);
-    let keys = [Key(global_selector_key()), Key(gc_progress_selector_key())];
-    let loaded = read
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &keys,
-            opts: GetOptions {
-                projection: CoreProjection::FullValue,
-            },
-        }])
-        .await?;
-    if loaded.values.len() != keys.len() {
-        return Err(corruption(
-            "GC selector recovery read has invalid cardinality",
-        ));
-    }
-    let raw_global = required_full(loaded.values[0].clone(), "global selector is absent")?;
-    let global = GlobalSelectorV1::decode(&raw_global)?;
-    let raw_progress = match loaded.values[1].clone() {
-        None => return Err(corruption("GC progress selector is absent")),
-        Some(ProjectedValue::FullValue(bytes)) => bytes,
-        Some(ProjectedValue::KeyOnly) => {
-            return Err(corruption("GC selector recovery returned key-only data"));
-        }
-    };
-    let mut publication = PreparedPublication::from_global_selector_claim(raw_global, global)?;
-    publication.stage_gc_progress_selector(Some(raw_progress), None)?;
-    commit_publication_plan(storage, publication).await?;
-    Ok(GcStepStatus::AbortedCorruptProgress)
 }
 
 async fn load_gc_snapshot<S>(

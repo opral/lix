@@ -43,9 +43,9 @@ use super::{
     SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
     StateMutationAudit, StateSource, StateTreeMutation, StateValueRef, UNTRACKED_ROW_SPACE,
     UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1, UploadSelectorV1,
-    VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree, encode_state_key,
-    encode_state_value, load_commit, load_commit_member_records, load_commit_summary,
-    open_coherent_view, prepare_upload_completion, prepare_upload_part, put_change_catalog_entries,
+    VisibleStateRow, advance_gc, edit_state_tree, encode_state_key, encode_state_value,
+    load_commit, load_commit_member_records, load_commit_summary, open_coherent_view,
+    prepare_upload_completion, prepare_upload_part, put_change_catalog_entries,
     put_commit_catalog_entries, state_point, state_points, state_range,
 };
 
@@ -3186,7 +3186,7 @@ async fn deterministic_crash_recovery_publication_and_gc_oracle() {
 }
 
 #[tokio::test]
-async fn corrupted_persisted_gc_index_aborts_without_authorizing_deletion() {
+async fn corrupted_persisted_gc_index_fails_closed_without_authorizing_deletion() {
     let seed = build_seed();
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
@@ -3219,6 +3219,7 @@ async fn corrupted_persisted_gc_index_aborts_without_authorizing_deletion() {
         [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes,
         other => panic!("expected GC selector, got {other:?}"),
     };
+    let expected_raw_selector = raw_selector.clone();
     let selector = GcProgressSelectorV2::decode(raw_selector).expect("GC selector decode");
     let progress_keys = [Key(Bytes::copy_from_slice(
         selector.progress_object_id.as_bytes(),
@@ -3250,12 +3251,27 @@ async fn corrupted_persisted_gc_index_aborts_without_authorizing_deletion() {
 
     assert!(advance_gc(&storage, GcBudget::default()).await.is_err());
     assert!(object_present(&storage, seed.repository_root_id).await);
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("post-corruption GC selector read");
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &[Key(gc_progress_selector_key())],
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("post-corruption GC selector");
     assert_eq!(
-        abort_corrupt_gc(&storage).await.expect("abort corrupt GC"),
-        GcStepStatus::AbortedCorruptProgress
+        loaded.values.as_slice(),
+        &[Some(crate::storage::ProjectedValue::FullValue(
+            expected_raw_selector,
+        ))],
+        "corrupt maintenance state must not authorize selector mutation",
     );
-    assert!(!selector_present(&storage, gc_progress_selector_key()).await);
-    sweep(&storage, seed.branch_id).await;
     open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("semantic graph survives maintenance corruption");
