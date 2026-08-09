@@ -114,14 +114,15 @@ use crate::transaction::staging::{
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
+#[cfg(test)]
+use crate::transaction::types::CertifiedRawWriteBatchPreparation;
 use crate::transaction::types::{
-    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
-    CertifiedRawWriteBatchPreparation, PreparedRowFacts, PreparedStateBatch,
-    PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
-    StagedCommitChangeBatchBuilder, TransactionFileContent, TransactionJson, TransactionWrite,
-    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
-    TransactionWriteOutcome, TransactionWriteRow, TypedMutationJournalBatch,
-    canonicalize_transaction_json_batch, stage_json_from_value,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
+    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
+    TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
 };
 
 use crate::transaction::validation::{
