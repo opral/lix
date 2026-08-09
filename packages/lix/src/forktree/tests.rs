@@ -157,21 +157,16 @@ async fn forktree_json_object_materializes_and_rejects_side_plane_or_corruption(
         bytes: Bytes::from(value.clone()),
     };
     let (object_id, encoded) = chunk.encode().expect("JSON object encoding");
+    let mut seed = build_seed();
+    seed.objects
+        .insert(object_id, encoded.clone())
+        .expect("JSON object seed");
     let storage = Memory::new();
-    let mut writes = StorageWriteSet::new();
-    writes.put(
-        OBJECT_SPACE,
-        object_id.as_bytes().to_vec(),
-        encoded.to_vec(),
-    );
-    commit_write_set_for_test(writes, &storage).await;
-
-    let adapter = StorageAdapter::new(storage.clone());
-    let read = adapter
-        .begin_read(StorageReadOptions::default())
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
         .await
-        .expect("JSON object read");
-    let facade = ForkTreeReadFacade::new(read);
+        .expect("JSON object retained view");
+    let facade = ForkTreeReadFacade::from_view(view);
     let slot = crate::json_store::JsonSlot::ForkTreeObject(*object_id.as_bytes());
     assert_eq!(
         facade
@@ -189,23 +184,22 @@ async fn forktree_json_object_materializes_and_rejects_side_plane_or_corruption(
     );
     drop(facade);
 
+    let adapter = StorageAdapter::new(storage.clone());
+    let raw_read = adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("unbound JSON object read");
+    let unbound = ForkTreeReadFacade::new(raw_read);
+    assert!(
+        unbound.load_json_slot(&slot).await.is_err(),
+        "historical JSON objects must not fall through an unbound raw-control facade"
+    );
+
     let mut corrupted = encoded.to_vec();
     *corrupted.last_mut().expect("encoded JSON object") ^= 1;
     assert!(
         BlobChunkV1::decode(object_id, &corrupted).is_err(),
         "corrupt authenticated JSON objects must fail closed"
-    );
-    let mut writes = StorageWriteSet::new();
-    writes.delete(OBJECT_SPACE, object_id.as_bytes().to_vec());
-    commit_write_set_for_test(writes, &storage).await;
-    let read = adapter
-        .begin_read(StorageReadOptions::default())
-        .await
-        .expect("corrupt JSON object read");
-    let facade = ForkTreeReadFacade::new(read);
-    assert!(
-        facade.load_json_slot(&slot).await.is_err(),
-        "missing authenticated JSON objects must fail closed"
     );
 }
 
@@ -1219,26 +1213,12 @@ async fn historical_missing_commit_catalog_fails_for_point_and_batch() {
             .await
             .expect("missing catalog read"),
     );
-    let facade = ForkTreeReadFacade::new(read);
-    let public_commit_id = public_commit_id(0x20);
+    let branch_id = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
     assert!(
-        facade
-            .load_state_value_at_commit(public_commit_id, &seed.state_keys[0], true)
+        ForkTreeReadFacade::from_read_on_branch(read, &branch_id)
             .await
             .is_err(),
-        "missing selected CommitCatalog entry must not become None"
-    );
-    let key = StateKey {
-        schema_key: "app.row".to_owned(),
-        file_id: Some("file".to_owned()),
-        entity_pk: EntityPk::single("a"),
-    };
-    assert!(
-        facade
-            .load_state_rows_at_commit(&public_commit_id.to_string(), &[key])
-            .await
-            .is_err(),
-        "batch lowering must propagate missing selected commit corruption"
+        "missing selected CommitCatalog entry must fail before a historical facade exists"
     );
 }
 
@@ -1304,13 +1284,12 @@ async fn historical_missing_state_root_fails_before_empty_result() {
             .await
             .expect("missing state root read"),
     );
-    let facade = ForkTreeReadFacade::new(read);
+    let branch_id = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
     assert!(
-        facade
-            .load_state_value_at_commit(public_commit_id(0x20), &seed.state_keys[2], true)
+        ForkTreeReadFacade::from_read_on_branch(read, &branch_id)
             .await
             .is_err(),
-        "missing selected state root must not become an empty historical result"
+        "missing selected state root must fail before a historical facade exists"
     );
 }
 

@@ -533,6 +533,27 @@ where
     O: StorageAdapterRead + Clone,
 {
     let facade = crate::forktree::ForkTreeReadFacade::new(retained.clone());
+    let historical_facade =
+        controls
+            .first()
+            .map(|(branch_id, _)| branch_id)
+            .map(|branch_id| async {
+                crate::forktree::ForkTreeReadFacade::from_read_on_branch(
+                    retained.clone(),
+                    branch_id,
+                )
+                .await
+            });
+    let historical_facade = match historical_facade {
+        Some(future) => Some(future.await?),
+        None if retained_commits.is_empty() => None,
+        None => {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "retained historical plugin roots require an authenticated branch-bound view",
+            ));
+        }
+    };
     let mut roots = BTreeSet::new();
     for (branch_id, _) in controls {
         let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
@@ -575,7 +596,13 @@ where
             entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
             file_id: None,
         });
-        let value = facade
+        let historical_facade = historical_facade.as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "retained historical plugin roots require an authenticated branch-bound view",
+            )
+        })?;
+        let value = historical_facade
             .load_state_value_at_commit(*commit_id, &key, true)
             .await?
             .ok_or_else(|| {
@@ -615,7 +642,7 @@ where
                     file_id: owner_key.file_id.as_deref(),
                     entity_pk: &owner_key.entity_pk,
                 });
-            let owner_value = facade
+            let owner_value = historical_facade
                 .load_state_value_at_commit(*commit_id, &encoded_owner_key, true)
                 .await?
                 .ok_or_else(|| {

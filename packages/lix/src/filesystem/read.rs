@@ -27,6 +27,27 @@ where
     O: crate::storage_adapter::StorageAdapterRead + Clone,
 {
     let facade = crate::forktree::ForkTreeReadFacade::new(retained.clone());
+    let historical_facade =
+        controls
+            .first()
+            .map(|(branch_id, _)| branch_id)
+            .map(|branch_id| async {
+                crate::forktree::ForkTreeReadFacade::from_read_on_branch(
+                    retained.clone(),
+                    branch_id,
+                )
+                .await
+            });
+    let historical_facade = match historical_facade {
+        Some(future) => Some(future.await?),
+        None if retained_commits.is_empty() => None,
+        None => {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "retained historical file roots require an authenticated branch-bound view",
+            ));
+        }
+    };
     let mut roots = BTreeSet::new();
     for (branch_id, _) in controls {
         let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
@@ -58,7 +79,13 @@ where
     }
 
     for commit_id in retained_commits {
-        let records = facade
+        let historical_facade = historical_facade.as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "retained historical file roots require an authenticated branch-bound view",
+            )
+        })?;
+        let records = historical_facade
             .load_commit_member_records(*commit_id)
             .await?
             .ok_or_else(|| {
@@ -71,7 +98,7 @@ where
             if record.schema_key != BLOB_REF_SCHEMA_KEY || record.snapshot.is_none() {
                 continue;
             }
-            let Some(snapshot) = facade.load_json_slot(&record.snapshot).await? else {
+            let Some(snapshot) = historical_facade.load_json_slot(&record.snapshot).await? else {
                 continue;
             };
             roots.insert(blob_id_from_snapshot(&record.entity_pk, &snapshot)?);

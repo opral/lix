@@ -946,6 +946,12 @@ where
         self.opening_read.clone()
     }
 
+    pub(crate) fn opening_read_for_forktree(
+        &self,
+    ) -> SharedStorageAdapterRead<StorageImpl::Read<'static>> {
+        self.opening_read()
+    }
+
     /// Creates the opaque ForkTree operation owner from this transaction's
     /// already-retained opening read. This does not acquire or refresh a
     /// storage read and does not expose the underlying handle.
@@ -1033,7 +1039,9 @@ where
             // `opening_read` is rebound to the commit-boundary read before
             // reconciliation begins. Keep predecessor hydration on the same
             // operation-owned ForkTree facade as the stale classifier.
-            let forktree = self.forktree_read_facade();
+            let read = self.opening_read();
+            let forktree =
+                ForkTreeReadFacade::from_read_on_branch(read, &self.active_branch_id).await?;
             let mut predecessors_by_commit = BTreeMap::new();
             for descriptor in journal_descriptors {
                 let predecessors = load_immutable_mutation_predecessors(
@@ -1048,7 +1056,8 @@ where
             prepared_writes.hydrate_and_lower_ordered_mutation_journals(predecessors_by_commit)?;
         }
 
-        let facade = self.forktree_read_facade();
+        let read = self.opening_read();
+        let facade = ForkTreeReadFacade::from_read_on_branch(read, &self.active_branch_id).await?;
         let concurrent_payload = facade
             .diff_state_rows_between_commits(opening_head, current_head)
             .instrument(tracing::debug_span!(
@@ -7173,8 +7182,9 @@ where
         params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
         let read_store = self.opening_read();
-        let forktree = ForkTreeReadFacade::new(read_store.clone());
         let active_branch_id = self.active_branch_id.clone();
+        let forktree =
+            ForkTreeReadFacade::from_read_on_branch(read_store.clone(), &active_branch_id).await?;
         let branch_ctx = Arc::clone(&self.branch_ctx);
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
@@ -7330,7 +7340,8 @@ where
         desired_commit_id: CommitId,
         keys: Vec<TrackedStateKey>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        let facade = self.forktree_read_facade();
+        let read = self.opening_read();
+        let facade = ForkTreeReadFacade::from_read_on_branch(read, &self.active_branch_id).await?;
         self.execute_tracked_state_transition_with_facade(
             &facade,
             current_commit_id,
@@ -7509,7 +7520,8 @@ where
             .collect::<BTreeSet<_>>();
         let read = self.opening_read();
         let records = load_change_records(&read, change_ids.into_iter()).await?;
-        let mut forktree_reader = ForkTreeReadFacade::new(read.clone());
+        let mut forktree_reader =
+            ForkTreeReadFacade::from_read_on_branch(read.clone(), &self.active_branch_id).await?;
         let mut payloads = materialize_known_change_payloads(
             &mut forktree_reader,
             records.values().cloned(),
@@ -7677,8 +7689,9 @@ where
             .load_branch_head(&branch_id)
             .await?
             .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
-        let previous_checkpoint_commit_id = self
-            .forktree_read_facade()
+        let read = self.opening_read();
+        let historical = ForkTreeReadFacade::from_read_on_branch(read, &branch_id).await?;
+        let previous_checkpoint_commit_id = historical
             .checkpoint_history_from_head(head_commit_id, &branch_id)
             .await?
             .into_iter()
@@ -7690,8 +7703,7 @@ where
                 )
             })?
             .commit_id;
-        let diff = self
-            .forktree_read_facade()
+        let diff = historical
             .diff_branch_state_rows_between_commits(previous_checkpoint_commit_id, head_commit_id)
             .await?;
         let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
@@ -8158,7 +8170,7 @@ where
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            forktree_reader: ForkTreeReadFacade::new(self.read_store.clone()),
+            forktree_reader: self.forktree.clone(),
         }
     }
 

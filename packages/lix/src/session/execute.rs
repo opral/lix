@@ -871,7 +871,11 @@ where
                 read_scope,
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                     let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                    let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+                    let forktree = crate::forktree::ForkTreeReadFacade::from_read_on_branch(
+                        read_store.clone(),
+                        &active_branch_id,
+                    )
+                    .await?;
                     let ctx = SessionSqlExecutionContext {
                         active_branch_id: &active_branch_id,
                         active_account_id: self.active_account_id(),
@@ -1155,7 +1159,11 @@ where
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+                let forktree = crate::forktree::ForkTreeReadFacade::from_read_on_branch(
+                    read_store.clone(),
+                    &active_branch_id,
+                )
+                .await?;
                 let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                     Arc::new(forktree.clone());
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
@@ -1977,7 +1985,11 @@ where
                 let file_view_collector =
                     acknowledge_file_views.then(sql2::SessionFileViews::default);
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+                let forktree = crate::forktree::ForkTreeReadFacade::from_read_on_branch(
+                    read_store.clone(),
+                    &active_branch_id,
+                )
+                .await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
@@ -2128,7 +2140,11 @@ where
                         Vec::new(),
                     ));
                 }
-                let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+                let forktree = crate::forktree::ForkTreeReadFacade::from_read_on_branch(
+                    read_store.clone(),
+                    &active_branch_id,
+                )
+                .await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
@@ -2301,7 +2317,11 @@ where
                 "lix.perf.public_read.active_branch"
             ))
             .await?;
-        let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+        let forktree = crate::forktree::ForkTreeReadFacade::from_read_on_branch(
+            read_store.clone(),
+            &active_branch_id,
+        )
+        .await?;
         if let Some(exact_filesystem_read) = exact_filesystem_read {
             let query = match exact_filesystem_read {
                 ExactFilesystemRead::RootFileListing => {
