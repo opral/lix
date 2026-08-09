@@ -2207,7 +2207,6 @@ fn historical_state_row(
         snapshot_content,
         metadata: value.metadata,
         deleted,
-        blob_manifest_object_ids: value.blob_manifest_object_ids,
     }
 }
 
