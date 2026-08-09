@@ -6991,8 +6991,8 @@ where
         params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
         let read_store = self.opening_read();
+        let forktree = ForkTreeReadFacade::new(read_store.clone());
         let active_branch_id = self.active_branch_id.clone();
-        let live_state = Arc::clone(&self.live_state);
         let binary_cas = Arc::clone(&self.binary_cas);
         let branch_ctx = Arc::clone(&self.branch_ctx);
         let visible_schemas = self.sql_visible_schemas();
@@ -7001,7 +7001,6 @@ where
         let staged_writes = Arc::clone(&self.staged_writes);
         let filesystem_path_index_cache = Arc::clone(&self.filesystem_path_index_cache);
         let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
-        let branch_head_control_cache = Arc::clone(&self.branch_head_control_cache);
         let plugin_host = self.plugin_host.clone();
         let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
         let sql_catalog_fingerprint = self.sql_catalog_fingerprint().clone();
@@ -7010,7 +7009,7 @@ where
             active_branch_id,
             active_account_id: self.active_account_id.clone(),
             read_store,
-            live_state,
+            forktree,
             binary_cas,
             branch_ctx,
             visible_schemas,
@@ -7019,7 +7018,6 @@ where
             staged_writes,
             filesystem_path_index_cache,
             filesystem_path_index_epoch,
-            branch_head_control_cache,
             plugin_host,
             sql_planning_cache,
             sql_catalog_fingerprint,
@@ -7912,7 +7910,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     active_branch_id: String,
     active_account_id: String,
     read_store: SharedStorageAdapterRead<R>,
-    live_state: Arc<LiveStateContext>,
+    forktree: ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
     binary_cas: Arc<BinaryCasContext>,
     branch_ctx: Arc<BranchContext>,
     visible_schemas: Vec<JsonValue>,
@@ -7921,7 +7919,6 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
     plugin_host: PluginRuntimeHost,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     sql_catalog_fingerprint: CatalogFingerprint,
@@ -7967,10 +7964,7 @@ where
 
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
         Arc::new(TransactionReadLiveStateReader {
-            base: self.live_state.transaction_reader(
-                self.read_store.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            ),
+            forktree: self.forktree.clone(),
             read_store: self.read_store.clone(),
             staged: self.staged.clone(),
             filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
@@ -7980,10 +7974,7 @@ where
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         Arc::new(TransactionReadLiveStateReader {
-            base: self.live_state.transaction_reader(
-                self.read_store.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            ),
+            forktree: self.forktree.clone(),
             read_store: self.read_store.clone(),
             staged: self.staged.clone(),
             filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
@@ -8363,10 +8354,28 @@ mod transaction_validation_reader_tests {
         assert!(!source.contains(concat!("self.", "current.scan_batch")));
         assert!(!source.contains(concat!("self.", "current.load_exact_batch")));
     }
+
+    #[test]
+    fn transaction_sql_reader_uses_the_operation_forktree_owner() {
+        let source = include_str!("context.rs");
+        let start = source
+            .rfind("struct TransactionReadLiveStateReader")
+            .expect("transaction read reader definition");
+        let end = source[start..]
+            .find("/// Erases the storage borrow lifetime")
+            .map(|offset| start + offset)
+            .expect("transaction read reader end");
+        let reader = &source[start..end];
+        assert!(reader.contains("forktree: ForkTreeReadFacade"));
+        assert!(!reader.contains("LiveStateStoreReader"));
+        assert!(!reader.contains("transaction_reader("));
+        assert!(reader.contains("overlay_scan_batch(&self.forktree"));
+        assert!(reader.contains("overlay_load_exact_batch(&self.forktree"));
+    }
 }
 
 struct TransactionReadLiveStateReader<R: crate::storage_adapter::StorageRead> {
-    base: crate::live_state::LiveStateStoreReader<SharedStorageAdapterRead<R>>,
+    forktree: ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
     read_store: SharedStorageAdapterRead<R>,
     staged: PreparedStateRowOverlay,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
@@ -8382,14 +8391,14 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        overlay_scan_batch(&self.base, &self.staged, request).await
+        overlay_scan_batch(&self.forktree, &self.staged, request).await
     }
 
     async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        overlay_load_exact_batch(&self.base, &self.staged, request).await
+        overlay_load_exact_batch(&self.forktree, &self.staged, request).await
     }
 }
 
@@ -8404,7 +8413,12 @@ where
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
         if descriptor_epoch == 0 {
-            return self.base.path_index(request).await;
+            let mut index = crate::filesystem::build_path_index(&self.forktree, request).await?;
+            if request.cache_small_blob_data {
+                let store = self.read_store.clone();
+                index = Arc::new((*index).clone().hydrate_small_blob_data(&store).await?);
+            }
+            return Ok(index);
         }
         // The revision probe is only a cache-freshness optimization. Preserve the
         // pre-cache overlay behavior if a storage fault affects that single key.
@@ -8420,7 +8434,7 @@ where
             return Ok(index);
         }
         let rows =
-            overlay_scan_batch(&self.base, &self.staged, &request.live_state_request()).await?;
+            overlay_scan_batch(&self.forktree, &self.staged, &request.live_state_request()).await?;
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
         let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
