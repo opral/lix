@@ -31,9 +31,9 @@ pub(crate) use model::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BlobMerkleInternalV1,
     BlobMerkleLeafV1, BlobMerkleNodeRefV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId,
     CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1,
-    CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
-    UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
+    GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1,
+    SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
 pub(crate) use object::ObjectId;
 pub(crate) use publication::{
@@ -41,18 +41,19 @@ pub(crate) use publication::{
 };
 pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
 pub(crate) use serving::{
-    CatalogPage, CommitTopology, CommitTopologyReader, StateSource, StateTreeMutation,
-    VisibleStateRow, edit_state_tree, edit_state_tree_sequence, load_branch_head,
-    load_branch_heads_with_metadata, load_change, load_change_records, load_commit,
-    load_commit_member_records, load_commit_records, load_commit_summary, load_commit_topologies,
-    page_changes, page_commits, put_change_catalog_entries, put_commit_catalog_entries,
-    scan_branch_heads, scan_change_records, scan_commit_records, scan_commit_topologies,
-    select_historical_commit_member, state_point, state_point_on_read, state_points, state_range,
+    CatalogPage, CommitTopology, CommitTopologyReader, StateMutationAudit, StateSource,
+    StateTreeMutation, VisibleStateRow, edit_state_tree, edit_state_tree_sequence,
+    load_branch_head, load_branch_heads_with_metadata, load_change, load_change_records,
+    load_commit, load_commit_member_records, load_commit_records, load_commit_summary,
+    load_commit_topologies, page_changes, page_commits, put_change_catalog_entries,
+    put_commit_catalog_entries, scan_branch_heads, scan_change_records, scan_commit_records,
+    scan_commit_topologies, select_historical_commit_member, state_point, state_point_on_read,
+    state_points, state_range,
 };
 pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
     UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
-    encode_state_key, encode_state_prefix, encode_state_value, encode_untracked_key,
+    encode_state_entity_prefix, encode_state_key, encode_state_value, encode_untracked_key,
     encode_untracked_value,
 };
 pub(crate) use tree::{
@@ -112,13 +113,14 @@ const _: () = {
             CommitTopologyReader<R>,
             StateSource,
             StateTreeMutation,
+            StateMutationAudit,
             VisibleStateRow,
             StateCell,
             StateCellRef<'static>,
             StateKey,
             StateKeyRef<'static>,
             StateValue,
-            StateValueRef<'static>,
+            StateValueRef,
             UntrackedValueRef<'static>,
             ReceiptTreeEdit,
             ReceiptTreeRoot,
@@ -166,7 +168,7 @@ const _: () = {
         let _ = decode_state_key;
         let _ = decode_state_value;
         let _ = encode_state_key;
-        let _ = encode_state_prefix;
+        let _ = encode_state_entity_prefix;
         let _ = encode_state_value;
         let _ = open_coherent_view::<S>;
         let _ = open_coherent_view_on_read::<R>;

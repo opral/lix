@@ -453,7 +453,6 @@ impl PreparedPublication {
             &[(
                 change_id,
                 ChangeCatalogEntry {
-                    change_object_id: ref_object_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id: ref_object_id,
                         branch_id,
@@ -539,7 +538,6 @@ impl PreparedPublication {
             &[(
                 change_id,
                 ChangeCatalogEntry {
-                    change_object_id: ref_object_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id: ref_object_id,
                         branch_id: view.branch_id(),
@@ -1249,33 +1247,46 @@ impl PreparedPublication {
                 return Err(corruption("state transition repeats one Change object"));
             }
         }
-        let mut expected_changes = BTreeSet::new();
-        for (ordinal, member) in semantic_commit.members.iter().copied().enumerate() {
-            let member_id = member.change_object_id();
+        let mut expected_change_ids = BTreeSet::new();
+        for (ordinal, member) in semantic_commit.members.iter().enumerate() {
             if member.source().is_some() {
                 return Err(corruption(
                     "single-transition publication cannot introduce selected history",
                 ));
             }
-            if !expected_changes.insert(member_id) {
-                return Err(corruption("semantic commit repeats one member Change"));
+            let change_id = member.change_id();
+            if !expected_change_ids.insert(change_id) {
+                return Err(corruption("semantic commit repeats one member ChangeId"));
             }
-            let Some((ChangeObjectV1::Semantic { change_id, .. }, _)) =
-                encoded_changes.get(&member_id)
+            let Some((payload, _global, _updated_at, _blob_manifest_object_ids)) =
+                member.introduced_payload()
             else {
                 return Err(corruption(
-                    "semantic commit member is absent or is a branch RefChange",
+                    "single-transition semantic member is not introduced",
                 ));
             };
-            let expected = ChangeCatalogEntry {
-                change_object_id: member_id,
-                owner: ChangeCatalogOwner::CommitMember {
+            let record = crate::changelog::decode_forktree_change_payload(
+                payload,
+                crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
+            )
+            .map_err(|error| corruption(error.to_string()))?;
+            let expected_json = crate::changelog::forktree_change_json_payload_ids(&record)
+                .into_iter()
+                .map(super::object::ObjectId::from_bytes)
+                .collect::<Vec<_>>();
+            if !expected_json.is_empty() {
+                return Err(corruption(
+                    "semantic page member contains an out-of-page JSON reference",
+                ));
+            }
+            let expected = super::model::ChangeCatalogEntry {
+                owner: super::model::ChangeCatalogOwner::CommitMember {
                     commit_object_id: commit_id,
                     ordinal: u32::try_from(ordinal)
                         .map_err(|_| corruption("semantic commit ordinal exceeds u32"))?,
                 },
             };
-            if change_catalog_edit.change_entries.get(change_id) != Some(&expected) {
+            if change_catalog_edit.change_entries.get(&change_id) != Some(&expected) {
                 return Err(corruption(
                     "semantic ChangeCatalog owner does not match commit ordinal",
                 ));
@@ -1300,9 +1311,8 @@ impl PreparedPublication {
                 "new branch RefChange edge has no typed Change object",
             ));
         };
-        let expected = ChangeCatalogEntry {
-            change_object_id: ref_id,
-            owner: ChangeCatalogOwner::BranchRef {
+        let expected = super::model::ChangeCatalogEntry {
+            owner: super::model::ChangeCatalogOwner::BranchRef {
                 ref_change_object_id: ref_id,
                 branch_id: *branch_id,
             },
@@ -1318,10 +1328,9 @@ impl PreparedPublication {
                 "branch RefChange/catalog/head edge is inconsistent",
             ));
         }
-        expected_changes.insert(ref_id);
-        if encoded_changes.keys().copied().collect::<BTreeSet<_>>() != expected_changes {
+        if encoded_changes.len() != 1 || !encoded_changes.contains_key(&ref_id) {
             return Err(corruption(
-                "state transition Change set is not exactly the commit members and RefChange",
+                "state transition standalone Change set is not exactly its RefChange",
             ));
         }
 
@@ -1406,18 +1415,10 @@ impl PreparedPublication {
             ));
         }
 
-        let mut encoded_fresh_changes = BTreeMap::new();
-        for change in &fresh_changes {
-            let (object_id, bytes) = change.encode()?;
-            if !matches!(change, ChangeObjectV1::Semantic { .. })
-                || encoded_fresh_changes
-                    .insert(object_id, (change, bytes))
-                    .is_some()
-            {
-                return Err(corruption(
-                    "ordered history repeats or misclassifies one fresh Change object",
-                ));
-            }
+        if !fresh_changes.is_empty() {
+            return Err(corruption(
+                "ordered history cannot publish standalone semantic Change objects",
+            ));
         }
 
         let is_global = state_domain_global;
@@ -1479,48 +1480,57 @@ impl PreparedPublication {
             }
 
             let mut member_ids = BTreeSet::new();
-            for (ordinal, member) in commit.members.iter().copied().enumerate() {
-                let change_object_id = member.change_object_id();
-                if !member_ids.insert(change_object_id) {
-                    return Err(corruption("ordered Commit repeats one Change member"));
+            for (ordinal, member) in commit.members.iter().enumerate() {
+                let change_id = member.change_id();
+                if !member_ids.insert(change_id) {
+                    return Err(corruption("ordered Commit repeats one ChangeId member"));
                 }
                 match member.source() {
                     None => {
-                        let Some((ChangeObjectV1::Semantic { change_id, .. }, _)) =
-                            encoded_fresh_changes.get(&change_object_id)
+                        let Some((payload, _global, _updated_at, _blob_manifest_object_ids)) =
+                            member.introduced_payload()
                         else {
                             return Err(corruption(
-                                "introduced member is absent from fresh semantic Changes",
+                                "introduced member has no embedded semantic payload",
                             ));
                         };
-                        let expected = ChangeCatalogEntry {
-                            change_object_id,
-                            owner: ChangeCatalogOwner::CommitMember {
+                        let record = crate::changelog::decode_forktree_change_payload(
+                            payload,
+                            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+                                *change_id.as_bytes(),
+                            )),
+                        )
+                        .map_err(|error| corruption(error.to_string()))?;
+                        let expected_json =
+                            crate::changelog::forktree_change_json_payload_ids(&record)
+                                .into_iter()
+                                .map(super::object::ObjectId::from_bytes)
+                                .collect::<Vec<_>>();
+                        if !expected_json.is_empty() {
+                            return Err(corruption(
+                                "ordered semantic page member contains an out-of-page JSON reference",
+                            ));
+                        }
+                        let expected = super::model::ChangeCatalogEntry {
+                            owner: super::model::ChangeCatalogOwner::CommitMember {
                                 commit_object_id,
                                 ordinal: u32::try_from(ordinal).map_err(|_| {
                                     corruption("ordered Commit member ordinal exceeds u32")
                                 })?,
                             },
                         };
-                        if change_catalog_edit.change_entries.get(change_id) != Some(&expected) {
+                        if change_catalog_edit.change_entries.get(&change_id) != Some(&expected) {
                             return Err(corruption(
                                 "fresh ChangeCatalog introduction owner is inconsistent",
                             ));
                         }
                     }
                     Some(_) => {
-                        let bytes = view.load_object_bytes(change_object_id).await?;
-                        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
-                        if !matches!(change, ChangeObjectV1::Semantic { .. }) {
-                            return Err(corruption(
-                                "selected history member names a non-semantic Change",
-                            ));
-                        }
                         let raw_entry = view
                             .lookup_tree_value(
                                 view.repository_root().change_catalog_root,
                                 "change",
-                                change.change_id().as_bytes(),
+                                change_id.as_bytes(),
                             )
                             .await?
                             .ok_or_else(|| {
@@ -1531,8 +1541,8 @@ impl PreparedPublication {
                             commit_object_id,
                             commit.generation,
                             ordinal,
-                            member,
-                            ChangeCatalogEntry::decode(&raw_entry)?,
+                            member.clone(),
+                            super::model::ChangeCatalogEntry::decode(&raw_entry)?,
                         )
                         .await?;
                     }
@@ -1565,9 +1575,8 @@ impl PreparedPublication {
                 "ordered history final ref fact has wrong domain",
             ));
         };
-        let expected_ref_entry = ChangeCatalogEntry {
-            change_object_id: ref_object_id,
-            owner: ChangeCatalogOwner::BranchRef {
+        let expected_ref_entry = super::model::ChangeCatalogEntry {
+            owner: super::model::ChangeCatalogOwner::BranchRef {
                 ref_change_object_id: ref_object_id,
                 branch_id: *branch_id,
             },
@@ -1594,9 +1603,6 @@ impl PreparedPublication {
             self.stage_encoded_object(page_id, page_bytes)?;
         }
         for (object_id, (_, bytes)) in encoded_commits {
-            self.stage_encoded_object(object_id, bytes)?;
-        }
-        for (object_id, (_, bytes)) in encoded_fresh_changes {
             self.stage_encoded_object(object_id, bytes)?;
         }
         self.stage_encoded_object(ref_object_id, ref_bytes)?;

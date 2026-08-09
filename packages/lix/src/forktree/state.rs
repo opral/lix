@@ -8,11 +8,8 @@ use crate::storage::StorageSpace;
 use super::model::CanonicalBranchId;
 use super::object::ObjectId;
 
-// A state-tree leaf contains at most 64 rows. Four roots per row keeps the
-// authenticated leaf edge page at or below the owner-wide 256-edge bound.
 const MAX_BLOB_ROOTS_PER_STATE_ROW: usize = 4;
-
-const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x01";
+const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x02";
 const UNTRACKED_KEY_MAGIC: &[u8; 8] = b"LIXFTU\0\x01";
 const UNTRACKED_VALUE_MAGIC: &[u8; 8] = b"LIXFTW\0\x01";
 
@@ -50,16 +47,10 @@ pub(crate) struct StateKey {
     pub(crate) entity_pk: EntityPk,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct StateValueRef<'a> {
-    pub(crate) change_id: crate::changelog::ChangeId,
-    pub(crate) commit_id: crate::changelog::CommitId,
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) updated_at: LixTimestamp,
-    pub(crate) cell: StateCellRef<'a>,
-    pub(crate) metadata: Option<&'a str>,
-    pub(crate) origin_key: Option<&'a str>,
-    pub(crate) blob_manifest_object_ids: &'a [ObjectId],
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StateValueRef {
+    pub(crate) page_object_id: ObjectId,
+    pub(crate) page_ordinal: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,10 +160,26 @@ pub(crate) fn encode_state_key(key: StateKeyRef<'_>) -> Vec<u8> {
             + key.entity_pk.components.len() * 18,
     );
     write_key_string(&mut output, key.schema_key, KEY_PART_FINAL);
+    write_entity_pk(&mut output, key.entity_pk);
     write_file_id(&mut output, key.file_id);
+    output
+}
+
+/// Encodes the canonical contiguous lookup prefix for one entity identity.
+/// File ownership is the final key component, so a SQL entity-PK predicate
+/// can authenticate every matching file/global row without scanning unrelated
+/// identities or maintaining a second index.
+pub(crate) fn encode_state_entity_prefix(schema_key: &str, entity_pk: &EntityPk) -> Vec<u8> {
+    let mut output = Vec::with_capacity(schema_key.len() + 4 + entity_pk.components.len() * 18);
+    write_key_string(&mut output, schema_key, KEY_PART_FINAL);
+    write_entity_pk(&mut output, entity_pk);
+    output
+}
+
+fn write_entity_pk(output: &mut Vec<u8>, entity_pk: &EntityPk) {
     output.push(ENTITY_PK_CODEC_V1);
-    for (index, component) in key.entity_pk.components.iter().enumerate() {
-        let terminator = if index + 1 == key.entity_pk.components.len() {
+    for (index, component) in entity_pk.components.iter().enumerate() {
+        let terminator = if index + 1 == entity_pk.components.len() {
             KEY_PART_FINAL
         } else {
             KEY_PART_MORE
@@ -191,22 +198,14 @@ pub(crate) fn encode_state_key(key: StateKeyRef<'_>) -> Vec<u8> {
             }
             EntityPkComponent::String(value) => {
                 output.push(ENTITY_PK_STRING);
-                write_key_bytes(&mut output, value.as_bytes(), terminator);
+                write_key_bytes(output, value.as_bytes(), terminator);
             }
             EntityPkComponent::Bytes(value) => {
                 output.push(ENTITY_PK_BYTES);
-                write_key_bytes(&mut output, value, terminator);
+                write_key_bytes(output, value, terminator);
             }
         }
     }
-    output
-}
-
-pub(crate) fn encode_state_prefix(schema_key: &str, file_id: Option<&str>) -> Vec<u8> {
-    let mut output = Vec::with_capacity(schema_key.len() + file_id.map_or(1, str::len) + 4);
-    write_key_string(&mut output, schema_key, KEY_PART_FINAL);
-    write_file_id(&mut output, file_id);
-    output
 }
 
 pub(crate) fn decode_state_key(bytes: &[u8]) -> Result<StateKey, LixError> {
@@ -215,8 +214,8 @@ pub(crate) fn decode_state_key(bytes: &[u8]) -> Result<StateKey, LixError> {
     if terminator != KEY_PART_FINAL {
         return Err(state_error("state schema key has an invalid terminator"));
     }
-    let file_id = read_file_id(bytes, &mut offset)?;
     let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    let file_id = read_file_id(bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(state_error("state key has trailing bytes"));
     }
@@ -227,59 +226,28 @@ pub(crate) fn decode_state_key(bytes: &[u8]) -> Result<StateKey, LixError> {
     })
 }
 
-pub(crate) fn encode_state_value(value: StateValueRef<'_>) -> Result<Vec<u8>, LixError> {
-    let mut output = Vec::with_capacity(
-        STATE_VALUE_MAGIC.len()
-            + 16
-            + 16
-            + 17
-            + match value.cell {
-                StateCellRef::Value(value) => 5 + value.len(),
-                StateCellRef::Null | StateCellRef::Tombstone => 1,
-            }
-            + value.metadata.map_or(1, |value| 5 + value.len())
-            + value.origin_key.map_or(1, |value| 5 + value.len()),
-    );
+pub(crate) fn encode_state_value(value: StateValueRef) -> Result<Vec<u8>, LixError> {
+    if value.page_object_id == ObjectId::ZERO {
+        return Err(state_error("state value page object id is zero"));
+    }
+    let mut output = Vec::with_capacity(STATE_VALUE_MAGIC.len() + 32 + 4);
     output.extend_from_slice(STATE_VALUE_MAGIC);
-    output.extend_from_slice(value.change_id.as_uuid().as_bytes());
-    output.extend_from_slice(value.commit_id.as_uuid().as_bytes());
-    output.extend_from_slice(&value.created_at.packed().to_be_bytes());
-    output.extend_from_slice(&value.updated_at.packed().to_be_bytes());
-    put_state_cell(&mut output, value.cell)?;
-    put_optional_bytes(&mut output, value.metadata.map(str::as_bytes))?;
-    put_optional_bytes(&mut output, value.origin_key.map(str::as_bytes))?;
-    put_object_ids(&mut output, value.blob_manifest_object_ids)?;
+    output.extend_from_slice(value.page_object_id.as_bytes());
+    output.extend_from_slice(&value.page_ordinal.to_be_bytes());
     Ok(output)
 }
 
-pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<StateValue, LixError> {
+pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<StateValueRef, LixError> {
     let mut decoder = ValueDecoder::after_magic(bytes, STATE_VALUE_MAGIC, "state value")?;
-    let change_id = crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
-        decoder.fixed_16("state change id")?,
-    ));
-    let commit_id = crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-        decoder.fixed_16("state commit id")?,
-    ));
-    let created_at = LixTimestamp::from_packed(decoder.u64("state created_at")?)
-        .map_err(|error| state_error(error.to_string()))?;
-    let updated_at = LixTimestamp::from_packed(decoder.u64("state updated_at")?)
-        .map_err(|error| state_error(error.to_string()))?;
-    let cell = decoder.state_cell("state cell")?;
-    let metadata = decoder
-        .optional_string("state metadata")?
-        .map(SharedStr::from);
-    let origin_key = decoder.optional_string("state origin key")?;
-    let blob_manifest_object_ids = decoder.object_ids("state blob manifests")?;
+    let page_object_id = ObjectId::from_bytes(decoder.fixed_32("state page object id")?);
+    if page_object_id == ObjectId::ZERO {
+        return Err(state_error("state value page object id is zero"));
+    }
+    let page_ordinal = decoder.u32("state page ordinal")?;
     decoder.finish("state value")?;
-    Ok(StateValue {
-        change_id,
-        commit_id,
-        created_at,
-        updated_at,
-        cell,
-        metadata,
-        origin_key,
-        blob_manifest_object_ids,
+    Ok(StateValueRef {
+        page_object_id,
+        page_ordinal,
     })
 }
 
@@ -623,6 +591,21 @@ impl<'a> ValueDecoder<'a> {
             .take(16, field)?
             .try_into()
             .expect("decoder returned fixed UUID width"))
+    }
+
+    fn fixed_32(&mut self, field: &str) -> Result<[u8; 32], LixError> {
+        Ok(self
+            .take(32, field)?
+            .try_into()
+            .expect("decoder returned fixed object-id width"))
+    }
+
+    fn u32(&mut self, field: &str) -> Result<u32, LixError> {
+        Ok(u32::from_be_bytes(
+            self.take(4, field)?
+                .try_into()
+                .expect("decoder returned fixed u32 width"),
+        ))
     }
 
     fn u64(&mut self, field: &str) -> Result<u64, LixError> {

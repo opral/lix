@@ -3,9 +3,11 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
+use crate::changelog::ChangeRecord;
 use crate::commit_graph::CommitGraphContext;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
+use crate::json_store::JsonSlot;
 use crate::storage::{
     BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
     KeyRange, Memory, MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage,
@@ -35,15 +37,16 @@ use super::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage,
     ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView,
-    CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, ForkTreeReadFacade, GcBudget,
-    GcStepStatus, GlobalSelectorV1, ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT,
-    RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot, RepositoryRootV1,
-    SelectorExpectation, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
-    StateCell, StateCellRef, StateKey, StateKeyRef, StateSource, StateTreeMutation, StateValueRef,
-    UNTRACKED_ROW_SPACE, UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree,
-    encode_state_key, encode_state_value, load_change, load_commit, load_commit_member_records,
-    load_commit_summary, load_commit_topologies, open_coherent_view, page_changes, page_commits,
+    CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
+    ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId, PreparedPublication,
+    RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
+    RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1,
+    SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef, StateMutationAudit,
+    StateSource, StateTreeMutation, StateValueRef, UNTRACKED_ROW_SPACE, UntrackedValueRef,
+    UploadBindingRef, UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow,
+    abort_corrupt_gc, advance_gc, edit_state_tree, encode_state_key, encode_state_value,
+    load_change, load_commit, load_commit_member_records, load_commit_summary,
+    load_commit_topologies, open_coherent_view, page_changes, page_commits,
     prepare_upload_completion, prepare_upload_part, put_change_catalog_entries,
     put_commit_catalog_entries, state_point, state_points, state_range,
 };
@@ -245,11 +248,10 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     assert_eq!(source_commit.commit_id, seed.commit_id);
     assert_eq!(source_change.change_id(), seed.semantic_change_id);
     assert_eq!(
-        member,
-        CommitMemberV1::selected(seed.semantic_change_object_id, seed.commit_object_id, 0)
+        member.clone(),
+        CommitMemberV1::selected(seed.semantic_change_id, seed.commit_object_id, 0)
     );
     let entry = ChangeCatalogEntry {
-        change_object_id: seed.semantic_change_object_id,
         owner: ChangeCatalogOwner::CommitMember {
             commit_object_id: seed.commit_object_id,
             ordinal: 0,
@@ -261,7 +263,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
         content_id(0xa1),
         2,
         0,
-        member,
+        member.clone(),
         entry,
     )
     .await
@@ -315,12 +317,19 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
 
+    let seed_commit = CommitObjectV1::decode(
+        seed.commit_object_id,
+        seed.objects
+            .get(seed.commit_object_id)
+            .expect("seed commit"),
+    )
+    .expect("decode seed commit");
     let source_commit = CommitObjectV1 {
         commit_id: seed.commit_id,
         generation: 1,
         parent_commit_object_ids: Vec::new(),
-        members: vec![CommitMemberV1::introduced(seed.semantic_change_object_id)],
-        member_page_root: None,
+        members: Vec::new(),
+        member_page_object_ids: seed_commit.member_page_object_ids,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"remapped-source-commit".to_vec(),
@@ -352,9 +361,8 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("open selected history view");
-    let member = CommitMemberV1::selected(seed.semantic_change_object_id, seed.commit_object_id, 0);
+    let member = CommitMemberV1::selected(seed.semantic_change_id, seed.commit_object_id, 0);
     let entry = ChangeCatalogEntry {
-        change_object_id: seed.semantic_change_object_id,
         owner: ChangeCatalogOwner::CommitMember {
             commit_object_id: seed.commit_object_id,
             ordinal: 0,
@@ -367,7 +375,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
             content_id(0xa1),
             2,
             0,
-            member,
+            member.clone(),
             entry,
         )
         .await
@@ -398,15 +406,144 @@ fn public_commit_id(byte: u8) -> crate::changelog::CommitId {
     crate::changelog::CommitId::new(uuid::Uuid::from_bytes(raw_id(byte)))
 }
 
-fn public_change_id(byte: u8) -> crate::changelog::ChangeId {
-    crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(raw_id(byte)))
+fn test_change_id(commit_byte: u8, key: &[u8], global: bool) -> ChangeId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lix.forktree.test.change.v2\0");
+    hasher.update(&[commit_byte]);
+    hasher.update(&[u8::from(global)]);
+    hasher.update(key);
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    ChangeId::from_bytes(id)
 }
 
-fn state_entry(
+fn test_state_member(
     primary_key: &str,
     cell: StateCellRef<'_>,
     commit_byte: u8,
     manifests: &[ObjectId],
+    global: bool,
+) -> (Vec<u8>, CommitMemberV1) {
+    let entity_pk = EntityPk::single(primary_key);
+    let key = encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: Some("file"),
+        entity_pk: &entity_pk,
+    });
+    let change_id = test_change_id(commit_byte, &key, global);
+    let snapshot = match cell {
+        StateCellRef::Value(value) => JsonSlot::Inline(value.into()),
+        StateCellRef::Null => JsonSlot::Inline("null".into()),
+        StateCellRef::Tombstone => JsonSlot::None,
+    };
+    let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+        format_version: 2,
+        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
+        account_id: "forktree-test".to_owned(),
+        schema_key: "app.row".to_owned(),
+        entity_pk,
+        file_id: Some("file".to_owned()),
+        snapshot,
+        metadata: JsonSlot::None,
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        origin_key: None,
+    })
+    .expect("test change payload");
+    (
+        key,
+        CommitMemberV1::introduced(
+            change_id,
+            payload,
+            global,
+            LixTimestamp::from_unix_millis_utc_lossy(2),
+            manifests.to_vec(),
+        ),
+    )
+}
+
+fn test_blob_ref_member(
+    primary_key: &str,
+    declared_id: &str,
+    blob_id: crate::binary_cas::BlobId,
+    size_bytes: u64,
+    commit_byte: u8,
+    manifest: ObjectId,
+) -> (Vec<u8>, CommitMemberV1) {
+    let entity_pk = EntityPk::uuid_from_canonical(primary_key).expect("canonical blob-ref id");
+    let key = encode_state_key(StateKeyRef {
+        schema_key: "lix_binary_blob_ref",
+        file_id: Some(primary_key),
+        entity_pk: &entity_pk,
+    });
+    let change_id = test_change_id(commit_byte, &key, false);
+    let snapshot = serde_json::json!({
+        "id": declared_id,
+        "blob_hash": blob_id.to_hex(),
+        "size_bytes": size_bytes,
+    })
+    .to_string();
+    let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+        format_version: 2,
+        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
+        account_id: "forktree-test".to_owned(),
+        schema_key: "lix_binary_blob_ref".to_owned(),
+        entity_pk,
+        file_id: Some(primary_key.to_owned()),
+        snapshot: JsonSlot::Inline(snapshot.into()),
+        metadata: JsonSlot::None,
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        origin_key: None,
+    })
+    .expect("blob-ref change payload");
+    (
+        key,
+        CommitMemberV1::introduced(
+            change_id,
+            payload,
+            false,
+            LixTimestamp::from_unix_millis_utc_lossy(2),
+            vec![manifest],
+        ),
+    )
+}
+
+fn encode_test_state_entries(
+    commit_byte: u8,
+    entries: Vec<(Vec<u8>, CommitMemberV1)>,
+) -> (
+    Vec<(Vec<u8>, Vec<u8>)>,
+    Vec<CommitMemberV1>,
+    Vec<(ObjectId, Bytes)>,
+) {
+    let members = entries
+        .iter()
+        .map(|(_, member)| member.clone())
+        .collect::<Vec<_>>();
+    let pages =
+        CommitChangePageV2::encode_pages(CommitId::from_bytes(raw_id(commit_byte)), &members)
+            .expect("test change pages");
+    let rows = entries
+        .into_iter()
+        .zip(&pages.member_locations)
+        .map(|((key, _), location)| {
+            (
+                key,
+                encode_state_value(StateValueRef {
+                    page_object_id: location.page_object_id,
+                    page_ordinal: location.page_ordinal,
+                })
+                .expect("state value"),
+            )
+        })
+        .collect();
+    (rows, members, pages.objects)
+}
+
+fn state_entry(
+    primary_key: &str,
+    _cell: StateCellRef<'_>,
+    commit_byte: u8,
+    _manifests: &[ObjectId],
 ) -> (Vec<u8>, Vec<u8>) {
     let entity_pk = EntityPk::single(primary_key);
     let key = encode_state_key(StateKeyRef {
@@ -415,67 +552,10 @@ fn state_entry(
         entity_pk: &entity_pk,
     });
     let value = encode_state_value(StateValueRef {
-        change_id: public_change_id(commit_byte.wrapping_add(1)),
-        commit_id: public_commit_id(commit_byte),
-        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
-        cell,
-        metadata: None,
-        origin_key: None,
-        blob_manifest_object_ids: manifests,
+        page_object_id: content_id(commit_byte),
+        page_ordinal: 0,
     })
     .expect("state value");
-    (key, value)
-}
-
-fn blob_ref_state_entry(
-    primary_key: &str,
-    blob_id: crate::binary_cas::BlobId,
-    size_bytes: u64,
-    commit_byte: u8,
-    manifest: ObjectId,
-) -> (Vec<u8>, Vec<u8>) {
-    blob_ref_state_entry_with_declared_id(
-        primary_key,
-        primary_key,
-        blob_id,
-        size_bytes,
-        commit_byte,
-        manifest,
-    )
-}
-
-fn blob_ref_state_entry_with_declared_id(
-    primary_key: &str,
-    declared_id: &str,
-    blob_id: crate::binary_cas::BlobId,
-    size_bytes: u64,
-    commit_byte: u8,
-    manifest: ObjectId,
-) -> (Vec<u8>, Vec<u8>) {
-    let entity_pk = EntityPk::uuid_from_canonical(primary_key).expect("canonical blob-ref id");
-    let key = encode_state_key(StateKeyRef {
-        schema_key: "lix_binary_blob_ref",
-        file_id: Some(primary_key),
-        entity_pk: &entity_pk,
-    });
-    let semantic_value = serde_json::json!({
-        "id": declared_id,
-        "blob_hash": blob_id.to_hex(),
-        "size_bytes": size_bytes,
-    })
-    .to_string();
-    let value = encode_state_value(StateValueRef {
-        change_id: public_change_id(commit_byte.wrapping_add(1)),
-        commit_id: public_commit_id(commit_byte),
-        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
-        cell: StateCellRef::Value(&semantic_value),
-        metadata: None,
-        origin_key: None,
-        blob_manifest_object_ids: &[manifest],
-    })
-    .expect("blob-ref state value");
     (key, value)
 }
 
@@ -503,15 +583,26 @@ struct SeedData {
 fn build_seed() -> SeedData {
     let branch_id = CanonicalBranchId::from_bytes(raw_id(0x11));
     let commit_id = CommitId::from_bytes(raw_id(0x20));
-    let semantic_change_id = ChangeId::from_bytes(raw_id(0x30));
     let ref_change_id = ChangeId::from_bytes(raw_id(0x31));
     let mut objects = ImmutableObjectSet::default();
 
-    let mut global_rows = vec![
-        state_entry("a", StateCellRef::Value("global-a"), 0x20, &[]),
-        state_entry("b", StateCellRef::Value("global-b"), 0x20, &[]),
-        state_entry("c", StateCellRef::Null, 0x20, &[]),
-    ];
+    let (all_rows, members, member_page_objects) = encode_test_state_entries(
+        0x20,
+        vec![
+            test_state_member("a", StateCellRef::Value("global-a"), 0x20, &[], true),
+            test_state_member("b", StateCellRef::Value("global-b"), 0x20, &[], true),
+            test_state_member("c", StateCellRef::Null, 0x20, &[], true),
+            test_state_member("a", StateCellRef::Value("local-a"), 0x20, &[], false),
+            test_state_member("b", StateCellRef::Tombstone, 0x20, &[], false),
+            test_state_member("d", StateCellRef::Null, 0x20, &[], false),
+        ],
+    );
+    let semantic_change_id = members[0].change_id();
+    let semantic_change_object_id = member_page_objects[0].0;
+    for (id, bytes) in member_page_objects {
+        objects.insert(id, bytes).expect("commit change page");
+    }
+    let mut global_rows = all_rows[..3].to_vec();
     global_rows.sort_by(|left, right| left.0.cmp(&right.0));
     let state_keys = global_rows.iter().map(|row| row.0.clone()).collect();
     let global_state = build_state_tree(&global_rows).expect("global state");
@@ -520,11 +611,7 @@ fn build_seed() -> SeedData {
         .extend(global_state.objects)
         .expect("global objects");
 
-    let mut local_rows = vec![
-        state_entry("a", StateCellRef::Value("local-a"), 0x20, &[]),
-        state_entry("b", StateCellRef::Tombstone, 0x20, &[]),
-        state_entry("d", StateCellRef::Null, 0x20, &[]),
-    ];
+    let mut local_rows = all_rows[3..].to_vec();
     local_rows.sort_by(|left, right| left.0.cmp(&right.0));
     let local_state = build_state_tree(&local_rows).expect("local state");
     let local_state_root = local_state.root.object_id;
@@ -535,22 +622,17 @@ fn build_seed() -> SeedData {
         .extend(retention.objects)
         .expect("retention objects");
 
-    let semantic_change = ChangeObjectV1::Semantic {
-        change_id: semantic_change_id,
-        payload: b"semantic-change".to_vec(),
-        json_payload_object_ids: Vec::new(),
-    };
-    let (semantic_change_object_id, semantic_change_bytes) =
-        semantic_change.encode().expect("semantic change");
-    objects
-        .insert(semantic_change_object_id, semantic_change_bytes)
-        .expect("semantic object");
     let commit = CommitObjectV1 {
         commit_id,
         generation: 1,
         parent_commit_object_ids: Vec::new(),
-        members: vec![CommitMemberV1::introduced(semantic_change_object_id)],
-        member_page_root: None,
+        member_page_object_ids: CommitChangePageV2::encode_pages(commit_id, &members)
+            .expect("seed member pages")
+            .objects
+            .iter()
+            .map(|(id, _)| *id)
+            .collect(),
+        members: members.clone(),
         global_state_root,
         local_state_root,
         metadata: b"commit".to_vec(),
@@ -580,29 +662,32 @@ fn build_seed() -> SeedData {
     objects
         .extend(commit_catalog.objects)
         .expect("commit catalog objects");
-    let change_catalog = build_change_catalog(&[
-        (
-            semantic_change_id,
-            ChangeCatalogEntry {
-                change_object_id: semantic_change_object_id,
-                owner: ChangeCatalogOwner::CommitMember {
-                    commit_object_id,
-                    ordinal: 0,
+    let mut change_entries = members
+        .iter()
+        .enumerate()
+        .map(|(ordinal, member)| {
+            (
+                member.change_id(),
+                ChangeCatalogEntry {
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: u32::try_from(ordinal).expect("seed member ordinal"),
+                    },
                 },
+            )
+        })
+        .collect::<Vec<_>>();
+    change_entries.push((
+        ref_change_id,
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id,
+                branch_id,
             },
-        ),
-        (
-            ref_change_id,
-            ChangeCatalogEntry {
-                change_object_id: ref_change_object_id,
-                owner: ChangeCatalogOwner::BranchRef {
-                    ref_change_object_id,
-                    branch_id,
-                },
-            },
-        ),
-    ])
-    .expect("change catalog");
+        },
+    ));
+    change_entries.sort_by_key(|(id, _)| *id.as_bytes());
+    let change_catalog = build_change_catalog(&change_entries).expect("change catalog");
     let change_catalog_root = change_catalog.root.object_id;
     objects
         .extend(change_catalog.objects)
@@ -630,10 +715,8 @@ fn build_seed() -> SeedData {
     objects
         .insert(branch_snapshot_id, branch_snapshot_bytes)
         .expect("branch snapshot object");
-    let orphan = ChangeObjectV1::Semantic {
-        change_id: ChangeId::from_bytes(raw_id(0xee)),
-        payload: b"unreachable".to_vec(),
-        json_payload_object_ids: Vec::new(),
+    let orphan = BlobChunkV1 {
+        bytes: Bytes::from_static(b"unreachable"),
     };
     let (orphan_object_id, orphan_object_bytes) = orphan.encode().expect("orphan");
     objects
@@ -675,12 +758,16 @@ fn replace_selected_history_graph(
     semantic_head_commit_object_id: ObjectId,
     latest_ref_change_object_id: ObjectId,
 ) {
-    let commit_catalog = build_commit_catalog(commits).expect("replacement commit catalog");
+    let mut commits = commits.to_vec();
+    commits.sort_by_key(|(id, _)| *id.as_bytes());
+    let commit_catalog = build_commit_catalog(&commits).expect("replacement commit catalog");
     let commit_catalog_root = commit_catalog.root.object_id;
     seed.objects
         .extend(commit_catalog.objects)
         .expect("replacement commit catalog objects");
-    let change_catalog = build_change_catalog(changes).expect("replacement change catalog");
+    let mut changes = changes.to_vec();
+    changes.sort_by_key(|(id, _)| *id.as_bytes());
+    let change_catalog = build_change_catalog(&changes).expect("replacement change catalog");
     let change_catalog_root = change_catalog.root.object_id;
     seed.objects
         .extend(change_catalog.objects)
@@ -763,6 +850,53 @@ fn load_from(
     }
 }
 
+fn seed_commit_members(seed: &SeedData) -> Vec<CommitMemberV1> {
+    let commit = CommitObjectV1::decode(
+        seed.commit_object_id,
+        seed.objects
+            .get(seed.commit_object_id)
+            .expect("seed commit"),
+    )
+    .expect("decode seed commit");
+    commit
+        .load_members_with(load_from(&seed.objects))
+        .expect("load seed members")
+}
+
+fn seed_member_catalog_entries(
+    seed: &SeedData,
+    commit_object_id: ObjectId,
+) -> Vec<(ChangeId, ChangeCatalogEntry)> {
+    seed_commit_members(seed)
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, member)| {
+            (
+                member.change_id(),
+                ChangeCatalogEntry {
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: u32::try_from(ordinal).expect("seed member ordinal"),
+                    },
+                },
+            )
+        })
+        .collect()
+}
+
+fn insert_test_change_pages(
+    objects: &mut ImmutableObjectSet,
+    commit_id: CommitId,
+    members: &[CommitMemberV1],
+) -> Vec<ObjectId> {
+    let pages = CommitChangePageV2::encode_pages(commit_id, members).expect("test change pages");
+    let ids = pages.objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    for (id, bytes) in pages.objects {
+        objects.insert(id, bytes).expect("test change page object");
+    }
+    ids
+}
+
 async fn object_present<S: Storage>(storage: &S, id: ObjectId) -> bool {
     let read = storage
         .begin_read(ReadOptions::default())
@@ -823,12 +957,32 @@ async fn branch_transition<R: StorageAdapterRead>(
     state_edit: super::serving::StateTreeEdit,
     identity: u8,
 ) -> BranchStateTransition {
+    branch_transition_with_members(view, state_edit, identity, Vec::new()).await
+}
+
+async fn branch_transition_with_members<R: StorageAdapterRead>(
+    view: &CoherentView<R>,
+    state_edit: super::serving::StateTreeEdit,
+    identity: u8,
+    members: Vec<CommitMemberV1>,
+) -> BranchStateTransition {
+    let commit_id = CommitId::from_bytes(raw_id(identity));
+    let member_page_object_ids = if members.is_empty() {
+        Vec::new()
+    } else {
+        CommitChangePageV2::encode_pages(commit_id, &members)
+            .expect("transition change pages")
+            .objects
+            .iter()
+            .map(|(id, _)| *id)
+            .collect()
+    };
     let semantic_commit = CommitObjectV1 {
-        commit_id: CommitId::from_bytes(raw_id(identity)),
+        commit_id,
         generation: identity as u64,
         parent_commit_object_ids: vec![view.branch_snapshot().semantic_head_commit_object_id],
-        members: Vec::new(),
-        member_page_root: None,
+        members,
+        member_page_object_ids,
         global_state_root: view.repository_root().global_state_root,
         local_state_root: state_edit.root,
         metadata: vec![identity],
@@ -857,18 +1011,35 @@ async fn branch_transition<R: StorageAdapterRead>(
     )
     .await
     .expect("commit catalog edit");
+    let mut change_entries = semantic_commit
+        .members
+        .iter()
+        .enumerate()
+        .map(|(ordinal, member)| {
+            (
+                member.change_id(),
+                ChangeCatalogEntry {
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: u32::try_from(ordinal).expect("transition member ordinal"),
+                    },
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    change_entries.push((
+        ref_change.change_id(),
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_object_id,
+                branch_id: view.branch_id(),
+            },
+        },
+    ));
+    change_entries.sort_by_key(|(id, _)| *id.as_bytes());
     let change_catalog_edit = put_change_catalog_entries(
         view.repository_root().change_catalog_root,
-        &[(
-            ref_change.change_id(),
-            ChangeCatalogEntry {
-                change_object_id: ref_object_id,
-                owner: ChangeCatalogOwner::BranchRef {
-                    ref_change_object_id: ref_object_id,
-                    branch_id: view.branch_id(),
-                },
-            },
-        )],
+        &change_entries,
         view.test_storage_read(),
     )
     .await
@@ -908,22 +1079,20 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
     assert!(RepositoryRootV1::decode(seed.repository_root_id, &corrupted).is_err());
     assert!(BranchSnapshotV1::decode(seed.repository_root_id, encoded).is_err());
 
-    for cell in [
-        StateCellRef::Value("value"),
-        StateCellRef::Null,
-        StateCellRef::Tombstone,
-    ] {
-        let (_, encoded) = state_entry("typed", cell, 7, &[]);
-        let decoded: super::StateValue = super::decode_state_value(&encoded).expect("typed state");
-        assert_eq!(
-            decoded.cell.deleted(),
-            matches!(cell, StateCellRef::Tombstone)
-        );
-    }
+    let page_object_id = content_id(7);
+    let encoded = encode_state_value(StateValueRef {
+        page_object_id,
+        page_ordinal: 3,
+    })
+    .expect("typed state");
+    let decoded = super::decode_state_value(&encoded).expect("typed state");
+    assert_eq!(decoded.page_object_id, page_object_id);
+    assert_eq!(decoded.page_ordinal, 3);
     let (key, _) = state_entry("typed-key", StateCellRef::Null, 7, &[]);
     let decoded_key: StateKey = super::decode_state_key(&key).expect("typed key");
     assert_eq!(decoded_key.schema_key, "app.row");
-    assert!(super::encode_state_prefix("app.row", Some("file")).len() < key.len());
+    let entity_pk = EntityPk::single("typed-key");
+    assert!(super::encode_state_entity_prefix("app.row", &entity_pk).len() < key.len());
     assert!(build_state_tree(&[(b"opaque".to_vec(), b"opaque".to_vec())]).is_err());
 }
 
@@ -1090,12 +1259,19 @@ async fn historical_missing_state_root_fails_before_empty_result() {
     let ref_change_id = seed.ref_change_id;
     let ref_change_object_id = seed.ref_change_object_id;
     let branch_id = seed.branch_id;
+    let seed_commit = CommitObjectV1::decode(
+        seed.commit_object_id,
+        seed.objects
+            .get(seed.commit_object_id)
+            .expect("seed commit"),
+    )
+    .expect("decode seed commit");
     let commit = CommitObjectV1 {
         commit_id,
         generation: 1,
         parent_commit_object_ids: Vec::new(),
-        members: vec![CommitMemberV1::introduced(semantic_change_object_id)],
-        member_page_root: None,
+        members: Vec::new(),
+        member_page_object_ids: seed_commit.member_page_object_ids,
         global_state_root: content_id(0xf1),
         local_state_root: seed.local_state_root,
         metadata: b"missing-state-root".to_vec(),
@@ -1108,7 +1284,6 @@ async fn historical_missing_state_root_fails_before_empty_result() {
         (
             semantic_change_id,
             ChangeCatalogEntry {
-                change_object_id: semantic_change_object_id,
                 owner: ChangeCatalogOwner::CommitMember {
                     commit_object_id,
                     ordinal: 0,
@@ -1118,7 +1293,6 @@ async fn historical_missing_state_root_fails_before_empty_result() {
         (
             ref_change_id,
             ChangeCatalogEntry {
-                change_object_id: ref_change_object_id,
                 owner: ChangeCatalogOwner::BranchRef {
                     ref_change_object_id,
                     branch_id,
@@ -1172,18 +1346,23 @@ fn catalogs_use_one_raw_uuid_tree_and_fail_closed_on_owner_mismatch() {
     let entry = CommitCatalogEntry::decode(&value).expect("entry");
     validate_commit_catalog_back_edge(seed.commit_id, entry, &load).expect("back edge");
     let rows = scan_all(repository.change_catalog_root, "change", &load).expect("scan");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0, seed.semantic_change_id.as_bytes());
-    assert_eq!(rows[1].0, seed.ref_change_id.as_bytes());
+    assert_eq!(rows.len(), 7);
+    assert!(
+        rows.iter()
+            .any(|row| row.0 == seed.semantic_change_id.as_bytes())
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.0 == seed.ref_change_id.as_bytes())
+    );
     let bad = ChangeCatalogEntry {
-        change_object_id: seed.semantic_change_object_id,
         owner: ChangeCatalogOwner::CommitMember {
             commit_object_id: seed.commit_object_id,
             ordinal: 9,
         },
     };
     assert!(validate_change_catalog_back_edge(seed.semantic_change_id, bad, &load).is_err());
-    let semantic = ChangeObjectV1::decode(
+    let semantic = CommitChangePageV2::decode(
         seed.semantic_change_object_id,
         seed.objects
             .get(seed.semantic_change_object_id)
@@ -1650,7 +1829,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         generation: 1,
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
-        member_page_root: None,
+        member_page_object_ids: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"grandparent".to_vec(),
@@ -1659,12 +1838,16 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
     seed.objects
         .insert(grandparent_object_id, grandparent_bytes)
         .expect("grandparent object");
+    let parent_commit_id = CommitId::from_bytes(raw_id(0x51));
+    let parent_members = vec![seed_commit_members(&seed)[0].clone()];
+    let parent_page_ids =
+        insert_test_change_pages(&mut seed.objects, parent_commit_id, &parent_members);
     let parent = CommitObjectV1 {
-        commit_id: CommitId::from_bytes(raw_id(0x51)),
+        commit_id: parent_commit_id,
         generation: 2,
         parent_commit_object_ids: vec![grandparent_object_id],
-        members: vec![CommitMemberV1::introduced(seed.semantic_change_object_id)],
-        member_page_root: None,
+        members: parent_members,
+        member_page_object_ids: parent_page_ids,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"shared-parent".to_vec(),
@@ -1678,7 +1861,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         generation: 3,
         parent_commit_object_ids: vec![parent_object_id],
         members: Vec::new(),
-        member_page_root: None,
+        member_page_object_ids: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"child-a".to_vec(),
@@ -1692,7 +1875,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         generation: 3,
         parent_commit_object_ids: vec![parent_object_id],
         members: Vec::new(),
-        member_page_root: None,
+        member_page_object_ids: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"child-b".to_vec(),
@@ -1717,7 +1900,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         .expect("creation ref object");
     let branch_id = seed.branch_id;
     let semantic_change_id = seed.semantic_change_id;
-    let semantic_change_object_id = seed.semantic_change_object_id;
+    let semantic_change_object_id = parent.member_page_object_ids[0];
     replace_selected_history_graph(
         &mut seed,
         &[
@@ -1750,7 +1933,6 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
             (
                 semantic_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: semantic_change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id: parent_object_id,
                         ordinal: 0,
@@ -1760,7 +1942,6 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
             (
                 creation.change_id(),
                 ChangeCatalogEntry {
-                    change_object_id: creation_object_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id: creation_object_id,
                         branch_id,
@@ -1786,7 +1967,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         ),
         parent_object: parent_object_id,
         grandparent_object: grandparent_object_id,
-        member_object: seed.semantic_change_object_id,
+        member_object: semantic_change_object_id,
         parent_object_reads: Arc::clone(&parent_object_reads),
         grandparent_object_reads: Arc::clone(&grandparent_object_reads),
         member_object_reads: Arc::clone(&member_object_reads),
@@ -1819,10 +2000,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
     drop(graph);
 
     let mut writes = StorageWriteSet::new();
-    writes.delete(
-        OBJECT_SPACE,
-        seed.semantic_change_object_id.as_bytes().to_vec(),
-    );
+    writes.delete(OBJECT_SPACE, semantic_change_object_id.as_bytes().to_vec());
     commit_write_set_for_test(writes, &storage).await;
 
     let read = StorageAdapterReadScope::new(
@@ -1862,11 +2040,10 @@ async fn coherent_open_defers_ref_target_authentication_until_visited() {
     seed.objects
         .insert(bad_ref_id, bad_ref_bytes)
         .expect("bad ref object");
-    let catalog = build_change_catalog(&[
+    let mut catalog_entries = vec![
         (
             seed.semantic_change_id,
             ChangeCatalogEntry {
-                change_object_id: seed.semantic_change_object_id,
                 owner: ChangeCatalogOwner::CommitMember {
                     commit_object_id: seed.commit_object_id,
                     ordinal: 0,
@@ -1876,7 +2053,6 @@ async fn coherent_open_defers_ref_target_authentication_until_visited() {
         (
             seed.ref_change_id,
             ChangeCatalogEntry {
-                change_object_id: seed.ref_change_object_id,
                 owner: ChangeCatalogOwner::BranchRef {
                     ref_change_object_id: seed.ref_change_object_id,
                     branch_id: seed.branch_id,
@@ -1886,15 +2062,15 @@ async fn coherent_open_defers_ref_target_authentication_until_visited() {
         (
             bad_ref.change_id(),
             ChangeCatalogEntry {
-                change_object_id: bad_ref_id,
                 owner: ChangeCatalogOwner::BranchRef {
                     ref_change_object_id: bad_ref_id,
                     branch_id: seed.branch_id,
                 },
             },
         ),
-    ])
-    .expect("bad catalog");
+    ];
+    catalog_entries.sort_by_key(|(id, _)| *id.as_bytes());
+    let catalog = build_change_catalog(&catalog_entries).expect("bad catalog");
     let change_catalog_root = catalog.root.object_id;
     seed.objects
         .extend(catalog.objects)
@@ -1955,7 +2131,6 @@ async fn coherent_open_requires_latest_ref_change_catalog_owner() {
         &[(
             semantic_change_id,
             ChangeCatalogEntry {
-                change_object_id: semantic_change_object_id,
                 owner: ChangeCatalogOwner::CommitMember {
                     commit_object_id,
                     ordinal: 0,
@@ -2003,7 +2178,6 @@ async fn coherent_open_requires_latest_ref_change_catalog_owner() {
             (
                 semantic_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: semantic_change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
                         ordinal: 0,
@@ -2013,7 +2187,6 @@ async fn coherent_open_requires_latest_ref_change_catalog_owner() {
             (
                 ref_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: alternate_ref_object_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id: alternate_ref_object_id,
                         branch_id,
@@ -2046,7 +2219,6 @@ async fn coherent_open_requires_latest_ref_change_catalog_owner() {
             (
                 semantic_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: semantic_change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
                         ordinal: 0,
@@ -2056,7 +2228,6 @@ async fn coherent_open_requires_latest_ref_change_catalog_owner() {
             (
                 ref_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: ref_change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
                         ordinal: 0,
@@ -2094,7 +2265,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
             (
                 semantic_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: semantic_change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
                         ordinal: 1,
@@ -2104,7 +2274,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
             (
                 ref_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: ref_change_object_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id,
                         branch_id,
@@ -2128,7 +2297,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         generation: 2,
         parent_commit_object_ids: vec![out_of_uuid_order.commit_object_id],
         members: Vec::new(),
-        member_page_root: None,
+        member_page_object_ids: Vec::new(),
         global_state_root: out_of_uuid_order.global_state_root,
         local_state_root: out_of_uuid_order.local_state_root,
         metadata: b"next branch head".to_vec(),
@@ -2156,11 +2325,28 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         .expect("next branch ref object");
     let seed_commit_id = out_of_uuid_order.commit_id;
     let seed_commit_object_id = out_of_uuid_order.commit_object_id;
-    let seed_semantic_change_id = out_of_uuid_order.semantic_change_id;
-    let seed_semantic_change_object_id = out_of_uuid_order.semantic_change_object_id;
     let seed_ref_change_id = out_of_uuid_order.ref_change_id;
     let seed_ref_change_object_id = out_of_uuid_order.ref_change_object_id;
     let seed_branch_id = out_of_uuid_order.branch_id;
+    let mut valid_changes = seed_member_catalog_entries(&out_of_uuid_order, seed_commit_object_id);
+    valid_changes.push((
+        next_ref.change_id(),
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: next_ref_object_id,
+                branch_id: seed_branch_id,
+            },
+        },
+    ));
+    valid_changes.push((
+        seed_ref_change_id,
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: seed_ref_change_object_id,
+                branch_id: seed_branch_id,
+            },
+        },
+    ));
     let storage = Memory::new();
     replace_selected_history_graph(
         &mut out_of_uuid_order,
@@ -2178,38 +2364,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
                 },
             ),
         ],
-        &[
-            (
-                next_ref.change_id(),
-                ChangeCatalogEntry {
-                    change_object_id: next_ref_object_id,
-                    owner: ChangeCatalogOwner::BranchRef {
-                        ref_change_object_id: next_ref_object_id,
-                        branch_id: seed_branch_id,
-                    },
-                },
-            ),
-            (
-                seed_semantic_change_id,
-                ChangeCatalogEntry {
-                    change_object_id: seed_semantic_change_object_id,
-                    owner: ChangeCatalogOwner::CommitMember {
-                        commit_object_id: seed_commit_object_id,
-                        ordinal: 0,
-                    },
-                },
-            ),
-            (
-                seed_ref_change_id,
-                ChangeCatalogEntry {
-                    change_object_id: seed_ref_change_object_id,
-                    owner: ChangeCatalogOwner::BranchRef {
-                        ref_change_object_id: seed_ref_change_object_id,
-                        branch_id: seed_branch_id,
-                    },
-                },
-            ),
-        ],
+        &valid_changes,
         next_commit_object_id,
         next_ref_object_id,
     );
@@ -2250,7 +2405,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
             (
                 semantic_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: semantic_change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
                         ordinal: 0,
@@ -2260,7 +2414,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
             (
                 ref_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: ref_change_object_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id,
                         branch_id,
@@ -2270,7 +2423,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
             (
                 latest.change_id(),
                 ChangeCatalogEntry {
-                    change_object_id: latest_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id: latest_id,
                         branch_id,
@@ -2292,7 +2444,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         generation: 2,
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
-        member_page_root: None,
+        member_page_object_ids: Vec::new(),
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
         metadata: b"parent".to_vec(),
@@ -2302,14 +2454,16 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         .objects
         .insert(parent_id, parent_bytes)
         .expect("parent object");
+    let child_commit_id = CommitId::from_bytes(raw_id(0x42));
+    let child_members = vec![seed_commit_members(&bad_generation)[0].clone()];
+    let child_page_ids =
+        insert_test_change_pages(&mut bad_generation.objects, child_commit_id, &child_members);
     let child = CommitObjectV1 {
-        commit_id: CommitId::from_bytes(raw_id(0x42)),
+        commit_id: child_commit_id,
         generation: 2,
         parent_commit_object_ids: vec![parent_id],
-        members: vec![CommitMemberV1::introduced(
-            bad_generation.semantic_change_object_id,
-        )],
-        member_page_root: None,
+        members: child_members,
+        member_page_object_ids: child_page_ids,
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
         metadata: b"child".to_vec(),
@@ -2335,7 +2489,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         .insert(creation_id, creation_bytes)
         .expect("creation ref object");
     let semantic_change_id = bad_generation.semantic_change_id;
-    let semantic_change_object_id = bad_generation.semantic_change_object_id;
     let branch_id = bad_generation.branch_id;
     replace_selected_history_graph(
         &mut bad_generation,
@@ -2357,7 +2510,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
             (
                 semantic_change_id,
                 ChangeCatalogEntry {
-                    change_object_id: semantic_change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id: child_id,
                         ordinal: 0,
@@ -2367,7 +2519,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
             (
                 creation.change_id(),
                 ChangeCatalogEntry {
-                    change_object_id: creation_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id: creation_id,
                         branch_id,
@@ -3046,7 +3197,15 @@ async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
     let (key, value) = state_entry("wrong-commit", StateCellRef::Value("value"), 0x73, &[]);
     let wrong_commit = edit_state_tree(
         view.branch_snapshot().local_state_root,
-        vec![StateTreeMutation::insert(key, value)],
+        vec![StateTreeMutation::insert_bound(
+            key,
+            value,
+            StateMutationAudit {
+                commit_id: raw_id(0x73),
+                tombstone: false,
+                blob_manifest_object_ids: Vec::new(),
+            },
+        )],
         view.test_storage_read(),
     )
     .await
@@ -3201,32 +3360,13 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         .0;
     let (manifest_id, _) = manifest.encode().expect("manifest");
     let blob_id = manifest.canonical_blob_id;
-    let (key, value) = blob_ref_state_entry(
-        "01920000-0000-7000-8000-0000000000a1",
-        blob_id,
-        4,
-        0x70,
-        manifest_id,
-    );
+    let key_id = "01920000-0000-7000-8000-0000000000a1";
     let wrong_owner_value = serde_json::json!({
         "id": "not-blob",
         "blob_hash": blob_id.to_hex(),
         "size_bytes": 4,
     })
     .to_string();
-    let (wrong_owner_key, wrong_owner) = state_entry(
-        "not-blob",
-        StateCellRef::Value(&wrong_owner_value),
-        0x70,
-        &[manifest_id],
-    );
-    let (mismatched_owner_key, mismatched_owner) = blob_ref_state_entry(
-        "01920000-0000-7000-8000-0000000000a2",
-        blob_id,
-        5,
-        0x70,
-        manifest_id,
-    );
 
     // A valid multi-chunk manifest must not be transplantable beneath a
     // same-size state owner carrying another public BlobId. The manifest's
@@ -3262,34 +3402,82 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     let (transplanted_manifest_id, _) = transplanted_manifest
         .encode()
         .expect("transplanted manifest");
-    let (transplanted_owner_key, transplanted_owner) = blob_ref_state_entry(
-        "01920000-0000-7000-8000-0000000000a3",
-        owner_blob_id,
-        owner_payload.len() as u64,
-        0x70,
-        transplanted_manifest_id,
-    );
-    let (valid_multichunk_key, valid_multichunk_owner) = blob_ref_state_entry(
-        "01920000-0000-7000-8000-0000000000a4",
-        transplanted_blob_id,
-        transplanted_payload.len() as u64,
-        0x70,
-        transplanted_manifest_id,
-    );
+    let test_entries = vec![
+        test_state_member(
+            "not-blob",
+            StateCellRef::Value(&wrong_owner_value),
+            0x70,
+            &[manifest_id],
+            false,
+        ),
+        test_blob_ref_member(key_id, key_id, blob_id, 4, 0x70, manifest_id),
+        test_blob_ref_member(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a2",
+            blob_id,
+            5,
+            0x70,
+            manifest_id,
+        ),
+        test_blob_ref_member(
+            "01920000-0000-7000-8000-0000000000a3",
+            "01920000-0000-7000-8000-0000000000a3",
+            owner_blob_id,
+            owner_payload.len() as u64,
+            0x70,
+            transplanted_manifest_id,
+        ),
+        test_blob_ref_member(
+            "01920000-0000-7000-8000-0000000000a4",
+            "01920000-0000-7000-8000-0000000000a4",
+            transplanted_blob_id,
+            transplanted_payload.len() as u64,
+            0x70,
+            transplanted_manifest_id,
+        ),
+    ];
+    let (rows, members, _) = encode_test_state_entries(0x70, test_entries);
+    let [
+        wrong_owner_row,
+        selected_row,
+        mismatched_row,
+        transplanted_row,
+        valid_multichunk_row,
+    ]: [(Vec<u8>, Vec<u8>); 5] = rows.try_into().expect("five state rows");
+    let wrong_owner_key = wrong_owner_row.0.clone();
+    let key = selected_row.0.clone();
+    let mismatched_owner_key = mismatched_row.0.clone();
+    let transplanted_owner_key = transplanted_row.0.clone();
+    let valid_multichunk_key = valid_multichunk_row.0.clone();
+    let bound_insert = |row: (Vec<u8>, Vec<u8>), member: &CommitMemberV1| {
+        StateTreeMutation::insert_bound(
+            row.0,
+            row.1,
+            StateMutationAudit {
+                commit_id: raw_id(0x70),
+                tombstone: false,
+                blob_manifest_object_ids: member
+                    .introduced_payload()
+                    .expect("introduced test member")
+                    .3
+                    .to_vec(),
+            },
+        )
+    };
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![
-            StateTreeMutation::insert(wrong_owner_key.clone(), wrong_owner),
-            StateTreeMutation::insert(key.clone(), value),
-            StateTreeMutation::insert(mismatched_owner_key.clone(), mismatched_owner),
-            StateTreeMutation::insert(transplanted_owner_key.clone(), transplanted_owner),
-            StateTreeMutation::insert(valid_multichunk_key.clone(), valid_multichunk_owner),
+            bound_insert(wrong_owner_row, &members[0]),
+            bound_insert(selected_row, &members[1]),
+            bound_insert(mismatched_row, &members[2]),
+            bound_insert(transplanted_row, &members[3]),
+            bound_insert(valid_multichunk_row, &members[4]),
         ],
         view.test_storage_read(),
     )
     .await
     .expect("state edit");
-    let transition = branch_transition(&view, state_edit, 0x70).await;
+    let transition = branch_transition_with_members(&view, state_edit, 0x70, members).await;
     let mut publish = PreparedPublication::from_branch_view(&view).expect("completion publication");
     publish
         .stage_blob_merkle_build_for_test(&transplanted_build)
@@ -3471,33 +3659,57 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     // Merkle leaf/chunk bytes.
     let (valid_manifest_id, _) = valid_manifest.encode().expect("valid duplicate manifest");
     let (wrong_manifest_id, _) = wrong_manifest.encode().expect("wrong duplicate manifest");
-    let (wrong_key, wrong_value) = blob_ref_state_entry(
-        "01920000-0000-7000-8000-0000000000b1",
-        semantic_id,
-        valid_payload.len() as u64,
-        0x70,
-        wrong_manifest_id,
-    );
-    let (valid_key, valid_value) = blob_ref_state_entry(
-        "01920000-0000-7000-8000-0000000000b2",
-        semantic_id,
-        valid_payload.len() as u64,
-        0x70,
-        valid_manifest_id,
-    );
-    let (wrong_identity_key, wrong_identity_value) = blob_ref_state_entry_with_declared_id(
-        "01920000-0000-7000-8000-0000000000b3",
-        "01920000-0000-7000-8000-0000000000b2",
-        semantic_id,
-        valid_payload.len() as u64,
-        0x70,
-        valid_manifest_id,
-    );
-    let mut mutations = vec![
-        StateTreeMutation::insert(wrong_key, wrong_value),
-        StateTreeMutation::insert(valid_key.clone(), valid_value),
-        StateTreeMutation::insert(wrong_identity_key.clone(), wrong_identity_value),
+    let wrong_id = "01920000-0000-7000-8000-0000000000b1";
+    let valid_id = "01920000-0000-7000-8000-0000000000b2";
+    let wrong_identity_id = "01920000-0000-7000-8000-0000000000b3";
+    let entries = vec![
+        test_blob_ref_member(
+            wrong_id,
+            wrong_id,
+            semantic_id,
+            valid_payload.len() as u64,
+            0x70,
+            wrong_manifest_id,
+        ),
+        test_blob_ref_member(
+            valid_id,
+            valid_id,
+            semantic_id,
+            valid_payload.len() as u64,
+            0x70,
+            valid_manifest_id,
+        ),
+        test_blob_ref_member(
+            wrong_identity_id,
+            valid_id,
+            semantic_id,
+            valid_payload.len() as u64,
+            0x70,
+            valid_manifest_id,
+        ),
     ];
+    let (rows, members, _) = encode_test_state_entries(0x70, entries);
+    let valid_key = rows[1].0.clone();
+    let wrong_identity_key = rows[2].0.clone();
+    let mut mutations = rows
+        .into_iter()
+        .zip(&members)
+        .map(|(row, member)| {
+            StateTreeMutation::insert_bound(
+                row.0,
+                row.1,
+                StateMutationAudit {
+                    commit_id: raw_id(0x70),
+                    tombstone: false,
+                    blob_manifest_object_ids: member
+                        .introduced_payload()
+                        .expect("introduced test member")
+                        .3
+                        .to_vec(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     mutations.sort_by(|left, right| {
         let left_key: &[u8] = match left {
             StateTreeMutation::Insert { key, .. }
@@ -3518,7 +3730,7 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     )
     .await
     .expect("duplicate-owner state edit");
-    let transition = branch_transition(&view, state_edit, 0x70).await;
+    let transition = branch_transition_with_members(&view, state_edit, 0x70, members).await;
     let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
     publication
         .stage_blob_merkle_build_for_test(&valid_build)
@@ -3662,39 +3874,27 @@ async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBr
     seed.objects
         .insert(disposable_ref_object_id, disposable_ref_bytes)
         .expect("disposable ref object");
-    let catalog = build_change_catalog(&[
-        (
-            seed.semantic_change_id,
-            ChangeCatalogEntry {
-                change_object_id: seed.semantic_change_object_id,
-                owner: ChangeCatalogOwner::CommitMember {
-                    commit_object_id: seed.commit_object_id,
-                    ordinal: 0,
-                },
+    let mut catalog_entries = seed_member_catalog_entries(&seed, seed.commit_object_id);
+    catalog_entries.push((
+        seed.ref_change_id,
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: seed.ref_change_object_id,
+                branch_id: seed.branch_id,
             },
-        ),
-        (
-            seed.ref_change_id,
-            ChangeCatalogEntry {
-                change_object_id: seed.ref_change_object_id,
-                owner: ChangeCatalogOwner::BranchRef {
-                    ref_change_object_id: seed.ref_change_object_id,
-                    branch_id: seed.branch_id,
-                },
+        },
+    ));
+    catalog_entries.push((
+        disposable_ref_id,
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: disposable_ref_object_id,
+                branch_id: disposable,
             },
-        ),
-        (
-            disposable_ref_id,
-            ChangeCatalogEntry {
-                change_object_id: disposable_ref_object_id,
-                owner: ChangeCatalogOwner::BranchRef {
-                    ref_change_object_id: disposable_ref_object_id,
-                    branch_id: disposable,
-                },
-            },
-        ),
-    ])
-    .expect("disposable catalog");
+        },
+    ));
+    catalog_entries.sort_by_key(|(id, _)| *id.as_bytes());
+    let catalog = build_change_catalog(&catalog_entries).expect("disposable catalog");
     let change_catalog_root = catalog.root.object_id;
     seed.objects
         .extend(catalog.objects)
@@ -3779,20 +3979,35 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
         .expect("authenticated checkpoint manifest")
         .0;
     let (manifest_id, _) = manifest.encode().expect("manifest");
-    let (key, value) = state_entry(
+    let entry = test_state_member(
         "disposable-blob",
         StateCellRef::Value("blob"),
         0x80,
         &[manifest_id],
+        false,
     );
+    let (rows, members, _) = encode_test_state_entries(0x80, vec![entry]);
+    let (key, value) = rows.into_iter().next().expect("state row");
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
-        vec![StateTreeMutation::insert(key, value)],
+        vec![StateTreeMutation::insert_bound(
+            key,
+            value,
+            StateMutationAudit {
+                commit_id: raw_id(0x80),
+                tombstone: false,
+                blob_manifest_object_ids: vec![manifest_id],
+            },
+        )],
         view.test_storage_read(),
     )
     .await
     .expect("state edit");
-    let transition = branch_transition(&view, state_edit, 0x80).await;
+    let semantic_change_ids = members
+        .iter()
+        .map(CommitMemberV1::change_id)
+        .collect::<Vec<_>>();
+    let transition = branch_transition_with_members(&view, state_edit, 0x80, members).await;
     let mut complete = PreparedPublication::from_branch_view(&view).expect("complete");
     complete
         .publish_completed_upload(&view, completion, transition)
@@ -3851,6 +4066,22 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     commit_publication_for_test(retire, &storage)
         .await
         .expect("retire commit");
+    let retained_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("retained catalog view");
+    assert!(
+        load_commit(&retained_view, CommitId::from_bytes(raw_id(0x20)))
+            .await
+            .expect("seed commit catalog lookup")
+            .is_some()
+    );
+    assert!(
+        load_commit(&retained_view, CommitId::from_bytes(raw_id(0x80)))
+            .await
+            .expect("checkpoint commit catalog lookup")
+            .is_some()
+    );
+    drop(retained_view);
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, manifest_id).await);
     assert!(object_present(&storage, upload.chunk_id).await);
@@ -3883,9 +4114,12 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     )
     .await
     .expect("final commit retirement");
+    let mut retired_change_ids = semantic_change_ids;
+    retired_change_ids.extend([initial_ref_id, ChangeId::from_bytes(raw_id(0x81))]);
+    retired_change_ids.sort_by_key(|id| *id.as_bytes());
     let change_catalog_edit = retire_change_catalog_entries(
         view.repository_root().change_catalog_root,
-        &[initial_ref_id, ChangeId::from_bytes(raw_id(0x81))],
+        &retired_change_ids,
         view.test_storage_read(),
     )
     .await
@@ -4196,7 +4430,6 @@ fn object_and_catalog_encodings_are_canonical() {
     );
     assert_eq!(
         ChangeCatalogEntry {
-            change_object_id: content_id(2),
             owner: ChangeCatalogOwner::CommitMember {
                 commit_object_id: content_id(3),
                 ordinal: 7,
@@ -4205,7 +4438,7 @@ fn object_and_catalog_encodings_are_canonical() {
         .encode()
         .expect("change entry")
         .len(),
-        69
+        37
     );
 }
 
@@ -4243,21 +4476,30 @@ fn seed_provenance_and_ref_edge_are_not_aliased() {
 
 #[test]
 fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
+    fn page_member(index: usize) -> CommitMemberV1 {
+        let mut change_raw = [0_u8; 16];
+        change_raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        change_raw[15] = 1;
+        let mut edge_raw = [0_u8; 32];
+        edge_raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        edge_raw[31] = 2;
+        CommitMemberV1::introduced(
+            ChangeId::from_bytes(change_raw),
+            vec![b'x'],
+            false,
+            LixTimestamp::from_unix_millis_utc_lossy(1),
+            vec![ObjectId::from_bytes(edge_raw)],
+        )
+    }
+
     for count in [255usize, 256, 257, 1002] {
-        let members = (0..count)
-            .map(|index| {
-                let mut raw = [0u8; 32];
-                raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-                raw[31] = 1;
-                CommitMemberV1::introduced(ObjectId::from_bytes(raw))
-            })
-            .collect::<Vec<_>>();
+        let members = (0..count).map(page_member).collect::<Vec<_>>();
         let mut commit = CommitObjectV1 {
             commit_id: CommitId::from_bytes(raw_id(0xa1)),
             generation: 1,
             parent_commit_object_ids: Vec::new(),
             members,
-            member_page_root: None,
+            member_page_object_ids: Vec::new(),
             global_state_root: content_id(0x71),
             local_state_root: content_id(0x72),
             metadata: b"page-boundary".to_vec(),
@@ -4266,8 +4508,8 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         assert_eq!(
             pages.len(),
             match count {
-                255 => 1,
-                256 | 257 => 2,
+                255 | 256 => 1,
+                257 => 2,
                 1002 => 4,
                 _ => unreachable!(),
             }
@@ -4290,26 +4532,19 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         assert_eq!(loaded.len(), count);
     }
 
-    let members = (0..255)
-        .map(|index| {
-            let mut raw = [0u8; 32];
-            raw[..8].copy_from_slice(&(index + 1_u64).to_be_bytes());
-            raw[31] = 2;
-            CommitMemberV1::introduced(ObjectId::from_bytes(raw))
-        })
-        .collect::<Vec<_>>();
+    let members = (0..255).map(page_member).collect::<Vec<_>>();
     let mut commit = CommitObjectV1 {
         commit_id: CommitId::from_bytes(raw_id(0xa2)),
         generation: 1,
         parent_commit_object_ids: Vec::new(),
         members,
-        member_page_root: None,
+        member_page_object_ids: Vec::new(),
         global_state_root: content_id(0x73),
         local_state_root: content_id(0x74),
         metadata: b"page-corruption".to_vec(),
     };
     let pages = commit.prepare_member_pages().expect("corruption pages");
-    let root = commit.member_page_root.expect("page root");
+    let root = commit.member_page_object_ids[0];
     let page_map = pages
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -4346,7 +4581,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     );
 
     let mut wrong_ordinal =
-        super::model::CommitMemberPageV1::decode(root, page_map.get(&root).expect("root page"))
+        CommitChangePageV2::decode(root, page_map.get(&root).expect("root page"))
             .expect("valid root page");
     wrong_ordinal.start_ordinal = 1;
     let (wrong_id, wrong_bytes) = wrong_ordinal.encode().expect("wrong ordinal page");
@@ -4354,7 +4589,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     wrong_map.remove(&root);
     wrong_map.insert(wrong_id, wrong_bytes);
     let mut wrong_commit = decoded.clone();
-    wrong_commit.member_page_root = Some(wrong_id);
+    wrong_commit.member_page_object_ids[0] = wrong_id;
     assert!(
         wrong_commit
             .load_members_with(|id| {
@@ -4366,21 +4601,21 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
             .is_err()
     );
 
-    let duplicate = super::model::CommitMemberPageV1 {
+    let duplicate = CommitChangePageV2 {
         commit_id: CommitId::from_bytes(raw_id(0xa3)),
         start_ordinal: 0,
-        members: vec![
-            CommitMemberV1::introduced(content_id(0x81)),
-            CommitMemberV1::introduced(content_id(0x81)),
-        ],
-        next_page_object_id: None,
+        members: vec![page_member(0x81), page_member(0x81)],
     };
     assert!(duplicate.encode().is_err());
-    let zero_successor = super::model::CommitMemberPageV1 {
+    let zero_page_edge = CommitObjectV1 {
         commit_id: CommitId::from_bytes(raw_id(0xa4)),
-        start_ordinal: 0,
-        members: vec![CommitMemberV1::introduced(content_id(0x82))],
-        next_page_object_id: Some(ObjectId::ZERO),
+        generation: 1,
+        parent_commit_object_ids: Vec::new(),
+        members: Vec::new(),
+        member_page_object_ids: vec![ObjectId::ZERO],
+        global_state_root: content_id(0x75),
+        local_state_root: content_id(0x76),
+        metadata: b"zero-page-edge".to_vec(),
     };
-    assert!(zero_successor.encode().is_err());
+    assert!(zero_page_edge.encode().is_err());
 }
