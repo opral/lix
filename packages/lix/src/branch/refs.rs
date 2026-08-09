@@ -136,4 +136,25 @@ where
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
         Self::scan_heads(self).await
     }
+
+    async fn scan_head_metadata(&self) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
+        Ok(
+            crate::forktree::load_branch_heads_with_metadata(&self.store, None)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    (
+                        BranchHead {
+                            branch_id: row.branch_id,
+                            commit_id: row.head_commit_id,
+                        },
+                        BranchRefMetadata {
+                            change_id: row.change_id,
+                            updated_at: row.updated_at,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
 }

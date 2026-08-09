@@ -40,4 +40,16 @@ pub(crate) trait BranchRefReader: Send + Sync {
     }
 
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, crate::LixError>;
+
+    /// Returns branch heads and authenticated RefChange metadata from one
+    /// operation-owned batch. ForkTree-backed readers override this method;
+    /// head-only readers do not expose this projection.
+    async fn scan_head_metadata(
+        &self,
+    ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, crate::LixError> {
+        Err(crate::LixError::new(
+            crate::LixError::CODE_STORAGE_ERROR,
+            "authenticated branch metadata batch is unavailable",
+        ))
+    }
 }
