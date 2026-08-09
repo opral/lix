@@ -1487,7 +1487,6 @@ pub(crate) struct LiveStateScanRequest {
 }
 
 /// Point lookup request for one visible live-state row.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LiveStateRowRequest {
     pub(crate) schema_key: String,
