@@ -70,8 +70,7 @@ where
         .load_branch_head(&branch_id)
         .await?
         .ok_or_else(|| LixError::branch_not_found(&branch_id, "undo", "target"))?;
-    let read = transaction.opening_read_for_forktree();
-    let facade = ForkTreeReadFacade::from_read_on_branch(read, &branch_id).await?;
+    let facade = transaction.forktree_read_facade();
     let head_record = load_node(transaction, head).await?;
     let (state, head_delta) =
         semantic_state_for_record(&facade, &branch_id, head, &head_record).await?;
@@ -139,8 +138,7 @@ where
         .load_branch_head(&branch_id)
         .await?
         .ok_or_else(|| LixError::branch_not_found(&branch_id, "redo", "target"))?;
-    let read = transaction.opening_read_for_forktree();
-    let facade = ForkTreeReadFacade::from_read_on_branch(read, &branch_id).await?;
+    let facade = transaction.forktree_read_facade();
     let head_record = load_node(transaction, head).await?;
     let (state, _) = semantic_state_for_record(&facade, &branch_id, head, &head_record).await?;
     let redo_node = state.redo_top.ok_or_else(|| {
