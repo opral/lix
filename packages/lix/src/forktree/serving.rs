@@ -18,13 +18,15 @@ use super::state::{
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
+    rebuild_ordered_insertions, scan_bounded_page_on_read, scan_page_on_read,
+    validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
 const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
 const CATALOG_SCAN_PAGE_ROWS: usize = 1024;
+pub(crate) const CHANGE_CATALOG_BULK_INSERTION_THRESHOLD: usize = 128;
 
 /// Loads a commit's complete authenticated member closure. Small commits keep
 /// the original inline representation; larger commits resolve the immutable
@@ -2136,11 +2138,16 @@ pub(crate) async fn put_change_catalog_entries<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    if entries.len() >= CHANGE_CATALOG_BULK_INSERTION_THRESHOLD {
+        return put_change_catalog_entries_bulk(root, entries, read).await;
+    }
+
     if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(corruption(
             "ChangeCatalog entries are not strictly ordered and distinct",
         ));
     }
+
     let mut mutations = Vec::new();
     for (id, entry) in entries {
         let value = entry.encode()?;
@@ -2158,6 +2165,40 @@ where
         }
     }
     let mut edit = edit_catalog(root, "change", &mutations, read).await?;
+    edit.change_entries.extend(entries.iter().copied());
+    Ok(edit)
+}
+
+#[cold]
+pub(crate) async fn put_change_catalog_entries_bulk<R>(
+    root: ObjectId,
+    entries: &[(ChangeId, ChangeCatalogEntry)],
+    read: &R,
+) -> Result<CatalogTreeEdit, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let encoded_entries = entries
+        .iter()
+        .map(|(id, entry)| Ok((id.as_bytes().to_vec(), entry.encode()?)))
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    let edit = rebuild_ordered_insertions(
+        root,
+        "change",
+        &encoded_entries,
+        "ChangeCatalog cannot remap one stable ChangeId or owner",
+        read,
+    )
+    .await?;
+    let mut edit = CatalogTreeEdit {
+        base_root: root,
+        root: edit.root.object_id,
+        entry_count: edit.root.entry_count,
+        copied_nodes: edit.copied_nodes,
+        commit_entries: BTreeMap::new(),
+        change_entries: BTreeMap::new(),
+        objects: edit.objects,
+    };
     edit.change_entries.extend(entries.iter().copied());
     Ok(edit)
 }
