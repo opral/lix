@@ -943,7 +943,7 @@ mod tests {
         CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
     };
     use crate::entity_pk::EntityPk;
-    use crate::json_store::{JsonSlot, JsonStoreContext};
+    use crate::json_store::JsonSlot;
     use crate::sql2::ChangelogQuerySource;
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
@@ -1047,7 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn history_loader_defaults_to_pinned_head_without_metadata_walk() {
         let reachable_calls = Arc::new(AtomicUsize::new(0));
-        let start_commit_id = CommitId::for_test_label("start");
+        let (query_source, start_commit_id) = empty_changelog_query_source().await;
         let mut route = HistoryRoute::default();
         route.default_to_as_of_commit_id(&start_commit_id.to_string());
         let rows = load_history_entries(
@@ -1056,7 +1056,7 @@ mod tests {
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
-            empty_changelog_query_source(start_commit_id).await,
+            query_source,
             &route,
             vec!["message".to_string()],
             HistoryMetadataProjection::default(),
@@ -1072,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn history_loader_reuses_history_topology_for_projected_commit_timestamp() {
         let reachable_calls = Arc::new(AtomicUsize::new(0));
-        let start_commit_id = CommitId::for_test_label("start");
+        let (query_source, start_commit_id) = empty_changelog_query_source().await;
         let metadata_schema = Arc::new(Schema::new(vec![Field::new(
             HISTORY_COL_COMMIT_CREATED_AT,
             DataType::Utf8,
@@ -1084,7 +1084,7 @@ mod tests {
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
-            empty_changelog_query_source(start_commit_id).await,
+            query_source,
             &HistoryRoute {
                 as_of_commit_ids: vec![start_commit_id.to_string()],
                 ..HistoryRoute::default()
@@ -1111,7 +1111,7 @@ mod tests {
     #[tokio::test]
     async fn history_loader_does_not_substitute_change_time_for_missing_commit_time() {
         let reachable_calls = Arc::new(AtomicUsize::new(0));
-        let as_of_commit_id = CommitId::for_test_label("start");
+        let (query_source, as_of_commit_id) = empty_changelog_query_source().await;
         let metadata_schema = Arc::new(Schema::new(vec![Field::new(
             HISTORY_COL_COMMIT_CREATED_AT,
             DataType::Utf8,
@@ -1127,7 +1127,7 @@ mod tests {
                 start_commit_id: as_of_commit_id,
                 include_reachable_commit: false,
             }))),
-            empty_changelog_query_source(as_of_commit_id).await,
+            query_source,
             &HistoryRoute {
                 as_of_commit_ids: vec![as_of_commit_id.to_string()],
                 ..HistoryRoute::default()
@@ -1257,18 +1257,29 @@ mod tests {
         crate::common::LixTimestamp::expect_parse("commit timestamp", "2026-07-12T00:00:00Z")
     }
 
-    async fn empty_changelog_query_source(
-        _default_as_of_commit_id: CommitId,
-    ) -> ChangelogQuerySource<SharedStorageAdapterRead<MemoryRead>> {
+    async fn empty_changelog_query_source() -> (
+        ChangelogQuerySource<SharedStorageAdapterRead<MemoryRead>>,
+        CommitId,
+    ) {
         let storage = StorageAdapter::new(Memory::new());
+        let receipt = crate::forktree::initialize_empty_repository(storage.clone())
+            .await
+            .expect("authenticated ForkTree bootstrap should succeed");
+        let initial_commit_id = CommitId::new(
+            uuid::Uuid::parse_str(&receipt.initial_commit_id)
+                .expect("bootstrap receipt contains a UUID commit id"),
+        );
         let read_scope = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
         let read_scope = SharedStorageAdapterRead::new(read_scope);
-        ChangelogQuerySource {
-            forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
-        }
+        (
+            ChangelogQuerySource {
+                forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
+            },
+            initial_commit_id,
+        )
     }
 
     fn and(left: Expr, right: Expr) -> Expr {
