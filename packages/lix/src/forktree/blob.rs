@@ -425,6 +425,34 @@ where
     Ok(crate::binary_cas::BlobBytesBatch::new(entries))
 }
 
+/// Validates historical BlobRef manifests and payload identity without
+/// materializing a complete file. The first manifest receives full closure
+/// validation; later same-geometry manifests reuse only authenticated equal
+/// Merkle subtrees from the immediately preceding validated row. This state
+/// is operation-local and is never persisted or shared across views.
+pub(crate) async fn validate_historical_blob_merkle_for_state_values<R>(
+    read: &R,
+    values: &[(StateKey, super::state::StateValue)],
+) -> Result<(), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let refs = values
+        .iter()
+        .map(|(key, value)| bind_historical_state_blob_ref(key, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifests = load_historical_manifests(read, &refs).await?;
+    let mut previous = None;
+    for reference in refs {
+        let manifest = required_manifest_by_id(&manifests, reference.manifest_object_id)?;
+        validate_manifest_fields(manifest, reference.expected_size, reference.semantic_id)?;
+        super::merkle::validate_blob_merkle_manifest_against_previous(read, previous, *manifest)
+            .await?;
+        previous = Some(*manifest);
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct HistoricalAuthenticatedBlobRef {
     semantic_id: crate::binary_cas::BlobId,

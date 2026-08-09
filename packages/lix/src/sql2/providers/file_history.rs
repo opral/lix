@@ -760,22 +760,27 @@ where
             .chain(plugin_registry_events),
     )?;
     let prepared = prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
-    let blob_bytes = load_file_history_blob_bytes(&historical, &prepared).await?;
+    let blob_bytes = if needs_data {
+        load_file_history_blob_bytes(&historical, &prepared).await?
+    } else {
+        validate_file_history_blob_merkle(&historical, &prepared).await?;
+        BTreeMap::new()
+    };
 
     let mut output = Vec::with_capacity(prepared.len());
     for prepared_row in prepared {
         let data = if prepared_row.descriptor().name.is_some() {
-            let blob_hash = validate_exactly_one_blob_ref(
-                &prepared_row.observed_state,
-                &prepared_row.event,
-                true,
-            )?
-            .and_then(|reference| reference.blob_hash.as_deref());
-            let bytes = blob_hash
-                .and_then(|blob_hash| blob_bytes.get(blob_hash))
-                .and_then(Option::as_deref);
-            validate_file_history_materialization(&prepared_row, bytes)?;
             if needs_data {
+                let blob_hash = validate_exactly_one_blob_ref(
+                    &prepared_row.observed_state,
+                    &prepared_row.event,
+                    true,
+                )?
+                .and_then(|reference| reference.blob_hash.as_deref());
+                let bytes = blob_hash
+                    .and_then(|blob_hash| blob_bytes.get(blob_hash))
+                    .and_then(Option::as_deref);
+                validate_file_history_materialization(&prepared_row, bytes)?;
                 Some(
                     bytes
                         .ok_or_else(|| {
@@ -787,6 +792,7 @@ where
                         .to_vec(),
                 )
             } else {
+                validate_file_history_metadata_materialization(&prepared_row)?;
                 None
             }
         } else {
@@ -960,8 +966,86 @@ where
     Ok(by_encoded_hash)
 }
 
+async fn validate_file_history_blob_merkle<S>(
+    historical: &ForkTreeReadFacade<S>,
+    rows: &[PreparedFileHistoryRow],
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut requests = Vec::new();
+    for row in rows.iter().filter(|row| row.descriptor().name.is_some()) {
+        let reference = validate_exactly_one_blob_ref(&row.observed_state, &row.event, true)?
+            .ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "file '{}' at commit '{}' has no authenticated BlobRef",
+                    row.id, row.event.observed_commit_id
+                ))
+            })?;
+        if reference.blob_hash.is_none() || reference.size_bytes.is_none() {
+            return Err(invalid_file_history_state(format!(
+                "file '{}' at commit '{}' has an incomplete authenticated BlobRef",
+                row.id, row.event.observed_commit_id
+            )));
+        }
+        let observed = row.observed_state.rows.row(reference.row);
+        requests.push((
+            observed.observed_commit_id().to_owned(),
+            observed.row().key().clone(),
+        ));
+    }
+    historical
+        .validate_historical_blob_merkle_for_rows(&requests)
+        .await
+}
+
 fn invalid_file_history_state(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INVALID_PLUGIN, message)
+}
+
+fn validate_file_history_metadata_materialization(
+    prepared: &PreparedFileHistoryRow,
+) -> Result<(), LixError> {
+    let observed_commit_id = prepared.event.observed_commit_id.as_str();
+    let state = prepared.observed_state.as_ref();
+    let descriptor = prepared.descriptor();
+    if let Some(owner) = live_file_history_plugin_owner(state, &descriptor.id) {
+        state
+            .plugin_registry
+            .get(owner.plugin_key())
+            .ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "plugin-owned file '{}' at commit '{observed_commit_id}' names unavailable plugin '{}'",
+                    descriptor.id,
+                    owner.plugin_key(),
+                ))
+            })?;
+    }
+    let blob = validate_exactly_one_blob_ref(state, &prepared.event, true)?.ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has no authenticated BlobRef",
+            descriptor.id
+        ))
+    })?;
+    let blob_hash = blob.blob_hash.as_deref().ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has no live blob identity",
+            descriptor.id
+        ))
+    })?;
+    BlobId::from_hex(blob_hash).map_err(|error| {
+        invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has an invalid BlobId: {error}",
+            descriptor.id
+        ))
+    })?;
+    if blob.size_bytes.is_none() {
+        return Err(invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has an incomplete authenticated BlobRef",
+            descriptor.id
+        )));
+    }
+    Ok(())
 }
 
 /// A plugin owner commits a materialization contract alongside semantic

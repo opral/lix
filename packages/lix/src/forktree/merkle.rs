@@ -25,6 +25,10 @@ use super::view::load_object_bytes;
 
 const MERKLE_STATE_BINDING_DOMAIN: &str = "lix forktree blob merkle state binding v1";
 const MAX_PROOF_DEPTH: usize = 128;
+// Metadata-only historical validation must not retain every chunk of a large
+// file. This is an operation-local I/O page, not a durable cache or format
+// boundary; lowering it changes only peak working memory.
+const MERKLE_VALIDATION_CHUNK_PAGE: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NodeSummary {
@@ -449,6 +453,233 @@ where
         chunk_claims,
         node_object_ids,
     })
+}
+
+/// Authenticates a complete manifest closure without concatenating its
+/// payload. This is the validation path for historical comparisons whose
+/// public result does not request file content: the manifest, every Merkle
+/// node, and every referenced chunk remain checked, but no 64 MiB `Vec` is
+/// assembled.
+pub(crate) async fn validate_blob_merkle_manifest<R>(
+    read: &R,
+    manifest: BlobManifestV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    manifest.validate()?;
+    let base = load_authenticated_blob_merkle_base(read, manifest).await?;
+    let chunk_ids = base
+        .chunk_claims
+        .iter()
+        .map(|(chunk, _)| chunk.chunk_object_id)
+        .collect::<BTreeSet<_>>();
+    let ids = chunk_ids.iter().copied().collect::<Vec<_>>();
+    for page in ids.chunks(MERKLE_VALIDATION_CHUNK_PAGE) {
+        let chunks = load_merkle_objects_many(read, page).await?;
+        for (chunk, expected_digest) in base
+            .chunk_claims
+            .iter()
+            .filter(|(chunk, _)| page.contains(&chunk.chunk_object_id))
+        {
+            let bytes = chunks
+                .get(&chunk.chunk_object_id)
+                .ok_or_else(|| corruption("Merkle manifest chunk is absent"))?;
+            let payload = BlobChunkV1::decode_borrowed(chunk.chunk_object_id, bytes)?;
+            if payload.len() as u64 != chunk.declared_len
+                || *blake3::hash(payload).as_bytes() != *expected_digest
+            {
+                return Err(corruption(
+                    "Merkle manifest chunk identity or digest is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates a manifest against one already-validated predecessor from the
+/// same retained operation. Equal roots are accepted without descending;
+/// same-geometry roots descend only changed authenticated branches and load
+/// only changed leaf chunks. A geometry change (append/truncate) receives a
+/// complete closure validation, so this optimization never becomes a
+/// fallback or a second authority.
+pub(crate) async fn validate_blob_merkle_manifest_against_previous<R>(
+    read: &R,
+    previous: Option<BlobManifestV1>,
+    manifest: BlobManifestV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    manifest.validate()?;
+    let Some(previous) = previous else {
+        return validate_blob_merkle_manifest(read, manifest).await;
+    };
+    previous.validate()?;
+    if previous == manifest {
+        return Ok(());
+    }
+    if previous.logical_bytes != manifest.logical_bytes
+        || previous.leaf_count != manifest.leaf_count
+        || previous.root_height != manifest.root_height
+        || previous.chunk_bytes != manifest.chunk_bytes
+    {
+        return validate_blob_merkle_manifest(read, manifest).await;
+    }
+
+    validate_blob_merkle_delta(read, previous, manifest).await
+}
+
+async fn validate_blob_merkle_delta<R>(
+    read: &R,
+    previous: BlobManifestV1,
+    manifest: BlobManifestV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let previous_root = NodeSummary {
+        object_id: previous.root_object_id,
+        height: previous.root_height,
+        first_ordinal: 0,
+        leaf_count: previous.leaf_count,
+        logical_bytes: previous.logical_bytes,
+    };
+    let current_root = NodeSummary {
+        object_id: manifest.root_object_id,
+        height: manifest.root_height,
+        first_ordinal: 0,
+        leaf_count: manifest.leaf_count,
+        logical_bytes: manifest.logical_bytes,
+    };
+    if previous_root == current_root {
+        return Ok(());
+    }
+
+    let mut frontier = vec![(previous_root, current_root)];
+    let mut visited = BTreeSet::new();
+    while !frontier.is_empty() {
+        let mut ids = BTreeSet::new();
+        for (old, new) in &frontier {
+            if old.object_id != new.object_id {
+                ids.insert(old.object_id);
+                ids.insert(new.object_id);
+            }
+        }
+        if ids.is_empty() {
+            break;
+        }
+        let objects = load_merkle_objects_many(read, &ids.into_iter().collect::<Vec<_>>()).await?;
+        let mut next = Vec::with_capacity(frontier.len().saturating_mul(2));
+        for (old, new) in std::mem::take(&mut frontier) {
+            if old.object_id == new.object_id {
+                if old != new {
+                    return Err(corruption(
+                        "equal Merkle subtree identity has a different authenticated summary",
+                    ));
+                }
+                continue;
+            }
+            if !visited.insert((old.object_id, new.object_id)) {
+                return Err(corruption("Merkle comparison contains a node cycle"));
+            }
+            let old_bytes = objects
+                .get(&old.object_id)
+                .ok_or_else(|| corruption("previous Merkle node is absent"))?;
+            let new_bytes = objects
+                .get(&new.object_id)
+                .ok_or_else(|| corruption("current Merkle node is absent"))?;
+            let old_node = decode_node(old.object_id, old_bytes)?;
+            let new_node = decode_node(new.object_id, new_bytes)?;
+            if old_node.summary(old.object_id) != old || new_node.summary(new.object_id) != new {
+                return Err(corruption(
+                    "Merkle comparison node does not match its authenticated summary",
+                ));
+            }
+            match (old_node, new_node) {
+                (DecodedNode::Leaf(old_leaf), DecodedNode::Leaf(new_leaf)) => {
+                    validate_changed_merkle_chunk(read, &new_leaf).await?;
+                    if old_leaf.ordinal != new_leaf.ordinal
+                        || old_leaf.declared_len != new_leaf.declared_len
+                    {
+                        return Err(corruption(
+                            "same-geometry Merkle comparison changed leaf placement",
+                        ));
+                    }
+                }
+                (DecodedNode::Internal(old_internal), DecodedNode::Internal(new_internal)) => {
+                    if old_internal.height != new_internal.height
+                        || old_internal.first_ordinal != new_internal.first_ordinal
+                        || old_internal.leaf_count != new_internal.leaf_count
+                        || old_internal.logical_bytes != new_internal.logical_bytes
+                    {
+                        return Err(corruption(
+                            "same-geometry Merkle comparison changed an internal summary",
+                        ));
+                    }
+                    next.push((
+                        NodeSummary {
+                            object_id: old_internal.left.object_id,
+                            height: old_internal.left.height,
+                            first_ordinal: old_internal.left.first_ordinal,
+                            leaf_count: old_internal.left.leaf_count,
+                            logical_bytes: old_internal.left.logical_bytes,
+                        },
+                        NodeSummary {
+                            object_id: new_internal.left.object_id,
+                            height: new_internal.left.height,
+                            first_ordinal: new_internal.left.first_ordinal,
+                            leaf_count: new_internal.left.leaf_count,
+                            logical_bytes: new_internal.left.logical_bytes,
+                        },
+                    ));
+                    next.push((
+                        NodeSummary {
+                            object_id: old_internal.right.object_id,
+                            height: old_internal.right.height,
+                            first_ordinal: old_internal.right.first_ordinal,
+                            leaf_count: old_internal.right.leaf_count,
+                            logical_bytes: old_internal.right.logical_bytes,
+                        },
+                        NodeSummary {
+                            object_id: new_internal.right.object_id,
+                            height: new_internal.right.height,
+                            first_ordinal: new_internal.right.first_ordinal,
+                            leaf_count: new_internal.right.leaf_count,
+                            logical_bytes: new_internal.right.logical_bytes,
+                        },
+                    ));
+                }
+                _ => {
+                    return Err(corruption(
+                        "same-geometry Merkle comparison changed node kind",
+                    ));
+                }
+            }
+        }
+        frontier = next;
+    }
+    Ok(())
+}
+
+async fn validate_changed_merkle_chunk<R>(
+    read: &R,
+    leaf: &BlobMerkleLeafV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let bytes = load_object_bytes(read, leaf.chunk_object_id).await?;
+    let payload = BlobChunkV1::decode_borrowed(leaf.chunk_object_id, &bytes)?;
+    if payload.len() as u64 != leaf.declared_len
+        || *blake3::hash(payload).as_bytes() != leaf.chunk_digest
+    {
+        return Err(corruption(
+            "changed Merkle leaf chunk identity or digest is invalid",
+        ));
+    }
+    Ok(())
 }
 
 async fn load_merkle_objects_many<R>(

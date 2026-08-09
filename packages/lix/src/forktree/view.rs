@@ -891,6 +891,41 @@ where
         super::blob::load_historical_blob_bytes_for_state_values(&self.read, &values).await
     }
 
+    /// Validates historical file BlobRefs through this facade's retained read
+    /// without constructing terminal payload buffers. Equal Merkle subtrees
+    /// across adjacent validated history rows are authenticated once per
+    /// operation; no cache or second view crosses this call boundary.
+    pub(crate) async fn validate_historical_blob_merkle_for_rows(
+        &self,
+        requests: &[(String, super::state::StateKey)],
+    ) -> Result<(), crate::LixError> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let mut values = Vec::with_capacity(requests.len());
+        for (commit_id, key) in requests {
+            let commit_id =
+                crate::changelog::CommitId::parse_lix(commit_id, "historical blob commit")?;
+            let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            let value = self
+                .load_state_value_at_commit(commit_id, &encoded_key, true)
+                .await?
+                .map(|(value, _source)| value)
+                .ok_or_else(|| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        "historical BlobRef state row is absent",
+                    )
+                })?;
+            values.push((key.clone(), value));
+        }
+        super::blob::validate_historical_blob_merkle_for_state_values(&self.read, &values).await
+    }
+
     /// Loads the state rows authored by one authenticated semantic commit.
     /// Commit membership and the final state row are authenticated together:
     /// a missing row, substituted key, or row owned by another change/commit

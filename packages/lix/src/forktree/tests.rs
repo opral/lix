@@ -1326,6 +1326,65 @@ where
     }
 }
 
+#[tokio::test]
+async fn historical_merkle_validation_prunes_equal_subtrees_and_chunks() {
+    let storage = Memory::new();
+    let base_chunks = (0..4)
+        .map(|ordinal| BlobChunkV1 {
+            bytes: Bytes::from(vec![
+                u8::try_from(ordinal + 1).expect("fixture ordinal");
+                BLOB_MERKLE_CHUNK_BYTES as usize
+            ]),
+        })
+        .collect::<Vec<_>>();
+    let base = build_blob_merkle_tree(&base_chunks).expect("base Merkle tree");
+    let mut successor_chunks = base_chunks;
+    successor_chunks[2] = BlobChunkV1 {
+        bytes: Bytes::from(vec![0xa2; BLOB_MERKLE_CHUNK_BYTES as usize]),
+    };
+    let successor = build_blob_merkle_tree(&successor_chunks).expect("successor Merkle tree");
+    assert_ne!(base.manifest, successor.manifest);
+
+    let mut writes = StorageWriteSet::new();
+    let mut objects = base.objects.clone();
+    objects
+        .extend(successor.objects.clone())
+        .expect("shared Merkle objects have identical bytes");
+    for (id, bytes) in objects.iter() {
+        writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(writes, &storage).await;
+
+    let full_reads = Arc::new(AtomicUsize::new(0));
+    let full_read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("base read");
+    let full_read = ObjectKeyCountingRead {
+        inner: StorageAdapterReadScope::new(full_read),
+        object_keys: Arc::clone(&full_reads),
+    };
+    super::merkle::validate_blob_merkle_manifest_against_previous(&full_read, None, base.manifest)
+        .await
+        .expect("base closure validates");
+    let full_count = full_reads.load(Ordering::Relaxed);
+    assert!(full_count > 0);
+
+    full_reads.store(0, Ordering::Relaxed);
+    super::merkle::validate_blob_merkle_manifest_against_previous(
+        &full_read,
+        Some(base.manifest),
+        successor.manifest,
+    )
+    .await
+    .expect("same-geometry successor validates");
+    let delta_count = full_reads.load(Ordering::Relaxed);
+    assert!(
+        delta_count < full_count,
+        "changed-leaf validation should skip equal authenticated subtrees: delta={delta_count}, full={full_count}"
+    );
+}
+
 impl<R> StorageAdapterRead for SharedParentCountingRead<R>
 where
     R: StorageAdapterRead,

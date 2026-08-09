@@ -1175,7 +1175,7 @@ impl BlobManifestV1 {
         Ok(value)
     }
 
-    fn validate(&self) -> Result<(), StorageError> {
+    pub(crate) fn validate(&self) -> Result<(), StorageError> {
         if self.leaf_count == 0
             || self.root_object_id == ObjectId::ZERO
             || self.chunk_bytes != BLOB_MERKLE_CHUNK_BYTES
