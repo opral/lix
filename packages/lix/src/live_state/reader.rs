@@ -9,7 +9,6 @@ use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateExactBa
 /// Selects the authenticated serving domain for an internal read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveStateReadDomain {
-    Combined,
     Tracked,
     Untracked,
 }
@@ -45,8 +44,8 @@ pub(crate) trait LiveStateReader: Send + Sync {
         }
     }
 
-    /// Reads one explicit authenticated serving domain.  Ordinary visibility
-    /// callers use `Combined`; internal historical/entity validation and
+    /// Reads one explicit authenticated serving domain. Ordinary visibility
+    /// callers use [`Self::scan_batch`]; internal historical/entity validation and
     /// current-only durable callers select their domain explicitly.
     async fn scan_domain_batch(
         &self,
@@ -54,7 +53,6 @@ pub(crate) trait LiveStateReader: Send + Sync {
         domain: LiveStateReadDomain,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         match domain {
-            LiveStateReadDomain::Combined => self.scan_constraint_batch(request, false).await,
             LiveStateReadDomain::Tracked => {
                 let mut request = request.clone();
                 request.filter.untracked = Some(false);

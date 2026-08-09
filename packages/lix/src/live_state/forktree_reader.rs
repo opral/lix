@@ -495,36 +495,6 @@ where
     MaterializedLiveStateExactBatch::new(builder.finish(), slots)
 }
 
-fn request_branch_id(request: &LiveStateScanRequest) -> Result<&str, LixError> {
-    let branch_ids = &request.filter.branch_ids;
-    let non_global_branch_ids = branch_ids
-        .iter()
-        .filter(|branch_id| branch_id.as_str() != crate::GLOBAL_BRANCH_ID)
-        .collect::<Vec<_>>();
-    let has_global = branch_ids
-        .iter()
-        .any(|branch_id| branch_id.as_str() == crate::GLOBAL_BRANCH_ID);
-    let valid_branch_scope = match non_global_branch_ids.as_slice() {
-        [] => branch_ids.len() == 1 && has_global,
-        [branch_id] => {
-            branch_ids.len() == 1 + usize::from(has_global)
-                && branch_ids.iter().all(|candidate| {
-                    candidate.as_str() == crate::GLOBAL_BRANCH_ID || candidate == *branch_id
-                })
-        }
-        _ => false,
-    };
-    if !valid_branch_scope {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "ForkTree live-state operation requires exactly one branch",
-        ));
-    }
-    Ok(non_global_branch_ids
-        .first()
-        .map_or(crate::GLOBAL_BRANCH_ID, |branch_id| branch_id.as_str()))
-}
-
 fn validate_scan_request(request: &LiveStateScanRequest) -> Result<(), LixError> {
     if request
         .filter
