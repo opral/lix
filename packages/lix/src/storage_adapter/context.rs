@@ -4,9 +4,9 @@ use bytes::Bytes;
 use tracing::Instrument as _;
 
 use crate::storage::{
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, Memory, Precondition, Prefix,
-    ProjectedValue, PutBatch, PutEntry, ReadOptions, Storage, StorageError, StorageWrite,
-    StoredValue, WriteOptions,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, Memory, Prefix, ProjectedValue,
+    PutBatch, PutEntry, ReadOptions, Storage, StorageError, StorageWrite, StoredValue,
+    WriteOptions,
 };
 use crate::storage_adapter::{
     StorageAdapterRead, StorageAdapterReadScope, StorageSpace, StorageWriteSet,
@@ -14,7 +14,7 @@ use crate::storage_adapter::{
 };
 
 use super::exact_get_many;
-use super::spaces::{MUTATION_REVISION_SPACE, TRACKED_MUTATION_REVISION_SPACE};
+use super::spaces::MUTATION_REVISION_SPACE;
 
 const MUTATION_REVISION_KEY: &[u8] = b"global";
 
@@ -129,28 +129,6 @@ where
         Self::load_mutation_revision_from_read(&StorageAdapterReadScope::new(read)).await
     }
 
-    pub(crate) fn tracked_mutation_revision_precondition(expected: Option<Bytes>) -> Precondition {
-        expected.map_or_else(
-            || Precondition::KeyAbsent {
-                space: TRACKED_MUTATION_REVISION_SPACE,
-                key: mutation_revision_key(),
-            },
-            |expected| Precondition::KeyValueEquals {
-                space: TRACKED_MUTATION_REVISION_SPACE,
-                key: mutation_revision_key(),
-                expected,
-            },
-        )
-    }
-
-    pub(crate) fn stage_tracked_mutation_revision(write_set: &mut StorageWriteSet) {
-        write_set.put(
-            TRACKED_MUTATION_REVISION_SPACE,
-            mutation_revision_key(),
-            uuid::Uuid::now_v7().as_bytes().as_slice(),
-        );
-    }
-
     pub(crate) async fn load_mutation_revision_from_read<R>(
         read: &R,
     ) -> Result<Option<Bytes>, StorageError>
@@ -161,34 +139,6 @@ where
             read,
             &[crate::storage::GetManyRequest {
                 space: MUTATION_REVISION_SPACE,
-                keys: &[mutation_revision_key()],
-                opts: GetOptions {
-                    projection: CoreProjection::FullValue,
-                },
-            }],
-        )
-        .await?;
-        Ok(values
-            .values
-            .into_iter()
-            .next()
-            .flatten()
-            .and_then(|value| match value {
-                ProjectedValue::FullValue(bytes) => Some(bytes),
-                ProjectedValue::KeyOnly => None,
-            }))
-    }
-
-    pub(crate) async fn load_tracked_mutation_revision_from_read<R>(
-        read: &R,
-    ) -> Result<Option<Bytes>, StorageError>
-    where
-        R: StorageAdapterRead + ?Sized,
-    {
-        let values = exact_get_many(
-            read,
-            &[crate::storage::GetManyRequest {
-                space: TRACKED_MUTATION_REVISION_SPACE,
                 keys: &[mutation_revision_key()],
                 opts: GetOptions {
                     projection: CoreProjection::FullValue,

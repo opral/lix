@@ -11,11 +11,6 @@ pub(crate) const MUTATION_REVISION_SPACE: StorageSpace = StorageSpace::engine_de
     "observe.mutation_revision",
     ValueSemantics::Mutable,
 );
-pub(crate) const TRACKED_MUTATION_REVISION_SPACE: StorageSpace = StorageSpace::engine_declared(
-    0x0007_0004,
-    "transaction.tracked_revision",
-    ValueSemantics::Mutable,
-);
 
 impl StorageSpace {
     pub const fn physical_prefix(&self) -> [u8; 4] {

@@ -86,8 +86,7 @@ where
         transaction.active_branch_id == leader.active_branch_id
             && transaction.opening_active_branch_head == leader.opening_active_branch_head
             && transaction.opening_global_branch_head == leader.opening_global_branch_head
-            && transaction.opening_tracked_mutation_revision
-                == leader.opening_tracked_mutation_revision
+            && transaction.opening_selector_fence == leader.opening_selector_fence
             && transaction.idempotency_receipt.is_none()
             && transaction.pending_forktree_publication.is_none()
             && !transaction.await_durable_commit
