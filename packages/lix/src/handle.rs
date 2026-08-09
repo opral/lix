@@ -707,7 +707,10 @@ mod tests {
         );
         assert_eq!(root.active_branch_id().await.unwrap(), main_branch_id);
 
-        let Err(error) = root.open_session("missing-branch").await else {
+        let Err(error) = root
+            .open_session("01920000-0000-7000-8000-000000000599")
+            .await
+        else {
             panic!("missing branch must not open");
         };
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
