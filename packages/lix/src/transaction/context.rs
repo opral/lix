@@ -145,6 +145,27 @@ pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ForkTreeSelectorFence {
+    global: Bytes,
+    branch: Bytes,
+}
+
+async fn load_forktree_selector_fence<R>(
+    read: &R,
+    branch_id: &str,
+) -> Result<ForkTreeSelectorFence, LixError>
+where
+    R: StorageAdapterRead + Clone,
+{
+    let facade = ForkTreeReadFacade::new(read.clone());
+    let view = facade.branch(branch_id).await?;
+    Ok(ForkTreeSelectorFence {
+        global: view.raw_global_selector().clone(),
+        branch: view.raw_branch_selector().clone(),
+    })
+}
+
 /// Commits one coordinator-owned cohort in queue order.
 ///
 /// The coordinator is the sole explicit-transaction persistence authority.
@@ -172,7 +193,7 @@ where
     a.active_branch_id == b.active_branch_id
         && a.opening_active_branch_head == b.opening_active_branch_head
         && a.opening_global_branch_head == b.opening_global_branch_head
-        && a.opening_tracked_mutation_revision == b.opening_tracked_mutation_revision
+        && a.opening_selector_fence == b.opening_selector_fence
         && a.idempotency_receipt.is_none()
         && b.idempotency_receipt.is_none()
         && a.pending_forktree_publication.is_none()
@@ -542,10 +563,10 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
     storage: Arc<StorageAdapter<StorageImpl>>,
     functions: FunctionProviderHandle,
-    /// Tracked-state revision observed by the coherent transaction-open read.
-    /// Durable tracked publication must still be based on this revision;
-    /// untracked current-state writes do not invalidate the tracked snapshot.
-    opening_tracked_mutation_revision: Option<Bytes>,
+    /// Raw authenticated ForkTree selector pair observed by the coherent
+    /// transaction-open read. Publication rechecks this pair through the
+    /// same global epoch/branch-generation CAS fence.
+    opening_selector_fence: ForkTreeSelectorFence,
     /// Branch roots captured by the same coherent opening read. They let an
     /// explicit transaction distinguish a disjoint concurrent commit from an
     /// overlapping semantic write without creating a temporary branch.
@@ -912,11 +933,11 @@ where
         prepared_writes: &mut PreparedWriteSet,
     ) -> Result<(), LixError>
     where
-        S: StorageAdapterRead,
+        S: StorageAdapterRead + Clone,
     {
-        let current_revision =
-            StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(read).await?;
-        if current_revision == self.opening_tracked_mutation_revision {
+        let current_selector_fence =
+            load_forktree_selector_fence(read, &self.active_branch_id).await?;
+        if current_selector_fence == self.opening_selector_fence {
             return Ok(());
         }
 
@@ -959,7 +980,7 @@ where
             ));
         }
         if current_active_head == self.opening_active_branch_head {
-            self.opening_tracked_mutation_revision = current_revision;
+            self.opening_selector_fence = current_selector_fence;
             return Ok(());
         }
         let Some(opening_head) = self.opening_active_branch_head else {
@@ -1088,7 +1109,7 @@ where
         }
 
         self.opening_active_branch_head = Some(current_head);
-        self.opening_tracked_mutation_revision = current_revision;
+        self.opening_selector_fence = current_selector_fence;
         Ok(())
     }
 
@@ -1483,9 +1504,8 @@ where
                     .await?;
                 (sql_schema_catalog, tracked_schema_catalog)
             };
-            let opening_tracked_mutation_revision =
-                StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(&read)
-                    .await?;
+            let opening_selector_fence =
+                load_forktree_selector_fence(&read, &active_branch_id).await?;
             let branch_reader = branch_ctx.ref_reader(&read);
             let opening_active_branch_head =
                 branch_reader.load_head_commit_id(&active_branch_id).await?;
@@ -1500,7 +1520,7 @@ where
                 functions,
                 sql_schema_catalog,
                 tracked_schema_catalog,
-                opening_tracked_mutation_revision,
+                opening_selector_fence,
                 opening_active_branch_head,
                 opening_global_branch_head,
                 runtime_boundary_result,
@@ -1513,7 +1533,7 @@ where
             functions,
             sql_schema_catalog,
             tracked_schema_catalog,
-            opening_tracked_mutation_revision,
+            opening_selector_fence,
             opening_active_branch_head,
             opening_global_branch_head,
             runtime_boundary_result,
@@ -1558,7 +1578,7 @@ where
                     opening_read,
                     storage,
                     functions,
-                    opening_tracked_mutation_revision,
+                    opening_selector_fence,
                     opening_active_branch_head,
                     opening_global_branch_head,
                     commit_boundary: None,
@@ -1613,15 +1633,6 @@ where
         transaction
             .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
             .await;
-        let tracked_state_changed = prepared_writes.state_rows.iter().any(|row| !row.untracked)
-            || !prepared_writes.commit_change_refs_by_branch.is_empty()
-            || !prepared_writes.extra_commit_parents_by_branch.is_empty();
-        let has_untracked_state_writes = prepared_writes.state_rows.iter().any(|row| row.untracked);
-        // Untracked rows are mutable current state, but their validation can read
-        // tracked schemas, parents, uniqueness owners, or filesystem state.
-        // Fence that snapshot without rotating the tracked revision: normal
-        // tracked transactions remain independent of untracked-only commits.
-        let requires_tracked_snapshot_fence = tracked_state_changed || has_untracked_state_writes;
         let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         if let Err(error) = check_commit_boundary(commit_boundary.as_ref()) {
@@ -1754,21 +1765,11 @@ where
         if catalog_revision_changed {
             stage_catalog_revision(&mut writes);
         }
-        if tracked_state_changed {
-            StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
-        }
         let mut write_options = StorageWriteOptions::default();
         write_options.await_durable = transaction.await_durable_commit;
         write_options
             .preconditions
             .extend(materialization_preconditions);
-        if requires_tracked_snapshot_fence {
-            write_options.preconditions.push(
-                StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
-                    transaction.opening_tracked_mutation_revision.clone(),
-                ),
-            );
-        }
         if let Some((key, value)) = transaction.idempotency_receipt.take() {
             writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
             // The mutation and this receipt share one atomic storage commit.
