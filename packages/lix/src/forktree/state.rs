@@ -118,6 +118,11 @@ pub(crate) struct HistoricalStateWriteIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HistoricalStateIdentityChange {
     pub(crate) key: StateKey,
+    /// Whether this physical identity came from the authenticated global
+    /// state root. Stale classification currently unions keys, but retaining
+    /// the domain prevents hidden global writes from being mistaken for the
+    /// visible branch overlay and keeps the authenticated source explicit.
+    pub(crate) global: bool,
     pub(crate) before: Option<HistoricalStateWriteIdentity>,
     pub(crate) after: Option<HistoricalStateWriteIdentity>,
 }

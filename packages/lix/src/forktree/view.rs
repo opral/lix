@@ -1088,49 +1088,7 @@ async fn touched_state_identities_between_commits_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let entries =
-        super::serving::diff_state_rows_between_commits(read, before, after, true).await?;
-    let mut by_key = BTreeMap::new();
-    for entry in entries {
-        by_key.insert(
-            entry.before.as_ref().map_or_else(
-                || {
-                    entry
-                        .after
-                        .as_ref()
-                        .expect("diff entry has an endpoint")
-                        .key
-                        .clone()
-                },
-                |row| row.key.clone(),
-            ),
-            (entry.before, entry.after),
-        );
-    }
-    Ok(by_key
-        .into_values()
-        .filter_map(|(before, after)| {
-            historical_state_identity_changed(before.as_ref(), after.as_ref()).then(|| {
-                let key = after
-                    .as_ref()
-                    .or(before.as_ref())
-                    .expect("identity change has an endpoint")
-                    .key
-                    .clone();
-                let identity = |row: &super::state::HistoricalStateRow| {
-                    super::state::HistoricalStateWriteIdentity {
-                        change_id: row.change_id,
-                        commit_id: row.commit_id,
-                    }
-                };
-                super::state::HistoricalStateIdentityChange {
-                    key,
-                    before: before.as_ref().map(identity),
-                    after: after.as_ref().map(identity),
-                }
-            })
-        })
-        .collect())
+    super::serving::physical_state_identity_changes_between_commits(read, before, after).await
 }
 
 pub(crate) async fn open_coherent_view<S>(
@@ -1447,6 +1405,7 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::forktree::state::{HistoricalStateRow, StateKey};
+    use std::collections::BTreeMap;
 
     fn historical_row(
         change_id: ChangeId,
@@ -1518,5 +1477,130 @@ mod tests {
         ));
         assert!(historical_state_payloads_differ(Some(&tombstone), None));
         assert!(historical_state_payloads_differ(None, Some(&null)));
+    }
+
+    #[test]
+    fn physical_identity_union_keeps_hidden_global_write_out_of_public_overlay() {
+        let key = StateKey {
+            schema_key: "plugin_entity".to_owned(),
+            file_id: Some("file-a".to_owned()),
+            entity_pk: EntityPk::single("row-a"),
+        };
+        let mut global_before = historical_row(
+            ChangeId::for_test_label("global-before"),
+            CommitId::for_test_label("global-before-commit"),
+            false,
+            Some(r#"{"value":"same-public-row"}"#),
+        );
+        global_before.key = key.clone();
+        global_before.global = true;
+        let mut global_after = historical_row(
+            ChangeId::for_test_label("global-after"),
+            CommitId::for_test_label("global-after-commit"),
+            false,
+            Some(r#"{"value":"same-public-row"}"#),
+        );
+        global_after.key = key.clone();
+        global_after.global = true;
+        let local_before = historical_row(
+            ChangeId::for_test_label("local"),
+            CommitId::for_test_label("local-commit"),
+            false,
+            Some(r#"{"value":"same-public-row"}"#),
+        );
+        let local_after = local_before.clone();
+        let mut physical = BTreeMap::new();
+        physical.insert((vec![0], true), (Some(global_before), Some(global_after)));
+        physical.insert(
+            (vec![0], false),
+            (Some(local_before.clone()), Some(local_after.clone())),
+        );
+
+        let changes = super::super::serving::physical_identity_changes_from_rows(physical);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].global);
+        assert_eq!(
+            changes[0]
+                .before
+                .as_ref()
+                .expect("global before identity")
+                .change_id,
+            ChangeId::for_test_label("global-before")
+        );
+        assert_eq!(
+            changes[0]
+                .after
+                .as_ref()
+                .expect("global after identity")
+                .change_id,
+            ChangeId::for_test_label("global-after")
+        );
+        assert!(!historical_state_identity_changed(
+            Some(&local_before),
+            Some(&local_after)
+        ));
+        assert!(!historical_state_payloads_differ(
+            Some(&local_before),
+            Some(&local_after)
+        ));
+    }
+
+    #[test]
+    fn state_diff_lookup_batches_are_bounded_and_ordered() {
+        let keys = (0..129).map(|index| vec![index as u8]).collect::<Vec<_>>();
+        let batches = super::super::serving::state_diff_lookup_batches(&keys).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch.len() <= 64));
+        assert_eq!(batches.concat(), keys);
+    }
+
+    #[test]
+    fn physical_identity_union_preserves_order_and_tombstone_counterparts() {
+        let mut physical = BTreeMap::new();
+        let mut first_before = historical_row(
+            ChangeId::for_test_label("first-before"),
+            CommitId::for_test_label("first-before-commit"),
+            false,
+            Some(r#"{"value":"one"}"#),
+        );
+        first_before.key.entity_pk = EntityPk::single("row-a");
+        let mut first_after = historical_row(
+            ChangeId::for_test_label("first-after"),
+            CommitId::for_test_label("first-after-commit"),
+            true,
+            None,
+        );
+        first_after.key.entity_pk = EntityPk::single("row-a");
+        let mut second_before = historical_row(
+            ChangeId::for_test_label("second-before"),
+            CommitId::for_test_label("second-before-commit"),
+            false,
+            Some(r#"{"value":"two"}"#),
+        );
+        second_before.key.entity_pk = EntityPk::single("row-b");
+        let mut second_after = second_before.clone();
+        second_after.change_id = ChangeId::for_test_label("second-after");
+        second_after.commit_id = CommitId::for_test_label("second-after-commit");
+        physical.insert(
+            (b"row-b".to_vec(), false),
+            (Some(second_before), Some(second_after)),
+        );
+        physical.insert(
+            (b"row-a".to_vec(), false),
+            (Some(first_before.clone()), Some(first_after.clone())),
+        );
+
+        let changes = super::super::serving::physical_identity_changes_from_rows(physical);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].key.entity_pk, EntityPk::single("row-a"));
+        assert_eq!(changes[1].key.entity_pk, EntityPk::single("row-b"));
+        assert!(historical_state_identity_changed(
+            Some(&first_before),
+            Some(&first_after)
+        ));
+        assert!(historical_state_payloads_differ(
+            Some(&first_before),
+            Some(&first_after)
+        ));
     }
 }

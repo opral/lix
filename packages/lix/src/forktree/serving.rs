@@ -14,8 +14,8 @@ use super::model::{
 };
 use super::object::ObjectId;
 use super::state::{
-    HistoricalStateDiffEntry, HistoricalStateRow, StateCell, StateValue, decode_state_key,
-    decode_state_value,
+    HistoricalStateDiffEntry, HistoricalStateIdentityChange, HistoricalStateRow,
+    HistoricalStateWriteIdentity, StateCell, StateValue, decode_state_key, decode_state_value,
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
@@ -27,6 +27,7 @@ use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
 const CATALOG_SCAN_PAGE_ROWS: usize = 1024;
+const STATE_DIFF_LOOKUP_BATCH_ROWS: usize = 64;
 
 /// Loads a commit's complete authenticated member closure. Small commits keep
 /// the original inline representation; larger commits resolve the immutable
@@ -1794,6 +1795,85 @@ where
     diff_state_rows_between_commits_impl(read, before, after, include_global, false).await
 }
 
+/// Returns every physical state-root identity change, before branch overlay
+/// projection. Public diffs intentionally collapse a global row hidden by a
+/// local row; stale-write detection cannot do that because the hidden global
+/// write is still an authenticated owner change.
+pub(crate) async fn physical_state_identity_changes_between_commits<R>(
+    read: &R,
+    before: crate::changelog::CommitId,
+    after: crate::changelog::CommitId,
+) -> Result<Vec<HistoricalStateIdentityChange>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let before_commit = load_diff_commit(read, before).await?;
+    let after_commit = load_diff_commit(read, after).await?;
+    let roots = collect_state_diff_roots(read, &before_commit, &after_commit).await?;
+
+    let mut physical_rows =
+        BTreeMap::<(Vec<u8>, bool), (Option<HistoricalStateRow>, Option<HistoricalStateRow>)>::new(
+        );
+    for (encoded_key, (global_before, global_after, local_before, local_after)) in roots {
+        let key = decode_state_key(&encoded_key)?;
+        let domains = [
+            (true, global_before, global_after),
+            (false, local_before, local_after),
+        ];
+        for (global, before_value, after_value) in domains {
+            let source = if global {
+                StateSource::Global
+            } else {
+                StateSource::Branch
+            };
+            let before = before_value.map(|value| historical_state_row(key.clone(), value, source));
+            let after = after_value.map(|value| historical_state_row(key.clone(), value, source));
+            physical_rows.insert((encoded_key.clone(), global), (before, after));
+        }
+    }
+
+    let row_refs = physical_rows.values().collect::<Vec<_>>();
+    authenticate_historical_rows(read, &row_refs).await?;
+
+    Ok(physical_identity_changes_from_rows(physical_rows))
+}
+
+pub(crate) fn physical_identity_changes_from_rows(
+    physical_rows: BTreeMap<
+        (Vec<u8>, bool),
+        (Option<HistoricalStateRow>, Option<HistoricalStateRow>),
+    >,
+) -> Vec<HistoricalStateIdentityChange> {
+    physical_rows
+        .into_values()
+        .filter_map(|(before, after)| {
+            historical_state_identity_changed(before.as_ref(), after.as_ref()).then(|| {
+                let key = after
+                    .as_ref()
+                    .or(before.as_ref())
+                    .expect("identity change has an endpoint")
+                    .key
+                    .clone();
+                let global = after
+                    .as_ref()
+                    .or(before.as_ref())
+                    .expect("identity change has an endpoint")
+                    .global;
+                let identity = |row: &HistoricalStateRow| HistoricalStateWriteIdentity {
+                    change_id: row.change_id,
+                    commit_id: row.commit_id,
+                };
+                HistoricalStateIdentityChange {
+                    key,
+                    global,
+                    before: before.as_ref().map(identity),
+                    after: after.as_ref().map(identity),
+                }
+            })
+        })
+        .collect()
+}
+
 async fn diff_state_rows_between_commits_impl<R>(
     read: &R,
     before: crate::changelog::CommitId,
@@ -1806,94 +1886,7 @@ where
 {
     let before_commit = load_diff_commit(read, before).await?;
     let after_commit = load_diff_commit(read, after).await?;
-    let mut roots = BTreeMap::<
-        Vec<u8>,
-        (
-            Option<StateValue>,
-            Option<StateValue>,
-            Option<StateValue>,
-            Option<StateValue>,
-        ),
-    >::new();
-
-    for (before_root, after_root, is_global) in [
-        (
-            before_commit.global_state_root,
-            after_commit.global_state_root,
-            true,
-        ),
-        (
-            before_commit.local_state_root,
-            after_commit.local_state_root,
-            false,
-        ),
-    ] {
-        for (key, before_value, after_value) in
-            diff_ordered_tree_on_read(before_root, after_root, "state", read).await?
-        {
-            let before_value = before_value
-                .as_deref()
-                .map(decode_state_value_storage)
-                .transpose()?;
-            let after_value = after_value
-                .as_deref()
-                .map(decode_state_value_storage)
-                .transpose()?;
-            if is_global
-                && [before_value.as_ref(), after_value.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|value| matches!(value.cell, StateCell::Tombstone))
-            {
-                return Err(corruption("global state tree contains a tombstone").into());
-            }
-            let entry = roots.entry(key).or_insert((None, None, None, None));
-            if is_global {
-                entry.0 = before_value;
-                entry.1 = after_value;
-            } else {
-                entry.2 = before_value;
-                entry.3 = after_value;
-            }
-        }
-    }
-
-    // A changed key may come from only one overlay root. The unchanged root
-    // therefore contributes no diff tuple, but it can still provide the
-    // visible counterpart (for example, a global row hidden by a new local
-    // override). Resolve only those missing endpoint/root cells by point
-    // lookup on this same retained read; never rescan either endpoint.
-    for (encoded_key, (global_before, global_after, local_before, local_after)) in roots.iter_mut()
-    {
-        if global_before.is_none() {
-            *global_before = load_state_value_from_root(
-                before_commit.global_state_root,
-                encoded_key,
-                true,
-                read,
-            )
-            .await?;
-        }
-        if global_after.is_none() {
-            *global_after =
-                load_state_value_from_root(after_commit.global_state_root, encoded_key, true, read)
-                    .await?;
-        }
-        if local_before.is_none() {
-            *local_before = load_state_value_from_root(
-                before_commit.local_state_root,
-                encoded_key,
-                false,
-                read,
-            )
-            .await?;
-        }
-        if local_after.is_none() {
-            *local_after =
-                load_state_value_from_root(after_commit.local_state_root, encoded_key, false, read)
-                    .await?;
-        }
-    }
+    let roots = collect_state_diff_roots(read, &before_commit, &after_commit).await?;
 
     let mut rows =
         BTreeMap::<Vec<u8>, (Option<HistoricalStateRow>, Option<HistoricalStateRow>)>::new();
@@ -1959,6 +1952,226 @@ where
         .collect())
 }
 
+type StateDiffRoots = BTreeMap<
+    Vec<u8>,
+    (
+        Option<StateValue>,
+        Option<StateValue>,
+        Option<StateValue>,
+        Option<StateValue>,
+    ),
+>;
+
+#[derive(Clone, Copy)]
+enum StateDiffRootSlot {
+    GlobalBefore,
+    GlobalAfter,
+    LocalBefore,
+    LocalAfter,
+}
+
+async fn collect_state_diff_roots<R>(
+    read: &R,
+    before_commit: &CommitObjectV1,
+    after_commit: &CommitObjectV1,
+) -> Result<StateDiffRoots, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut roots = StateDiffRoots::new();
+    for (before_root, after_root, is_global) in [
+        (
+            before_commit.global_state_root,
+            after_commit.global_state_root,
+            true,
+        ),
+        (
+            before_commit.local_state_root,
+            after_commit.local_state_root,
+            false,
+        ),
+    ] {
+        for (key, before_value, after_value) in
+            diff_ordered_tree_on_read(before_root, after_root, "state", read).await?
+        {
+            let before_value = before_value
+                .as_deref()
+                .map(decode_state_value_storage)
+                .transpose()?;
+            let after_value = after_value
+                .as_deref()
+                .map(decode_state_value_storage)
+                .transpose()?;
+            reject_global_tombstone(is_global, before_value.as_ref())?;
+            reject_global_tombstone(is_global, after_value.as_ref())?;
+            let entry = roots.entry(key).or_insert((None, None, None, None));
+            if is_global {
+                entry.0 = before_value;
+                entry.1 = after_value;
+            } else {
+                entry.2 = before_value;
+                entry.3 = after_value;
+            }
+        }
+    }
+
+    let mut missing = [
+        (
+            StateDiffRootSlot::GlobalBefore,
+            before_commit.global_state_root,
+            true,
+            Vec::new(),
+        ),
+        (
+            StateDiffRootSlot::GlobalAfter,
+            after_commit.global_state_root,
+            true,
+            Vec::new(),
+        ),
+        (
+            StateDiffRootSlot::LocalBefore,
+            before_commit.local_state_root,
+            false,
+            Vec::new(),
+        ),
+        (
+            StateDiffRootSlot::LocalAfter,
+            after_commit.local_state_root,
+            false,
+            Vec::new(),
+        ),
+    ];
+    for (encoded_key, (global_before, global_after, local_before, local_after)) in &roots {
+        if global_before.is_none() {
+            missing[0].3.push(encoded_key.clone());
+        }
+        if global_after.is_none() {
+            missing[1].3.push(encoded_key.clone());
+        }
+        if local_before.is_none() {
+            missing[2].3.push(encoded_key.clone());
+        }
+        if local_after.is_none() {
+            missing[3].3.push(encoded_key.clone());
+        }
+    }
+    for (slot, root, is_global, keys) in missing {
+        let values = load_state_values_from_root_batch(root, &keys, is_global, read).await?;
+        for (key, value) in keys.into_iter().zip(values) {
+            let entry = roots
+                .get_mut(&key)
+                .expect("missing state lookup key remains in root map");
+            set_state_diff_root_slot(entry, slot, value);
+        }
+    }
+    Ok(roots)
+}
+
+fn set_state_diff_root_slot(
+    entry: &mut (
+        Option<StateValue>,
+        Option<StateValue>,
+        Option<StateValue>,
+        Option<StateValue>,
+    ),
+    slot: StateDiffRootSlot,
+    value: Option<StateValue>,
+) {
+    match slot {
+        StateDiffRootSlot::GlobalBefore => entry.0 = value,
+        StateDiffRootSlot::GlobalAfter => entry.1 = value,
+        StateDiffRootSlot::LocalBefore => entry.2 = value,
+        StateDiffRootSlot::LocalAfter => entry.3 = value,
+    }
+}
+
+async fn load_state_values_from_root_batch<R>(
+    root: ObjectId,
+    keys: &[Vec<u8>],
+    is_global: bool,
+    read: &R,
+) -> Result<Vec<Option<StateValue>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut values = Vec::with_capacity(keys.len());
+    for keys in state_diff_lookup_batches(keys) {
+        let encoded_values = lookup_many_on_read(root, "state", keys, read).await?;
+        for encoded_value in encoded_values {
+            let value = encoded_value
+                .as_deref()
+                .map(decode_state_value_storage)
+                .transpose()?;
+            reject_global_tombstone(is_global, value.as_ref())?;
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+pub(crate) fn state_diff_lookup_batches(keys: &[Vec<u8>]) -> impl Iterator<Item = &[Vec<u8>]> {
+    keys.chunks(STATE_DIFF_LOOKUP_BATCH_ROWS)
+}
+
+fn reject_global_tombstone(
+    is_global: bool,
+    value: Option<&StateValue>,
+) -> Result<(), StorageError> {
+    if is_global && value.is_some_and(|value| matches!(value.cell, StateCell::Tombstone)) {
+        return Err(corruption("global state tree contains a tombstone"));
+    }
+    Ok(())
+}
+
+async fn authenticate_historical_rows<R>(
+    read: &R,
+    rows: &[&(Option<HistoricalStateRow>, Option<HistoricalStateRow>)],
+) -> Result<(), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut change_ids = BTreeSet::new();
+    for &(before, after) in rows {
+        for row in [before.as_ref(), after.as_ref()].into_iter().flatten() {
+            change_ids.insert(row.change_id);
+        }
+    }
+    if change_ids.is_empty() {
+        return Ok(());
+    }
+    let ids = change_ids.into_iter().collect::<Vec<_>>();
+    let records = load_change_records(read, &ids).await?;
+    let mut authenticated = BTreeMap::new();
+    for (id, record) in ids.into_iter().zip(records) {
+        let record = record.ok_or_else(|| {
+            corruption("changed historical state row has no authenticated Change")
+        })?;
+        authenticated.insert(id, record);
+    }
+    for &(before, after) in rows {
+        for row in [before.as_ref(), after.as_ref()].into_iter().flatten() {
+            let record = authenticated.get(&row.change_id).ok_or_else(|| {
+                corruption("changed historical state row lost its authenticated Change")
+            })?;
+            validate_historical_state_row(read, row, record).await?;
+        }
+    }
+    Ok(())
+}
+
+fn historical_state_identity_changed(
+    before: Option<&HistoricalStateRow>,
+    after: Option<&HistoricalStateRow>,
+) -> bool {
+    match (before, after) {
+        (Some(left), Some(right)) => {
+            left.change_id != right.change_id || left.commit_id != right.commit_id
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
+}
+
 async fn load_diff_commit<R>(
     read: &R,
     id: crate::changelog::CommitId,
@@ -2006,25 +2219,6 @@ fn historical_state_row(
         deleted,
         blob_manifest_object_ids: value.blob_manifest_object_ids,
     }
-}
-
-async fn load_state_value_from_root<R>(
-    root: ObjectId,
-    encoded_key: &[u8],
-    is_global: bool,
-    read: &R,
-) -> Result<Option<StateValue>, StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let Some(encoded_value) = lookup_on_read(root, "state", encoded_key, read).await? else {
-        return Ok(None);
-    };
-    let value = decode_state_value_storage(&encoded_value)?;
-    if is_global && matches!(value.cell, StateCell::Tombstone) {
-        return Err(corruption("global state tree contains a tombstone"));
-    }
-    Ok(Some(value))
 }
 
 fn historical_state_payloads_differ(
