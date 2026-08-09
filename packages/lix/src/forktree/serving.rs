@@ -281,6 +281,62 @@ where
     selected_head_commit_id(read, branch_id).await.map(Some)
 }
 
+/// Loads the authenticated semantic identity of a moving branch selector.
+/// The identity is the latest RefChange object named by the selected snapshot;
+/// no head-only live-state projection can manufacture it.
+pub(crate) async fn load_branch_ref_metadata<R>(
+    read: &R,
+    branch_id: &str,
+) -> Result<crate::branch::BranchRefMetadata, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let branch_id = canonical_branch_id(branch_id)?;
+    let view = open_coherent_view_on_read(read, branch_id).await?;
+    let ref_object_id = view
+        .branch_snapshot()
+        .latest_ref_change_object_id
+        .ok_or_else(|| corruption("branch snapshot has no authenticated latest RefChange edge"))?;
+    let bytes = view.load_object_bytes(ref_object_id).await?;
+    let change = ChangeObjectV1::decode(ref_object_id, &bytes)?;
+    let ChangeObjectV1::BranchRef {
+        change_id,
+        updated_at,
+        branch_id: change_branch_id,
+        after_semantic_head_commit_object_id,
+        ..
+    } = change
+    else {
+        return Err(
+            corruption("branch snapshot latest ref-change edge names a semantic Change").into(),
+        );
+    };
+    if change_branch_id != branch_id
+        || after_semantic_head_commit_object_id
+            != Some(view.branch_snapshot().semantic_head_commit_object_id)
+    {
+        return Err(
+            corruption("branch snapshot latest ref-change does not match its branch/head").into(),
+        );
+    }
+    Ok(crate::branch::BranchRefMetadata {
+        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
+        updated_at,
+    })
+}
+
+pub(crate) async fn load_branch_ref_change_id<R>(
+    read: &R,
+    branch_id: &str,
+) -> Result<Option<crate::changelog::ChangeId>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    Ok(Some(
+        load_branch_ref_metadata(read, branch_id).await?.change_id,
+    ))
+}
+
 /// Scans every authenticated branch selector in one coherent read view.
 /// Selector enumeration is storage-streaming and retains only one page plus
 /// the output branch-head list.

@@ -1190,7 +1190,9 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let Some(ref_id) = snapshot.latest_ref_change_object_id else {
-        return Ok(());
+        return Err(corruption(
+            "branch snapshot has no authenticated latest RefChange edge",
+        ));
     };
     let bytes = load_object_bytes(read, ref_id).await?;
     let change = ChangeObjectV1::decode(ref_id, &bytes)?;

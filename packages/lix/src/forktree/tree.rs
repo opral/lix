@@ -1010,7 +1010,9 @@ pub(super) fn validate_branch_snapshot_ref_edge(
     load: impl Fn(ObjectId) -> Result<Bytes, StorageError>,
 ) -> Result<Option<ChangeObjectV1>, StorageError> {
     let Some(ref_change_id) = snapshot.latest_ref_change_object_id else {
-        return Ok(None);
+        return Err(corruption(
+            "branch snapshot has no authenticated latest RefChange edge",
+        ));
     };
     let change = ChangeObjectV1::decode(ref_change_id, &load(ref_change_id)?)?;
     match &change {

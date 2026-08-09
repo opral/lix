@@ -1,5 +1,5 @@
 use crate::LixError;
-use crate::branch::{BranchHead, BranchRefReader};
+use crate::branch::{BranchHead, BranchRefMetadata, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -52,6 +52,22 @@ where
         Ok(self.load_head(branch_id).await?.map(|head| head.commit_id))
     }
 
+    pub(crate) async fn load_head_change_id(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<crate::changelog::ChangeId>, LixError> {
+        crate::forktree::load_branch_ref_change_id(&self.store, branch_id).await
+    }
+
+    pub(crate) async fn load_head_metadata(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<BranchRefMetadata>, LixError> {
+        Ok(Some(
+            crate::forktree::load_branch_ref_metadata(&self.store, branch_id).await?,
+        ))
+    }
+
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
         Ok(crate::forktree::scan_branch_heads(&self.store)
             .await?
@@ -75,6 +91,20 @@ where
 
     async fn load_head_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
         Self::load_head_commit_id(self, branch_id).await
+    }
+
+    async fn load_head_change_id(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<crate::changelog::ChangeId>, LixError> {
+        Self::load_head_change_id(self, branch_id).await
+    }
+
+    async fn load_head_metadata(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<BranchRefMetadata>, LixError> {
+        Self::load_head_metadata(self, branch_id).await
     }
 
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {

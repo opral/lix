@@ -36,7 +36,8 @@ pub(crate) use publication::{
 pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
 pub(crate) use serving::{
     CatalogPage, CommitTopology, CommitTopologyReader, StateSource, StateTreeMutation,
-    VisibleStateRow, edit_state_tree, edit_state_tree_sequence, load_branch_head, load_change,
+    VisibleStateRow, edit_state_tree, edit_state_tree_sequence, load_branch_head,
+    load_branch_ref_change_id, load_branch_ref_metadata, load_change,
     load_change_records, load_commit, load_commit_member_records, load_commit_member_sources,
     load_commit_records, load_commit_topologies, page_changes, page_commits,
     put_change_catalog_entries, put_commit_catalog_entries, scan_branch_heads, scan_change_records,
