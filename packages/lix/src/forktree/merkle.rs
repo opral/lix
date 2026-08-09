@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 
 use crate::binary_cas::BlobId;
 use crate::storage::StorageError;
@@ -433,102 +434,104 @@ where
     })
 }
 
-async fn canonical_range_summary<R>(
-    read: &R,
+fn canonical_range_summary<'a, R>(
+    read: &'a R,
     node: NodeSummary,
     start: u64,
     count: u64,
-    loaded: &mut BTreeMap<ObjectId, Bytes>,
-    objects: &mut ImmutableObjectSet,
-) -> Result<NodeSummary, StorageError>
+    loaded: &'a mut BTreeMap<ObjectId, Bytes>,
+    objects: &'a mut ImmutableObjectSet,
+) -> BoxFuture<'a, Result<NodeSummary, StorageError>>
 where
-    R: StorageAdapterRead + ?Sized,
+    R: StorageAdapterRead + ?Sized + 'a,
 {
-    if count == 0 || start >= node.leaf_count || count > node.leaf_count.saturating_sub(start) {
-        return Err(corruption("Merkle prefix range is outside its source node"));
-    }
-
-    // Even a wholly reused subtree is decoded once before its identity is
-    // carried into the successor. This catches missing/wrong-domain/corrupt
-    // retained roots without fetching any chunk payload.
-    if start == 0 && count == node.leaf_count {
-        let bytes = load_cached_object(read, loaded, node.object_id).await?;
-        let decoded = decode_node(node.object_id, &bytes)?;
-        if decoded.summary(node.object_id) != node {
-            return Err(corruption(
-                "Merkle retained subtree summary is not object-authenticated",
-            ));
+    Box::pin(async move {
+        if count == 0 || start >= node.leaf_count || count > node.leaf_count.saturating_sub(start) {
+            return Err(corruption("Merkle prefix range is outside its source node"));
         }
-        return Ok(node);
-    }
-    if node.height == 0 {
-        return Err(corruption("Merkle prefix split a single leaf"));
-    }
 
-    let bytes = load_cached_object(read, loaded, node.object_id).await?;
-    let DecodedNode::Internal(internal) = decode_node(node.object_id, &bytes)? else {
-        return Err(corruption("Merkle prefix internal node decoded as a leaf"));
-    };
-    if DecodedNode::Internal(internal).summary(node.object_id) != node {
-        return Err(corruption("Merkle prefix source node summary is invalid"));
-    }
-    let left_end = internal.left.first_ordinal + internal.left.leaf_count;
-    let requested_end = node.first_ordinal + start + count;
-    if node.first_ordinal + start + count <= left_end {
-        return canonical_range_summary(
-            read,
-            NodeSummary {
-                object_id: internal.left.object_id,
-                height: internal.left.height,
-                first_ordinal: internal.left.first_ordinal,
-                leaf_count: internal.left.leaf_count,
-                logical_bytes: internal.left.logical_bytes,
-            },
-            node.first_ordinal + start - internal.left.first_ordinal,
-            count,
-            loaded,
-            objects,
-        )
-        .await;
-    }
-    if node.first_ordinal + start >= internal.right.first_ordinal {
-        return canonical_range_summary(
-            read,
-            NodeSummary {
-                object_id: internal.right.object_id,
-                height: internal.right.height,
-                first_ordinal: internal.right.first_ordinal,
-                leaf_count: internal.right.leaf_count,
-                logical_bytes: internal.right.logical_bytes,
-            },
-            node.first_ordinal + start - internal.right.first_ordinal,
-            count,
-            loaded,
-            objects,
-        )
-        .await;
-    }
-    if requested_end <= left_end || node.first_ordinal + start >= internal.right.first_ordinal {
-        return Err(corruption("Merkle prefix child partition is inconsistent"));
-    }
+        // Even a wholly reused subtree is decoded once before its identity is
+        // carried into the successor. This catches missing/wrong-domain/corrupt
+        // retained roots without fetching any chunk payload.
+        if start == 0 && count == node.leaf_count {
+            let bytes = load_cached_object(read, loaded, node.object_id).await?;
+            let decoded = decode_node(node.object_id, &bytes)?;
+            if decoded.summary(node.object_id) != node {
+                return Err(corruption(
+                    "Merkle retained subtree summary is not object-authenticated",
+                ));
+            }
+            return Ok(node);
+        }
+        if node.height == 0 {
+            return Err(corruption("Merkle prefix split a single leaf"));
+        }
 
-    // The requested range crosses an old partition. Repartition it using the
-    // canonical ceil-half shape required for the successor; at most one of
-    // these recursive requests crosses the old boundary at each level.
-    let left_count = count.div_ceil(2);
-    let right_count = count - left_count;
-    let left = canonical_range_summary(read, node, start, left_count, loaded, objects).await?;
-    let right =
-        canonical_range_summary(read, node, start + left_count, right_count, loaded, objects)
-            .await?;
-    let parent = encode_internal(left, right)?;
-    objects.insert(parent.object_id, parent.bytes)?;
-    Ok(NodeSummary {
-        object_id: parent.object_id,
-        height: parent.value.height,
-        first_ordinal: parent.value.first_ordinal,
-        leaf_count: parent.value.leaf_count,
-        logical_bytes: parent.value.logical_bytes,
+        let bytes = load_cached_object(read, loaded, node.object_id).await?;
+        let DecodedNode::Internal(internal) = decode_node(node.object_id, &bytes)? else {
+            return Err(corruption("Merkle prefix internal node decoded as a leaf"));
+        };
+        if DecodedNode::Internal(internal).summary(node.object_id) != node {
+            return Err(corruption("Merkle prefix source node summary is invalid"));
+        }
+        let left_end = internal.left.first_ordinal + internal.left.leaf_count;
+        let requested_end = node.first_ordinal + start + count;
+        if node.first_ordinal + start + count <= left_end {
+            return canonical_range_summary(
+                read,
+                NodeSummary {
+                    object_id: internal.left.object_id,
+                    height: internal.left.height,
+                    first_ordinal: internal.left.first_ordinal,
+                    leaf_count: internal.left.leaf_count,
+                    logical_bytes: internal.left.logical_bytes,
+                },
+                node.first_ordinal + start - internal.left.first_ordinal,
+                count,
+                loaded,
+                objects,
+            )
+            .await;
+        }
+        if node.first_ordinal + start >= internal.right.first_ordinal {
+            return canonical_range_summary(
+                read,
+                NodeSummary {
+                    object_id: internal.right.object_id,
+                    height: internal.right.height,
+                    first_ordinal: internal.right.first_ordinal,
+                    leaf_count: internal.right.leaf_count,
+                    logical_bytes: internal.right.logical_bytes,
+                },
+                node.first_ordinal + start - internal.right.first_ordinal,
+                count,
+                loaded,
+                objects,
+            )
+            .await;
+        }
+        if requested_end <= left_end || node.first_ordinal + start >= internal.right.first_ordinal {
+            return Err(corruption("Merkle prefix child partition is inconsistent"));
+        }
+
+        // The requested range crosses an old partition. Repartition it using the
+        // canonical ceil-half shape required for the successor; at most one of
+        // these recursive requests crosses the old boundary at each level.
+        let left_count = count.div_ceil(2);
+        let right_count = count - left_count;
+        let left = canonical_range_summary(read, node, start, left_count, loaded, objects).await?;
+        let right =
+            canonical_range_summary(read, node, start + left_count, right_count, loaded, objects)
+                .await?;
+        let parent = encode_internal(left, right)?;
+        objects.insert(parent.object_id, parent.bytes)?;
+        Ok(NodeSummary {
+            object_id: parent.object_id,
+            height: parent.value.height,
+            first_ordinal: parent.value.first_ordinal,
+            leaf_count: parent.value.leaf_count,
+            logical_bytes: parent.value.logical_bytes,
+        })
     })
 }
 
