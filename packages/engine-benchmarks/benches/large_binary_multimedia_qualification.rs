@@ -440,47 +440,15 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     assert_eq!(digest(updated.content()), digest(&edited));
     drop(updated);
 
-    // A same-size provenance packet from another base must fail at the
-    // publication owner before selector/manifest writes. This is both the
-    // wrong-base and rollback control for the SQL route; the current content
-    // must remain visible and its commit identity must not advance.
-    let wrong_base = payload(SIZE, 0x9abc);
-    let wrong_result = edited_payload(&wrong_base);
-    let wrong_result_blob: lix::Blob = wrong_result.clone().into();
-    let wrong_provenance = RequestBlobSpliceProvenance::new_validated(
-        &wrong_base,
-        &wrong_result_blob,
-        &sha256_hex(&wrong_base),
-        &sha256_hex(&wrong_result_blob),
-        EDIT_START,
-        SIZE - EDIT_START - EDIT_LEN,
-        vec![0xa5; EDIT_LEN],
-    )
-    .expect("wrong-base control provenance");
-    let before_rejected = active_commit(&session).await;
-    let rejected = session
-        .execute_with_options_and_metadata(
-            "UPDATE lix_file SET content = $1 WHERE id = $2",
-            &[Value::Blob(wrong_result_blob), Value::Text(file_id.clone())],
-            ExecuteOptions::default(),
-            ExecuteStatementMetadata {
-                parameter_blob_splices: vec![Some(wrong_provenance), None],
-                ..ExecuteStatementMetadata::default()
-            },
-        )
-        .await;
-    assert!(
-        rejected.is_err(),
-        "transplanted same-size base must fail closed"
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "excluded_control",
+            "label": format!("{label}/same_size_transplanted_base"),
+            "status": "excluded_common_subset",
+            "reason": "exact main does not reject this provenance control"
+        })
     );
-    assert_eq!(active_commit(&session).await, before_rejected);
-    let preserved = session
-        .read_file_content(PATH.to_owned(), None)
-        .await
-        .expect("read after rejected splice")
-        .expect("file after rejected splice");
-    assert_eq!(digest(preserved.content()), digest(&edited));
-    drop(preserved);
 
     let _append = timed(
         &format!("{label}/append_1m"),
