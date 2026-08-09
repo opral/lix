@@ -6385,7 +6385,8 @@ where
                 &branch_prepared_writes,
                 schema_catalog,
                 &validation_live_state,
-            );
+            )
+            .with_branch_ref_intents(&prepared_writes.branch_ref_intents);
             if self.trust_filesystem_planner {
                 validation_input = validation_input.with_trusted_filesystem_planner();
             }
@@ -6506,11 +6507,18 @@ where
 
     /// Reports whether the active branch has any visible untracked state.
     pub(crate) async fn has_untracked_rows(&mut self) -> Result<bool, LixError> {
-        let branch_id = self.active_branch_id.clone();
+        self.has_untracked_rows_for_branch(&self.active_branch_id.clone())
+            .await
+    }
+
+    pub(crate) async fn has_untracked_rows_for_branch(
+        &mut self,
+        branch_id: &str,
+    ) -> Result<bool, LixError> {
         let rows = self
             .scan_visible_live_state_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    branch_ids: vec![branch_id],
+                    branch_ids: vec![branch_id.to_string()],
                     untracked: Some(true),
                     ..LiveStateFilter::default()
                 },
@@ -6518,7 +6526,11 @@ where
                 limit: Some(1),
             })
             .await?;
-        Ok(!rows.is_empty())
+        Ok(rows.into_rows().into_iter().any(|row| {
+            !row.global
+                && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                && row.schema_key != crate::branch::BRANCH_DESCRIPTOR_SCHEMA_KEY
+        }))
     }
 
     /// Stages the protocol replay receipt into this transaction's final
@@ -9109,6 +9121,10 @@ where
             .ref_reader(read)
             .load_head_commit_id(branch_id)
             .await
+    }
+
+    async fn has_untracked_rows(&mut self, branch_id: &str) -> Result<bool, LixError> {
+        self.has_untracked_rows_for_branch(branch_id).await
     }
 
     async fn load_collection_generation(

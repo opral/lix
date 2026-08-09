@@ -202,6 +202,14 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;
 
+    /// Reports whether the authenticated branch view contains visible
+    /// branch-local untracked state. Destructive selector changes must reject
+    /// while that state exists; lightweight write contexts remain conservative
+    /// by returning false unless they can answer from their transaction view.
+    async fn has_untracked_rows(&mut self, _branch_id: &str) -> Result<bool, LixError> {
+        Ok(false)
+    }
+
     async fn load_collection_generation(
         &mut self,
         _branch_id: &str,
@@ -463,6 +471,19 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .load_branch_head(branch_id)
+                .await
+        }
+    }
+
+    pub(crate) async fn has_untracked_rows(&self, branch_id: &str) -> Result<bool, LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .has_untracked_rows(branch_id)
                 .await
         }
     }

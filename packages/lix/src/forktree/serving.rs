@@ -281,6 +281,47 @@ where
     selected_head_commit_id(read, branch_id).await.map(Some)
 }
 
+/// Loads the authenticated semantic identity of a moving branch selector.
+/// The identity is the latest RefChange object named by the selected snapshot;
+/// no head-only live-state projection can manufacture it.
+pub(crate) async fn load_branch_ref_change_id<R>(
+    read: &R,
+    branch_id: &str,
+) -> Result<Option<crate::changelog::ChangeId>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let branch_id = canonical_branch_id(branch_id)?;
+    let view = open_coherent_view_on_read(read, branch_id).await?;
+    let Some(ref_object_id) = view.branch_snapshot().latest_ref_change_object_id else {
+        return Ok(None);
+    };
+    let bytes = view.load_object_bytes(ref_object_id).await?;
+    let change = ChangeObjectV1::decode(ref_object_id, &bytes)?;
+    let ChangeObjectV1::BranchRef {
+        change_id,
+        branch_id: change_branch_id,
+        after_semantic_head_commit_object_id,
+        ..
+    } = change
+    else {
+        return Err(
+            corruption("branch snapshot latest ref-change edge names a semantic Change").into(),
+        );
+    };
+    if change_branch_id != branch_id
+        || after_semantic_head_commit_object_id
+            != Some(view.branch_snapshot().semantic_head_commit_object_id)
+    {
+        return Err(
+            corruption("branch snapshot latest ref-change does not match its branch/head").into(),
+        );
+    }
+    Ok(Some(crate::changelog::ChangeId::new(
+        uuid::Uuid::from_bytes(*change_id.as_bytes()),
+    )))
+}
+
 /// Scans every authenticated branch selector in one coherent read view.
 /// Selector enumeration is storage-streaming and retains only one page plus
 /// the output branch-head list.
@@ -1677,9 +1718,15 @@ where
     Ok(edits)
 }
 
-struct ObjectOverlayRead<'a, R: ?Sized> {
+pub(super) struct ObjectOverlayRead<'a, R: ?Sized> {
     read: &'a R,
     objects: &'a ImmutableObjectSet,
+}
+
+impl<'a, R: ?Sized> ObjectOverlayRead<'a, R> {
+    pub(super) fn new(read: &'a R, objects: &'a ImmutableObjectSet) -> Self {
+        Self { read, objects }
+    }
 }
 
 impl<R> StorageAdapterRead for ObjectOverlayRead<'_, R>
@@ -2157,7 +2204,7 @@ where
             let bytes = super::view::load_object_bytes(read, *previous_id).await?;
             let previous = ChangeObjectV1::decode(*previous_id, &bytes)?;
             let ChangeObjectV1::BranchRef {
-                change_id: previous_change_id,
+                change_id: _previous_change_id,
                 branch_id: previous_branch_id,
                 after_semantic_head_commit_object_id: previous_after,
                 ..
@@ -2167,7 +2214,6 @@ where
             };
             if previous_branch_id != *branch_id
                 || previous_after != *before_semantic_head_commit_object_id
-                || previous_change_id.as_bytes() >= change_id.as_bytes()
             {
                 return Err(corruption(
                     "RefChange predecessor chronology or branch binding is invalid",

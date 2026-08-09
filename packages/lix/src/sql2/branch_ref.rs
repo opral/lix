@@ -42,6 +42,13 @@ impl BranchRefReader for PreparedBranchRefReader {
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
         self.inner.scan_heads().await
     }
+
+    async fn load_head_change_id(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<crate::changelog::ChangeId>, LixError> {
+        self.inner.load_head_change_id(branch_id).await
+    }
 }
 
 #[cfg(test)]

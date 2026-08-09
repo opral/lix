@@ -291,14 +291,23 @@ impl TableSpec for BranchSpec {
         filters: &[Expr],
     ) -> Result<PlannedDml> {
         let active_branch_id = write_ctx.active_branch_id();
+        let branch_ref = Arc::clone(&self.branch_ref);
         Ok(PlannedDml {
             source: self.write_row_source(filters),
             apply: Arc::new(move |matched_batch| {
                 let write_ctx = write_ctx.clone();
                 let active_branch_id = active_branch_id.clone();
+                let branch_ref = Arc::clone(&branch_ref);
                 async move {
                     let branch_rows = branch_rows_from_batch(&matched_batch)?;
                     reject_protected_branch_deletes(&branch_rows, &active_branch_id)?;
+                    reject_branch_local_untracked_ref_change(
+                        &write_ctx,
+                        branch_ref.as_ref(),
+                        &branch_rows,
+                        true,
+                    )
+                    .await?;
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("DELETE row count overflow".to_string())
                     })?;
@@ -339,16 +348,25 @@ impl TableSpec for BranchSpec {
         filters: &[Expr],
     ) -> Result<PlannedDml> {
         let table_schema = lix_branch_schema();
+        let branch_ref = Arc::clone(&self.branch_ref);
         Ok(PlannedDml {
             source: self.write_row_source(filters),
             apply: Arc::new(move |matched_batch| {
                 let write_ctx = write_ctx.clone();
                 let assignments = assignments.clone();
                 let table_schema = Arc::clone(&table_schema);
+                let branch_ref = Arc::clone(&branch_ref);
                 async move {
                     let branch_rows =
                         branch_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
                     reject_protected_branch_updates(&branch_rows)?;
+                    reject_branch_local_untracked_ref_change(
+                        &write_ctx,
+                        branch_ref.as_ref(),
+                        &branch_rows,
+                        false,
+                    )
+                    .await?;
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("UPDATE row count overflow".to_string())
                     })?;
@@ -390,6 +408,7 @@ impl TableSpec for BranchSpec {
         returning: DmlReturning,
     ) -> Result<PlannedDml> {
         let table_schema = lix_branch_schema();
+        let branch_ref = Arc::clone(&self.branch_ref);
         Ok(PlannedDml {
             source: self.write_row_source(filters),
             apply: Arc::new(move |matched_batch| {
@@ -397,10 +416,18 @@ impl TableSpec for BranchSpec {
                 let assignments = assignments.clone();
                 let table_schema = Arc::clone(&table_schema);
                 let returning = returning.clone();
+                let branch_ref = Arc::clone(&branch_ref);
                 async move {
                     let branch_rows =
                         branch_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
                     reject_protected_branch_updates(&branch_rows)?;
+                    reject_branch_local_untracked_ref_change(
+                        &write_ctx,
+                        branch_ref.as_ref(),
+                        &branch_rows,
+                        false,
+                    )
+                    .await?;
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("UPDATE row count overflow".to_string())
                     })?;
@@ -647,13 +674,20 @@ impl UpsertSupport for BranchSpec {
 
     async fn apply_conflict_update(
         &self,
-        _write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext,
         augmented: &RecordBatch,
         assignments: &[(String, Arc<dyn PhysicalExpr>)],
     ) -> Result<StagedUpsert> {
         let branch_rows =
             branch_update_rows_from_batch(augmented, assignments, &lix_branch_schema())?;
         reject_protected_branch_updates(&branch_rows)?;
+        reject_branch_local_untracked_ref_change(
+            write_ctx,
+            self.branch_ref.as_ref(),
+            &branch_rows,
+            false,
+        )
+        .await?;
         let mut rows = RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
         let mut branch_ref_intents = Vec::new();
         for row in branch_rows {
@@ -1077,6 +1111,44 @@ fn reject_protected_branch_updates(rows: &[BranchRow]) -> Result<()> {
             return Err(DataFusionError::Execution(
                 "UPDATE lix_branch cannot update the global branch".to_string(),
             ));
+        }
+    }
+    Ok(())
+}
+
+async fn reject_branch_local_untracked_ref_change(
+    write_ctx: &SqlWriteContext,
+    branch_ref: &dyn BranchRefReader,
+    rows: &[BranchRow],
+    deleting: bool,
+) -> Result<()> {
+    for row in rows {
+        if !write_ctx
+            .has_untracked_rows(&row.id)
+            .await
+            .map_err(lix_error_to_datafusion_error)?
+        {
+            continue;
+        }
+
+        let changes_head = if deleting {
+            true
+        } else {
+            let current_head = branch_ref
+                .load_head_commit_id(&row.id)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            current_head.as_ref() != Some(&row.commit_id)
+        };
+        if changes_head {
+            let action = if deleting { "delete" } else { "repoint" };
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "cannot {action} branch '{}' while branch-local untracked state exists",
+                    row.id
+                ),
+            )));
         }
     }
     Ok(())

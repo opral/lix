@@ -691,7 +691,12 @@ where
                 .ok_or_else(|| writer_error("branch creation has no source commit"))?;
             let source_commit = load_commit(view, forktree_commit_id(source_head))
                 .await?
-                .ok_or_else(|| writer_error("branch creation source commit is absent"))?;
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_FOREIGN_KEY,
+                        "branch creation source commit is absent",
+                    )
+                })?;
             publication
                 .publish_new_branch_selector(view, branch_id, &source_commit)
                 .map_err(LixError::from)?;
@@ -701,7 +706,12 @@ where
                 Some(commit_id) => Some(
                     load_commit(&target_view, forktree_commit_id(commit_id))
                         .await?
-                        .ok_or_else(|| writer_error("branch selector target commit is absent"))?,
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_FOREIGN_KEY,
+                                "branch selector target commit is absent",
+                            )
+                        })?,
                 ),
                 None => None,
             };

@@ -43,7 +43,8 @@ use crate::schema::{
 use crate::transaction::normalization::reject_reserved_schema_namespace;
 use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{
-    PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
+    BranchRefPublicationIntent, PreparedInsertRef, PreparedValidationRow, PreparedWriteSet,
+    PreparedWriteValidationSet,
 };
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteOrigin;
@@ -67,6 +68,7 @@ pub(crate) struct TransactionValidationInput<'a> {
     schema_catalog: &'a CatalogSnapshot,
     live_state: &'a dyn LiveStateReader,
     trust_filesystem_planner: bool,
+    branch_ref_intents: &'a [BranchRefPublicationIntent],
 }
 
 impl<'a> TransactionValidationInput<'a> {
@@ -80,6 +82,7 @@ impl<'a> TransactionValidationInput<'a> {
             schema_catalog,
             live_state,
             trust_filesystem_planner: false,
+            branch_ref_intents: &[],
         }
     }
 
@@ -88,6 +91,14 @@ impl<'a> TransactionValidationInput<'a> {
     /// validation because their planner snapshot can become stale.
     pub(crate) fn with_trusted_filesystem_planner(mut self) -> Self {
         self.trust_filesystem_planner = true;
+        self
+    }
+
+    pub(crate) fn with_branch_ref_intents(
+        mut self,
+        branch_ref_intents: &'a [BranchRefPublicationIntent],
+    ) -> Self {
+        self.branch_ref_intents = branch_ref_intents;
         self
     }
 
@@ -368,6 +379,7 @@ pub(crate) async fn validate_prepared_writes(
         return Ok(());
     }
     let mut pending_constraints = PendingConstraintIndexes::default();
+    pending_constraints.remember_branch_ref_intents(input.branch_ref_intents)?;
     let mut validated_constraint_rows =
         BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
     let mut file_owner_validator = FileOwnerReferenceValidator::default();
@@ -2066,9 +2078,29 @@ struct PendingConstraintIndexes {
     fk_references: BTreeMap<PendingForeignKeyReferenceTarget, Vec<PendingForeignKeyReference>>,
     tombstones: Vec<PendingTombstone>,
     tombstone_identities: HashSet<DomainRowIdentity>,
+    retired_branch_refs: HashSet<EntityPk>,
 }
 
 impl PendingConstraintIndexes {
+    fn remember_branch_ref_intents(
+        &mut self,
+        intents: &[BranchRefPublicationIntent],
+    ) -> Result<(), LixError> {
+        for intent in intents {
+            if !intent.create && intent.commit_id.is_none() {
+                let branch_pk =
+                    EntityPk::uuid_from_canonical(&intent.branch_id).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            format!("branch selector intent has an invalid branch ID: {error}"),
+                        )
+                    })?;
+                self.retired_branch_refs.insert(branch_pk);
+            }
+        }
+        Ok(())
+    }
+
     fn remember_tombstone(&mut self, row: PreparedValidationRow<'_>) {
         let identity = row.domain_row_identity();
         self.tombstone_identities.insert(identity.clone());
@@ -2205,6 +2237,12 @@ impl PendingConstraintIndexes {
     }
 
     fn tombstones_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+        if row.schema_key() == BRANCH_REF_SCHEMA_KEY
+            && row.untracked()
+            && self.retired_branch_refs.contains(row.entity_pk())
+        {
+            return true;
+        }
         !self.tombstone_identities.is_empty()
             && committed_row_ref_is_exact_branch_scoped(row, row.branch_id())
             && self

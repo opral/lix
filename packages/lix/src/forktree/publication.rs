@@ -16,7 +16,9 @@ use super::model::{
     snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::serving::{CatalogTreeEdit, StateTreeEdit, validate_member_catalog_owner};
+use super::serving::{
+    CatalogTreeEdit, ObjectOverlayRead, StateTreeEdit, validate_member_catalog_owner,
+};
 use super::state::{
     StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
     encode_untracked_value,
@@ -459,21 +461,22 @@ impl PreparedPublication {
         };
         let (ref_object_id, ref_bytes) = branch_ref.encode()?;
         let base_repository_root = self.next_repository_root.unwrap_or(view.repository_root());
-        let change_catalog_edit = view
-            .put_change_catalog_entries(
-                base_repository_root.change_catalog_root,
-                &[(
-                    change_id,
-                    ChangeCatalogEntry {
-                        change_object_id: ref_object_id,
-                        owner: ChangeCatalogOwner::BranchRef {
-                            ref_change_object_id: ref_object_id,
-                            branch_id: view.branch_id(),
-                        },
+        let overlay = ObjectOverlayRead::new(view.storage_read(), &self.object_puts);
+        let change_catalog_edit = super::serving::put_change_catalog_entries(
+            base_repository_root.change_catalog_root,
+            &[(
+                change_id,
+                ChangeCatalogEntry {
+                    change_object_id: ref_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: ref_object_id,
+                        branch_id: view.branch_id(),
                     },
-                )],
-            )
-            .await?;
+                },
+            )],
+            &overlay,
+        )
+        .await?;
         let branch_snapshot = BranchSnapshotV1 {
             branch_id: view.branch_id(),
             local_state_root: next_commit.local_state_root,
