@@ -22,12 +22,12 @@ use crate::live_state::MaterializedLiveStateBatch;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
-    WasmChangeDrainValidator, WasmChangePage, WasmComponentActor, WasmConflictResolution,
-    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
-    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
-    WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
-    WasmEntityConflictSource, WasmEntityKey, WasmEntityPage, WasmEntitySource,
-    WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
+    WasmChangeDrainValidator, WasmChangeEffect, WasmChangePage, WasmComponentActor,
+    WasmConflictResolution, WasmConflictResolutionDrainValidator, WasmConflictResolutionPage,
+    WasmConflictTransition, WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity,
+    WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict,
+    WasmEntityConflictPage, WasmEntityConflictSource, WasmEntityKey, WasmEntityPage,
+    WasmEntitySource, WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
     WasmHostConflictResolution, WasmHostEntity, WasmHostEntityChanges, WasmInputBytes,
     WasmInputSplice, WasmOutputRange, WasmSourceRange, WasmTransitionCounters,
     WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
@@ -2232,6 +2232,220 @@ fn validate_certified_snapshot_packets(
             schema_key
         )));
     }
+    Ok(())
+}
+
+/// Converts a complete certified create packet into the ordinary semantic
+/// change representation consumed by transaction publication. The packet is
+/// still retained on the file write for its bounded storage certificate, but
+/// the transaction must also materialize the logical rows that SQL readers
+/// observe. Certified packets are only used for complete-file transitions;
+/// sparse transitions are returned as ordinary change pages by the runtime.
+pub(crate) fn expand_certified_entity_batches(
+    transition: &mut ValidatedFileTransition,
+    schemas: &SchemaAllowlist,
+) -> Result<(), LixError> {
+    if !transition.changes.changes.is_empty() || transition.certified_batches.is_empty() {
+        return Ok(());
+    }
+
+    enum ExpandedCertifiedRecord {
+        Upsert {
+            key: WasmEntityKey,
+            effect: WasmChangeEffect,
+            snapshot_content: WasmCanonicalJson,
+        },
+        Create {
+            schema_key: String,
+            local_ref: u64,
+            id: String,
+            normalized: SharedStr,
+            fingerprint: Arc<SchemaPlanFingerprint>,
+        },
+    }
+
+    let mut records = Vec::<ExpandedCertifiedRecord>::new();
+    for batch in &transition.certified_batches {
+        if batch.format != 2 || !batch.complete_file_state {
+            return Err(invalid_guest(
+                "certified packet without ordinary changes is not a complete create batch",
+            ));
+        }
+        for page in &batch.pages {
+            let mut page = CertifiedPacketReader::new(page);
+            while !page.finished() {
+                let record_len = page.u32()? as usize;
+                let record_bytes = page.bytes(record_len)?;
+                let mut record = CertifiedPacketReader::new(record_bytes);
+                let tag = record.u8()?;
+                let schema_key = record.text()?.to_owned();
+                let plan = schemas.schema_plan(&schema_key).ok_or_else(|| {
+                    invalid_guest(format!(
+                        "certified packet schema '{schema_key}' has no validation plan"
+                    ))
+                })?;
+                match tag {
+                    0 => {
+                        let component_count = record.u32()? as usize;
+                        if component_count == 0 {
+                            return Err(invalid_guest(
+                                "certified packet upsert key has no components",
+                            ));
+                        }
+                        let components = (0..component_count)
+                            .map(|_| record.text().map(str::to_owned))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let effect = match record.u8()? {
+                            0 => WasmChangeEffect::Content,
+                            1 => WasmChangeEffect::FormatOnly,
+                            _ => {
+                                return Err(invalid_guest(
+                                    "certified packet upsert has an invalid effect",
+                                ));
+                            }
+                        };
+                        let snapshot = record.inline_blob()?;
+                        record.finish()?;
+                        let normalized = canonicalize_snapshot(snapshot)?;
+                        let value = parse_number_free_snapshot(&normalized)?;
+                        let normalized_len = u32::try_from(normalized.len())
+                            .map_err(|_| invalid_guest("certified packet snapshot exceeds u32"))?;
+                        let snapshot_content = WasmCanonicalJson::from_batch_parts(
+                            vec![value],
+                            normalized,
+                            vec![(0, normalized_len)],
+                            1,
+                            1,
+                        )?
+                        .into_iter()
+                        .next()
+                        .expect("one canonical packet snapshot produces one row");
+                        records.push(ExpandedCertifiedRecord::Upsert {
+                            key: WasmEntityKey::from_owned_parts(schema_key, components),
+                            effect,
+                            snapshot_content,
+                        });
+                    }
+                    2 => {
+                        let local_ref = record.u64()?;
+                        let snapshot = record.inline_blob()?;
+                        record.finish()?;
+                        let id = batch.creates.component(local_ref)?;
+                        let entity_pk = EntityPk::uuid_from_canonical(&id).map_err(|error| {
+                            invalid_guest(format!(
+                                "certified packet generated identity '{id}' is invalid: {error}"
+                            ))
+                        })?;
+                        let normalized = SharedStr::from_utf8(Bytes::copy_from_slice(snapshot))
+                            .map_err(|error| {
+                                invalid_guest(format!("certified snapshot is not UTF-8: {error}"))
+                            })?;
+                        let _ = entity_pk;
+                        records.push(ExpandedCertifiedRecord::Create {
+                            schema_key,
+                            local_ref,
+                            id,
+                            normalized,
+                            fingerprint: plan.shared_fingerprint(),
+                        });
+                    }
+                    _ => {
+                        return Err(invalid_guest(
+                            "certified snapshot packet contains a non-snapshot change",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if records.is_empty() {
+        return Err(invalid_guest(
+            "certified complete create batch contains no rows",
+        ));
+    }
+
+    let mut fingerprints = Vec::<Arc<SchemaPlanFingerprint>>::new();
+    let mut fingerprint_indices = Vec::with_capacity(records.len());
+    for record in &records {
+        let ExpandedCertifiedRecord::Create { fingerprint, .. } = record else {
+            continue;
+        };
+        let index = fingerprints
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, fingerprint))
+            .unwrap_or_else(|| {
+                fingerprints.push(Arc::clone(fingerprint));
+                fingerprints.len() - 1
+            });
+        fingerprint_indices.push(
+            u32::try_from(index)
+                .map_err(|_| invalid_guest("too many certified packet schema plans"))?,
+        );
+    }
+    let normalized = records
+        .iter()
+        .filter_map(|record| match record {
+            ExpandedCertifiedRecord::Create { normalized, .. } => Some(normalized.clone()),
+            ExpandedCertifiedRecord::Upsert { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let entity_pks = records
+        .iter()
+        .filter_map(|record| match record {
+            ExpandedCertifiedRecord::Create { id, .. } => Some(EntityPk::uuid_from_canonical(id)),
+            ExpandedCertifiedRecord::Upsert { .. } => None,
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| invalid_guest(format!("certified packet identity is invalid: {error}")))?;
+    let snapshots = if normalized.is_empty() {
+        Vec::new()
+    } else {
+        WasmCanonicalJson::from_certified_batch_parts(
+            normalized,
+            entity_pks,
+            fingerprints,
+            fingerprint_indices,
+            0,
+        )?
+    };
+    let mut snapshots = snapshots.into_iter();
+    transition.changes = WasmEntityChanges {
+        changes: records
+            .into_iter()
+            .map(|record| match record {
+                ExpandedCertifiedRecord::Upsert {
+                    key,
+                    effect,
+                    snapshot_content,
+                } => WasmEntityChange::Upsert {
+                    entity: WasmEntity {
+                        key,
+                        snapshot_content: WasmHostBytes::CanonicalJson(snapshot_content),
+                    },
+                    effect,
+                },
+                ExpandedCertifiedRecord::Create {
+                    schema_key,
+                    local_ref,
+                    id,
+                    ..
+                } => {
+                    let resolved_key =
+                        WasmEntityKey::from_owned_parts(schema_key.clone(), vec![id]);
+                    WasmEntityChange::Create {
+                        schema_key,
+                        local_ref,
+                        resolved_key: Some(resolved_key),
+                        snapshot_content: WasmHostBytes::CanonicalJson(
+                            snapshots
+                                .next()
+                                .expect("certified create has one materialized snapshot"),
+                        ),
+                    }
+                }
+            })
+            .collect(),
+    };
     Ok(())
 }
 

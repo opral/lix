@@ -227,6 +227,7 @@ struct LixFileSpec {
 enum LixFilePayloadReader {
     Authenticated(Arc<dyn crate::forktree::AuthenticatedBlobReader>),
     Write(Arc<dyn BlobDataReader>),
+    WriteAuthenticated(SqlWriteContext),
 }
 
 impl LixFilePayloadReader {
@@ -258,13 +259,23 @@ impl LixFilePayloadReader {
                 )
                 .await
             }
+            Self::WriteAuthenticated(write_ctx) => {
+                lix_file_record_batch_from_prepared_write(
+                    schema,
+                    write_ctx,
+                    plugin_render,
+                    load_data,
+                    prepared,
+                )
+                .await
+            }
         }
     }
 
     fn write_reader(&self) -> Result<&Arc<dyn BlobDataReader>, LixError> {
         match self {
             Self::Write(reader) => Ok(reader),
-            Self::Authenticated(_) => Err(LixError::new(
+            Self::Authenticated(_) | Self::WriteAuthenticated(_) => Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
                 "lix_file write conflict requires a transaction-owned blob writer",
             )),
@@ -380,7 +391,6 @@ impl LixFileSpec {
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
-        let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
         let session_file_views = write_ctx.session_file_views();
         Self {
@@ -388,7 +398,7 @@ impl LixFileSpec {
             live_state,
             filesystem_path_index,
             branch_ref,
-            blob_reader: LixFilePayloadReader::Write(blob_reader),
+            blob_reader: LixFilePayloadReader::WriteAuthenticated(write_ctx.clone()),
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -427,7 +437,6 @@ impl LixFileSpec {
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
-        let blob_reader = write_ctx.blob_reader();
         let plugin_host = write_ctx.plugin_host();
         let session_file_views = write_ctx.session_file_views();
         Self {
@@ -435,7 +444,7 @@ impl LixFileSpec {
             live_state,
             filesystem_path_index,
             branch_ref,
-            blob_reader: LixFilePayloadReader::Write(blob_reader),
+            blob_reader: LixFilePayloadReader::WriteAuthenticated(write_ctx.clone()),
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -1553,11 +1562,13 @@ impl LixFileSpec {
         filters: &[Expr],
         returning: Option<DmlReturning>,
     ) -> Result<PlannedDml> {
+        let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
         let needs_data = filters
             .iter()
             .any(|filter| contains_column(filter, "content"))
             || assignments.iter().any(|(column_name, expr)| {
-                column_name == "path" || physical_expr_contains_column(expr, "content")
+                (column_name == "path" && !update_columns.data)
+                    || physical_expr_contains_column(expr, "content")
             })
             || returning
                 .as_ref()
@@ -1576,7 +1587,6 @@ impl LixFileSpec {
             .indexed_dml_matches(&request, filters, &target_file_ids)
             .await?;
 
-        let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
         let capture_path_resolver_rows = update_columns.requires_path_resolver()
             && matches!(
                 (&self.branch_binding, &target_file_ids),
@@ -1972,13 +1982,9 @@ impl UpsertSupport for LixFileSpec {
         } else {
             None
         };
-        let blob_reader = self
-            .blob_reader
-            .write_reader()
-            .map_err(lix_error_to_datafusion_error)?;
-        lix_file_record_batch_from_prepared(
+        lix_file_record_batch_from_prepared_write(
             &self.schema,
-            blob_reader,
+            write_ctx,
             plugin_render,
             true,
             prepared,
@@ -5004,6 +5010,40 @@ async fn lix_file_record_batch_from_prepared_authenticated(
     .await
 }
 
+async fn lix_file_record_batch_from_prepared_write(
+    schema: &SchemaRef,
+    write_ctx: &SqlWriteContext,
+    plugin_render: Option<PluginRenderContext>,
+    load_data: bool,
+    prepared: PreparedLixFileRows,
+) -> Result<RecordBatch, LixError> {
+    let projected_columns = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    let needs_data = load_data && projected_columns.contains(&"content");
+    let mut blob_bytes = if needs_data {
+        load_authenticated_blob_bytes_for_files_write(
+            write_ctx,
+            &prepared.live_rows,
+            &prepared.file_rows,
+            &prepared.blob_rows,
+        )
+        .await?
+    } else {
+        LoadedBlobBytes::default()
+    };
+    lix_file_record_batch_from_prepared_with_blob_bytes(
+        schema,
+        plugin_render,
+        load_data,
+        prepared,
+        &mut blob_bytes,
+    )
+    .await
+}
+
 async fn lix_file_record_batch_from_prepared_with_blob_bytes(
     schema: &SchemaRef,
     plugin_render: Option<PluginRenderContext>,
@@ -5388,6 +5428,66 @@ async fn load_authenticated_blob_bytes_for_files(
                 "LIX_ERROR_UNKNOWN",
                 format!(
                     "authenticated blob reader returned {} values for {} requested rows",
+                    values.len(),
+                    keys.len()
+                ),
+            ));
+        }
+        bytes_by_key.extend(keys.into_iter().zip(values));
+    }
+    Ok(LoadedBlobBytes {
+        bytes_by_key,
+        remaining_by_key,
+    })
+}
+
+async fn load_authenticated_blob_bytes_for_files_write(
+    write_ctx: &SqlWriteContext,
+    live_rows: &LiveStateBatchOwners,
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+) -> Result<LoadedBlobBytes, LixError> {
+    if file_rows.is_empty() || blob_rows.is_empty() {
+        return Ok(LoadedBlobBytes::default());
+    }
+    let mut bytes_by_key = BTreeMap::new();
+    let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
+    let mut requests_by_branch = BTreeMap::<
+        String,
+        (
+            Vec<FilesystemBlobRefKey>,
+            Vec<crate::forktree::StateKey>,
+            Vec<BlobId>,
+        ),
+    >::new();
+    for file in file_rows.values() {
+        let key = file.blob_ref_key(live_rows);
+        if let Some(row) = blob_rows.get(&key) {
+            let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
+            if *remaining == 0 {
+                if let Some(data) = &row.inline_data {
+                    bytes_by_key.insert(key.clone(), Some(data.clone()));
+                } else {
+                    let branch_id = live_rows.row(row.live).branch_id().to_owned();
+                    let requests = requests_by_branch.entry(branch_id).or_default();
+                    requests.0.push(key);
+                    requests.1.push(row.state_key.clone());
+                    requests.2.push(BlobId::from_hex(&row.blob_hash)?);
+                }
+            }
+            *remaining += 1;
+        }
+    }
+    for (branch_id, (keys, rows, hashes)) in requests_by_branch {
+        let values = write_ctx
+            .load_authenticated_blob_bytes_for_rows(&branch_id, &rows, &hashes)
+            .await?
+            .into_vec();
+        if values.len() != keys.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "authenticated transaction blob reader returned {} values for {} requested rows",
                     values.len(),
                     keys.len()
                 ),
@@ -8965,6 +9065,16 @@ mod tests {
         }
 
         async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
+            BlobDataReader::load_bytes_many(self, hashes).await
+        }
+
+        async fn load_authenticated_blob_bytes_for_rows(
+            &mut self,
+            _branch_id: &str,
+            rows: &[crate::forktree::StateKey],
+            hashes: &[BlobId],
+        ) -> Result<BlobBytesBatch, LixError> {
+            assert_eq!(rows.len(), hashes.len());
             BlobDataReader::load_bytes_many(self, hashes).await
         }
 

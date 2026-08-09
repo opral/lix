@@ -168,6 +168,19 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 
     async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
 
+    async fn load_authenticated_blob_bytes_for_rows(
+        &mut self,
+        branch_id: &str,
+        rows: &[crate::forktree::StateKey],
+        hashes: &[BlobId],
+    ) -> Result<BlobBytesBatch, LixError> {
+        let _ = (branch_id, rows, hashes);
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "authenticated ForkTree blob reader is unavailable for this SQL write context",
+        ))
+    }
+
     async fn scan_live_state_batch(
         &mut self,
         request: &LiveStateScanRequest,
@@ -413,6 +426,24 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .load_bytes_many(hashes)
+                .await
+        }
+    }
+
+    pub(crate) async fn load_authenticated_blob_bytes_for_rows(
+        &self,
+        branch_id: &str,
+        rows: &[crate::forktree::StateKey],
+        hashes: &[BlobId],
+    ) -> Result<BlobBytesBatch, LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .load_authenticated_blob_bytes_for_rows(branch_id, rows, hashes)
                 .await
         }
     }

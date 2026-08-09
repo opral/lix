@@ -45,8 +45,8 @@ use crate::filesystem::{
     FilesystemRowContext, load_path_index_revision,
 };
 use crate::forktree::{
-    CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow, PreparedPublication, StateKey,
-    UploadBindingRef, prepare_upload_part,
+    AuthenticatedBlobReader, CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow,
+    PreparedPublication, StateKey, UploadBindingRef, prepare_upload_part,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{
@@ -73,13 +73,15 @@ use crate::plugin::{
     ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
     VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
     canonicalize_snapshot, drain_conflict_transition_resolutions, drain_entity_transition_edits,
-    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
-    host_entity_with_lazy_snapshot, is_plugin_storage_path, is_reservation_key,
-    local_mutation_identity, materialize_keyless_creates, plugin_archive_file_id_matches,
+    drain_file_transition_changes, expand_certified_entity_batches,
+    host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot, is_plugin_storage_path,
+    is_reservation_key, local_mutation_identity, materialize_keyless_creates,
+    parse_plugin_archive_for_install, plugin_archive_file_id_matches,
     plugin_install_plan_from_archive_path, plugin_key_from_archive_delete_origin,
-    plugin_state_live_state_projection, require_existing_id_authorities, reservation_tombstone_row,
-    reserve_create_row, transport_splice_preserves_prefix_exclusion,
-    transport_splice_preserves_utf8, validate_create_changes, validate_create_reservation,
+    plugin_state_live_state_projection, plugin_storage_archive_file_id,
+    require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
+    transport_splice_preserves_prefix_exclusion, transport_splice_preserves_utf8,
+    validate_create_changes, validate_create_reservation,
 };
 use crate::session::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
@@ -386,28 +388,11 @@ fn decode_visible_materialization_parts(
             ),
         )
     })?;
-    let bytes = match schema_key {
+    let (blob_snapshot, blob_hash) = match schema_key {
         BLOB_REF_SCHEMA_KEY => {
-            let snapshot: PluginUpgradeBlobRefSnapshot =
-                serde_json::from_str(snapshot).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!(
-                            "owned component plugin file '{file_id}' has an invalid blob reference: {error}"
-                        ),
-                    )
-                })?;
-            if snapshot.id != file_id {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!(
-                        "owned component plugin file '{file_id}' materialization identity does not match its file scope"
-                    ),
-                ));
-            }
-            VisibleMaterializationBytes::Blob {
-                hash: BlobId::from_hex(&snapshot.blob_hash)?,
-            }
+            let (snapshot, blob_hash) =
+                decode_plugin_upgrade_blob_ref_snapshot(snapshot, file_id, &semantic_root)?;
+            (Some(snapshot), Some(blob_hash))
         }
         schema_key => {
             return Err(LixError::new(
@@ -418,48 +403,158 @@ fn decode_visible_materialization_parts(
             ));
         }
     };
-    let durable_checkpoint = if schema_key == BLOB_REF_SCHEMA_KEY {
-        let snapshot: PluginUpgradeBlobRefSnapshot =
-            serde_json::from_str(snapshot).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!("invalid authenticated blob reference: {error}"),
-                )
-            })?;
-        snapshot
-            .plugin_checkpoint
-            .map(|checkpoint| {
-                let runtime = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(checkpoint.runtime)
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            format!("invalid durable plugin checkpoint runtime: {error}"),
-                        )
-                    })?;
-                let authority = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(checkpoint.authority)
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            format!("invalid durable plugin checkpoint authority: {error}"),
-                        )
-                    })?;
-                Ok::<DecodedDurablePluginCheckpoint, LixError>(DecodedDurablePluginCheckpoint {
-                    generation: checkpoint.generation,
-                    semantic_root: checkpoint.semantic_root,
-                    runtime: runtime.into(),
-                    authorities: PluginEntityAuthorities::decode_checkpoint(&authority)?,
+    let (bytes, durable_checkpoint) = match (blob_snapshot, blob_hash) {
+        (Some(snapshot), Some(blob_hash)) => (
+            VisibleMaterializationBytes::Blob { hash: blob_hash },
+            snapshot
+                .plugin_checkpoint
+                .map(|checkpoint| {
+                    decode_durable_plugin_checkpoint(checkpoint, &semantic_root, file_id)
                 })
-            })
-            .transpose()?
-    } else {
-        None
+                .transpose()?,
+        ),
+        _ => unreachable!("blob materialization has a decoded blob snapshot"),
     };
     Ok(VisibleMaterialization {
         semantic_root,
         bytes,
         durable_checkpoint,
+    })
+}
+
+fn decode_plugin_upgrade_blob_ref_snapshot(
+    snapshot: &str,
+    file_id: &str,
+    semantic_root: &str,
+) -> Result<(PluginUpgradeBlobRefSnapshot, BlobId), LixError> {
+    let value: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "owned component plugin file '{file_id}' has an invalid blob reference: {error}"
+            ),
+        )
+    })?;
+    if value
+        .get("plugin_checkpoint")
+        .is_some_and(|checkpoint| !checkpoint.is_object())
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("owned component plugin file '{file_id}' has a non-object plugin_checkpoint"),
+        ));
+    }
+    let parsed: PluginUpgradeBlobRefSnapshot = serde_json::from_value(value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "owned component plugin file '{file_id}' has an invalid blob reference: {error}"
+            ),
+        )
+    })?;
+    if parsed.id != file_id {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "owned component plugin file '{file_id}' materialization identity does not match its file scope"
+            ),
+        ));
+    }
+    let blob_hash = BlobId::from_hex(&parsed.blob_hash).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("owned component plugin file '{file_id}' has an invalid BlobId: {error}"),
+        )
+    })?;
+    let _declared_size = parsed.size_bytes;
+    if let Some(checkpoint) = &parsed.plugin_checkpoint {
+        validate_durable_plugin_checkpoint_shape(checkpoint, semantic_root, file_id)?;
+    }
+    Ok((parsed, blob_hash))
+}
+
+fn validate_durable_plugin_checkpoint_shape(
+    checkpoint: &DurableBlobCheckpointSnapshot,
+    semantic_root: &str,
+    file_id: &str,
+) -> Result<(), LixError> {
+    let generation = BlobId::from_hex(&checkpoint.generation).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("durable plugin checkpoint for '{file_id}' has an invalid generation: {error}"),
+        )
+    })?;
+    if generation.to_hex() != checkpoint.generation {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("durable plugin checkpoint for '{file_id}' has a noncanonical generation"),
+        ));
+    }
+    let checkpoint_root = ChangeId::parse(&checkpoint.semantic_root).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "durable plugin checkpoint for '{file_id}' has an invalid semantic_root: {error}"
+            ),
+        )
+    })?;
+    if checkpoint_root.to_string() != checkpoint.semantic_root
+        || checkpoint.semantic_root != semantic_root
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "durable plugin checkpoint for '{file_id}' is bound to a different semantic root"
+            ),
+        ));
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&checkpoint.runtime)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("invalid durable plugin checkpoint runtime: {error}"),
+            )
+        })?;
+    let authority = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&checkpoint.authority)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("invalid durable plugin checkpoint authority: {error}"),
+            )
+        })?;
+    PluginEntityAuthorities::decode_checkpoint(&authority)?;
+    Ok(())
+}
+
+fn decode_durable_plugin_checkpoint(
+    checkpoint: DurableBlobCheckpointSnapshot,
+    semantic_root: &str,
+    file_id: &str,
+) -> Result<DecodedDurablePluginCheckpoint, LixError> {
+    validate_durable_plugin_checkpoint_shape(&checkpoint, semantic_root, file_id)?;
+    let runtime = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&checkpoint.runtime)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("invalid durable plugin checkpoint runtime: {error}"),
+            )
+        })?;
+    let authority = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&checkpoint.authority)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("invalid durable plugin checkpoint authority: {error}"),
+            )
+        })?;
+    Ok(DecodedDurablePluginCheckpoint {
+        generation: checkpoint.generation,
+        semantic_root: checkpoint.semantic_root,
+        runtime: runtime.into(),
+        authorities: PluginEntityAuthorities::decode_checkpoint(&authority)?,
     })
 }
 
@@ -2633,10 +2728,16 @@ where
             plugin_entity_authorities_from_live_batch(plugin, &rows, &entity_ordinals);
         let entity_count = entity_ordinals.len();
         let VisibleMaterializationBytes::Blob { hash } = materialization.bytes;
-        let base_blob_reader = self.binary_cas.reader(read);
-        let materialized_bytes: crate::Blob = load_transaction_blob_bytes(
-            &base_blob_reader,
+        let materialized_state_key = StateKey {
+            schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+            entity_pk: validated_uuid_entity_pk(&actor_key.file_id)?,
+            file_id: Some(actor_key.file_id.clone()),
+        };
+        let materialized_bytes: crate::Blob = load_authenticated_transaction_blob_bytes(
+            read,
             &self.staged_writes,
+            &actor_key.branch_id,
+            &[materialized_state_key],
             &[hash],
         )
         .await?
@@ -4263,33 +4364,64 @@ where
         }
 
         let mut wasm_by_hash = current_install_wasm;
-        let mut missing_hashes = Vec::<BlobId>::new();
-        for entry in cold_entries.values() {
+        let mut missing_requests = BTreeMap::<String, (Vec<StateKey>, Vec<BlobId>)>::new();
+        for (key, entry) in &cold_entries {
             let hash = BlobId::from_hex(entry.wasm_blob_hash())?;
-            if !wasm_by_hash.contains_key(&hash) && !missing_hashes.contains(&hash) {
-                missing_hashes.push(hash);
+            if wasm_by_hash.contains_key(&hash) {
+                continue;
             }
+            let file_id = plugin_storage_archive_file_id(&key.plugin_key);
+            let requests = missing_requests.entry(key.branch_id.clone()).or_default();
+            requests.0.push(StateKey {
+                schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                entity_pk: validated_uuid_entity_pk(&file_id)?,
+                file_id: Some(file_id),
+            });
+            requests
+                .1
+                .push(BlobId::from_hex(entry.archive_blob_hash())?);
         }
-        if !missing_hashes.is_empty() {
-            let base_blob_reader = self.binary_cas.reader(read.clone());
-            let loaded = load_transaction_blob_bytes(
-                &base_blob_reader,
+        for (branch_id, (rows, hashes)) in missing_requests {
+            let loaded_archives = load_authenticated_transaction_blob_bytes(
+                read.clone(),
                 &self.staged_writes,
-                &missing_hashes,
+                &branch_id,
+                &rows,
+                &hashes,
             )
             .await?
             .into_vec();
-            for (hash, bytes) in missing_hashes.into_iter().zip(loaded) {
-                let bytes = bytes.ok_or_else(|| {
+            if loaded_archives.len() != hashes.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "authenticated plugin WASM read expected {} rows, got {} payloads",
+                        hashes.len(),
+                        loaded_archives.len()
+                    ),
+                ));
+            }
+            for (archive_hash, archive_bytes) in hashes.into_iter().zip(loaded_archives) {
+                let archive_bytes = archive_bytes.ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
-                            "plugin registry references missing WASM blob '{}'",
-                            hash.to_hex()
+                            "plugin registry references missing archive blob '{}'",
+                            archive_hash.to_hex()
                         ),
                     )
                 })?;
-                wasm_by_hash.insert(hash, bytes);
+                if BlobId::from_content(&archive_bytes) != archive_hash {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "authenticated plugin archive bytes do not match registry hash '{}'",
+                            archive_hash.to_hex()
+                        ),
+                    ));
+                }
+                let parsed = parse_plugin_archive_for_install(&archive_bytes)?;
+                wasm_by_hash.insert(parsed.wasm_hash, parsed.wasm_bytes);
             }
         }
         for (key, entry) in cold_entries {
@@ -4526,6 +4658,7 @@ where
                         ))
                         .await?;
                         crate::plugin::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
+                        expand_certified_entity_batches(&mut validated, &schemas)?;
                         Ok((actor, validated))
                     });
                     PendingFreshPluginOpen {
@@ -4885,10 +5018,17 @@ where
                             ) = {
                                 let VisibleMaterializationBytes::Blob { hash } =
                                     visible_materialization.bytes;
+                                let materialization_state_key = StateKey {
+                                    schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                                    file_id: Some(actor_key.file_id.clone()),
+                                    entity_pk: validated_uuid_entity_pk(&actor_key.file_id)?,
+                                };
                                 let before_bytes: crate::Blob =
-                                        load_transaction_blob_bytes(
-                                            &self.binary_cas.reader(read.clone()),
+                                        load_authenticated_transaction_blob_bytes(
+                                            read.clone(),
                                             &self.staged_writes,
+                                            &actor_key.branch_id,
+                                            &[materialization_state_key],
                                             &[hash],
                                         )
                                         .await?
@@ -5603,6 +5743,7 @@ where
                 ))
                 .await?;
                 crate::plugin::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
+                expand_certified_entity_batches(&mut validated, &schemas)?;
                 let certified_row_count = validated
                     .certified_batches
                     .iter()
@@ -8124,6 +8265,59 @@ async fn load_transaction_blob_bytes(
     Ok(BlobBytesBatch::new(entries))
 }
 
+async fn load_authenticated_transaction_blob_bytes<R>(
+    read: R,
+    staged_writes: &TransactionWriteBuffer,
+    branch_id: &str,
+    rows: &[StateKey],
+    hashes: &[BlobId],
+) -> Result<BlobBytesBatch, LixError>
+where
+    R: StorageAdapterRead + Clone + Sync,
+{
+    if rows.len() != hashes.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "authenticated blob read expected one hash per state row, got {} rows and {} hashes",
+                rows.len(),
+                hashes.len()
+            ),
+        ));
+    }
+    let mut entries = staged_writes
+        .load_staged_file_bytes_many(hashes)?
+        .into_vec();
+    let mut missing_indices = Vec::new();
+    let mut missing_rows = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.is_none() {
+            missing_indices.push(index);
+            missing_rows.push(rows[index].clone());
+        }
+    }
+    if missing_rows.is_empty() {
+        return Ok(BlobBytesBatch::new(entries));
+    }
+
+    let reader = crate::forktree::blob_reader_on_read(read, branch_id)?;
+    let persisted = reader.load_bytes_for_rows(&missing_rows).await?.into_vec();
+    if persisted.len() != missing_indices.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "authenticated blob read expected {} state rows, got {} payloads",
+                missing_indices.len(),
+                persisted.len()
+            ),
+        ));
+    }
+    for (index, entry) in missing_indices.into_iter().zip(persisted) {
+        entries[index] = entry;
+    }
+    Ok(BlobBytesBatch::new(entries))
+}
+
 struct TransactionReadLiveStateReader<R: crate::storage_adapter::StorageRead> {
     base: crate::live_state::LiveStateStoreReader<SharedStorageAdapterRead<R>>,
     read_store: SharedStorageAdapterRead<R>,
@@ -8681,6 +8875,56 @@ where
         );
         let base = self.binary_cas.reader(read);
         load_transaction_blob_bytes(&base, &self.staged_writes, hashes).await
+    }
+
+    async fn load_authenticated_blob_bytes_for_rows(
+        &mut self,
+        branch_id: &str,
+        rows: &[StateKey],
+        hashes: &[BlobId],
+    ) -> Result<BlobBytesBatch, LixError> {
+        if rows.len() != hashes.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "authenticated blob read expected one hash per state row, got {} rows and {} hashes",
+                    rows.len(),
+                    hashes.len()
+                ),
+            ));
+        }
+        let mut entries = self
+            .staged_writes
+            .load_staged_file_bytes_many(hashes)?
+            .into_vec();
+        let mut missing_indices = Vec::new();
+        let mut missing_rows = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.is_none() {
+                missing_indices.push(index);
+                missing_rows.push(rows[index].clone());
+            }
+        }
+        if missing_rows.is_empty() {
+            return Ok(BlobBytesBatch::new(entries));
+        }
+
+        let reader = crate::forktree::blob_reader_on_read(self.opening_read(), branch_id)?;
+        let persisted = reader.load_bytes_for_rows(&missing_rows).await?.into_vec();
+        if persisted.len() != missing_indices.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "authenticated blob read expected {} state rows, got {} payloads",
+                    missing_indices.len(),
+                    persisted.len()
+                ),
+            ));
+        }
+        for (index, entry) in missing_indices.into_iter().zip(persisted) {
+            entries[index] = entry;
+        }
+        Ok(BlobBytesBatch::new(entries))
     }
 
     async fn scan_live_state_batch(
@@ -10599,14 +10843,17 @@ struct PluginGenerationUpgrade {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PluginUpgradeBlobRefSnapshot {
     id: String,
     blob_hash: String,
+    size_bytes: u64,
     #[serde(default)]
     plugin_checkpoint: Option<DurableBlobCheckpointSnapshot>,
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DurableBlobCheckpointSnapshot {
     generation: String,
     semantic_root: String,
@@ -11336,6 +11583,120 @@ fn transaction_write_has_plugin_lifecycle_candidate(write: &TransactionWrite) ->
                         plugin_archive_file_id_matches(&file_id, plugin_key)
                     })
         })
+}
+
+#[cfg(test)]
+mod plugin_checkpoint_tests {
+    use super::*;
+
+    const FILE_ID: &str = "01920000-0000-7000-8000-0000000000c1";
+    const ROOT: &str = "01920000-0000-7000-8000-0000000000c2";
+    const GENERATION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn authority() -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            PluginEntityAuthorities::empty()
+                .encode_checkpoint()
+                .expect("empty authority checkpoint should encode"),
+        )
+    }
+
+    fn blob_ref(checkpoint: JsonValue) -> String {
+        serde_json::json!({
+            "id": FILE_ID,
+            "blob_hash": GENERATION,
+            "size_bytes": 0,
+            "plugin_checkpoint": checkpoint,
+        })
+        .to_string()
+    }
+
+    fn valid_checkpoint() -> JsonValue {
+        serde_json::json!({
+            "generation": GENERATION,
+            "semantic_root": ROOT,
+            "runtime": "",
+            "authority": authority(),
+        })
+    }
+
+    #[test]
+    fn valid_checkpoint_and_absent_checkpoint_preserve_encoder_shape() {
+        let (parsed, hash) =
+            decode_plugin_upgrade_blob_ref_snapshot(&blob_ref(valid_checkpoint()), FILE_ID, ROOT)
+                .expect("valid durable checkpoint should decode");
+        assert_eq!(parsed.id, FILE_ID);
+        assert_eq!(hash.to_hex(), GENERATION);
+        let decoded = decode_durable_plugin_checkpoint(
+            parsed
+                .plugin_checkpoint
+                .expect("checkpoint should be present"),
+            ROOT,
+            FILE_ID,
+        )
+        .expect("valid durable checkpoint should authenticate");
+        assert_eq!(decoded.generation, GENERATION);
+        assert_eq!(decoded.semantic_root, ROOT);
+
+        let absent = serde_json::json!({
+            "id": FILE_ID,
+            "blob_hash": GENERATION,
+            "size_bytes": 0,
+        })
+        .to_string();
+        let (parsed, _) = decode_plugin_upgrade_blob_ref_snapshot(&absent, FILE_ID, ROOT)
+            .expect("checkpoint absence is the encoded None form");
+        assert!(parsed.plugin_checkpoint.is_none());
+    }
+
+    #[test]
+    fn malformed_checkpoint_shapes_fail_closed() {
+        for checkpoint in [
+            JsonValue::Null,
+            serde_json::json!([]),
+            serde_json::json!({
+                "generation": "wrong",
+                "semantic_root": ROOT,
+                "runtime": "",
+                "authority": authority(),
+            }),
+            serde_json::json!({
+                "generation": GENERATION,
+                "semantic_root": ROOT,
+                "runtime": "!",
+                "authority": authority(),
+            }),
+        ] {
+            assert!(
+                decode_plugin_upgrade_blob_ref_snapshot(&blob_ref(checkpoint), FILE_ID, ROOT)
+                    .is_err(),
+                "malformed checkpoint must not downgrade to an absent checkpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn substituted_checkpoint_root_or_extra_fields_fail_closed() {
+        let substituted_root = serde_json::json!({
+            "generation": GENERATION,
+            "semantic_root": "01920000-0000-7000-8000-0000000000c3",
+            "runtime": "",
+            "authority": authority(),
+        });
+        assert!(
+            decode_plugin_upgrade_blob_ref_snapshot(&blob_ref(substituted_root), FILE_ID, ROOT,)
+                .is_err()
+        );
+
+        let extra = serde_json::json!({
+            "generation": GENERATION,
+            "semantic_root": ROOT,
+            "runtime": "",
+            "authority": authority(),
+            "extra": "second-owner-witness",
+        });
+        assert!(decode_plugin_upgrade_blob_ref_snapshot(&blob_ref(extra), FILE_ID, ROOT).is_err());
+    }
 }
 
 fn transaction_write_branch_ids(write: &TransactionWrite) -> BTreeSet<String> {

@@ -19,6 +19,34 @@
       "type": "integer",
       "minimum": 0,
       "description": "Logical uncompressed file size in bytes for the referenced binary payload."
+    },
+    "plugin_checkpoint": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "semantic_root": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "runtime": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]*$"
+        },
+        "authority": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]*$"
+        }
+      },
+      "required": [
+        "generation",
+        "semantic_root",
+        "runtime",
+        "authority"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [
