@@ -18,8 +18,8 @@ use super::state::{
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
-    apply_ordered_mutations_idempotent_inserts, lookup_on_read, scan_bounded_page_on_read,
-    scan_page_on_read, validate_root_on_read,
+    apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
+    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -1421,26 +1421,42 @@ pub(crate) async fn state_point<R>(
 where
     R: StorageAdapterRead,
 {
+    let mut rows = state_points(view, &[key.to_vec()], include_tombstone).await?;
+    Ok(rows.pop().flatten())
+}
+
+/// Resolves an exact batch through the canonical ordered-tree index on one
+/// retained view. Each internal node and requested leaf is decoded at most
+/// once per root, and result slots preserve caller order and duplicates.
+pub(crate) async fn state_points<R>(
+    view: &CoherentView<R>,
+    keys: &[Vec<u8>],
+    include_tombstone: bool,
+) -> Result<Vec<Option<VisibleStateRow>>, StorageError>
+where
+    R: StorageAdapterRead,
+{
     let (global_root, local_root) = current_state_roots(view);
-    let value_source = match local_root {
-        Some(local_root) => {
-            view.state_point_at_roots(global_root, local_root, key, include_tombstone)
-                .await?
-        }
-        None => view
-            .state_point_at_roots(global_root, global_root, key, include_tombstone)
-            .await?
-            .map(|(value, _)| (value, StateSource::Global)),
-    };
-    let Some((value, source)) = value_source else {
-        return Ok(None);
-    };
-    Ok(Some(VisibleStateRow {
-        encoded_key: key.to_vec(),
-        value,
-        source,
-        view_instance_id: view.view_instance_id(),
-    }))
+    let values = state_points_on_read(
+        global_root,
+        local_root,
+        keys,
+        include_tombstone,
+        view.retained_read(),
+    )
+    .await?;
+    Ok(keys
+        .iter()
+        .zip(values)
+        .map(|(key, value)| {
+            value.map(|(value, source)| VisibleStateRow {
+                encoded_key: key.clone(),
+                value,
+                source,
+                view_instance_id: view.view_instance_id(),
+            })
+        })
+        .collect())
 }
 
 /// Resolves one state identity against explicitly authenticated commit roots
@@ -1456,22 +1472,78 @@ pub(crate) async fn state_point_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    if let Some(encoded) = lookup_on_read(local_state_root, "state", key, read).await? {
-        let value = decode_state_value_storage(&encoded)?;
-        return if value.cell.deleted() && !include_tombstone {
-            Ok(None)
-        } else {
-            Ok(Some((value, StateSource::Branch)))
-        };
+    let mut rows = state_points_on_read(
+        global_state_root,
+        Some(local_state_root),
+        &[key.to_vec()],
+        include_tombstone,
+        read,
+    )
+    .await?;
+    Ok(rows.pop().flatten())
+}
+
+pub(crate) async fn state_points_on_read<R>(
+    global_state_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    keys: &[Vec<u8>],
+    include_tombstone: bool,
+    read: &R,
+) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if keys.is_empty() {
+        return Ok(Vec::new());
     }
-    let Some(encoded) = lookup_on_read(global_state_root, "state", key, read).await? else {
-        return Ok(None);
+    let local_encoded = match local_state_root {
+        Some(root) => lookup_many_on_read(root, "state", keys, read).await?,
+        None => vec![None; keys.len()],
     };
-    let value = decode_state_value_storage(&encoded)?;
-    if matches!(value.cell, StateCell::Tombstone) {
-        return Err(corruption("global state tree contains a tombstone"));
+    let mut local = Vec::with_capacity(local_encoded.len());
+    let mut missing_by_key = BTreeMap::<Vec<u8>, Vec<usize>>::new();
+    for (slot, encoded) in local_encoded.into_iter().enumerate() {
+        match encoded {
+            Some(encoded) => local.push(Some(decode_state_value_storage(&encoded)?)),
+            None => {
+                local.push(None);
+                missing_by_key
+                    .entry(keys[slot].clone())
+                    .or_default()
+                    .push(slot);
+            }
+        }
     }
-    Ok(Some((value, StateSource::Global)))
+    let global_keys = missing_by_key.keys().cloned().collect::<Vec<_>>();
+    let global = lookup_many_on_read(global_state_root, "state", &global_keys, read).await?;
+    let mut global_by_slot = BTreeMap::new();
+    for ((_, slots), value) in missing_by_key.into_iter().zip(global) {
+        for slot in slots {
+            global_by_slot.insert(slot, value.clone());
+        }
+    }
+
+    local
+        .into_iter()
+        .enumerate()
+        .map(|(slot, local)| {
+            if let Some(value) = local {
+                return if value.cell.deleted() && !include_tombstone {
+                    Ok(None)
+                } else {
+                    Ok(Some((value, StateSource::Branch)))
+                };
+            }
+            let Some(encoded) = global_by_slot.remove(&slot).flatten() else {
+                return Ok(None);
+            };
+            let value = decode_state_value_storage(&encoded)?;
+            if matches!(value.cell, StateCell::Tombstone) {
+                return Err(corruption("global state tree contains a tombstone"));
+            }
+            Ok(Some((value, StateSource::Global)))
+        })
+        .collect()
 }
 
 pub(crate) async fn state_range<R>(

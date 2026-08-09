@@ -25,7 +25,7 @@ use crate::forktree::{
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
     StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
     encode_state_key, encode_state_value, load_commit, load_commit_summary,
-    open_coherent_view_on_read, select_historical_commit_member, state_point,
+    open_coherent_view_on_read, select_historical_commit_member, state_point, state_points,
 };
 
 #[cfg(test)]
@@ -401,9 +401,29 @@ where
     catalog_change_ids.push(forktree_change_id(change_refs.branch_ref_change_id));
     let catalog_order = canonical_change_order(&catalog_change_ids)?;
 
+    let tracked_keys = tracked_rows
+        .iter()
+        .map(|row| {
+            encode_state_key(StateKeyRef {
+                schema_key: row.schema_key.as_str(),
+                file_id: row.file_id.map(|value| value.as_str()),
+                entity_pk: row.entity_pk,
+            })
+        })
+        .collect::<Vec<_>>();
+    let previous_rows = state_points(&view, &tracked_keys, true).await?;
+    if previous_rows.len() != tracked_rows.len() {
+        return Err(writer_error(
+            "ForkTree predecessor lookup returned the wrong slot count",
+        ));
+    }
     let mut changes = Vec::with_capacity(tracked_rows.len().saturating_add(1));
     let mut state_mutations = Vec::with_capacity(tracked_rows.len());
-    for row in tracked_rows {
+    for ((row, key), previous) in tracked_rows
+        .into_iter()
+        .zip(tracked_keys)
+        .zip(previous_rows)
+    {
         let row_commit_id = row
             .commit_id
             .ok_or_else(|| writer_error("tracked row has no commit identity"))?;
@@ -415,12 +435,6 @@ where
         let change_id = row
             .change_id
             .ok_or_else(|| writer_error("tracked row has no change identity"))?;
-        let key = encode_state_key(StateKeyRef {
-            schema_key: row.schema_key.as_str(),
-            file_id: row.file_id.map(|value| value.as_str()),
-            entity_pk: row.entity_pk,
-        });
-        let previous = state_point(&view, &key, true).await?;
         let snapshot = stage_forktree_json_slot(&mut publication, row.snapshot)?;
         let metadata = stage_forktree_json_slot(&mut publication, row.metadata)?;
         let json_payload_object_ids = json_payload_object_ids(&snapshot, &metadata)?;

@@ -43,7 +43,7 @@ use super::{
     advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
     load_commit_member_records, load_commit_summary, load_commit_topologies, open_coherent_view,
     page_changes, page_commits, prepare_upload_completion, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_range,
+    put_commit_catalog_entries, state_point, state_points, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -939,6 +939,32 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
             .cell,
         StateCell::Null
     ));
+    let exact = state_points(
+        &view,
+        &[
+            seed.state_keys[2].clone(),
+            seed.state_keys[0].clone(),
+            seed.state_keys[1].clone(),
+            seed.state_keys[2].clone(),
+        ],
+        false,
+    )
+    .await
+    .expect("batched exact state");
+    assert_eq!(exact.len(), 4);
+    assert!(matches!(
+        exact[0].as_ref().map(|row| &row.value.cell),
+        Some(StateCell::Null)
+    ));
+    assert_eq!(exact[0], exact[3]);
+    assert_eq!(
+        exact[1].as_ref().map(|row| row.source),
+        Some(StateSource::Branch)
+    );
+    assert!(
+        exact[2].is_none(),
+        "branch tombstone must mask global state"
+    );
     let rows = state_range(&view, None, None, Some(3), false)
         .await
         .expect("merged range");

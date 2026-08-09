@@ -90,6 +90,10 @@ where
         &self.read
     }
 
+    pub(super) fn retained_read(&self) -> &R {
+        &self.read
+    }
+
     /// Builds the publication's temporary object overlay without exposing
     /// this view's retained storage handle to callers. Staged objects must
     /// still be read through the same authenticated view identity.

@@ -678,6 +678,76 @@ where
     }
 }
 
+/// Resolves exact keys by decoding each authenticated index node at most once
+/// and batching every tree level through the caller's retained read. The
+/// ordered tree remains the sole durable value owner: internal nodes name the
+/// canonical leaf ObjectIds and only requested leaves are materialized.
+pub(super) async fn lookup_many_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    keys: &[Vec<u8>],
+    read: &R,
+) -> Result<Vec<Option<Vec<u8>>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kind = parse_kind(expected_kind)?;
+    let mut output = vec![None; keys.len()];
+    let mut frontier = BTreeMap::<ObjectId, (Option<NodeRef>, Vec<usize>)>::new();
+    frontier.insert(root, (None, (0..keys.len()).collect()));
+
+    while !frontier.is_empty() {
+        let ids = frontier.keys().copied().collect::<Vec<_>>();
+        let objects = load_objects_many_on_read(read, &ids).await?;
+        let mut next = BTreeMap::<ObjectId, (Option<NodeRef>, Vec<usize>)>::new();
+        for (id, (expected, slots)) in frontier {
+            let bytes = objects
+                .get(&id)
+                .ok_or_else(|| corruption(format!("ordered-tree object {id} is absent")))?;
+            let node = decode_node(id, bytes)?;
+            validate_loaded_node(id, &node, kind, expected.as_ref())?;
+            match node.body {
+                NodeBody::Leaf(entries) => {
+                    for slot in slots {
+                        output[slot] = entries
+                            .binary_search_by(|entry| entry.key.as_slice().cmp(&keys[slot]))
+                            .ok()
+                            .map(|index| entries[index].value.clone());
+                    }
+                }
+                NodeBody::Internal(children) => {
+                    for slot in slots {
+                        let child = children
+                            .get(child_index(&children, &keys[slot]))
+                            .ok_or_else(|| {
+                                corruption("ordered-tree exact lookup child index is invalid")
+                            })?
+                            .clone();
+                        match next.entry(child.id) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert((Some(child), vec![slot]));
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                if entry.get().0.as_ref() != Some(&child) {
+                                    return Err(corruption(
+                                        "ordered-tree exact lookup has conflicting child edges",
+                                    ));
+                                }
+                                entry.get_mut().1.push(slot);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    Ok(output)
+}
+
 pub(super) async fn validate_root_on_read<R>(
     root: ObjectId,
     expected_kind: &'static str,
@@ -1414,6 +1484,44 @@ where
         )),
         None => Err(corruption(format!("ordered-tree object {id} is absent"))),
     }
+}
+
+async fn load_objects_many_on_read<R>(
+    read: &R,
+    ids: &[ObjectId],
+) -> Result<BTreeMap<ObjectId, Bytes>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let keys = ids
+        .iter()
+        .map(|id| Key(Bytes::copy_from_slice(id.as_bytes())))
+        .collect::<Vec<_>>();
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: super::object::OBJECT_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    if loaded.values.len() != ids.len() {
+        return Err(corruption(
+            "ordered-tree exact object read returned the wrong slot count",
+        ));
+    }
+    ids.iter()
+        .copied()
+        .zip(loaded.values)
+        .map(|(id, value)| match value {
+            Some(ProjectedValue::FullValue(bytes)) => Ok((id, bytes)),
+            Some(ProjectedValue::KeyOnly) => Err(corruption(
+                "ordered-tree exact object read returned a key-only projection",
+            )),
+            None => Err(corruption(format!("ordered-tree object {id} is absent"))),
+        })
+        .collect()
 }
 
 fn finish_root(
