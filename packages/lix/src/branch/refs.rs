@@ -119,13 +119,6 @@ where
         Self::load_head_commit_id(self, branch_id).await
     }
 
-    async fn load_head_change_id(
-        &self,
-        branch_id: &str,
-    ) -> Result<Option<crate::changelog::ChangeId>, LixError> {
-        Self::load_head_change_id(self, branch_id).await
-    }
-
     async fn load_head_metadata(
         &self,
         branch_id: &str,

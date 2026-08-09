@@ -295,10 +295,17 @@ impl CommitGraphLiveStateReader {
         // the authenticated branch-selector set here for these two ForkTree
         // owned schemas.  The by-branch surfaces deliberately keep their
         // caller-provided branch scope below.
+        let commit_surface = matches!(self.schema_key.as_str(), "lix_commit" | "lix_commit_edge");
         let global_commit_surface =
-            matches!(self.schema_key.as_str(), "lix_commit" | "lix_commit_edge")
-                && self.include_recovery_roots
-                && self.include_retained_nodes;
+            commit_surface && self.include_recovery_roots && self.include_retained_nodes;
+        // EntityByBranch uses the same base schema key, but asks for the
+        // branch projection with `include_retained_nodes = false`.  Its
+        // rows are still the authenticated global commit topology, repeated
+        // under each requested branch projection.  Keeping this mode
+        // distinct from the base global surface preserves requested selector
+        // batching while restoring the public by-branch projection.
+        let by_branch_commit_surface =
+            commit_surface && self.include_recovery_roots && !self.include_retained_nodes;
         let (recovery_roots, retained_nodes_until_gc) = if self.include_recovery_roots {
             self.checkpoint_roots().await?
         } else {
@@ -325,13 +332,46 @@ impl CommitGraphLiveStateReader {
             .iter()
             .map(|(head, _metadata)| (head.branch_id.clone(), head.clone()))
             .collect::<BTreeMap<_, _>>();
-        let global_root_ids = if global_commit_surface {
+        if let Some(requested_branch_ids) = requested_branch_ids.as_ref() {
+            if let Some(missing_branch_id) = requested_branch_ids
+                .iter()
+                .find(|branch_id| !authenticated_heads_by_branch.contains_key(*branch_id))
+            {
+                return Err(LixError::branch_not_found(
+                    missing_branch_id.clone(),
+                    "scan ForkTree derived commit surface",
+                    "branch head",
+                ));
+            }
+        }
+        let global_topology_heads = if by_branch_commit_surface && requested_branch_ids.is_some() {
+            // The requested selector batch above remains the only source for
+            // branch scope and missing-selector validation.  The by-branch
+            // commit projection additionally needs the authenticated global
+            // topology, whose roots are the complete selector set; obtain
+            // that topology batch separately rather than widening the
+            // requested selector batch or issuing per-branch point loads.
+            self.branch_ref.scan_head_metadata().await?
+        } else {
+            authenticated_heads.clone()
+        };
+        let global_root_ids = if global_commit_surface || by_branch_commit_surface {
             let mut root_ids = BTreeSet::new();
-            for (head, _metadata) in &authenticated_heads {
+            for (head, _metadata) in &global_topology_heads {
                 root_ids.insert(head.commit_id);
             }
             for roots in recovery_roots.values() {
                 root_ids.extend(roots.iter().copied());
+            }
+            if by_branch_commit_surface {
+                for entity_pk in &request.filter.entity_pks {
+                    let Ok(commit_text) = entity_pk.as_single_string_owned() else {
+                        continue;
+                    };
+                    if let Ok(commit_id) = CommitId::parse_lix(&commit_text, "requested commit") {
+                        root_ids.insert(commit_id);
+                    }
+                }
             }
             root_ids
         } else {
@@ -353,7 +393,7 @@ impl CommitGraphLiveStateReader {
         };
         let mut rows = Vec::new();
         for branch_id in branch_ids {
-            let head = if global_commit_surface {
+            let head = if global_commit_surface || by_branch_commit_surface {
                 None
             } else {
                 Some(
@@ -385,7 +425,7 @@ impl CommitGraphLiveStateReader {
                         .entry(commit.commit_id)
                         .or_insert(ReachableCommitGraphNode { commit, depth: 0 });
                 }
-            } else if global_commit_surface {
+            } else if global_commit_surface || by_branch_commit_surface {
                 for root_id in &global_root_ids {
                     let reachable = {
                         let mut graph = self.commit_graph.lock().await;
@@ -457,7 +497,9 @@ impl CommitGraphLiveStateReader {
                         deleted: false,
                         created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
                         updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-                        global: branch_id == crate::GLOBAL_BRANCH_ID,
+                        global: global_commit_surface
+                            || by_branch_commit_surface
+                            || branch_id == crate::GLOBAL_BRANCH_ID,
                         change_id: None,
                         commit_id: Some(commit.commit_id),
                         untracked: false,
@@ -512,7 +554,9 @@ impl CommitGraphLiveStateReader {
                             deleted: false,
                             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
                             updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-                            global: branch_id == crate::GLOBAL_BRANCH_ID,
+                            global: global_commit_surface
+                                || by_branch_commit_surface
+                                || branch_id == crate::GLOBAL_BRANCH_ID,
                             change_id: None,
                             commit_id: Some(commit.commit_id),
                             untracked: false,
@@ -1573,6 +1617,263 @@ mod tests {
                 reachable_nodes: Vec::new().into(),
             })
         }
+    }
+
+    #[derive(Clone)]
+    struct SharedTopologyCommitGraphReader {
+        nodes: Arc<[ReachableCommitGraphNode]>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitGraphReader for SharedTopologyCommitGraphReader {
+        async fn load_node(
+            &mut self,
+            commit_id: &CommitId,
+        ) -> Result<Option<CommitGraphNode>, LixError> {
+            Ok(self
+                .nodes
+                .iter()
+                .find(|node| node.commit.commit_id == *commit_id)
+                .map(|node| node.commit.clone()))
+        }
+
+        async fn reachable_nodes(
+            &mut self,
+            _head_commit_id: &CommitId,
+        ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+            Ok(Arc::clone(&self.nodes))
+        }
+
+        async fn load_commit_records(
+            &mut self,
+            commit_ids: &[CommitId],
+        ) -> Result<Vec<Option<CommitRecord>>, LixError> {
+            Ok(vec![None; commit_ids.len()])
+        }
+
+        async fn change_history_from_commit(
+            &mut self,
+            _start_commit_id: &CommitId,
+            _request: &CommitGraphChangeHistoryRequest,
+        ) -> Result<CommitGraphHistory, LixError> {
+            Ok(CommitGraphHistory {
+                entries: Vec::new(),
+                reachable_nodes: Arc::clone(&self.nodes),
+            })
+        }
+    }
+
+    fn with_global_projection_head(
+        branch_ref: &CountingBatchBranchRefReader,
+    ) -> CountingBatchBranchRefReader {
+        let mut reader = CountingBatchBranchRefReader {
+            rows: branch_ref.rows.clone(),
+            scan_calls: AtomicUsize::new(0),
+            load_calls: AtomicUsize::new(0),
+            batch_calls: Mutex::new(Vec::new()),
+        };
+        reader.rows.push((
+            BranchHead {
+                branch_id: crate::GLOBAL_BRANCH_ID.to_owned(),
+                commit_id: CommitId::for_test_label("global-projection-head"),
+            },
+            BranchRefMetadata {
+                change_id: ChangeId::for_test_label("global-projection-change"),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            },
+        ));
+        reader
+    }
+
+    fn shared_topology_nodes(count: usize) -> Arc<[ReachableCommitGraphNode]> {
+        (0..count)
+            .map(|index| ReachableCommitGraphNode {
+                commit: CommitGraphNode {
+                    commit_id: CommitId::for_test_label(&format!("global-projection-{index}")),
+                    generation: 0,
+                    parent_commit_ids: Vec::new(),
+                },
+                depth: 0,
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    fn projection_digest(
+        branch_ids: impl IntoIterator<Item = String>,
+        commit_ids: impl IntoIterator<Item = CommitId>,
+    ) -> String {
+        let mut branch_ids = branch_ids.into_iter().collect::<Vec<_>>();
+        branch_ids.sort();
+        let mut commit_ids = commit_ids.into_iter().collect::<Vec<_>>();
+        commit_ids.sort();
+        let mut digest = blake3::Hasher::new();
+        for branch_id in branch_ids {
+            for commit_id in &commit_ids {
+                digest.update(branch_id.as_bytes());
+                digest.update(b"\0");
+                digest.update(commit_id.to_string().as_bytes());
+                digest.update(b"\0true\n");
+            }
+        }
+        digest.finalize().to_hex().to_string()
+    }
+
+    #[tokio::test]
+    async fn by_branch_global_projection_matches_main_rows_and_digest_at_scale() {
+        for branch_count in [1, 32, 128] {
+            let base_branch_ref = CountingBatchBranchRefReader::new(branch_count);
+            let branch_ref = Arc::new(with_global_projection_head(&base_branch_ref));
+            let nodes = shared_topology_nodes(branch_count + 2);
+            let graph_reader: Box<dyn CommitGraphReader> =
+                Box::new(SharedTopologyCommitGraphReader {
+                    nodes: Arc::clone(&nodes),
+                });
+            let graph = Arc::new(tokio::sync::Mutex::new(graph_reader));
+            let reader = CommitGraphLiveStateReader::new(
+                "lix_commit",
+                graph,
+                branch_ref.clone(),
+                None,
+                true,
+                false,
+            );
+            let request = LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    rows: LiveStateRowFilter::All,
+                    schema_keys: vec!["lix_commit".to_owned()],
+                    branch_ids: Vec::new(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let rows = reader
+                .rows_for_request(&request)
+                .await
+                .expect("by-branch commit projection should authenticate global topology");
+            let branch_ids = branch_ref
+                .rows
+                .iter()
+                .map(|(head, _metadata)| head.branch_id.clone())
+                .collect::<Vec<_>>();
+            let commit_ids = nodes
+                .iter()
+                .map(|node| node.commit.commit_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.len(),
+                (branch_count + 1) * (branch_count + 2),
+                "main-equivalent by-branch row cardinality for B={branch_count}"
+            );
+            assert!(rows.iter().all(|row| row.global));
+            assert_eq!(
+                projection_digest(
+                    rows.iter()
+                        .map(|row| row.branch_id.to_string())
+                        .collect::<BTreeSet<_>>(),
+                    rows.iter()
+                        .filter_map(|row| row.commit_id)
+                        .collect::<BTreeSet<_>>(),
+                ),
+                projection_digest(branch_ids, commit_ids),
+                "main-equivalent canonical by-branch row digest for B={branch_count}"
+            );
+            assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                branch_ref
+                    .batch_calls
+                    .lock()
+                    .expect("batch call log is not poisoned")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn by_branch_explicit_selector_batches_scope_before_global_projection() {
+        let base_branch_ref = CountingBatchBranchRefReader::new(128);
+        let selected_branch_id = base_branch_ref.rows[73].0.branch_id.clone();
+        let branch_ref = Arc::new(with_global_projection_head(&base_branch_ref));
+        let nodes = shared_topology_nodes(130);
+        let graph_reader: Box<dyn CommitGraphReader> = Box::new(SharedTopologyCommitGraphReader {
+            nodes: Arc::clone(&nodes),
+        });
+        let graph = Arc::new(tokio::sync::Mutex::new(graph_reader));
+        let reader = CommitGraphLiveStateReader::new(
+            "lix_commit",
+            graph,
+            branch_ref.clone(),
+            None,
+            true,
+            false,
+        );
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                rows: LiveStateRowFilter::All,
+                schema_keys: vec!["lix_commit".to_owned()],
+                branch_ids: vec![selected_branch_id.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rows = reader
+            .rows_for_request(&request)
+            .await
+            .expect("explicit branch projection should preserve global topology");
+        assert_eq!(rows.len(), 130);
+        assert!(rows.iter().all(|row| row.global));
+        assert_eq!(
+            branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned")
+                .as_slice(),
+            &[vec![selected_branch_id]],
+        );
+        assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn by_branch_explicit_missing_selector_fails_before_global_projection_scan() {
+        let base_branch_ref = CountingBatchBranchRefReader::new(128);
+        let branch_ref = Arc::new(with_global_projection_head(&base_branch_ref));
+        let graph_reader: Box<dyn CommitGraphReader> = Box::new(SharedTopologyCommitGraphReader {
+            nodes: shared_topology_nodes(130),
+        });
+        let graph = Arc::new(tokio::sync::Mutex::new(graph_reader));
+        let reader = CommitGraphLiveStateReader::new(
+            "lix_commit",
+            graph,
+            branch_ref.clone(),
+            None,
+            true,
+            false,
+        );
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                rows: LiveStateRowFilter::All,
+                schema_keys: vec!["lix_commit".to_owned()],
+                branch_ids: vec!["missing-branch".to_owned()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(reader.rows_for_request(&request).await.is_err());
+        assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned")
+                .as_slice(),
+            &[vec!["missing-branch".to_owned()]],
+        );
     }
 
     #[tokio::test]
