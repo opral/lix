@@ -450,26 +450,31 @@ where
         let prepare_ms = duration_to_ms(prepare_started.elapsed());
         phase_totals.prepare_ms += prepare_ms;
 
+        let mut prepared = prepared;
+        let blob_bytes = prepared_blob_bytes(&prepared);
+        let inserts = prepared.inserts.len();
+        let updates = prepared.updates.len();
+        let deletes = prepared.deletes.len();
+        let is_marker_only = prepared.deletes.is_empty()
+            && prepared.inserts.is_empty()
+            && prepared.updates.is_empty();
+
         let build_sql_started = Instant::now();
-        let mut statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
+        let mut statements =
+            build_replay_commit_statements(&mut prepared, DEFAULT_INSERT_BATCH_ROWS);
         statements.push(git_replay_marker_statement(commit));
         let build_sql_ms = duration_to_ms(build_sql_started.elapsed());
         phase_totals.build_sql_ms += build_sql_ms;
 
         let logical_statement_count = statements.len();
         let sql_chars = total_statement_sql_chars(&statements);
-        let blob_bytes = prepared_blob_bytes(&prepared);
-        let inserts = prepared.inserts.len();
-        let updates = prepared.updates.len();
-        let deletes = prepared.deletes.len();
-        if prepared.deletes.is_empty() && prepared.inserts.is_empty() && prepared.updates.is_empty()
-        {
+        if is_marker_only {
             marker_only += 1;
         }
         lix.reset_plugin_transition_counters();
         let execute_started = Instant::now();
         let physical_execution_groups =
-            execute_statements_as_transaction(&lix, &statements, commit_sha)?;
+            execute_statements_as_transaction(&lix, &mut statements, commit_sha)?;
         let execute_ms = duration_to_ms(execute_started.elapsed());
         let plugin_counters = lix.plugin_transition_counters().into();
         phase_totals.execute_ms += execute_ms;
@@ -501,9 +506,7 @@ where
             physical_execution_groups,
             sql_chars,
             blob_bytes,
-            marker_only: prepared.deletes.is_empty()
-                && prepared.inserts.is_empty()
-                && prepared.updates.is_empty(),
+            marker_only: is_marker_only,
             read_diff_ms,
             read_blobs_ms,
             prepare_ms,
@@ -623,7 +626,7 @@ where
 
 fn execute_statements_as_transaction<StorageImpl>(
     lix: &Lix<StorageImpl>,
-    statements: &[SqlStatement],
+    statements: &mut [SqlStatement],
     commit_sha: &str,
 ) -> Result<usize, CliError>
 where
@@ -641,29 +644,30 @@ where
     let mut index = 0;
     let mut physical_execution_groups = 0usize;
     while index < statements.len() {
-        let statement = &statements[index];
+        let statement_sql = statements[index].sql.clone();
+        let statement_params_len = statements[index].params.len();
         let mut end = index + 1;
         while end < statements.len()
-            && statements[end].sql == statement.sql
-            && statements[end].params.len() == statement.params.len()
+            && statements[end].sql == statement_sql
+            && statements[end].params.len() == statement_params_len
         {
             end += 1;
         }
-        if end - index >= 2 && is_prepared_replay_shape(&statement.sql) {
+        if end - index >= 2 && is_prepared_replay_shape(&statement_sql) {
             let parameter_batch = PreparedDmlParameterBatch::from_rows(
                 statements[index..end]
-                    .iter()
-                    .map(|statement| statement.params.clone()),
+                    .iter_mut()
+                    .map(|statement| std::mem::take(&mut statement.params)),
             )
             .map_err(|error| {
                 CliError::msg(format!(
                     "failed at commit {commit_sha} while packing prepared replay batch: {error}"
                 ))
             })?;
-            db::block_on(transaction.execute_prepared_dml_batch(
-                Arc::<str>::from(statement.sql.as_str()),
-                parameter_batch,
-            ))
+            db::block_on(
+                transaction
+                    .execute_prepared_dml_batch(Arc::<str>::from(statement_sql), parameter_batch),
+            )
             .map_err(|error| {
                 CliError::msg(format!(
                     "failed at commit {commit_sha} while executing prepared replay batch: {error}"
@@ -957,10 +961,11 @@ where
     if pending.deletes.is_empty() && pending.inserts.is_empty() && pending.updates.is_empty() {
         return Ok(0);
     }
-    let prepared = std::mem::take(pending);
-    let statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
-    execute_statements_as_transaction(lix, &statements, parent_commit)?;
-    Ok(prepared.inserts.len())
+    let mut prepared = std::mem::take(pending);
+    let inserted = prepared.inserts.len();
+    let mut statements = build_replay_commit_statements(&mut prepared, DEFAULT_INSERT_BATCH_ROWS);
+    execute_statements_as_transaction(lix, &mut statements, parent_commit)?;
+    Ok(inserted)
 }
 
 fn read_tree_snapshot_changes(repo_path: &Path, commit_sha: &str) -> Result<Vec<Change>, CliError> {
@@ -1881,7 +1886,7 @@ fn resolve_write_target(state: &mut ReplayState, change: &Change) -> Result<Writ
 }
 
 fn build_replay_commit_statements(
-    batch: &PreparedBatch,
+    batch: &mut PreparedBatch,
     _max_insert_rows: usize,
 ) -> Vec<SqlStatement> {
     if batch.deletes.is_empty() && batch.inserts.is_empty() && batch.updates.is_empty() {
@@ -1905,20 +1910,20 @@ fn build_replay_commit_statements(
         statements.push(SqlStatement { sql, params });
     }
 
-    for row in &batch.inserts {
+    for row in &mut batch.inserts {
         statements.push(SqlStatement {
             sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
                 .to_string(),
             params: vec![
                 Value::Text(row.id.clone()),
                 Value::Text(row.path.clone()),
-                value_from_optional_blob(row.data.as_ref()),
+                value_from_optional_blob(row.data.take()),
                 git_file_metadata_value(row),
             ],
         });
     }
 
-    for row in &batch.updates {
+    for row in &mut batch.updates {
         statements.push(SqlStatement {
             sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET content = excluded.content, \
@@ -1927,7 +1932,7 @@ fn build_replay_commit_statements(
             params: vec![
                 Value::Text(row.id.clone()),
                 Value::Text(row.path.clone()),
-                value_from_optional_blob(row.data.as_ref()),
+                value_from_optional_blob(row.data.take()),
                 git_file_metadata_value(row),
             ],
         });
@@ -1936,12 +1941,12 @@ fn build_replay_commit_statements(
     statements
 }
 
-fn value_from_optional_blob(data: Option<&Vec<u8>>) -> Value {
+fn value_from_optional_blob(data: Option<Vec<u8>>) -> Value {
     // A Gitlink is a commit reference rather than a blob. `lix_file` requires
     // binary data, so its payload is empty and the real Git type/object id is
     // carried in metadata. Readers must use `git_mode` to distinguish it from
     // an ordinary empty blob.
-    Value::Blob(data.cloned().unwrap_or_default().into())
+    Value::Blob(data.unwrap_or_default().into())
 }
 
 fn git_file_metadata_value(row: &WriteRow) -> Value {
@@ -2572,7 +2577,7 @@ mod tests {
         let before = PreparedDmlParameterBatch::take_execution_counters();
         let lix =
             db::block_on(open_lix().with_storage(Memory::new())).expect("memory Lix should open");
-        let statements =
+        let mut statements =
             vec![
             SqlStatement {
                 sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
@@ -2600,7 +2605,7 @@ mod tests {
             }),
         ];
         let physical_execution_groups =
-            execute_statements_as_transaction(&lix, &statements, "commit-1")
+            execute_statements_as_transaction(&lix, &mut statements, "commit-1")
                 .expect("ordinary replay transaction should commit");
         assert_eq!(physical_execution_groups, 2);
         let after = PreparedDmlParameterBatch::take_execution_counters();
@@ -3114,7 +3119,7 @@ mod tests {
 
     #[test]
     fn build_replay_commit_statements_batches_stable_id_upserts() {
-        let batch = PreparedBatch {
+        let mut batch = PreparedBatch {
             deletes: Vec::new(),
             inserts: Vec::new(),
             updates: vec![WriteRow {
@@ -3126,7 +3131,9 @@ mod tests {
             }],
         };
 
-        let statements = build_replay_commit_statements(&batch, DEFAULT_INSERT_BATCH_ROWS);
+        let statements = build_replay_commit_statements(&mut batch, DEFAULT_INSERT_BATCH_ROWS);
+
+        assert!(batch.updates[0].data.is_none());
 
         assert_eq!(statements.len(), 1);
         assert_eq!(
@@ -3146,7 +3153,7 @@ mod tests {
 
     #[test]
     fn build_replay_commit_statements_rebinds_renames_via_delete_then_insert() {
-        let batch = PreparedBatch {
+        let mut batch = PreparedBatch {
             deletes: vec!["/src/old.ts".to_string()],
             inserts: vec![WriteRow {
                 id: "/src/new.ts".to_string(),
@@ -3158,7 +3165,9 @@ mod tests {
             updates: Vec::new(),
         };
 
-        let statements = build_replay_commit_statements(&batch, DEFAULT_INSERT_BATCH_ROWS);
+        let statements = build_replay_commit_statements(&mut batch, DEFAULT_INSERT_BATCH_ROWS);
+
+        assert!(batch.inserts[0].data.is_none());
 
         assert_eq!(statements.len(), 2);
         assert_eq!(statements[0].sql, "DELETE FROM lix_file WHERE id IN (?)");
