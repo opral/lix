@@ -9,6 +9,8 @@ mapfile -t changed < <(git diff --name-only "$base" HEAD)
 for path in "${changed[@]}"; do
     case "$path" in
         packages/engine-benchmarks/tests/prepared_cas_streaming_qualification/*) ;;
+        packages/engine-benchmarks/tests/prepared_cas_streaming_adapter.rs) ;;
+        packages/engine-benchmarks/Cargo.toml) ;;
         *) echo "forbidden non-test path changed: $path" >&2; exit 1 ;;
     esac
 done

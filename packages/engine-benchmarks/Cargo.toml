@@ -98,6 +98,11 @@ path = "tests/plugin_blobref_reopen.rs"
 required-features = ["rocksdb", "slatedb", "plugin-wasm-tests"]
 
 [[test]]
+name = "prepared_cas_streaming_adapter"
+path = "tests/prepared_cas_streaming_adapter.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
 name = "tpch_overlay_helpers"
 path = "tests/tpch_overlay_helpers.rs"
 
