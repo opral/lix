@@ -21,7 +21,7 @@ use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BlobBytesBatch, BlobId};
+use crate::binary_cas::{BlobBytesBatch, BlobId, BlobLayout, BlobWriteReceipt};
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchLifecycle, BranchOperation, BranchRefReader,
     BranchReferenceRole,
@@ -117,7 +117,7 @@ use crate::transaction::stale_commit::{
 };
 use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
-    CertifiedRawWriteBatchPreparation, PreparedRowFacts, PreparedStateBatch,
+    CertifiedRawWriteBatchPreparation, FileContent, PreparedRowFacts, PreparedStateBatch,
     PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
     StagedCommitChangeBatchBuilder, TransactionFileContent, TransactionJson, TransactionWrite,
     TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
@@ -686,6 +686,8 @@ struct TypedStateTransitionTarget {
     change_id: ChangeId,
     snapshot_content: Option<SharedStr>,
     metadata: Option<SharedStr>,
+    global: bool,
+    blob_manifest_object_ids: Vec<crate::forktree::ObjectId>,
 }
 
 /// State which must be restored when `RETURNING` evaluation fails after a
@@ -7425,6 +7427,8 @@ where
                 change_id: row.change_id,
                 snapshot_content: row.snapshot_content.clone(),
                 metadata: row.metadata.clone(),
+                global: row.global,
+                blob_manifest_object_ids: row.blob_manifest_object_ids.clone(),
             });
             if expected_change_id != target.as_ref().map(|target| target.change_id) {
                 transitions.push(TypedStateTransition {
@@ -7450,6 +7454,7 @@ where
         let branch_id = self.active_branch_id.clone();
         let rows_affected = transitions.len() as u64;
         let mut rows = RawWriteBatch::with_capacity(transitions.len());
+        let mut file_content = Vec::new();
         for transition in transitions {
             if transition.expected_change_id
                 == transition.target.as_ref().map(|target| target.change_id)
@@ -7459,18 +7464,33 @@ where
                     "typed tracked-state transition contains an unchanged row",
                 ));
             }
-            let (snapshot, metadata) = match transition.target {
+            let (snapshot, metadata, target_global) = match transition.target.as_ref() {
                 Some(target) => (
                     parse_materialized_diff_json(
-                        target.snapshot_content,
+                        target.snapshot_content.clone(),
                         "typed state transition target",
                     )?,
                     parse_materialized_diff_json(
-                        target.metadata,
+                        target.metadata.clone(),
                         "typed state transition target metadata",
                     )?,
+                    target.global,
                 ),
-                None => (None, None),
+                None => (None, None, false),
+            };
+            if let Some(target) = transition.target.as_ref() {
+                if let Some(content) = Self::historical_blob_ref_file_content(
+                    &transition.identity,
+                    target,
+                    &branch_id,
+                )? {
+                    file_content.push(content);
+                }
+            }
+            let write_branch_id = if target_global {
+                GLOBAL_BRANCH_ID.to_string()
+            } else {
+                branch_id.clone()
             };
             rows.push(TransactionWriteRow {
                 entity_pk: Some(transition.identity.entity_pk),
@@ -7481,18 +7501,27 @@ where
                 origin: None,
                 created_at: None,
                 updated_at: None,
-                global: false,
+                global: target_global,
                 change_id: None,
                 commit_id: None,
                 untracked: false,
-                branch_id: branch_id.clone().into(),
+                branch_id: write_branch_id.into(),
             });
         }
-        self.stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows,
-        })
-        .await?;
+        let write = if file_content.is_empty() {
+            TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows,
+            }
+        } else {
+            TransactionWrite::RowsWithFileContent {
+                mode: TransactionWriteMode::Replace,
+                rows,
+                file_content,
+                count: rows_affected,
+            }
+        };
+        self.stage_write(write).await?;
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected,
             commit_id: self
@@ -7500,6 +7529,101 @@ where
                 .commit_id_for_branch(&branch_id)?
                 .map(|commit_id| commit_id.to_string()),
         })
+    }
+
+    fn historical_blob_ref_file_content(
+        identity: &TrackedStateKey,
+        target: &TypedStateTransitionTarget,
+        branch_id: &str,
+    ) -> Result<Option<TransactionFileContent>, LixError> {
+        if identity.schema_key != "lix_binary_blob_ref" {
+            return Ok(None);
+        }
+        let file_id = identity.file_id.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "historical BlobRef transition has no file identity",
+            )
+        })?;
+        let entity_pk = EntityPk::uuid_from_canonical(file_id).map_err(|_| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "historical BlobRef transition file identity is not a canonical UUID",
+            )
+        })?;
+        if identity.entity_pk != entity_pk {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "historical BlobRef transition key identity is inconsistent",
+            ));
+        }
+        let snapshot = target.snapshot_content.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "live historical BlobRef transition has no snapshot",
+            )
+        })?;
+        #[derive(serde::Deserialize)]
+        struct HistoricalBlobRefSnapshot {
+            id: String,
+            blob_hash: String,
+            size_bytes: u64,
+        }
+        let snapshot =
+            serde_json::from_str::<HistoricalBlobRefSnapshot>(snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("historical BlobRef transition snapshot is malformed: {error}"),
+                )
+            })?;
+        if snapshot.id != file_id {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "historical BlobRef transition payload identity does not match its StateKey",
+            ));
+        }
+        let blob_hash = BlobId::from_hex(&snapshot.blob_hash).map_err(|error| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("historical BlobRef transition has an invalid BlobId: {error}"),
+            )
+        })?;
+        if target.blob_manifest_object_ids.len() != 1 {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "historical live BlobRef transition must carry exactly one authenticated manifest",
+            ));
+        }
+        let manifest_object_id = target.blob_manifest_object_ids[0];
+        if manifest_object_id == crate::forktree::ObjectId::ZERO {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "historical BlobRef transition has a zero manifest identity",
+            ));
+        }
+        let receipt = BlobWriteReceipt {
+            hash: blob_hash,
+            size_bytes: snapshot.size_bytes,
+            // The durable manifest edge is the authority here; this receipt
+            // carries no staged payload whose physical layout needs to be
+            // described. Commit uses the authenticated manifest identity.
+            layout: BlobLayout::Empty,
+            manifest_object_id: *manifest_object_id.as_bytes(),
+            manifest_was_existing: true,
+        };
+        Ok(Some(TransactionFileContent::new(
+            file_id.to_owned(),
+            None,
+            None,
+            if target.global {
+                GLOBAL_BRANCH_ID.to_owned()
+            } else {
+                branch_id.to_owned()
+            },
+            target.global,
+            false,
+            FileContent::PreparedCas(receipt),
+        )))
     }
 
     async fn execute_apply_or_revert(
