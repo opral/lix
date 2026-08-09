@@ -2564,8 +2564,8 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![
-            StateTreeMutation::insert(key.clone(), value),
             StateTreeMutation::insert(wrong_owner_key.clone(), wrong_owner),
+            StateTreeMutation::insert(key.clone(), value),
             StateTreeMutation::insert(mismatched_owner_key.clone(), mismatched_owner),
             StateTreeMutation::insert(transplanted_owner_key.clone(), transplanted_owner),
             StateTreeMutation::insert(valid_multichunk_key.clone(), valid_multichunk_owner),
