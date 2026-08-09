@@ -293,12 +293,7 @@ where
 {
     let branch_id = canonical_branch_id(branch_id)?;
     let view = open_coherent_view_on_read(read, branch_id).await?;
-    let ref_object_id = view
-        .branch_snapshot()
-        .latest_ref_change_object_id
-        .ok_or_else(|| corruption("branch snapshot has no authenticated latest RefChange edge"))?;
-    let bytes = view.load_object_bytes(ref_object_id).await?;
-    let change = ChangeObjectV1::decode(ref_object_id, &bytes)?;
+    let change = view.latest_ref_change();
     let ChangeObjectV1::BranchRef {
         change_id,
         updated_at,
@@ -311,8 +306,8 @@ where
             corruption("branch snapshot latest ref-change edge names a semantic Change").into(),
         );
     };
-    if change_branch_id != branch_id
-        || after_semantic_head_commit_object_id
+    if *change_branch_id != branch_id
+        || *after_semantic_head_commit_object_id
             != Some(view.branch_snapshot().semantic_head_commit_object_id)
     {
         return Err(
@@ -321,7 +316,7 @@ where
     }
     Ok(crate::branch::BranchRefMetadata {
         change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
-        updated_at,
+        updated_at: *updated_at,
     })
 }
 
@@ -409,9 +404,7 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let view = open_coherent_view_on_read(read, branch_id).await?;
-    let selected_id = view.branch_snapshot().semantic_head_commit_object_id;
-    let bytes = view.load_object_bytes(selected_id).await?;
-    let commit = CommitObjectV1::decode(selected_id, &bytes)?;
+    let commit = view.semantic_head_commit();
     Ok(crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
         *commit.commit_id.as_bytes(),
     )))
