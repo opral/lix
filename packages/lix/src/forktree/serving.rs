@@ -891,7 +891,7 @@ where
         &commit,
     )
     .await?;
-    validate_retained_commit_with_context(
+    let validated_members = validate_retained_commit_with_context(
         read,
         repository.commit_catalog_root,
         repository.change_catalog_root,
@@ -901,32 +901,12 @@ where
     )
     .await?;
     let members = &closure.members;
+    if validated_members.len() != members.len() {
+        return Err(corruption("validated commit member count changed during read").into());
+    }
     let mut records = Vec::with_capacity(members.len());
-    for (ordinal, member) in members.iter().copied().enumerate() {
-        let change_object_id = member.change_object_id();
-        let bytes = super::view::load_object_bytes(read, change_object_id).await?;
-        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
-        let change_id = change.change_id();
-        let value = lookup_on_read(
-            repository.change_catalog_root,
-            "change",
-            change_id.as_bytes(),
-            read,
-        )
-        .await?
-        .ok_or_else(|| corruption("Commit member has no ChangeCatalog owner"))?;
-        let entry = ChangeCatalogEntry::decode(&value)?;
-        validate_member_catalog_owner(
-            read,
-            repository.commit_catalog_root,
-            commit_object_id,
-            commit.generation,
-            ordinal,
-            member,
-            entry,
-            Some(&closure),
-        )
-        .await?;
+    for (member, validated) in members.iter().copied().zip(validated_members) {
+        let change_id = validated.change.change_id();
         let source_commit_id = match member.source() {
             None => commit_id,
             Some((source_commit_object_id, _)) => {
@@ -937,7 +917,7 @@ where
         };
         records.push((
             crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*source_commit_id.as_bytes())),
-            semantic_change_record(read, repository.change_catalog_root, change_id, entry).await?,
+            decode_validated_change_record(change_id, validated.change)?,
         ));
     }
     Ok(Some(records))
@@ -1285,6 +1265,13 @@ where
         }
         _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid").into()),
     }
+    decode_change_record(id, change)
+}
+
+fn decode_change_record(
+    id: ChangeId,
+    change: ChangeObjectV1,
+) -> Result<crate::changelog::ChangeRecord, crate::LixError> {
     let (payload, json_payload_object_ids) = match change {
         ChangeObjectV1::Semantic {
             payload,
@@ -1312,6 +1299,13 @@ where
         .into());
     }
     Ok(record)
+}
+
+fn decode_validated_change_record(
+    id: ChangeId,
+    change: ChangeObjectV1,
+) -> Result<crate::changelog::ChangeRecord, crate::LixError> {
+    decode_change_record(id, change)
 }
 
 async fn validate_commit_catalog_identity<R>(
@@ -2304,7 +2298,7 @@ where
     let closure =
         load_authenticated_member_closure(read, commit_catalog_root, commit_object_id, commit)
             .await?;
-    validate_retained_commit_with_context(
+    let _ = validate_retained_commit_with_context(
         read,
         commit_catalog_root,
         change_catalog_root,
@@ -2312,7 +2306,13 @@ where
         commit,
         Some(&closure),
     )
-    .await
+    .await?;
+    Ok(())
+}
+
+struct ValidatedCommitMember {
+    change: ChangeObjectV1,
+    entry: ChangeCatalogEntry,
 }
 
 async fn validate_retained_commit_with_context<R>(
@@ -2322,7 +2322,7 @@ async fn validate_retained_commit_with_context<R>(
     commit_object_id: ObjectId,
     commit: &CommitObjectV1,
     context: Option<&AuthenticatedMemberClosure<'_, R>>,
-) -> Result<(), StorageError>
+) -> Result<Vec<ValidatedCommitMember>, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -2344,6 +2344,7 @@ where
             "retained commit validation requires an authenticated member closure",
         ));
     };
+    let mut validated_members = Vec::with_capacity(members.len());
     for (ordinal, member) in members.iter().copied().enumerate() {
         let change_object_id = member.change_object_id();
         let bytes = super::view::load_object_bytes(read, change_object_id).await?;
@@ -2371,8 +2372,9 @@ where
             context,
         )
         .await?;
+        validated_members.push(ValidatedCommitMember { change, entry });
     }
-    Ok(())
+    Ok(validated_members)
 }
 
 /// Authenticates one visited standalone branch-ref fact and its immediate
