@@ -21,6 +21,16 @@ use crate::storage_adapter::StorageAdapterRead;
 /// contexts that do not provide this capability.
 #[async_trait]
 pub(crate) trait EntitySnapshotReader: Send + Sync {
+    /// Projects the complete authenticated row batch for non-direct SQL
+    /// shapes. This remains a terminal capability over the operation-owned
+    /// ForkTree reader; it is not a second visibility path.
+    async fn scan_entity_rows(
+        &self,
+        _request: LiveStateScanRequest,
+    ) -> Result<Option<crate::live_state::MaterializedLiveStateBatch>, LixError> {
+        Ok(None)
+    }
+
     async fn scan_entity_snapshots(
         &self,
         request: LiveStateScanRequest,
@@ -48,11 +58,63 @@ impl<S> CurrentEntitySnapshotReader<S> {
     }
 }
 
+/// Terminal entity projection over a derived or transaction-owned live-state
+/// capability. The capability must already be operation-owned; this adapter
+/// only projects its authenticated rows and never acquires storage.
+pub(crate) struct LiveStateEntitySnapshotReader {
+    live_state: std::sync::Arc<dyn LiveStateReader>,
+}
+
+impl LiveStateEntitySnapshotReader {
+    pub(crate) fn new(live_state: std::sync::Arc<dyn LiveStateReader>) -> Self {
+        Self { live_state }
+    }
+}
+
+#[async_trait]
+impl EntitySnapshotReader for LiveStateEntitySnapshotReader {
+    async fn scan_entity_rows(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<crate::live_state::MaterializedLiveStateBatch>, LixError> {
+        validate_terminal_projection_request(&request)?;
+        Ok(Some(self.live_state.scan_batch(&request).await?))
+    }
+
+    async fn scan_entity_snapshots(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        validate_terminal_projection_request(&request)?;
+        Ok(Some(
+            canonical_snapshot_projection(self.live_state.as_ref(), &request).await?,
+        ))
+    }
+
+    async fn scan_entity_primary_keys(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        validate_terminal_projection_request(&request)?;
+        Ok(Some(
+            canonical_primary_key_projection(self.live_state.as_ref(), &request).await?,
+        ))
+    }
+}
+
 #[async_trait]
 impl<S> EntitySnapshotReader for CurrentEntitySnapshotReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    async fn scan_entity_rows(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<crate::live_state::MaterializedLiveStateBatch>, LixError> {
+        validate_terminal_projection_request(&request)?;
+        Ok(Some(self.forktree.scan_batch(&request).await?))
+    }
+
     async fn scan_entity_snapshots(
         &self,
         request: LiveStateScanRequest,
@@ -116,6 +178,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateRow};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingCanonicalReader {
@@ -200,6 +263,34 @@ mod tests {
             primary_keys,
             vec![EntityPk::single("a"), EntityPk::single("b")]
         );
+    }
+
+    #[tokio::test]
+    async fn non_direct_terminal_projection_still_uses_one_canonical_scan() {
+        let reader = Arc::new(CountingCanonicalReader {
+            rows: mixed_retention_rows(),
+            scans: AtomicUsize::new(0),
+        });
+        let entity_reader = LiveStateEntitySnapshotReader::new(reader.clone());
+        let request = LiveStateScanRequest {
+            filter: crate::live_state::LiveStateFilter {
+                constraints: vec![crate::live_state::ScanConstraint {
+                    field: crate::live_state::ScanField::EntityPk,
+                    operator: crate::live_state::ScanOperator::Eq(crate::Value::Text(
+                        "a".to_owned(),
+                    )),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = entity_reader
+            .scan_entity_rows(request)
+            .await
+            .expect("non-direct request should use canonical row projection")
+            .expect("canonical row projection should be available");
+        assert_eq!(reader.scans.load(Ordering::SeqCst), 1);
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

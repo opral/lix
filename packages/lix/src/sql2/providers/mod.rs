@@ -8,6 +8,7 @@ use datafusion::prelude::SessionContext;
 use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
+use crate::live_state::LiveStateReader;
 
 mod branch;
 mod change;
@@ -475,11 +476,16 @@ where
             && selection.includes(surface)
             && matches!(&surface.kind, PublicSurfaceKind::EntityHistory { .. })
     });
+    let entity_live_state: Arc<dyn LiveStateReader> =
+        Arc::new(changelog_query_source.forktree_reader.clone());
+    let entity_snapshot_reader: Arc<dyn crate::sql2::EntitySnapshotReader> = Arc::new(
+        crate::sql2::LiveStateEntitySnapshotReader::new(Arc::clone(&entity_live_state)),
+    );
     entity::register_entity_providers(
         session,
         ctx.active_branch_id(),
-        ctx.live_state(),
-        ctx.entity_snapshot_reader(),
+        entity_live_state,
+        Some(entity_snapshot_reader),
         Arc::clone(&branch_ref),
         (needs_entity_history
             || catalog.surfaces().any(|surface| {
