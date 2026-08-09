@@ -1,4 +1,5 @@
 use crate::LixError;
+use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::changelog::CommitId;
 use crate::forktree::{CoherentView, ForkTreeReadFacade};
 use crate::storage_adapter::StorageAdapterRead;
@@ -65,6 +66,29 @@ where
     };
     exclude_internal_checkpoint_markers(&mut source_diff);
     exclude_internal_checkpoint_markers(&mut target_diff);
+
+    let untracked_rows = view.scan_untracked_overlay_rows().await?;
+    if let Some(entry) = source_diff.entries.iter().find(|entry| {
+        untracked_rows.iter().any(|(_, key, _)| {
+            key.schema_key == entry.identity.schema_key()
+                && key.file_id.as_deref() == entry.identity.file_id()
+                && key.entity_pk == *entry.identity.entity_pk()
+        })
+    }) {
+        return Err(LixError::new(
+            LixError::CODE_MERGE_CONFLICT,
+            format!(
+                "merge source identity conflicts with an untracked current row for schema '{}'",
+                entry.identity.schema_key()
+            ),
+        )
+        .with_details(serde_json::json!({
+            "kind": "trackedUntrackedIdentityCollision",
+            "schemaKey": entry.identity.schema_key(),
+            "entityPk": entry.identity.entity_pk().as_json_array_value()?,
+            "fileId": entry.identity.file_id(),
+        })));
+    }
 
     let outcome = if commits.base_commit_id == commits.source_commit_id {
         MergeOutcome::AlreadyUpToDate
@@ -244,7 +268,12 @@ where
 
 fn exclude_internal_checkpoint_markers(diff: &mut TrackedStateDiff) {
     diff.entries.retain(|entry| {
-        entry.identity.schema_key() != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
-            && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+        !matches!(
+            entry.identity.schema_key(),
+            crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+                | crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                | BRANCH_DESCRIPTOR_SCHEMA_KEY
+                | BRANCH_REF_SCHEMA_KEY
+        )
     });
 }

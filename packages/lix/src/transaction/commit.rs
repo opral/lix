@@ -353,7 +353,7 @@ where
         || prepared_writes
             .commit_change_refs_by_branch
             .values()
-            .any(crate::transaction::types::StagedCommitChangeRefs::has_selected_changes);
+            .any(|refs| refs.has_selected_changes() || refs.tracked_change_count == 0);
     if ordered_history {
         let plan = prepare_ordered_single_branch_history(
             active_account_id,
@@ -1261,6 +1261,7 @@ where
     };
     let transition = OrderedBranchHistoryTransition {
         state_edits,
+        state_domain_global: state_domain.unwrap_or(false),
         commit_catalog_edit,
         change_catalog_edit,
         semantic_commits,
@@ -1357,14 +1358,18 @@ fn classify_publication_intent(
             .copied()
             .unwrap_or_default();
         if tracked_rows == 0 {
-            if *has_selected {
-                return Err(writer_error(
-                    "selected historical members require the ForkTree history lowering slice",
-                ));
+            if *expected_rows != 0 {
+                return Err(writer_error(if *has_selected {
+                    "selected historical commit has missing fresh state rows"
+                } else {
+                    "ref-only commit intent has unexpected tracked state rows"
+                }));
             }
-            return Err(writer_error(
-                "ref-only commit intent requires the ForkTree history lowering slice",
-            ));
+            // A zero-row commit is valid when its authenticated members are
+            // selected from history, or when it is an empty/ref-only merge.
+            // Both are lowered by the ordered ForkTree publisher below; do
+            // not reject them before the retained read can authenticate the
+            // source members and parent topology.
         }
         if *expected_rows != tracked_rows {
             return Err(writer_error(

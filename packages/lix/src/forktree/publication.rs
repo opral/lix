@@ -52,6 +52,7 @@ pub(crate) struct BranchStateTransition {
 #[derive(Debug)]
 pub(crate) struct OrderedBranchHistoryTransition {
     pub(crate) state_edits: Vec<StateTreeEdit>,
+    pub(crate) state_domain_global: bool,
     pub(crate) commit_catalog_edit: CatalogTreeEdit,
     pub(crate) change_catalog_edit: CatalogTreeEdit,
     pub(crate) semantic_commits: Vec<CommitObjectV1>,
@@ -1034,6 +1035,7 @@ impl PreparedPublication {
         }
         let OrderedBranchHistoryTransition {
             state_edits,
+            state_domain_global,
             commit_catalog_edit,
             change_catalog_edit,
             mut semantic_commits,
@@ -1098,9 +1100,7 @@ impl PreparedPublication {
             }
         }
 
-        let is_global = semantic_commits
-            .iter()
-            .all(|commit| commit.local_state_root == view.branch_snapshot().local_state_root);
+        let is_global = state_domain_global;
         let mut expected_state_base = if is_global {
             view.repository_root().global_state_root
         } else {

@@ -736,9 +736,8 @@ where
             continue;
         };
         let entry = ChangeCatalogEntry::decode(&value)?;
-        records.push(Some(
-            semantic_change_record(read, repository.change_catalog_root, id, entry).await?,
-        ));
+        records
+            .push(semantic_change_record(read, repository.change_catalog_root, id, entry).await?);
     }
     Ok(records)
 }
@@ -839,9 +838,12 @@ where
                 source.commit_id
             }
         };
+        let record = semantic_change_record(read, repository.change_catalog_root, change_id, entry)
+            .await?
+            .ok_or_else(|| corruption("Commit member has no semantic Change payload"))?;
         records.push((
             crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*source_commit_id.as_bytes())),
-            semantic_change_record(read, repository.change_catalog_root, change_id, entry).await?,
+            record,
         ));
     }
     Ok(Some(records))
@@ -923,8 +925,11 @@ where
                 .map_err(|_| corruption("ChangeCatalog key is not a raw UUID"))?,
         );
         let entry = ChangeCatalogEntry::decode(&value)?;
-        records
-            .push(semantic_change_record(read, repository.change_catalog_root, id, entry).await?);
+        if let Some(record) =
+            semantic_change_record(read, repository.change_catalog_root, id, entry).await?
+        {
+            records.push(record);
+        }
     }
     Ok(records)
 }
@@ -1143,7 +1148,7 @@ async fn semantic_change_record<R>(
     change_catalog_root: ObjectId,
     id: ChangeId,
     entry: ChangeCatalogEntry,
-) -> Result<crate::changelog::ChangeRecord, crate::LixError>
+) -> Result<Option<crate::changelog::ChangeRecord>, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1189,18 +1194,27 @@ where
         }
         _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid").into()),
     }
-    let (payload, json_payload_object_ids) = match change {
+    let (payload, json_payload_object_ids, is_empty_ref_payload) = match change {
         ChangeObjectV1::Semantic {
             payload,
             json_payload_object_ids,
             ..
-        }
-        | ChangeObjectV1::BranchRef {
+        } => (payload, json_payload_object_ids, false),
+        ChangeObjectV1::BranchRef {
             payload,
             json_payload_object_ids,
             ..
-        } => (payload, json_payload_object_ids),
+        } => {
+            let is_empty = payload.is_empty();
+            (payload, json_payload_object_ids, is_empty)
+        }
     };
+    if is_empty_ref_payload {
+        // Creation RefChanges carry authenticated branch/head edges but no
+        // public lix_change payload. Keep the object/catalog validation above,
+        // while leaving this control-plane fact out of the semantic changelog.
+        return Ok(None);
+    }
     let record = crate::changelog::decode_forktree_change_payload(
         &payload,
         crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*id.as_bytes())),
@@ -1215,7 +1229,7 @@ where
         )
         .into());
     }
-    Ok(record)
+    Ok(Some(record))
 }
 
 async fn validate_commit_catalog_identity<R>(
