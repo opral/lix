@@ -19,7 +19,7 @@ use super::state::{
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
     apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
+    scan_page_on_read, scan_range_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -1615,71 +1615,45 @@ pub(crate) async fn state_range_on_roots<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let page_size = limit.unwrap_or(64).clamp(1, 64);
-    let mut output = Vec::new();
-    let mut global_cursor = None;
-    let mut local_cursor = None;
-    let mut global = std::collections::VecDeque::new();
-    let mut local = std::collections::VecDeque::new();
-    let mut global_done = false;
-    let mut local_done = local_state_root.is_none();
-    loop {
+    // Each root is descended once for the requested range. The previous
+    // implementation restarted from the root after every 64-row page, which
+    // multiplied authenticated node reads by the number of pages. These two
+    // ordered streams are merged below without an intermediate map or owned
+    // row DTO, so the branch overlay remains the sole logical result.
+    let global = scan_range_on_read(global_state_root, "state", lower, upper, None, read).await?;
+    let local = match local_state_root {
+        Some(root) => scan_range_on_read(root, "state", lower, upper, None, read).await?,
+        None => Vec::new(),
+    };
+    let mut global_index = 0;
+    let mut local_index = 0;
+    let mut output = Vec::with_capacity(limit.unwrap_or(global.len() + local.len()));
+    while global_index < global.len() || local_index < local.len() {
         if limit.is_some_and(|limit| output.len() >= limit) {
             break;
         }
-        if global.is_empty() && !global_done {
-            let page = scan_bounded_page_on_read(
-                global_state_root,
-                "state",
-                lower,
-                upper,
-                global_cursor.as_deref(),
-                page_size,
-                read,
-            )
-            .await?;
-            global_done = page.len() < page_size;
-            global_cursor = page.last().map(|(key, _)| key.clone());
-            global.extend(page);
-        }
-        if local.is_empty() && !local_done {
-            let page = scan_bounded_page_on_read(
-                local_state_root.expect("local state root is present while scanning"),
-                "state",
-                lower,
-                upper,
-                local_cursor.as_deref(),
-                page_size,
-                read,
-            )
-            .await?;
-            local_done = page.len() < page_size;
-            local_cursor = page.last().map(|(key, _)| key.clone());
-            local.extend(page);
-        }
-        if global.is_empty() && local.is_empty() {
-            break;
-        }
-        let take_local = match (global.front(), local.front()) {
+        let take_local = match (global.get(global_index), local.get(local_index)) {
             (None, Some(_)) => true,
             (Some(_), None) => false,
             (Some((global_key, _)), Some((local_key, _))) => local_key <= global_key,
             (None, None) => break,
         };
         let (key, encoded, source) = if take_local {
-            let (key, value) = local.pop_front().expect("front local state row");
+            let (key, value) = &local[local_index];
+            local_index += 1;
             if global
-                .front()
-                .is_some_and(|(global_key, _)| *global_key == key)
+                .get(global_index)
+                .is_some_and(|(global_key, _)| global_key == key)
             {
-                global.pop_front();
+                global_index += 1;
             }
-            (key, value, StateSource::Branch)
+            (key.clone(), value, StateSource::Branch)
         } else {
-            let (key, value) = global.pop_front().expect("front global state row");
-            (key, value, StateSource::Global)
+            let (key, value) = &global[global_index];
+            global_index += 1;
+            (key.clone(), value, StateSource::Global)
         };
-        let value = decode_state_value_storage(&encoded)?;
+        let value = decode_state_value_storage(encoded)?;
         if source == StateSource::Global && matches!(value.cell, StateCell::Tombstone) {
             return Err(corruption("global state tree contains a tombstone"));
         }

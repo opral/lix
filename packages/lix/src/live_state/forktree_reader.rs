@@ -20,7 +20,7 @@ use crate::forktree::{
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
-    MaterializedLiveStateRow,
+    MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -189,42 +189,66 @@ fn merge_current_overlay(
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
-    let mut by_key = BTreeMap::new();
-    let mut tracked_keys = BTreeSet::new();
-    for row in tracked.into_rows() {
-        let key = encode_row_key(&row);
-        if !tracked_keys.insert(key.clone()) {
-            return Err(overlay_corruption("tracked"));
-        }
-        by_key.insert(key, row);
+    let tracked_keys = (0..tracked.len())
+        .map(|index| encode_row_key_ref(tracked.row(index)))
+        .collect::<Vec<_>>();
+    let untracked_keys = (0..untracked.len())
+        .map(|index| encode_row_key_ref(untracked.row(index)))
+        .collect::<Vec<_>>();
+    if tracked_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(overlay_corruption("tracked"));
     }
-    let mut untracked_keys = BTreeSet::new();
-    for row in untracked.into_rows() {
-        let key = encode_row_key(&row);
-        if !untracked_keys.insert(key.clone()) {
-            return Err(overlay_corruption("untracked"));
-        }
-        by_key.insert(key, row);
+    if untracked_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(overlay_corruption("untracked"));
     }
 
-    let mut output = Vec::with_capacity(limit.unwrap_or(by_key.len()).min(by_key.len()));
-    for row in by_key.into_values() {
-        if row.deleted && !include_tombstones {
-            continue;
-        }
-        output.push(row);
+    let mut tracked_index = 0;
+    let mut untracked_index = 0;
+    let mut output = MaterializedLiveStateBatchBuilder::with_capacity(
+        limit.unwrap_or(tracked.len() + untracked.len()),
+    );
+    while tracked_index < tracked.len() || untracked_index < untracked.len() {
         if limit.is_some_and(|limit| output.len() >= limit) {
             break;
         }
+        let take_untracked = match (
+            tracked_keys.get(tracked_index),
+            untracked_keys.get(untracked_index),
+        ) {
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(tracked_key), Some(untracked_key)) => untracked_key <= tracked_key,
+            (None, None) => break,
+        };
+        let row = if take_untracked {
+            let row = untracked.row(untracked_index);
+            let key = &untracked_keys[untracked_index];
+            untracked_index += 1;
+            if tracked_keys
+                .get(tracked_index)
+                .is_some_and(|tracked_key| tracked_key == key)
+            {
+                tracked_index += 1;
+            }
+            row
+        } else {
+            let row = tracked.row(tracked_index);
+            tracked_index += 1;
+            row
+        };
+        if row.deleted() && !include_tombstones {
+            continue;
+        }
+        output.push_ref(row, None);
     }
-    Ok(MaterializedLiveStateBatch::from_rows(output))
+    Ok(output.finish())
 }
 
-fn encode_row_key(row: &MaterializedLiveStateRow) -> Vec<u8> {
+fn encode_row_key_ref(row: MaterializedLiveStateRowRef<'_>) -> Vec<u8> {
     encode_state_key(StateKeyRef {
-        schema_key: &row.schema_key,
-        file_id: row.file_id.as_deref(),
-        entity_pk: &row.entity_pk,
+        schema_key: row.schema_key(),
+        file_id: row.file_id(),
+        entity_pk: row.entity_pk(),
     })
 }
 
@@ -926,8 +950,8 @@ mod tests {
     #[test]
     fn combined_overlay_tombstone_masks_value_but_null_remains_visible() {
         let tracked = MaterializedLiveStateBatch::from_rows(vec![
-            row("branch", "null", None, false, false, false),
             row("branch", "deleted", Some("old"), false, false, false),
+            row("branch", "null", None, false, false, false),
         ]);
         let untracked = MaterializedLiveStateBatch::from_rows(vec![row(
             "branch", "deleted", None, true, false, true,
