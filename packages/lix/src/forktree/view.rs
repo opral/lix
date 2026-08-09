@@ -84,7 +84,8 @@ where
         self.branch_snapshot
     }
 
-    pub(crate) fn storage_read(&self) -> &R {
+    #[cfg(test)]
+    pub(crate) fn test_storage_read(&self) -> &R {
         &self.read
     }
 
@@ -270,6 +271,208 @@ where
     }
     pub(crate) async fn load_object_bytes(&self, id: ObjectId) -> Result<Bytes, StorageError> {
         load_object_bytes(&self.read, id).await
+    }
+
+    pub(crate) async fn load_selector_value(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<Bytes>, StorageError> {
+        let loaded = self
+            .read
+            .get_many(&[GetManyRequest {
+                space: SELECTOR_SPACE,
+                keys: &[Key(key.to_vec().into())],
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            }])
+            .await?;
+        match loaded.values.as_slice() {
+            [None] => Ok(None),
+            [Some(ProjectedValue::FullValue(bytes))] => Ok(Some(bytes.clone())),
+            [Some(ProjectedValue::KeyOnly)] => {
+                Err(corruption("ForkTree selector read returned key-only data"))
+            }
+            _ => Err(corruption("ForkTree selector read cardinality is invalid")),
+        }
+    }
+
+    pub(crate) async fn validate_receipt_root(
+        &self,
+        root: super::tree::ReceiptTreeRoot,
+    ) -> Result<(), StorageError> {
+        super::tree::validate_receipt_root_on_read(root, &self.read).await
+    }
+
+    pub(crate) async fn insert_receipt_part(
+        &self,
+        root: super::tree::ReceiptTreeRoot,
+        part_object_id: ObjectId,
+        part: &super::model::UploadPartV1,
+        overlay: &super::tree::ImmutableObjectSet,
+    ) -> Result<super::tree::ReceiptTreeEdit, StorageError> {
+        super::tree::insert_receipt_part_on_read(root, part_object_id, part, &self.read, overlay)
+            .await
+    }
+
+    pub(super) async fn authenticate_chunk(
+        &self,
+        chunk_ref: &super::model::BlobChunkRefV1,
+        part_hasher: &mut blake3::Hasher,
+        final_hasher: &mut blake3::Hasher,
+        semantic_id_builder: &mut super::blob::CanonicalBlobIdBuilder,
+    ) -> Result<(), StorageError> {
+        super::blob::authenticate_chunk(
+            &self.read,
+            chunk_ref,
+            part_hasher,
+            final_hasher,
+            semantic_id_builder,
+        )
+        .await
+    }
+
+    pub(super) async fn load_blob_bytes_many_on_view(
+        &self,
+        refs: &[super::blob::AuthenticatedBlobRef],
+    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError> {
+        super::blob::load_blob_bytes_many_on_read(
+            &self.read,
+            self.branch_id(),
+            self.view_id(),
+            self.view_instance_id(),
+            refs,
+        )
+        .await
+    }
+
+    pub(super) async fn load_blob_ranges_many_on_view(
+        &self,
+        requests: &[(super::blob::AuthenticatedBlobRef, std::ops::Range<u64>)],
+    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError> {
+        super::blob::load_blob_ranges_many_on_read(
+            &self.read,
+            self.branch_id(),
+            self.view_id(),
+            self.view_instance_id(),
+            requests,
+        )
+        .await
+    }
+
+    pub(crate) async fn lookup_tree_value(
+        &self,
+        root: ObjectId,
+        expected_kind: &'static str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        super::tree::lookup_on_read(root, expected_kind, key, &self.read).await
+    }
+
+    pub(crate) async fn load_commit_members(
+        &self,
+        commit: &CommitObjectV1,
+    ) -> Result<Vec<super::model::CommitMemberV1>, StorageError> {
+        super::serving::load_commit_members(&self.read, commit).await
+    }
+
+    pub(crate) async fn scan_tree_page(
+        &self,
+        root: ObjectId,
+        expected_kind: &'static str,
+        start_after: Option<&[u8]>,
+        page_size: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        super::tree::scan_page_on_read(root, expected_kind, start_after, page_size, &self.read)
+            .await
+    }
+
+    pub(crate) async fn validate_member_catalog_owner(
+        &self,
+        commit_catalog_root: ObjectId,
+        target_commit_object_id: ObjectId,
+        target_generation: u64,
+        target_ordinal: usize,
+        member: super::model::CommitMemberV1,
+        entry: ChangeCatalogEntry,
+    ) -> Result<(), StorageError> {
+        super::serving::validate_member_catalog_owner(
+            &self.read,
+            commit_catalog_root,
+            target_commit_object_id,
+            target_generation,
+            target_ordinal,
+            member,
+            entry,
+        )
+        .await
+    }
+
+    pub(crate) async fn validate_retained_commit(
+        &self,
+        commit_catalog_root: ObjectId,
+        change_catalog_root: ObjectId,
+        commit_object_id: ObjectId,
+        commit: &CommitObjectV1,
+    ) -> Result<(), StorageError> {
+        super::serving::validate_retained_commit(
+            &self.read,
+            commit_catalog_root,
+            change_catalog_root,
+            commit_object_id,
+            commit,
+        )
+        .await
+    }
+
+    pub(crate) async fn validate_retained_ref_change(
+        &self,
+        change_catalog_root: ObjectId,
+        ref_object_id: ObjectId,
+        change: &ChangeObjectV1,
+    ) -> Result<(), StorageError> {
+        super::serving::validate_retained_ref_change(
+            &self.read,
+            change_catalog_root,
+            ref_object_id,
+            change,
+        )
+        .await
+    }
+
+    pub(crate) async fn state_range_at_roots(
+        &self,
+        global_root: ObjectId,
+        local_root: Option<ObjectId>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<
+        Vec<(
+            Vec<u8>,
+            super::state::StateValue,
+            super::serving::StateSource,
+        )>,
+        StorageError,
+    > {
+        super::serving::state_range_on_roots(
+            global_root,
+            local_root,
+            &self.read,
+            lower,
+            upper,
+            limit,
+            include_tombstones,
+        )
+        .await
+    }
+
+    pub(crate) async fn branch_view(
+        &self,
+        branch_id: CanonicalBranchId,
+    ) -> Result<CoherentView<&R>, StorageError> {
+        open_coherent_view_on_read(&self.read, branch_id).await
     }
 
     pub(crate) async fn load_change_records(

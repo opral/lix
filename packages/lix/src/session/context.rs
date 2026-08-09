@@ -44,13 +44,13 @@ pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 /// Loads the workspace selector from its canonical untracked current-state
 /// member when opening a workspace session.
 pub(crate) async fn load_workspace_branch_id_from_index(
-    live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
-    let rows = live_state
-        .reader(reader)
-        .load_exact_batch(&LiveStateExactBatchRequest {
+    let forktree = crate::forktree::ForkTreeReadFacade::new(reader);
+    let rows = crate::live_state::load_forktree_exact_facade(
+        &forktree,
+        &LiveStateExactBatchRequest {
             rows: vec![LiveStateExactRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -62,8 +62,9 @@ pub(crate) async fn load_workspace_branch_id_from_index(
             },
             untracked: Some(true),
             include_tombstones: false,
-        })
-        .await?;
+        },
+    )
+    .await?;
     let row = rows.row(0).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -173,9 +174,7 @@ where
     ) -> Result<Self, LixError> {
         let read =
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-        let branch_id =
-            load_workspace_branch_id_from_index(live_state.as_ref(), branch_ctx.as_ref(), &read)
-                .await?;
+        let branch_id = load_workspace_branch_id_from_index(branch_ctx.as_ref(), &read).await?;
         drop(read);
         Ok(Self::new(
             SessionMode::Workspace {
@@ -634,7 +633,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) active_branch_id: &'a str,
     pub(super) active_account_id: &'a str,
     pub(super) read_store: SharedStorageAdapterRead<R>,
-    pub(super) live_state: Arc<LiveStateContext>,
+    pub(super) forktree: crate::forktree::ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
@@ -707,25 +706,24 @@ where
 
     #[expect(trivial_casts)]
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
-        Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
+        Arc::new(self.forktree.clone()) as Arc<dyn LiveStateReader>
     }
 
     fn entity_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::EntitySnapshotReader>> {
         Some(Arc::new(crate::sql2::CurrentEntitySnapshotReader::new(
-            Arc::clone(&self.live_state),
-            self.read_store.clone(),
+            self.forktree.clone(),
         )))
     }
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
-        let reader: Arc<dyn FilesystemPathIndexReader> =
-            Arc::new(self.live_state.reader(self.read_store.clone()));
-        reader
+        Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
+            self.forktree.clone(),
+        ))
     }
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
+            forktree_reader: self.forktree.clone(),
         }
     }
 
@@ -1074,7 +1072,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_waits_for_session_read_blocked_in_storage_read() {
+    async fn close_waits_for_session_read_blocked_in_storage_snapshot() {
         let (session, gate) = open_blocking_read_session().await;
 
         gate.block_next();

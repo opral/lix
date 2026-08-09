@@ -696,7 +696,7 @@ where
                 .publish_new_branch_selector(view, branch_id, &source_commit)
                 .map_err(LixError::from)?;
         } else {
-            let target_view = open_coherent_view_on_read(view.storage_read(), branch_id).await?;
+            let target_view = view.branch_view(branch_id).await?;
             let target_commit = match intent.commit_id {
                 Some(commit_id) => Some(
                     load_commit(&target_view, forktree_commit_id(commit_id))

@@ -4,14 +4,13 @@
 //! operation-owned `LiveStateReader::scan_batch` for the visible rows once and
 //! projects that authenticated batch into snapshot bytes or primary keys.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::LixError;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateScanRequest};
+use crate::forktree::ForkTreeReadFacade;
+use crate::live_state::{LiveStateReader, LiveStateScanRequest};
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Optional private capability supplied by a SQL execution context.
@@ -40,13 +39,12 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
 }
 
 pub(crate) struct CurrentEntitySnapshotReader<S> {
-    live_state: Arc<LiveStateContext>,
-    store: S,
+    forktree: ForkTreeReadFacade<S>,
 }
 
 impl<S> CurrentEntitySnapshotReader<S> {
-    pub(crate) fn new(live_state: Arc<LiveStateContext>, store: S) -> Self {
-        Self { live_state, store }
+    pub(crate) fn new(forktree: ForkTreeReadFacade<S>) -> Self {
+        Self { forktree }
     }
 }
 
@@ -60,9 +58,8 @@ where
         request: LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
         validate_terminal_projection_request(&request)?;
-        let reader = self.live_state.reader(self.store.clone());
         Ok(Some(
-            canonical_snapshot_projection(&reader, &request).await?,
+            canonical_snapshot_projection(&self.forktree, &request).await?,
         ))
     }
 
@@ -71,9 +68,8 @@ where
         request: LiveStateScanRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
         validate_terminal_projection_request(&request)?;
-        let reader = self.live_state.reader(self.store.clone());
         Ok(Some(
-            canonical_primary_key_projection(&reader, &request).await?,
+            canonical_primary_key_projection(&self.forktree, &request).await?,
         ))
     }
 }

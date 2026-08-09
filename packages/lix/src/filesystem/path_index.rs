@@ -14,6 +14,7 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
+use crate::forktree::ForkTreeReadFacade;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
     MaterializedLiveStateRow,
@@ -563,11 +564,13 @@ impl FilesystemPathIndex {
     /// Warms small CAS payloads while the filesystem index is already being
     /// built. The manifest lookup is one batch for the whole view, so exact
     /// file reads do not pay another storage round trip after path selection.
-    pub(crate) async fn hydrate_small_blob_data<S>(self, store: &S) -> Result<Self, LixError>
+    pub(crate) async fn hydrate_small_blob_data<S>(
+        self,
+        forktree: &ForkTreeReadFacade<S>,
+    ) -> Result<Self, LixError>
     where
         S: StorageAdapterRead + Send + Sync + 'static,
     {
-        let facade = crate::forktree::ForkTreeReadFacade::new(store);
         let mut candidates =
             BTreeMap::<String, Vec<(FilesystemPathEntryIdentity, MaterializedLiveStateRow)>>::new();
         for entry in self.entries() {
@@ -581,7 +584,7 @@ impl FilesystemPathIndex {
         }
         let mut hydrated = BTreeMap::<FilesystemPathEntryIdentity, crate::Blob>::new();
         for (branch_id, entries) in candidates {
-            let view = facade.branch(&branch_id).await?;
+            let view = forktree.branch(&branch_id).await?;
             let mut refs = Vec::with_capacity(entries.len());
             let mut identities = Vec::with_capacity(entries.len());
             for (identity, row) in entries {
@@ -1115,6 +1118,41 @@ pub(crate) trait FilesystemPathIndexReader: Send + Sync {
 
 pub(crate) struct UncachedFilesystemPathIndexReader {
     live_state: Arc<dyn LiveStateReader>,
+}
+
+/// Operation-owned filesystem index reader. The index is derived from the
+/// caller's retained ForkTree capability; it never opens a second facade or
+/// reaches the underlying storage read directly.
+pub(crate) struct ForkTreeFilesystemPathIndexReader<R> {
+    forktree: ForkTreeReadFacade<R>,
+}
+
+impl<R> ForkTreeFilesystemPathIndexReader<R> {
+    pub(crate) fn new(forktree: ForkTreeReadFacade<R>) -> Self {
+        Self { forktree }
+    }
+}
+
+#[async_trait]
+impl<R> FilesystemPathIndexReader for ForkTreeFilesystemPathIndexReader<R>
+where
+    R: StorageAdapterRead + Send + Sync + 'static,
+{
+    async fn path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        let mut index = build_path_index(&self.forktree, request).await?;
+        if request.cache_small_blob_data {
+            index = Arc::new(
+                (*index)
+                    .clone()
+                    .hydrate_small_blob_data(&self.forktree)
+                    .await?,
+            );
+        }
+        Ok(index)
+    }
 }
 
 impl UncachedFilesystemPathIndexReader {

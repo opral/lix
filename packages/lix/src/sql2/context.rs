@@ -575,7 +575,15 @@ impl LiveStateReader for WriteContextLiveStateReader {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.ctx.scan_live_state_batch(request).await
+        let mut request = request.clone();
+        if request.filter.branch_ids.is_empty() {
+            // Write-side validation requests that do not carry a branch
+            // predicate are scoped to the transaction's active branch. The
+            // operation context still owns the same retained ForkTree read;
+            // this only supplies the missing logical scope.
+            request.filter.branch_ids = vec![self.ctx.active_branch_id()];
+        }
+        self.ctx.scan_live_state_batch(&request).await
     }
 
     async fn load_exact_batch(

@@ -51,11 +51,35 @@ pub(crate) async fn scan_facade<R>(
 where
     R: StorageAdapterRead,
 {
-    let branch_id = request_branch_id(request)?;
-    let mut fork_tree_request = request.clone();
-    fork_tree_request.filter.branch_ids = vec![branch_id.to_owned()];
-    let view = facade.branch(branch_id).await?;
-    scan_view(&view, &fork_tree_request).await
+    validate_scan_request(request)?;
+    let branch_ids = &request.filter.branch_ids;
+    if branch_ids.is_empty() {
+        return Err(unsupported(
+            "current ForkTree reader requires an authenticated branch scope",
+        ));
+    }
+    if branch_ids.len() == 1 {
+        let view = facade.branch(&branch_ids[0]).await?;
+        return scan_view(&view, request).await;
+    }
+
+    // An explicit by-branch surface may enumerate several authenticated
+    // branch views. Each view borrows the same operation-owned read; its
+    // global overlay is intentionally materialized once per branch, matching
+    // the public lix_file_by_branch identity contract. Apply LIMIT only after
+    // the ordered branch streams have been concatenated.
+    let mut rows = Vec::new();
+    for branch_id in branch_ids {
+        let view = facade.branch(branch_id).await?;
+        let mut branch_request = request.clone();
+        branch_request.filter.branch_ids = vec![branch_id.clone()];
+        branch_request.limit = None;
+        rows.extend(scan_view(&view, &branch_request).await?.into_rows());
+    }
+    if let Some(limit) = request.limit {
+        rows.truncate(limit);
+    }
+    Ok(MaterializedLiveStateBatch::from_rows(rows))
 }
 
 async fn scan_tracked_view<R>(
@@ -116,8 +140,7 @@ where
             continue;
         }
         let branch_owner = match row.source {
-            StateSource::Global => crate::GLOBAL_BRANCH_ID.to_owned(),
-            StateSource::Branch => branch_id_text(branch_id),
+            StateSource::Global | StateSource::Branch => branch_id_text(branch_id),
         };
         output.push(materialize_row(
             row,
@@ -322,11 +345,11 @@ where
 
 /// The ForkTree owner itself satisfies the engine read capability. This keeps
 /// transaction overlays on the caller-owned facade instead of embedding the
-/// superseded `LiveStateStoreReader` as a second current-state owner.
+/// superseded legacy current-state reader as a second current-state owner.
 #[async_trait]
 impl<R> crate::live_state::LiveStateReader for ForkTreeReadFacade<R>
 where
-    R: StorageAdapterRead + 'static,
+    R: StorageAdapterRead,
 {
     async fn scan_batch(
         &self,

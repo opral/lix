@@ -16,7 +16,7 @@ use super::model::{
     snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::serving::{CatalogTreeEdit, StateTreeEdit, validate_member_catalog_owner};
+use super::serving::{CatalogTreeEdit, StateTreeEdit};
 use super::state::{
     StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
     encode_untracked_value,
@@ -1150,18 +1150,17 @@ impl PreparedPublication {
                                 "selected history member names a non-semantic Change",
                             ));
                         }
-                        let raw_entry = super::tree::lookup_on_read(
-                            view.repository_root().change_catalog_root,
-                            "change",
-                            change.change_id().as_bytes(),
-                            view.storage_read(),
-                        )
-                        .await?
-                        .ok_or_else(|| {
-                            corruption("selected history member has no ChangeCatalog owner")
-                        })?;
-                        validate_member_catalog_owner(
-                            view.storage_read(),
+                        let raw_entry = view
+                            .lookup_tree_value(
+                                view.repository_root().change_catalog_root,
+                                "change",
+                                change.change_id().as_bytes(),
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                corruption("selected history member has no ChangeCatalog owner")
+                            })?;
+                        view.validate_member_catalog_owner(
                             view.repository_root().commit_catalog_root,
                             commit_object_id,
                             commit.generation,

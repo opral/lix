@@ -5,8 +5,7 @@ mod reader;
 mod types;
 pub(crate) mod visibility;
 
-#[allow(unused_imports)]
-pub(crate) use context::{BranchHeadControlCache, LiveStateContext, LiveStateStoreReader};
+pub(crate) use context::{BranchHeadControlCache, LiveStateContext};
 pub(crate) use derived::is_derived_schema;
 pub(crate) use forktree_reader::{
     load_exact_batch as load_forktree_exact_batch, load_exact_facade as load_forktree_exact_facade,
