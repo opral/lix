@@ -244,6 +244,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
         0,
         member,
         entry,
+        None,
     )
     .await
     .expect("older selected source is valid");
@@ -256,10 +257,79 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
             0,
             member,
             entry,
+            None,
         )
         .await
         .is_err(),
         "same-generation selected history must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open first retained history view");
+    let second_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open second retained history view");
+    let source_commit = load_commit(&view, seed.commit_id)
+        .await
+        .expect("load source commit")
+        .expect("source commit exists");
+    let closure = super::serving::load_authenticated_member_closure(
+        view.storage_read(),
+        seed.commit_object_id,
+        &source_commit,
+    )
+    .await
+    .expect("load authenticated member closure");
+    assert!(
+        closure
+            .members_for(
+                view.storage_read(),
+                seed.commit_object_id,
+                seed.commit_id,
+                source_commit.generation,
+            )
+            .expect("same read/commit context")
+            .is_some()
+    );
+    assert!(
+        closure
+            .members_for(
+                second_view.storage_read(),
+                seed.commit_object_id,
+                seed.commit_id,
+                source_commit.generation,
+            )
+            .is_err(),
+        "a closure cannot cross retained reads"
+    );
+    assert!(
+        closure
+            .members_for(
+                view.storage_read(),
+                seed.commit_object_id,
+                seed.commit_id,
+                source_commit.generation + 1,
+            )
+            .is_err(),
+        "a closure cannot cross commit generations"
+    );
+    assert!(
+        closure
+            .members_for(
+                view.storage_read(),
+                content_id(0xa2),
+                seed.commit_id,
+                source_commit.generation,
+            )
+            .expect("different commit context is not a cache hit")
+            .is_none()
     );
 }
 
@@ -323,6 +393,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
             0,
             member,
             entry,
+            None,
         )
         .await
         .is_err(),
@@ -337,6 +408,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
             0,
             member,
             entry,
+            None,
         )
         .await
         .is_err(),

@@ -1216,6 +1216,7 @@ impl PreparedPublication {
                             ordinal,
                             member,
                             super::model::ChangeCatalogEntry::decode(&raw_entry)?,
+                            None,
                         )
                         .await?;
                     }
