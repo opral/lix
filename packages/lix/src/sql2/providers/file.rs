@@ -216,6 +216,10 @@ struct LixFileSpec {
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: LixFilePayloadReader,
+    /// The transaction's retained opening-read capability for pre-image
+    /// payload validation. Write-side staging remains separate because it may
+    /// contain unpublished bytes that are not in the opening view.
+    authenticated_blob_reader: Option<Arc<dyn crate::forktree::AuthenticatedBlobReader>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
@@ -293,6 +297,7 @@ struct LixFileDmlSourceOptions {
     needs_data: bool,
     needs_plugin_ownership: bool,
     capture_path_resolver_rows: bool,
+    use_authenticated_blob_reader: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,7 +367,10 @@ impl LixFileSpec {
             live_state,
             filesystem_path_index,
             branch_ref,
-            blob_reader: LixFilePayloadReader::Authenticated(authenticated_blob_reader),
+            blob_reader: LixFilePayloadReader::Authenticated(Arc::clone(
+                &authenticated_blob_reader,
+            )),
+            authenticated_blob_reader: Some(authenticated_blob_reader),
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -381,6 +389,7 @@ impl LixFileSpec {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let blob_reader = write_ctx.blob_reader();
+        let authenticated_blob_reader = write_ctx.authenticated_blob_reader().ok();
         let plugin_host = write_ctx.plugin_host();
         let session_file_views = write_ctx.session_file_views();
         Self {
@@ -389,6 +398,7 @@ impl LixFileSpec {
             filesystem_path_index,
             branch_ref,
             blob_reader: LixFilePayloadReader::Write(blob_reader),
+            authenticated_blob_reader,
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -410,7 +420,10 @@ impl LixFileSpec {
             live_state,
             filesystem_path_index,
             branch_ref,
-            blob_reader: LixFilePayloadReader::Authenticated(authenticated_blob_reader),
+            blob_reader: LixFilePayloadReader::Authenticated(Arc::clone(
+                &authenticated_blob_reader,
+            )),
+            authenticated_blob_reader: Some(authenticated_blob_reader),
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -428,6 +441,7 @@ impl LixFileSpec {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let blob_reader = write_ctx.blob_reader();
+        let authenticated_blob_reader = write_ctx.authenticated_blob_reader().ok();
         let plugin_host = write_ctx.plugin_host();
         let session_file_views = write_ctx.session_file_views();
         Self {
@@ -436,6 +450,7 @@ impl LixFileSpec {
             filesystem_path_index,
             branch_ref,
             blob_reader: LixFilePayloadReader::Write(blob_reader),
+            authenticated_blob_reader,
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -465,6 +480,7 @@ impl LixFileSpec {
             (
                 write_ctx.clone(),
                 self.blob_reader.clone(),
+                self.authenticated_blob_reader.clone(),
                 self.plugin_host.clone(),
                 Arc::clone(&self.schema),
                 request,
@@ -477,6 +493,7 @@ impl LixFileSpec {
             |(
                 write_ctx,
                 blob_reader,
+                authenticated_blob_reader,
                 plugin_host,
                 table_schema,
                 request,
@@ -548,15 +565,33 @@ impl LixFileSpec {
                     None
                 };
                 let blob_ref_keys = prepared.blob_rows.keys().cloned().collect();
-                let source_batch = blob_reader
-                    .record_batch(
+                let source_batch = if options.use_authenticated_blob_reader {
+                    let authenticated_blob_reader =
+                        authenticated_blob_reader.as_ref().ok_or_else(|| {
+                            DataFusionError::Execution(
+                            "authenticated ForkTree blob reader is unavailable for this transaction"
+                                .to_string(),
+                        )
+                        })?;
+                    lix_file_record_batch_from_prepared_authenticated(
                         &table_schema,
+                        authenticated_blob_reader.as_ref(),
                         plugin_render.clone(),
                         options.needs_data,
                         prepared,
                     )
                     .await
-                    .map_err(lix_error_to_datafusion_error)?;
+                } else {
+                    blob_reader
+                        .record_batch(
+                            &table_schema,
+                            plugin_render.clone(),
+                            options.needs_data,
+                            prepared,
+                        )
+                        .await
+                }
+                .map_err(lix_error_to_datafusion_error)?;
                 *captured.lock().expect("lix_file DML source mutex poisoned") =
                     Some(LixFileDmlSourceState {
                         blob_ref_keys,
@@ -644,6 +679,7 @@ impl LixFileSpec {
                 needs_data,
                 needs_plugin_ownership: false,
                 capture_path_resolver_rows: false,
+                use_authenticated_blob_reader: false,
             },
             captured,
         );
@@ -1487,6 +1523,7 @@ impl TableSpec for LixFileSpec {
                 needs_data,
                 needs_plugin_ownership: false,
                 capture_path_resolver_rows: false,
+                use_authenticated_blob_reader: false,
             },
             Arc::clone(&captured),
         );
@@ -1593,6 +1630,8 @@ impl LixFileSpec {
                 needs_data,
                 needs_plugin_ownership: update_columns.updates_path() && !update_columns.data,
                 capture_path_resolver_rows,
+                use_authenticated_blob_reader: update_columns.updates_path()
+                    && !update_columns.data,
             },
             Arc::clone(&captured),
         );

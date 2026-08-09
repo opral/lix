@@ -8799,6 +8799,15 @@ where
         None
     }
 
+    fn authenticated_blob_reader(
+        &self,
+    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+        Ok(Arc::new(crate::forktree::blob_reader_on_read(
+            self.opening_read(),
+            &self.active_branch_id,
+        )?))
+    }
+
     async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         let read = SharedStorageAdapterRead::new(
             self.storage
