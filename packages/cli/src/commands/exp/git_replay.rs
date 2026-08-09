@@ -2000,10 +2000,25 @@ where
         }
     }
 
+    // Plugin installation also materializes the embedded WASM payloads at the
+    // root of `lix_file`. They are Lix-internal artifacts, not Git paths, so
+    // exclude this exact generated set from the semantic file-row count while
+    // keeping the expected Git-path/content verification below unchanged.
+    const EMBEDDED_REPLAY_PLUGIN_WASM_PATHS: [&str; 4] = [
+        "/plugin_csv.wasm",
+        "/plugin_excalidraw.wasm",
+        "/plugin_markdown.wasm",
+        "/plugin_text.wasm",
+    ];
+    let count_params = EMBEDDED_REPLAY_PLUGIN_WASM_PATHS
+        .iter()
+        .map(|path| Value::Text((*path).to_owned()))
+        .collect::<Vec<_>>();
     let count = db::block_on(lix.execute(
         "SELECT COUNT(*) FROM lix_file \
-         WHERE path NOT LIKE '/.lix/plugins/%'",
-        &[],
+         WHERE path NOT LIKE '/.lix/plugins/%' \
+         AND path NOT IN (?, ?, ?, ?)",
+        &count_params,
     ))
     .map_err(|error| CliError::msg(format!("failed to count Lix final tree: {error}")))?;
     let lix_count = match count.rows().first().and_then(|row| row.get_index(0)) {
