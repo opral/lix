@@ -15,7 +15,7 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,8 +25,8 @@ use lix::{
     CreateBranchOptions, Lix, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
     SwitchBranchOptions, Value, open_lix,
 };
-use lix_storage_rocksdb::RocksDB;
-use lix_storage_slatedb::SlateDB;
+use lix_storage_rocksdb::{RocksDB, RocksDBIoCounters};
+use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tracing::Subscriber;
@@ -39,6 +39,9 @@ use tracing_subscriber::registry::LookupSpan;
 const SCHEMA_VERSION: u64 = 2;
 const SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-00000000b001";
 const INSERT_BATCH: usize = 250;
+
+static ROCKS_IO_COUNTERS: OnceLock<Mutex<Option<RocksDBIoCounters>>> = OnceLock::new();
+static SLATE_IO_COUNTERS: OnceLock<Mutex<Option<SlateDBIoCounters>>> = OnceLock::new();
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: TrackingAllocator = TrackingAllocator;
@@ -194,10 +197,114 @@ struct ProcessCounters {
     rss_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BackendIoSnapshot {
+    read_calls: u64,
+    read_bytes: u64,
+    scan_calls: u64,
+    scan_rows: u64,
+    scan_bytes: u64,
+    write_calls: u64,
+    write_bytes: u64,
+    list_calls: u64,
+    listed_objects: u64,
+    deleted_objects: u64,
+    cache_reads: u64,
+    cache_writes: u64,
+    cache_removes: u64,
+}
+
+impl BackendIoSnapshot {
+    fn delta(self, before: Self) -> Self {
+        Self {
+            read_calls: self.read_calls.saturating_sub(before.read_calls),
+            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
+            scan_calls: self.scan_calls.saturating_sub(before.scan_calls),
+            scan_rows: self.scan_rows.saturating_sub(before.scan_rows),
+            scan_bytes: self.scan_bytes.saturating_sub(before.scan_bytes),
+            write_calls: self.write_calls.saturating_sub(before.write_calls),
+            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+            list_calls: self.list_calls.saturating_sub(before.list_calls),
+            listed_objects: self.listed_objects.saturating_sub(before.listed_objects),
+            deleted_objects: self.deleted_objects.saturating_sub(before.deleted_objects),
+            cache_reads: self.cache_reads.saturating_sub(before.cache_reads),
+            cache_writes: self.cache_writes.saturating_sub(before.cache_writes),
+            cache_removes: self.cache_removes.saturating_sub(before.cache_removes),
+        }
+    }
+
+    fn json(self) -> serde_json::Value {
+        json!({
+            "read_calls": self.read_calls,
+            "read_bytes": self.read_bytes,
+            "scan_calls": self.scan_calls,
+            "scan_rows": self.scan_rows,
+            "scan_bytes": self.scan_bytes,
+            "write_calls": self.write_calls,
+            "write_bytes": self.write_bytes,
+            "list_calls": self.list_calls,
+            "listed_objects": self.listed_objects,
+            "deleted_objects": self.deleted_objects,
+            "cache_reads": self.cache_reads,
+            "cache_writes": self.cache_writes,
+            "cache_removes": self.cache_removes,
+        })
+    }
+}
+
 struct RssSampler {
     stop: Arc<AtomicBool>,
     peak: Arc<AtomicU64>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+fn backend_io_snapshot() -> BackendIoSnapshot {
+    match benchmark_storage_name().as_str() {
+        "rocksdb" => {
+            let counters = ROCKS_IO_COUNTERS
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("rocks counters lock")
+                .clone();
+            let Some(counters) = counters else {
+                return BackendIoSnapshot::default();
+            };
+            let snapshot = counters.snapshot();
+            BackendIoSnapshot {
+                read_calls: snapshot.get_many_calls + snapshot.scan_pages,
+                read_bytes: snapshot.get_many_bytes + snapshot.scan_bytes,
+                scan_calls: snapshot.scan_pages,
+                scan_rows: snapshot.scan_rows,
+                scan_bytes: snapshot.scan_bytes,
+                ..BackendIoSnapshot::default()
+            }
+        }
+        "slatedb" => {
+            let counters = SLATE_IO_COUNTERS
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("slate counters lock")
+                .clone();
+            let Some(counters) = counters else {
+                return BackendIoSnapshot::default();
+            };
+            let snapshot = counters.snapshot();
+            BackendIoSnapshot {
+                read_calls: snapshot.read_objects,
+                read_bytes: snapshot.read_bytes,
+                write_calls: snapshot.write_objects,
+                write_bytes: snapshot.write_bytes,
+                list_calls: snapshot.list_operations,
+                listed_objects: snapshot.listed_objects,
+                deleted_objects: snapshot.deleted_objects,
+                cache_reads: snapshot.cache_filesystem_reads,
+                cache_writes: snapshot.cache_filesystem_writes,
+                cache_removes: snapshot.cache_filesystem_removes,
+                ..BackendIoSnapshot::default()
+            }
+        }
+        storage => panic!("unknown benchmark storage {storage:?}"),
+    }
 }
 
 impl RssSampler {
@@ -643,6 +750,10 @@ where
             "merge_write": merge_measure.after.write_bytes.saturating_sub(merge_measure.before.write_bytes),
             "storage_before": storage_bytes_before, "storage_after_merge": storage_bytes_after,
             "storage_growth_after_merge": signed_delta(storage_bytes_after, storage_bytes_before),
+        },
+        "backend_io": {
+            "preview": preview_measure.backend_io.json(),
+            "merge": merge_measure.backend_io.json(),
         },
         "phase_ms": { "preview": preview_phases, "merge": merge_phases },
         "plugin_counters": {
@@ -1092,6 +1203,14 @@ where
             "storage_after_branch_deletion": storage_bytes_after_branch_deletion,
             "storage_growth_after_branch_deletion": signed_delta(storage_bytes_after_branch_deletion, storage_bytes_before),
         },
+        "backend_io": {
+            "create_branches": branch_measure.backend_io.json(),
+            "switch_roundtrip": switch_measure.backend_io.json(),
+            "preview": preview_measure.backend_io.json(),
+            "merge": merge_measure.backend_io.json(),
+            "diff": diff_measure.backend_io.json(),
+            "delete_branches": delete_branches_measure.backend_io.json(),
+        },
         "phase_ms": {
             "setup": setup_phases,
             "create_branches": branch_phases,
@@ -1129,6 +1248,7 @@ struct Measurement<T> {
     before: ProcessCounters,
     after: ProcessCounters,
     peak_rss_bytes: u64,
+    backend_io: BackendIoSnapshot,
 }
 
 async fn measure_async<F, Fut, T>(operation: F) -> Measurement<T>
@@ -1137,6 +1257,7 @@ where
     Fut: std::future::Future<Output = T>,
 {
     let before = process_counters();
+    let backend_before = backend_io_snapshot();
     let sampler = RssSampler::start();
     let allocated_before = ALLOCATED_BYTES.load(Ordering::Relaxed);
     let started = Instant::now();
@@ -1145,6 +1266,7 @@ where
     let allocated_after = ALLOCATED_BYTES.load(Ordering::Relaxed);
     let peak_rss_bytes = sampler.finish();
     let after = process_counters();
+    let backend_after = backend_io_snapshot();
     Measurement {
         value,
         wall_ms,
@@ -1153,6 +1275,7 @@ where
         before,
         after,
         peak_rss_bytes,
+        backend_io: backend_after.delta(backend_before),
     }
 }
 
@@ -1166,7 +1289,14 @@ impl BenchmarkStorage for RocksDB {
     const NAME: &'static str = "rocksdb";
 
     fn open_for_benchmark(path: &Path) -> Self {
-        Self::open(path).expect("open benchmark RocksDB")
+        let counters = RocksDBIoCounters::default();
+        let storage =
+            Self::open_with_io_counters(path, counters.clone()).expect("open benchmark RocksDB");
+        *ROCKS_IO_COUNTERS
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("rocks counters lock") = Some(counters);
+        storage
     }
 }
 
@@ -1174,7 +1304,14 @@ impl BenchmarkStorage for SlateDB {
     const NAME: &'static str = "slatedb";
 
     fn open_for_benchmark(path: &Path) -> Self {
-        Self::open(path).expect("open benchmark SlateDB")
+        let counters = SlateDBIoCounters::default();
+        let storage =
+            Self::open_with_io_counters(path, counters.clone()).expect("open benchmark SlateDB");
+        *SLATE_IO_COUNTERS
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("slate counters lock") = Some(counters);
+        storage
     }
 }
 

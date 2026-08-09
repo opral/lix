@@ -2,4 +2,7 @@
 
 mod rocksdb;
 
-pub use rocksdb::{RocksDB, RocksDBFactory, RocksDBFixture, RocksDBRead, RocksDBWrite};
+pub use rocksdb::{
+    RocksDB, RocksDBFactory, RocksDBFixture, RocksDBIoCounters, RocksDBIoSnapshot, RocksDBRead,
+    RocksDBWrite,
+};
