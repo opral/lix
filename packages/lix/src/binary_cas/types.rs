@@ -221,28 +221,6 @@ pub(crate) enum BlobLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlobMetadata {
-    pub(crate) hash: BlobId,
-    pub(crate) size_bytes: u64,
-    pub(crate) layout: BlobLayout,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlobMetadataBatch {
-    entries: Vec<Option<BlobMetadata>>,
-}
-
-impl BlobMetadataBatch {
-    pub(crate) fn new(entries: Vec<Option<BlobMetadata>>) -> Self {
-        Self { entries }
-    }
-
-    pub(crate) fn into_vec(self) -> Vec<Option<BlobMetadata>> {
-        self.entries
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobBytesBatch {
     entries: Vec<Option<Vec<u8>>>,
 }
@@ -291,13 +269,4 @@ pub(crate) struct BlobWriteReceipt {
     /// already present in the retained read; this is an in-memory proof bit,
     /// not a second persisted authority.
     pub(crate) manifest_was_existing: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BlobChunkReceipt {
-    pub(crate) hash: ChunkHash,
-    pub(crate) size_bytes: u64,
-    /// The authenticated ForkTree chunk object carrying this content hash.
-    /// The physical owner is retained across resumable receipt rows.
-    pub(crate) object_id: [u8; 32],
 }

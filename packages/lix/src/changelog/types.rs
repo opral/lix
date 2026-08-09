@@ -2,7 +2,7 @@ use crate::LixError;
 use crate::common::LixTimestamp;
 use crate::common::{ExactBatch, ExactValue};
 use crate::entity_pk::EntityPk;
-use crate::json_store::{JsonRef, JsonSlot};
+use crate::json_store::JsonSlot;
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -63,7 +63,7 @@ impl CommitId {
         Self::new(Uuid::from_bytes(bytes))
     }
 
-    #[cfg(any(test, feature = "storage-benches"))]
+    #[cfg(test)]
     pub(crate) fn for_test_label(value: &str) -> Self {
         Uuid::parse_str(value)
             .map(Self::new)
@@ -100,7 +100,7 @@ impl ChangeId {
         &self.uuid
     }
 
-    #[cfg(any(test, feature = "storage-benches"))]
+    #[cfg(test)]
     pub(crate) fn for_test_label(value: &str) -> Self {
         Uuid::parse_str(value)
             .map(Self::new)
@@ -118,7 +118,7 @@ fn uuid_text_str(text: &[u8; UUID_HYPHENATED_LEN]) -> &str {
     std::str::from_utf8(text).expect("UUID text cache should contain valid UTF-8")
 }
 
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(test)]
 fn test_uuid_from_label(kind: u8, value: &str) -> Uuid {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0100_0000_01b3;
@@ -385,55 +385,6 @@ pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) origin_key: Option<&'a str>,
 }
 
-/// Borrowed, already-prepared change record for the terminal transaction
-/// append lane.
-///
-/// Unlike [`ChangeRecord`], this form never owns a second copy of row JSON,
-/// primary-key parts, or schema strings. Transaction materialization has
-/// already assigned identities and validated the facts, so the changelog can
-/// encode these references directly into the final write set.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TransactionChangeRecordRef<'a> {
-    pub(crate) change_id: ChangeId,
-    pub(crate) format_version: u32,
-    pub(crate) account_id: &'a str,
-    pub(crate) schema_key: &'a str,
-    pub(crate) entity_pk: &'a EntityPk,
-    pub(crate) file_id: Option<&'a str>,
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) origin_key: Option<&'a str>,
-}
-
-impl<'a> From<&'a ChangeRecord> for TransactionChangeRecordRef<'a> {
-    fn from(record: &'a ChangeRecord) -> Self {
-        Self {
-            change_id: record.change_id,
-            format_version: record.format_version,
-            account_id: &record.account_id,
-            schema_key: &record.schema_key,
-            entity_pk: &record.entity_pk,
-            file_id: record.file_id.as_deref(),
-            snapshot: record.snapshot.as_ref_slot(),
-            metadata: record.metadata.as_ref_slot(),
-            created_at: record.created_at,
-            origin_key: record.origin_key.as_deref(),
-        }
-    }
-}
-
-/// Trusted changelog facts assembled at the transaction commit boundary.
-///
-/// This is deliberately separate from [`ChangelogAppend`]: the generic
-/// writer supports validation and read-your-writes overlays, while this lane
-/// is terminal and encodes prepared transaction facts directly into storage.
-#[derive(Debug)]
-pub(crate) struct TransactionChangelogAppend<'a> {
-    pub(crate) commits: Vec<CommitRecord>,
-    pub(crate) changes: Vec<TransactionChangeRecordRef<'a>>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct ChangeRecordView<'a> {
@@ -551,51 +502,6 @@ pub(crate) struct ChangeScanRequest<'a> {
 pub(crate) struct ChangeScanBatch {
     pub(crate) entries: Vec<ChangeRecord>,
     pub(crate) next_start_after: Option<ChangeId>,
-}
-
-#[cfg(feature = "storage-benches")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RebuildIndexStats {
-    pub(crate) expected: usize,
-    pub(crate) put: usize,
-    pub(crate) deleted: usize,
-    pub(crate) unchanged: usize,
-}
-
-#[allow(dead_code)] // Activated by the checkpoint GC integration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum GcRoot {
-    BranchHead(CommitId),
-    StandaloneChange(ChangeId),
-    /// A history-free untracked current-state member owns this payload
-    /// directly, without a changelog record to retain it.
-    CurrentPayload(JsonRef),
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GcLiveSet {
-    pub(crate) commits: Vec<CommitId>,
-    pub(crate) changes: Vec<ChangeId>,
-    pub(crate) payloads: Vec<JsonRef>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GcSweepSet {
-    pub(crate) commits: Vec<CommitId>,
-    pub(crate) commit_change_ids: Vec<ChangeId>,
-    pub(crate) changes: Vec<ChangeId>,
-    pub(crate) json_payloads: Vec<JsonRef>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GcRepairSet {}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GcPlan {
-    pub(crate) roots: Vec<GcRoot>,
-    pub(crate) live: GcLiveSet,
-    pub(crate) sweep: GcSweepSet,
-    pub(crate) repair: GcRepairSet,
 }
 
 /// Canonical derived `lix_commit` row snapshot.
