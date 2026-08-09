@@ -49,6 +49,7 @@ datafusion = { version = "53.0.0", default-features = false, features = ["sql"] 
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,6 +60,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+[[example]]
+name = "forktree_sqlite_oltp"
+path = "examples/forktree_sqlite_oltp.rs"
+required-features = ["storage-benches", "slatedb"]
 [[test]]
 name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"
