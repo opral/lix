@@ -41,7 +41,7 @@ use super::{
     StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef,
     UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
     advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
-    load_commit_member_records, load_commit_topologies, load_commit_with_memo,
+    load_commit_member_records, load_commit_summary, load_commit_topologies, load_commit_with_memo,
     new_commit_validation_memo, open_coherent_view, page_changes, page_commits,
     prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
     state_range,
@@ -300,6 +300,39 @@ async fn commit_validation_memo_is_view_local_and_never_caches_corruption() {
             .await
             .is_err(),
         "a memo from another coherent view must not mask corruption"
+    );
+}
+
+#[tokio::test]
+async fn commit_summary_defers_unaccessed_member_authentication() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+
+    let mut writes = StorageWriteSet::new();
+    writes.delete(
+        OBJECT_SPACE,
+        seed.semantic_change_object_id.as_bytes().to_vec(),
+    );
+    commit_write_set_for_test(writes, &storage).await;
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open summary view");
+    let summary = load_commit_summary(&view, seed.commit_id)
+        .await
+        .expect("authenticated commit summary")
+        .expect("seed summary");
+    assert_eq!(summary.commit_id, seed.commit_id);
+    assert!(
+        load_commit_with_memo(
+            &view,
+            seed.commit_id,
+            &mut new_commit_validation_memo(&view)
+        )
+        .await
+        .is_err(),
+        "later member consumption must fail closed on the missing member"
     );
 }
 

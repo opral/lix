@@ -24,8 +24,9 @@ use crate::forktree::{
     CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, CommitValidationMemo, ObjectId,
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
     StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
-    encode_state_key, encode_state_value, load_commit_with_memo, new_commit_validation_memo,
-    open_coherent_view_on_read, select_historical_commit_member, state_point,
+    encode_state_key, encode_state_value, load_commit_summary, load_commit_with_memo,
+    new_commit_validation_memo, open_coherent_view_on_read, select_historical_commit_member,
+    state_point,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -461,13 +462,9 @@ where
         .copied()
         .flatten()
         .ok_or_else(|| writer_error("branch commit has no selected parent"))?;
-    let selected_parent = load_commit_with_memo(
-        &view,
-        forktree_commit_id(expected_parent),
-        &mut validation_memo,
-    )
-    .await?
-    .ok_or_else(|| writer_error("selected branch parent is absent from CommitCatalog"))?;
+    let selected_parent = load_commit_summary(&view, forktree_commit_id(expected_parent))
+        .await?
+        .ok_or_else(|| writer_error("selected branch parent is absent from CommitCatalog"))?;
     let (selected_parent_object_id, _) = selected_parent.encode()?;
     if selected_parent_object_id != view.branch_snapshot().semantic_head_commit_object_id {
         return Err(writer_error(

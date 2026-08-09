@@ -1068,7 +1068,7 @@ fn semantic_commit_record(
     Ok(record)
 }
 
-async fn validate_commit_topology<R>(
+pub(crate) async fn validate_commit_topology<R>(
     read: &R,
     commit_catalog_root: ObjectId,
     catalog_id: CommitId,
@@ -2284,6 +2284,38 @@ where
     memo.insert(view, commit.clone(), entry.commit_object_id, members);
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_forktree_commit_validation_success();
+    Ok(Some(commit))
+}
+
+/// Loads the authenticated commit envelope and immediate topology needed to
+/// publish a child. Member payloads remain lazy: callers that enumerate or
+/// consume members must use the eager path above, which keeps every member and
+/// ChangeCatalog owner check fail-closed at the point of access.
+pub(crate) async fn load_commit_summary<R>(
+    view: &CoherentView<R>,
+    id: CommitId,
+) -> Result<Option<CommitObjectV1>, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let Some(value) = view
+        .lookup_tree_value(
+            view.repository_root().commit_catalog_root,
+            "commit",
+            id.as_bytes(),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let entry = CommitCatalogEntry::decode(&value)?;
+    let bytes = view.load_object_bytes(entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != id {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
+    }
+    view.validate_commit_topology(view.repository_root().commit_catalog_root, id, &commit)
+        .await?;
     Ok(Some(commit))
 }
 
