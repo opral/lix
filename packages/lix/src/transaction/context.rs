@@ -3012,13 +3012,12 @@ where
                         })?;
                     BlobRefRowInput {
                         file_id: file_key.file_id.clone(),
-                        blob_hash: payload.blob_hash().unwrap_or_else(|| {
-                            BlobId::from_canonical_content(
-                                payload
-                                    .inline_data()
-                                    .expect("plugin materializations require inline file content"),
+                        blob_hash: payload.blob_hash().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin materialization payload has no authenticated Merkle BlobId",
                             )
-                        }),
+                        })?,
                         size_bytes: payload.len(),
                         plugin_checkpoint: payload.plugin_checkpoint().map(|checkpoint| {
                             BlobRefPluginCheckpoint {
@@ -3104,13 +3103,12 @@ where
                         })?;
                     BlobRefRowInput {
                         file_id: file_key.file_id.clone(),
-                        blob_hash: payload.blob_hash().unwrap_or_else(|| {
-                            BlobId::from_canonical_content(
-                                payload
-                                    .inline_data()
-                                    .expect("plugin materializations require inline file content"),
+                        blob_hash: payload.blob_hash().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin materialization payload has no authenticated Merkle BlobId",
                             )
-                        }),
+                        })?,
                         size_bytes: payload.len(),
                         plugin_checkpoint: payload.plugin_checkpoint().map(|checkpoint| {
                             BlobRefPluginCheckpoint {

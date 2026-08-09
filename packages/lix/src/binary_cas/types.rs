@@ -129,17 +129,6 @@ impl BlobPayload {
         Self { bytes, hash }
     }
 
-    pub(crate) fn from_bytes_with_canonical_id(
-        bytes: impl Into<crate::Blob>,
-        canonical_id: BlobId,
-    ) -> Self {
-        let bytes = bytes.into();
-        Self {
-            bytes,
-            hash: Some(canonical_id),
-        }
-    }
-
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }

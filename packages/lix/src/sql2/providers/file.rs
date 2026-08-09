@@ -3421,14 +3421,12 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
 
 fn file_content_from_request_splice(
     data: crate::Blob,
-    provenance: Option<&RequestBlobSpliceProvenance>,
+    _provenance: Option<&RequestBlobSpliceProvenance>,
 ) -> FileContent {
-    match provenance.filter(|provenance| provenance.matches_result(&data)) {
-        Some(provenance) => {
-            FileContent::inline_with_canonical_id(data, provenance.result_blob_id())
-        }
-        None => FileContent::inline(data),
-    }
+    // The durable identity is derived only after the retained-view Merkle
+    // proof reaches PreparedPublication. Transport provenance never seeds a
+    // BlobRef/manifest identity.
+    FileContent::inline(data)
 }
 
 struct FastLixFilePathWrite {

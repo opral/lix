@@ -1798,16 +1798,6 @@ impl FileContent {
         Self::Inline(BlobPayload::from_bytes(data))
     }
 
-    pub(crate) fn inline_with_canonical_id(
-        data: impl Into<crate::Blob>,
-        canonical_id: BlobId,
-    ) -> Self {
-        Self::Inline(BlobPayload::from_bytes_with_canonical_id(
-            data,
-            canonical_id,
-        ))
-    }
-
     pub(crate) fn blob_id(&self) -> Option<BlobId> {
         match self {
             Self::Inline(payload) => payload.hash(),

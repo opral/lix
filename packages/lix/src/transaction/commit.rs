@@ -236,8 +236,8 @@ where
         crate::gc::stage_checkpoint_publication(&mut publication, checkpoint)?;
     }
 
-    let runtime_entity_pk = runtime_checkpoint
-        .map(|_| crate::entity_pk::EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_KEY));
+    let runtime_entity_pk =
+        runtime_checkpoint.map(|_| EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_KEY));
 
     for row in prepared_writes
         .state_rows
@@ -309,9 +309,8 @@ where
                 blob_manifest_object_ids: &[],
             },
         )?;
-        let initialized_entity_pk = crate::entity_pk::EntityPk::single(
-            crate::functions::DETERMINISTIC_SEQUENCE_INITIALIZED_KEY,
-        );
+        let initialized_entity_pk =
+            EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_INITIALIZED_KEY);
         let initialized_snapshot = serde_json::to_string(&serde_json::json!({
             "key": crate::functions::DETERMINISTIC_SEQUENCE_INITIALIZED_KEY,
             "value": true,
@@ -565,9 +564,9 @@ where
         change_id: change_refs.branch_ref_change_id,
         account_id: active_account_id.to_string(),
         schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
-        entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(&branch_id).map_err(
-            |error| writer_error(format!("transaction branch identity is invalid: {error}")),
-        )?,
+        entity_pk: EntityPk::uuid_from_canonical(&branch_id).map_err(|error| {
+            writer_error(format!("transaction branch identity is invalid: {error}"))
+        })?,
         file_id: None,
         snapshot: JsonSlot::from_json(
             &serde_json::json!({
@@ -1244,9 +1243,9 @@ where
         change_id: final_content.draft.branch_ref_change_id,
         account_id: active_account_id.to_string(),
         schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
-        entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(&branch_id).map_err(
-            |error| writer_error(format!("transaction branch identity is invalid: {error}")),
-        )?,
+        entity_pk: EntityPk::uuid_from_canonical(&branch_id).map_err(|error| {
+            writer_error(format!("transaction branch identity is invalid: {error}"))
+        })?,
         file_id: None,
         snapshot: JsonSlot::from_json(
             &serde_json::json!({

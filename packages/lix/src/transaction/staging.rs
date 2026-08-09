@@ -2800,9 +2800,12 @@ impl TransactionWriteBuffer {
                 // unresolved lets the transaction reader fall through to CAS.
                 continue;
             };
-            let hash = write
-                .blob_hash()
-                .unwrap_or_else(|| BlobId::from_canonical_content(data));
+            let hash = write.blob_hash().ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_STORAGE",
+                    "staged file payload has no authenticated Merkle BlobId",
+                )
+            })?;
             if let Some(bytes) = requested.get_mut(&hash)
                 && bytes.is_none()
             {
@@ -2813,9 +2816,9 @@ impl TransactionWriteBuffer {
                 }
             }
             for payload in write.auxiliary_payloads() {
-                let hash = payload
-                    .hash()
-                    .unwrap_or_else(|| BlobId::from_canonical_content(payload.bytes()));
+                let Some(hash) = payload.hash() else {
+                    continue;
+                };
                 if let Some(bytes) = requested.get_mut(&hash)
                     && bytes.is_none()
                 {
@@ -2863,9 +2866,12 @@ impl TransactionWriteBuffer {
             let Some(data) = write.inline_data() else {
                 continue;
             };
-            let actual = write
-                .blob_hash()
-                .unwrap_or_else(|| BlobId::from_canonical_content(data));
+            let actual = write.blob_hash().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "staged plugin payload has no authenticated Merkle BlobId",
+                )
+            })?;
             if actual != expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,

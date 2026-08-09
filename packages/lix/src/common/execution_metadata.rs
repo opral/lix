@@ -78,8 +78,6 @@ impl VerifiedRequestBlob {
             base_blob_id: crate::forktree::canonical_blob_id_for_content(&self.blob)
                 .map_err(LixError::from)?,
             transport_result_digest_hex: result.sha256.clone(),
-            result_blob_id: crate::forktree::canonical_blob_id_for_content(&result.blob)
-                .map_err(LixError::from)?,
             prefix_bytes,
             suffix_bytes,
             insert,
@@ -106,9 +104,6 @@ pub struct RequestBlobSpliceProvenance {
     /// any object is staged.
     base_blob_id: crate::binary_cas::BlobId,
     transport_result_digest_hex: String,
-    /// Canonical Merkle identity of `validated_result`, computed once while
-    /// the transport already owns the complete reconstructed bytes.
-    result_blob_id: crate::binary_cas::BlobId,
     prefix_bytes: usize,
     suffix_bytes: usize,
     insert: Blob,
@@ -167,8 +162,6 @@ impl RequestBlobSpliceProvenance {
             base_blob_id: crate::forktree::canonical_blob_id_for_content(base)
                 .map_err(LixError::from)?,
             transport_result_digest_hex: actual_result_sha256,
-            result_blob_id: crate::forktree::canonical_blob_id_for_content(result)
-                .map_err(LixError::from)?,
             prefix_bytes,
             suffix_bytes,
             insert,
@@ -187,15 +180,10 @@ impl RequestBlobSpliceProvenance {
         self.base_blob_id
     }
 
-    /// Returns the transport protocol's successor witness for plugin input
-    /// bookkeeping. Durable file identity comes exclusively from the Merkle
-    /// root carried by [`Self::result_blob_id`].
+    /// Returns the transport protocol's successor byte witness for plugin
+    /// input bookkeeping. It is never a durable file identity.
     pub(crate) fn transport_result_digest_hex(&self) -> &str {
         &self.transport_result_digest_hex
-    }
-
-    pub(crate) fn result_blob_id(&self) -> crate::binary_cas::BlobId {
-        self.result_blob_id
     }
 
     pub(crate) fn prefix_bytes(&self) -> usize {
