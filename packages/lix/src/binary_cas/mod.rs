@@ -1,8 +1,6 @@
 mod context;
-pub(crate) mod metrics;
 mod types;
 
-pub(crate) use context::BinaryCasContext;
 #[cfg(test)]
 pub(crate) use context::BlobDataReader;
 pub(crate) use types::{

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::entity_pk::EntityPk;
@@ -33,7 +32,6 @@ pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memor
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
     branch_ctx: Arc<BranchContext>,
-    binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -171,7 +169,6 @@ where
             Arc::clone(&observe_invalidation),
         ));
         Ok(Self {
-            binary_cas: Arc::new(BinaryCasContext::new()),
             storage,
             tracked_state,
             live_state,
@@ -236,7 +233,6 @@ where
             self.storage(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
-            Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
@@ -267,7 +263,6 @@ where
             self.storage(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
-            Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),

@@ -265,7 +265,7 @@ impl PreparedPublication {
     /// Stages one authenticated upload part in this publication. Open parts
     /// retain typed ReceiptTree state; a completed part stages the manifest
     /// and lets the ordinary file-row lowerer publish the visible BlobRef in
-    /// the same transaction. No BinaryCasContext writer or second commit is
+    /// the same transaction. No separate CAS writer or second commit is
     /// reachable from this operation.
     pub(crate) fn publish_upload_part(
         &mut self,

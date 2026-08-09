@@ -21,7 +21,7 @@ use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobId};
+use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchLifecycle, BranchOperation, BranchRefReader,
     BranchReferenceRole,
@@ -563,7 +563,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_account_id: String,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
-    binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     schema_resolver: TransactionSchemaResolver,
@@ -1485,7 +1484,6 @@ where
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
         plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
@@ -1591,7 +1589,6 @@ where
                     active_account_id,
                     live_state,
                     tracked_state,
-                    binary_cas,
                     plugin_host,
                     branch_ctx,
                     schema_resolver,
@@ -7193,7 +7190,6 @@ where
         let read_store = self.opening_read();
         let forktree = ForkTreeReadFacade::new(read_store.clone());
         let active_branch_id = self.active_branch_id.clone();
-        let binary_cas = Arc::clone(&self.binary_cas);
         let branch_ctx = Arc::clone(&self.branch_ctx);
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
@@ -7210,7 +7206,6 @@ where
             active_account_id: self.active_account_id.clone(),
             read_store,
             forktree,
-            binary_cas,
             branch_ctx,
             visible_schemas,
             functions,
@@ -8129,7 +8124,6 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     active_account_id: String,
     read_store: SharedStorageAdapterRead<R>,
     forktree: ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
-    binary_cas: Arc<BinaryCasContext>,
     branch_ctx: Arc<BranchContext>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
@@ -9426,7 +9420,6 @@ pub(crate) async fn open_transaction<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
-    binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -9442,7 +9435,6 @@ where
         storage,
         live_state,
         tracked_state,
-        binary_cas,
         plugin_host,
         branch_ctx,
         catalog_context,
@@ -9460,7 +9452,6 @@ pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
-    binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -9478,7 +9469,6 @@ where
         storage,
         live_state,
         tracked_state,
-        binary_cas,
         plugin_host,
         branch_ctx,
         catalog_context,

@@ -1,15 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use bytes::Bytes;
-
-use crate::storage::{ReadOptions, WriteOptions};
-use crate::storage_adapter::Storage;
-use crate::storage_adapter::{
-    StorageAdapter, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
-    StoragePrefix, StorageProjectedValue, StorageWriteOptions, StorageWriteSet,
-    StorageWriteSetError,
-};
-
 #[cfg(any())]
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
@@ -435,16 +425,6 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BinaryCasWriteAccounting {
-    pub chunk_lookup_count: u64,
-    pub chunk_lookup_batch_count: u64,
-    pub chunk_lookup_hit_count: u64,
-    pub chunk_lookup_miss_count: u64,
-    pub chunk_lookup_elapsed_ns: u64,
-    pub transaction_duplicate_chunk_count: u64,
 }
 
 pub(crate) fn record_transaction_rows_staged(count: usize) {
@@ -1372,64 +1352,6 @@ mod obsolete_benchmark_support {
         let read = adapter.begin_read(ReadOptions::default()).await?;
         let reader = crate::tracked_state::TrackedStateContext::new().reader(read);
         reader.has_durable_commit_root(commit_id).await
-    }
-
-    pub fn reset_binary_cas_write_accounting() {
-        crate::binary_cas::metrics::reset_binary_cas_write_metrics();
-    }
-
-    pub fn binary_cas_write_accounting() -> BinaryCasWriteAccounting {
-        let metrics = crate::binary_cas::metrics::binary_cas_write_metrics_snapshot();
-        BinaryCasWriteAccounting {
-            chunk_lookup_count: metrics.chunk_lookup_count,
-            chunk_lookup_batch_count: metrics.chunk_lookup_batch_count,
-            chunk_lookup_hit_count: metrics.chunk_lookup_hit_count,
-            chunk_lookup_miss_count: metrics.chunk_lookup_miss_count,
-            chunk_lookup_elapsed_ns: metrics.chunk_lookup_elapsed_ns,
-            transaction_duplicate_chunk_count: metrics.transaction_duplicate_chunk_count,
-        }
-    }
-
-    /// Writes one payload through the production binary CAS and commits the
-    /// resulting canonical write set. This is intentionally available only to
-    /// storage benchmarks so they can isolate CAS layout costs from SQL planning,
-    /// validation, tracked state, and changelog work.
-    pub async fn write_binary_cas_for_bench<StorageImpl>(
-        storage: &StorageAdapter<StorageImpl>,
-        bytes: &[u8],
-    ) -> Result<String, crate::LixError>
-    where
-        StorageImpl: Storage,
-    {
-        let read = storage.begin_read(ReadOptions::default()).await?;
-        let mut writes = storage.new_write_set();
-        let receipt = crate::binary_cas::BinaryCasContext::new()
-            .writer_skipping_existing_chunks(&read, &mut writes)
-            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(bytes.to_vec()))
-            .await?;
-        storage
-            .commit_write_set(writes, WriteOptions::default())
-            .await?;
-        Ok(receipt.hash.to_hex())
-    }
-
-    /// Reads one payload through the production binary CAS. See
-    /// [`write_binary_cas_for_bench`] for why this feature-gated helper exists.
-    pub async fn read_binary_cas_for_bench<StorageImpl>(
-        storage: &StorageAdapter<StorageImpl>,
-        hash_hex: &str,
-    ) -> Result<Option<Vec<u8>>, crate::LixError>
-    where
-        StorageImpl: Storage,
-    {
-        let read = storage.begin_read(ReadOptions::default()).await?;
-        let hash = crate::binary_cas::BlobId::from_hex(hash_hex)?;
-        let mut entries = crate::binary_cas::BinaryCasContext::new()
-            .reader(read)
-            .load_bytes_many(&[hash])
-            .await?
-            .into_vec();
-        Ok(entries.pop().flatten())
     }
 
     pub(crate) fn record_transaction_rows_staged(count: usize) {
