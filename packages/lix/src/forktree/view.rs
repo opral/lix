@@ -202,7 +202,9 @@ where
                         } else {
                             let canonical = load_object_bytes(self.read, id).await?;
                             let domain = super::object::authenticate_object_domain(id, &canonical)?;
-                            if super::object::hot_packable_object(id, &canonical)? {
+                            if self.pack_id != ObjectId::ZERO
+                                && super::object::hot_packable_object(id, &canonical)?
+                            {
                                 return Err(corruption(format!(
                                     "hot pack object {id} is absent for authenticated domain {domain:?} (pack={}, entries={})",
                                     self.pack_id,
@@ -858,6 +860,8 @@ where
 #[derive(Clone)]
 pub(crate) struct ForkTreeReadFacade<R> {
     read: R,
+    identity: ReadIdentity,
+    hot_objects: BTreeMap<ObjectId, Bytes>,
 }
 
 /// Let snapshot-bound ForkTree serving primitives consume the operation-owned
@@ -909,7 +913,20 @@ where
     R: StorageAdapterRead,
 {
     pub(crate) fn new(read: R) -> Self {
-        Self { read }
+        Self {
+            identity: ReadIdentity::for_raw_control(&read, ObjectId::ZERO, ObjectId::ZERO),
+            read,
+            hot_objects: BTreeMap::new(),
+        }
+    }
+
+    fn packed_read(&self) -> PackedRead<'_, R> {
+        PackedRead {
+            read: &self.read,
+            objects: &self.hot_objects,
+            pack_id: self.identity.hot_pack_object_id,
+            identity: self.identity,
+        }
     }
 
     pub(crate) async fn branch(
@@ -936,7 +953,7 @@ where
         &self,
         commit_id: crate::changelog::CommitId,
     ) -> Result<Option<Vec<crate::changelog::ChangeRecord>>, crate::LixError> {
-        super::serving::load_commit_member_records(&self.read, commit_id).await
+        super::serving::load_commit_member_records(&self.packed_read(), commit_id).await
     }
 
     pub(crate) async fn load_commit_member_sources(
@@ -946,14 +963,14 @@ where
         Option<Vec<(crate::changelog::CommitId, crate::changelog::ChangeRecord)>>,
         crate::LixError,
     > {
-        super::serving::load_commit_member_sources(&self.read, commit_id).await
+        super::serving::load_commit_member_sources(&self.packed_read(), commit_id).await
     }
 
     pub(crate) async fn load_change_records(
         &self,
         ids: &[crate::changelog::ChangeId],
     ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError> {
-        super::serving::load_change_records(&self.read, ids).await
+        super::serving::load_change_records(&self.packed_read(), ids).await
     }
 
     pub(crate) async fn scan_change_records(
@@ -961,7 +978,7 @@ where
         start_after: Option<crate::changelog::ChangeId>,
         limit: usize,
     ) -> Result<Vec<crate::changelog::ChangeRecord>, crate::LixError> {
-        super::serving::scan_change_records(&self.read, start_after, limit).await
+        super::serving::scan_change_records(&self.packed_read(), start_after, limit).await
     }
 
     pub(crate) async fn scan_commit_records(
@@ -969,7 +986,7 @@ where
         start_after: Option<crate::changelog::CommitId>,
         limit: usize,
     ) -> Result<Vec<crate::changelog::CommitRecord>, crate::LixError> {
-        super::serving::scan_commit_records(&self.read, start_after, limit).await
+        super::serving::scan_commit_records(&self.packed_read(), start_after, limit).await
     }
 
     pub(crate) async fn load_state_value_at_commit(
@@ -979,8 +996,13 @@ where
         include_tombstone: bool,
     ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, crate::LixError>
     {
-        super::serving::load_state_value_at_commit(&self.read, commit_id, key, include_tombstone)
-            .await
+        super::serving::load_state_value_at_commit(
+            &self.packed_read(),
+            commit_id,
+            key,
+            include_tombstone,
+        )
+        .await
     }
 
     /// Loads exact historical rows from the authenticated ForkTree state
@@ -1057,7 +1079,7 @@ where
                 })?;
             values.push((key.clone(), value));
         }
-        super::blob::load_historical_blob_bytes_for_state_values(&self.read, &values).await
+        super::blob::load_historical_blob_bytes_for_state_values(&self.packed_read(), &values).await
     }
 
     /// Loads the state rows authored by one authenticated semantic commit.
@@ -1148,7 +1170,7 @@ where
         &self,
         commit_id: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
-        super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
+        super::serving::scan_state_rows_at_commit(&self.packed_read(), commit_id).await
     }
 
     /// Diffs two authenticated historical state roots through this facade's
@@ -1160,7 +1182,7 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, true).await
+        diff_state_rows_between_commits_on_read(&self.packed_read(), before, after, true).await
     }
 
     /// Diffs only the branch-local state domain for checkpoint and working
@@ -1171,7 +1193,7 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, false).await
+        diff_state_rows_between_commits_on_read(&self.packed_read(), before, after, false).await
     }
 
     /// Returns authenticated state-write identity changes separately from
@@ -1183,7 +1205,7 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateIdentityChange>, crate::LixError> {
-        touched_state_identities_between_commits_on_read(&self.read, before, after).await
+        touched_state_identities_between_commits_on_read(&self.packed_read(), before, after).await
     }
 
     /// Resolves one required semantic commit record from the authenticated
@@ -1192,7 +1214,7 @@ where
         &self,
         commit_id: crate::changelog::CommitId,
     ) -> Result<crate::changelog::CommitRecord, crate::LixError> {
-        super::serving::load_required_commit_record(&self.read, commit_id).await
+        super::serving::load_required_commit_record(&self.packed_read(), commit_id).await
     }
 
     /// Returns the authenticated checkpoint history for one branch head. The
@@ -1325,7 +1347,7 @@ where
             }
             crate::json_store::JsonSlot::ForkTreeObject(object_id) => {
                 let id = ObjectId::from_bytes(*object_id);
-                let bytes = load_object_bytes(&self.read, id).await?;
+                let bytes = load_object_bytes(&self.packed_read(), id).await?;
                 let chunk = BlobChunkV1::decode(id, &bytes)?;
                 String::from_utf8(chunk.bytes.to_vec())
                     .map(Some)
