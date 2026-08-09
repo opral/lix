@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
@@ -90,6 +90,7 @@ struct CommitWindow {
     from: String,
     to: String,
     count: usize,
+    commits: Vec<String>,
 }
 
 fn main() {
@@ -104,16 +105,7 @@ fn run() -> Result<(), String> {
     validate_config(&config)?;
 
     let window = resolve_window(&config.repo, &config.branch, &config.from, &config.to)?;
-    let lfs = inspect_lfs(&config.repo, &window.to)?;
-    if lfs.pointer_files > 0 && lfs.local_object_files == 0 {
-        return Err(format!(
-            "required Git LFS objects are unavailable for {}: {} pointer files are present but {} has no materialized objects; fetch the selected history with `git -C {} lfs fetch --all`; refusing pointer-as-bytes fallback",
-            window.to,
-            lfs.pointer_files,
-            lfs.objects_path.display(),
-            config.repo.display()
-        ));
-    }
+    let lfs = inspect_lfs(&config.repo, &window)?;
 
     let tree_listing = git_capture(
         &config.repo,
@@ -168,6 +160,7 @@ fn run() -> Result<(), String> {
             "from": window.from,
             "to": window.to,
             "commit_count": window.count,
+            "selected_first_parent_commits": window.commits,
             "pinned_vscode_docs_head": FIXTURE_COMMIT,
             "pinned_vscode_docs_tree": FIXTURE_TREE,
             "pinned_vscode_docs_first_parent": FIXTURE_FIRST_PARENT,
@@ -366,7 +359,7 @@ fn resolve_window(repo: &Path, branch: &str, from: &str, to: &str) -> Result<Com
     )?;
     let commits = listing
         .lines()
-        .filter_map(|line| line.split_ascii_whitespace().next())
+        .filter_map(|line| line.split_ascii_whitespace().next().map(str::to_owned))
         .collect::<Vec<_>>();
     let from_index = commits
         .iter()
@@ -386,34 +379,53 @@ fn resolve_window(repo: &Path, branch: &str, from: &str, to: &str) -> Result<Com
         from: from_oid,
         to: to_oid,
         count: to_index - from_index + 1,
+        commits: commits[from_index..=to_index].to_vec(),
     })
 }
 
 #[derive(Debug, serde::Serialize)]
 struct LfsStats {
+    selected_commit_count: usize,
     pointer_files: usize,
+    unique_oids: usize,
+    declared_pointer_bytes: u64,
+    unique_declared_bytes: u64,
     local_object_files: usize,
+    validated_objects: usize,
+    validated_unique_bytes: u64,
     objects_path: PathBuf,
 }
 
-fn inspect_lfs(repo: &Path, commit: &str) -> Result<LfsStats, String> {
-    let pointer_listing = git_output(
-        repo,
-        &["grep", "-I", "-l", "-e", LFS_POINTER_VERSION, commit, "--"],
-    )?;
-    let pointer_files = if pointer_listing.status.code() == Some(1) {
-        0
-    } else if !pointer_listing.status.success() {
-        return Err(format_child_failure(
-            "inspect Git LFS pointers",
-            &pointer_listing,
-        ));
-    } else {
-        text(&pointer_listing.stdout)
-            .lines()
-            .filter(|line| !line.is_empty())
-            .count()
-    };
+fn inspect_lfs(repo: &Path, window: &CommitWindow) -> Result<LfsStats, String> {
+    let mut requirements = BTreeMap::<String, u64>::new();
+    let mut pointer_files = 0usize;
+    let mut declared_pointer_bytes = 0u64;
+    for commit in &window.commits {
+        for path in lfs_pointer_paths(repo, commit)? {
+            let commit_path = format!("{commit}:{path}");
+            let pointer = git_output(repo, &["show", &commit_path])?;
+            if !pointer.status.success() {
+                return Err(format_child_failure(
+                    &format!("read Git LFS pointer {commit_path}"),
+                    &pointer,
+                ));
+            }
+            let (oid, size) = parse_lfs_pointer(&pointer.stdout, &commit_path)?;
+            pointer_files = pointer_files
+                .checked_add(1)
+                .ok_or_else(|| "Git LFS pointer count overflow".to_string())?;
+            declared_pointer_bytes = declared_pointer_bytes
+                .checked_add(size)
+                .ok_or_else(|| "Git LFS declared byte count overflow".to_string())?;
+            if let Some(previous_size) = requirements.insert(oid.clone(), size)
+                && previous_size != size
+            {
+                return Err(format!(
+                    "Git LFS OID {oid} has conflicting declared sizes {previous_size} and {size} in selected first-parent commits"
+                ));
+            }
+        }
+    }
     let common_dir = git_text(repo, &["rev-parse", "--git-common-dir"])?;
     let common_dir = PathBuf::from(common_dir);
     let common_dir = if common_dir.is_absolute() {
@@ -422,17 +434,298 @@ fn inspect_lfs(repo: &Path, commit: &str) -> Result<LfsStats, String> {
         repo.join(common_dir)
     };
     let objects_path = common_dir.join("lfs").join("objects");
-    let local_object_files = if objects_path.is_dir() {
-        count_files(&objects_path)
-            .map_err(|error| format!("scan {}: {error}", objects_path.display()))?
-    } else {
-        0
-    };
+    let local_objects = collect_local_lfs_objects(&objects_path)
+        .map_err(|error| format!("scan {}: {error}", objects_path.display()))?;
+    let (validated_objects, validated_unique_bytes) =
+        validate_lfs_objects(&objects_path, &requirements, &local_objects)?;
+    let unique_declared_bytes = requirements.values().try_fold(0u64, |total, size| {
+        total
+            .checked_add(*size)
+            .ok_or_else(|| "Git LFS unique declared byte count overflow".to_string())
+    })?;
     Ok(LfsStats {
+        selected_commit_count: window.commits.len(),
         pointer_files,
-        local_object_files,
+        unique_oids: requirements.len(),
+        declared_pointer_bytes,
+        unique_declared_bytes,
+        local_object_files: local_objects.len(),
+        validated_objects,
+        validated_unique_bytes,
         objects_path,
     })
+}
+
+fn lfs_pointer_paths(repo: &Path, commit: &str) -> Result<Vec<String>, String> {
+    let listing = git_output(
+        repo,
+        &[
+            "grep",
+            "-z",
+            "-I",
+            "-l",
+            "-e",
+            LFS_POINTER_VERSION,
+            commit,
+            "--",
+        ],
+    )?;
+    if listing.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !listing.status.success() {
+        return Err(format_child_failure(
+            &format!("inspect Git LFS pointers in {commit}"),
+            &listing,
+        ));
+    }
+    listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            String::from_utf8(path.to_vec())
+                .map_err(|_| format!("Git LFS pointer path in {commit} is not UTF-8"))
+        })
+        .collect()
+}
+
+fn parse_lfs_pointer(bytes: &[u8], location: &str) -> Result<(String, u64), String> {
+    let contents = std::str::from_utf8(bytes)
+        .map_err(|_| format!("Git LFS pointer {location} is not UTF-8"))?;
+    let lines = contents.lines().collect::<Vec<_>>();
+    if lines.len() != 3 || lines[0] != LFS_POINTER_VERSION {
+        return Err(format!(
+            "Git LFS pointer {location} is malformed: expected exactly version/oid/size"
+        ));
+    }
+    let oid = lines[1]
+        .strip_prefix("oid sha256:")
+        .filter(|oid| {
+            oid.len() == 64
+                && oid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| format!("Git LFS pointer {location} has a noncanonical SHA-256 OID"))?;
+    let size = lines[2]
+        .strip_prefix("size ")
+        .filter(|size| !size.is_empty() && size.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| format!("Git LFS pointer {location} has an invalid declared size"))?
+        .parse::<u64>()
+        .map_err(|error| {
+            format!("Git LFS pointer {location} has an invalid declared size: {error}")
+        })?;
+    Ok((oid.to_owned(), size))
+}
+
+fn collect_local_lfs_objects(objects_path: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
+    let mut objects = BTreeMap::new();
+    if objects_path.is_dir() {
+        collect_local_lfs_objects_recursive(objects_path, objects_path, &mut objects)?;
+    }
+    Ok(objects)
+}
+
+fn collect_local_lfs_objects_recursive(
+    root: &Path,
+    path: &Path,
+    objects: &mut BTreeMap<String, PathBuf>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_local_lfs_objects_recursive(root, &entry_path, objects)?;
+            continue;
+        }
+        let relative = entry_path.strip_prefix(root).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("LFS object path {}: {error}", entry_path.display()),
+            )
+        })?;
+        let components = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if components.len() != 3
+            || components[0].len() != 2
+            || components[1].len() != 2
+            || components[2].len() != 64
+            || !components[0]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !components[1]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !components[2]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected local LFS object path {}", entry_path.display()),
+            ));
+        }
+        let oid = format!("{}{}{}", components[0], components[1], components[2]);
+        if objects.insert(oid.clone(), entry_path).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate local LFS object path for OID {oid}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_lfs_objects(
+    objects_path: &Path,
+    requirements: &BTreeMap<String, u64>,
+    local_objects: &BTreeMap<String, PathBuf>,
+) -> Result<(usize, u64), String> {
+    for (oid, expected_size) in requirements {
+        let path = local_objects.get(oid).ok_or_else(|| {
+            format!(
+                "required Git LFS object {oid} is missing from {} ({} exact OID/size requirements; refusing partial or unrelated cache)",
+                objects_path.display(),
+                requirements.len()
+            )
+        })?;
+        let actual_size = fs::metadata(path)
+            .map_err(|error| {
+                format!(
+                    "stat required Git LFS object {oid} at {}: {error}",
+                    path.display()
+                )
+            })?
+            .len();
+        if actual_size != *expected_size {
+            return Err(format!(
+                "required Git LFS object {oid} at {} has size {actual_size}, expected {expected_size}",
+                path.display()
+            ));
+        }
+        let actual_oid = sha256_file(path).map_err(|error| {
+            format!(
+                "hash required Git LFS object {oid} at {}: {error}",
+                path.display()
+            )
+        })?;
+        if actual_oid != *oid {
+            return Err(format!(
+                "required Git LFS object {oid} at {} hashes as {actual_oid}",
+                path.display()
+            ));
+        }
+    }
+    if let Some((oid, path)) = local_objects
+        .iter()
+        .find(|(oid, _)| !requirements.contains_key(*oid))
+    {
+        return Err(format!(
+            "unrelated local Git LFS object {oid} at {} is outside the selected first-parent requirements",
+            path.display()
+        ));
+    }
+    let validated_unique_bytes = requirements.values().try_fold(0u64, |total, size| {
+        total
+            .checked_add(*size)
+            .ok_or_else(|| "Git LFS validated byte count overflow".to_string())
+    })?;
+    Ok((requirements.len(), validated_unique_bytes))
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_only_canonical_lfs_pointer() {
+        let oid = "a".repeat(64);
+        let pointer = format!("{LFS_POINTER_VERSION}\noid sha256:{oid}\nsize 7\n");
+        assert_eq!(parse_lfs_pointer(pointer.as_bytes(), "valid"), Ok((oid, 7)));
+        assert!(
+            parse_lfs_pointer(
+                format!(
+                    "{LFS_POINTER_VERSION}\noid sha256:{}\nsize 7\n",
+                    "A".repeat(64)
+                )
+                .as_bytes(),
+                "uppercase"
+            )
+            .is_err()
+        );
+        assert!(parse_lfs_pointer(b"not an LFS pointer", "malformed").is_err());
+    }
+
+    #[test]
+    fn validates_exact_required_lfs_objects_and_rejects_partial_or_unrelated_cache() {
+        let temp = tempfile::tempdir().expect("temporary LFS object directory");
+        let payload = b"payload";
+        let oid = sha256_hex(payload);
+        let object = temp.path().join(&oid[..2]).join(&oid[2..4]).join(&oid);
+        fs::create_dir_all(object.parent().expect("object parent")).expect("object directory");
+        fs::write(&object, payload).expect("object bytes");
+        let required = BTreeMap::from([(oid.clone(), payload.len() as u64)]);
+        let local = collect_local_lfs_objects(temp.path()).expect("local object scan");
+        assert_eq!(
+            validate_lfs_objects(temp.path(), &required, &local),
+            Ok((1, payload.len() as u64))
+        );
+
+        let unrelated_oid = "b".repeat(64);
+        let unrelated = temp
+            .path()
+            .join(&unrelated_oid[..2])
+            .join(&unrelated_oid[2..4])
+            .join(&unrelated_oid);
+        fs::create_dir_all(unrelated.parent().expect("unrelated parent"))
+            .expect("unrelated directory");
+        fs::write(&unrelated, b"unrelated").expect("unrelated bytes");
+        let local_with_unrelated =
+            collect_local_lfs_objects(temp.path()).expect("local object scan with unrelated");
+        assert!(
+            validate_lfs_objects(temp.path(), &required, &local_with_unrelated)
+                .expect_err("unrelated object must fail")
+                .contains("unrelated local Git LFS object")
+        );
+
+        let missing = BTreeMap::from([("c".repeat(64), payload.len() as u64)]);
+        assert!(
+            validate_lfs_objects(temp.path(), &missing, &local_with_unrelated)
+                .expect_err("partial cache must fail")
+                .contains("required Git LFS object")
+        );
+
+        fs::remove_file(unrelated).expect("remove unrelated object");
+        fs::write(&object, b"wrong").expect("wrong object bytes");
+        let local_with_wrong_hash =
+            collect_local_lfs_objects(temp.path()).expect("wrong-hash object scan");
+        assert!(
+            validate_lfs_objects(temp.path(), &required, &local_with_wrong_hash)
+                .expect_err("wrong hash must fail")
+                .contains("hashes as")
+        );
+    }
 }
 
 fn run_replay(config: &Config, window: &CommitWindow, profile: &Path) -> Result<Output, String> {
@@ -654,17 +947,6 @@ fn directory_bytes(path: &Path) -> io::Result<u64> {
     let mut total = 0;
     for entry in fs::read_dir(path)? {
         total += directory_bytes(&entry?.path())?;
-    }
-    Ok(total)
-}
-
-fn count_files(path: &Path) -> io::Result<usize> {
-    if path.is_file() {
-        return Ok(1);
-    }
-    let mut total = 0;
-    for entry in fs::read_dir(path)? {
-        total += count_files(&entry?.path())?;
     }
     Ok(total)
 }
