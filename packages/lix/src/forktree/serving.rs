@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
+
+use bytes::Bytes;
 
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
@@ -446,7 +449,7 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let range = Prefix {
-        bytes: bytes::Bytes::from_static(BRANCH_SELECTOR_PREFIX),
+        bytes: Bytes::from_static(BRANCH_SELECTOR_PREFIX),
     }
     .to_range()?;
     let mut cursor = read
@@ -1679,7 +1682,7 @@ where
 fn required_full_value(
     value: Option<ProjectedValue>,
     missing: &'static str,
-) -> Result<bytes::Bytes, crate::LixError> {
+) -> Result<Bytes, crate::LixError> {
     match value {
         Some(ProjectedValue::FullValue(bytes)) => Ok(bytes),
         Some(ProjectedValue::KeyOnly) => {
@@ -1910,10 +1913,264 @@ pub(crate) async fn entity_pack_on_roots<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let global = load_entity_pack(read, global_pack_root, global_state_root).await?;
+    entity_pack_on_roots_with_keys(
+        global_state_root,
+        global_pack_root,
+        local_state_root,
+        local_pack_root,
+        None,
+        read,
+    )
+    .await
+}
+
+/// Reads only the authenticated pages that can contain the requested exact
+/// state keys. The manifest is still authenticated in full, while page
+/// contents outside the requested key ranges are not materialized.
+pub(crate) async fn entity_pack_on_roots_for_keys<R>(
+    global_state_root: ObjectId,
+    global_pack_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    local_pack_root: Option<ObjectId>,
+    keys: &[super::state::StateKey],
+    read: &R,
+) -> Result<Vec<(Vec<u8>, StateValue, StateSource)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    entity_pack_on_roots_with_keys(
+        global_state_root,
+        global_pack_root,
+        local_state_root,
+        local_pack_root,
+        Some(keys),
+        read,
+    )
+    .await
+}
+
+/// Authenticated terminal payload rows for exact entity keys. This projection
+/// keeps the selected pack/page proof in ForkTree while discarding state-row
+/// metadata before the SQL layer is reached.
+pub(crate) async fn entity_snapshot_bytes_on_roots_for_keys<R>(
+    global_state_root: ObjectId,
+    global_pack_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    local_pack_root: Option<ObjectId>,
+    keys: &[super::state::StateKey],
+    read: &R,
+) -> Result<Vec<(super::state::StateKey, Option<Bytes>, bool, StateSource)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let requested = keys.iter().collect::<BTreeSet<_>>();
+    let global =
+        load_entity_snapshot_pack_selected(read, global_pack_root, global_state_root, Some(keys))
+            .await?;
     let local = match (local_state_root, local_pack_root) {
         (Some(state_root), Some(pack_root)) => {
-            Some(load_entity_pack(read, pack_root, state_root).await?)
+            Some(load_entity_snapshot_pack_selected(read, pack_root, state_root, Some(keys)).await?)
+        }
+        (None, None) => None,
+        _ => return Err(corruption("current state pack/root edges are incomplete")),
+    };
+    let mut by_key = BTreeMap::new();
+    for page in global.pages {
+        for (key, snapshot, deleted) in page {
+            if !requested.contains(&key) {
+                continue;
+            }
+            if by_key
+                .insert(key, (snapshot, deleted, StateSource::Global))
+                .is_some()
+            {
+                return Err(corruption(
+                    "entity state pack repeats a requested state key",
+                ));
+            }
+        }
+    }
+    if let Some(local) = local {
+        for page in local.pages {
+            for (key, snapshot, deleted) in page {
+                if !requested.contains(&key) {
+                    continue;
+                }
+                by_key.insert(key, (snapshot, deleted, StateSource::Branch));
+            }
+        }
+    }
+    Ok(by_key
+        .into_iter()
+        .map(|(key, (snapshot, deleted, source))| (key, snapshot, deleted, source))
+        .collect())
+}
+
+pub(crate) async fn entity_snapshot_bytes_on_roots<R>(
+    global_state_root: ObjectId,
+    global_pack_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    local_pack_root: Option<ObjectId>,
+    read: &R,
+) -> Result<Vec<(super::state::StateKey, Option<Bytes>, bool, StateSource)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let global_started = Instant::now();
+    let global =
+        load_entity_snapshot_pack_selected(read, global_pack_root, global_state_root, None).await?;
+    let global_elapsed = global_started.elapsed();
+    let local_started = Instant::now();
+    let local = match (local_state_root, local_pack_root) {
+        (Some(state_root), Some(pack_root)) => {
+            Some(load_entity_snapshot_pack_selected(read, pack_root, state_root, None).await?)
+        }
+        (None, None) => None,
+        _ => return Err(corruption("current state pack/root edges are incomplete")),
+    };
+    let local_elapsed = local_started.elapsed();
+    let merge_started = Instant::now();
+    let output = merge_entity_snapshot_pack_rows(global.pages, local.map(|pack| pack.pages))?;
+    if entity_pack_profile_enabled() {
+        eprintln!(
+            "entity_pack_merge_profile_us={} global_us={} local_us={} rows={}",
+            merge_started.elapsed().as_micros(),
+            global_elapsed.as_micros(),
+            local_elapsed.as_micros(),
+            output.len(),
+        );
+    }
+    Ok(output)
+}
+
+type EntitySnapshotPackRow = (super::state::StateKey, Option<Bytes>, bool);
+type EntitySnapshotPackOutput = (super::state::StateKey, Option<Bytes>, bool, StateSource);
+
+/// Merges two independently authenticated sorted pack streams. Pack
+/// manifests prove strict page-range ordering and page decoders prove strict
+/// row ordering, so this avoids allocating one BTree node per visible row
+/// while retaining the local-over-global replacement rule. The final
+/// monotonicity check remains a fail-closed guard at the overlay boundary.
+fn merge_entity_snapshot_pack_rows(
+    global_pages: Vec<Vec<EntitySnapshotPackRow>>,
+    local_pages: Option<Vec<Vec<EntitySnapshotPackRow>>>,
+) -> Result<Vec<EntitySnapshotPackOutput>, StorageError> {
+    let capacity = global_pages.iter().map(Vec::len).sum::<usize>()
+        + local_pages
+            .as_ref()
+            .map_or(0, |pages| pages.iter().map(Vec::len).sum());
+    let mut global = global_pages.into_iter().flatten().peekable();
+    let mut local = local_pages
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .peekable();
+    let mut output = Vec::with_capacity(capacity);
+
+    while global.peek().is_some() || local.peek().is_some() {
+        match (global.peek(), local.peek()) {
+            (Some(global_row), Some(local_row)) => match global_row.0.cmp(&local_row.0) {
+                std::cmp::Ordering::Less => {
+                    let (key, snapshot, deleted) = global
+                        .next()
+                        .expect("global pack peek must have a matching row");
+                    push_entity_snapshot_pack_row(
+                        &mut output,
+                        key,
+                        snapshot,
+                        deleted,
+                        StateSource::Global,
+                    )?;
+                }
+                std::cmp::Ordering::Equal => {
+                    let _ = global
+                        .next()
+                        .expect("global pack peek must have a matching row");
+                    let (key, snapshot, deleted) = local
+                        .next()
+                        .expect("local pack peek must have a matching row");
+                    push_entity_snapshot_pack_row(
+                        &mut output,
+                        key,
+                        snapshot,
+                        deleted,
+                        StateSource::Branch,
+                    )?;
+                }
+                std::cmp::Ordering::Greater => {
+                    let (key, snapshot, deleted) = local
+                        .next()
+                        .expect("local pack peek must have a matching row");
+                    push_entity_snapshot_pack_row(
+                        &mut output,
+                        key,
+                        snapshot,
+                        deleted,
+                        StateSource::Branch,
+                    )?;
+                }
+            },
+            (Some(_), None) => {
+                let (key, snapshot, deleted) = global
+                    .next()
+                    .expect("global pack peek must have a matching row");
+                push_entity_snapshot_pack_row(
+                    &mut output,
+                    key,
+                    snapshot,
+                    deleted,
+                    StateSource::Global,
+                )?;
+            }
+            (None, Some(_)) => {
+                let (key, snapshot, deleted) = local
+                    .next()
+                    .expect("local pack peek must have a matching row");
+                push_entity_snapshot_pack_row(
+                    &mut output,
+                    key,
+                    snapshot,
+                    deleted,
+                    StateSource::Branch,
+                )?;
+            }
+            (None, None) => break,
+        }
+    }
+    Ok(output)
+}
+
+fn push_entity_snapshot_pack_row(
+    output: &mut Vec<EntitySnapshotPackOutput>,
+    key: super::state::StateKey,
+    snapshot: Option<Bytes>,
+    deleted: bool,
+    source: StateSource,
+) -> Result<(), StorageError> {
+    if output.last().is_some_and(|previous| previous.0 >= key) {
+        return Err(corruption(
+            "entity state pack overlay contains duplicate or unordered keys",
+        ));
+    }
+    output.push((key, snapshot, deleted, source));
+    Ok(())
+}
+
+async fn entity_pack_on_roots_with_keys<R>(
+    global_state_root: ObjectId,
+    global_pack_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    local_pack_root: Option<ObjectId>,
+    keys: Option<&[super::state::StateKey]>,
+    read: &R,
+) -> Result<Vec<(Vec<u8>, StateValue, StateSource)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let global = load_entity_pack_selected(read, global_pack_root, global_state_root, keys).await?;
+    let local = match (local_state_root, local_pack_root) {
+        (Some(state_root), Some(pack_root)) => {
+            Some(load_entity_pack_selected(read, pack_root, state_root, keys).await?)
         }
         (None, None) => None,
         _ => return Err(corruption("current state pack/root edges are incomplete")),
@@ -1934,15 +2191,12 @@ where
     Ok(by_key
         .into_iter()
         .map(|(key, (value, source))| {
-            (
-                super::state::encode_state_key(super::state::StateKeyRef {
-                    schema_key: &key.schema_key,
-                    file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
-                }),
-                value,
-                source,
-            )
+            let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            (encoded_key, value, source)
         })
         .collect())
 }
@@ -1951,20 +2205,89 @@ struct LoadedEntityStatePack {
     pages: Vec<super::pack::EntityStatePackPageV1>,
 }
 
-async fn load_entity_pack<R>(
+async fn load_entity_pack_selected<R>(
     read: &R,
     pack_root: ObjectId,
     state_root: ObjectId,
+    keys: Option<&[super::state::StateKey]>,
 ) -> Result<LoadedEntityStatePack, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
     let manifest = load_entity_pack_manifest(read, pack_root, state_root).await?;
-    let mut pages = Vec::with_capacity(manifest.pages.len());
-    for page in &manifest.pages {
+    let selected_pages = keys.map(|keys| {
+        keys.iter()
+            .map(|key| manifest.page_index_for_key(key))
+            .collect::<BTreeSet<_>>()
+    });
+    let mut pages = Vec::with_capacity(
+        selected_pages
+            .as_ref()
+            .map_or(manifest.pages.len(), BTreeSet::len),
+    );
+    for (index, page) in manifest.pages.iter().enumerate() {
+        if selected_pages
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(&index))
+        {
+            continue;
+        }
         pages.push(load_entity_pack_page(read, page).await?);
     }
     Ok(LoadedEntityStatePack { pages })
+}
+
+struct LoadedEntitySnapshotPack {
+    pages: Vec<Vec<(super::state::StateKey, Option<Bytes>, bool)>>,
+}
+
+async fn load_entity_snapshot_pack_selected<R>(
+    read: &R,
+    pack_root: ObjectId,
+    state_root: ObjectId,
+    keys: Option<&[super::state::StateKey]>,
+) -> Result<LoadedEntitySnapshotPack, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let manifest_started = Instant::now();
+    let manifest = load_entity_pack_manifest(read, pack_root, state_root).await?;
+    let selected_pages = keys.map(|keys| {
+        keys.iter()
+            .map(|key| manifest.page_index_for_key(key))
+            .collect::<BTreeSet<_>>()
+    });
+    let mut pages = Vec::with_capacity(
+        selected_pages
+            .as_ref()
+            .map_or(manifest.pages.len(), BTreeSet::len),
+    );
+    let selected_page_count = selected_pages
+        .as_ref()
+        .map_or(manifest.pages.len(), BTreeSet::len);
+    if entity_pack_profile_enabled() {
+        let selected_indices = selected_pages
+            .as_ref()
+            .map(|selected| selected.iter().copied().collect::<Vec<_>>());
+        eprintln!(
+            "entity_pack_manifest_profile_us={} pages_total={} pages_selected={} selected_indices={:?} keys={:?}",
+            manifest_started.elapsed().as_micros(),
+            manifest.pages.len(),
+            selected_page_count,
+            selected_indices,
+            keys.map(|keys| keys.len()),
+        );
+    }
+    for (index, page) in manifest.pages.iter().enumerate() {
+        if selected_pages
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(&index))
+        {
+            continue;
+        }
+        pages.push(load_entity_pack_page_snapshot(read, page).await?);
+    }
+    Ok(LoadedEntitySnapshotPack { pages })
 }
 
 async fn load_entity_pack_manifest<R>(
@@ -2001,6 +2324,42 @@ where
         return Err(corruption("entity state pack page does not match manifest"));
     }
     Ok(page)
+}
+
+async fn load_entity_pack_page_snapshot<R>(
+    read: &R,
+    page_ref: &super::pack::EntityStatePackPageRef,
+) -> Result<Vec<(super::state::StateKey, Option<Bytes>, bool)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let read_started = Instant::now();
+    let bytes = super::view::load_object_bytes(read, page_ref.object_id).await?;
+    let backend_elapsed = read_started.elapsed();
+    let decode_started = Instant::now();
+    let rows =
+        super::pack::EntityStatePackPageV1::decode_snapshot_rows(page_ref.object_id, &bytes)?;
+    if entity_pack_profile_enabled() {
+        eprintln!(
+            "entity_pack_page_profile_us={} backend_us={} decode_us={} bytes={} rows={}",
+            read_started.elapsed().as_micros(),
+            backend_elapsed.as_micros(),
+            decode_started.elapsed().as_micros(),
+            bytes.len(),
+            rows.len(),
+        );
+    }
+    if rows.len() != page_ref.row_count
+        || rows.first().map(|row| &row.0) != Some(&page_ref.first_key)
+        || rows.last().map(|row| &row.0) != Some(&page_ref.last_key)
+    {
+        return Err(corruption("entity state pack page does not match manifest"));
+    }
+    Ok(rows)
+}
+
+fn entity_pack_profile_enabled() -> bool {
+    std::env::var_os("LIX_ENTITY_PACK_PROFILE").is_some()
 }
 
 pub(crate) async fn state_rows_for_entity_pack<R>(

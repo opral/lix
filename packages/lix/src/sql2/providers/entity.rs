@@ -677,6 +677,7 @@ impl TableSpec for EntitySpec {
                         return entity_primary_key_record_batch(&spec, schema, entity_pks);
                     }
                     if direct_entity_snapshot {
+                        let projection_started = std::time::Instant::now();
                         let rows = entity_snapshot_reader
                             .scan_entity_snapshots(request.clone())
                             .await
@@ -686,14 +687,26 @@ impl TableSpec for EntitySpec {
                                     "ForkTree entity snapshot projection is unavailable for this request".into(),
                                 )
                             })?;
+                        let reader_elapsed = projection_started.elapsed();
                         let decoder = EntityProjectionDecoder::new(
                             &spec,
                             schema.fields().iter().map(|field| field.name().as_str()),
                         )
                         .map_err(entity_projection_error_to_datafusion_error)?;
+                        let decode_started = std::time::Instant::now();
                         let columns = decoder
                             .decode_arrow_columns(rows.iter().map(Option::as_deref))
                             .map_err(entity_projection_error_to_datafusion_error)?;
+                        if std::env::var_os("LIX_ENTITY_PACK_PROFILE").is_some() {
+                            eprintln!(
+                                "entity_projection_profile_us={} reader_us={} decode_us={} rows={} columns={}",
+                                projection_started.elapsed().as_micros(),
+                                reader_elapsed.as_micros(),
+                                decode_started.elapsed().as_micros(),
+                                rows.len(),
+                                columns.len(),
+                            );
+                        }
                         return RecordBatch::try_new(schema, columns)
                             .map_err(DataFusionError::from);
                     }

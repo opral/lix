@@ -114,6 +114,11 @@ impl<'a> Decoder<'a> {
         Ok(self.take(length)?.to_vec())
     }
 
+    pub(super) fn bytes_ref(&mut self, label: &str) -> CodecResult<&[u8]> {
+        let length = self.usize(label)?;
+        self.take(length)
+    }
+
     pub(super) fn optional_fixed<const N: usize>(
         &mut self,
         label: &str,

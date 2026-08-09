@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Range;
 
 use crate::LixError;
 use crate::common::{LixTimestamp, SharedStr};
@@ -298,6 +299,34 @@ pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<StateValue, LixError> {
         origin_key,
         blob_manifest_object_ids,
     })
+}
+
+/// Authenticated state-value projection used by terminal entity reads. It
+/// validates the complete encoded value, but retains only the payload range
+/// and deletion bit so metadata, origin strings, and blob-root vectors are not
+/// materialized for a SQL projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StateSnapshotProjection {
+    pub(crate) snapshot: Option<Range<usize>>,
+    pub(crate) deleted: bool,
+}
+
+pub(crate) fn decode_state_snapshot_projection(
+    bytes: &[u8],
+) -> Result<StateSnapshotProjection, LixError> {
+    let mut decoder = ValueDecoder::after_magic(bytes, STATE_VALUE_MAGIC, "state value")?;
+    decoder.fixed_16("state change id")?;
+    decoder.fixed_16("state commit id")?;
+    LixTimestamp::from_packed(decoder.u64("state created_at")?)
+        .map_err(|error| state_error(error.to_string()))?;
+    LixTimestamp::from_packed(decoder.u64("state updated_at")?)
+        .map_err(|error| state_error(error.to_string()))?;
+    let cell = decoder.state_cell_projection("state cell")?;
+    decoder.optional_string_valid("state metadata")?;
+    decoder.optional_string_valid("state origin key")?;
+    decoder.object_ids_valid("state blob manifests")?;
+    decoder.finish("state value")?;
+    Ok(cell)
 }
 
 pub(crate) fn encode_untracked_key(branch_id: CanonicalBranchId, key: StateKeyRef<'_>) -> Vec<u8> {
@@ -669,6 +698,34 @@ impl<'a> ValueDecoder<'a> {
         }
     }
 
+    fn state_cell_projection(&mut self, field: &str) -> Result<StateSnapshotProjection, LixError> {
+        match self.take(1, field)?[0] {
+            0 => {
+                let length = u32::from_be_bytes(
+                    self.take(4, field)?
+                        .try_into()
+                        .expect("decoder returned fixed u32 width"),
+                ) as usize;
+                let start = self.offset;
+                std::str::from_utf8(self.take(length, field)?)
+                    .map_err(|_| state_error(format!("{field} value is not UTF-8")))?;
+                Ok(StateSnapshotProjection {
+                    snapshot: Some(start..start.saturating_add(length)),
+                    deleted: false,
+                })
+            }
+            1 => Ok(StateSnapshotProjection {
+                snapshot: None,
+                deleted: false,
+            }),
+            2 => Ok(StateSnapshotProjection {
+                snapshot: None,
+                deleted: true,
+            }),
+            other => Err(state_error(format!("{field} has invalid tag {other}"))),
+        }
+    }
+
     fn optional_string(&mut self, field: &str) -> Result<Option<String>, LixError> {
         match self.take(1, field)?[0] {
             0 => Ok(None),
@@ -681,6 +738,25 @@ impl<'a> ValueDecoder<'a> {
                 std::str::from_utf8(self.take(length, field)?)
                     .map(str::to_owned)
                     .map(Some)
+                    .map_err(|_| state_error(format!("{field} is not UTF-8")))
+            }
+            other => Err(state_error(format!(
+                "{field} has invalid option tag {other}"
+            ))),
+        }
+    }
+
+    fn optional_string_valid(&mut self, field: &str) -> Result<(), LixError> {
+        match self.take(1, field)?[0] {
+            0 => Ok(()),
+            1 => {
+                let length = u32::from_be_bytes(
+                    self.take(4, field)?
+                        .try_into()
+                        .expect("decoder returned fixed u32 width"),
+                ) as usize;
+                std::str::from_utf8(self.take(length, field)?)
+                    .map(|_| ())
                     .map_err(|_| state_error(format!("{field} is not UTF-8")))
             }
             other => Err(state_error(format!(
@@ -713,6 +789,30 @@ impl<'a> ValueDecoder<'a> {
             values.push(value);
         }
         Ok(values)
+    }
+
+    fn object_ids_valid(&mut self, field: &str) -> Result<(), LixError> {
+        let count = u32::from_be_bytes(
+            self.take(4, field)?
+                .try_into()
+                .expect("decoder returned fixed u32 width"),
+        ) as usize;
+        if count > MAX_BLOB_ROOTS_PER_STATE_ROW
+            || count > self.bytes.len().saturating_sub(self.offset) / 32
+        {
+            return Err(state_error(format!("{field} count exceeds encoded body")));
+        }
+        for _ in 0..count {
+            let value = ObjectId::from_bytes(
+                self.take(32, field)?
+                    .try_into()
+                    .expect("decoder returned fixed object-id width"),
+            );
+            if value == ObjectId::ZERO {
+                return Err(state_error(format!("{field} contains a zero object id")));
+            }
+        }
+        Ok(())
     }
 
     fn take(&mut self, length: usize, field: &str) -> Result<&'a [u8], LixError> {

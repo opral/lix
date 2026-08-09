@@ -31,8 +31,6 @@ use datafusion::prelude::SessionContext;
 use futures_util::{FutureExt, future::try_join_all};
 use serde::Deserialize;
 
-#[cfg(test)]
-use crate::binary_cas::BlobDataReader;
 use crate::binary_cas::{BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
@@ -43,8 +41,6 @@ use crate::filesystem::{
     FilesystemPathSelection,
 };
 use crate::functions::FunctionProviderHandle;
-#[cfg(test)]
-use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
     LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
@@ -2471,8 +2467,6 @@ impl PluginRenderContext {
 #[derive(Debug, Clone)]
 struct BlobRefRecord {
     blob_hash: String,
-    #[cfg(test)]
-    inline_data: Option<Vec<u8>>,
     live: LiveStateRowHandle,
     state_key: crate::forktree::StateKey,
 }
@@ -2543,8 +2537,6 @@ fn blob_ref_record_from_live_row(
         key,
         BlobRefRecord {
             blob_hash: snapshot.blob_hash,
-            #[cfg(test)]
-            inline_data: None,
             live: handle,
             state_key: crate::forktree::StateKey {
                 schema_key: row.schema_key().to_owned(),
@@ -4416,22 +4408,6 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
     )
 }
 
-#[cfg(test)]
-async fn lix_file_record_batch(
-    schema: &SchemaRef,
-    blob_reader: &Arc<dyn BlobDataReader>,
-    plugin_render: Option<PluginRenderContext>,
-    load_data: bool,
-    rows: Vec<MaterializedLiveStateRow>,
-) -> Result<RecordBatch, LixError> {
-    let prepared = prepare_lix_file_rows(
-        MaterializedLiveStateBatch::from_rows(rows),
-        &FilePathPredicate::All,
-    )?;
-    lix_file_record_batch_from_prepared(schema, blob_reader, plugin_render, load_data, prepared)
-        .await
-}
-
 struct PreparedLixFileRows {
     live_rows: LiveStateBatchOwners,
     file_rows: BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
@@ -4951,41 +4927,6 @@ impl LixFileRecordBatchColumns {
     }
 }
 
-#[cfg(test)]
-async fn lix_file_record_batch_from_prepared(
-    schema: &SchemaRef,
-    blob_reader: &Arc<dyn BlobDataReader>,
-    plugin_render: Option<PluginRenderContext>,
-    load_data: bool,
-    prepared: PreparedLixFileRows,
-) -> Result<RecordBatch, LixError> {
-    let projected_columns = schema
-        .fields()
-        .iter()
-        .map(|field| field.name().as_str())
-        .collect::<Vec<_>>();
-    let needs_data = load_data && projected_columns.contains(&"content");
-    let mut blob_bytes = if needs_data {
-        load_blob_bytes_for_files(
-            blob_reader,
-            &prepared.live_rows,
-            &prepared.file_rows,
-            &prepared.blob_rows,
-        )
-        .await?
-    } else {
-        LoadedBlobBytes::default()
-    };
-    lix_file_record_batch_from_prepared_with_blob_bytes(
-        schema,
-        plugin_render,
-        load_data,
-        prepared,
-        &mut blob_bytes,
-    )
-    .await
-}
-
 async fn lix_file_record_batch_from_prepared_authenticated(
     schema: &SchemaRef,
     authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
@@ -5393,55 +5334,6 @@ async fn load_authenticated_blob_bytes_for_files(
                 "LIX_ERROR_UNKNOWN",
                 format!(
                     "authenticated blob reader returned {} values for {} requested rows",
-                    values.len(),
-                    keys.len()
-                ),
-            ));
-        }
-        bytes_by_key.extend(keys.into_iter().zip(values));
-    }
-    Ok(LoadedBlobBytes {
-        bytes_by_key,
-        remaining_by_key,
-    })
-}
-
-#[cfg(test)]
-async fn load_blob_bytes_for_files(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    live_rows: &LiveStateBatchOwners,
-    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
-    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
-) -> Result<LoadedBlobBytes, LixError> {
-    if file_rows.is_empty() || blob_rows.is_empty() {
-        return Ok(LoadedBlobBytes::default());
-    }
-    let mut keys = Vec::new();
-    let mut hashes = Vec::new();
-    let mut bytes_by_key = BTreeMap::new();
-    let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
-    for file in file_rows.values() {
-        let key = file.blob_ref_key(live_rows);
-        if let Some(row) = blob_rows.get(&key) {
-            let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
-            if *remaining == 0 {
-                if let Some(data) = &row.inline_data {
-                    bytes_by_key.insert(key.clone(), Some(data.clone()));
-                } else {
-                    keys.push(key);
-                    hashes.push(BlobId::from_hex(&row.blob_hash)?);
-                }
-            }
-            *remaining += 1;
-        }
-    }
-    if !keys.is_empty() {
-        let values = blob_reader.load_bytes_many(&hashes).await?.into_vec();
-        if values.len() != keys.len() {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "blob reader returned {} values for {} requested hashes",
                     values.len(),
                     keys.len()
                 ),
@@ -7046,8 +6938,7 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use crate::binary_cas::{
-        BlobBytesBatch, BlobDataReader, BlobId, BlobLayout, BlobRangeBytesBatch, BlobWriteReceipt,
-        ChunkHash,
+        BlobBytesBatch, BlobId, BlobLayout, BlobRangeBytesBatch, BlobWriteReceipt, ChunkHash,
     };
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
@@ -8081,9 +7972,8 @@ mod tests {
             super::scan_indexed_file_batch(&matches, true).expect("matching blob rows should load");
         let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
             .expect("indexed rows should prepare");
-        let blob_reader: Arc<dyn BlobDataReader> =
-            Arc::new(StaticBlobReader::from_blobs(Vec::new()));
-        let batch = super::lix_file_record_batch_from_prepared(
+        let blob_reader = StaticBlobReader::from_blobs(Vec::new());
+        let batch = super::lix_file_record_batch_from_prepared_authenticated(
             &projected_schema,
             &blob_reader,
             None,
@@ -8539,9 +8429,8 @@ mod tests {
             super::scan_indexed_file_batch(&matches, true).expect("matching blob rows should load");
         let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
             .expect("indexed rows should prepare");
-        let blob_reader: Arc<dyn BlobDataReader> =
-            Arc::new(StaticBlobReader::from_blobs(Vec::new()));
-        let batch = super::lix_file_record_batch_from_prepared(
+        let blob_reader = StaticBlobReader::from_blobs(Vec::new());
+        let batch = super::lix_file_record_batch_from_prepared_authenticated(
             &projected_schema,
             &blob_reader,
             None,
@@ -8804,7 +8693,6 @@ mod tests {
     #[derive(Default)]
     struct CapturingWriteContext {
         rows: Vec<MaterializedLiveStateRow>,
-        blob_bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
         writes: Vec<TransactionWrite>,
         scan_count: usize,
         path_index_count: usize,
@@ -8820,11 +8708,6 @@ mod tests {
     }
 
     struct StaticBlobReader {
-        bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
-    }
-
-    struct ExactBlobReader {
-        expected_hashes: Vec<BlobId>,
         bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
     }
 
@@ -8845,30 +8728,6 @@ mod tests {
     }
 
     #[async_trait]
-    impl BlobDataReader for CapturingWriteContext {
-        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            Ok(BlobBytesBatch::new(
-                hashes
-                    .iter()
-                    .map(|hash| self.blob_bytes_by_hash.get(hash).cloned())
-                    .collect(),
-            ))
-        }
-    }
-
-    #[async_trait]
-    impl BlobDataReader for StaticBlobReader {
-        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            Ok(BlobBytesBatch::new(
-                hashes
-                    .iter()
-                    .map(|hash| self.bytes_by_hash.get(hash).cloned())
-                    .collect(),
-            ))
-        }
-    }
-
-    #[async_trait]
     impl AuthenticatedBlobReader for StaticBlobReader {
         async fn load_bytes_for_rows(&self, rows: &[StateKey]) -> Result<BlobBytesBatch, LixError> {
             let bytes = self.bytes_by_hash.values().next().cloned();
@@ -8882,19 +8741,6 @@ mod tests {
             _requests: &[(StateKey, std::ops::Range<u64>)],
         ) -> Result<BlobRangeBytesBatch, LixError> {
             Ok(BlobRangeBytesBatch::new(Vec::new()))
-        }
-    }
-
-    #[async_trait]
-    impl BlobDataReader for ExactBlobReader {
-        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            assert_eq!(hashes, self.expected_hashes.as_slice());
-            Ok(BlobBytesBatch::new(
-                hashes
-                    .iter()
-                    .map(|hash| self.bytes_by_hash.get(hash).cloned())
-                    .collect(),
-            ))
         }
     }
 
@@ -9792,17 +9638,22 @@ mod tests {
 
     #[tokio::test]
     async fn file_projection_rejects_unresolved_non_root_directory_id() {
-        let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
-        let error = super::lix_file_record_batch(
+        let blob_reader = StaticBlobReader::from_blobs(Vec::new());
+        let prepared = super::prepare_lix_file_rows(
+            MaterializedLiveStateBatch::from_rows(vec![live_file_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\"}",
+            )]),
+            &super::FilePathPredicate::All,
+        )
+        .expect("file row should prepare");
+        let error = super::lix_file_record_batch_from_prepared_authenticated(
             &super::lix_file_schema(),
             &blob_reader,
             None,
             true,
-            vec![live_file_row(
-                "01920000-0000-7000-8000-0000000000d2",
-                "01920000-0000-7000-8000-0000000000b1",
-                "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\"}",
-            )],
+            prepared,
         )
         .await
         .expect_err("unresolved non-root directory_id should not project as root path");
@@ -10051,14 +9902,8 @@ mod tests {
         assert_eq!(prepared.file_rows.len(), 1);
         assert!(!prepared.needs_plugin_render(true));
 
-        let blob_reader = Arc::new(ExactBlobReader {
-            expected_hashes: vec![selected_hash],
-            bytes_by_hash: BTreeMap::from([
-                (selected_hash, selected_data.clone()),
-                (other_hash, other_data),
-            ]),
-        }) as Arc<dyn BlobDataReader>;
-        let batch = super::lix_file_record_batch_from_prepared(
+        let blob_reader = StaticBlobReader::from_blobs(vec![selected_data.clone()]);
+        let batch = super::lix_file_record_batch_from_prepared_authenticated(
             &super::lix_file_schema(),
             &blob_reader,
             None,
@@ -10125,17 +9970,22 @@ mod tests {
 
     #[tokio::test]
     async fn file_projection_sets_descriptor_file_id_to_own_id() {
-        let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
-        let batch = super::lix_file_record_batch(
+        let blob_reader = StaticBlobReader::from_blobs(Vec::new());
+        let prepared = super::prepare_lix_file_rows(
+            MaterializedLiveStateBatch::from_rows(vec![live_file_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"root.md\"}",
+            )]),
+            &super::FilePathPredicate::All,
+        )
+        .expect("file row should prepare");
+        let batch = super::lix_file_record_batch_from_prepared_authenticated(
             &super::lix_file_schema(),
             &blob_reader,
             None,
             true,
-            vec![live_file_row(
-                "01920000-0000-7000-8000-0000000000d2",
-                "01920000-0000-7000-8000-0000000000b1",
-                "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"root.md\"}",
-            )],
+            prepared,
         )
         .await
         .expect("file descriptor should project");
@@ -10156,14 +10006,9 @@ mod tests {
     async fn file_projection_matches_blob_ref_by_descriptor_file_id() {
         let data = b"shared data".to_vec();
         let blob_hash = BlobId::from_content(&data).to_hex();
-        let blob_reader =
-            Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])) as Arc<dyn BlobDataReader>;
-        let batch = super::lix_file_record_batch(
-            &super::lix_file_schema(),
-            &blob_reader,
-            None,
-            true,
-            vec![
+        let blob_reader = StaticBlobReader::from_blobs(vec![data.clone()]);
+        let prepared = super::prepare_lix_file_rows(
+            MaterializedLiveStateBatch::from_rows(vec![
                 live_file_row(
                     "01920000-0000-7000-8000-0000000000d2",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -10176,7 +10021,16 @@ mod tests {
                     &blob_hash,
                     data.len(),
                 ),
-            ],
+            ]),
+            &super::FilePathPredicate::All,
+        )
+        .expect("file rows should prepare");
+        let batch = super::lix_file_record_batch_from_prepared_authenticated(
+            &super::lix_file_schema(),
+            &blob_reader,
+            None,
+            true,
+            prepared,
         )
         .await
         .expect("blob ref should project data for its descriptor");
@@ -10437,11 +10291,11 @@ mod tests {
         .await
         .expect("durable owner lookup should succeed")
         .expect("durable owner should create a render context");
-        let blob_reader = Arc::new(StaticBlobReader {
+        let blob_reader = StaticBlobReader {
             bytes_by_hash: BTreeMap::new(),
-        }) as Arc<dyn BlobDataReader>;
+        };
 
-        let error = super::lix_file_record_batch_from_prepared(
+        let error = super::lix_file_record_batch_from_prepared_authenticated(
             &super::lix_file_schema(),
             &blob_reader,
             Some(context),
@@ -11840,7 +11694,6 @@ mod tests {
         ];
         let mut write_context = CapturingWriteContext {
             rows,
-            blob_bytes_by_hash: BTreeMap::from([(blob_hash, data)]),
             ..CapturingWriteContext::default()
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);

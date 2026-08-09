@@ -45,14 +45,6 @@ impl JsonStoreContext {
     }
 
     #[expect(clippy::unused_self)]
-    pub(crate) fn reader<S>(&self, store: S) -> JsonStoreReader<S>
-    where
-        S: StorageAdapterRead,
-    {
-        JsonStoreReader { store }
-    }
-
-    #[expect(clippy::unused_self)]
     pub(crate) fn writer(&self) -> JsonStoreWriter {
         JsonStoreWriter::new()
     }
@@ -63,36 +55,6 @@ impl JsonStoreContext {
         request: JsonLoadRequestRef<'_>,
     ) -> Result<JsonLoadBatch, LixError> {
         store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
-            .await
-            .map(JsonLoadBatch::new)
-    }
-}
-
-pub(crate) struct JsonStoreReader<S> {
-    store: S,
-}
-
-impl<S> Clone for JsonStoreReader<S>
-where
-    S: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            store: self.store.clone(),
-        }
-    }
-}
-
-impl<S> JsonStoreReader<S>
-where
-    S: StorageAdapterRead,
-{
-    #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) async fn load_bytes_many(
-        &mut self,
-        request: JsonLoadRequestRef<'_>,
-    ) -> Result<JsonLoadBatch, LixError> {
-        store::load_json_bytes_many_in_scope(&self.store, request.refs, request.scope)
             .await
             .map(JsonLoadBatch::new)
     }

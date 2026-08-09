@@ -286,6 +286,37 @@ impl EntityStatePackPageV1 {
         }
         Ok(Self { rows })
     }
+
+    pub(crate) fn decode_snapshot_rows(
+        id: ObjectId,
+        bytes: &Bytes,
+    ) -> Result<Vec<(StateKey, Option<Bytes>, bool)>, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::EntityStatePackPageV1, bytes)?;
+        let count = decoder.usize("entity state pack page row count")?;
+        if count == 0 || count > EntityStatePackV1::PAGE_ROWS {
+            return Err(corruption("entity state pack page row count is invalid"));
+        }
+        let mut rows = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = decode_state_key(&decoder.bytes("entity state pack page key")?)
+                .map_err(|error| corruption(error.to_string()))?;
+            let value_bytes = decoder.bytes_ref("entity state pack page value")?;
+            let projection = super::state::decode_state_snapshot_projection(value_bytes)
+                .map_err(|error| corruption(error.to_string()))?;
+            let value_start = value_bytes.as_ptr() as usize - bytes.as_ptr() as usize;
+            let snapshot = projection
+                .snapshot
+                .map(|range| bytes.slice((value_start + range.start)..(value_start + range.end)));
+            rows.push((key, snapshot, projection.deleted));
+        }
+        decoder.finish()?;
+        for pair in rows.windows(2) {
+            if pair[0].0 >= pair[1].0 {
+                return Err(corruption("entity state pack page rows are not ordered"));
+            }
+        }
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]

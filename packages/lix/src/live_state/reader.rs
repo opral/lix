@@ -1,10 +1,10 @@
-use async_trait::async_trait;
-
 use crate::LixError;
 #[cfg(test)]
 use crate::live_state::MaterializedLiveStateBatchBuilder;
 use crate::live_state::{LiveStateExactBatchRequest, LiveStateScanRequest};
 use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateExactBatch};
+use async_trait::async_trait;
+use bytes::Bytes;
 
 /// Selects the authenticated serving domain for an internal read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,17 @@ pub(crate) trait LiveStateReader: Send + Sync {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError>;
+
+    /// Optional terminal payload projection for SQL entity reads. A durable
+    /// reader may return authenticated snapshot bytes directly so the SQL
+    /// layer can build its Arrow arrays without first materializing live-state
+    /// row DTOs. `None` means this reader does not own that shape.
+    async fn scan_entity_snapshot_bytes(
+        &self,
+        _request: &LiveStateScanRequest,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        Ok(None)
+    }
 
     /// Scans committed rows for constraint validation into one shared owner.
     ///

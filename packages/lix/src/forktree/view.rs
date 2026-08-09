@@ -85,11 +85,6 @@ where
         self.branch_snapshot
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_storage_read(&self) -> &R {
-        &self.read
-    }
-
     /// Builds the publication's temporary object overlay without exposing
     /// this view's retained storage handle to callers. Staged objects must
     /// still be read through the same authenticated view identity.
@@ -154,6 +149,24 @@ where
         entries: &[(ChangeId, ChangeCatalogEntry)],
     ) -> Result<super::serving::CatalogTreeEdit, StorageError> {
         super::serving::put_change_catalog_entries(root, entries, &self.read).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retire_commit_catalog_entries(
+        &self,
+        root: ObjectId,
+        commit_ids: &[CommitId],
+    ) -> Result<super::serving::CatalogTreeEdit, StorageError> {
+        super::serving::retire_commit_catalog_entries(root, commit_ids, &self.read).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retire_change_catalog_entries(
+        &self,
+        root: ObjectId,
+        change_ids: &[ChangeId],
+    ) -> Result<super::serving::CatalogTreeEdit, StorageError> {
+        super::serving::retire_change_catalog_entries(root, change_ids, &self.read).await
     }
 
     pub(crate) async fn state_point_at_roots(
@@ -523,6 +536,105 @@ where
             .map_err(|_| corruption("GLOBAL_BRANCH_ID is not a UUID"))?;
         let is_global = self.branch_id.as_bytes() == global_branch.as_bytes();
         super::serving::entity_pack_on_roots(
+            self.repository_root.global_state_root,
+            self.repository_root
+                .global_entity_pack_root
+                .ok_or_else(|| corruption("selected repository has no current entity pack"))?,
+            (!is_global).then_some(self.branch_snapshot.local_state_root),
+            (!is_global)
+                .then_some(
+                    self.branch_snapshot
+                        .local_entity_pack_root
+                        .ok_or_else(|| corruption("selected branch has no current entity pack")),
+                )
+                .transpose()?,
+            &self.read,
+        )
+        .await
+    }
+
+    pub(crate) async fn current_entity_state_rows_for_keys(
+        &self,
+        keys: &[super::state::StateKey],
+    ) -> Result<
+        Vec<(
+            Vec<u8>,
+            super::state::StateValue,
+            super::serving::StateSource,
+        )>,
+        StorageError,
+    > {
+        let global_branch = uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .map_err(|_| corruption("GLOBAL_BRANCH_ID is not a UUID"))?;
+        let is_global = self.branch_id.as_bytes() == global_branch.as_bytes();
+        super::serving::entity_pack_on_roots_for_keys(
+            self.repository_root.global_state_root,
+            self.repository_root
+                .global_entity_pack_root
+                .ok_or_else(|| corruption("selected repository has no current entity pack"))?,
+            (!is_global).then_some(self.branch_snapshot.local_state_root),
+            (!is_global)
+                .then_some(
+                    self.branch_snapshot
+                        .local_entity_pack_root
+                        .ok_or_else(|| corruption("selected branch has no current entity pack")),
+                )
+                .transpose()?,
+            keys,
+            &self.read,
+        )
+        .await
+    }
+
+    pub(crate) async fn current_entity_snapshot_bytes_for_keys(
+        &self,
+        keys: &[super::state::StateKey],
+    ) -> Result<
+        Vec<(
+            super::state::StateKey,
+            Option<Bytes>,
+            bool,
+            super::serving::StateSource,
+        )>,
+        StorageError,
+    > {
+        let global_branch = uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .map_err(|_| corruption("GLOBAL_BRANCH_ID is not a UUID"))?;
+        let is_global = self.branch_id.as_bytes() == global_branch.as_bytes();
+        super::serving::entity_snapshot_bytes_on_roots_for_keys(
+            self.repository_root.global_state_root,
+            self.repository_root
+                .global_entity_pack_root
+                .ok_or_else(|| corruption("selected repository has no current entity pack"))?,
+            (!is_global).then_some(self.branch_snapshot.local_state_root),
+            (!is_global)
+                .then_some(
+                    self.branch_snapshot
+                        .local_entity_pack_root
+                        .ok_or_else(|| corruption("selected branch has no current entity pack")),
+                )
+                .transpose()?,
+            keys,
+            &self.read,
+        )
+        .await
+    }
+
+    pub(crate) async fn current_entity_snapshot_bytes(
+        &self,
+    ) -> Result<
+        Vec<(
+            super::state::StateKey,
+            Option<Bytes>,
+            bool,
+            super::serving::StateSource,
+        )>,
+        StorageError,
+    > {
+        let global_branch = uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .map_err(|_| corruption("GLOBAL_BRANCH_ID is not a UUID"))?;
+        let is_global = self.branch_id.as_bytes() == global_branch.as_bytes();
+        super::serving::entity_snapshot_bytes_on_roots(
             self.repository_root.global_state_root,
             self.repository_root
                 .global_entity_pack_root

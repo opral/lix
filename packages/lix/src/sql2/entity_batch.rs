@@ -58,6 +58,9 @@ impl EntitySnapshotReader for CanonicalEntitySnapshotProjection {
         request: LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
         validate_terminal_projection_request(&request)?;
+        if let Some(snapshots) = self.live_state.scan_entity_snapshot_bytes(&request).await? {
+            return Ok(Some(snapshots));
+        }
         Ok(Some(
             canonical_snapshot_projection(self.live_state.as_ref(), &request).await?,
         ))

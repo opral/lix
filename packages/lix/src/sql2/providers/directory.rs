@@ -2393,7 +2393,6 @@ mod tests {
     use serde_json::json;
 
     use crate::LixError;
-    use crate::binary_cas::BlobDataReader;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
@@ -2585,19 +2584,6 @@ mod tests {
         rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<TransactionWrite>,
         reject_scans: bool,
-    }
-
-    #[async_trait]
-    impl BlobDataReader for CapturingWriteContext {
-        async fn load_bytes_many(
-            &self,
-            hashes: &[crate::binary_cas::BlobId],
-        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
-                None;
-                hashes.len()
-            ]))
-        }
     }
 
     #[async_trait]

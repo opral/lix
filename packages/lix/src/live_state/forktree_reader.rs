@@ -9,13 +9,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use async_trait::async_trait;
+use bytes::Bytes;
 
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
-    CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_key, state_point,
+    CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKey, StateKeyRef, StateSource,
+    decode_state_key, encode_state_key, state_point,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -23,6 +23,7 @@ use crate::live_state::{
     MaterializedLiveStateRow,
 };
 use crate::storage_adapter::StorageAdapterRead;
+use async_trait::async_trait;
 
 use super::derived::is_derived_schema;
 
@@ -34,6 +35,16 @@ where
     R: StorageAdapterRead,
 {
     validate_scan_request(request)?;
+    if std::env::var_os("LIX_ENTITY_PACK_PROFILE").is_some() {
+        eprintln!(
+            "entity_scan_request_profile schema_keys={:?} entity_pks={} file_ids={:?} limit={:?} rows={:?}",
+            request.filter.schema_keys,
+            request.filter.entity_pks.len(),
+            request.filter.file_ids,
+            request.limit,
+            request.filter.rows,
+        );
+    }
     match request.filter.untracked {
         Some(true) => scan_untracked_view(view, request).await,
         Some(false) => scan_tracked_view(view, request).await,
@@ -106,7 +117,11 @@ where
             "current ForkTree reader view does not match requested branch",
         ));
     }
-    let rows = view.current_entity_state_rows().await?;
+    let rows = if let Some(keys) = exact_pack_keys(request) {
+        view.current_entity_state_rows_for_keys(&keys).await?
+    } else {
+        view.current_entity_state_rows().await?
+    };
     let mut output = Vec::with_capacity(rows.len());
     for (encoded_key, value, source) in rows {
         let key = decode_state_key(&encoded_key)?;
@@ -160,6 +175,216 @@ where
         }
     }
     Ok(MaterializedLiveStateBatch::from_rows(output))
+}
+
+fn exact_pack_keys(request: &LiveStateScanRequest) -> Option<Vec<StateKey>> {
+    if std::env::var_os("LIX_ENTITY_PACK_PROFILE").is_some() {
+        eprintln!(
+            "entity_exact_key_profile schema={} pks={} file_ids={} constraints={} rows={:?} branches={} tombstones={} eligible={}",
+            request.filter.schema_keys.len(),
+            request.filter.entity_pks.len(),
+            request.filter.file_ids.len(),
+            request.filter.constraints.len(),
+            request.filter.rows,
+            request.filter.branch_ids.len(),
+            request.filter.include_tombstones,
+            request.filter.schema_keys.len() == 1
+                && !request.filter.entity_pks.is_empty()
+                && request.filter.file_ids.len() <= 1
+                && request.filter.constraints.is_empty()
+                && matches!(request.filter.rows, LiveStateRowFilter::All),
+        );
+    }
+    if request.filter.schema_keys.len() != 1
+        || request.filter.entity_pks.is_empty()
+        || request.filter.file_ids.len() > 1
+        || !request.filter.constraints.is_empty()
+        || !matches!(request.filter.rows, LiveStateRowFilter::All)
+    {
+        return None;
+    }
+    let file_id = match request.filter.file_ids.as_slice() {
+        [] => None,
+        [crate::NullableKeyFilter::Null] => None,
+        [crate::NullableKeyFilter::Value(file_id)] => Some(file_id.clone()),
+        [crate::NullableKeyFilter::Any] => return None,
+        _ => unreachable!("exact pack key filter length was checked above"),
+    };
+    Some(
+        request
+            .filter
+            .entity_pks
+            .iter()
+            .map(|entity_pk| StateKey {
+                schema_key: request.filter.schema_keys[0].clone(),
+                file_id: file_id.clone(),
+                entity_pk: entity_pk.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// Projects authenticated entity payloads directly out of the selected pack
+/// rows. This is the terminal SQL payload lane: it deliberately does not
+/// construct `MaterializedLiveStateRow` values, reparse JSON, or expose the
+/// retained storage read. Unsupported relational shapes return `None` so the
+/// caller can use the canonical batch projection; they never acquire another
+/// reader or view.
+pub(crate) async fn scan_entity_snapshot_bytes_facade<R>(
+    facade: &ForkTreeReadFacade<R>,
+    request: &LiveStateScanRequest,
+) -> Result<Option<Vec<Option<Bytes>>>, LixError>
+where
+    R: StorageAdapterRead,
+{
+    validate_scan_request(request)?;
+    if request.filter.include_tombstones
+        || request.filter.branch_ids.is_empty()
+        || request.filter.schema_keys.len() != 1
+        || request.filter.file_ids.len() > 1
+        || request
+            .filter
+            .file_ids
+            .iter()
+            .any(|filter| matches!(filter, crate::NullableKeyFilter::Any))
+        || !request.filter.constraints.is_empty()
+        || !matches!(request.filter.rows, LiveStateRowFilter::All)
+    {
+        return Ok(None);
+    }
+
+    let mut snapshots = Vec::new();
+    for branch_id in &request.filter.branch_ids {
+        let view = facade.branch(branch_id).await?;
+        let mut branch_request = request.clone();
+        branch_request.filter.branch_ids = vec![branch_id.clone()];
+        branch_request.limit = None;
+        snapshots.extend(scan_entity_snapshot_bytes_view(&view, &branch_request).await?);
+    }
+    if let Some(limit) = request.limit {
+        snapshots.truncate(limit);
+    }
+    Ok(Some(snapshots))
+}
+
+async fn scan_entity_snapshot_bytes_view<R>(
+    view: &crate::forktree::CoherentView<R>,
+    request: &LiveStateScanRequest,
+) -> Result<Vec<Option<Bytes>>, LixError>
+where
+    R: StorageAdapterRead,
+{
+    let tracked_started = std::time::Instant::now();
+    let tracked = if request.filter.untracked == Some(true) {
+        Vec::new()
+    } else {
+        let rows = if let Some(keys) = exact_pack_keys(request) {
+            view.current_entity_snapshot_bytes_for_keys(&keys).await?
+        } else {
+            view.current_entity_snapshot_bytes().await?
+        };
+        let mut selected = Vec::with_capacity(rows.len());
+        for (key, snapshot, deleted, _source) in rows {
+            if !state_key_matches_request(&key, request) {
+                continue;
+            }
+            selected.push((key, (snapshot, deleted)));
+        }
+        selected
+    };
+    if std::env::var_os("LIX_ENTITY_PACK_PROFILE").is_some() {
+        eprintln!(
+            "entity_scan_tracked_profile_us={} rows={}",
+            tracked_started.elapsed().as_micros(),
+            tracked.len(),
+        );
+    }
+
+    let untracked_started = std::time::Instant::now();
+    let untracked = if request.filter.untracked == Some(false) {
+        BTreeMap::new()
+    } else {
+        let owner_rows =
+            merge_untracked_overlay_rows(view, view.scan_untracked_overlay_rows().await?)?;
+        let mut selected = BTreeMap::new();
+        for (encoded_key, (_owner, key, value)) in owner_rows {
+            if !state_key_matches_request(&key, request) {
+                continue;
+            }
+            let row = entity_snapshot_byte_row(value.cell);
+            if selected.insert(encoded_key, row).is_some() {
+                return Err(overlay_corruption("untracked entity overlay"));
+            }
+        }
+        selected
+    };
+    if std::env::var_os("LIX_ENTITY_PACK_PROFILE").is_some() {
+        eprintln!(
+            "entity_scan_untracked_profile_us={} rows={}",
+            untracked_started.elapsed().as_micros(),
+            untracked.len(),
+        );
+    }
+
+    let visible = if request.filter.untracked == Some(true) {
+        untracked.into_values().collect::<Vec<_>>()
+    } else if request.filter.untracked.is_none() && untracked.is_empty() {
+        tracked
+            .into_iter()
+            .map(|(_key, row)| row)
+            .collect::<Vec<_>>()
+    } else {
+        let mut merged = BTreeMap::new();
+        for (key, row) in tracked {
+            let encoded_key = encode_state_key(StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            if merged.insert(encoded_key, row).is_some() {
+                return Err(overlay_corruption("tracked entity pack"));
+            }
+        }
+        if request.filter.untracked.is_none() {
+            for (encoded_key, row) in untracked {
+                merged.insert(encoded_key, row);
+            }
+        }
+        merged.into_values().collect::<Vec<_>>()
+    };
+
+    Ok(visible
+        .into_iter()
+        .filter_map(|(snapshot, deleted)| (!deleted).then_some(snapshot))
+        .collect())
+}
+
+fn state_key_matches_request(key: &StateKey, request: &LiveStateScanRequest) -> bool {
+    (request.filter.schema_keys.is_empty()
+        || request
+            .filter
+            .schema_keys
+            .iter()
+            .any(|schema| schema == &key.schema_key))
+        && (request.filter.entity_pks.is_empty()
+            || request
+                .filter
+                .entity_pks
+                .iter()
+                .any(|entity| entity == &key.entity_pk))
+        && request
+            .filter
+            .file_ids
+            .iter()
+            .all(|filter| filter.matches(key.file_id.as_ref()))
+}
+
+fn entity_snapshot_byte_row(cell: StateCell) -> (Option<Bytes>, bool) {
+    match cell {
+        StateCell::Value(value) => (Some(value.into_bytes()), false),
+        StateCell::Null => (None, false),
+        StateCell::Tombstone => (None, true),
+    }
 }
 
 /// Resolves the complete current logical overlay while borrowing the one view
@@ -342,6 +567,13 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         scan_facade(self, request).await
+    }
+
+    async fn scan_entity_snapshot_bytes(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        scan_entity_snapshot_bytes_facade(self, request).await
     }
 
     async fn load_exact_batch(
@@ -594,20 +826,9 @@ fn global_branch_id() -> CanonicalBranchId {
 
 fn merge_untracked_overlay_rows(
     view: &crate::forktree::CoherentView<impl StorageAdapterRead>,
-    rows: Vec<(
-        CanonicalBranchId,
-        crate::forktree::StateKey,
-        crate::forktree::UntrackedValue,
-    )>,
+    rows: Vec<(CanonicalBranchId, StateKey, crate::forktree::UntrackedValue)>,
 ) -> Result<
-    BTreeMap<
-        Vec<u8>,
-        (
-            CanonicalBranchId,
-            crate::forktree::StateKey,
-            crate::forktree::UntrackedValue,
-        ),
-    >,
+    BTreeMap<Vec<u8>, (CanonicalBranchId, StateKey, crate::forktree::UntrackedValue)>,
     LixError,
 > {
     let branch_id = view.branch_id();
