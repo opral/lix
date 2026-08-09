@@ -410,7 +410,11 @@ impl EntitySpec {
             ))
         })?;
         let branch_id = match self.branch_binding {
-            BranchBinding::Active { .. } => String::new(),
+            BranchBinding::Active { .. } => self
+                .branch_binding
+                .active_branch_id()
+                .expect("active branch binding has an ID")
+                .to_owned(),
             BranchBinding::Explicit => required_string_value(
                 batch,
                 row_index,
@@ -421,6 +425,12 @@ impl EntitySpec {
         Ok(EntityReturningKey {
             entity_pk,
             branch_id,
+            file_id: optional_string_value(
+                batch,
+                row_index,
+                "lixcol_file_id",
+                "UPDATE entity surface RETURNING",
+            )?,
         })
     }
 
@@ -432,31 +442,32 @@ impl EntitySpec {
         if keys.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
-        let mut request = entity_live_state_scan_request(
+        let request = entity_live_state_scan_request(
             &self.spec.schema_key,
             self.branch_binding.active_branch_id(),
             Some(self.schema.as_ref()),
             None,
             false,
         );
-        request.filter.entity_pks = keys
-            .iter()
-            .map(|key| key.entity_pk.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        if matches!(self.branch_binding, BranchBinding::Explicit) {
-            request.filter.branch_ids = keys
+        let exact_request = LiveStateExactBatchRequest {
+            rows: keys
                 .iter()
-                .map(|key| key.branch_id.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-        }
+                .map(|key| LiveStateExactRowRequest {
+                    schema_key: self.spec.schema_key.clone(),
+                    branch_id: key.branch_id.clone(),
+                    entity_pk: key.entity_pk.clone(),
+                    file_id: key.file_id.clone(),
+                })
+                .collect(),
+            projection: request.projection.clone(),
+            untracked: None,
+            include_tombstones: false,
+        };
         let rows = WriteContextLiveStateReader::new(write_ctx.clone())
-            .scan_batch(&request)
+            .load_exact_batch(&exact_request)
             .await
-            .map_err(lix_error_to_datafusion_error)?;
+            .map_err(lix_error_to_datafusion_error)?
+            .into_present_batch();
         let batch = entity_record_batch_with_parsed(
             &self.spec,
             Arc::clone(&self.schema),
@@ -592,6 +603,7 @@ impl EntitySpec {
 struct EntityReturningKey {
     entity_pk: EntityPk,
     branch_id: String,
+    file_id: Option<String>,
 }
 
 #[async_trait]
@@ -636,9 +648,12 @@ impl TableSpec for EntitySpec {
         let live_state = Arc::clone(&self.live_state);
         let batch_projection = EntityBatchProjection::for_request(&request);
         let exact_request = exact_live_state_batch_request(&request);
-        let direct_entity_snapshot = direct_entity_batch_eligible(&schema, &request, &row_filters);
-        let direct_primary_key_projection =
-            direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
+        let exact_limit_requires_materialization =
+            exact_request.is_some() && request.limit.is_some();
+        let direct_entity_snapshot = !exact_limit_requires_materialization
+            && direct_entity_batch_eligible(&schema, &request, &row_filters);
+        let direct_primary_key_projection = !exact_limit_requires_materialization
+            && direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -1221,10 +1236,13 @@ fn apply_exact_file_id_filters(request: &mut LiveStateScanRequest, filters: &[Ex
         if file_ids.is_empty() {
             request.filter.rows = LiveStateRowFilter::None;
         }
-        request.filter.file_ids = file_ids
-            .into_iter()
-            .map(|file_id| file_id.map_or(NullableKeyFilter::Null, NullableKeyFilter::Value))
-            .collect();
+        if let [file_id] = file_ids.as_slice() {
+            request.filter.file_ids = vec![
+                file_id
+                    .clone()
+                    .map_or(NullableKeyFilter::Null, NullableKeyFilter::Value),
+            ];
+        }
     }
     Ok(())
 }
@@ -1252,7 +1270,7 @@ fn exact_live_state_batch_request(
         NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
         NullableKeyFilter::Any => return None,
     };
-    let mut rows = request
+    let rows = request
         .filter
         .entity_pks
         .iter()
@@ -1264,9 +1282,6 @@ fn exact_live_state_batch_request(
             file_id: file_id.clone(),
         })
         .collect::<Vec<_>>();
-    if let Some(limit) = request.limit {
-        rows.truncate(limit);
-    }
     Some(LiveStateExactBatchRequest {
         rows,
         projection: request.projection.clone(),
@@ -1281,10 +1296,11 @@ async fn load_entity_live_state_batch(
     exact_request: Option<&LiveStateExactBatchRequest>,
 ) -> std::result::Result<MaterializedLiveStateBatch, LixError> {
     if let Some(exact_request) = exact_request {
-        return Ok(reader
+        let rows = reader
             .load_exact_batch(exact_request)
             .await?
-            .into_present_batch());
+            .into_present_batch();
+        return Ok(rows.filter(|_| true, scan_request.limit));
     }
     reader.scan_batch(scan_request).await
 }
@@ -1371,7 +1387,7 @@ impl ExactBranchIdFilterAnalyzer {
 impl ExactFileIdFilterAnalyzer {
     fn supports(&self, expr: &Expr) -> bool {
         self.analyze(expr)
-            .is_ok_and(|constraint| constraint.is_some())
+            .is_ok_and(|constraint| constraint.is_some_and(|ids| ids.len() == 1))
     }
 
     fn analyze_conjunctive(&self, expr: &Expr) -> Result<Option<BTreeSet<Option<String>>>> {
@@ -2652,6 +2668,7 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
 #[expect(trivial_casts)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
@@ -2681,6 +2698,29 @@ mod tests {
 
     struct EmptyLiveStateReader;
     struct EmptyBranchRefReader;
+
+    struct ExactOnlyLiveStateReader {
+        result: crate::live_state::MaterializedLiveStateExactBatch,
+        scans: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LiveStateReader for ExactOnlyLiveStateReader {
+        async fn load_exact_batch(
+            &self,
+            _request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            Ok(self.result.clone())
+        }
+
+        async fn scan_batch(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            Ok(MaterializedLiveStateBatch::default())
+        }
+    }
 
     #[async_trait]
     impl LiveStateReader for EmptyLiveStateReader {
@@ -3724,12 +3764,17 @@ mod tests {
         };
         let exact = super::exact_live_state_batch_request(&request)
             .expect("correlated identity should use exact batch");
-        assert_eq!(exact.rows.len(), 1);
+        assert_eq!(exact.rows.len(), 2);
         assert_eq!(
             exact.rows[0].entity_pk,
             crate::entity_pk::EntityPk::single("b")
         );
         assert_eq!(exact.rows[0].file_id, None);
+        assert_eq!(
+            exact.rows[1].entity_pk,
+            crate::entity_pk::EntityPk::single("a")
+        );
+        assert_eq!(exact.rows[1].file_id, None);
 
         request.filter.file_ids.clear();
         assert!(
@@ -3751,6 +3796,84 @@ mod tests {
                 .expect("named file filter should analyze"),
             Some(vec![Some("file-a".into())])
         );
+    }
+
+    #[tokio::test]
+    async fn exact_limit_is_applied_after_missing_tombstone_and_duplicate_slots() {
+        let request = LiveStateScanRequest {
+            limit: Some(1),
+            ..Default::default()
+        };
+        let exact_request = crate::live_state::LiveStateExactBatchRequest::default();
+        let mut tracked = live_row();
+        tracked.entity_pk = crate::entity_pk::EntityPk::single("visible-after-missing");
+        let reader = ExactOnlyLiveStateReader {
+            // The first two slots represent an absent row and a tombstone
+            // omitted by visibility. LIMIT must select the later visible row.
+            result: crate::live_state::MaterializedLiveStateExactBatch::from_rows(vec![
+                None,
+                None,
+                Some(tracked),
+            ]),
+            scans: AtomicUsize::new(0),
+        };
+        let rows = super::load_entity_live_state_batch(&reader, &request, Some(&exact_request))
+            .await
+            .expect("exact visible batch");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.row(0).entity_pk(),
+            &crate::entity_pk::EntityPk::single("visible-after-missing")
+        );
+        assert_eq!(reader.scans.load(Ordering::SeqCst), 0);
+
+        let mut untracked = live_row();
+        untracked.entity_pk = crate::entity_pk::EntityPk::single("duplicate");
+        untracked.untracked = true;
+        let reader = ExactOnlyLiveStateReader {
+            result: crate::live_state::MaterializedLiveStateExactBatch::from_rows(vec![
+                Some(untracked.clone()),
+                Some(untracked),
+            ]),
+            scans: AtomicUsize::new(0),
+        };
+        let rows = super::load_entity_live_state_batch(&reader, &request, Some(&exact_request))
+            .await
+            .expect("duplicate exact slots");
+        assert_eq!(rows.len(), 1);
+        assert!(rows.row(0).untracked());
+        assert_eq!(reader.scans.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn multi_value_file_filter_is_not_declared_or_applied_as_exact() {
+        let filter = Expr::InList(InList::new(
+            Box::new(column("lixcol_file_id")),
+            vec![string_literal("file-a"), string_literal("file-b")],
+            false,
+        ));
+        assert!(!super::ExactFileIdFilterAnalyzer.supports(&filter));
+        let mut request = LiveStateScanRequest::default();
+        super::apply_exact_file_id_filters(&mut request, &[filter])
+            .expect("multi-owner predicate should remain residual");
+        assert!(request.filter.file_ids.is_empty());
+    }
+
+    #[test]
+    fn update_returning_post_image_uses_correlated_exact_identity() {
+        let source = include_str!("entity.rs");
+        let start = source
+            .find("async fn returning_post_image")
+            .expect("returning post-image owner");
+        let end = source[start..]
+            .find("async fn plan_update_with_post_image")
+            .map(|offset| start + offset)
+            .expect("next update owner");
+        let owner = &source[start..end];
+        assert!(owner.contains("LiveStateExactRowRequest"));
+        assert!(owner.contains("file_id: key.file_id.clone()"));
+        assert!(owner.contains(".load_exact_batch(&exact_request)"));
+        assert!(!owner.contains(".scan_batch("));
     }
 
     #[tokio::test]

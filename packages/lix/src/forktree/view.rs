@@ -209,11 +209,19 @@ where
                 .expect("GLOBAL_BRANCH_ID must be a UUID")
                 .as_bytes(),
         );
-        let include_global = self.branch_id != global_id;
-        let mut keys = Vec::with_capacity(state_keys.len() * (1 + usize::from(include_global)));
+        let mut unique_ordinals = BTreeMap::<Vec<u8>, usize>::new();
+        let mut unique_state_keys = Vec::new();
         for state_key in state_keys {
+            if unique_ordinals.contains_key(state_key) {
+                continue;
+            }
+            unique_ordinals.insert(state_key.clone(), unique_state_keys.len());
+            unique_state_keys.push(state_key.clone());
+        }
+        let mut local_keys = Vec::with_capacity(unique_state_keys.len());
+        for state_key in &unique_state_keys {
             let decoded = super::state::decode_state_key(state_key)?;
-            keys.push(Key(super::state::encode_untracked_key(
+            local_keys.push(Key(super::state::encode_untracked_key(
                 self.branch_id,
                 super::state::StateKeyRef {
                     schema_key: &decoded.schema_key,
@@ -223,10 +231,46 @@ where
             )
             .into()));
         }
-        if include_global {
-            for state_key in state_keys {
-                let decoded = super::state::decode_state_key(state_key)?;
-                keys.push(Key(super::state::encode_untracked_key(
+        let local = self
+            .read
+            .get_many(&[GetManyRequest {
+                space: super::state::UNTRACKED_ROW_SPACE,
+                keys: &local_keys,
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            }])
+            .await?;
+        if local.values.len() != local_keys.len() {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "ForkTree exact local untracked get_many returned the wrong slot count",
+            ));
+        }
+        if local
+            .values
+            .iter()
+            .flatten()
+            .any(|value| matches!(value, ProjectedValue::KeyOnly))
+        {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "ForkTree exact local untracked lookup returned key-only data",
+            ));
+        }
+
+        let absent = local
+            .values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.is_none().then_some(index))
+            .collect::<Vec<_>>();
+        let mut global_by_unique = vec![None; unique_state_keys.len()];
+        if self.branch_id != global_id && !absent.is_empty() {
+            let mut global_keys = Vec::with_capacity(absent.len());
+            for index in &absent {
+                let decoded = super::state::decode_state_key(&unique_state_keys[*index])?;
+                global_keys.push(Key(super::state::encode_untracked_key(
                     global_id,
                     super::state::StateKeyRef {
                         schema_key: &decoded.schema_key,
@@ -236,34 +280,42 @@ where
                 )
                 .into()));
             }
-        }
-        let loaded = self
-            .read
-            .get_many(&[GetManyRequest {
-                space: super::state::UNTRACKED_ROW_SPACE,
-                keys: &keys,
-                opts: GetOptions {
-                    projection: CoreProjection::FullValue,
-                },
-            }])
-            .await?;
-        if loaded.values.len() != keys.len() {
-            return Err(crate::LixError::new(
-                crate::LixError::CODE_STORAGE_ERROR,
-                "ForkTree exact untracked get_many returned the wrong slot count",
-            ));
+            let global = self
+                .read
+                .get_many(&[GetManyRequest {
+                    space: super::state::UNTRACKED_ROW_SPACE,
+                    keys: &global_keys,
+                    opts: GetOptions {
+                        projection: CoreProjection::FullValue,
+                    },
+                }])
+                .await?;
+            if global.values.len() != global_keys.len() {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "ForkTree exact global untracked get_many returned the wrong slot count",
+                ));
+            }
+            for (index, projected) in absent.into_iter().zip(global.values) {
+                if matches!(projected, Some(ProjectedValue::KeyOnly)) {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        "ForkTree exact global untracked lookup returned key-only data",
+                    ));
+                }
+                global_by_unique[index] = projected;
+            }
         }
 
-        let (local, global) = loaded.values.split_at(state_keys.len());
         let mut output = Vec::with_capacity(state_keys.len());
-        for (index, state_key) in state_keys.iter().enumerate() {
-            let selected = local[index]
+        for state_key in state_keys {
+            let unique_index = unique_ordinals[state_key];
+            let selected = local.values[unique_index]
                 .as_ref()
                 .map(|value| (self.branch_id, value))
                 .or_else(|| {
-                    global
-                        .get(index)
-                        .and_then(Option::as_ref)
+                    global_by_unique[unique_index]
+                        .as_ref()
                         .map(|value| (global_id, value))
                 });
             let Some((owner, projected)) = selected else {

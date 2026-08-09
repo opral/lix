@@ -38,12 +38,13 @@ use super::{
     ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
     ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
     SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
-    StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef,
-    UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
-    advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
-    load_commit_member_records, load_commit_summary, load_commit_topologies, open_coherent_view,
-    page_changes, page_commits, prepare_upload_completion, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_points, state_range,
+    StateSource, StateTreeMutation, StateValueRef, UNTRACKED_ROW_SPACE, UntrackedValueRef,
+    UploadBindingRef, UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow,
+    abort_corrupt_gc, advance_gc, edit_state_tree, encode_state_key, encode_state_value,
+    load_change, load_commit, load_commit_member_records, load_commit_summary,
+    load_commit_topologies, open_coherent_view, page_changes, page_commits,
+    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    state_points, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -1251,10 +1252,12 @@ async fn path_copy_catalog_put_and_view_bound_resume_are_bounded() {
 struct CountingStorage {
     inner: Memory,
     begin_reads: Arc<AtomicUsize>,
+    untracked_get_many: Arc<AtomicUsize>,
 }
 
 struct CountingRead {
     inner: MemoryRead,
+    untracked_get_many: Arc<AtomicUsize>,
 }
 
 struct SharedParentCountingRead<R> {
@@ -1318,6 +1321,13 @@ impl StorageRead for CountingRead {
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        self.untracked_get_many.fetch_add(
+            requests
+                .iter()
+                .filter(|request| request.space == UNTRACKED_ROW_SPACE)
+                .count(),
+            Ordering::Relaxed,
+        );
         self.inner.get_many(requests)
     }
 
@@ -1336,6 +1346,7 @@ impl CountingStorage {
         Self {
             inner: Memory::new(),
             begin_reads: Arc::new(AtomicUsize::new(0)),
+            untracked_get_many: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -1348,6 +1359,7 @@ impl Storage for CountingStorage {
         self.begin_reads.fetch_add(1, Ordering::Relaxed);
         Ok(CountingRead {
             inner: self.inner.begin_read(options).await?,
+            untracked_get_many: Arc::clone(&self.untracked_get_many),
         })
     }
 
@@ -1495,6 +1507,121 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
         .await
         .expect("bounded open does not traverse an unrelated catalog member");
     assert!(load_change(&view, seed.semantic_change_id).await.is_err());
+}
+
+#[tokio::test]
+async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
+    let seed = build_seed();
+    let storage = CountingStorage::new();
+    seed_storage(&storage, &seed).await;
+    let local_pk = EntityPk::single("local");
+    let global_pk = EntityPk::single("global-only");
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("untracked publication view");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("publication");
+    publication
+        .put_untracked_row(
+            CanonicalBranchId::from_bytes(
+                *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+                    .expect("global branch UUID")
+                    .as_bytes(),
+            ),
+            StateKeyRef {
+                schema_key: "app.exact",
+                file_id: None,
+                entity_pk: &local_pk,
+            },
+            UntrackedValueRef {
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                cell: StateCellRef::Value("global-shadowed"),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &[],
+            },
+        )
+        .expect("global shadowed value");
+    publication
+        .put_untracked_row(
+            seed.branch_id,
+            StateKeyRef {
+                schema_key: "app.exact",
+                file_id: None,
+                entity_pk: &local_pk,
+            },
+            UntrackedValueRef {
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(3),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(4),
+                cell: StateCellRef::Tombstone,
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &[],
+            },
+        )
+        .expect("local tombstone");
+    publication
+        .put_untracked_row(
+            CanonicalBranchId::from_bytes(
+                *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+                    .expect("global branch UUID")
+                    .as_bytes(),
+            ),
+            StateKeyRef {
+                schema_key: "app.exact",
+                file_id: None,
+                entity_pk: &global_pk,
+            },
+            UntrackedValueRef {
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(5),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(6),
+                cell: StateCellRef::Value("global"),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &[],
+            },
+        )
+        .expect("global-only value");
+    drop(view);
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("commit untracked rows");
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("exact untracked view");
+    let local_key = encode_state_key(StateKeyRef {
+        schema_key: "app.exact",
+        file_id: None,
+        entity_pk: &local_pk,
+    });
+    storage.untracked_get_many.store(0, Ordering::Relaxed);
+    let local = view
+        .load_untracked_overlay_points(&[local_key.clone(), local_key])
+        .await
+        .expect("local exact rows");
+    assert_eq!(storage.untracked_get_many.load(Ordering::Relaxed), 1);
+    assert_eq!(local.len(), 2);
+    assert!(local.iter().all(|row| {
+        row.as_ref()
+            .is_some_and(|(_, _, value)| value.cell.deleted())
+    }));
+
+    let global_key = encode_state_key(StateKeyRef {
+        schema_key: "app.exact",
+        file_id: None,
+        entity_pk: &global_pk,
+    });
+    storage.untracked_get_many.store(0, Ordering::Relaxed);
+    let global = view
+        .load_untracked_overlay_points(&[global_key])
+        .await
+        .expect("global fallback row");
+    assert_eq!(storage.untracked_get_many.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        global[0].as_ref().map(|(_, key, _)| key.entity_pk.clone()),
+        Some(global_pk)
+    );
 }
 
 #[tokio::test]
