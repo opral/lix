@@ -497,7 +497,7 @@ where
         account_id: active_account_id.to_string(),
         created_at: change_refs.created_at,
     };
-    let semantic_commit = CommitObjectV1 {
+    let mut semantic_commit = CommitObjectV1 {
         commit_id: forktree_commit_id(commit_id),
         generation,
         parent_commit_object_ids: parent_object_ids,
@@ -505,10 +505,12 @@ where
             .into_iter()
             .map(CommitMemberV1::introduced)
             .collect(),
+        member_page_root: None,
         global_state_root,
         local_state_root,
         metadata: crate::changelog::encode_forktree_commit_payload(&commit_record)?,
     };
+    let _member_pages = semantic_commit.prepare_member_pages()?;
     let (commit_object_id, _) = semantic_commit.encode()?;
 
     let ref_payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
@@ -1038,15 +1040,17 @@ where
             account_id: active_account_id.to_string(),
             created_at: content.draft.created_at,
         };
-        let commit = CommitObjectV1 {
+        let mut commit = CommitObjectV1 {
             commit_id: forktree_commit_id(content.draft.commit_id),
             generation,
             parent_commit_object_ids: parent_object_ids,
             members: content.members.clone(),
+            member_page_root: None,
             global_state_root,
             local_state_root,
             metadata: crate::changelog::encode_forktree_commit_payload(&record)?,
         };
+        let _member_pages = commit.prepare_member_pages()?;
         let (commit_object_id, _) = commit.encode()?;
         staged_commits.insert(content.draft.commit_id, (commit_object_id, commit.clone()));
         commit_entries.push((commit.commit_id, CommitCatalogEntry { commit_object_id }));
