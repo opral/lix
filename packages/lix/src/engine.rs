@@ -27,7 +27,6 @@ use crate::{LixError, NullableKeyFilter};
 #[expect(missing_debug_implementations)]
 pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
-    tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -151,7 +150,6 @@ where
             options.plugin_max_live_stores,
         )?;
 
-        let tracked_state = Arc::new(TrackedStateContext::new());
         let live_state = Arc::new(LiveStateContext::new());
         let branch_ctx = Arc::new(BranchContext::new());
         assert_initialized(storage.clone()).await?;
@@ -168,7 +166,6 @@ where
         ));
         Ok(Self {
             storage,
-            tracked_state,
             live_state,
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
@@ -230,7 +227,6 @@ where
             active_account_id,
             self.storage(),
             Arc::clone(&self.live_state),
-            Arc::clone(&self.tracked_state),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
@@ -260,7 +256,6 @@ where
             active_account_id,
             self.storage(),
             Arc::clone(&self.live_state),
-            Arc::clone(&self.tracked_state),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),

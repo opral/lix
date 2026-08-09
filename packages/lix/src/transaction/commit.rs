@@ -28,36 +28,6 @@ use crate::forktree::{
     select_historical_commit_member, state_point,
 };
 
-#[cfg(test)]
-pub(crate) fn take_ordered_packed_current_base_publications() -> usize {
-    0
-}
-
-#[cfg(test)]
-pub(crate) fn take_certified_columnar_current_base_publications() -> usize {
-    0
-}
-
-#[cfg(test)]
-pub(crate) fn take_complete_replacement_packed_current_base_publications() -> usize {
-    0
-}
-
-#[cfg(test)]
-pub(crate) fn take_complete_replacement_packed_current_base_retirements() -> usize {
-    0
-}
-
-#[cfg(test)]
-pub(crate) fn take_rootless_replacement_generation_publications() -> usize {
-    0
-}
-
-#[cfg(test)]
-pub(crate) fn take_direct_journal_replacement_publications(_schema_key: &str) -> usize {
-    0
-}
-
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
 
 /// Converts transaction JSON into the representation owned by a ForkTree

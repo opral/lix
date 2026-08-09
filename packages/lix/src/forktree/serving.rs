@@ -88,6 +88,7 @@ pub(crate) struct VisibleStateRow {
     pub(crate) encoded_key: Vec<u8>,
     pub(crate) value: StateValue,
     pub(crate) source: StateSource,
+    #[cfg(test)]
     pub(super) view_instance_id: u64,
 }
 
@@ -323,18 +324,6 @@ where
         change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
         updated_at,
     })
-}
-
-pub(crate) async fn load_branch_ref_change_id<R>(
-    read: &R,
-    branch_id: &str,
-) -> Result<Option<crate::changelog::ChangeId>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    Ok(Some(
-        load_branch_ref_metadata(read, branch_id).await?.change_id,
-    ))
 }
 
 /// Scans every authenticated branch selector in one coherent read view.
@@ -1438,6 +1427,7 @@ where
         encoded_key: key.to_vec(),
         value,
         source,
+        #[cfg(test)]
         view_instance_id: view.view_instance_id(),
     }))
 }
@@ -1500,6 +1490,7 @@ where
             encoded_key,
             value,
             source,
+            #[cfg(test)]
             view_instance_id: view.view_instance_id(),
         })
         .collect())
@@ -1681,7 +1672,6 @@ where
                 snapshot_content,
                 metadata: value.metadata,
                 deleted,
-                blob_manifest_object_ids: value.blob_manifest_object_ids,
             })
         })
         .collect()

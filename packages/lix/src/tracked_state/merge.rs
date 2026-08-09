@@ -61,11 +61,6 @@ macro_rules! impl_merge_row_batch {
             }
 
             #[cfg(test)]
-            pub(crate) fn large_buffer_count(&self) -> usize {
-                usize::from(!self.rows.is_empty())
-            }
-
-            #[cfg(test)]
             pub(crate) fn row_capacity(&self) -> usize {
                 self.rows.capacity()
             }
@@ -106,6 +101,13 @@ macro_rules! impl_merge_row_batch {
 
 impl_merge_row_batch!(TrackedStateMergePickBatch, TrackedStateMergePick);
 impl_merge_row_batch!(TrackedStateMergeConflictBatch, TrackedStateMergeConflict);
+
+#[cfg(test)]
+impl TrackedStateMergeConflictBatch {
+    pub(crate) fn large_buffer_count(&self) -> usize {
+        usize::from(!self.rows.is_empty())
+    }
+}
 
 /// One source-side change selected for the merge result.
 ///

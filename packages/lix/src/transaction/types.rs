@@ -1954,6 +1954,7 @@ impl TransactionFileContent {
         self.mutation_identity
     }
 
+    #[cfg(test)]
     pub(crate) fn add_auxiliary_payload(&mut self, data: impl Into<crate::Blob>) {
         self.auxiliary_payloads.push(BlobPayload::from_bytes(data));
     }
@@ -2080,10 +2081,12 @@ impl TransactionFileContent {
         self.content.inline_payload()
     }
 
+    #[cfg(test)]
     pub(crate) fn same_length_blob_splice(&self) -> Option<BlobSameLengthSplice> {
         self.same_length_blob_splice
     }
 
+    #[cfg(test)]
     pub(crate) fn edit_blob_splice(&self) -> Option<BlobEditSplice> {
         self.edit_blob_splice
     }
@@ -2093,6 +2096,7 @@ impl TransactionFileContent {
         self.base_blob_hash
     }
 
+    #[cfg(test)]
     pub(crate) fn auxiliary_payloads(&self) -> &[BlobPayload] {
         &self.auxiliary_payloads
     }
@@ -2173,6 +2177,7 @@ enum StageJsonStorage {
     /// The parsed batch column is deliberately gone at this boundary. Commit
     /// materialization and storage lowering consume only the certified bytes,
     /// so making decoded access impossible prevents an accidental second parse.
+    #[cfg(test)]
     ValidatedShared {
         normalized: SharedStr,
     },
@@ -2181,6 +2186,7 @@ enum StageJsonStorage {
     /// Direct entity writes already arrive in an `Arc<str>`. Keeping that
     /// owner avoids allocating and copying the full JSON payload merely to
     /// discard an empty (or no-longer-needed) decoded-value cache.
+    #[cfg(test)]
     ValidatedOwned {
         normalized: Arc<str>,
     },
@@ -2206,6 +2212,7 @@ impl StageJson {
                     )
                 })
                 .as_ref(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedShared { .. } | StageJsonStorage::ValidatedOwned { .. } => {
                 panic!("validated staged JSON must not be decoded after transaction validation")
             }
@@ -2217,7 +2224,9 @@ impl StageJson {
         match &self.storage {
             StageJsonStorage::Owned { normalized, .. } => normalized.as_ref(),
             StageJsonStorage::CertifiedShared { normalized, .. } => normalized.as_str(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedShared { normalized } => normalized.as_str(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedOwned { normalized } => normalized.as_ref(),
             StageJsonStorage::CanonicalBatch(value) => value.normalized(),
         }
@@ -2239,6 +2248,7 @@ impl StageJson {
     /// Every row retains only a cheap slice of the canonical batch arena. The
     /// final row releases the shared DOM and offset columns before commit
     /// materialization allocates its storage buffers.
+    #[cfg(test)]
     pub(crate) fn release_validated_canonical_value_column(&mut self) -> bool {
         let storage = match &self.storage {
             StageJsonStorage::CanonicalBatch(value) => StageJsonStorage::ValidatedShared {
@@ -2281,7 +2291,9 @@ impl StageJson {
         match &self.storage {
             StageJsonStorage::Owned { normalized, .. } => SharedStr::from(normalized.as_ref()),
             StageJsonStorage::CertifiedShared { normalized, .. } => normalized.clone(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedShared { normalized } => normalized.clone(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedOwned { normalized } => SharedStr::from(normalized.as_ref()),
             StageJsonStorage::CanonicalBatch(value) => value.normalized_shared(),
         }
@@ -2919,6 +2931,7 @@ impl PreparedStateBatch {
         self.certified_tracked_keys_strictly_ordered
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_collection_replacement_proof(
         &self,
     ) -> Option<CompleteCollectionReplacementProof> {
@@ -3502,6 +3515,7 @@ impl PreparedStateBatch {
         self.slots[index].change_id = change_id;
     }
 
+    #[cfg(test)]
     pub(crate) fn release_validated_canonical_value_columns(&mut self) {
         if let Some(dense) = &self.dense_certified_parameter {
             debug_assert_eq!(dense.len, self.json.len());
@@ -3579,7 +3593,7 @@ impl PreparedStateBatch {
             .iter()
             .filter_map(|(_, value)| {
                 source_buffers
-                    .insert(value.retained_buffer_identity())
+                    .insert((value.as_bytes().as_ptr(), value.len()))
                     .then_some(value.retained_buffer_len())
             })
             .sum::<usize>();
@@ -4107,6 +4121,7 @@ impl StagedCommitChangeBatch {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn source_membership_certified(&self) -> bool {
         self.source_membership_certified
     }

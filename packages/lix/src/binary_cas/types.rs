@@ -98,10 +98,6 @@ impl BlobId {
 pub(crate) struct ChunkHash([u8; 32]);
 
 impl ChunkHash {
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
     pub(crate) fn from_content(content: &[u8]) -> Self {
         Self(binary_blob_hash_bytes(content))
     }
@@ -112,10 +108,6 @@ impl ChunkHash {
 
     pub(crate) fn into_bytes(self) -> [u8; 32] {
         self.0
-    }
-
-    pub(crate) fn to_hex(self) -> String {
-        hash_bytes_to_hex(&self.0)
     }
 }
 
@@ -148,10 +140,6 @@ impl BlobSameLengthSplice {
             offset,
             length,
         }
-    }
-
-    pub(crate) fn end(self) -> Option<usize> {
-        self.offset.checked_add(self.length)
     }
 }
 
@@ -190,34 +178,10 @@ impl BlobPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobDeltaSegment {
-    Copy { offset: u64, length: u64 },
-    Insert { bytes: Vec<u8> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobDeltaBaseLayout {
-    SingleChunk { chunk_hash: ChunkHash },
-    Chunked { chunk_count: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlobLayout {
     Empty,
-    SingleChunk {
-        chunk_hash: ChunkHash,
-    },
-    Chunked {
-        chunk_count: u32,
-    },
-    /// One-level, flattened copy/insert program against a canonical full blob,
-    /// so reads never walk a history chain.
-    Delta {
-        base_blob_hash: BlobId,
-        base_size_bytes: u64,
-        base_layout: BlobDeltaBaseLayout,
-        segments: Vec<BlobDeltaSegment>,
-    },
+    SingleChunk { chunk_hash: ChunkHash },
+    Chunked { chunk_count: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

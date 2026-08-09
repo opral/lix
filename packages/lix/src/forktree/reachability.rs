@@ -1458,13 +1458,6 @@ fn full_value<'a>(value: &'a ProjectedValue, message: &str) -> Result<&'a Bytes,
     }
 }
 
-fn unbounded_range() -> KeyRange {
-    KeyRange {
-        lower: Bound::Unbounded,
-        upper: Bound::Unbounded,
-    }
-}
-
 fn restart_range(resume_after: Option<&[u8]>) -> KeyRange {
     KeyRange {
         lower: resume_after.map_or(Bound::Unbounded, |key| {

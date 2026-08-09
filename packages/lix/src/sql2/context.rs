@@ -7,7 +7,6 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
@@ -85,13 +84,6 @@ pub(crate) trait SqlExecutionContext: Sync {
         crate::ANONYMOUS_ACCOUNT_ID
     }
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
-    /// Supplies the committed tracked-head entity snapshot capability when the
-    /// read context can prove it is scoped to one immutable storage snapshot.
-    /// Generic and transaction contexts intentionally retain the default
-    /// materialized-row path.
-    fn entity_snapshot_reader(&self) -> Option<Arc<dyn super::EntitySnapshotReader>> {
-        None
-    }
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         Arc::new(UncachedFilesystemPathIndexReader::new(self.live_state()))
     }
@@ -175,13 +167,6 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "authenticated ForkTree blob reader is unavailable for this SQL write context",
-        ))
-    }
-
-    async fn load_bytes_many(&mut self, _hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "hash-only SQL blob reads are not supported; resolve an authenticated ForkTree BlobRef",
         ))
     }
 
@@ -432,22 +417,6 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .load_exact_live_state_batch(request)
-                .await
-        }
-    }
-
-    pub(crate) async fn load_bytes_many(
-        &self,
-        hashes: &[BlobId],
-    ) -> Result<BlobBytesBatch, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .load_bytes_many(hashes)
                 .await
         }
     }

@@ -1,12 +1,14 @@
+#[cfg(test)]
 pub(crate) mod compression;
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(test)]
 pub(crate) mod context;
+#[cfg(test)]
 mod encoded;
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(test)]
 pub(crate) mod store;
 pub(crate) mod types;
 
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use context::{
     JsonStoreContext, JsonStoreReader, JsonStoreWriter, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,

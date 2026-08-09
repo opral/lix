@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::borrow::Cow;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
@@ -70,16 +71,6 @@ pub(crate) struct AutoParameterizedUpdate {
     pub(crate) sql: Arc<str>,
     pub(crate) statement: DataFusionStatement,
     pub(crate) params: Vec<Value>,
-}
-
-#[derive(Default)]
-pub(crate) struct CachedUpdateLiteralShape {
-    shape_address: usize,
-    shape_len: usize,
-    prefix_end: usize,
-    middle_start: usize,
-    middle_end: usize,
-    suffix_start: usize,
 }
 
 /// Bounded, engine-owned cache for snapshot-independent SQL planning templates.
@@ -238,11 +229,6 @@ where
         lock_or_recover(&self.read_plans).len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn clear_read_plans(&self) {
-        lock_or_recover(&self.read_plans).clear();
-    }
-
     /// Parses exact SQL once and returns an owned clone of the cached AST.
     ///
     /// Parse failures are intentionally not cached. Two concurrent cold calls
@@ -308,6 +294,7 @@ where
     /// Returns borrowed decoded string literals when a warm UPDATE still
     /// matches its normalized shape. Ordinary literals borrow the caller's
     /// SQL directly; SQL quote escapes allocate only the affected slot.
+    #[cfg(test)]
     pub(crate) fn decode_update_literals_for_shape<'a>(
         &self,
         sql: &'a str,
@@ -322,53 +309,6 @@ where
             sql,
             normalized_shape,
             parameter_count,
-            escape_scratch,
-        )
-    }
-
-    pub(crate) fn decode_update_literals_for_cached_shape<'a>(
-        &self,
-        sql: &'a str,
-        normalized_shape: &str,
-        parameter_count: usize,
-        escape_scratch: &mut SmallVec<[String; 4]>,
-        cached_shape: &mut CachedUpdateLiteralShape,
-    ) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
-        if parameter_count != 2 {
-            return self.decode_update_literals_for_shape(
-                sql,
-                normalized_shape,
-                parameter_count,
-                escape_scratch,
-            );
-        }
-        if cached_shape.shape_address != normalized_shape.as_ptr() as usize
-            || cached_shape.shape_len != normalized_shape.len()
-            || normalized_shape.get(cached_shape.prefix_end..cached_shape.middle_start)
-                != Some("$1")
-            || normalized_shape.get(cached_shape.middle_end..cached_shape.suffix_start)
-                != Some("$2")
-        {
-            let (prefix, remainder) = normalized_shape.split_once("$1")?;
-            let (middle, suffix) = remainder.split_once("$2")?;
-            if prefix.contains('$') || middle.contains('$') || suffix.contains('$') {
-                return None;
-            }
-            cached_shape.shape_address = normalized_shape.as_ptr() as usize;
-            cached_shape.shape_len = normalized_shape.len();
-            cached_shape.prefix_end = prefix.len();
-            cached_shape.middle_start = prefix.len() + 2;
-            cached_shape.middle_end = cached_shape.middle_start + middle.len();
-            cached_shape.suffix_start = cached_shape.middle_end + 2;
-        }
-        if escape_scratch.len() < 2 {
-            escape_scratch.resize_with(2, String::new);
-        }
-        decode_two_update_string_literals(
-            sql,
-            &normalized_shape[..cached_shape.prefix_end],
-            &normalized_shape[cached_shape.middle_start..cached_shape.middle_end],
-            &normalized_shape[cached_shape.suffix_start..],
             escape_scratch,
         )
     }
@@ -711,11 +651,13 @@ fn update_string_literals_match_shape(sql: &str, normalized_shape: &str) -> bool
     !quoted_identifier && param_count > 0 && shape.get(shape_cursor..) == Some(&bytes[copied..])
 }
 
+#[cfg(test)]
 enum DecodedUpdateLiteral<'a> {
     Borrowed(&'a str),
     Escaped(usize),
 }
 
+#[cfg(test)]
 fn decode_update_string_literals_for_shape<'a>(
     sql: &'a str,
     normalized_shape: &str,
@@ -862,6 +804,7 @@ fn decode_update_string_literals_for_shape<'a>(
     )
 }
 
+#[cfg(test)]
 fn decode_two_update_string_literals<'a>(
     sql: &'a str,
     prefix: &str,

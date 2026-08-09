@@ -130,15 +130,3 @@ pub(crate) fn append_path_value_replacement_snapshot(
         normalized,
     )
 }
-
-pub(crate) fn append_path_value_replacement_snapshot_text(
-    primary_key: &str,
-    replacement_value: Option<&str>,
-    normalized: &mut Vec<u8>,
-) -> Result<(usize, usize), crate::LixError> {
-    bound_public_write::append_path_value_replacement_snapshot_text(
-        primary_key,
-        replacement_value,
-        normalized,
-    )
-}

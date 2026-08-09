@@ -1,118 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
-
-use crate::LixError;
-use crate::common::compose_file_path;
-use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateScanRequest, scan_forktree_view,
-};
 
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
 use super::{DirectoryPathRecord, derive_directory_paths};
-
-/// Collects every file payload root selected by the authenticated serving
-/// controls and retained commit/checkpoint roots. Tracked history is read from
-/// commit state; current-only untracked rows are read from each control's
-/// untracked selector through the live-state owner.
-pub(crate) async fn collect_gc_binary_blob_roots<O, C>(
-    retained: &O,
-    controls: &[(String, C)],
-    retained_commits: &BTreeSet<crate::changelog::CommitId>,
-) -> Result<BTreeSet<crate::binary_cas::BlobId>, LixError>
-where
-    O: crate::storage_adapter::StorageAdapterRead + Clone,
-{
-    let facade = crate::forktree::ForkTreeReadFacade::new(retained.clone());
-    let mut roots = BTreeSet::new();
-    for (branch_id, _) in controls {
-        let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
-        let rows = scan_forktree_view(
-            &view,
-            &LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_owned()],
-                    branch_ids: vec![branch_id.clone()],
-                    untracked: Some(true),
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection {
-                    columns: vec!["snapshot_content".to_owned()],
-                },
-                limit: None,
-            },
-        )
-        .await?;
-        for row in rows.iter() {
-            let snapshot = row.snapshot_content().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    "current binary blob reference has no snapshot",
-                )
-            })?;
-            roots.insert(blob_id_from_snapshot(row.entity_pk(), snapshot.as_str())?);
-        }
-    }
-
-    for commit_id in retained_commits {
-        let records = facade
-            .load_commit_member_records(*commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    format!("retained commit '{commit_id}' has no authenticated member records"),
-                )
-            })?;
-        for record in records {
-            if record.schema_key != BLOB_REF_SCHEMA_KEY || record.snapshot.is_none() {
-                continue;
-            }
-            let Some(snapshot) = facade.load_json_slot(&record.snapshot).await? else {
-                continue;
-            };
-            roots.insert(blob_id_from_snapshot(&record.entity_pk, &snapshot)?);
-        }
-    }
-    Ok(roots)
-}
-
-fn blob_id_from_snapshot(
-    row: &crate::entity_pk::EntityPk,
-    snapshot: &str,
-) -> Result<crate::binary_cas::BlobId, LixError> {
-    let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot).map_err(|error| {
-        LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            format!("invalid live binary blob reference snapshot: {error}"),
-        )
-    })?;
-    let expected_id = row.as_single_string().map_err(|error| {
-        LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            format!("authenticated blob reference row identity is not a string: {error}"),
-        )
-    })?;
-    if snapshot.id != expected_id {
-        return Err(LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            format!(
-                "authenticated blob reference id '{}' does not match row identity '{expected_id}'",
-                snapshot.id
-            ),
-        ));
-    }
-    let _size = usize::try_from(snapshot.size_bytes).map_err(|_| {
-        LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "authenticated blob reference size exceeds the platform limit",
-        )
-    })?;
-    crate::binary_cas::BlobId::from_hex(&snapshot.blob_hash)
-}
+use crate::LixError;
+use crate::common::compose_file_path;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FilesystemIndex {
@@ -172,6 +68,11 @@ impl FilesystemIndex {
                                 "invalid lix_binary_blob_ref snapshot JSON: {error}"
                             ))
                         })?;
+                    usize::try_from(snapshot.size_bytes).map_err(|_| {
+                        LixError::unknown(
+                            "lix_binary_blob_ref size exceeds the platform addressable range",
+                        )
+                    })?;
                     blob_hashes_by_key.insert(
                         FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id),
                         snapshot.blob_hash,
