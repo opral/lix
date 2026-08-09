@@ -429,6 +429,122 @@ where
     })
 }
 
+/// Rebuilds an ordered tree from one authenticated full scan plus a sorted
+/// insertion batch. The scan uses the caller's retained read and validates
+/// every existing node before any replacement object is staged. The merged
+/// entries then go through the same canonical tree builder, so domain/object
+/// identity, leaf ordering, summaries, and fanout remain owned by this module.
+///
+/// This is intentionally a bulk insertion primitive, not a second catalog
+/// authority: callers provide only raw encoded entries already validated at
+/// their semantic owner boundary, and the returned object set is staged by
+/// the same publication as the ordinary path-copy edit.
+pub(super) async fn rebuild_ordered_insertions<R>(
+    root_object_id: ObjectId,
+    expected_kind: &'static str,
+    insertions: &[(Vec<u8>, Vec<u8>)],
+    conflict_message: &'static str,
+    read: &R,
+) -> Result<OrderedTreeEdit, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if insertions.is_empty() {
+        let root = validate_root_on_read(root_object_id, expected_kind, read).await?;
+        return Ok(OrderedTreeEdit {
+            root,
+            objects: ImmutableObjectSet::default(),
+            copied_nodes: 0,
+        });
+    }
+    if insertions.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(corruption(
+            "ordered-tree bulk insertions are not strictly ordered and distinct",
+        ));
+    }
+    let kind = parse_kind(expected_kind)?;
+    let root = validate_root_on_read(root_object_id, expected_kind, read).await?;
+    let existing =
+        scan_range_on_read(root.object_id, expected_kind, None, None, None, read).await?;
+    let expected_count = usize::try_from(root.entry_count)
+        .map_err(|_| corruption("ordered-tree root entry count exceeds usize"))?;
+    if existing.len() != expected_count {
+        return Err(corruption(
+            "ordered-tree full scan does not match authenticated root count",
+        ));
+    }
+
+    let mut merged = Vec::with_capacity(existing.len() + insertions.len());
+    let mut existing_index = 0;
+    let mut insertion_index = 0;
+    while existing_index < existing.len() && insertion_index < insertions.len() {
+        match existing[existing_index]
+            .0
+            .as_slice()
+            .cmp(insertions[insertion_index].0.as_slice())
+        {
+            std::cmp::Ordering::Less => {
+                let (key, value) = &existing[existing_index];
+                merged.push(LeafEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                    receipt: None,
+                });
+                existing_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let (existing_key, existing_value) = &existing[existing_index];
+                let (_, insertion_value) = &insertions[insertion_index];
+                if existing_value != insertion_value {
+                    return Err(corruption(conflict_message));
+                }
+                merged.push(LeafEntry {
+                    key: existing_key.clone(),
+                    value: existing_value.clone(),
+                    receipt: None,
+                });
+                existing_index += 1;
+                insertion_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                let (key, value) = &insertions[insertion_index];
+                merged.push(LeafEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                    receipt: None,
+                });
+                insertion_index += 1;
+            }
+        }
+    }
+    while existing_index < existing.len() {
+        let (key, value) = &existing[existing_index];
+        merged.push(LeafEntry {
+            key: key.clone(),
+            value: value.clone(),
+            receipt: None,
+        });
+        existing_index += 1;
+    }
+    while insertion_index < insertions.len() {
+        let (key, value) = &insertions[insertion_index];
+        merged.push(LeafEntry {
+            key: key.clone(),
+            value: value.clone(),
+            receipt: None,
+        });
+        insertion_index += 1;
+    }
+
+    let build = build_tree(kind, &merged)?;
+    let copied_nodes = build.objects.iter().count();
+    Ok(OrderedTreeEdit {
+        root: build.root,
+        objects: build.objects,
+        copied_nodes,
+    })
+}
+
 pub(super) async fn lookup_on_read<R>(
     root: ObjectId,
     expected_kind: &'static str,

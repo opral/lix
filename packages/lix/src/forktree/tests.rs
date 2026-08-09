@@ -1339,6 +1339,81 @@ async fn path_copy_catalog_put_and_view_bound_resume_are_bounded() {
     );
 }
 
+#[tokio::test]
+async fn bulk_change_catalog_rebuild_preserves_order_and_rejects_conflicts() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("view");
+    let mut bulk_entries = Vec::with_capacity(128);
+    for ordinal in 0..128_u8 {
+        let mut bytes = [0x40; 16];
+        bytes[15] = ordinal;
+        bulk_entries.push((
+            ChangeId::from_bytes(bytes),
+            ChangeCatalogEntry {
+                change_object_id: seed.semantic_change_object_id,
+                owner: ChangeCatalogOwner::CommitMember {
+                    commit_object_id: seed.commit_object_id,
+                    ordinal: 0,
+                },
+            },
+        ));
+    }
+    let read = view.test_storage_read();
+    let edit = super::serving::put_change_catalog_entries_bulk(
+        view.repository_root().change_catalog_root,
+        &bulk_entries,
+        &read,
+    )
+    .await
+    .expect("bulk catalog rebuild");
+    let rows = scan_all(edit.root, "change", |id| {
+        edit.objects
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StorageError::Corruption("bulk tree omitted an object".into()))
+    })
+    .expect("rebuilt catalog scan");
+    assert_eq!(rows.len(), 130);
+    assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+    let mut duplicate_entries = bulk_entries.clone();
+    duplicate_entries[1].0 = duplicate_entries[0].0;
+    assert!(
+        super::serving::put_change_catalog_entries_bulk(
+            view.repository_root().change_catalog_root,
+            &duplicate_entries,
+            &read,
+        )
+        .await
+        .is_err()
+    );
+
+    let mut conflict_entries = bulk_entries;
+    conflict_entries[0] = (
+        seed.semantic_change_id,
+        ChangeCatalogEntry {
+            change_object_id: seed.ref_change_object_id,
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: seed.ref_change_object_id,
+                branch_id: seed.branch_id,
+            },
+        },
+    );
+    assert!(
+        super::serving::put_change_catalog_entries_bulk(
+            view.repository_root().change_catalog_root,
+            &conflict_entries,
+            &read,
+        )
+        .await
+        .is_err()
+    );
+}
+
 #[derive(Clone)]
 struct CountingStorage {
     inner: Memory,
