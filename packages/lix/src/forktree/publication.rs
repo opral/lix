@@ -470,6 +470,22 @@ impl PreparedPublication {
         self.stage_blob_manifest(&manifest)
     }
 
+    /// Lowers one large JSON value into an authenticated ForkTree payload
+    /// object. The object is deliberately a typed BlobChunk: its envelope
+    /// authenticates the domain and complete bytes, while the owning Change
+    /// object carries the edge used by reachability and GC. JSON never uses
+    /// the legacy JSON_SPACE on this path.
+    pub(crate) fn stage_json_payload(&mut self, json: &str) -> Result<ObjectId, StorageError> {
+        if json.len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
+            return Err(corruption(
+                "inline JSON must remain inline rather than becoming an object",
+            ));
+        }
+        self.stage_blob_chunk(&BlobChunkV1 {
+            bytes: Bytes::copy_from_slice(json.as_bytes()),
+        })
+    }
+
     pub(super) fn stage_upload_part(
         &mut self,
         value: &UploadPartV1,

@@ -201,6 +201,10 @@ pub(crate) enum JsonSlot {
     None,
     Ref(JsonRef),
     Inline(Box<str>),
+    /// Authenticated ForkTree object payload. This variant is only emitted
+    /// while lowering a ForkTree publication; `Ref` remains an ingress shape
+    /// and is never persisted in a ForkTree change object.
+    ForkTreeObject([u8; 32]),
 }
 
 /// Inline threshold in bytes. Payloads at or under this length skip the
@@ -229,6 +233,7 @@ impl JsonSlot {
             Self::None => JsonSlotRef::None,
             Self::Ref(json_ref) => JsonSlotRef::Ref(json_ref),
             Self::Inline(json) => JsonSlotRef::Inline(json),
+            Self::ForkTreeObject(object_id) => JsonSlotRef::ForkTreeObject(object_id),
         }
     }
 }
@@ -239,6 +244,7 @@ pub(crate) enum JsonSlotRef<'a> {
     None,
     Ref(&'a JsonRef),
     Inline(&'a str),
+    ForkTreeObject(&'a [u8; 32]),
 }
 
 /// Musli codec for [`JsonSlot`]: tag byte 0/1/2, then the payload.
@@ -272,6 +278,13 @@ pub(crate) mod json_slot_storage {
                         |json| Ok(JsonSlot::Inline(json.into_boxed_str())),
                     )
                 }
+                3 => {
+                    let bytes: Vec<u8> = pack.next()?;
+                    let object_id = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                        cx.message(format_args!("forktree json object id is not 32 bytes"))
+                    })?;
+                    Ok(JsonSlot::ForkTreeObject(object_id))
+                }
                 other => Err(cx.message(format_args!("unknown json slot tag {other}"))),
             }
         })
@@ -297,6 +310,10 @@ pub(crate) mod json_slot_storage_ref {
             JsonSlotRef::Inline(json) => {
                 pack.push(2u8)?;
                 pack.push(json.as_bytes())
+            }
+            JsonSlotRef::ForkTreeObject(object_id) => {
+                pack.push(3u8)?;
+                pack.push(object_id.as_slice())
             }
         })
     }

@@ -1104,15 +1104,33 @@ where
         }
         _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid").into()),
     }
-    let payload = match change {
-        ChangeObjectV1::Semantic { payload, .. } | ChangeObjectV1::BranchRef { payload, .. } => {
-            payload
+    let (payload, json_payload_object_ids) = match change {
+        ChangeObjectV1::Semantic {
+            payload,
+            json_payload_object_ids,
+            ..
         }
+        | ChangeObjectV1::BranchRef {
+            payload,
+            json_payload_object_ids,
+            ..
+        } => (payload, json_payload_object_ids),
     };
-    Ok(crate::changelog::decode_forktree_change_payload(
+    let record = crate::changelog::decode_forktree_change_payload(
         &payload,
         crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*id.as_bytes())),
-    )?)
+    )?;
+    let expected = crate::changelog::forktree_change_json_payload_ids(&record)
+        .into_iter()
+        .map(ObjectId::from_bytes)
+        .collect::<Vec<_>>();
+    if expected != json_payload_object_ids {
+        return Err(corruption(
+            "Change object JSON payload edges do not match its semantic payload",
+        )
+        .into());
+    }
+    Ok(record)
 }
 
 async fn validate_commit_catalog_identity<R>(

@@ -12,8 +12,8 @@ use crate::storage::{
     StorageError, StorageRead, StorageWrite, WriteOptions,
 };
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapterRead, StorageAdapterReadScope, StorageWriteSet,
-    StorageWriteSetError,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
+    StorageReadOptions, StorageWriteSet, StorageWriteSetError,
 };
 
 use super::model::{
@@ -109,6 +109,68 @@ fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
     assert!(blob.contains("manifest.canonical_blob_id != semantic_id"));
     assert!(!blob.contains("BTreeMap<crate::binary_cas::BlobId"));
     assert!(!blob.contains("fn canonical_blob_id"));
+}
+
+#[tokio::test]
+async fn forktree_json_object_materializes_and_rejects_side_plane_or_corruption() {
+    let value = format!(
+        r#"{{"large":"{}"}}"#,
+        "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES + 1)
+    );
+    let chunk = BlobChunkV1 {
+        bytes: Bytes::from(value.clone()),
+    };
+    let (object_id, encoded) = chunk.encode().expect("JSON object encoding");
+    let storage = Memory::new();
+    let mut writes = StorageWriteSet::new();
+    writes.put(
+        OBJECT_SPACE,
+        object_id.as_bytes().to_vec(),
+        encoded.to_vec(),
+    );
+    commit_write_set_for_test(writes, &storage).await;
+
+    let adapter = StorageAdapter::new(storage.clone());
+    let read = adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("JSON object read");
+    let facade = ForkTreeReadFacade::new(read);
+    let slot = crate::json_store::JsonSlot::ForkTreeObject(*object_id.as_bytes());
+    assert_eq!(
+        facade
+            .load_json_slot(&slot)
+            .await
+            .expect("authenticated JSON object"),
+        Some(value)
+    );
+    let legacy = crate::json_store::JsonSlot::Ref(crate::json_store::JsonRef::for_content(
+        b"legacy side plane",
+    ));
+    assert!(
+        facade.load_json_slot(&legacy).await.is_err(),
+        "legacy JSON_SPACE references must never fall back"
+    );
+    drop(facade);
+
+    let mut corrupted = encoded.to_vec();
+    *corrupted.last_mut().expect("encoded JSON object") ^= 1;
+    assert!(
+        BlobChunkV1::decode(object_id, &corrupted).is_err(),
+        "corrupt authenticated JSON objects must fail closed"
+    );
+    let mut writes = StorageWriteSet::new();
+    writes.delete(OBJECT_SPACE, object_id.as_bytes().to_vec());
+    commit_write_set_for_test(writes, &storage).await;
+    let read = adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("corrupt JSON object read");
+    let facade = ForkTreeReadFacade::new(read);
+    assert!(
+        facade.load_json_slot(&slot).await.is_err(),
+        "missing authenticated JSON objects must fail closed"
+    );
 }
 
 #[tokio::test]
@@ -377,6 +439,7 @@ fn build_seed() -> SeedData {
     let semantic_change = ChangeObjectV1::Semantic {
         change_id: semantic_change_id,
         payload: b"semantic-change".to_vec(),
+        json_payload_object_ids: Vec::new(),
     };
     let (semantic_change_object_id, semantic_change_bytes) =
         semantic_change.encode().expect("semantic change");
@@ -404,6 +467,7 @@ fn build_seed() -> SeedData {
         after_semantic_head_commit_object_id: Some(commit_object_id),
         previous_ref_change_object_id: None,
         payload: b"create-main".to_vec(),
+        json_payload_object_ids: Vec::new(),
     };
     let (ref_change_object_id, ref_change_bytes) = ref_change.encode().expect("ref change");
     objects
@@ -469,6 +533,7 @@ fn build_seed() -> SeedData {
     let orphan = ChangeObjectV1::Semantic {
         change_id: ChangeId::from_bytes(raw_id(0xee)),
         payload: b"unreachable".to_vec(),
+        json_payload_object_ids: Vec::new(),
     };
     let (orphan_object_id, orphan_object_bytes) = orphan.encode().expect("orphan");
     objects
@@ -678,6 +743,7 @@ async fn branch_transition<R: StorageAdapterRead>(
         after_semantic_head_commit_object_id: Some(commit_object_id),
         previous_ref_change_object_id: view.branch_snapshot().latest_ref_change_object_id,
         payload: vec![identity],
+        json_payload_object_ids: Vec::new(),
     };
     let (ref_object_id, _) = ref_change.encode().expect("next ref change");
     let commit_catalog_edit = put_commit_catalog_entries(
@@ -1387,6 +1453,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         after_semantic_head_commit_object_id: Some(child_a_object_id),
         previous_ref_change_object_id: None,
         payload: b"shared-parent-branch".to_vec(),
+        json_payload_object_ids: Vec::new(),
     };
     let (creation_object_id, creation_bytes) = creation.encode().expect("creation ref");
     seed.objects
@@ -1532,6 +1599,7 @@ async fn coherent_open_defers_ref_target_authentication_until_visited() {
         after_semantic_head_commit_object_id: Some(seed.commit_object_id),
         previous_ref_change_object_id: Some(seed.ref_change_object_id),
         payload: b"wrong-domain-before".to_vec(),
+        json_payload_object_ids: Vec::new(),
     };
     let (bad_ref_id, bad_ref_bytes) = bad_ref.encode().expect("bad ref envelope");
     seed.objects
@@ -1669,6 +1737,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         after_semantic_head_commit_object_id: Some(bad_ref_history.commit_object_id),
         previous_ref_change_object_id: Some(bad_ref_history.ref_change_object_id),
         payload: b"broken-ref-chronology".to_vec(),
+        json_payload_object_ids: Vec::new(),
     };
     let (latest_id, latest_bytes) = latest.encode().expect("bad chronology ref");
     bad_ref_history
@@ -1765,6 +1834,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         after_semantic_head_commit_object_id: Some(child_id),
         previous_ref_change_object_id: None,
         payload: b"generation-branch".to_vec(),
+        json_payload_object_ids: Vec::new(),
     };
     let (creation_id, creation_bytes) = creation.encode().expect("creation ref");
     bad_generation
@@ -3002,6 +3072,7 @@ async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBr
         after_semantic_head_commit_object_id: Some(seed.commit_object_id),
         previous_ref_change_object_id: None,
         payload: b"create-disposable".to_vec(),
+        json_payload_object_ids: Vec::new(),
     };
     let (disposable_ref_object_id, disposable_ref_bytes) =
         disposable_ref.encode().expect("disposable ref");

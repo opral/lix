@@ -647,6 +647,11 @@ pub(crate) enum ChangeObjectV1 {
     Semantic {
         change_id: ChangeId,
         payload: Vec<u8>,
+        /// Authenticated edges for large JSON payloads referenced by the
+        /// semantic change body. These are part of the Change object rather
+        /// than a side-plane lookup, so reachability and corruption checks
+        /// retain the payload with the change.
+        json_payload_object_ids: Vec<ObjectId>,
     },
     BranchRef {
         change_id: ChangeId,
@@ -655,6 +660,7 @@ pub(crate) enum ChangeObjectV1 {
         after_semantic_head_commit_object_id: Option<ObjectId>,
         previous_ref_change_object_id: Option<ObjectId>,
         payload: Vec<u8>,
+        json_payload_object_ids: Vec<ObjectId>,
     },
 }
 
@@ -694,20 +700,29 @@ impl ChangeObjectV1 {
         encode_object(domain, |encoder| {
             encoder.fixed(self.change_id().as_bytes());
             match self {
-                Self::Semantic { payload, .. } => encoder.bytes(payload),
+                Self::Semantic {
+                    payload,
+                    json_payload_object_ids,
+                    ..
+                } => {
+                    encoder.bytes(payload)?;
+                    encode_object_id_list(encoder, json_payload_object_ids)
+                }
                 Self::BranchRef {
                     branch_id,
                     before_semantic_head_commit_object_id,
                     after_semantic_head_commit_object_id,
                     previous_ref_change_object_id,
                     payload,
+                    json_payload_object_ids,
                     ..
                 } => {
                     encoder.fixed(branch_id.as_bytes());
                     encode_optional_id(encoder, *before_semantic_head_commit_object_id);
                     encode_optional_id(encoder, *after_semantic_head_commit_object_id);
                     encode_optional_id(encoder, *previous_ref_change_object_id);
-                    encoder.bytes(payload)
+                    encoder.bytes(payload)?;
+                    encode_object_id_list(encoder, json_payload_object_ids)
                 }
             }
         })
@@ -720,6 +735,10 @@ impl ChangeObjectV1 {
                 let value = Self::Semantic {
                     change_id: ChangeId::from_bytes(decoder.fixed()?),
                     payload: decoder.bytes("semantic change payload")?,
+                    json_payload_object_ids: decode_object_id_list(
+                        &mut decoder,
+                        "semantic change JSON payload edges",
+                    )?,
                 };
                 decoder.finish()?;
                 value
@@ -742,6 +761,10 @@ impl ChangeObjectV1 {
                         "branch-ref previous edge",
                     )?,
                     payload: decoder.bytes("branch-ref payload")?,
+                    json_payload_object_ids: decode_object_id_list(
+                        &mut decoder,
+                        "branch-ref JSON payload edges",
+                    )?,
                 };
                 decoder.finish()?;
                 value
@@ -771,6 +794,44 @@ impl ChangeObjectV1 {
         }
         Ok(value)
     }
+}
+
+fn encode_object_id_list(encoder: &mut Encoder, ids: &[ObjectId]) -> Result<(), StorageError> {
+    let count = u32::try_from(ids.len())
+        .map_err(|_| corruption("JSON payload object edge count exceeds u32"))?;
+    encoder.u32(count);
+    for id in ids {
+        if *id == ObjectId::ZERO || ids.iter().filter(|candidate| **candidate == *id).count() != 1 {
+            return Err(corruption(
+                "JSON payload object edges contain a zero or duplicate object",
+            ));
+        }
+        encode_id(encoder, *id);
+    }
+    Ok(())
+}
+
+fn decode_object_id_list(
+    decoder: &mut Decoder<'_>,
+    claim: &str,
+) -> Result<Vec<ObjectId>, StorageError> {
+    let count = decoder.u32()? as usize;
+    if count > AUTHENTICATED_EDGE_PAGE_ENTRIES {
+        return Err(corruption(format!(
+            "{claim} exceeds authenticated edge bound"
+        )));
+    }
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = decode_id(decoder)?;
+        if id == ObjectId::ZERO || ids.contains(&id) {
+            return Err(corruption(format!(
+                "{claim} contains a zero or duplicate object"
+            )));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

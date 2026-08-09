@@ -17,5 +17,6 @@ pub(crate) use types::{
     CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
     commit_row_snapshot_json, decode_forktree_change_payload, decode_forktree_commit_payload,
     encode_forktree_change_payload, encode_forktree_commit_payload,
+    forktree_change_json_payload_ids,
 };
 pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};

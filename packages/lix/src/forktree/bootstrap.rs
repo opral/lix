@@ -221,6 +221,7 @@ where
         let change = ChangeObjectV1::Semantic {
             change_id: super::model::ChangeId::from_bytes(*row.change_id.as_uuid().as_bytes()),
             payload,
+            json_payload_object_ids: Vec::new(),
         };
         let (object_id, bytes) = change.encode().map_err(LixError::from)?;
         objects.insert(object_id, bytes).map_err(LixError::from)?;
@@ -468,6 +469,7 @@ fn branch_ref_change(
         after_semantic_head_commit_object_id: Some(commit_object_id),
         previous_ref_change_object_id: previous_ref,
         payload: Vec::new(),
+        json_payload_object_ids: Vec::new(),
     };
     let (object_id, bytes) = change.encode().map_err(LixError::from)?;
     Ok((change_id, object_id, bytes))

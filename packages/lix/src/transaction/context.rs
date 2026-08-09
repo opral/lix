@@ -7450,12 +7450,14 @@ where
                 .await?,
         );
         let records = load_change_records(&read, change_ids.into_iter()).await?;
+        let mut forktree_reader = ForkTreeReadFacade::new(read.clone());
         let mut payloads = materialize_known_change_payloads(
-            &read,
+            &mut forktree_reader,
             records.values().cloned(),
             ChangeRecordProjection::full(),
         )
         .await?;
+        drop(forktree_reader);
         drop(read);
         let branch_id = self.active_branch_id.clone();
         let mut identities = BTreeSet::new();
@@ -8099,7 +8101,6 @@ where
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
             forktree_reader: ForkTreeReadFacade::new(self.read_store.clone()),
         }
     }
