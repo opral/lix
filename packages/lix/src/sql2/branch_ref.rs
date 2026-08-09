@@ -60,6 +60,13 @@ impl BranchRefReader for PreparedBranchRefReader {
     async fn scan_head_metadata(&self) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
         self.inner.scan_head_metadata().await
     }
+
+    async fn load_head_metadata_batch(
+        &self,
+        branch_ids: &[String],
+    ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
+        self.inner.load_head_metadata_batch(branch_ids).await
+    }
 }
 
 #[cfg(test)]
