@@ -25,8 +25,8 @@ use super::object::OBJECT_SPACE;
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_retention_tree,
-    build_state_tree, empty_receipt_tree, insert_receipt_part, lookup, scan_all,
-    validate_branch_snapshot_ref_edge, validate_change_catalog_back_edge,
+    build_state_tree, empty_receipt_tree, insert_receipt_part, insert_receipt_part_on_read, lookup,
+    scan_all, validate_branch_snapshot_ref_edge, validate_change_catalog_back_edge,
     validate_commit_catalog_back_edge, validate_receipt_tree, validate_upload_progress_tree,
     validate_upload_selector_progress,
 };
@@ -1288,6 +1288,44 @@ struct SharedParentCountingRead<R> {
     member_object_reads: Arc<AtomicUsize>,
 }
 
+struct ObjectKeyCountingRead<R> {
+    inner: R,
+    object_keys: Arc<AtomicUsize>,
+}
+
+impl<R> StorageAdapterRead for ObjectKeyCountingRead<R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.inner.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        self.object_keys.fetch_add(
+            requests
+                .iter()
+                .filter(|request| request.space == OBJECT_SPACE)
+                .map(|request| request.keys.len())
+                .sum::<usize>(),
+            Ordering::Relaxed,
+        );
+        self.inner.get_many(requests)
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.inner.begin_scan(space, range, opts)
+    }
+}
+
 impl<R> StorageAdapterRead for SharedParentCountingRead<R>
 where
     R: StorageAdapterRead,
@@ -2519,6 +2557,102 @@ fn receipt_tree_is_path_copied_bounded_and_has_no_predecessor() {
         insert_receipt_part(root, duplicate_id, duplicate, load_from(&arena)).expect("duplicate");
     assert!(!duplicate_edit.inserted);
     assert!(duplicate_edit.objects.is_empty());
+}
+
+#[tokio::test]
+async fn retained_receipt_edit_loads_only_the_authenticated_target_path() {
+    const PARTS: u64 = 257;
+    const PAYLOAD: &[u8] = b"part";
+
+    let upload_id = CanonicalUploadId::new("bounded-path-load").expect("upload ID");
+    let initial = empty_receipt_tree().expect("empty receipt");
+    let mut arena = initial.objects;
+    let mut root = initial.root;
+    for part_number in 0..PARTS {
+        let (chunk, part) = make_part(
+            &upload_id,
+            part_number,
+            part_number * PAYLOAD.len() as u64,
+            PAYLOAD,
+        );
+        let (chunk_id, chunk_bytes) = chunk.encode().expect("chunk");
+        let (part_id, part_bytes) = part.encode().expect("part");
+        arena.insert(chunk_id, chunk_bytes).expect("chunk arena");
+        arena.insert(part_id, part_bytes).expect("part arena");
+        let edit =
+            insert_receipt_part(root, part_id, &part, load_from(&arena)).expect("receipt edit");
+        root = edit.root;
+        arena.extend(edit.objects).expect("receipt nodes");
+    }
+
+    let storage = Memory::new();
+    let mut writes = StorageWriteSet::new();
+    for (id, bytes) in arena.iter() {
+        writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(writes, &storage).await;
+
+    let (_, next_part) = make_part(&upload_id, PARTS, PARTS * PAYLOAD.len() as u64, PAYLOAD);
+    let (next_part_id, _) = next_part.encode().expect("next part");
+    let object_keys = Arc::new(AtomicUsize::new(0));
+    let read = ObjectKeyCountingRead {
+        inner: StorageAdapterReadScope::new(
+            storage
+                .begin_read(ReadOptions::default())
+                .await
+                .expect("retained receipt read"),
+        ),
+        object_keys: Arc::clone(&object_keys),
+    };
+    let edit = insert_receipt_part_on_read(
+        root,
+        next_part_id,
+        &next_part,
+        &read,
+        &ImmutableObjectSet::default(),
+    )
+    .await
+    .expect("bounded receipt edit");
+    assert!(edit.inserted);
+    let object_key_count = object_keys.load(Ordering::Relaxed);
+    eprintln!("receipt_path_object_keys={object_key_count}");
+    assert!(
+        object_key_count <= 3,
+        "retained receipt edit loaded {} objects instead of one bounded root-to-leaf path",
+        object_key_count,
+    );
+
+    let wrong_summary = ReceiptTreeRoot {
+        received_bytes: root.received_bytes + 1,
+        ..root
+    };
+    assert!(
+        insert_receipt_part_on_read(
+            wrong_summary,
+            next_part_id,
+            &next_part,
+            &read,
+            &ImmutableObjectSet::default(),
+        )
+        .await
+        .is_err(),
+        "retained receipt edit accepted a mismatched authenticated root summary",
+    );
+    assert!(
+        insert_receipt_part_on_read(
+            ReceiptTreeRoot {
+                object_id: ObjectId::from_bytes([0xfe; 32]),
+                ..root
+            },
+            next_part_id,
+            &next_part,
+            &read,
+            &ImmutableObjectSet::default(),
+        )
+        .await
+        .is_err(),
+        "retained receipt edit accepted a missing root object",
+    );
 }
 
 #[test]

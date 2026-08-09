@@ -1014,23 +1014,39 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let mut loaded = BTreeMap::<ObjectId, Bytes>::new();
-    let mut pending = vec![root.object_id];
-    while let Some(id) = pending.pop() {
-        if loaded.contains_key(&id) {
-            continue;
+    let key = part.part_number.to_be_bytes();
+    let mut current = root.object_id;
+    let mut expected = None::<NodeRef>;
+    loop {
+        if loaded.contains_key(&current) {
+            return Err(corruption("receipt edit path contains a cycle"));
         }
-        let bytes = match overlay.get(id) {
+        let bytes = match overlay.get(current) {
             Some(bytes) => bytes.clone(),
-            None => load_object_on_read(read, id).await?,
+            None => load_object_on_read(read, current).await?,
         };
-        let node = decode_node(id, &bytes)?;
-        if node.kind != TreeKind::Receipt {
-            return Err(corruption("receipt edit encountered a non-receipt node"));
+        let node = decode_node(current, &bytes)?;
+        validate_loaded_node(current, &node, TreeKind::Receipt, expected.as_ref())?;
+        if current == root.object_id && receipt_root(&node_ref(current, &node)) != root {
+            return Err(corruption(
+                "receipt edit root summary does not match its authenticated node",
+            ));
         }
-        if let NodeBody::Internal(children) = &node.body {
-            pending.extend(children.iter().map(|child| child.id));
-        }
-        loaded.insert(id, bytes);
+        let child = match &node.body {
+            NodeBody::Leaf(_) => None,
+            NodeBody::Internal(children) => Some(
+                children
+                    .get(child_index(children, &key))
+                    .cloned()
+                    .ok_or_else(|| corruption("receipt edit has no target child"))?,
+            ),
+        };
+        loaded.insert(current, bytes);
+        let Some(child) = child else {
+            break;
+        };
+        current = child.id;
+        expected = Some(child);
     }
     insert_receipt_part(root, part_object_id, part, |id| {
         loaded
