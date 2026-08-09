@@ -1363,23 +1363,6 @@ simulation_test!(
                 Value::Text("REQUIRED".to_string()),
             ]],
         );
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT is_nullable, lix_insert_policy \
-                     FROM information_schema.columns \
-                     WHERE table_name = 'lix_label_assignment' \
-                       AND column_name = 'target_file_id'",
-                    &[],
-                )
-                .await
-                .expect("built-in required nullable column should introspect"),
-            vec![vec![
-                Value::Text("YES".to_string()),
-                Value::Text("REQUIRED".to_string()),
-            ]],
-        );
-
         let omission_error = session
             .execute(
                 "INSERT INTO engine_required_nullable_contract (id) VALUES ('omitted')",

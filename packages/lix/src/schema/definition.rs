@@ -25,9 +25,6 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     if let Some(err) = detect_missing_pointer_slash(schema) {
         return Err(err);
     }
-    if let Some(err) = detect_state_foreign_key_tuple_shape(schema) {
-        return Err(err);
-    }
 
     let validator = lix_schema_validator()?;
     if let Err(errors) = validator.validate(schema) {
@@ -42,7 +39,6 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
 
     assert_primary_key_pointers(schema)?;
     assert_unique_pointers(schema)?;
-    assert_state_foreign_key_pointers(schema)?;
     assert_known_x_lix_top_level_fields(schema)?;
     assert_entity_properties_do_not_use_reserved_lix_prefix(schema)?;
     assert_entity_properties_have_projectable_types(schema)?;
@@ -134,8 +130,7 @@ fn collect_schema_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a s
 
 /// Detect the common no-leading-slash mistake in JSON-Pointer-valued fields
 /// (`x-lix-primary-key`, `x-lix-unique`, `x-lix-foreign-keys[].properties`,
-/// `x-lix-foreign-keys[].references.properties`,
-/// `x-lix-state-foreign-keys[]`) and return a targeted
+/// `x-lix-foreign-keys[].references.properties`) and return a targeted
 /// error + hint suggesting the fix.
 ///
 /// Surfacing this before the meta-schema validator runs replaces the
@@ -192,15 +187,6 @@ fn detect_missing_pointer_slash(schema: &JsonValue) -> Option<LixError> {
         }
     }
 
-    if let Some(fks) = schema
-        .get("x-lix-state-foreign-keys")
-        .and_then(JsonValue::as_array)
-    {
-        for fk in fks {
-            collect(fk.as_array(), "x-lix-state-foreign-keys", &mut offenders);
-        }
-    }
-
     if offenders.is_empty() {
         return None;
     }
@@ -227,26 +213,6 @@ fn detect_missing_pointer_slash(schema: &JsonValue) -> Option<LixError> {
         }
         .with_hint(hint),
     )
-}
-
-fn detect_state_foreign_key_tuple_shape(schema: &JsonValue) -> Option<LixError> {
-    let foreign_keys = schema
-        .get("x-lix-state-foreign-keys")
-        .and_then(JsonValue::as_array)?;
-    for (index, foreign_key) in foreign_keys.iter().enumerate() {
-        let Some(local_pointers) = foreign_key.as_array() else {
-            continue;
-        };
-        if local_pointers.len() != 3 {
-            return Some(LixError::new(
-                LixError::CODE_SCHEMA_DEFINITION,
-                format!(
-                    "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_pk, schema_key, file_id]; [0] entity_pk, [1] schema_key, [2] file_id."
-                ),
-            ));
-        }
-    }
-    None
 }
 
 pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), LixError> {
@@ -408,72 +374,6 @@ fn assert_unique_pointers(schema: &JsonValue) -> Result<(), LixError> {
     Ok(())
 }
 
-fn assert_state_foreign_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
-    let Some(foreign_keys) = schema
-        .get("x-lix-state-foreign-keys")
-        .and_then(|value| value.as_array())
-    else {
-        return Ok(());
-    };
-
-    for (index, foreign_key) in foreign_keys.iter().enumerate() {
-        let Some(local_pointers) = foreign_key.as_array() else {
-            continue;
-        };
-        if local_pointers.len() != 3 {
-            continue;
-        }
-
-        let roles = [
-            ("entity_pk", "a non-empty JSON array of strings"),
-            ("schema_key", "a string"),
-            ("file_id", "a string or null"),
-        ];
-        for (slot, (role, expected)) in roles.iter().enumerate() {
-            let Some(pointer) = local_pointers[slot].as_str() else {
-                continue;
-            };
-            let segments = parse_json_pointer(pointer)?;
-            let Some(property_schema) = (!segments.is_empty())
-                .then(|| schema_property(schema, &segments))
-                .flatten()
-            else {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) references missing property \"{pointer}\"."
-                    ),
-                ));
-            };
-            if !schema_pointer_is_required(schema, &segments) {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be required. Tuple order is [entity_pk, schema_key, file_id]."
-                    ),
-                ));
-            }
-
-            let valid = match *role {
-                "entity_pk" => schema_property_is_string_array(property_schema),
-                "schema_key" => schema_property_is_string_only(property_schema),
-                "file_id" => schema_property_is_string_or_null(property_schema),
-                _ => unreachable!("state foreign key roles are exhaustive"),
-            };
-            if !valid {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be {expected}. Tuple order is [entity_pk, schema_key, file_id]."
-                    ),
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixError> {
     let Some(object) = schema.as_object() else {
         return Ok(());
@@ -486,11 +386,7 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
 
         let known = matches!(
             key.as_str(),
-            "x-lix-key"
-                | "x-lix-primary-key"
-                | "x-lix-unique"
-                | "x-lix-foreign-keys"
-                | "x-lix-state-foreign-keys"
+            "x-lix-key" | "x-lix-primary-key" | "x-lix-unique" | "x-lix-foreign-keys"
         );
 
         if !known {
@@ -551,37 +447,6 @@ fn schema_property<'a>(schema: &'a JsonValue, segments: &[String]) -> Option<&'a
         node = next;
     }
     Some(node)
-}
-
-fn schema_property_is_string_only(schema: &JsonValue) -> bool {
-    let mut kinds = BTreeSet::new();
-    collect_schema_type_kinds(schema, &mut kinds);
-    kinds.len() == 1 && kinds.contains("string")
-}
-
-fn schema_property_is_string_or_null(schema: &JsonValue) -> bool {
-    let mut kinds = BTreeSet::new();
-    collect_schema_type_kinds(schema, &mut kinds);
-    kinds.remove("null");
-    kinds.len() == 1 && kinds.contains("string")
-}
-
-fn schema_property_is_string_array(schema: &JsonValue) -> bool {
-    let mut kinds = BTreeSet::new();
-    collect_schema_type_kinds(schema, &mut kinds);
-    if kinds.len() != 1 || !kinds.contains("array") {
-        return false;
-    }
-    let Some(items) = schema.get("items") else {
-        return false;
-    };
-    if !schema_property_is_string_only(items) {
-        return false;
-    }
-    schema
-        .get("minItems")
-        .and_then(JsonValue::as_u64)
-        .is_some_and(|min_items| min_items >= 1)
 }
 
 pub(crate) fn format_lix_schema_validation_errors<'a>(

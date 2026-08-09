@@ -243,14 +243,6 @@ impl DomainRowIdentity {
         )
     }
 
-    pub(crate) fn with_domain(&self, domain: Domain) -> Self {
-        Self {
-            domain,
-            schema_key: self.schema_key.clone(),
-            entity_pk: self.entity_pk.clone(),
-        }
-    }
-
     pub(crate) fn domain(&self) -> &Domain {
         &self.domain
     }
@@ -269,28 +261,6 @@ impl DomainRowIdentity {
 
     pub(crate) fn entity_pk_owned(&self) -> EntityPk {
         self.entity_pk.clone()
-    }
-
-    pub(crate) fn matches_live_row_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
-        self.domain.contains_ref(row)
-            && self.schema_key == row.schema_key()
-            && &self.entity_pk == row.entity_pk()
-    }
-
-    pub(crate) fn reachable_target_identities(&self) -> Vec<Self> {
-        self.domain
-            .fk_target_domains()
-            .into_iter()
-            .map(|domain| self.with_domain(domain))
-            .collect()
-    }
-
-    pub(crate) fn source_identities_that_can_reach(&self) -> Vec<Self> {
-        self.domain
-            .fk_source_domains_for_target()
-            .into_iter()
-            .map(|domain| self.with_domain(domain))
-            .collect()
     }
 }
 
