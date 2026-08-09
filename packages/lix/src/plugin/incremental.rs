@@ -22,12 +22,12 @@ use crate::live_state::MaterializedLiveStateBatch;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
-    WasmChangeDrainValidator, WasmChangePage, WasmComponentActor, WasmConflictResolution,
-    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
-    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
-    WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
-    WasmEntityConflictSource, WasmEntityKey, WasmEntityPage, WasmEntitySource,
-    WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
+    WasmChangeDrainValidator, WasmChangeEffect, WasmChangePage, WasmComponentActor,
+    WasmConflictResolution, WasmConflictResolutionDrainValidator, WasmConflictResolutionPage,
+    WasmConflictTransition, WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity,
+    WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict,
+    WasmEntityConflictPage, WasmEntityConflictSource, WasmEntityKey, WasmEntityPage,
+    WasmEntitySource, WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
     WasmHostConflictResolution, WasmHostEntity, WasmHostEntityChanges, WasmInputBytes,
     WasmInputSplice, WasmOutputRange, WasmSourceRange, WasmTransitionCounters,
     WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
@@ -2341,6 +2341,133 @@ fn json_pointer_components_optional(
 struct CertifiedPacketReader<'a> {
     bytes: &'a [u8],
     offset: usize,
+}
+
+/// Materializes the host-validated certified packet that the component uses
+/// for a complete file transition. The packet is the authenticated owner of
+/// these rows; keeping the decode here lets transaction staging feed the same
+/// change validator as ordinary component output without introducing a second
+/// state reader or a raw storage path.
+pub(crate) fn materialize_certified_entity_batch(
+    batch: &WasmCertifiedEntityBatch,
+    schemas: &SchemaAllowlist,
+) -> Result<WasmHostEntityChanges, LixError> {
+    // Host-synthesized dense packets retain their ordinary validated changes;
+    // decoding them here would duplicate every row. Only the component-owned
+    // certified packet format needs transaction materialization.
+    if batch.format != 2 {
+        return Ok(WasmHostEntityChanges::default());
+    }
+
+    let mut changes = Vec::new();
+    for page in &batch.pages {
+        let mut page = CertifiedPacketReader::new(page);
+        while !page.finished() {
+            let record_len = page.u32()? as usize;
+            let record_bytes = page.bytes(record_len)?;
+            let mut record = CertifiedPacketReader::new(record_bytes);
+            let tag = record.u8()?;
+            let schema_key = record.text()?.to_owned();
+            let plan = schemas.schema_plan(&schema_key).ok_or_else(|| {
+                invalid_guest(format!(
+                    "certified batch schema '{schema_key}' has no validation plan"
+                ))
+            })?;
+            let change = match tag {
+                0 => {
+                    let component_count = record.u32()? as usize;
+                    if component_count == 0 {
+                        return Err(invalid_guest(
+                            "certified packet upsert key has no components",
+                        ));
+                    }
+                    let entity_pk = (0..component_count)
+                        .map(|_| record.text().map(str::to_owned))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let effect = match record.u8()? {
+                        0 => WasmChangeEffect::Content,
+                        1 => WasmChangeEffect::FormatOnly,
+                        _ => {
+                            return Err(invalid_guest(
+                                "certified packet upsert has invalid effect",
+                            ));
+                        }
+                    };
+                    let snapshot_content =
+                        certified_snapshot_content(plan, &entity_pk, record.inline_blob()?)?;
+                    WasmEntityChange::Upsert {
+                        entity: WasmEntity {
+                            key: WasmEntityKey::from_owned_parts(schema_key, entity_pk),
+                            snapshot_content,
+                        },
+                        effect,
+                    }
+                }
+                2 => {
+                    let local_ref = record.u64()?;
+                    let entity_pk = vec![batch.creates.component(local_ref)?];
+                    let resolved_key =
+                        WasmEntityKey::from_owned_parts(schema_key.clone(), entity_pk.clone());
+                    let snapshot_content =
+                        certified_snapshot_content(plan, &entity_pk, record.inline_blob()?)?;
+                    WasmEntityChange::Create {
+                        schema_key,
+                        local_ref,
+                        resolved_key: Some(resolved_key),
+                        snapshot_content,
+                    }
+                }
+                _ => {
+                    return Err(invalid_guest(
+                        "certified snapshot packet contains a non-snapshot change",
+                    ));
+                }
+            };
+            record.finish()?;
+            changes.push(change);
+        }
+    }
+    let row_count = u64::try_from(changes.len())
+        .map_err(|_| invalid_guest("certified packet row count overflowed"))?;
+    if row_count != batch.row_count {
+        return Err(invalid_guest(format!(
+            "certified batch declared {} rows but materialized {row_count}",
+            batch.row_count
+        )));
+    }
+    let changes = WasmHostEntityChanges { changes };
+    changes.validate()?;
+    Ok(changes)
+}
+
+fn certified_snapshot_content(
+    plan: &SchemaPlan,
+    entity_pk: &[String],
+    snapshot: &[u8],
+) -> Result<WasmHostBytes, LixError> {
+    let component_types = plan
+        .primary_key_component_types
+        .as_deref()
+        .ok_or_else(|| invalid_guest("certified snapshot schema has no typed primary key"))?;
+    let entity_pk = EntityPk::from_external_parts(entity_pk.to_vec(), component_types)
+        .map_err(|error| invalid_guest(format!("certified entity key is invalid: {error}")))?;
+    let normalized = SharedStr::from_utf8(Bytes::copy_from_slice(snapshot))
+        .map_err(|_| invalid_guest("certified snapshot is not UTF-8"))?;
+    let mut rows = WasmCanonicalJson::from_certified_batch_parts(
+        vec![normalized],
+        vec![entity_pk],
+        vec![plan.shared_fingerprint()],
+        vec![0],
+        0,
+    )
+    .map_err(|error| {
+        invalid_guest(format!(
+            "certified snapshot could not be materialized: {error}"
+        ))
+    })?;
+    Ok(WasmHostBytes::CanonicalJson(
+        rows.pop().expect("one certified snapshot row"),
+    ))
 }
 
 impl<'a> CertifiedPacketReader<'a> {

@@ -36,7 +36,8 @@ pub(crate) use incremental::{
     canonicalize_snapshot, certify_dense_fresh_file, drain_conflict_transition_resolutions,
     drain_entity_transition_edits, drain_file_transition_changes,
     host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
-    transport_splice_preserves_prefix_exclusion, transport_splice_preserves_utf8,
+    materialize_certified_entity_batch, transport_splice_preserves_prefix_exclusion,
+    transport_splice_preserves_utf8,
 };
 pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
 pub(crate) use manifest::{

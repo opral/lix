@@ -480,6 +480,12 @@ fn decode_visible_materialization_parts(
                             format!("invalid durable plugin checkpoint runtime: {error}"),
                         )
                     })?;
+                let runtime = WasmDurableDocumentCheckpoint::decode(&runtime).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("invalid durable plugin checkpoint envelope: {error}"),
+                    )
+                })?;
                 let authority = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(checkpoint.authority)
                     .map_err(|error| {
@@ -4679,6 +4685,15 @@ where
                     .map(|batch| batch.row_count)
                     .sum::<u64>();
                 let mut changes = validated.changes;
+                let schemas = SchemaAllowlist::from_catalog(
+                    pending.selected.schema_keys(),
+                    Arc::clone(&self.sql_schema_snapshot),
+                )?;
+                append_certified_entity_changes(
+                    &mut changes,
+                    &validated.certified_batches,
+                    &schemas,
+                )?;
                 let create_rows = self
                     .v2_create_rows(
                         &pending.selected,
@@ -5263,6 +5278,11 @@ where
                                 .sum::<u64>();
                             write.set_certified_entity_batches(validated.certified_batches);
                             let mut changes = validated.changes;
+                            append_certified_entity_changes(
+                                &mut changes,
+                                write.certified_entity_batches(),
+                                &schemas,
+                            )?;
                             let (filtered, observed_existing_authorities) = self
                                 .suppress_format_only_noops(selected, changes, &file_key)
                                 .await?;
@@ -5505,6 +5525,11 @@ where
                             return Err(lease.handle_guest_call_error(error));
                         }
                     };
+                    append_certified_entity_changes(
+                        &mut changes,
+                        &detected_transition.certified_batches,
+                        &schemas,
+                    )?;
                     let create_rows = match self
                         .v2_create_rows(
                             selected,
@@ -5710,6 +5735,11 @@ where
                     .map(|batch| batch.row_count)
                     .sum::<u64>();
                 let mut changes = validated.changes;
+                append_certified_entity_changes(
+                    &mut changes,
+                    &validated.certified_batches,
+                    &schemas,
+                )?;
                 let create_rows = self
                     .v2_create_rows(
                         selected,
@@ -10201,6 +10231,19 @@ fn append_plugin_change_rows(
         );
     }
     Ok(())
+}
+
+fn append_certified_entity_changes(
+    changes: &mut WasmHostEntityChanges,
+    batches: &[WasmCertifiedEntityBatch],
+    schemas: &crate::plugin::SchemaAllowlist,
+) -> Result<(), LixError> {
+    for batch in batches {
+        changes
+            .changes
+            .extend(crate::plugin::materialize_certified_entity_batch(batch, schemas)?.changes);
+    }
+    changes.validate()
 }
 
 fn plugin_entity_pk(
