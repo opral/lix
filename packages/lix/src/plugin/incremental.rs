@@ -313,8 +313,10 @@ pub(crate) fn build_file_update_splices(
     limits.validate()?;
     let before_sha256 = before_sha256.into();
     let verified_transport = provenance.and_then(|provenance| {
-        let provenance_base = FileBytesSha256::from_lower_hex(provenance.base_sha256())?;
-        let provenance_result = FileBytesSha256::from_lower_hex(provenance.result_sha256())?;
+        let provenance_base =
+            FileBytesSha256::from_lower_hex(provenance.transport_base_digest_hex())?;
+        let provenance_result =
+            FileBytesSha256::from_lower_hex(provenance.transport_result_digest_hex())?;
         let before_sha256 = before_sha256.unwrap_or_else(|| FileBytesSha256::compute(before));
         (provenance_base == before_sha256
             && provenance.matches_result(after)

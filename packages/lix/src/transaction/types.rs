@@ -1798,6 +1798,16 @@ impl FileContent {
         Self::Inline(BlobPayload::from_bytes(data))
     }
 
+    pub(crate) fn inline_with_canonical_id(
+        data: impl Into<crate::Blob>,
+        canonical_id: BlobId,
+    ) -> Self {
+        Self::Inline(BlobPayload::from_bytes_with_canonical_id(
+            data,
+            canonical_id,
+        ))
+    }
+
     pub(crate) fn blob_id(&self) -> Option<BlobId> {
         match self {
             Self::Inline(payload) => payload.hash(),
@@ -5641,8 +5651,8 @@ mod tests {
 
     #[test]
     fn verified_same_length_splice_requires_the_visible_blob_base() {
-        let base = BlobId::from_content(b"before");
-        let wrong_base = BlobId::from_content(b"other!");
+        let base = BlobId::from_canonical_content(b"before");
+        let wrong_base = BlobId::from_canonical_content(b"other!");
         let mut write = TransactionFileContent::new(
             "file".to_string(),
             None,
@@ -5670,8 +5680,8 @@ mod tests {
 
     #[test]
     fn verified_edit_splice_is_format_neutral_and_cleared_by_rematerialization() {
-        let base = BlobId::from_content(b"before");
-        let wrong_base = BlobId::from_content(b"other!");
+        let base = BlobId::from_canonical_content(b"before");
+        let wrong_base = BlobId::from_canonical_content(b"other!");
         let mut write = TransactionFileContent::new(
             "file".to_string(),
             None,

@@ -901,7 +901,7 @@ where
                     "visible upload target BlobRef identity is absent",
                 )
             })?;
-        let expected = BlobId::from_content(content).to_hex();
+        let expected = BlobId::from_canonical_content(content).to_hex();
         if byte_offset == 0
             && total_size == content.len() as u64
             && declared_size == total_size
@@ -1724,6 +1724,7 @@ where
             runtime_functions.deterministic_sequence_checkpoint(),
             read.clone(),
             prepared_writes,
+            transaction.pending_forktree_publication.take(),
         )
         .instrument(tracing::debug_span!(
             target: "lix_perf",
@@ -1738,20 +1739,6 @@ where
                     .await;
                 return Err(error);
             }
-        };
-        let prepared_forktree_plan = match (
-            prepared_forktree_plan,
-            transaction.pending_forktree_publication.take(),
-        ) {
-            (commit::PreparedForkTreePlan::Noop, None) => commit::PreparedForkTreePlan::Noop,
-            (commit::PreparedForkTreePlan::Noop, Some(publication)) => {
-                commit::PreparedForkTreePlan::Publication(publication)
-            }
-            (commit::PreparedForkTreePlan::Publication(mut publication), Some(upload)) => {
-                publication.merge_from(upload)?;
-                commit::PreparedForkTreePlan::Publication(publication)
-            }
-            (publication, None) => publication,
         };
         // ForkTree never commits independently. Its authenticated objects,
         // selectors, untracked rows, and exact CAS fences are lowered once
@@ -3026,7 +3013,7 @@ where
                     BlobRefRowInput {
                         file_id: file_key.file_id.clone(),
                         blob_hash: payload.blob_hash().unwrap_or_else(|| {
-                            BlobId::from_content(
+                            BlobId::from_canonical_content(
                                 payload
                                     .inline_data()
                                     .expect("plugin materializations require inline file content"),
@@ -3118,7 +3105,7 @@ where
                     BlobRefRowInput {
                         file_id: file_key.file_id.clone(),
                         blob_hash: payload.blob_hash().unwrap_or_else(|| {
-                            BlobId::from_content(
+                            BlobId::from_canonical_content(
                                 payload
                                     .inline_data()
                                     .expect("plugin materializations require inline file content"),
@@ -4119,7 +4106,7 @@ where
                     Some(PluginContentMatcher::Text) => {
                         write.splice_provenance().is_some_and(|provenance| {
                             observation.bytes_sha256().is_some_and(|digest| {
-                                digest.matches_lower_hex(provenance.base_sha256())
+                                digest.matches_lower_hex(provenance.transport_base_digest_hex())
                             }) && transport_splice_preserves_utf8(write_data, provenance)
                         })
                     }
@@ -4128,7 +4115,7 @@ where
                         bytes: scan_bytes,
                     }) => write.splice_provenance().is_some_and(|provenance| {
                         observation.bytes_sha256().is_some_and(|digest| {
-                            digest.matches_lower_hex(provenance.base_sha256())
+                            digest.matches_lower_hex(provenance.transport_base_digest_hex())
                         }) && transport_splice_preserves_prefix_exclusion(
                             write_data, provenance, byte, scan_bytes,
                         )
@@ -4329,7 +4316,7 @@ where
             if let Some((installed_hash, bytes)) =
                 current_install_plugin_wasm.get(&(key.branch_id.clone(), entry.key().to_owned()))
             {
-                if *installed_hash != hash || BlobId::from_content(bytes) != hash {
+                if *installed_hash != hash || BlobId::from_canonical_content(bytes) != hash {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
@@ -8186,7 +8173,7 @@ where
             .transpose()?
             .flatten();
         if let Some(bytes) = staged {
-            if BlobId::from_content(&bytes) != *expected {
+            if BlobId::from_canonical_content(&bytes) != *expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "staged plugin payload does not match its authenticated BlobRef identity",
@@ -8197,7 +8184,7 @@ where
             && let Some((actual, bytes)) =
                 pending_plugin_wasm_by_owner.get(&(branch_id.to_owned(), file_id.to_owned()))
         {
-            if *actual != *expected || BlobId::from_content(bytes) != *expected {
+            if *actual != *expected || BlobId::from_canonical_content(bytes) != *expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "staged plugin payload owner does not match its authenticated BlobRef identity",
@@ -8228,7 +8215,7 @@ where
                     "authenticated plugin BlobRef owner has no payload",
                 )
             })?;
-            if BlobId::from_content(&bytes) != expected {
+            if BlobId::from_canonical_content(&bytes) != expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "authenticated plugin BlobRef payload identity does not match the requested owner",

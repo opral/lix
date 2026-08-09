@@ -4048,7 +4048,7 @@ mod tests {
             snapshot_content: Some(
                 json!({
                     "id": entity_pk,
-                    "blob_hash": crate::binary_cas::BlobId::from_content(bytes).to_hex(),
+                    "blob_hash": crate::binary_cas::BlobId::from_canonical_content(bytes).to_hex(),
                     "size_bytes": bytes.len()
                 })
                 .to_string()
@@ -5859,7 +5859,7 @@ mod tests {
         assert_eq!(blob_ref["size_bytes"], 3);
         assert_eq!(
             blob_ref["blob_hash"],
-            crate::binary_cas::BlobId::from_content(b"new").to_hex()
+            crate::binary_cas::BlobId::from_canonical_content(b"new").to_hex()
         );
     }
 
@@ -7129,7 +7129,7 @@ mod tests {
         assert_eq!(snapshot["size_bytes"], 3);
         assert_eq!(
             snapshot["blob_hash"],
-            crate::binary_cas::BlobId::from_content(b"new").to_hex()
+            crate::binary_cas::BlobId::from_canonical_content(b"new").to_hex()
         );
     }
 

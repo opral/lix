@@ -1,8 +1,6 @@
 use crate::LixError;
 use std::ops::Range;
 
-const MEDIA_CHUNK_BYTES: usize = 1024 * 1024;
-
 fn hash_bytes_to_hex(bytes: &[u8; 32]) -> String {
     let mut encoded = String::with_capacity(64);
     for byte in bytes {
@@ -43,33 +41,12 @@ impl BlobId {
         Self(bytes)
     }
 
-    pub(crate) fn from_content(content: &[u8]) -> Self {
-        if content.len() <= MEDIA_CHUNK_BYTES {
-            return Self::from_single_chunk(ChunkHash::from_content(content));
-        }
-        let chunks = content
-            .chunks(MEDIA_CHUNK_BYTES)
-            .map(|chunk| (ChunkHash::from_content(chunk), chunk.len() as u64));
-        Self::from_chunks(content.len() as u64, chunks)
-    }
-
-    pub(crate) fn from_single_chunk(chunk_hash: ChunkHash) -> Self {
-        Self(chunk_hash.into_bytes())
-    }
-
-    /// Computes the canonical identity of a fixed-chunk blob without opening
-    /// its payload. Upload recovery persists precisely these bounded receipts.
-    pub(crate) fn from_chunks(
-        size_bytes: u64,
-        chunks: impl IntoIterator<Item = (ChunkHash, u64)>,
-    ) -> Self {
-        let mut hasher = blake3::Hasher::new_derive_key("lix binary cas fixed manifest v3");
-        hasher.update(&size_bytes.to_le_bytes());
-        for (hash, size) in chunks {
-            hasher.update(&size.to_le_bytes());
-            hasher.update(hash.as_bytes());
-        }
-        Self(*hasher.finalize().as_bytes())
+    /// Derives the sole semantic identity from the canonical authenticated
+    /// Merkle layout. This name deliberately excludes the retired flat/fixed
+    /// manifest constructor contract.
+    pub(crate) fn from_canonical_content(content: &[u8]) -> Self {
+        crate::forktree::canonical_blob_id_for_content(content)
+            .expect("in-memory content has canonical Merkle geometry")
     }
 
     pub(crate) fn from_hex(hash_hex: &str) -> Result<Self, LixError> {
@@ -89,26 +66,6 @@ impl BlobId {
     }
 }
 
-fn blob_identity_and_content_digest(content: &[u8]) -> (BlobId, [u8; 32]) {
-    let mut content_digest = blake3::Hasher::new();
-    let mut chunks = Vec::with_capacity(content.len().div_ceil(MEDIA_CHUNK_BYTES));
-    for chunk in content.chunks(MEDIA_CHUNK_BYTES) {
-        content_digest.update(chunk);
-        chunks.push((ChunkHash::from_content(chunk), chunk.len() as u64));
-    }
-    let blob_id = if content.len() <= MEDIA_CHUNK_BYTES {
-        BlobId::from_single_chunk(
-            chunks
-                .first()
-                .map(|(hash, _)| *hash)
-                .expect("non-empty blob has one canonical chunk"),
-        )
-    } else {
-        BlobId::from_chunks(content.len() as u64, chunks)
-    };
-    (blob_id, *content_digest.finalize().as_bytes())
-}
-
 /// The raw content hash of one immutable CAS chunk.
 ///
 /// A `ChunkHash` can equal a small blob's `BlobId` byte-for-byte, but it is
@@ -120,14 +77,6 @@ pub(crate) struct ChunkHash([u8; 32]);
 impl ChunkHash {
     pub(crate) fn from_content(content: &[u8]) -> Self {
         Self(binary_blob_hash_bytes(content))
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    pub(crate) fn into_bytes(self) -> [u8; 32] {
-        self.0
     }
 }
 
@@ -171,22 +120,23 @@ impl BlobSameLengthSplice {
 pub(crate) struct BlobPayload {
     bytes: crate::Blob,
     hash: Option<BlobId>,
-    content_digest: Option<[u8; 32]>,
 }
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        let (hash, content_digest) = if bytes.is_empty() {
-            (None, None)
-        } else {
-            let (hash, content_digest) = blob_identity_and_content_digest(&bytes);
-            (Some(hash), Some(content_digest))
-        };
+        let hash = (!bytes.is_empty()).then(|| BlobId::from_canonical_content(&bytes));
+        Self { bytes, hash }
+    }
+
+    pub(crate) fn from_bytes_with_canonical_id(
+        bytes: impl Into<crate::Blob>,
+        canonical_id: BlobId,
+    ) -> Self {
+        let bytes = bytes.into();
         Self {
             bytes,
-            hash,
-            content_digest,
+            hash: Some(canonical_id),
         }
     }
 
@@ -200,10 +150,6 @@ impl BlobPayload {
 
     pub(crate) fn hash(&self) -> Option<BlobId> {
         self.hash
-    }
-
-    pub(crate) fn content_digest(&self) -> Option<[u8; 32]> {
-        self.content_digest
     }
 
     pub(crate) fn len(&self) -> usize {

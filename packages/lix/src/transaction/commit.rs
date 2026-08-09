@@ -7,6 +7,7 @@
 //! joins the resulting writes and exact preconditions to the existing single
 //! backend commit.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
@@ -47,6 +48,22 @@ fn stage_forktree_json_slot(
     }
     let object_id = publication
         .stage_json_payload(value.normalized())
+        .map_err(LixError::from)?;
+    Ok(JsonSlot::ForkTreeObject(*object_id.as_bytes()))
+}
+
+fn stage_forktree_json_text(
+    publication: &mut PreparedPublication,
+    value: Option<&str>,
+) -> Result<JsonSlot, LixError> {
+    let Some(value) = value else {
+        return Ok(JsonSlot::None);
+    };
+    if value.len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
+        return Ok(JsonSlot::Inline(value.into()));
+    }
+    let object_id = publication
+        .stage_json_payload(value)
         .map_err(LixError::from)?;
     Ok(JsonSlot::ForkTreeObject(*object_id.as_bytes()))
 }
@@ -189,6 +206,7 @@ pub(crate) async fn prepare_forktree_publication_with_parent_heads<R>(
     runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
     read: R,
     prepared_writes: PreparedWriteSet,
+    pending_publication: Option<PreparedPublication>,
 ) -> Result<PreparedForkTreePlan, LixError>
 where
     R: StorageAdapterRead + Clone,
@@ -199,11 +217,17 @@ where
         semantic_commit,
     } = intent
     else {
-        return Ok(PreparedForkTreePlan::Noop);
+        return Ok(match pending_publication {
+            Some(publication) => PreparedForkTreePlan::Publication(publication),
+            None => PreparedForkTreePlan::Noop,
+        });
     };
     let branch_id = sole_publication_branch(&prepared_writes, runtime_checkpoint.is_some())?;
     let view = open_coherent_view_on_read(read, publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
+    if let Some(pending) = pending_publication {
+        publication.merge_from(pending)?;
+    }
     let prepared_blob_manifests =
         prepared_blob_manifest_ids(&mut publication, &view, &prepared_writes).await?;
     let branch_ref_intents = prepared_writes.branch_ref_intents.clone();
@@ -242,14 +266,15 @@ where
         } else {
             publication_branch_id
         };
-        if let Some(snapshot) = row.snapshot {
+        let canonical_snapshot = canonical_snapshot_for_row(row, &prepared_blob_manifests)?;
+        if let Some(snapshot) = canonical_snapshot.as_deref() {
             publication.put_untracked_row(
                 untracked_owner,
                 key,
                 UntrackedValueRef {
                     created_at: row.created_at,
                     updated_at: row.updated_at,
-                    cell: StateCellRef::Value(snapshot.normalized()),
+                    cell: StateCellRef::Value(snapshot),
                     metadata: row.metadata.map(|value| value.normalized()),
                     origin_key: row.origin_key.map(|value| value.as_str()),
                     blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
@@ -393,7 +418,8 @@ where
             entity_pk: row.entity_pk,
         });
         let previous = state_point(&view, &key, true).await?;
-        let snapshot = stage_forktree_json_slot(&mut publication, row.snapshot)?;
+        let canonical_snapshot = canonical_snapshot_for_row(row, &prepared_blob_manifests)?;
+        let snapshot = stage_forktree_json_text(&mut publication, canonical_snapshot.as_deref())?;
         let metadata = stage_forktree_json_slot(&mut publication, row.metadata)?;
         let json_payload_object_ids = json_payload_object_ids(&snapshot, &metadata)?;
         let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
@@ -417,8 +443,8 @@ where
         let mutation = if global && row.snapshot.is_none() {
             StateTreeMutation::remove(key)
         } else {
-            let cell = match row.snapshot {
-                Some(value) => StateCellRef::Value(value.normalized()),
+            let cell = match canonical_snapshot.as_deref() {
+                Some(value) => StateCellRef::Value(value),
                 None => StateCellRef::Tombstone,
             };
             let encoded = encode_state_value(StateValueRef {
@@ -762,7 +788,7 @@ async fn prepare_ordered_single_branch_history<R>(
     view: &crate::forktree::CoherentView<R>,
     mut publication: PreparedPublication,
     prepared: PreparedWriteSet,
-    prepared_blob_manifests: BTreeMap<(String, String, bool, bool), ObjectId>,
+    prepared_blob_manifests: PreparedBlobManifestMap,
 ) -> Result<PreparedForkTreePlan, LixError>
 where
     R: StorageAdapterRead + Clone,
@@ -926,7 +952,9 @@ where
                     "ordered history repeats one logical state identity",
                 ));
             }
-            let snapshot = stage_forktree_json_slot(&mut publication, row.snapshot)?;
+            let canonical_snapshot = canonical_snapshot_for_row(row, &prepared_blob_manifests)?;
+            let snapshot =
+                stage_forktree_json_text(&mut publication, canonical_snapshot.as_deref())?;
             let metadata = stage_forktree_json_slot(&mut publication, row.metadata)?;
             let json_payload_object_ids = json_payload_object_ids(&snapshot, &metadata)?;
             let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
@@ -966,9 +994,9 @@ where
                     commit_id: draft.commit_id,
                     created_at: row.created_at,
                     updated_at: row.updated_at,
-                    cell: row.snapshot.map_or(StateCellRef::Tombstone, |value| {
-                        StateCellRef::Value(value.normalized())
-                    }),
+                    cell: canonical_snapshot
+                        .as_deref()
+                        .map_or(StateCellRef::Tombstone, StateCellRef::Value),
                     metadata: row.metadata.map(|value| value.normalized()),
                     origin_key: row.origin_key.map(|value| value.as_str()),
                     blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
@@ -1419,7 +1447,14 @@ fn classify_publication_intent(
     })
 }
 
-type PreparedBlobManifestMap = BTreeMap<(String, String, bool, bool), ObjectId>;
+#[derive(Clone, Copy)]
+struct PreparedBlobManifest {
+    object_id: ObjectId,
+    canonical_blob_id: crate::binary_cas::BlobId,
+    logical_bytes: u64,
+}
+
+type PreparedBlobManifestMap = BTreeMap<(String, String, bool, bool), PreparedBlobManifest>;
 
 async fn prepared_blob_manifest_ids<R>(
     publication: &mut PreparedPublication,
@@ -1489,14 +1524,26 @@ where
                 "file payload has a zero ForkTree manifest identity",
             ));
         }
+        let manifest_value = match publication.staged_blob_manifest(manifest)? {
+            Some(value) => value,
+            None => {
+                let bytes = view.load_object_bytes(manifest).await?;
+                crate::forktree::BlobManifestV1::decode(manifest, &bytes)?
+            }
+        };
+        let prepared_manifest = PreparedBlobManifest {
+            object_id: manifest,
+            canonical_blob_id: manifest_value.canonical_blob_id,
+            logical_bytes: manifest_value.logical_bytes,
+        };
         let key = (
             write.branch_id.clone(),
             write.file_id.clone(),
             write.global,
             write.untracked,
         );
-        if let Some(previous) = manifests.insert(key.clone(), manifest)
-            && previous != manifest
+        if let Some(previous) = manifests.insert(key.clone(), prepared_manifest)
+            && previous.object_id != manifest
         {
             return Err(writer_error(
                 "one file scope has conflicting ForkTree manifest identities",
@@ -1528,7 +1575,51 @@ fn blob_manifest_object_ids_for_row(
     let manifest = manifests.get(&key).copied().ok_or_else(|| {
         writer_error("blob-ref state row has no matching prepared ForkTree manifest")
     })?;
-    Ok(vec![manifest])
+    Ok(vec![manifest.object_id])
+}
+
+fn canonical_snapshot_for_row<'a>(
+    row: PreparedStateRowRef<'a>,
+    manifests: &PreparedBlobManifestMap,
+) -> Result<Option<Cow<'a, str>>, LixError> {
+    let Some(snapshot) = row.snapshot else {
+        return Ok(None);
+    };
+    if row.schema_key.as_str() != "lix_binary_blob_ref" {
+        return Ok(Some(Cow::Borrowed(snapshot.normalized())));
+    }
+    let file_id = row
+        .file_id
+        .ok_or_else(|| writer_error("blob-ref state row has no file identity"))?;
+    let key = (
+        row.branch_id.to_string(),
+        file_id.to_string(),
+        row.global,
+        row.untracked,
+    );
+    let manifest = manifests.get(&key).copied().ok_or_else(|| {
+        writer_error("blob-ref state row has no matching prepared ForkTree manifest")
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(snapshot.normalized())
+        .map_err(|error| writer_error(format!("blob-ref state row JSON is malformed: {error}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| writer_error("blob-ref state row JSON is not an object"))?;
+    if object.get("id").and_then(serde_json::Value::as_str) != Some(file_id.as_str())
+        || object.get("size_bytes").and_then(serde_json::Value::as_u64)
+            != Some(manifest.logical_bytes)
+    {
+        return Err(writer_error(
+            "blob-ref state row identity or size does not match its prepared manifest",
+        ));
+    }
+    object.insert(
+        "blob_hash".to_owned(),
+        serde_json::Value::String(manifest.canonical_blob_id.to_hex()),
+    );
+    Ok(Some(Cow::Owned(serde_json::to_string(&value).map_err(
+        |error| writer_error(format!("failed to encode canonical blob-ref row: {error}")),
+    )?)))
 }
 
 fn sole_publication_branch(
