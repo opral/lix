@@ -7205,7 +7205,6 @@ where
                 recovery_ref: CheckpointRecoveryRef {
                     branch_id,
                     recovered_head_commit_id,
-                    checkpoint_commit_id,
                     interval_has_commits,
                 },
             })?;
@@ -7725,7 +7724,6 @@ where
                     recovery_ref: CheckpointRecoveryRef {
                         branch_id: branch_id.clone(),
                         recovered_head_commit_id: head_commit_id,
-                        checkpoint_commit_id,
                         interval_has_commits,
                     },
                 })?;

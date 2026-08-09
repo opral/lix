@@ -18,7 +18,6 @@ use crate::storage_adapter::StorageAdapterRead;
 pub(crate) struct CheckpointRecoveryRef {
     pub(crate) branch_id: String,
     pub(crate) recovered_head_commit_id: CommitId,
-    pub(crate) checkpoint_commit_id: CommitId,
     pub(crate) interval_has_commits: bool,
 }
 
@@ -152,7 +151,6 @@ where
     Ok(Some(CheckpointRecoveryRef {
         branch_id: branch_id.to_owned(),
         recovered_head_commit_id,
-        checkpoint_commit_id: recovered_head_commit_id,
         interval_has_commits: true,
     }))
 }
