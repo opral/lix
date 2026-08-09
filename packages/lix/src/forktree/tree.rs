@@ -819,8 +819,8 @@ pub(super) fn validate_change_catalog_back_edge(
             ChangeObjectV1::Semantic { .. },
         ) => {
             let commit = CommitObjectV1::decode(commit_object_id, &load(commit_object_id)?)?;
-            let member = commit
-                .members
+            let members = commit.load_members_with(&load)?;
+            let member = members
                 .get(ordinal as usize)
                 .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
             if *member != super::model::CommitMemberV1::introduced(entry.change_object_id) {

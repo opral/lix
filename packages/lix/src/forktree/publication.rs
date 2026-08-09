@@ -524,7 +524,7 @@ impl PreparedPublication {
             state_edit,
             commit_catalog_edit,
             change_catalog_edit,
-            semantic_commit,
+            mut semantic_commit,
             changes,
             branch_snapshot,
             repository_root,
@@ -559,6 +559,7 @@ impl PreparedPublication {
         if is_global && state_edit.wrote_tombstone {
             return Err(corruption("global state publication contains a tombstone"));
         }
+        let member_pages = semantic_commit.prepare_member_pages()?;
         let (commit_id, commit_bytes) = semantic_commit.encode()?;
         if state_edit
             .written_commit_ids
@@ -701,6 +702,9 @@ impl PreparedPublication {
         self.stage_state_edit(state_edit)?;
         self.stage_catalog_edit(commit_catalog_edit)?;
         self.stage_catalog_edit(change_catalog_edit)?;
+        for (page_id, page_bytes) in member_pages {
+            self.stage_encoded_object(page_id, page_bytes)?;
+        }
         self.stage_encoded_object(commit_id, commit_bytes)?;
         for (id, (_, bytes)) in encoded_changes {
             self.stage_encoded_object(id, bytes)?;
@@ -727,12 +731,16 @@ impl PreparedPublication {
             state_edits,
             commit_catalog_edit,
             change_catalog_edit,
-            semantic_commits,
+            mut semantic_commits,
             fresh_changes,
             branch_ref_change,
             branch_snapshot,
             repository_root,
         } = transition;
+        let mut member_pages = Vec::new();
+        for commit in &mut semantic_commits {
+            member_pages.extend(commit.prepare_member_pages()?);
+        }
         if semantic_commits.is_empty() || semantic_commits.len() != state_edits.len() {
             return Err(corruption(
                 "ordered history has mismatched commit/state-root cardinality",
@@ -958,6 +966,9 @@ impl PreparedPublication {
         }
         self.stage_catalog_edit(commit_catalog_edit)?;
         self.stage_catalog_edit(change_catalog_edit)?;
+        for (page_id, page_bytes) in member_pages {
+            self.stage_encoded_object(page_id, page_bytes)?;
+        }
         for (object_id, (_, bytes)) in encoded_commits {
             self.stage_encoded_object(object_id, bytes)?;
         }

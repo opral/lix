@@ -49,6 +49,7 @@ datafusion = { version = "53.0.0", default-features = false, features = ["sql"] 
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,6 +59,31 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[[example]]
+name = "storage_layout"
+path = "examples/storage_layout.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "revision_pack_oracle"
+path = "examples/revision_pack_oracle.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "cas_gc_qualification"
+path = "examples/cas_gc_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "cas_publication_epoch_qualification"
+path = "examples/cas_publication_epoch_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "forktree_sqlite_oltp"
+path = "examples/forktree_sqlite_oltp.rs"
+required-features = ["storage-benches", "slatedb"]
 
 [[test]]
 name = "exact_file_read_benchmark"
@@ -75,6 +101,16 @@ path = "tests/movie_workspace_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
+name = "corruption_recovery_qualification"
+path = "tests/corruption_recovery_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
+name = "large_payload_read_qualification"
+path = "tests/large_payload_read_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
 name = "certified_replacement_delete_reopen"
 path = "tests/certified_replacement_delete_reopen.rs"
 required-features = ["rocksdb", "slatedb"]
@@ -85,14 +121,73 @@ path = "tests/checkpoint_gc_replay_reopen.rs"
 required-features = ["rocksdb", "slatedb"]
 
 [[test]]
+name = "cas_gc_history_retention"
+path = "tests/cas_gc_history_retention.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
 name = "tpch_overlay_helpers"
 path = "tests/tpch_overlay_helpers.rs"
+
+[[bench]]
+name = "storage_v2"
+path = "benches/storage_v2.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_scorecard"
+path = "benches/changelog/scorecard.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_cpu_profile"
+path = "benches/changelog/profile_cpu.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_direct_profile"
+path = "benches/changelog/profile_direct.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "untracked_state_crud"
+path = "benches/untracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "tracked_state_crud"
+path = "benches/tracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "current_state_scope_sharing"
+path = "benches/current_state_scope_sharing.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
 name = "tpch"
 path = "benches/tpch/main.rs"
 harness = false
 required-features = ["storage-benches", "tpch"]
+
+[[bench]]
+name = "tracked_working_diff"
+path = "benches/tracked_working_diff.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "slatedb_file_api"
+path = "benches/slatedb_file_api.rs"
+harness = false
+required-features = ["slatedb"]
 
 [[bench]]
 name = "native_file_upsert_component"
@@ -107,6 +202,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "large_blob_updates"
+path = "benches/large_blob_updates.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "diff_commands"
 path = "benches/diff_commands.rs"
 harness = false
@@ -117,9 +218,81 @@ path = "benches/undo_redo.rs"
 harness = false
 
 [[bench]]
+name = "undo_redo_storage"
+path = "benches/undo_redo_storage.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "entity_default_values"
 path = "benches/entity_default_values.rs"
 harness = false
+
+[[bench]]
+name = "small_blob_cas"
+path = "benches/small_blob_cas.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "changelog_history_append"
+path = "benches/changelog_history_append.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "packed_history_scale"
+path = "benches/packed_history_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "checkpoint_history_scale"
+path = "benches/checkpoint_history_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "commit_graph_scale"
+path = "benches/commit_graph_scale.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "merge_base_scale"
+path = "benches/merge_base_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "repository_gc_scale"
+path = "benches/repository_gc_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "branch_checkpoint_retirement"
+path = "benches/branch_checkpoint_retirement.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "fixed_live_history_scale"
+path = "benches/fixed_live_history_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "multi_space_point_read"
+path = "benches/multi_space_point_read.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "uuid_v7_physical_keys"
+path = "benches/uuid_v7_physical_keys.rs"
+harness = false
+required-features = ["lix/storage-benches", "rocksdb", "slatedb"]
 
 [[bench]]
 name = "entity_pk_layout"

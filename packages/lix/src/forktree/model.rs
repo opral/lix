@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use bytes::Bytes;
 
 use crate::binary_cas::BlobId;
@@ -15,6 +17,8 @@ use super::object::{
 /// Larger logical values must use a blocked tree rather than an unbounded
 /// vector in one object.
 pub(crate) const AUTHENTICATED_EDGE_PAGE_ENTRIES: usize = 256;
+const COMMIT_MEMBER_PAGE_MARKER: u32 = u32::MAX;
+const COMMIT_MEMBER_PAGE_EDGE_BUDGET: usize = AUTHENTICATED_EDGE_PAGE_ENTRIES - 1;
 
 const GLOBAL_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTG\0\x01";
 const BRANCH_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTB\0\x01";
@@ -274,12 +278,169 @@ impl CommitMemberV1 {
     }
 }
 
+/// One authenticated page in a commit's ordered member closure. The commit
+/// object points to the first page; every page authenticates its commit ID,
+/// ordinal range, member edges, and optional successor link.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommitMemberPageV1 {
+    pub(crate) commit_id: CommitId,
+    pub(crate) start_ordinal: u32,
+    pub(crate) members: Vec<CommitMemberV1>,
+    pub(crate) next_page_object_id: Option<ObjectId>,
+}
+
+impl CommitMemberPageV1 {
+    pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
+        self.validate()?;
+        encode_object(ObjectDomain::CommitMemberPageV1, |encoder| {
+            encoder.fixed(self.commit_id.as_bytes());
+            encoder.u32(self.start_ordinal);
+            encoder.u32(
+                u32::try_from(self.members.len())
+                    .map_err(|_| corruption("commit member page count exceeds u32"))?,
+            );
+            for member in &self.members {
+                member.encode(encoder);
+            }
+            encode_optional_id(encoder, self.next_page_object_id);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::CommitMemberPageV1, bytes)?;
+        let commit_id = CommitId::from_bytes(decoder.fixed()?);
+        let start_ordinal = decoder.u32()?;
+        let count = decoder.usize("commit member page count")?;
+        if count == 0 || count > decoder.remaining() / 33 {
+            return Err(corruption(
+                "commit member page count exceeds its encoded body",
+            ));
+        }
+        let mut members = Vec::with_capacity(count);
+        for _ in 0..count {
+            members.push(CommitMemberV1::decode(&mut decoder)?);
+        }
+        let next_page_object_id = decode_optional_id(&mut decoder, "commit member page next")?;
+        decoder.finish()?;
+        let value = Self {
+            commit_id,
+            start_ordinal,
+            members,
+            next_page_object_id,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), StorageError> {
+        if self.members.is_empty() {
+            return Err(corruption("commit member page must not be empty"));
+        }
+        let member_edges = self
+            .members
+            .iter()
+            .copied()
+            .map(CommitMemberV1::authenticated_edge_count)
+            .try_fold(0usize, |total, count| total.checked_add(count))
+            .ok_or_else(|| corruption("commit member page edge count overflowed"))?;
+        let edge_count = member_edges
+            .checked_add(usize::from(self.next_page_object_id.is_some()))
+            .ok_or_else(|| corruption("commit member page edge count overflowed"))?;
+        if edge_count > AUTHENTICATED_EDGE_PAGE_ENTRIES {
+            return Err(corruption(
+                "commit member page exceeds its authenticated edge bound",
+            ));
+        }
+        if self.next_page_object_id == Some(ObjectId::ZERO) {
+            return Err(corruption("commit member page has a zero successor"));
+        }
+        self.start_ordinal
+            .checked_add(
+                u32::try_from(self.members.len())
+                    .map_err(|_| corruption("commit member page ordinal exceeds u32"))?,
+            )
+            .ok_or_else(|| corruption("commit member page ordinal overflows u32"))?;
+        let mut unique_changes = BTreeSet::new();
+        for member in &self.members {
+            member.validate()?;
+            if !unique_changes.insert(member.change_object_id()) {
+                return Err(corruption("commit member page repeats a change object"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn encode_chain(
+        commit_id: CommitId,
+        members: &[CommitMemberV1],
+    ) -> Result<(ObjectId, Vec<(ObjectId, Bytes)>), StorageError> {
+        if members.is_empty() {
+            return Err(corruption("cannot page an empty commit member set"));
+        }
+        let mut chunks = Vec::<(u32, Vec<CommitMemberV1>)>::new();
+        let mut start = 0usize;
+        let mut current = Vec::new();
+        let mut current_edges = 0usize;
+        for member in members.iter().copied() {
+            member.validate()?;
+            let member_edges = member.authenticated_edge_count();
+            if member_edges > COMMIT_MEMBER_PAGE_EDGE_BUDGET {
+                return Err(corruption("one commit member exceeds the page edge budget"));
+            }
+            if !current.is_empty()
+                && current_edges
+                    .checked_add(member_edges)
+                    .is_none_or(|edges| edges > COMMIT_MEMBER_PAGE_EDGE_BUDGET)
+            {
+                chunks.push((
+                    u32::try_from(start)
+                        .map_err(|_| corruption("commit member page ordinal exceeds u32"))?,
+                    std::mem::take(&mut current),
+                ));
+                start = start
+                    .checked_add(chunks.last().expect("just pushed").1.len())
+                    .ok_or_else(|| corruption("commit member page ordinal overflows usize"))?;
+                current_edges = 0;
+            }
+            current.push(member);
+            current_edges = current_edges
+                .checked_add(member_edges)
+                .ok_or_else(|| corruption("commit member page edge count overflowed"))?;
+        }
+        if !current.is_empty() {
+            chunks.push((
+                u32::try_from(start)
+                    .map_err(|_| corruption("commit member page ordinal exceeds u32"))?,
+                current,
+            ));
+        }
+
+        let mut next = None;
+        let mut encoded = Vec::with_capacity(chunks.len());
+        for (start_ordinal, page_members) in chunks.into_iter().rev() {
+            let page = Self {
+                commit_id,
+                start_ordinal,
+                members: page_members,
+                next_page_object_id: next,
+            };
+            let (id, bytes) = page.encode()?;
+            encoded.push((id, bytes));
+            next = Some(id);
+        }
+        encoded.reverse();
+        Ok((next.expect("nonempty member pages"), encoded))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitObjectV1 {
     pub(crate) commit_id: CommitId,
     pub(crate) generation: u64,
     pub(crate) parent_commit_object_ids: Vec<ObjectId>,
     pub(crate) members: Vec<CommitMemberV1>,
+    pub(crate) member_page_root: Option<ObjectId>,
     pub(crate) global_state_root: ObjectId,
     pub(crate) local_state_root: ObjectId,
     pub(crate) metadata: Vec<u8>,
@@ -298,8 +459,12 @@ impl CommitObjectV1 {
         )?;
         let parent_count = u32::try_from(self.parent_commit_object_ids.len())
             .map_err(|_| corruption("commit has too many parents"))?;
-        let member_count = u32::try_from(self.members.len())
-            .map_err(|_| corruption("commit has too many member changes"))?;
+        let member_count = if self.member_page_root.is_some() {
+            COMMIT_MEMBER_PAGE_MARKER
+        } else {
+            u32::try_from(self.members.len())
+                .map_err(|_| corruption("commit has too many member changes"))?
+        };
         encode_object(ObjectDomain::Commit, |encoder| {
             encoder.fixed(self.commit_id.as_bytes());
             encoder.u64(self.generation);
@@ -308,8 +473,12 @@ impl CommitObjectV1 {
                 encode_id(encoder, *parent);
             }
             encoder.u32(member_count);
-            for member in &self.members {
-                member.encode(encoder);
+            if let Some(page_root) = self.member_page_root {
+                encode_id(encoder, page_root);
+            } else {
+                for member in &self.members {
+                    member.encode(encoder);
+                }
             }
             encode_id(encoder, self.global_state_root);
             encode_id(encoder, self.local_state_root);
@@ -327,17 +496,24 @@ impl CommitObjectV1 {
         for _ in 0..parent_count {
             parent_commit_object_ids.push(decode_id(&mut decoder)?);
         }
-        let member_count = decoder.usize("commit member count")?;
-        validate_count(member_count, decoder.remaining(), 32, "commit member count")?;
-        let mut members = Vec::with_capacity(member_count);
-        for _ in 0..member_count {
-            members.push(CommitMemberV1::decode(&mut decoder)?);
-        }
+        let member_count = decoder.u32()?;
+        let (members, member_page_root) = if member_count == COMMIT_MEMBER_PAGE_MARKER {
+            (Vec::new(), Some(decode_id(&mut decoder)?))
+        } else {
+            let member_count = member_count as usize;
+            validate_count(member_count, decoder.remaining(), 33, "commit member count")?;
+            let mut members = Vec::with_capacity(member_count);
+            for _ in 0..member_count {
+                members.push(CommitMemberV1::decode(&mut decoder)?);
+            }
+            (members, None)
+        };
         let value = Self {
             commit_id,
             generation,
             parent_commit_object_ids,
             members,
+            member_page_root,
             global_state_root: decode_id(&mut decoder)?,
             local_state_root: decode_id(&mut decoder)?,
             metadata: decoder.bytes("commit metadata")?,
@@ -356,16 +532,23 @@ impl CommitObjectV1 {
     }
 
     fn validate_edge_bound(&self) -> Result<(), StorageError> {
-        if self
-            .parent_commit_object_ids
-            .len()
-            .checked_add(
+        if self.member_page_root == Some(ObjectId::ZERO) {
+            return Err(corruption("commit member page root is zero"));
+        }
+        let member_edges = self.member_page_root.map_or_else(
+            || {
                 self.members
                     .iter()
                     .copied()
                     .map(CommitMemberV1::authenticated_edge_count)
-                    .sum(),
-            )
+                    .try_fold(0usize, |total, count| total.checked_add(count))
+            },
+            |_| Some(1),
+        );
+        if self
+            .parent_commit_object_ids
+            .len()
+            .checked_add(member_edges.unwrap_or(usize::MAX))
             .and_then(|count| count.checked_add(2))
             .is_none_or(|count| count > AUTHENTICATED_EDGE_PAGE_ENTRIES)
         {
@@ -374,6 +557,88 @@ impl CommitObjectV1 {
             ));
         }
         Ok(())
+    }
+
+    /// Prepare an oversized member closure as authenticated pages. The full
+    /// member vector remains available to the writer-side validation path, but
+    /// the persisted commit envelope carries only the authenticated page root.
+    pub(crate) fn prepare_member_pages(&mut self) -> Result<Vec<(ObjectId, Bytes)>, StorageError> {
+        if self.member_page_root.is_some() && self.members.is_empty() {
+            return Ok(Vec::new());
+        }
+        let direct_edges = self
+            .members
+            .iter()
+            .copied()
+            .map(CommitMemberV1::authenticated_edge_count)
+            .try_fold(self.parent_commit_object_ids.len(), |total, count| {
+                total.checked_add(count)
+            })
+            .and_then(|count| count.checked_add(2));
+        if self.member_page_root.is_none()
+            && direct_edges.is_some_and(|count| count <= AUTHENTICATED_EDGE_PAGE_ENTRIES)
+        {
+            return Ok(Vec::new());
+        }
+        let (root, pages) = CommitMemberPageV1::encode_chain(self.commit_id, &self.members)?;
+        if let Some(expected_root) = self.member_page_root {
+            if expected_root != root {
+                return Err(corruption(
+                    "commit member page root does not match its ordered member closure",
+                ));
+            }
+            return Ok(pages);
+        }
+        self.member_page_root = Some(root);
+        Ok(pages)
+    }
+
+    /// Resolve the complete ordered member closure, authenticating every page
+    /// link and every page's position.  This is intentionally a caller-owned
+    /// loader: page objects are validated with the same object-domain decoder
+    /// as the commit envelope and are never treated as an alternate catalog.
+    pub(crate) fn load_members_with(
+        &self,
+        mut load: impl FnMut(ObjectId) -> Result<Bytes, StorageError>,
+    ) -> Result<Vec<CommitMemberV1>, StorageError> {
+        let Some(mut page_id) = self.member_page_root else {
+            return Ok(self.members.clone());
+        };
+        if !self.members.is_empty() {
+            return Err(corruption("paged commit carries an inline member closure"));
+        }
+        let mut output = Vec::new();
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(page_id) {
+                return Err(corruption("commit member page chain contains a cycle"));
+            }
+            let page = CommitMemberPageV1::decode(page_id, &load(page_id)?)?;
+            if page.commit_id != self.commit_id
+                || page.start_ordinal
+                    != u32::try_from(output.len()).map_err(|_| {
+                        corruption("commit member page ordinal exceeds u32 while loading")
+                    })?
+            {
+                return Err(corruption(
+                    "commit member page chain has a mismatched commit or ordinal",
+                ));
+            }
+            output.extend(page.members);
+            match page.next_page_object_id {
+                Some(next) => page_id = next,
+                None => break,
+            }
+        }
+        let mut unique_changes = BTreeSet::new();
+        for member in &output {
+            if !unique_changes.insert(member.change_object_id()) {
+                return Err(corruption(
+                    "commit member page chain repeats a change object",
+                ));
+            }
+        }
+        Ok(output)
     }
 }
 
