@@ -1468,6 +1468,26 @@ where
     for write in &prepared.file_content_writes {
         let manifest = if let Some(receipt) = write.prepared_cas_receipt() {
             ObjectId::from_bytes(receipt.manifest_object_id)
+        } else if let Some((base_blob_id, new_size)) = write.merkle_prefix_truncate() {
+            if write.untracked {
+                return Err(writer_error(
+                    "Merkle prefix truncate cannot target an untracked file owner",
+                ));
+            }
+            let file_id = &write.file_id;
+            let state_key = StateKey {
+                schema_key: "lix_binary_blob_ref".to_owned(),
+                file_id: Some(file_id.clone()),
+                entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                    writer_error(format!(
+                        "Merkle prefix truncate file identity is not a canonical UUID: {error}"
+                    ))
+                })?,
+            };
+            publication
+                .stage_verified_merkle_prefix_truncate(view, &state_key, base_blob_id, new_size)
+                .await
+                .map_err(LixError::from)?
         } else if let Some(payload) = write.inline_payload() {
             if let Some(splice) = write.same_length_blob_splice() {
                 if write.untracked {

@@ -2683,6 +2683,123 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
     .await
 }
 
+/// Stages one authenticated Merkle prefix truncate through the normal
+/// transaction publication boundary. This path deliberately accepts no
+/// replacement bytes: the current BlobRef identity and size come from the
+/// retained ForkTree filesystem index, and commit-time publication derives
+/// the successor manifest from that same selected owner.
+pub(crate) async fn execute_fast_lix_file_path_prefix_truncate(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    path: String,
+    new_size: u64,
+) -> Result<Option<u64>, LixError> {
+    let active_branch_id = ctx.active_branch_id().to_string();
+    let parsed = parse_file_upsert_path(&path, TransactionWriteOperation::Update)
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    if parsed.plugin_key.is_some() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "Merkle prefix truncate does not support plugin-owned files",
+        ));
+    }
+    let index = ctx
+        .filesystem_path_index(
+            &FilesystemPathIndexRequest::new(vec![active_branch_id.clone()]).with_blob_refs(true),
+        )
+        .await?;
+    let entries = index.exact_entries(&parsed.path);
+    let [entry] = entries.as_slice() else {
+        return Ok(None);
+    };
+    if entry.kind != FilesystemPathKind::File
+        || entry.key.global()
+        || entry.key.is_untracked()
+        || entry.key.branch_id() != active_branch_id
+    {
+        return Err(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            "Merkle prefix truncate requires the active tracked file owner",
+        ));
+    }
+    let Some(blob_row) = entry.blob_ref_live_row() else {
+        return Err(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            "Merkle prefix truncate requires an authenticated BlobRef owner",
+        ));
+    };
+    let snapshot = blob_row.snapshot_content.as_ref().ok_or_else(|| {
+        LixError::new(LixError::CODE_INTERNAL_ERROR, "BlobRef snapshot is absent")
+    })?;
+    let snapshot: serde_json::Value = serde_json::from_str(snapshot.as_str()).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("BlobRef snapshot is malformed: {error}"),
+        )
+    })?;
+    if snapshot.get("id").and_then(serde_json::Value::as_str) != Some(entry.id()) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "BlobRef snapshot identity does not match the selected file",
+        ));
+    }
+    let base_size = snapshot
+        .get("size_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "BlobRef snapshot size is absent or invalid",
+            )
+        })?;
+    let base_blob_id = snapshot
+        .get("blob_hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "BlobRef snapshot identity is absent",
+            )
+        })
+        .and_then(|value| {
+            BlobId::from_hex(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("BlobRef snapshot identity is invalid: {error}"),
+                )
+            })
+        })?;
+    if new_size >= base_size {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "Merkle prefix truncate must reduce the selected file",
+        ));
+    }
+
+    let mut staged = LixFileStagedBatch::with_row_capacity(1);
+    stage_lix_file_content_update_write(
+        &mut staged,
+        entry.id().to_string(),
+        Some(parsed.path),
+        Some(entry.name.clone()),
+        FileContent::merkle_prefix_truncate(base_blob_id, new_size),
+        FilesystemRowContext {
+            branch_id: active_branch_id,
+            global: false,
+            untracked: false,
+            file_id: Some(entry.id().to_string()),
+            metadata: None,
+        },
+        true,
+        Some(base_blob_id),
+        None,
+    )
+    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    staged.add_count(1)?;
+    stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged)
+        .await
+        .map(Some)
+}
+
 pub(crate) async fn execute_fast_lix_file_id_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
     writes: Vec<(

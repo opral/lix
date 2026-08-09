@@ -359,6 +359,14 @@ where
             .await
     }
 
+    pub(super) async fn build_blob_merkle_prefix_successor(
+        &self,
+        manifest: super::model::BlobManifestV1,
+        new_size: u64,
+    ) -> Result<super::merkle::BlobMerkleTreeBuild, StorageError> {
+        super::merkle::build_blob_merkle_prefix_successor(&self.read, manifest, new_size).await
+    }
+
     pub(super) async fn load_blob_ranges_many_on_view(
         &self,
         requests: &[(super::blob::AuthenticatedBlobRef, std::ops::Range<u64>)],

@@ -260,6 +260,18 @@ where
             .await
     }
 
+    /// Truncates an existing tracked binary file at a canonical Merkle chunk
+    /// boundary without materializing replacement bytes.
+    pub async fn truncate_file_content(
+        &self,
+        path: impl Into<String>,
+        new_size: u64,
+    ) -> Result<u64, LixError> {
+        self.session
+            .truncate_file_content(path.into(), new_size)
+            .await
+    }
+
     /// Sends one sequential resumable part through the same logical file
     /// upsert. The final part atomically publishes the ordinary file version.
     pub async fn upsert_file_content_part(

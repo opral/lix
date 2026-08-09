@@ -658,6 +658,52 @@ impl PreparedPublication {
             .await
     }
 
+    /// Stages an authenticated prefix truncation without accepting a caller
+    /// payload. The selected StateKey's existing BlobRef and manifest remain
+    /// the sole base authority; the successor root is derived through the
+    /// same retained CoherentView and enters this publication's object set.
+    pub(crate) async fn stage_verified_merkle_prefix_truncate<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        state_key: &StateKey,
+        expected_base_blob_id: crate::binary_cas::BlobId,
+        new_size: u64,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead + Sync,
+    {
+        let reference = view
+            .bind_blob_at_state_key(state_key)
+            .await
+            .map_err(|error| StorageError::Corruption(error.to_string()))?
+            .ok_or_else(|| corruption("Merkle prefix truncate base owner is absent"))?;
+        if reference.semantic_id() != expected_base_blob_id {
+            return Err(corruption(
+                "Merkle prefix truncate base identity does not match its StateKey owner",
+            ));
+        }
+        if new_size >= reference.expected_size() {
+            return Err(corruption(
+                "Merkle prefix truncate does not reduce the authenticated file",
+            ));
+        }
+        let manifest_object_id = reference.manifest_object_id();
+        let manifest_bytes = view.load_object_bytes(manifest_object_id).await?;
+        let manifest = BlobManifestV1::decode(manifest_object_id, &manifest_bytes)?;
+        if manifest.logical_bytes != reference.expected_size()
+            || manifest.canonical_blob_id != reference.semantic_id()
+        {
+            return Err(corruption(
+                "Merkle prefix truncate base manifest is not bound to its BlobRef owner",
+            ));
+        }
+        let successor = view
+            .build_blob_merkle_prefix_successor(manifest, new_size)
+            .await?;
+        self.stage_immutable_objects(&successor.objects)?;
+        self.stage_blob_manifest(&successor.manifest)
+    }
+
     /// Promotes SQL's transport-side splice proof at the publication owner.
     /// The proof is re-bound to the exact BlobRef StateKey on this retained
     /// coherent view, and the authenticated base payload is checked against

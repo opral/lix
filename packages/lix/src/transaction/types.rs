@@ -1791,6 +1791,12 @@ where
 pub(crate) enum FileContent {
     Inline(BlobPayload),
     PreparedCas(BlobWriteReceipt),
+    /// Transient authenticated prefix-truncate intent.  The publication
+    /// owner derives the successor Merkle root from the retained read.
+    MerklePrefixTruncate {
+        base_blob_id: BlobId,
+        size_bytes: u64,
+    },
 }
 
 impl FileContent {
@@ -1812,6 +1818,9 @@ impl FileContent {
         match self {
             Self::Inline(payload) => payload.hash(),
             Self::PreparedCas(receipt) => Some(receipt.hash),
+            // This placeholder is replaced by canonical_snapshot_for_row
+            // after the authenticated successor manifest is staged.
+            Self::MerklePrefixTruncate { base_blob_id, .. } => Some(*base_blob_id),
         }
     }
 
@@ -1819,6 +1828,7 @@ impl FileContent {
         match self {
             Self::Inline(payload) => payload.len() as u64,
             Self::PreparedCas(receipt) => receipt.size_bytes,
+            Self::MerklePrefixTruncate { size_bytes, .. } => *size_bytes,
         }
     }
 
@@ -1826,18 +1836,27 @@ impl FileContent {
         match self {
             Self::Inline(payload) => payload.is_empty(),
             Self::PreparedCas(receipt) => receipt.size_bytes == 0,
+            // An empty Merkle prefix is a present empty file, not a tombstone.
+            Self::MerklePrefixTruncate { .. } => false,
         }
     }
 
     pub(crate) fn inline_payload(&self) -> Option<&BlobPayload> {
         match self {
             Self::Inline(payload) => Some(payload),
-            Self::PreparedCas(_) => None,
+            Self::PreparedCas(_) | Self::MerklePrefixTruncate { .. } => None,
         }
     }
 
     pub(crate) fn inline_bytes(&self) -> Option<&[u8]> {
         self.inline_payload().map(BlobPayload::bytes)
+    }
+
+    pub(crate) fn merkle_prefix_truncate(base_blob_id: BlobId, size_bytes: u64) -> Self {
+        Self::MerklePrefixTruncate {
+            base_blob_id,
+            size_bytes,
+        }
     }
 }
 
@@ -2079,7 +2098,7 @@ impl TransactionFileContent {
     pub(crate) fn prepared_cas_receipt(&self) -> Option<&BlobWriteReceipt> {
         match &self.content {
             FileContent::PreparedCas(receipt) => Some(receipt),
-            FileContent::Inline(_) => None,
+            FileContent::Inline(_) | FileContent::MerklePrefixTruncate { .. } => None,
         }
     }
 
@@ -2089,6 +2108,16 @@ impl TransactionFileContent {
 
     pub(crate) fn inline_payload(&self) -> Option<&BlobPayload> {
         self.content.inline_payload()
+    }
+
+    pub(crate) fn merkle_prefix_truncate(&self) -> Option<(BlobId, u64)> {
+        match self.content {
+            FileContent::MerklePrefixTruncate {
+                base_blob_id,
+                size_bytes,
+            } => Some((base_blob_id, size_bytes)),
+            FileContent::Inline(_) | FileContent::PreparedCas(_) => None,
+        }
     }
 
     pub(crate) fn same_length_blob_splice(&self) -> Option<BlobSameLengthSplice> {

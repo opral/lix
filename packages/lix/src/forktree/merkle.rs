@@ -369,6 +369,185 @@ where
     Ok(proof)
 }
 
+/// Builds a canonical prefix successor without reading any retained chunk
+/// payload.  Only the authenticated tree nodes on the old/new partition
+/// boundaries are decoded; reused leaf and subtree identities are carried by
+/// their authenticated Merkle references.  The public truncate owner limits
+/// this operation to canonical chunk boundaries, so no partial retained leaf
+/// can be mistaken for a complete one.
+pub(crate) async fn build_blob_merkle_prefix_successor<R>(
+    read: &R,
+    manifest: BlobManifestV1,
+    new_size: u64,
+) -> Result<BlobMerkleTreeBuild, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if new_size >= manifest.logical_bytes {
+        return Err(corruption(
+            "Merkle prefix truncate must reduce the authenticated length",
+        ));
+    }
+    if new_size != 0 && !new_size.is_multiple_of(CANONICAL_BLOB_CHUNK_BYTES as u64) {
+        return Err(corruption(
+            "Merkle prefix truncate must end on a canonical chunk boundary",
+        ));
+    }
+    if new_size == 0 {
+        return build_blob_merkle_tree(&[BlobChunkV1 {
+            bytes: Bytes::new(),
+        }]);
+    }
+
+    let target_leaf_count = new_size / CANONICAL_BLOB_CHUNK_BYTES as u64;
+    if target_leaf_count == 0 || target_leaf_count >= manifest.leaf_count {
+        return Err(corruption("Merkle prefix truncate leaf count is invalid"));
+    }
+    let root = NodeSummary {
+        object_id: manifest.root_object_id,
+        height: manifest.root_height,
+        first_ordinal: 0,
+        leaf_count: manifest.leaf_count,
+        logical_bytes: manifest.logical_bytes,
+    };
+    let mut loaded = BTreeMap::new();
+    let mut objects = ImmutableObjectSet::default();
+    let root = canonical_range_summary(read, root, 0, target_leaf_count, &mut loaded, &mut objects)
+        .await?;
+    if root.first_ordinal != 0
+        || root.leaf_count != target_leaf_count
+        || root.logical_bytes != new_size
+    {
+        return Err(corruption(
+            "Merkle prefix truncate successor does not cover the requested prefix",
+        ));
+    }
+    Ok(BlobMerkleTreeBuild {
+        manifest: BlobManifestV1::from_merkle_root(
+            new_size,
+            target_leaf_count,
+            root.object_id,
+            root.height,
+        ),
+        objects,
+    })
+}
+
+async fn canonical_range_summary<R>(
+    read: &R,
+    node: NodeSummary,
+    start: u64,
+    count: u64,
+    loaded: &mut BTreeMap<ObjectId, Bytes>,
+    objects: &mut ImmutableObjectSet,
+) -> Result<NodeSummary, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if count == 0 || start >= node.leaf_count || count > node.leaf_count.saturating_sub(start) {
+        return Err(corruption("Merkle prefix range is outside its source node"));
+    }
+
+    // Even a wholly reused subtree is decoded once before its identity is
+    // carried into the successor. This catches missing/wrong-domain/corrupt
+    // retained roots without fetching any chunk payload.
+    if start == 0 && count == node.leaf_count {
+        let bytes = load_cached_object(read, loaded, node.object_id).await?;
+        let decoded = decode_node(node.object_id, &bytes)?;
+        if decoded.summary(node.object_id) != node {
+            return Err(corruption(
+                "Merkle retained subtree summary is not object-authenticated",
+            ));
+        }
+        return Ok(node);
+    }
+    if node.height == 0 {
+        return Err(corruption("Merkle prefix split a single leaf"));
+    }
+
+    let bytes = load_cached_object(read, loaded, node.object_id).await?;
+    let DecodedNode::Internal(internal) = decode_node(node.object_id, &bytes)? else {
+        return Err(corruption("Merkle prefix internal node decoded as a leaf"));
+    };
+    if DecodedNode::Internal(internal).summary(node.object_id) != node {
+        return Err(corruption("Merkle prefix source node summary is invalid"));
+    }
+    let left_end = internal.left.first_ordinal + internal.left.leaf_count;
+    let requested_end = node.first_ordinal + start + count;
+    if node.first_ordinal + start + count <= left_end {
+        return canonical_range_summary(
+            read,
+            NodeSummary {
+                object_id: internal.left.object_id,
+                height: internal.left.height,
+                first_ordinal: internal.left.first_ordinal,
+                leaf_count: internal.left.leaf_count,
+                logical_bytes: internal.left.logical_bytes,
+            },
+            node.first_ordinal + start - internal.left.first_ordinal,
+            count,
+            loaded,
+            objects,
+        )
+        .await;
+    }
+    if node.first_ordinal + start >= internal.right.first_ordinal {
+        return canonical_range_summary(
+            read,
+            NodeSummary {
+                object_id: internal.right.object_id,
+                height: internal.right.height,
+                first_ordinal: internal.right.first_ordinal,
+                leaf_count: internal.right.leaf_count,
+                logical_bytes: internal.right.logical_bytes,
+            },
+            node.first_ordinal + start - internal.right.first_ordinal,
+            count,
+            loaded,
+            objects,
+        )
+        .await;
+    }
+    if requested_end <= left_end || node.first_ordinal + start >= internal.right.first_ordinal {
+        return Err(corruption("Merkle prefix child partition is inconsistent"));
+    }
+
+    // The requested range crosses an old partition. Repartition it using the
+    // canonical ceil-half shape required for the successor; at most one of
+    // these recursive requests crosses the old boundary at each level.
+    let left_count = count.div_ceil(2);
+    let right_count = count - left_count;
+    let left = canonical_range_summary(read, node, start, left_count, loaded, objects).await?;
+    let right =
+        canonical_range_summary(read, node, start + left_count, right_count, loaded, objects)
+            .await?;
+    let parent = encode_internal(left, right)?;
+    objects.insert(parent.object_id, parent.bytes)?;
+    Ok(NodeSummary {
+        object_id: parent.object_id,
+        height: parent.value.height,
+        first_ordinal: parent.value.first_ordinal,
+        leaf_count: parent.value.leaf_count,
+        logical_bytes: parent.value.logical_bytes,
+    })
+}
+
+async fn load_cached_object<R>(
+    read: &R,
+    loaded: &mut BTreeMap<ObjectId, Bytes>,
+    id: ObjectId,
+) -> Result<Bytes, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(bytes) = loaded.get(&id) {
+        return Ok(bytes.clone());
+    }
+    let bytes = load_object_bytes(read, id).await?;
+    loaded.insert(id, bytes.clone());
+    Ok(bytes)
+}
+
 async fn load_proof_object<R>(
     read: &R,
     loaded: &mut BTreeMap<ObjectId, Bytes>,

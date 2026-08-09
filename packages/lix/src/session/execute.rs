@@ -1078,6 +1078,35 @@ where
         .await
     }
 
+    /// Truncates an existing tracked binary file at a canonical Merkle chunk
+    /// boundary. The request carries no replacement bytes; the transaction
+    /// owner authenticates the selected BlobRef and derives the prefix root
+    /// through the same retained ForkTree publication.
+    pub async fn truncate_file_content(
+        &self,
+        path: String,
+        new_size: u64,
+    ) -> Result<u64, LixError> {
+        self.ensure_open()?;
+        crate::common::LixPath::try_from_file_path(&path)?;
+        let write_access = self.begin_session_write_access().await?;
+        self.with_write_transaction_reserved_lending(
+            write_access,
+            async move |transaction| {
+                sql2::execute_fast_lix_file_path_prefix_truncate(transaction, path, new_size)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_CONSTRAINT_VIOLATION,
+                            "truncate_file_content requires one existing tracked file",
+                        )
+                    })
+            },
+            |_| Ok(()),
+        )
+        .await
+    }
+
     /// Upserts a non-empty batch of file bytes in one transaction.
     ///
     /// Paths are validated and required to be unique before a transaction is
