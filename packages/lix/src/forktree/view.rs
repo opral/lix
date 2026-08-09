@@ -188,6 +188,103 @@ where
         self.scan_untracked_rows_for_scope(true).await
     }
 
+    /// Loads exact untracked identities through this view's retained read.
+    /// Branch-owned values, including tombstones, suppress the global value;
+    /// duplicate request slots remain aligned without scanning the space.
+    pub(crate) async fn load_untracked_overlay_points(
+        &self,
+        state_keys: &[Vec<u8>],
+    ) -> Result<
+        Vec<
+            Option<(
+                CanonicalBranchId,
+                super::state::StateKey,
+                super::state::UntrackedValue,
+            )>,
+        >,
+        crate::LixError,
+    > {
+        let global_id = CanonicalBranchId::from_bytes(
+            *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+                .expect("GLOBAL_BRANCH_ID must be a UUID")
+                .as_bytes(),
+        );
+        let include_global = self.branch_id != global_id;
+        let mut keys = Vec::with_capacity(state_keys.len() * (1 + usize::from(include_global)));
+        for state_key in state_keys {
+            let decoded = super::state::decode_state_key(state_key)?;
+            keys.push(Key(super::state::encode_untracked_key(
+                self.branch_id,
+                super::state::StateKeyRef {
+                    schema_key: &decoded.schema_key,
+                    file_id: decoded.file_id.as_deref(),
+                    entity_pk: &decoded.entity_pk,
+                },
+            )
+            .into()));
+        }
+        if include_global {
+            for state_key in state_keys {
+                let decoded = super::state::decode_state_key(state_key)?;
+                keys.push(Key(super::state::encode_untracked_key(
+                    global_id,
+                    super::state::StateKeyRef {
+                        schema_key: &decoded.schema_key,
+                        file_id: decoded.file_id.as_deref(),
+                        entity_pk: &decoded.entity_pk,
+                    },
+                )
+                .into()));
+            }
+        }
+        let loaded = self
+            .read
+            .get_many(&[GetManyRequest {
+                space: super::state::UNTRACKED_ROW_SPACE,
+                keys: &keys,
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            }])
+            .await?;
+        if loaded.values.len() != keys.len() {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "ForkTree exact untracked get_many returned the wrong slot count",
+            ));
+        }
+
+        let (local, global) = loaded.values.split_at(state_keys.len());
+        let mut output = Vec::with_capacity(state_keys.len());
+        for (index, state_key) in state_keys.iter().enumerate() {
+            let selected = local[index]
+                .as_ref()
+                .map(|value| (self.branch_id, value))
+                .or_else(|| {
+                    global
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .map(|value| (global_id, value))
+                });
+            let Some((owner, projected)) = selected else {
+                output.push(None);
+                continue;
+            };
+            let ProjectedValue::FullValue(bytes) = projected else {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "ForkTree exact untracked lookup returned key-only data",
+                ));
+            };
+            output.push(Some((
+                owner,
+                super::state::decode_state_key(state_key)?,
+                super::state::decode_untracked_value(bytes)?,
+            )));
+        }
+        Ok(output)
+    }
+
     async fn scan_untracked_rows_for_scope(
         &self,
         include_global_overlay: bool,

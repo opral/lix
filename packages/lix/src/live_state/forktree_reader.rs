@@ -505,38 +505,6 @@ where
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
     let mut slots = Vec::with_capacity(request.rows.len());
 
-    if request.untracked == Some(true) {
-        let untracked_rows =
-            merge_untracked_overlay_rows(&view, view.scan_untracked_overlay_rows().await?)?;
-        for requested in &request.rows {
-            let key = encode_state_key(StateKeyRef {
-                schema_key: &requested.schema_key,
-                file_id: requested.file_id.as_deref(),
-                entity_pk: &requested.entity_pk,
-            });
-            let Some((_owner, decoded_key, value)) = untracked_rows.get(&key) else {
-                slots.push(None);
-                continue;
-            };
-            let ordinal = u32::try_from(builder.len()).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "exact live-state result exceeds u32 rows",
-                )
-            })?;
-            builder.push_owned(materialize_untracked_row(
-                value.clone(),
-                decoded_key.entity_pk.clone(),
-                decoded_key.schema_key.clone(),
-                decoded_key.file_id.clone(),
-                branch_id_text(*_owner),
-                _owner.as_bytes() == global_branch_id().as_bytes(),
-            ));
-            slots.push(Some(ordinal));
-        }
-        return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
-    }
-
     let requested_keys = request
         .rows
         .iter()
@@ -548,26 +516,55 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let rows = state_points(view, &requested_keys, request.include_tombstones).await?;
-    if rows.len() != request.rows.len() {
+    let tracked = if request.untracked == Some(true) {
+        vec![None; request.rows.len()]
+    } else {
+        state_points(view, &requested_keys, true).await?
+    };
+    let untracked = if request.untracked == Some(false) {
+        vec![None; request.rows.len()]
+    } else {
+        view.load_untracked_overlay_points(&requested_keys).await?
+    };
+    if tracked.len() != request.rows.len() || untracked.len() != request.rows.len() {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
             "ForkTree exact state lookup returned the wrong slot count",
         ));
     }
-    for (requested, row) in request.rows.iter().zip(rows) {
-        let Some(row) = row else {
+    for ((requested, tracked), untracked) in request.rows.iter().zip(tracked).zip(untracked) {
+        let materialized = if let Some((owner, key, value)) = untracked {
+            (!value.cell.deleted() || request.include_tombstones).then(|| {
+                materialize_untracked_row(
+                    value,
+                    key.entity_pk,
+                    key.schema_key,
+                    key.file_id,
+                    branch_id_text(owner),
+                    owner.as_bytes() == global_branch_id().as_bytes(),
+                )
+            })
+        } else if let Some(row) = tracked {
+            (!row.value.cell.deleted() || request.include_tombstones)
+                .then(|| {
+                    let decoded_key = decode_state_key(&row.encoded_key)?;
+                    Ok::<_, LixError>(materialize_row(
+                        row,
+                        decoded_key.entity_pk,
+                        decoded_key.schema_key,
+                        decoded_key.file_id,
+                        requested.branch_id.clone(),
+                    ))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let Some(materialized) = materialized else {
             slots.push(None);
             continue;
         };
-        let decoded_key = decode_state_key(&row.encoded_key)?;
-        builder.push_owned(materialize_row(
-            row,
-            decoded_key.entity_pk,
-            decoded_key.schema_key,
-            decoded_key.file_id,
-            requested.branch_id.clone(),
-        ));
+        builder.push_owned(materialized);
         let ordinal = u32::try_from(builder.len().saturating_sub(1)).map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,

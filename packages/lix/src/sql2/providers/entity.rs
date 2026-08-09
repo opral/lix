@@ -20,7 +20,8 @@ use crate::entity_pk::EntityPk;
 #[cfg(test)]
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
+    LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
 use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder};
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
@@ -35,7 +36,7 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
-use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
+use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter, parse_row_metadata_value};
 
 use crate::sql2::{
     EntitySnapshotReader, SqlChangelogQuerySource, SqlWriteContext, WriteAccess,
@@ -388,6 +389,7 @@ impl EntitySpec {
         }
         apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
+        apply_exact_file_id_filters(&mut request, filters)?;
         Ok((projected_schema, request, row_filters))
     }
 
@@ -498,6 +500,7 @@ impl EntitySpec {
     ) -> Result<PlannedDml> {
         reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
         let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
+        let exact_request = exact_live_state_batch_request(&request);
         let batch_projection = EntityBatchProjection::for_request(&request);
         let source = row_source(
             (
@@ -505,14 +508,18 @@ impl EntitySpec {
                 Arc::clone(&self.live_state),
                 schema,
                 request,
+                exact_request,
                 row_filters,
                 batch_projection,
             ),
-            |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
-                let rows = live_state
-                    .scan_batch(&request)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
+            |(spec, live_state, schema, request, exact_request, row_filters, batch_projection)| async move {
+                let rows = load_entity_live_state_batch(
+                    live_state.as_ref(),
+                    &request,
+                    exact_request.as_ref(),
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
                 let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                 entity_record_batch_with_parsed(
                     &spec,
@@ -600,7 +607,10 @@ impl TableSpec for EntitySpec {
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
         let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
-        if ExactBranchIdFilterAnalyzer.supports(filter) || primary_key_analyzer.supports(filter) {
+        if ExactBranchIdFilterAnalyzer.supports(filter)
+            || ExactFileIdFilterAnalyzer.supports(filter)
+            || primary_key_analyzer.supports(filter)
+        {
             TableProviderFilterPushDown::Exact
         } else if row_filter_analyzer.supports(filter) {
             // Retain a DataFusion residual even when the row-shaped fallback
@@ -625,6 +635,7 @@ impl TableSpec for EntitySpec {
         let entity_snapshot_reader = self.entity_snapshot_reader.clone();
         let live_state = Arc::clone(&self.live_state);
         let batch_projection = EntityBatchProjection::for_request(&request);
+        let exact_request = exact_live_state_batch_request(&request);
         let direct_entity_snapshot = direct_entity_batch_eligible(&schema, &request, &row_filters);
         let direct_primary_key_projection =
             direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
@@ -637,6 +648,7 @@ impl TableSpec for EntitySpec {
                     Arc::clone(&self.spec),
                     schema,
                     request,
+                    exact_request,
                     row_filters,
                     batch_projection,
                     entity_snapshot_reader,
@@ -648,6 +660,7 @@ impl TableSpec for EntitySpec {
                     spec,
                     schema,
                     request,
+                    exact_request,
                     row_filters,
                     batch_projection,
                     entity_snapshot_reader,
@@ -660,18 +673,31 @@ impl TableSpec for EntitySpec {
                             "entity projection has no authenticated ForkTree capability".into(),
                         )
                     })?;
-                    if direct_primary_key_projection
-                        && let Some(entity_pks) = entity_snapshot_reader
-                            .scan_entity_primary_keys(request.clone())
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
-                    {
-                        return entity_primary_key_record_batch(&spec, schema, entity_pks);
+                    if direct_primary_key_projection {
+                        let entity_pks = if let Some(exact_request) = &exact_request {
+                            entity_snapshot_reader
+                                .load_exact_entity_primary_keys(exact_request.clone())
+                                .await
+                        } else {
+                            entity_snapshot_reader
+                                .scan_entity_primary_keys(request.clone())
+                                .await
+                        }
+                        .map_err(lix_error_to_datafusion_error)?;
+                        if let Some(entity_pks) = entity_pks {
+                            return entity_primary_key_record_batch(&spec, schema, entity_pks);
+                        }
                     }
                     if direct_entity_snapshot {
-                        let rows = entity_snapshot_reader
-                            .scan_entity_snapshots(request.clone())
-                            .await
+                        let rows = if let Some(exact_request) = &exact_request {
+                            entity_snapshot_reader
+                                .load_exact_entity_snapshots(exact_request.clone())
+                                .await
+                        } else {
+                            entity_snapshot_reader
+                                .scan_entity_snapshots(request.clone())
+                                .await
+                        }
                             .map_err(lix_error_to_datafusion_error)?
                             .ok_or_else(|| {
                                 DataFusionError::Execution(
@@ -690,10 +716,13 @@ impl TableSpec for EntitySpec {
                             .map_err(DataFusionError::from);
                     }
 
-                    let rows = live_state
-                        .scan_batch(&request)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                    let rows = load_entity_live_state_batch(
+                        live_state.as_ref(),
+                        &request,
+                        exact_request.as_ref(),
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
                     let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                     entity_record_batch_with_parsed(
                         &spec,
@@ -1172,6 +1201,94 @@ fn apply_exact_entity_pk_filters(
     Ok(())
 }
 
+fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<Option<String>>>> {
+    let analyzer = ExactFileIdFilterAnalyzer;
+    let mut file_ids: Option<BTreeSet<Option<String>>> = None;
+    for filter in filters {
+        let Some(filter_ids) = analyzer.analyze_conjunctive(filter)? else {
+            continue;
+        };
+        file_ids = Some(match file_ids {
+            Some(existing) => existing.intersection(&filter_ids).cloned().collect(),
+            None => filter_ids,
+        });
+    }
+    Ok(file_ids.map(|ids| ids.into_iter().collect()))
+}
+
+fn apply_exact_file_id_filters(request: &mut LiveStateScanRequest, filters: &[Expr]) -> Result<()> {
+    if let Some(file_ids) = exact_file_ids_from_filters(filters)? {
+        if file_ids.is_empty() {
+            request.filter.rows = LiveStateRowFilter::None;
+        }
+        request.filter.file_ids = file_ids
+            .into_iter()
+            .map(|file_id| file_id.map_or(NullableKeyFilter::Null, NullableKeyFilter::Value))
+            .collect();
+    }
+    Ok(())
+}
+
+fn exact_live_state_batch_request(
+    request: &LiveStateScanRequest,
+) -> Option<LiveStateExactBatchRequest> {
+    if !matches!(request.filter.rows, LiveStateRowFilter::All)
+        || !request.filter.constraints.is_empty()
+        || request.filter.entity_pks.is_empty()
+    {
+        return None;
+    }
+    let [schema_key] = request.filter.schema_keys.as_slice() else {
+        return None;
+    };
+    let [branch_id] = request.filter.branch_ids.as_slice() else {
+        return None;
+    };
+    let [file_id] = request.filter.file_ids.as_slice() else {
+        return None;
+    };
+    let file_id = match file_id {
+        NullableKeyFilter::Null => None,
+        NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
+        NullableKeyFilter::Any => return None,
+    };
+    let mut rows = request
+        .filter
+        .entity_pks
+        .iter()
+        .cloned()
+        .map(|entity_pk| LiveStateExactRowRequest {
+            schema_key: schema_key.clone(),
+            branch_id: branch_id.clone(),
+            entity_pk,
+            file_id: file_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    if let Some(limit) = request.limit {
+        rows.truncate(limit);
+    }
+    Some(LiveStateExactBatchRequest {
+        rows,
+        projection: request.projection.clone(),
+        untracked: request.filter.untracked,
+        include_tombstones: request.filter.include_tombstones,
+    })
+}
+
+async fn load_entity_live_state_batch(
+    reader: &dyn LiveStateReader,
+    scan_request: &LiveStateScanRequest,
+    exact_request: Option<&LiveStateExactBatchRequest>,
+) -> std::result::Result<MaterializedLiveStateBatch, LixError> {
+    if let Some(exact_request) = exact_request {
+        return Ok(reader
+            .load_exact_batch(exact_request)
+            .await?
+            .into_present_batch());
+    }
+    reader.scan_batch(scan_request).await
+}
+
 fn exact_branch_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
     let analyzer = ExactBranchIdFilterAnalyzer;
     let mut branch_ids: Option<BTreeSet<String>> = None;
@@ -1209,6 +1326,7 @@ struct EntityRowFilterAnalyzer<'a> {
 }
 
 struct ExactBranchIdFilterAnalyzer;
+struct ExactFileIdFilterAnalyzer;
 
 impl ExactBranchIdFilterAnalyzer {
     fn supports(&self, expr: &Expr) -> bool {
@@ -1248,6 +1366,94 @@ impl ExactBranchIdFilterAnalyzer {
             _ => Ok(None),
         }
     }
+}
+
+impl ExactFileIdFilterAnalyzer {
+    fn supports(&self, expr: &Expr) -> bool {
+        self.analyze(expr)
+            .is_ok_and(|constraint| constraint.is_some())
+    }
+
+    fn analyze_conjunctive(&self, expr: &Expr) -> Result<Option<BTreeSet<Option<String>>>> {
+        let Expr::BinaryExpr(binary_expr) = expr else {
+            return self.analyze(expr);
+        };
+        if binary_expr.op != Operator::And {
+            return self.analyze(expr);
+        }
+        let left = self.analyze_conjunctive(&binary_expr.left)?;
+        let right = self.analyze_conjunctive(&binary_expr.right)?;
+        Ok(match (left, right) {
+            (Some(left), Some(right)) => Some(left.intersection(&right).cloned().collect()),
+            (Some(ids), None) | (None, Some(ids)) => Some(ids),
+            (None, None) => None,
+        })
+    }
+
+    #[expect(clippy::self_only_used_in_recursion)]
+    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<Option<String>>>> {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+                let Some(left) = self.analyze(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                Ok(Some(left.intersection(&right).cloned().collect()))
+            }
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+                let Some(mut left) = self.analyze(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                left.extend(right);
+                Ok(Some(left))
+            }
+            Expr::BinaryExpr(binary_expr) => {
+                Ok(file_id_from_binary_filter(binary_expr)
+                    .map(|value| BTreeSet::from([Some(value)])))
+            }
+            Expr::InList(in_list) => Ok(file_ids_from_in_list_filter(in_list)
+                .map(|values| values.into_iter().map(Some).collect())),
+            Expr::IsNull(inner) if matches!(inner.as_ref(), Expr::Column(column) if column.name == "lixcol_file_id") => {
+                Ok(Some(BTreeSet::from([None])))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn file_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
+    if binary_expr.op != Operator::Eq {
+        return None;
+    }
+    file_id_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
+        .or_else(|| file_id_from_column_literal_filter(&binary_expr.right, &binary_expr.left))
+}
+
+fn file_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
+    if in_list.negated {
+        return None;
+    }
+    let Expr::Column(column) = in_list.expr.as_ref() else {
+        return None;
+    };
+    if column.name != "lixcol_file_id" || in_list.list.is_empty() {
+        return None;
+    }
+    in_list.list.iter().map(string_expr_literal).collect()
+}
+
+fn file_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr) -> Option<String> {
+    let Expr::Column(column) = column_expr else {
+        return None;
+    };
+    (column.name == "lixcol_file_id")
+        .then(|| string_expr_literal(literal_expr))
+        .flatten()
 }
 
 fn branch_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
@@ -2044,7 +2250,6 @@ fn direct_entity_batch_eligible(
         && matches!(request.filter.rows, LiveStateRowFilter::All)
         && !request.filter.include_tombstones
         && row_filters.is_empty()
-        && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
         && schema
             .fields()
@@ -2063,10 +2268,6 @@ fn direct_primary_key_projection_eligible(
     row_filters: &[EntityRowFilter],
 ) -> bool {
     direct_entity_batch_eligible(schema, request, row_filters)
-        // Exact identities retain the point-snapshot cache. This projection
-        // capability is for ordered collection scans, not a replacement for
-        // the row-addressable OLTP path.
-        && request.filter.entity_pks.is_empty()
         && !schema.fields().is_empty()
         && schema
             .fields()
@@ -3502,6 +3703,53 @@ mod tests {
         assert_eq!(
             entity_pks,
             vec![crate::entity_pk::EntityPk::single("entity-a")]
+        );
+    }
+
+    #[test]
+    fn exact_batch_requires_and_preserves_correlated_file_owner() {
+        let mut request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec!["entity".into()],
+                branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".into()],
+                entity_pks: vec![
+                    crate::entity_pk::EntityPk::single("b"),
+                    crate::entity_pk::EntityPk::single("a"),
+                ],
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                ..Default::default()
+            },
+            limit: Some(1),
+            ..Default::default()
+        };
+        let exact = super::exact_live_state_batch_request(&request)
+            .expect("correlated identity should use exact batch");
+        assert_eq!(exact.rows.len(), 1);
+        assert_eq!(
+            exact.rows[0].entity_pk,
+            crate::entity_pk::EntityPk::single("b")
+        );
+        assert_eq!(exact.rows[0].file_id, None);
+
+        request.filter.file_ids.clear();
+        assert!(
+            super::exact_live_state_batch_request(&request).is_none(),
+            "PK-only identity must not guess a file owner"
+        );
+    }
+
+    #[test]
+    fn exact_file_filter_distinguishes_null_and_named_owner() {
+        let null_filter = Expr::IsNull(Box::new(column("lixcol_file_id")));
+        assert_eq!(
+            super::exact_file_ids_from_filters(&[null_filter])
+                .expect("NULL file filter should analyze"),
+            Some(vec![None])
+        );
+        assert_eq!(
+            super::exact_file_ids_from_filters(&[eq_filter("lixcol_file_id", "file-a")])
+                .expect("named file filter should analyze"),
+            Some(vec![Some("file-a".into())])
         );
     }
 

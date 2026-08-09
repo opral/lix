@@ -12,7 +12,7 @@ use bytes::Bytes;
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::ForkTreeReadFacade;
-use crate::live_state::{LiveStateReader, LiveStateScanRequest};
+use crate::live_state::{LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest};
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Optional private capability supplied by a SQL execution context.
@@ -35,6 +35,20 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
     async fn scan_entity_primary_keys(
         &self,
         _request: LiveStateScanRequest,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        Ok(None)
+    }
+
+    async fn load_exact_entity_snapshots(
+        &self,
+        _request: LiveStateExactBatchRequest,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        Ok(None)
+    }
+
+    async fn load_exact_entity_primary_keys(
+        &self,
+        _request: LiveStateExactBatchRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
         Ok(None)
     }
@@ -84,6 +98,26 @@ impl EntitySnapshotReader for CanonicalEntitySnapshotProjection {
             canonical_primary_key_projection(self.live_state.as_ref(), &request).await?,
         ))
     }
+
+    async fn load_exact_entity_snapshots(
+        &self,
+        request: LiveStateExactBatchRequest,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        validate_exact_terminal_projection_request(&request)?;
+        Ok(Some(
+            canonical_exact_snapshot_projection(self.live_state.as_ref(), &request).await?,
+        ))
+    }
+
+    async fn load_exact_entity_primary_keys(
+        &self,
+        request: LiveStateExactBatchRequest,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        validate_exact_terminal_projection_request(&request)?;
+        Ok(Some(
+            canonical_exact_primary_key_projection(self.live_state.as_ref(), &request).await?,
+        ))
+    }
 }
 
 #[async_trait]
@@ -110,10 +144,42 @@ where
             canonical_primary_key_projection(&self.forktree, &request).await?,
         ))
     }
+
+    async fn load_exact_entity_snapshots(
+        &self,
+        request: LiveStateExactBatchRequest,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        validate_exact_terminal_projection_request(&request)?;
+        Ok(Some(
+            canonical_exact_snapshot_projection(&self.forktree, &request).await?,
+        ))
+    }
+
+    async fn load_exact_entity_primary_keys(
+        &self,
+        request: LiveStateExactBatchRequest,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        validate_exact_terminal_projection_request(&request)?;
+        Ok(Some(
+            canonical_exact_primary_key_projection(&self.forktree, &request).await?,
+        ))
+    }
 }
 
 fn validate_terminal_projection_request(request: &LiveStateScanRequest) -> Result<(), LixError> {
     if request.filter.include_tombstones {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "entity terminal projection does not preserve tombstone rows",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_terminal_projection_request(
+    request: &LiveStateExactBatchRequest,
+) -> Result<(), LixError> {
+    if request.include_tombstones {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "entity terminal projection does not preserve tombstone rows",
@@ -148,6 +214,34 @@ where
         .into_identity_ordered_primary_keys())
 }
 
+async fn canonical_exact_snapshot_projection<R>(
+    reader: &R,
+    request: &LiveStateExactBatchRequest,
+) -> Result<Vec<Option<Bytes>>, LixError>
+where
+    R: LiveStateReader + ?Sized,
+{
+    Ok(reader
+        .load_exact_batch(request)
+        .await?
+        .into_present_batch()
+        .into_identity_ordered_snapshots())
+}
+
+async fn canonical_exact_primary_key_projection<R>(
+    reader: &R,
+    request: &LiveStateExactBatchRequest,
+) -> Result<Vec<EntityPk>, LixError>
+where
+    R: LiveStateReader + ?Sized,
+{
+    Ok(reader
+        .load_exact_batch(request)
+        .await?
+        .into_present_batch()
+        .into_identity_ordered_primary_keys())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +253,7 @@ mod tests {
     struct CountingCanonicalReader {
         rows: MaterializedLiveStateBatch,
         scans: AtomicUsize,
+        exact_loads: AtomicUsize,
     }
 
     #[async_trait]
@@ -175,10 +270,17 @@ mod tests {
             &self,
             _request: &crate::live_state::LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "test reader does not provide exact rows",
-            ))
+            self.exact_loads.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                crate::live_state::MaterializedLiveStateExactBatch::from_rows(
+                    self.rows
+                        .clone()
+                        .into_rows()
+                        .into_iter()
+                        .map(Some)
+                        .collect(),
+                ),
+            )
         }
     }
 
@@ -212,6 +314,7 @@ mod tests {
         let reader = CountingCanonicalReader {
             rows: mixed_retention_rows(),
             scans: AtomicUsize::new(0),
+            exact_loads: AtomicUsize::new(0),
         };
         let snapshots = canonical_snapshot_projection(&reader, &LiveStateScanRequest::default())
             .await
@@ -228,6 +331,7 @@ mod tests {
         let reader = CountingCanonicalReader {
             rows: mixed_retention_rows(),
             scans: AtomicUsize::new(0),
+            exact_loads: AtomicUsize::new(0),
         };
         let primary_keys =
             canonical_primary_key_projection(&reader, &LiveStateScanRequest::default())
@@ -238,6 +342,38 @@ mod tests {
             primary_keys,
             vec![EntityPk::single("a"), EntityPk::single("b")]
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_exact_projection_never_scans() {
+        let reader = CountingCanonicalReader {
+            rows: mixed_retention_rows(),
+            scans: AtomicUsize::new(0),
+            exact_loads: AtomicUsize::new(0),
+        };
+        let request = LiveStateExactBatchRequest {
+            rows: vec![
+                crate::live_state::LiveStateExactRowRequest {
+                    schema_key: "entity".into(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
+                    entity_pk: EntityPk::single("a"),
+                    file_id: None,
+                },
+                crate::live_state::LiveStateExactRowRequest {
+                    schema_key: "entity".into(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
+                    entity_pk: EntityPk::single("b"),
+                    file_id: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let snapshots = canonical_exact_snapshot_projection(&reader, &request)
+            .await
+            .expect("exact projection should succeed");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(reader.scans.load(Ordering::SeqCst), 0);
+        assert_eq!(reader.exact_loads.load(Ordering::SeqCst), 1);
     }
 
     #[test]
