@@ -464,6 +464,15 @@ where
     }
     let kind = parse_kind(expected_kind)?;
     let root = validate_root_on_read(root_object_id, expected_kind, read).await?;
+    // UUID-v7 ChangeIds normally arrive after the existing catalog tail. The
+    // append attempt authenticates only the root and right spine, preserving
+    // the retained-read/lazy-summary contract. It returns None for a
+    // non-tail insertion, which takes the original fully-scanned rebuild
+    // below so conflict and canonical-tree behavior remain unchanged.
+    if let Some(edit) = append_ordered_insertions(root, kind, insertions, read).await? {
+        return Ok(edit);
+    }
+
     let existing =
         scan_range_on_read(root.object_id, expected_kind, None, None, None, read).await?;
     let expected_count = usize::try_from(root.entry_count)
@@ -543,6 +552,116 @@ where
         objects: build.objects,
         copied_nodes,
     })
+}
+
+async fn append_ordered_insertions<R>(
+    root: OrderedTreeRoot,
+    kind: TreeKind,
+    insertions: &[(Vec<u8>, Vec<u8>)],
+    read: &R,
+) -> Result<Option<OrderedTreeEdit>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut objects = ImmutableObjectSet::default();
+    let mut copied_nodes = 0_usize;
+    let mut path = Vec::<Vec<NodeRef>>::new();
+    let mut current = root.object_id;
+    let mut expected = None;
+    let rewritten = loop {
+        let node = decode_node(current, &load_object_on_read(read, current).await?)?;
+        validate_loaded_node(current, &node, kind, expected.as_ref())?;
+        let original = node_ref(current, &node);
+        match node.body {
+            NodeBody::Leaf(entries) => {
+                validate_entries(kind, &entries)?;
+                let Some(last_key) = entries.last().map(|entry| entry.key.as_slice()) else {
+                    // An empty root has no append tail; use the existing
+                    // canonical builder for this exceptional case.
+                    break None;
+                };
+                if insertions
+                    .first()
+                    .is_none_or(|(key, _)| key.as_slice() <= last_key)
+                {
+                    // A non-tail insertion may be idempotent or conflicting;
+                    // let the original full scan decide which one.
+                    break None;
+                }
+                let leaf_limit = kind.limits().0;
+                let available = leaf_limit.saturating_sub(entries.len());
+                let take = available.min(insertions.len());
+                let mut rewritten = Vec::new();
+                if take > 0 {
+                    let mut merged = entries;
+                    merged.extend(insertions[..take].iter().map(|(key, value)| LeafEntry {
+                        key: key.clone(),
+                        value: value.clone(),
+                        receipt: None,
+                    }));
+                    rewritten.push(stage_leaf(kind, &merged, &mut objects)?);
+                    copied_nodes = copied_nodes.saturating_add(1);
+                } else {
+                    rewritten.push(original);
+                }
+                if take < insertions.len() {
+                    let tail = insertions[take..]
+                        .iter()
+                        .map(|(key, value)| LeafEntry {
+                            key: key.clone(),
+                            value: value.clone(),
+                            receipt: None,
+                        })
+                        .collect::<Vec<_>>();
+                    let new_leaves = stage_leaf_level(kind, &tail, &mut objects)?;
+                    copied_nodes = copied_nodes.saturating_add(new_leaves.len());
+                    rewritten.extend(new_leaves);
+                }
+                break Some(rewritten);
+            }
+            NodeBody::Internal(children) => {
+                validate_children(&children)?;
+                if children.len() > kind.limits().1 {
+                    return Err(corruption(
+                        "ordered-tree internal node exceeds its authenticated limit",
+                    ));
+                }
+                let last = children
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| corruption("ordered-tree internal node has no right child"))?;
+                path.push(children);
+                current = last.id;
+                expected = Some(last);
+            }
+        }
+    };
+    let Some(mut rewritten) = rewritten else {
+        return Ok(None);
+    };
+    while let Some(children) = path.pop() {
+        let mut next = Vec::with_capacity(children.len() - 1 + rewritten.len());
+        next.extend_from_slice(&children[..children.len() - 1]);
+        next.extend(rewritten);
+        rewritten = stage_internal_level(kind, &next, &mut objects)?;
+        copied_nodes = copied_nodes.saturating_add(rewritten.len());
+    }
+    while rewritten.len() > 1 {
+        rewritten = stage_internal_level(kind, &rewritten, &mut objects)?;
+        copied_nodes = copied_nodes.saturating_add(rewritten.len());
+    }
+    let root = rewritten
+        .pop()
+        .ok_or_else(|| corruption("ordered-tree append emitted no root"))?;
+    retain_reachable_new_nodes(root.id, kind, &mut objects)?;
+    Ok(Some(OrderedTreeEdit {
+        root: OrderedTreeRoot {
+            object_id: root.id,
+            entry_count: root.summary.entry_count,
+        },
+        objects,
+        copied_nodes,
+    }))
 }
 
 pub(super) async fn lookup_on_read<R>(
