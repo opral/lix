@@ -36,6 +36,13 @@ pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace = StorageSpace::engine_declar
     crate::storage::ValueSemantics::Mutable,
 );
 
+pub(crate) fn untracked_owner_prefix(branch_id: CanonicalBranchId) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(UNTRACKED_KEY_MAGIC.len() + 16);
+    prefix.extend_from_slice(UNTRACKED_KEY_MAGIC);
+    prefix.extend_from_slice(branch_id.as_bytes());
+    prefix
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StateKeyRef<'a> {
     pub(crate) schema_key: &'a str,

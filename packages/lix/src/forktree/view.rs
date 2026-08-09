@@ -6,8 +6,8 @@ use bytes::Bytes;
 
 use crate::entity_pk::EntityPk;
 use crate::storage::{
-    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
-    ReadOptions, ScanCursor, ScanOrder, Storage, StorageError,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, Prefix,
+    ProjectedValue, ReadOptions, ScanCursor, ScanOrder, Storage, StorageError,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
@@ -83,6 +83,26 @@ where
 
     pub(crate) fn branch_snapshot(&self) -> BranchSnapshotV1 {
         self.branch_snapshot
+    }
+
+    pub(crate) async fn begin_untracked_owner_scan(
+        &self,
+        owner: CanonicalBranchId,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        let range = Prefix {
+            bytes: super::state::untracked_owner_prefix(owner).into(),
+        }
+        .to_range()?;
+        self.read
+            .begin_scan(
+                super::state::UNTRACKED_ROW_SPACE,
+                range,
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    order: ScanOrder::Ascending,
+                },
+            )
+            .await
     }
 
     #[cfg(test)]

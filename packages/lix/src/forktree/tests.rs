@@ -1014,6 +1014,121 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
 }
 
 #[tokio::test]
+async fn ordered_state_limit_one_has_bounded_reads_at_1_32_and_1k_rows() {
+    for row_count in [1usize, 32, 1_000] {
+        let mut rows = (0..row_count)
+            .map(|index| {
+                state_entry(
+                    &format!("row-{index:04}"),
+                    StateCellRef::Value("payload"),
+                    0x22,
+                    &[],
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        let tree = build_state_tree(&rows).expect("state tree");
+        let storage = CountingStorage::new();
+        let mut writes = StorageWriteSet::new();
+        for (object_id, bytes) in tree.objects.iter() {
+            writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+        }
+        commit_write_set_for_test(writes, &storage).await;
+
+        let read = StorageAdapterReadScope::new(
+            storage
+                .begin_read(ReadOptions::default())
+                .await
+                .expect("bounded range read"),
+        );
+        let visible = super::serving::state_range_on_roots(
+            tree.root.object_id,
+            None,
+            &read,
+            None,
+            None,
+            Some(1),
+            false,
+        )
+        .await
+        .expect("bounded range");
+        let object_gets = storage.object_gets.load(Ordering::Relaxed);
+        println!("limit=1 rows={row_count} object_gets={object_gets}");
+        assert_eq!(visible.len(), 1);
+        assert!(
+            object_gets <= 8,
+            "LIMIT 1 must not decode the tail: rows={row_count}, object_gets={object_gets}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordered_state_cursor_reopens_and_rejects_a_missing_root() {
+    let mut rows = (0..128)
+        .map(|index| {
+            state_entry(
+                &format!("cold-{index:04}"),
+                StateCellRef::Value("payload"),
+                0x22,
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let tree = build_state_tree(&rows).expect("state tree");
+    let storage = CountingStorage::new();
+    let mut writes = StorageWriteSet::new();
+    for (object_id, bytes) in tree.objects.iter() {
+        writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(writes, &storage).await;
+
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("cold reopen read"),
+    );
+    let reopened = super::serving::state_range_on_roots(
+        tree.root.object_id,
+        None,
+        &read,
+        None,
+        None,
+        Some(1),
+        false,
+    )
+    .await
+    .expect("cold reopen range");
+    assert_eq!(reopened.len(), 1);
+    drop(read);
+
+    let mut deletes = StorageWriteSet::new();
+    deletes.delete(OBJECT_SPACE, tree.root.object_id.as_bytes().to_vec());
+    commit_write_set_for_test(deletes, &storage).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("missing root read"),
+    );
+    assert!(
+        super::serving::state_range_on_roots(
+            tree.root.object_id,
+            None,
+            &read,
+            None,
+            None,
+            Some(1),
+            false,
+        )
+        .await
+        .is_err(),
+        "missing authenticated cursor root must fail closed"
+    );
+}
+
+#[tokio::test]
 async fn historical_absence_requires_authenticated_commit_and_root() {
     let seed = build_seed();
     let storage = Memory::new();
@@ -1271,11 +1386,13 @@ struct CountingStorage {
     inner: Memory,
     begin_reads: Arc<AtomicUsize>,
     untracked_get_many: Arc<AtomicUsize>,
+    object_gets: Arc<AtomicUsize>,
 }
 
 struct CountingRead {
     inner: MemoryRead,
     untracked_get_many: Arc<AtomicUsize>,
+    object_gets: Arc<AtomicUsize>,
 }
 
 struct SharedParentCountingRead<R> {
@@ -1339,6 +1456,12 @@ impl StorageRead for CountingRead {
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        for request in requests {
+            if request.space == OBJECT_SPACE {
+                self.object_gets
+                    .fetch_add(request.keys.len(), Ordering::Relaxed);
+            }
+        }
         self.untracked_get_many.fetch_add(
             requests
                 .iter()
@@ -1365,6 +1488,7 @@ impl CountingStorage {
             inner: Memory::new(),
             begin_reads: Arc::new(AtomicUsize::new(0)),
             untracked_get_many: Arc::new(AtomicUsize::new(0)),
+            object_gets: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -1378,6 +1502,7 @@ impl Storage for CountingStorage {
         Ok(CountingRead {
             inner: self.inner.begin_read(options).await?,
             untracked_get_many: Arc::clone(&self.untracked_get_many),
+            object_gets: Arc::clone(&self.object_gets),
         })
     }
 
