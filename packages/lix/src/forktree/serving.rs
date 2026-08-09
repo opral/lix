@@ -82,13 +82,16 @@ where
 /// accidentally reuse a closure for another commit or another read view.
 pub(super) struct AuthenticatedMemberClosure<'a, R: ?Sized> {
     read: &'a R,
+    commit_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     commit_id: CommitId,
     generation: u64,
+    commit: CommitObjectV1,
     members: Vec<CommitMemberV1>,
+    catalog_identity: tokio::sync::OnceCell<()>,
 }
 
-impl<'a, R: ?Sized> AuthenticatedMemberClosure<'a, R> {
+impl<'a, R: StorageAdapterRead + ?Sized> AuthenticatedMemberClosure<'a, R> {
     pub(super) fn members_for(
         &self,
         read: &R,
@@ -109,10 +112,59 @@ impl<'a, R: ?Sized> AuthenticatedMemberClosure<'a, R> {
         }
         Ok(Some(&self.members))
     }
+
+    fn exact_commit(
+        &self,
+        read: &R,
+        commit_catalog_root: ObjectId,
+        commit_object_id: ObjectId,
+    ) -> Result<Option<&CommitObjectV1>, StorageError> {
+        if self.commit_object_id != commit_object_id {
+            return Ok(None);
+        }
+        if !std::ptr::eq(self.read, read) || self.commit_catalog_root != commit_catalog_root {
+            return Err(corruption(
+                "authenticated member closure is bound to another read or commit",
+            ));
+        }
+        Ok(Some(&self.commit))
+    }
+
+    async fn validate_catalog_identity(
+        &self,
+        read: &R,
+        commit_catalog_root: ObjectId,
+        commit_object_id: ObjectId,
+        commit: &CommitObjectV1,
+    ) -> Result<(), StorageError> {
+        if self.commit_catalog_root != commit_catalog_root
+            || self.commit_object_id != commit_object_id
+            || self.commit_id != commit.commit_id
+            || self.generation != commit.generation
+            || !std::ptr::eq(self.read, read)
+        {
+            return Err(corruption(
+                "authenticated member closure identity context does not match",
+            ));
+        }
+        self.catalog_identity
+            .get_or_try_init(|| async {
+                validate_commit_catalog_identity(
+                    read,
+                    commit_catalog_root,
+                    commit_object_id,
+                    commit,
+                )
+                .await
+            })
+            .await
+            .map(|_| ())
+    }
 }
 
 pub(super) async fn load_authenticated_member_closure<'a, R>(
     read: &'a R,
+    commit_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     commit: &CommitObjectV1,
 ) -> Result<AuthenticatedMemberClosure<'a, R>, StorageError>
@@ -121,10 +173,13 @@ where
 {
     Ok(AuthenticatedMemberClosure {
         read,
+        commit_catalog_root,
         commit_object_id,
         commit_id: commit.commit_id,
         generation: commit.generation,
+        commit: commit.clone(),
         members: load_commit_members(read, commit).await?,
+        catalog_identity: tokio::sync::OnceCell::const_new(),
     })
 }
 
@@ -829,7 +884,13 @@ where
     if commit.commit_id != commit_id {
         return Err(corruption("CommitCatalog key does not match Commit object").into());
     }
-    let closure = load_authenticated_member_closure(read, commit_object_id, &commit).await?;
+    let closure = load_authenticated_member_closure(
+        read,
+        repository.commit_catalog_root,
+        commit_object_id,
+        &commit,
+    )
+    .await?;
     validate_retained_commit_with_context(
         read,
         repository.commit_catalog_root,
@@ -1302,25 +1363,66 @@ where
             commit_object_id,
             ordinal,
         } => {
-            let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
-            let introduction = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            validate_commit_catalog_identity(
-                read,
-                commit_catalog_root,
-                commit_object_id,
-                &introduction,
-            )
-            .await?;
-            validate_member_at_ordinal_with_context(
-                read,
-                commit_object_id,
-                &introduction,
-                ordinal,
-                CommitMemberV1::introduced(member.change_object_id()),
-                context,
-                "ChangeCatalog canonical introduction owner/ordinal is invalid",
-            )
-            .await?;
+            if let Some(context) = context {
+                if let Some(introduction) =
+                    context.exact_commit(read, commit_catalog_root, commit_object_id)?
+                {
+                    context
+                        .validate_catalog_identity(
+                            read,
+                            commit_catalog_root,
+                            commit_object_id,
+                            introduction,
+                        )
+                        .await?;
+                    validate_member_at_ordinal(
+                        &context.members,
+                        ordinal,
+                        CommitMemberV1::introduced(member.change_object_id()),
+                        "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                    )?;
+                } else {
+                    let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+                    let introduction = CommitObjectV1::decode(commit_object_id, &bytes)?;
+                    validate_commit_catalog_identity(
+                        read,
+                        commit_catalog_root,
+                        commit_object_id,
+                        &introduction,
+                    )
+                    .await?;
+                    validate_member_at_ordinal_with_context(
+                        read,
+                        commit_object_id,
+                        &introduction,
+                        ordinal,
+                        CommitMemberV1::introduced(member.change_object_id()),
+                        Some(context),
+                        "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                    )
+                    .await?;
+                }
+            } else {
+                let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+                let introduction = CommitObjectV1::decode(commit_object_id, &bytes)?;
+                validate_commit_catalog_identity(
+                    read,
+                    commit_catalog_root,
+                    commit_object_id,
+                    &introduction,
+                )
+                .await?;
+                validate_member_at_ordinal_with_context(
+                    read,
+                    commit_object_id,
+                    &introduction,
+                    ordinal,
+                    CommitMemberV1::introduced(member.change_object_id()),
+                    None,
+                    "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                )
+                .await?;
+            }
             (commit_object_id, ordinal)
         }
         ChangeCatalogOwner::BranchRef { .. } => {
@@ -1381,9 +1483,13 @@ where
         .await?
         .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
     let (source_commit_object_id, _) = source.encode()?;
-    let closure =
-        load_authenticated_member_closure(view.storage_read(), source_commit_object_id, &source)
-            .await?;
+    let closure = load_authenticated_member_closure(
+        view.storage_read(),
+        view.repository_root().commit_catalog_root,
+        source_commit_object_id,
+        &source,
+    )
+    .await?;
     let source_members = &closure.members;
     for (source_ordinal, source_member) in source_members.iter().copied().enumerate() {
         let change_object_id = source_member.change_object_id();
@@ -2195,7 +2301,9 @@ pub(super) async fn validate_retained_commit<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let closure = load_authenticated_member_closure(read, commit_object_id, commit).await?;
+    let closure =
+        load_authenticated_member_closure(read, commit_catalog_root, commit_object_id, commit)
+            .await?;
     validate_retained_commit_with_context(
         read,
         commit_catalog_root,
