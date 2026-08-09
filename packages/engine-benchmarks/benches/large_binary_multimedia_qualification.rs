@@ -16,7 +16,7 @@ use lix::storage::{
 };
 use lix::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, FILE_UPLOAD_PART_BYTES,
-    RequestBlobSpliceProvenance, Value,
+    MergeBranchOptions, MergeBranchOutcome, RequestBlobSpliceProvenance, Value,
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
@@ -28,6 +28,10 @@ const APPEND_SIZE: usize = SIZE + 1024 * 1024;
 const EDIT_START: usize = SIZE / 2;
 const EDIT_LEN: usize = 1024 * 1024;
 const PATH: &str = "/media/foreground.mov";
+const MERGE_SOURCE_PATH: &str = "/media/merge-source.bin";
+const MERGE_TARGET_PATH: &str = "/media/merge-target.bin";
+const SHARED_LEFT_PATH: &str = "/media/shared-left.bin";
+const SHARED_RIGHT_PATH: &str = "/media/shared-right.bin";
 const BRANCH_ID: &str = "01980000-0000-7000-8000-000000000064";
 
 struct CountingAllocator;
@@ -509,7 +513,31 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     )
     .await
     .expect("append");
+
+    let _truncated = timed(
+        &format!("{label}/truncate_1m"),
+        &counted,
+        &path,
+        session.upsert_file_content(PATH.to_owned(), base.clone().into()),
+    )
+    .await
+    .expect("truncate");
+    let truncated = session
+        .read_file_content(PATH.to_owned(), None)
+        .await
+        .expect("truncated file read")
+        .expect("truncated file");
+    assert_eq!(truncated.content().len(), SIZE);
+    assert_eq!(digest(truncated.content()), digest(&base));
+    drop(truncated);
+
     session.create_checkpoint().await.expect("checkpoint");
+    // Re-establish the 65 MiB branch baseline after the measured truncation;
+    // this write is setup for the branch/merge controls, not a timed phase.
+    session
+        .upsert_file_content(PATH.to_owned(), appended.clone().into())
+        .await
+        .expect("restore appended branch baseline");
     let branch = session
         .create_branch(CreateBranchOptions {
             id: Some(BRANCH_ID.to_owned()),
@@ -533,6 +561,89 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     .expect("branch file");
     assert_eq!(digest(branch_read.content()), digest(&appended));
     drop(branch_read);
+
+    let merge_source = payload(1024 * 1024, 0x9def);
+    branch_session
+        .upsert_file_content(MERGE_SOURCE_PATH.to_owned(), merge_source.clone().into())
+        .await
+        .expect("source branch write");
+
+    let merge_target = payload(1024 * 1024, 0xace0);
+    session
+        .upsert_file_content(MERGE_TARGET_PATH.to_owned(), merge_target.clone().into())
+        .await
+        .expect("target branch write");
+    let merge_receipt = timed(
+        &format!("{label}/true_merge"),
+        &counted,
+        &path,
+        session.merge_branch(MergeBranchOptions {
+            source_branch_id: branch.id.clone(),
+        }),
+    )
+    .await
+    .expect("merge");
+    assert_eq!(merge_receipt.outcome, MergeBranchOutcome::MergeCommitted);
+    let merged_source = session
+        .read_file_content(MERGE_SOURCE_PATH.to_owned(), None)
+        .await
+        .expect("merged source read")
+        .expect("merged source");
+    assert_eq!(digest(merged_source.content()), digest(&merge_source));
+    drop(merged_source);
+    let merged_target = session
+        .read_file_content(MERGE_TARGET_PATH.to_owned(), None)
+        .await
+        .expect("merged target read")
+        .expect("merged target");
+    assert_eq!(digest(merged_target.content()), digest(&merge_target));
+    drop(merged_target);
+
+    let shared = payload(1024 * 1024, 0xbeef);
+    session
+        .upsert_file_content(SHARED_LEFT_PATH.to_owned(), shared.clone().into())
+        .await
+        .expect("shared left write");
+    session
+        .upsert_file_content(SHARED_RIGHT_PATH.to_owned(), shared.clone().into())
+        .await
+        .expect("shared right write");
+    timed(
+        &format!("{label}/shared_reference_release"),
+        &counted,
+        &path,
+        session.execute(
+            "DELETE FROM lix_file WHERE path = $1",
+            &[Value::Text(SHARED_LEFT_PATH.to_owned())],
+        ),
+    )
+    .await
+    .expect("shared reference release");
+    let shared_after_release = session
+        .read_file_content(SHARED_RIGHT_PATH.to_owned(), None)
+        .await
+        .expect("shared survivor read")
+        .expect("shared survivor");
+    assert_eq!(digest(shared_after_release.content()), digest(&shared));
+    drop(shared_after_release);
+    timed(
+        &format!("{label}/shared_final_delete"),
+        &counted,
+        &path,
+        session.execute(
+            "DELETE FROM lix_file WHERE path = $1",
+            &[Value::Text(SHARED_RIGHT_PATH.to_owned())],
+        ),
+    )
+    .await
+    .expect("shared final deletion");
+    assert!(
+        session
+            .read_file_content(SHARED_RIGHT_PATH.to_owned(), None)
+            .await
+            .expect("shared deleted read")
+            .is_none()
+    );
     branch_session.close().await.expect("close branch");
     session.close().await.expect("close main");
     drop(engine);
