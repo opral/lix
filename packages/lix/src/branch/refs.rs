@@ -37,12 +37,17 @@ where
     S: StorageAdapterRead,
 {
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-        Ok(crate::forktree::load_branch_head(&self.store, branch_id)
-            .await?
-            .map(|commit_id| BranchHead {
-                branch_id: branch_id.to_string(),
-                commit_id,
-            }))
+        let requested = [branch_id.to_string()];
+        Ok(
+            crate::forktree::load_branch_heads_with_metadata(&self.store, Some(&requested))
+                .await?
+                .into_iter()
+                .next()
+                .map(|row| BranchHead {
+                    branch_id: row.branch_id,
+                    commit_id: row.head_commit_id,
+                }),
+        )
     }
 
     pub(crate) async fn load_head_commit_id(
@@ -52,24 +57,52 @@ where
         Ok(self.load_head(branch_id).await?.map(|head| head.commit_id))
     }
 
+    pub(crate) async fn load_head_change_id(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<crate::changelog::ChangeId>, LixError> {
+        let requested = [branch_id.to_string()];
+        Ok(
+            crate::forktree::load_branch_heads_with_metadata(&self.store, Some(&requested))
+                .await?
+                .into_iter()
+                .next()
+                .map(|row| row.change_id),
+        )
+    }
+
     pub(crate) async fn load_head_metadata(
         &self,
         branch_id: &str,
     ) -> Result<Option<BranchRefMetadata>, LixError> {
-        Ok(Some(
-            crate::forktree::load_branch_ref_metadata(&self.store, branch_id).await?,
-        ))
+        let requested = [branch_id.to_string()];
+        let row = crate::forktree::load_branch_heads_with_metadata(&self.store, Some(&requested))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "requested branch selector is absent",
+                )
+            })?;
+        Ok(Some(BranchRefMetadata {
+            change_id: row.change_id,
+            updated_at: row.updated_at,
+        }))
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-        Ok(crate::forktree::scan_branch_heads(&self.store)
-            .await?
-            .into_iter()
-            .map(|(branch_id, commit_id)| BranchHead {
-                branch_id,
-                commit_id,
-            })
-            .collect())
+        Ok(
+            crate::forktree::load_branch_heads_with_metadata(&self.store, None)
+                .await?
+                .into_iter()
+                .map(|row| BranchHead {
+                    branch_id: row.branch_id,
+                    commit_id: row.head_commit_id,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -84,6 +117,13 @@ where
 
     async fn load_head_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
         Self::load_head_commit_id(self, branch_id).await
+    }
+
+    async fn load_head_change_id(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<crate::changelog::ChangeId>, LixError> {
+        Self::load_head_change_id(self, branch_id).await
     }
 
     async fn load_head_metadata(

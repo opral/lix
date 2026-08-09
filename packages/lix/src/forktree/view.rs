@@ -41,6 +41,8 @@ pub(crate) struct CoherentView<R> {
     branch_selector: BranchSelectorV1,
     repository_root: RepositoryRootV1,
     branch_snapshot: BranchSnapshotV1,
+    semantic_head_commit: CommitObjectV1,
+    latest_ref_change: ChangeObjectV1,
     view_id: [u8; 32],
     view_instance_id: u64,
 }
@@ -83,6 +85,17 @@ where
 
     pub(crate) fn branch_snapshot(&self) -> BranchSnapshotV1 {
         self.branch_snapshot
+    }
+
+    pub(crate) fn semantic_head_commit(&self) -> &CommitObjectV1 {
+        &self.semantic_head_commit
+    }
+
+    /// Returns the RefChange authenticated from the selected snapshot while
+    /// opening this view. Callers must reuse it instead of reloading the
+    /// latest-ref object through a second metadata path.
+    pub(crate) fn latest_ref_change(&self) -> &ChangeObjectV1 {
+        &self.latest_ref_change
     }
 
     #[cfg(test)]
@@ -1375,7 +1388,7 @@ where
             "branch snapshot does not match the selected branch id",
         ));
     }
-    authenticate_selected_graph(
+    let (semantic_head_commit, latest_ref_change) = authenticate_selected_graph(
         &read,
         global_selector.repository_root,
         branch_selector.branch_snapshot_object_id,
@@ -1398,6 +1411,8 @@ where
         branch_selector,
         repository_root,
         branch_snapshot,
+        semantic_head_commit,
+        latest_ref_change,
         view_id,
         view_instance_id,
     })
@@ -1429,7 +1444,7 @@ async fn authenticate_selected_graph<R>(
     _branch_snapshot_id: ObjectId,
     repository: RepositoryRootV1,
     branch: BranchSnapshotV1,
-) -> Result<(), StorageError>
+) -> Result<(CommitObjectV1, ChangeObjectV1), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1506,7 +1521,7 @@ where
         &change,
     )
     .await?;
-    Ok(())
+    Ok((head, change))
 }
 
 pub(super) async fn load_object_map<R>(

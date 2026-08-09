@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::common::LixTimestamp;
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
     Prefix, ProjectedValue, ScanCursor, ScanOrder, StorageError, StorageSpace,
@@ -89,7 +90,6 @@ pub(crate) struct VisibleStateRow {
     pub(crate) encoded_key: Vec<u8>,
     pub(crate) value: StateValue,
     pub(crate) source: StateSource,
-    #[cfg(test)]
     pub(super) view_instance_id: u64,
 }
 
@@ -250,37 +250,23 @@ pub(crate) async fn load_branch_head<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let branch_id = canonical_branch_id(branch_id)?;
-    let selector_key = branch_selector_key(branch_id);
-    let keys = [Key(selector_key.clone())];
-    let loaded = read
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &keys,
-            opts: GetOptions {
-                projection: CoreProjection::FullValue,
-            },
-        }])
-        .await?;
-    let Some(value) = loaded.values.into_iter().next().flatten() else {
-        return Ok(None);
-    };
-    let bytes = match value {
-        ProjectedValue::FullValue(bytes) => bytes,
-        ProjectedValue::KeyOnly => {
-            return Err(crate::LixError::new(
-                crate::LixError::CODE_INTERNAL_ERROR,
-                "ForkTree branch selector point read returned key-only data",
-            ));
-        }
-    };
-    let selector = BranchSelectorV1::decode(&bytes)?;
-    if selector.branch_id != branch_id || branch_selector_key(selector.branch_id) != selector_key {
-        return Err(
-            corruption("ForkTree branch selector key and embedded branch ID differ").into(),
-        );
-    }
-    selected_head_commit_id(read, branch_id).await.map(Some)
+    let requested = [branch_id.to_string()];
+    Ok(load_branch_heads_with_metadata(read, Some(&requested))
+        .await?
+        .into_iter()
+        .next()
+        .map(|row| row.head_commit_id))
+}
+
+/// One authenticated branch result returned by the selector/control-plane
+/// batch. The head, RefChange identity, and timestamp are all derived from
+/// the same retained read and validated against the same branch snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedBranchHead {
+    pub(crate) branch_id: String,
+    pub(crate) head_commit_id: crate::changelog::CommitId,
+    pub(crate) change_id: crate::changelog::ChangeId,
+    pub(crate) updated_at: LixTimestamp,
 }
 
 /// Loads the authenticated semantic identity of a moving branch selector.
@@ -295,90 +281,339 @@ where
 {
     let branch_id = canonical_branch_id(branch_id)?;
     let view = open_coherent_view_on_read(read, branch_id).await?;
-    let ref_object_id = view
-        .branch_snapshot()
-        .latest_ref_change_object_id
-        .ok_or_else(|| corruption("branch snapshot has no authenticated latest RefChange edge"))?;
-    let bytes = view.load_object_bytes(ref_object_id).await?;
-    let change = ChangeObjectV1::decode(ref_object_id, &bytes)?;
     let ChangeObjectV1::BranchRef {
         change_id,
         updated_at,
-        branch_id: change_branch_id,
-        after_semantic_head_commit_object_id,
         ..
-    } = change
+    } = view.latest_ref_change()
     else {
         return Err(
-            corruption("branch snapshot latest ref-change edge names a semantic Change").into(),
+            corruption("branch snapshot latest RefChange edge names a semantic Change").into(),
         );
     };
-    if change_branch_id != branch_id
-        || after_semantic_head_commit_object_id
-            != Some(view.branch_snapshot().semantic_head_commit_object_id)
-    {
-        return Err(
-            corruption("branch snapshot latest ref-change does not match its branch/head").into(),
-        );
-    }
     Ok(crate::branch::BranchRefMetadata {
         change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
-        updated_at,
+        updated_at: updated_at.clone(),
     })
 }
 
-/// Scans every authenticated branch selector in one coherent read view.
-/// Selector enumeration is storage-streaming and retains only one page plus
-/// the output branch-head list.
+pub(crate) async fn load_branch_ref_change_id<R>(
+    read: &R,
+    branch_id: &str,
+) -> Result<Option<crate::changelog::ChangeId>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    Ok(Some(
+        load_branch_ref_metadata(read, branch_id).await?.change_id,
+    ))
+}
+
+/// Loads selected branch heads and their authenticated RefChange metadata in
+/// one retained read. `None` selects every branch selector; `Some` preserves
+/// requested order and omits absent selectors. Selector, snapshot, root,
+/// head, RefChange, catalog, predecessor, and target objects are acquired in
+/// batches. No per-branch coherent view or retained-ref validator is opened.
+pub(crate) async fn load_branch_heads_with_metadata<R>(
+    read: &R,
+    requested_branch_ids: Option<&[String]>,
+) -> Result<Vec<AuthenticatedBranchHead>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let selectors = load_branch_selectors(read, requested_branch_ids).await?;
+    if selectors.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let global_key = Key(global_selector_key());
+    let global = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: std::slice::from_ref(&global_key),
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    let raw_global = match global.values.into_iter().next().flatten() {
+        Some(ProjectedValue::FullValue(bytes)) => bytes,
+        Some(ProjectedValue::KeyOnly) => {
+            return Err(corruption("ForkTree global selector returned key-only data").into());
+        }
+        None => return Err(corruption("ForkTree global selector is absent").into()),
+    };
+    let global_selector = GlobalSelectorV1::decode(&raw_global)?;
+
+    let mut root_ids = Vec::with_capacity(selectors.len() + 1);
+    root_ids.push(global_selector.repository_root);
+    root_ids.extend(
+        selectors
+            .iter()
+            .map(|selector| selector.branch_snapshot_object_id),
+    );
+    root_ids.sort_unstable();
+    root_ids.dedup();
+    let roots = super::view::load_object_map(read, root_ids).await?;
+    let repository_root = RepositoryRootV1::decode(
+        global_selector.repository_root,
+        required_scan_object(&roots, global_selector.repository_root)?,
+    )?;
+    let mut snapshots = Vec::with_capacity(selectors.len());
+    let mut selected_ids = Vec::with_capacity(selectors.len() * 2);
+    for selector in &selectors {
+        let snapshot = super::model::BranchSnapshotV1::decode(
+            selector.branch_snapshot_object_id,
+            required_scan_object(&roots, selector.branch_snapshot_object_id)?,
+        )?;
+        if snapshot.branch_id != selector.branch_id {
+            return Err(corruption("ForkTree branch selector and snapshot IDs differ").into());
+        }
+        selected_ids.push(snapshot.semantic_head_commit_object_id);
+        selected_ids.push(snapshot.latest_ref_change_object_id.ok_or_else(|| {
+            corruption("branch snapshot has no authenticated latest RefChange edge")
+        })?);
+        snapshots.push(snapshot);
+    }
+
+    let mut authenticated_root_ids = vec![
+        repository_root.global_state_root,
+        repository_root.commit_catalog_root,
+        repository_root.change_catalog_root,
+        repository_root.retention_policy_root,
+    ];
+    authenticated_root_ids.extend(snapshots.iter().flat_map(|snapshot| {
+        [
+            snapshot.local_state_root,
+            snapshot.historical_global_state_root,
+        ]
+    }));
+    authenticated_root_ids.sort_unstable();
+    authenticated_root_ids.dedup();
+    let authenticated_roots = super::view::load_object_map(read, authenticated_root_ids).await?;
+    for (id, kind) in [
+        (repository_root.global_state_root, "state"),
+        (repository_root.commit_catalog_root, "commit"),
+        (repository_root.change_catalog_root, "change"),
+        (repository_root.retention_policy_root, "retention"),
+    ] {
+        super::tree::validate_root_bytes(
+            id,
+            kind,
+            required_scan_object(&authenticated_roots, id)?,
+        )?;
+    }
+    for snapshot in &snapshots {
+        for (id, kind) in [
+            (snapshot.local_state_root, "state"),
+            (snapshot.historical_global_state_root, "state"),
+        ] {
+            super::tree::validate_root_bytes(
+                id,
+                kind,
+                required_scan_object(&authenticated_roots, id)?,
+            )?;
+        }
+    }
+
+    selected_ids.sort_unstable();
+    selected_ids.dedup();
+    let selected_objects = super::view::load_object_map(read, selected_ids).await?;
+    let mut heads = Vec::with_capacity(snapshots.len());
+    let mut refs = Vec::with_capacity(snapshots.len());
+    for snapshot in &snapshots {
+        let head = CommitObjectV1::decode(
+            snapshot.semantic_head_commit_object_id,
+            required_scan_object(&selected_objects, snapshot.semantic_head_commit_object_id)?,
+        )?;
+        if head.global_state_root != snapshot.historical_global_state_root
+            || head.local_state_root != snapshot.local_state_root
+        {
+            return Err(
+                corruption("selected semantic head does not authenticate branch roots").into(),
+            );
+        }
+        let ref_id = snapshot.latest_ref_change_object_id.ok_or_else(|| {
+            corruption("branch snapshot has no authenticated latest RefChange edge")
+        })?;
+        let change =
+            ChangeObjectV1::decode(ref_id, required_scan_object(&selected_objects, ref_id)?)?;
+        let ChangeObjectV1::BranchRef {
+            branch_id,
+            after_semantic_head_commit_object_id,
+            ..
+        } = &change
+        else {
+            return Err(corruption(
+                "branch snapshot latest RefChange edge names a semantic Change",
+            )
+            .into());
+        };
+        if *branch_id != snapshot.branch_id
+            || *after_semantic_head_commit_object_id
+                != Some(snapshot.semantic_head_commit_object_id)
+        {
+            return Err(corruption(
+                "branch snapshot latest RefChange does not match its branch/head",
+            )
+            .into());
+        }
+        heads.push(head);
+        refs.push((ref_id, change));
+    }
+
+    let change_keys = refs
+        .iter()
+        .map(|(_, change)| change.change_id().as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let catalog_values = lookup_many_on_read(
+        repository_root.change_catalog_root,
+        "change",
+        &change_keys,
+        read,
+    )
+    .await?;
+    if catalog_values.len() != refs.len() {
+        return Err(
+            corruption("batched ChangeCatalog lookup returned the wrong number of values").into(),
+        );
+    }
+    for ((ref_id, change), value) in refs.iter().zip(catalog_values) {
+        let value =
+            value.ok_or_else(|| corruption("retained RefChange has no ChangeCatalog owner"))?;
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        if entry.change_object_id != *ref_id
+            || entry.owner
+                != (ChangeCatalogOwner::BranchRef {
+                    ref_change_object_id: *ref_id,
+                    branch_id: match change {
+                        ChangeObjectV1::BranchRef { branch_id, .. } => *branch_id,
+                        ChangeObjectV1::Semantic { .. } => {
+                            return Err(corruption(
+                                "RefChange chronology reached a semantic Change",
+                            )
+                            .into());
+                        }
+                    },
+                })
+        {
+            return Err(corruption(
+                "retained RefChange disagrees with its ChangeCatalog owner/back-edge",
+            )
+            .into());
+        }
+    }
+
+    let mut provenance_ids = Vec::new();
+    for (_, change) in &refs {
+        let ChangeObjectV1::BranchRef {
+            before_semantic_head_commit_object_id,
+            after_semantic_head_commit_object_id,
+            previous_ref_change_object_id,
+            ..
+        } = change
+        else {
+            return Err(corruption("RefChange chronology reached a semantic Change").into());
+        };
+        provenance_ids.extend(
+            before_semantic_head_commit_object_id
+                .into_iter()
+                .chain(after_semantic_head_commit_object_id)
+                .copied(),
+        );
+        if let Some(previous_id) = previous_ref_change_object_id {
+            provenance_ids.push(*previous_id);
+        } else if before_semantic_head_commit_object_id.is_some() {
+            return Err(corruption(
+                "non-creation RefChange is missing its authenticated predecessor",
+            )
+            .into());
+        }
+    }
+    provenance_ids.sort_unstable();
+    provenance_ids.dedup();
+    let provenance_objects = super::view::load_object_map(read, provenance_ids).await?;
+    for (_, change) in &refs {
+        let ChangeObjectV1::BranchRef {
+            branch_id,
+            before_semantic_head_commit_object_id,
+            after_semantic_head_commit_object_id,
+            previous_ref_change_object_id,
+            ..
+        } = change
+        else {
+            return Err(corruption("RefChange chronology reached a semantic Change").into());
+        };
+        if let Some(previous_id) = previous_ref_change_object_id {
+            let previous = ChangeObjectV1::decode(
+                *previous_id,
+                required_scan_object(&provenance_objects, *previous_id)?,
+            )?;
+            let ChangeObjectV1::BranchRef {
+                branch_id: previous_branch_id,
+                after_semantic_head_commit_object_id: previous_after,
+                ..
+            } = previous
+            else {
+                return Err(corruption("RefChange predecessor is a semantic Change").into());
+            };
+            if previous_branch_id != *branch_id
+                || previous_after != *before_semantic_head_commit_object_id
+            {
+                return Err(corruption("RefChange predecessor branch binding is invalid").into());
+            }
+        }
+        for target in [
+            *before_semantic_head_commit_object_id,
+            *after_semantic_head_commit_object_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ =
+                CommitObjectV1::decode(target, required_scan_object(&provenance_objects, target)?)?;
+        }
+    }
+
+    Ok(snapshots
+        .into_iter()
+        .zip(heads)
+        .zip(refs)
+        .map(|((snapshot, head), (_, change))| {
+            let ChangeObjectV1::BranchRef {
+                change_id,
+                updated_at,
+                ..
+            } = change
+            else {
+                unreachable!("validated branch ref changes are BranchRef");
+            };
+            AuthenticatedBranchHead {
+                branch_id: uuid::Uuid::from_bytes(*snapshot.branch_id.as_bytes()).to_string(),
+                head_commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+                    *head.commit_id.as_bytes(),
+                )),
+                change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+                    *change_id.as_bytes(),
+                )),
+                updated_at,
+            }
+        })
+        .collect())
+}
+
+/// Scans every authenticated branch selector and returns only head IDs.
 pub(crate) async fn scan_branch_heads<R>(
     read: &R,
 ) -> Result<Vec<(String, crate::changelog::CommitId)>, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let range = Prefix {
-        bytes: bytes::Bytes::from_static(BRANCH_SELECTOR_PREFIX),
-    }
-    .to_range()?;
-    let mut cursor = read
-        .begin_scan(
-            SELECTOR_SPACE,
-            range,
-            BeginScanOptions {
-                projection: CoreProjection::FullValue,
-                order: ScanOrder::Ascending,
-            },
-        )
-        .await?;
-    let mut heads = Vec::new();
-    loop {
-        let page = cursor.next_page(BRANCH_SCAN_PAGE_ROWS).await?;
-        for entry in page.entries {
-            let bytes = match entry.value {
-                ProjectedValue::FullValue(bytes) => bytes,
-                ProjectedValue::KeyOnly => {
-                    return Err(crate::LixError::new(
-                        crate::LixError::CODE_INTERNAL_ERROR,
-                        "ForkTree branch selector scan returned key-only data",
-                    ));
-                }
-            };
-            let selector = BranchSelectorV1::decode(&bytes)?;
-            if entry.key.0 != branch_selector_key(selector.branch_id) {
-                return Err(corruption(
-                    "ForkTree branch selector scan key and embedded branch ID differ",
-                )
-                .into());
-            }
-            let branch_text = uuid::Uuid::from_bytes(*selector.branch_id.as_bytes()).to_string();
-            let commit_id = selected_head_commit_id(read, selector.branch_id).await?;
-            heads.push((branch_text, commit_id));
-        }
-        if !page.has_more {
-            break;
-        }
-    }
-    Ok(heads)
+    Ok(load_branch_heads_with_metadata(read, None)
+        .await?
+        .into_iter()
+        .map(|row| (row.branch_id, row.head_commit_id))
+        .collect())
 }
 
 fn canonical_branch_id(branch_id: &str) -> Result<CanonicalBranchId, crate::LixError> {
@@ -391,20 +626,112 @@ fn canonical_branch_id(branch_id: &str) -> Result<CanonicalBranchId, crate::LixE
     Ok(CanonicalBranchId::from_bytes(*id.as_bytes()))
 }
 
-async fn selected_head_commit_id<R>(
+async fn load_branch_selectors<R>(
     read: &R,
-    branch_id: CanonicalBranchId,
-) -> Result<crate::changelog::CommitId, crate::LixError>
+    requested_branch_ids: Option<&[String]>,
+) -> Result<Vec<BranchSelectorV1>, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let view = open_coherent_view_on_read(read, branch_id).await?;
-    let selected_id = view.branch_snapshot().semantic_head_commit_object_id;
-    let bytes = view.load_object_bytes(selected_id).await?;
-    let commit = CommitObjectV1::decode(selected_id, &bytes)?;
-    Ok(crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-        *commit.commit_id.as_bytes(),
-    )))
+    let Some(requested_branch_ids) = requested_branch_ids else {
+        let range = Prefix {
+            bytes: bytes::Bytes::from_static(BRANCH_SELECTOR_PREFIX),
+        }
+        .to_range()?;
+        let mut cursor = read
+            .begin_scan(
+                SELECTOR_SPACE,
+                range,
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    order: ScanOrder::Ascending,
+                },
+            )
+            .await?;
+        let mut selectors = Vec::new();
+        loop {
+            let page = cursor.next_page(BRANCH_SCAN_PAGE_ROWS).await?;
+            for entry in page.entries {
+                let bytes = match entry.value {
+                    ProjectedValue::FullValue(bytes) => bytes,
+                    ProjectedValue::KeyOnly => {
+                        return Err(crate::LixError::new(
+                            crate::LixError::CODE_INTERNAL_ERROR,
+                            "ForkTree branch selector scan returned key-only data",
+                        ));
+                    }
+                };
+                let selector = BranchSelectorV1::decode(&bytes)?;
+                if entry.key.0 != branch_selector_key(selector.branch_id) {
+                    return Err(corruption(
+                        "ForkTree branch selector scan key and embedded branch ID differ",
+                    )
+                    .into());
+                }
+                selectors.push(selector);
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+        return Ok(selectors);
+    };
+
+    if requested_branch_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let canonical_ids = requested_branch_ids
+        .iter()
+        .map(|branch_id| canonical_branch_id(branch_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let keys = canonical_ids
+        .iter()
+        .map(|branch_id| Key(branch_selector_key(*branch_id)))
+        .collect::<Vec<_>>();
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    if loaded.values.len() != keys.len() {
+        return Err(corruption("branch selector batch returned the wrong number of values").into());
+    }
+    let mut selectors = Vec::new();
+    for ((canonical_id, key), value) in canonical_ids.into_iter().zip(keys).zip(loaded.values) {
+        let Some(value) = value else {
+            continue;
+        };
+        let bytes = match value {
+            ProjectedValue::FullValue(bytes) => bytes,
+            ProjectedValue::KeyOnly => {
+                return Err(corruption(
+                    "ForkTree branch selector point read returned key-only data",
+                )
+                .into());
+            }
+        };
+        let selector = BranchSelectorV1::decode(&bytes)?;
+        if selector.branch_id != canonical_id || branch_selector_key(selector.branch_id) != key.0 {
+            return Err(
+                corruption("ForkTree branch selector key and embedded branch ID differ").into(),
+            );
+        }
+        selectors.push(selector);
+    }
+    Ok(selectors)
+}
+
+fn required_scan_object(
+    objects: &BTreeMap<ObjectId, bytes::Bytes>,
+    id: ObjectId,
+) -> Result<&bytes::Bytes, StorageError> {
+    objects
+        .get(&id)
+        .ok_or_else(|| corruption(format!("selected branch object {id} is absent")))
 }
 
 /// Loads exact public commit facts from the single authenticated
@@ -1442,7 +1769,6 @@ where
                 encoded_key: key.clone(),
                 value,
                 source,
-                #[cfg(test)]
                 view_instance_id: view.view_instance_id(),
             })
         })
@@ -1563,7 +1889,6 @@ where
             encoded_key,
             value,
             source,
-            #[cfg(test)]
             view_instance_id: view.view_instance_id(),
         })
         .collect())
@@ -1745,6 +2070,7 @@ where
                 snapshot_content,
                 metadata: value.metadata,
                 deleted,
+                blob_manifest_object_ids: value.blob_manifest_object_ids,
             })
         })
         .collect()

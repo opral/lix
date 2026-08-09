@@ -8246,19 +8246,18 @@ where
                 return Ok(Vec::new());
             }
             let mut rows = Vec::new();
-            for (branch_id, commit_id) in crate::forktree::scan_branch_heads(&self.forktree).await?
+            for row in
+                crate::forktree::load_branch_heads_with_metadata(&self.forktree, None).await?
             {
-                let entity_pk = EntityPk::uuid_from_canonical(&branch_id).map_err(|error| {
+                let entity_pk = EntityPk::uuid_from_canonical(&row.branch_id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_STORAGE_ERROR,
                         format!("authenticated branch ID is not a UUID: {error}"),
                     )
                 })?;
-                let metadata =
-                    crate::forktree::load_branch_ref_metadata(&self.forktree, &branch_id).await?;
                 let snapshot = serde_json::json!({
-                    "id": branch_id,
-                    "commit_id": commit_id.to_string(),
+                    "id": row.branch_id,
+                    "commit_id": row.head_commit_id.to_string(),
                 });
                 rows.push(MaterializedLiveStateRow {
                     entity_pk,
@@ -8277,10 +8276,10 @@ where
                     metadata: None,
                     deleted: false,
                     created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-                    updated_at: metadata.updated_at,
+                    updated_at: row.updated_at,
                     global: true,
-                    change_id: Some(metadata.change_id),
-                    commit_id: Some(commit_id),
+                    change_id: Some(row.change_id),
+                    commit_id: Some(row.head_commit_id),
                     untracked: true,
                     branch_id: Arc::from(GLOBAL_BRANCH_ID),
                 });
@@ -8309,28 +8308,29 @@ where
         ) {
             return Ok(Vec::new());
         }
-        let branch_ids = if request.filter.branch_ids.is_empty() {
-            crate::forktree::scan_branch_heads(&self.forktree)
-                .await?
-                .into_iter()
-                .map(|(branch_id, _)| branch_id)
-                .collect::<Vec<_>>()
+        let requested_branch_ids = if request.filter.branch_ids.is_empty() {
+            None
         } else {
-            request.filter.branch_ids.clone()
+            Some(request.filter.branch_ids.as_slice())
         };
-        let mut heads = Vec::with_capacity(branch_ids.len());
-        for branch_id in branch_ids {
-            let head = crate::forktree::load_branch_head(&self.forktree, &branch_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::branch_not_found(
+        let branch_rows =
+            crate::forktree::load_branch_heads_with_metadata(&self.forktree, requested_branch_ids)
+                .await?;
+        if let Some(requested) = requested_branch_ids {
+            for branch_id in requested {
+                if !branch_rows.iter().any(|row| row.branch_id == *branch_id) {
+                    return Err(LixError::branch_not_found(
                         branch_id.clone(),
                         "scan ForkTree derived commit surface",
                         "branch head",
-                    )
-                })?;
-            heads.push((branch_id, head));
+                    ));
+                }
+            }
         }
+        let heads = branch_rows
+            .into_iter()
+            .map(|row| (row.branch_id, row.head_commit_id))
+            .collect::<Vec<_>>();
 
         let mut rows = Vec::new();
         let mut graph = self.graph.lock().await;
