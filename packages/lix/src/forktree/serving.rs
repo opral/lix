@@ -8,18 +8,19 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::codec::corruption;
 use super::model::{
-    BranchSelectorV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, branch_selector_key, global_selector_key,
+    BlobChunkV1, BranchSelectorV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
+    ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1,
+    GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::ObjectId;
 use super::state::{
-    HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
+    HistoricalStateDiffEntry, HistoricalStateRow, StateCell, StateValue, decode_state_key,
+    decode_state_value,
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
-    apply_ordered_mutations_idempotent_inserts, lookup_on_read, scan_bounded_page_on_read,
-    scan_page_on_read, validate_root_on_read,
+    apply_ordered_mutations_idempotent_inserts, diff_ordered_tree_on_read, lookup_on_read,
+    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -1686,6 +1687,299 @@ where
             })
         })
         .collect()
+}
+
+/// Diffs two authenticated historical state overlays without scanning either
+/// endpoint. Ordered-tree object IDs prune equal subtrees; only changed leaf
+/// keys are decoded and projected. Commit envelopes/catalog/topology and every
+/// changed row's ChangeCatalog identity are still authenticated, while
+/// unrelated commit members are not eagerly traversed.
+pub(crate) async fn diff_state_rows_between_commits<R>(
+    read: &R,
+    before: crate::changelog::CommitId,
+    after: crate::changelog::CommitId,
+    include_global: bool,
+) -> Result<Vec<HistoricalStateDiffEntry>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    diff_state_rows_between_commits_impl(read, before, after, include_global, true).await
+}
+
+/// Diffs the same authenticated roots for the working-diff projection. The
+/// result deliberately ignores commit/change provenance when the materialized
+/// payload is equal, so a value reverted to its checkpoint payload disappears
+/// from the user-facing working diff.
+pub(crate) async fn diff_state_rows_for_working_diff<R>(
+    read: &R,
+    before: crate::changelog::CommitId,
+    after: crate::changelog::CommitId,
+    include_global: bool,
+) -> Result<Vec<HistoricalStateDiffEntry>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    diff_state_rows_between_commits_impl(read, before, after, include_global, false).await
+}
+
+async fn diff_state_rows_between_commits_impl<R>(
+    read: &R,
+    before: crate::changelog::CommitId,
+    after: crate::changelog::CommitId,
+    include_global: bool,
+    identity_aware: bool,
+) -> Result<Vec<HistoricalStateDiffEntry>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let before_commit = load_diff_commit(read, before).await?;
+    let after_commit = load_diff_commit(read, after).await?;
+    let mut roots = BTreeMap::<
+        Vec<u8>,
+        (
+            Option<StateValue>,
+            Option<StateValue>,
+            Option<StateValue>,
+            Option<StateValue>,
+        ),
+    >::new();
+
+    for (before_root, after_root, is_global) in [
+        (
+            before_commit.global_state_root,
+            after_commit.global_state_root,
+            true,
+        ),
+        (
+            before_commit.local_state_root,
+            after_commit.local_state_root,
+            false,
+        ),
+    ] {
+        for (key, before_value, after_value) in
+            diff_ordered_tree_on_read(before_root, after_root, "state", read).await?
+        {
+            let before_value = before_value
+                .as_deref()
+                .map(decode_state_value_storage)
+                .transpose()?;
+            let after_value = after_value
+                .as_deref()
+                .map(decode_state_value_storage)
+                .transpose()?;
+            if is_global
+                && [before_value.as_ref(), after_value.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|value| matches!(value.cell, StateCell::Tombstone))
+            {
+                return Err(corruption("global state tree contains a tombstone").into());
+            }
+            let entry = roots.entry(key).or_insert((None, None, None, None));
+            if is_global {
+                entry.0 = before_value;
+                entry.1 = after_value;
+            } else {
+                entry.2 = before_value;
+                entry.3 = after_value;
+            }
+        }
+    }
+
+    let mut rows =
+        BTreeMap::<Vec<u8>, (Option<HistoricalStateRow>, Option<HistoricalStateRow>)>::new();
+    for (encoded_key, (global_before, global_after, local_before, local_after)) in roots {
+        let key = decode_state_key(&encoded_key)?;
+        let before = local_before
+            .map(|value| (value, StateSource::Branch))
+            .or_else(|| global_before.map(|value| (value, StateSource::Global)));
+        let after = local_after
+            .map(|value| (value, StateSource::Branch))
+            .or_else(|| global_after.map(|value| (value, StateSource::Global)));
+        rows.insert(
+            encoded_key,
+            (
+                before.map(|(value, source)| historical_state_row(key.clone(), value, source)),
+                after.map(|(value, source)| historical_state_row(key.clone(), value, source)),
+            ),
+        );
+    }
+
+    let mut change_ids = BTreeSet::new();
+    for (before, after) in rows.values() {
+        for row in [before.as_ref(), after.as_ref()].into_iter().flatten() {
+            change_ids.insert(row.change_id);
+        }
+    }
+    if !change_ids.is_empty() {
+        let ids = change_ids.into_iter().collect::<Vec<_>>();
+        let records = load_change_records(read, &ids).await?;
+        let mut authenticated = BTreeMap::new();
+        for (id, record) in ids.into_iter().zip(records) {
+            let record = record.ok_or_else(|| {
+                corruption("changed historical state row has no authenticated Change")
+            })?;
+            authenticated.insert(id, record);
+        }
+        for (before, after) in rows.values() {
+            for row in [before.as_ref(), after.as_ref()].into_iter().flatten() {
+                let record = authenticated.get(&row.change_id).ok_or_else(|| {
+                    corruption("changed historical state row lost its authenticated Change")
+                })?;
+                validate_historical_state_row(read, row, record).await?;
+            }
+        }
+    }
+
+    Ok(rows
+        .into_values()
+        .filter_map(|(before, after)| {
+            let changed = if identity_aware {
+                historical_state_payloads_differ(before.as_ref(), after.as_ref())
+            } else {
+                historical_state_content_differ(before.as_ref(), after.as_ref())
+            };
+            if !changed {
+                return None;
+            }
+            let before = before.filter(|row| include_global || !row.global);
+            let after = after.filter(|row| include_global || !row.global);
+            (before.is_some() || after.is_some())
+                .then_some(HistoricalStateDiffEntry { before, after })
+        })
+        .collect())
+}
+
+async fn load_diff_commit<R>(
+    read: &R,
+    id: crate::changelog::CommitId,
+) -> Result<CommitObjectV1, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let repository = load_repository_root(read).await?;
+    let catalog_id = CommitId::from_bytes(*id.as_uuid().as_bytes());
+    let entry =
+        load_required_commit_catalog_entry(read, repository.commit_catalog_root, catalog_id)
+            .await?;
+    let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    validate_commit_catalog_identity(
+        read,
+        repository.commit_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit).await?;
+    Ok(commit)
+}
+
+fn historical_state_row(
+    key: super::state::StateKey,
+    value: StateValue,
+    source: StateSource,
+) -> HistoricalStateRow {
+    let (snapshot_content, deleted) = match value.cell {
+        StateCell::Value(snapshot) => (Some(snapshot), false),
+        StateCell::Null => (None, false),
+        StateCell::Tombstone => (None, true),
+    };
+    HistoricalStateRow {
+        key,
+        global: source == StateSource::Global,
+        change_id: value.change_id,
+        commit_id: value.commit_id,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        snapshot_content,
+        metadata: value.metadata,
+        deleted,
+        blob_manifest_object_ids: value.blob_manifest_object_ids,
+    }
+}
+
+fn historical_state_payloads_differ(
+    before: Option<&HistoricalStateRow>,
+    after: Option<&HistoricalStateRow>,
+) -> bool {
+    match (before, after) {
+        (Some(left), Some(right)) => {
+            left.key != right.key
+                || left.change_id != right.change_id
+                || left.commit_id != right.commit_id
+                || left.deleted != right.deleted
+                || left.snapshot_content != right.snapshot_content
+                || left.metadata != right.metadata
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
+}
+
+fn historical_state_content_differ(
+    before: Option<&HistoricalStateRow>,
+    after: Option<&HistoricalStateRow>,
+) -> bool {
+    match (before, after) {
+        (Some(left), Some(right)) => {
+            left.key != right.key
+                || left.deleted != right.deleted
+                || left.snapshot_content != right.snapshot_content
+                || left.metadata != right.metadata
+                || (left.created_at == right.created_at
+                    && (left.change_id != right.change_id || left.commit_id != right.commit_id))
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
+}
+
+async fn json_slot_matches_state_content<R>(
+    read: &R,
+    content: Option<&str>,
+    expected: &crate::json_store::JsonSlot,
+) -> Result<bool, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    match expected {
+        crate::json_store::JsonSlot::None => Ok(content.is_none()),
+        crate::json_store::JsonSlot::Inline(expected) => Ok(content == Some(expected.as_ref())),
+        crate::json_store::JsonSlot::Ref(_) => Ok(content
+            .map(crate::json_store::JsonSlot::from_json)
+            .is_some_and(|actual| actual == *expected)),
+        crate::json_store::JsonSlot::ForkTreeObject(object_id) => {
+            let object_id = ObjectId::from_bytes(*object_id);
+            let bytes = super::view::load_object_bytes(read, object_id).await?;
+            let chunk = BlobChunkV1::decode(object_id, &bytes)?;
+            Ok(content.is_some_and(|content| chunk.bytes.as_ref() == content.as_bytes()))
+        }
+    }
+}
+
+pub(crate) async fn validate_historical_state_row<R>(
+    read: &R,
+    row: &HistoricalStateRow,
+    record: &crate::changelog::ChangeRecord,
+) -> Result<(), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if record.schema_key != row.key.schema_key
+        || record.file_id != row.key.file_id
+        || record.entity_pk != row.key.entity_pk
+        || record.created_at != row.created_at
+        || !json_slot_matches_state_content(read, row.snapshot_content.as_deref(), &record.snapshot)
+            .await?
+        || !json_slot_matches_state_content(read, row.metadata.as_deref(), &record.metadata).await?
+    {
+        return Err(corruption(
+            "changed historical state row does not authenticate its Change payload",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) async fn edit_state_tree<R>(
