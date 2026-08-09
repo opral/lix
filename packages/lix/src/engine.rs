@@ -4,11 +4,10 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
-use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
-use crate::live_state::LiveStateRowRequest;
+use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{
@@ -157,13 +156,9 @@ where
         )?;
 
         let tracked_state = Arc::new(TrackedStateContext::new());
-        let commit_graph = CommitGraphContext::new();
-        let live_state = Arc::new(LiveStateContext::new(
-            tracked_state.as_ref().clone(),
-            commit_graph,
-        ));
+        let live_state = Arc::new(LiveStateContext::new());
         let branch_ctx = Arc::new(BranchContext::new());
-        assert_initialized(storage.clone(), live_state.as_ref()).await?;
+        assert_initialized(storage.clone()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
         // execution-scoped SQL context, optionally wrapped by a transaction
@@ -330,22 +325,30 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let row = self
-            .live_state
-            .reader(read)
-            .load_row(&LiveStateRowRequest {
-                schema_key: "lix_account".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: account_pk,
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ACCOUNT_NOT_FOUND",
-                    format!("active account '{account_id}' does not exist"),
-                )
-            })?;
+        let row = crate::live_state::scan_forktree_facade(
+            &crate::forktree::ForkTreeReadFacade::new(read),
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["lix_account".to_string()],
+                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
+                    entity_pks: vec![account_pk],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?
+        .into_rows()
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ACCOUNT_NOT_FOUND",
+                format!("active account '{account_id}' does not exist"),
+            )
+        })?;
         let snapshot = row.snapshot_content.ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -370,7 +373,6 @@ where
 
 async fn assert_initialized<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
-    live_state: &LiveStateContext,
 ) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -382,16 +384,25 @@ where
         // spaces keep their physical IDs across hard layout cuts, so an old
         // group value could otherwise be decoded before we reject it.
         crate::init::RepositoryProtocolStatus::Current => {
-            let reader = live_state.reader(read);
-            let initialized = reader
-                .load_row(&LiveStateRowRequest {
-                    schema_key: "lix_key_value".to_string(),
-                    branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    entity_pk: EntityPk::single("lix_id"),
-                    file_id: NullableKeyFilter::Null,
-                })
-                .await?
-                .is_some();
+            let initialized = crate::live_state::scan_forktree_facade(
+                &crate::forktree::ForkTreeReadFacade::new(read),
+                &LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: vec!["lix_key_value".to_string()],
+                        branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
+                        entity_pks: vec![EntityPk::single("lix_id")],
+                        file_ids: vec![NullableKeyFilter::Null],
+                        ..Default::default()
+                    },
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .into_rows()
+            .into_iter()
+            .next()
+            .is_some();
             if initialized {
                 Ok(())
             } else {

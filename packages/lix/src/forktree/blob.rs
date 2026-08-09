@@ -5,9 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
 
-use crate::storage::{
-    CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, StorageError,
-};
+use crate::storage::StorageError;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::codec::corruption;
@@ -18,10 +16,10 @@ use super::model::{
 use super::object::ObjectId;
 use super::state::{StateCell, StateKey};
 use super::tree::{
-    ImmutableObjectSet, ReceiptTreeEdit, ReceiptTreeRoot, empty_receipt_tree,
-    insert_receipt_part_on_read, lookup_on_read, scan_page_on_read, validate_receipt_root_on_read,
+    ImmutableObjectSet, ReceiptTreeEdit, ReceiptTreeRoot, empty_receipt_tree, scan_page_on_read,
+    validate_receipt_root_on_read,
 };
-use super::view::{CoherentView, SELECTOR_SPACE, load_object_bytes, load_object_map};
+use super::view::{CoherentView, load_object_bytes, load_object_map};
 
 const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const UPLOAD_PART_BYTES: u64 = CANONICAL_BLOB_CHUNK_BYTES as u64 * 16;
@@ -32,7 +30,7 @@ const UPLOAD_PART_WINDOW: u64 = 4;
 /// O(chunk-count) hashes; the result is copied into the manifest only as an
 /// integrity claim checked against the selected state owner.
 #[derive(Default)]
-struct CanonicalBlobIdBuilder {
+pub(super) struct CanonicalBlobIdBuilder {
     total_size: u64,
     pending: Vec<u8>,
     chunks: Vec<(crate::binary_cas::ChunkHash, u64)>,
@@ -377,14 +375,7 @@ where
     where
         R: Sync,
     {
-        load_blob_bytes_many_on_read(
-            self.storage_read(),
-            self.branch_id(),
-            self.view_id(),
-            self.view_instance_id(),
-            refs,
-        )
-        .await
+        self.load_blob_bytes_many_on_view(refs).await
     }
 
     /// Loads payload ranges on the same StorageRead that authenticated their
@@ -396,21 +387,14 @@ where
     where
         R: Sync,
     {
-        load_blob_ranges_many_on_read(
-            self.storage_read(),
-            self.branch_id(),
-            self.view_id(),
-            self.view_instance_id(),
-            requests,
-        )
-        .await
+        self.load_blob_ranges_many_on_view(requests).await
     }
 }
 
 /// Loads complete payloads through state-authenticated manifest edges. One
 /// object batch authenticates all manifests and one batch authenticates all
 /// distinct chunks, so adapter calls scale with object levels rather than rows.
-async fn load_blob_bytes_many_on_read<R>(
+pub(super) async fn load_blob_bytes_many_on_read<R>(
     read: &R,
     branch_id: CanonicalBranchId,
     view_id: [u8; 32],
@@ -591,7 +575,7 @@ fn bind_historical_state_blob_ref(
 
 /// Loads only chunks intersecting each requested range while preserving the
 /// same authenticated state/manifest ownership as full reads.
-async fn load_blob_ranges_many_on_read<R>(
+pub(super) async fn load_blob_ranges_many_on_read<R>(
     read: &R,
     branch_id: CanonicalBranchId,
     view_id: [u8; 32],
@@ -881,27 +865,8 @@ where
         binding.declared_total_size,
         binding.declared_final_hash,
     )?;
-    let selector_key = [Key(upload_selector_key(&upload_id)?)];
-    let loaded = view
-        .storage_read()
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &selector_key,
-            opts: GetOptions {
-                projection: CoreProjection::FullValue,
-            },
-        }])
-        .await?;
-    let raw_selector = match loaded.values.as_slice() {
-        [None] => None,
-        [Some(ProjectedValue::FullValue(bytes))] => Some(bytes.clone()),
-        [Some(ProjectedValue::KeyOnly)] => {
-            return Err(corruption(
-                "upload selector point read returned key-only data",
-            ));
-        }
-        _ => return Err(corruption("upload selector read cardinality is invalid")),
-    };
+    let selector_key = upload_selector_key(&upload_id)?;
+    let raw_selector = view.load_selector_value(&selector_key).await?;
 
     let (root, prior_progress, selector_generation) = if let Some(raw) = &raw_selector {
         let selector = UploadSelectorV1::decode(raw)?;
@@ -910,23 +875,19 @@ where
                 "upload selector binding does not match this request",
             ));
         }
-        let progress_bytes =
-            load_object_bytes(view.storage_read(), selector.progress_object_id).await?;
+        let progress_bytes = view.load_object_bytes(selector.progress_object_id).await?;
         let progress = UploadProgressV1::decode(selector.progress_object_id, &progress_bytes)?;
         if progress.upload_id != upload_id || progress.binding_digest != expected_binding {
             return Err(corruption(
                 "upload progress binding does not match its selector",
             ));
         }
-        validate_receipt_root_on_read(
-            ReceiptTreeRoot {
-                object_id: progress.receipt_tree_root,
-                completed_part_count: progress.completed_part_count,
-                received_bytes: progress.received_bytes,
-                contiguous_prefix_bytes: progress.contiguous_prefix_bytes,
-            },
-            view.storage_read(),
-        )
+        view.validate_receipt_root(ReceiptTreeRoot {
+            object_id: progress.receipt_tree_root,
+            completed_part_count: progress.completed_part_count,
+            received_bytes: progress.received_bytes,
+            contiguous_prefix_bytes: progress.contiguous_prefix_bytes,
+        })
         .await?;
         (
             ReceiptTreeRoot {
@@ -969,13 +930,13 @@ where
     let (part_object_id, _) = part.encode()?;
 
     let (already_present, receipt, progress) = if let Some(ref prior) = prior_progress {
-        let existing = lookup_on_read(
-            prior.receipt_tree_root,
-            "receipt",
-            &part_number.to_be_bytes(),
-            view.storage_read(),
-        )
-        .await?;
+        let existing = view
+            .lookup_tree_value(
+                prior.receipt_tree_root,
+                "receipt",
+                &part_number.to_be_bytes(),
+            )
+            .await?;
         if let Some(existing) = existing {
             let existing_id = ObjectId::from_bytes(
                 existing
@@ -983,7 +944,7 @@ where
                     .try_into()
                     .map_err(|_| corruption("receipt part edge is not an object ID"))?,
             );
-            let existing_bytes = load_object_bytes(view.storage_read(), existing_id).await?;
+            let existing_bytes = view.load_object_bytes(existing_id).await?;
             let existing_part = UploadPartV1::decode(existing_id, &existing_bytes)?;
             if existing_part != part {
                 return Err(corruption("upload part was replayed with different bytes"));
@@ -999,14 +960,9 @@ where
                 prior.clone(),
             )
         } else {
-            let edit = insert_receipt_part_on_read(
-                root,
-                part_object_id,
-                &part,
-                view.storage_read(),
-                &ImmutableObjectSet::default(),
-            )
-            .await?;
+            let edit = view
+                .insert_receipt_part(root, part_object_id, &part, &ImmutableObjectSet::default())
+                .await?;
             let progress = UploadProgressV1 {
                 upload_id: upload_id.clone(),
                 binding_digest: expected_binding,
@@ -1026,14 +982,9 @@ where
     } else {
         let empty = empty_receipt_tree()?;
         let mut overlay = empty.objects.clone();
-        let edit = insert_receipt_part_on_read(
-            empty.root,
-            part_object_id,
-            &part,
-            view.storage_read(),
-            &overlay,
-        )
-        .await?;
+        let edit = view
+            .insert_receipt_part(empty.root, part_object_id, &part, &overlay)
+            .await?;
         let progress = UploadProgressV1 {
             upload_id: upload_id.clone(),
             binding_digest: expected_binding,
@@ -1132,14 +1083,14 @@ where
     if let Some(prior_root) = prior_root {
         let mut start_after = None;
         loop {
-            let page = scan_page_on_read(
-                prior_root.object_id,
-                "receipt",
-                start_after.as_deref(),
-                super::tree::RECEIPT_TREE_LEAF_ENTRIES,
-                view.storage_read(),
-            )
-            .await?;
+            let page = view
+                .scan_tree_page(
+                    prior_root.object_id,
+                    "receipt",
+                    start_after.as_deref(),
+                    super::tree::RECEIPT_TREE_LEAF_ENTRIES,
+                )
+                .await?;
             if page.is_empty() {
                 break;
             }
@@ -1155,7 +1106,7 @@ where
                         .try_into()
                         .map_err(|_| corruption("receipt value is not an object ID"))?,
                 );
-                let part_bytes = load_object_bytes(view.storage_read(), part_id).await?;
+                let part_bytes = view.load_object_bytes(part_id).await?;
                 let part = UploadPartV1::decode(part_id, &part_bytes)?;
                 if parts.insert(part_number, part).is_some() {
                     return Err(corruption("receipt tree contains a duplicate part number"));
@@ -1188,8 +1139,7 @@ where
                     })
                     .ok_or_else(|| corruption("new upload chunk is absent"))?
             } else {
-                let bytes =
-                    load_object_bytes(view.storage_read(), chunk_ref.chunk_object_id).await?;
+                let bytes = view.load_object_bytes(chunk_ref.chunk_object_id).await?;
                 BlobChunkV1::decode(chunk_ref.chunk_object_id, &bytes)?.bytes
             };
             if bytes.len() as u64 != chunk_ref.declared_len {
@@ -1234,27 +1184,10 @@ pub(crate) async fn prepare_upload_completion<R>(
 where
     R: StorageAdapterRead,
 {
-    let selector_key = [Key(upload_selector_key(upload_id)?)];
-    let loaded = view
-        .storage_read()
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &selector_key,
-            opts: GetOptions {
-                projection: CoreProjection::FullValue,
-            },
-        }])
-        .await?;
-    let raw_upload_selector = match loaded.values.as_slice() {
-        [Some(ProjectedValue::FullValue(bytes))] => bytes.clone(),
-        [Some(ProjectedValue::KeyOnly)] => {
-            return Err(corruption(
-                "upload selector point read returned key-only data",
-            ));
-        }
-        [None] => return Err(corruption("upload selector is absent")),
-        _ => return Err(corruption("upload selector read cardinality is invalid")),
-    };
+    let raw_upload_selector = view
+        .load_selector_value(&upload_selector_key(upload_id)?)
+        .await?
+        .ok_or_else(|| corruption("upload selector is absent"))?;
     let selector = UploadSelectorV1::decode(&raw_upload_selector)?;
     if &selector.upload_id != upload_id {
         return Err(corruption(
@@ -1273,8 +1206,7 @@ where
             "upload completion binding does not match its receipt",
         ));
     }
-    let progress_bytes =
-        load_object_bytes(view.storage_read(), selector.progress_object_id).await?;
+    let progress_bytes = view.load_object_bytes(selector.progress_object_id).await?;
     let progress = UploadProgressV1::decode(selector.progress_object_id, &progress_bytes)?;
     if progress.upload_id != selector.upload_id
         || progress.binding_digest != selector.binding_digest
@@ -1297,7 +1229,7 @@ where
         received_bytes: progress.received_bytes,
         contiguous_prefix_bytes: progress.contiguous_prefix_bytes,
     };
-    validate_receipt_root_on_read(receipt_root, view.storage_read()).await?;
+    view.validate_receipt_root(receipt_root).await?;
     let mut ordered_chunks = Vec::new();
     let mut final_hasher = blake3::Hasher::new();
     let mut semantic_id_builder = CanonicalBlobIdBuilder::default();
@@ -1305,14 +1237,14 @@ where
     let mut part_count = 0_u64;
     let mut start_after: Option<Vec<u8>> = None;
     loop {
-        let page = scan_page_on_read(
-            receipt_root.object_id,
-            "receipt",
-            start_after.as_deref(),
-            super::tree::RECEIPT_TREE_LEAF_ENTRIES,
-            view.storage_read(),
-        )
-        .await?;
+        let page = view
+            .scan_tree_page(
+                receipt_root.object_id,
+                "receipt",
+                start_after.as_deref(),
+                super::tree::RECEIPT_TREE_LEAF_ENTRIES,
+            )
+            .await?;
         if page.is_empty() {
             break;
         }
@@ -1328,7 +1260,7 @@ where
                     .try_into()
                     .map_err(|_| corruption("receipt value is not an object ID"))?,
             );
-            let part_bytes = load_object_bytes(view.storage_read(), part_id).await?;
+            let part_bytes = view.load_object_bytes(part_id).await?;
             let part = UploadPartV1::decode(part_id, &part_bytes)?;
             if part.upload_id != selector.upload_id
                 || part.part_number != part_number
@@ -1340,8 +1272,7 @@ where
             }
             let mut part_hasher = blake3::Hasher::new();
             for chunk_ref in &part.ordered_chunks {
-                authenticate_chunk(
-                    view.storage_read(),
+                view.authenticate_chunk(
                     chunk_ref,
                     &mut part_hasher,
                     &mut final_hasher,
@@ -1484,7 +1415,7 @@ where
     Ok(())
 }
 
-async fn authenticate_chunk<R>(
+pub(super) async fn authenticate_chunk<R>(
     read: &R,
     chunk_ref: &BlobChunkRefV1,
     part_hasher: &mut blake3::Hasher,

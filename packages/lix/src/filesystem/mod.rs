@@ -10,8 +10,8 @@ pub(crate) use self::descriptor_path::{DirectoryPathRecord, derive_directory_pat
 pub(crate) use self::path_index::{
     FilesystemPathEntry, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, FilesystemPathKind, FilesystemPathSelection,
-    UncachedFilesystemPathIndexReader, build_path_index, load_path_index_revision,
-    stage_path_index_revision,
+    ForkTreeFilesystemPathIndexReader, UncachedFilesystemPathIndexReader, build_path_index,
+    load_path_index_revision, stage_path_index_revision,
 };
 #[cfg(test)]
 pub(crate) use self::path_index::{full_rebuild_stats, reset_full_rebuild_stats};

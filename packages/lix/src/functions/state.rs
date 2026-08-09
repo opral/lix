@@ -1,12 +1,9 @@
 use crate::LixError;
 use crate::NullableKeyFilter;
-use crate::commit_graph::CommitGraphContext;
+use crate::forktree::ForkTreeReadFacade;
 use crate::functions::{DeterministicMode, DeterministicSequence};
-use crate::live_state::{
-    LiveStateContext, LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow,
-};
+use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use crate::tracked_state::TrackedStateContext;
 use bytes::Bytes;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
@@ -192,9 +189,10 @@ async fn untracked_precondition(
 async fn load_key_value_rows(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    let rows = LiveStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
-        .reader(read)
-        .scan_batch(&LiveStateScanRequest {
+    let forktree = ForkTreeReadFacade::new(read);
+    let rows = crate::live_state::scan_forktree_facade(
+        &forktree,
+        &LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
                 branch_ids: vec![crate::GLOBAL_BRANCH_ID.to_owned()],
@@ -204,9 +202,10 @@ async fn load_key_value_rows(
                 ..Default::default()
             },
             ..Default::default()
-        })
-        .await?
-        .into_rows();
+        },
+    )
+    .await?
+    .into_rows();
     let mut identities = BTreeSet::new();
     for row in &rows {
         if row.schema_key != KEY_VALUE_SCHEMA_KEY

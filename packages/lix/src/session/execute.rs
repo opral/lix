@@ -871,11 +871,12 @@ where
                 read_scope,
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                     let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                    let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
                     let ctx = SessionSqlExecutionContext {
                         active_branch_id: &active_branch_id,
                         active_account_id: self.active_account_id(),
                         read_store,
-                        live_state: Arc::clone(&self.live_state),
+                        forktree,
                         binary_cas: Arc::clone(&self.binary_cas),
                         branch_ctx: Arc::clone(&self.branch_ctx),
                         catalog_context: Arc::clone(&self.catalog_context),
@@ -1155,10 +1156,13 @@ where
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
                 let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
+                    Arc::new(forktree.clone());
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
+                    Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
+                        forktree.clone(),
+                    ));
                 let branch_ref: Arc<dyn BranchRefReader> =
                     Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                 let authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader> =
@@ -1974,11 +1978,12 @@ where
                 let file_view_collector =
                     acknowledge_file_views.then(sql2::SessionFileViews::default);
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
                     read_store,
-                    live_state: Arc::clone(&self.live_state),
+                    forktree,
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
@@ -2125,11 +2130,12 @@ where
                         Vec::new(),
                     ));
                 }
+                let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
                     read_store,
-                    live_state: Arc::clone(&self.live_state),
+                    forktree,
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
@@ -2298,12 +2304,15 @@ where
                 "lix.perf.public_read.active_branch"
             ))
             .await?;
+        let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
         if let Some(exact_filesystem_read) = exact_filesystem_read {
             let query = match exact_filesystem_read {
                 ExactFilesystemRead::RootFileListing => {
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
+                        forktree.clone(),
+                    ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store));
                     sql2::execute_exact_lix_file_root_listing(
@@ -2316,7 +2325,9 @@ where
                 ExactFilesystemRead::RootDirectoryListing => {
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
+                        forktree.clone(),
+                    ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store));
                     sql2::execute_exact_lix_directory_root_listing(
@@ -2328,10 +2339,12 @@ where
                 }
                 exact_filesystem_read => {
                     let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                        Arc::new(self.live_state.reader(read_store.clone()));
+                        Arc::new(forktree.clone());
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
+                        forktree.clone(),
+                    ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                     let authenticated_blob_reader: Arc<
@@ -2400,8 +2413,7 @@ where
                 file_view_mutations,
             ));
         }
-        let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-            Arc::new(self.live_state.reader(read_store.clone()));
+        let live_state: Arc<dyn crate::live_state::LiveStateReader> = Arc::new(forktree.clone());
         let runtime_functions = if has_durable_runtime_function {
             Some(FunctionContext::prepare(&read_store).await?)
         } else {
@@ -2421,7 +2433,7 @@ where
             active_branch_id: &active_branch_id,
             active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
-            live_state: Arc::clone(&self.live_state),
+            forktree: forktree.clone(),
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
             catalog_context: Arc::clone(&self.catalog_context),
@@ -2444,7 +2456,9 @@ where
         drop(ctx);
         if let Some(data_column_index) = late_file_content_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
+                Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
+                    forktree.clone(),
+                ));
             let branch_ref: Arc<dyn BranchRefReader> =
                 Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
             let authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader> =

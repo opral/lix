@@ -1795,20 +1795,19 @@ mod obsolete_benchmark_support {
     {
         use crate::live_state::LiveStateScanRequest;
 
-        let live_state = crate::live_state::LiveStateContext::new(
-            crate::tracked_state::TrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(),
-        );
-        let current_rows = live_state
-            .reader(read)
-            .scan_batch(&LiveStateScanRequest {
+        let forktree = crate::forktree::ForkTreeReadFacade::new(read);
+        let current_rows = crate::live_state::scan_forktree_facade(
+            &forktree,
+            &LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec!["lix_binary_blob_ref".to_owned()],
                     ..Default::default()
                 },
                 ..Default::default()
-            })
-            .await?;
+            },
+        )
+        .await?
+        .into_rows();
         let mut current_file_hashes = std::collections::BTreeSet::new();
         for row in current_rows.iter() {
             let Some(snapshot) = row.snapshot_content() else {

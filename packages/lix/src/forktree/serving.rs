@@ -1357,7 +1357,7 @@ where
         .await?
         .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
     let (source_commit_object_id, _) = source.encode()?;
-    let source_members = load_commit_members(view.storage_read(), &source).await?;
+    let source_members = view.load_commit_members(&source).await?;
     for (source_ordinal, source_member) in source_members.iter().copied().enumerate() {
         let change_object_id = source_member.change_object_id();
         let bytes = view.load_object_bytes(change_object_id).await?;
@@ -1365,17 +1365,16 @@ where
         if change.change_id() != change_id {
             continue;
         }
-        let value = lookup_on_read(
-            view.repository_root().change_catalog_root,
-            "change",
-            change_id.as_bytes(),
-            view.storage_read(),
-        )
-        .await?
-        .ok_or_else(|| corruption("selected Change has no ChangeCatalog introduction owner"))?;
+        let value = view
+            .lookup_tree_value(
+                view.repository_root().change_catalog_root,
+                "change",
+                change_id.as_bytes(),
+            )
+            .await?
+            .ok_or_else(|| corruption("selected Change has no ChangeCatalog introduction owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
-        validate_member_catalog_owner(
-            view.storage_read(),
+        view.validate_member_catalog_owner(
             view.repository_root().commit_catalog_root,
             source_commit_object_id,
             source.generation,
@@ -1424,24 +1423,13 @@ where
     let (global_root, local_root) = current_state_roots(view);
     let value_source = match local_root {
         Some(local_root) => {
-            state_point_on_read(
-                global_root,
-                local_root,
-                key,
-                include_tombstone,
-                view.storage_read(),
-            )
-            .await?
+            view.state_point_at_roots(global_root, local_root, key, include_tombstone)
+                .await?
         }
-        None => state_point_on_read(
-            global_root,
-            global_root,
-            key,
-            include_tombstone,
-            view.storage_read(),
-        )
-        .await?
-        .map(|(value, _)| (value, StateSource::Global)),
+        None => view
+            .state_point_at_roots(global_root, global_root, key, include_tombstone)
+            .await?
+            .map(|(value, _)| (value, StateSource::Global)),
     };
     let Some((value, source)) = value_source else {
         return Ok(None);
@@ -1496,16 +1484,16 @@ where
     R: StorageAdapterRead,
 {
     let (global_root, local_root) = current_state_roots(view);
-    let rows = state_range_on_roots(
-        global_root,
-        local_root,
-        view.storage_read(),
-        lower,
-        upper,
-        limit,
-        include_tombstones,
-    )
-    .await?;
+    let rows = view
+        .state_range_at_roots(
+            global_root,
+            local_root,
+            lower,
+            upper,
+            limit,
+            include_tombstones,
+        )
+        .await?;
     Ok(rows
         .into_iter()
         .map(|(encoded_key, value, source)| VisibleStateRow {
@@ -1939,13 +1927,13 @@ pub(crate) async fn load_commit<R>(
 where
     R: StorageAdapterRead,
 {
-    let Some(value) = lookup_on_read(
-        view.repository_root().commit_catalog_root,
-        "commit",
-        id.as_bytes(),
-        view.storage_read(),
-    )
-    .await?
+    let Some(value) = view
+        .lookup_tree_value(
+            view.repository_root().commit_catalog_root,
+            "commit",
+            id.as_bytes(),
+        )
+        .await?
     else {
         return Ok(None);
     };
@@ -1957,8 +1945,7 @@ where
             "CommitCatalog key does not match embedded CommitId",
         ));
     }
-    validate_retained_commit(
-        view.storage_read(),
+    view.validate_retained_commit(
         view.repository_root().commit_catalog_root,
         view.repository_root().change_catalog_root,
         entry.commit_object_id,
@@ -1975,13 +1962,13 @@ pub(crate) async fn load_change<R>(
 where
     R: StorageAdapterRead,
 {
-    let Some(value) = lookup_on_read(
-        view.repository_root().change_catalog_root,
-        "change",
-        id.as_bytes(),
-        view.storage_read(),
-    )
-    .await?
+    let Some(value) = view
+        .lookup_tree_value(
+            view.repository_root().change_catalog_root,
+            "change",
+            id.as_bytes(),
+        )
+        .await?
     else {
         return Ok(None);
     };
@@ -2001,14 +1988,9 @@ where
     let start_after = resume_token
         .map(|token| view.validate_resume_key(root, token))
         .transpose()?;
-    let rows = scan_page_on_read(
-        root,
-        "commit",
-        start_after.as_deref(),
-        page_size,
-        view.storage_read(),
-    )
-    .await?;
+    let rows = view
+        .scan_tree_page(root, "commit", start_after.as_deref(), page_size)
+        .await?;
     let mut entries = Vec::with_capacity(rows.len());
     for (key, value) in &rows {
         let id = CommitId::from_bytes(
@@ -2024,8 +2006,7 @@ where
                 "CommitCatalog page has a mismatched key/object ID",
             ));
         }
-        validate_retained_commit(
-            view.storage_read(),
+        view.validate_retained_commit(
             view.repository_root().commit_catalog_root,
             view.repository_root().change_catalog_root,
             entry.commit_object_id,
@@ -2053,14 +2034,9 @@ where
     let start_after = resume_token
         .map(|token| view.validate_resume_key(root, token))
         .transpose()?;
-    let rows = scan_page_on_read(
-        root,
-        "change",
-        start_after.as_deref(),
-        page_size,
-        view.storage_read(),
-    )
-    .await?;
+    let rows = view
+        .scan_tree_page(root, "change", start_after.as_deref(), page_size)
+        .await?;
     let mut entries = Vec::with_capacity(rows.len());
     for (key, value) in &rows {
         let id = ChangeId::from_bytes(
@@ -2125,7 +2101,7 @@ where
         ) => {
             let bytes = view.load_object_bytes(commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            let members = load_commit_members(view.storage_read(), &commit).await?;
+            let members = view.load_commit_members(&commit).await?;
             if members.get(ordinal as usize)
                 != Some(&CommitMemberV1::introduced(entry.change_object_id))
             {
@@ -2144,8 +2120,7 @@ where
                 ..
             },
         ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {
-            validate_retained_ref_change(
-                view.storage_read(),
+            view.validate_retained_ref_change(
                 view.repository_root().change_catalog_root,
                 entry.change_object_id,
                 &change,

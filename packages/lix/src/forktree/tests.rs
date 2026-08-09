@@ -119,7 +119,7 @@ where
 }
 
 #[test]
-fn topology_cache_is_private_and_inseparable_from_its_storage_read() {
+fn topology_cache_is_private_and_inseparable_from_its_storage_snapshot() {
     let serving = include_str!("serving.rs");
     let facade = include_str!("mod.rs");
     assert!(serving.contains("pub(crate) struct CommitTopologyReader<R>"));
@@ -237,7 +237,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
         },
     };
     super::serving::validate_member_catalog_owner(
-        view.storage_read(),
+        view.test_storage_read(),
         view.repository_root().commit_catalog_root,
         content_id(0xa1),
         2,
@@ -249,7 +249,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     .expect("older selected source is valid");
     assert!(
         super::serving::validate_member_catalog_owner(
-            view.storage_read(),
+            view.test_storage_read(),
             view.repository_root().commit_catalog_root,
             content_id(0xa1),
             1,
@@ -316,7 +316,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     };
     assert!(
         super::serving::validate_member_catalog_owner(
-            view.storage_read(),
+            view.test_storage_read(),
             remapped_catalog.root.object_id,
             content_id(0xa1),
             2,
@@ -330,7 +330,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     );
     assert!(
         super::serving::validate_member_catalog_owner(
-            view.storage_read(),
+            view.test_storage_read(),
             empty_catalog.root.object_id,
             content_id(0xa1),
             2,
@@ -807,7 +807,7 @@ async fn branch_transition<R: StorageAdapterRead>(
             semantic_commit.commit_id,
             CommitCatalogEntry { commit_object_id },
         )],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("commit catalog edit");
@@ -823,7 +823,7 @@ async fn branch_transition<R: StorageAdapterRead>(
                 },
             },
         )],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("change catalog edit");
@@ -931,7 +931,7 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
             StateTreeMutation::update(seed.state_keys[0].clone(), updated),
             StateTreeMutation::remove(local_d),
         ],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("update/remove path copy");
@@ -1138,7 +1138,7 @@ async fn path_copy_catalog_put_and_view_bound_resume_are_bounded() {
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         Vec::new(),
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("no-op state edit");
@@ -2472,7 +2472,7 @@ async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
     let selector_key = snapshot_selector_key(SnapshotRole::Checkpoint, checkpoint_id);
     let keys = [Key(selector_key)];
     let loaded = current
-        .storage_read()
+        .test_storage_read()
         .get_many(&[GetManyRequest {
             space: SELECTOR_SPACE,
             keys: &keys,
@@ -2490,14 +2490,14 @@ async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
     let commit_catalog_edit = retire_commit_catalog_entries(
         current.repository_root().commit_catalog_root,
         &[],
-        current.storage_read(),
+        current.test_storage_read(),
     )
     .await
     .expect("unchanged commit catalog");
     let change_catalog_edit = retire_change_catalog_entries(
         current.repository_root().change_catalog_root,
         &[],
-        current.storage_read(),
+        current.test_storage_read(),
     )
     .await
     .expect("unchanged change catalog");
@@ -2712,7 +2712,7 @@ async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
         edit_state_tree(
             view.branch_snapshot().local_state_root,
             vec![StateTreeMutation::remove(vec![0xff])],
-            view.storage_read(),
+            view.test_storage_read(),
         )
         .await
         .is_err(),
@@ -2735,7 +2735,7 @@ async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
                     },
                 ),
             ],
-            view.storage_read(),
+            view.test_storage_read(),
         )
         .await
         .is_err(),
@@ -2745,7 +2745,7 @@ async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
     let wrong_base = edit_state_tree(
         view.repository_root().global_state_root,
         Vec::new(),
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("wrong-base edit remains a valid standalone tree edit");
@@ -2763,7 +2763,7 @@ async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
     let wrong_commit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![StateTreeMutation::insert(key, value)],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("typed state edit");
@@ -2795,7 +2795,7 @@ async fn state_edit_rejects_unsorted_and_duplicate_encoded_keys() {
             StateTreeMutation::insert(z_key, z_value),
             StateTreeMutation::insert(a_key.clone(), a_value.clone()),
         ],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect_err("unsorted encoded mutations must fail closed");
@@ -2819,7 +2819,7 @@ async fn state_edit_rejects_unsorted_and_duplicate_encoded_keys() {
                 duplicate_value,
             ),
         ],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect_err("duplicate encoded mutations must fail closed");
@@ -2853,7 +2853,7 @@ async fn upload_abort_releases_receipt_closure_after_final_selector_move() {
         upload_selector_key(&upload.upload_id).expect("upload key")
     )];
     let loaded = view
-        .storage_read()
+        .test_storage_read()
         .get_many(&[GetManyRequest {
             space: SELECTOR_SPACE,
             keys: &keys,
@@ -3007,7 +3007,7 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
             StateTreeMutation::insert(transplanted_owner_key.clone(), transplanted_owner),
             StateTreeMutation::insert(valid_multichunk_key.clone(), valid_multichunk_owner),
         ],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("state edit");
@@ -3151,7 +3151,7 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     );
     let selector_keys = [Key(upload_selector_key(&upload.upload_id).expect("key"))];
     let selector = reopened
-        .storage_read()
+        .test_storage_read()
         .get_many(&[GetManyRequest {
             space: SELECTOR_SPACE,
             keys: &selector_keys,
@@ -3254,7 +3254,7 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         mutations,
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("duplicate-owner state edit");
@@ -3539,7 +3539,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![StateTreeMutation::insert(key, value)],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("state edit");
@@ -3578,14 +3578,14 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     let commit_catalog_edit = retire_commit_catalog_entries(
         view.repository_root().commit_catalog_root,
         &[],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("retire commit");
     let change_catalog_edit = retire_change_catalog_entries(
         view.repository_root().change_catalog_root,
         &[],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("retire changes");
@@ -3612,7 +3612,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     let key = snapshot_selector_key(SnapshotRole::Checkpoint, checkpoint_id);
     let keys = [Key(key)];
     let loaded = view
-        .storage_read()
+        .test_storage_read()
         .get_many(&[GetManyRequest {
             space: SELECTOR_SPACE,
             keys: &keys,
@@ -3630,14 +3630,14 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     let commit_catalog_edit = retire_commit_catalog_entries(
         view.repository_root().commit_catalog_root,
         &[CommitId::from_bytes(raw_id(0x80))],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("final commit retirement");
     let change_catalog_edit = retire_change_catalog_entries(
         view.repository_root().change_catalog_root,
         &[initial_ref_id, ChangeId::from_bytes(raw_id(0x81))],
-        view.storage_read(),
+        view.test_storage_read(),
     )
     .await
     .expect("final change retirement");

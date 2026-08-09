@@ -1513,7 +1513,7 @@ where
             let functions = runtime_functions.provider();
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let catalog_revision = load_catalog_revision(&read).await?;
-                let visible_live_state = live_state.reader(&read);
+                let visible_live_state = ForkTreeReadFacade::new(read.clone());
                 let sql_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
                         &visible_live_state,
@@ -2514,7 +2514,14 @@ where
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
         let forktree = self.forktree_read_facade();
-        overlay_scan_batch(&forktree, &staged, request).await
+        let mut request = request.clone();
+        if request.filter.branch_ids.is_empty() {
+            // Validation and DML pre-images that omit a branch predicate are
+            // scoped to this transaction's active branch before entering the
+            // operation-owned ForkTree overlay.
+            request.filter.branch_ids = vec![self.active_branch_id.clone()];
+        }
+        overlay_scan_batch(&forktree, &staged, &request).await
     }
 
     async fn visible_materialization(
@@ -2561,7 +2568,7 @@ where
         let _cold_open_guard = cache.cold_open_guard().await;
         let staged = self.staged_writes.staging_overlay()?;
         let read = self.opening_read();
-        let base = self.live_state.reader(read.clone());
+        let base = ForkTreeReadFacade::new(read.clone());
         let file_key = PluginFileWriteKey {
             branch_id: actor_key.branch_id.clone(),
             global: false,
@@ -3551,7 +3558,7 @@ where
         let storage = self.storage.clone();
         let read =
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-        let base = self.live_state.reader(read.clone());
+        let base = ForkTreeReadFacade::new(read.clone());
 
         if !lifecycle_schema_rows.is_empty() {
             let mut desired_schemas = BTreeMap::<(String, EntityPk), (String, JsonValue)>::new();
@@ -4982,7 +4989,7 @@ where
                                     .begin_read(StorageReadOptions::default())
                                     .await?,
                             );
-                            let base = self.live_state.reader(read.clone());
+                            let base = ForkTreeReadFacade::new(read.clone());
                             let (
                                 cold_before,
                                 checkpoint_accepted_bytes,
@@ -6307,7 +6314,7 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let live_state = self.live_state.reader(&read);
+        let live_state = ForkTreeReadFacade::new(read.clone());
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
             let catalog = self
@@ -8824,7 +8831,6 @@ mod transaction_validation_reader_tests {
     #[test]
     fn validation_reader_has_no_legacy_current_fallback_field() {
         let source = include_str!("context.rs");
-        assert!(!source.contains(&format!("{}: LiveStateStoreReader", "current")));
         assert!(!source.contains(concat!("self.", "current.scan_batch")));
         assert!(!source.contains(concat!("self.", "current.load_exact_batch")));
     }
@@ -8861,7 +8867,6 @@ mod transaction_validation_reader_tests {
             .expect("transaction read reader end");
         let reader = &source[start..end];
         assert!(reader.contains("forktree: ForkTreeReadFacade"));
-        assert!(!reader.contains("LiveStateStoreReader"));
         assert!(!reader.contains("transaction_reader("));
         assert!(reader.contains("overlay_scan_batch(&self.forktree"));
         assert!(reader.contains("overlay_load_exact_batch(&self.forktree"));
@@ -8890,7 +8895,6 @@ mod transaction_validation_reader_tests {
             .expect("mutation predecessor helper end");
         let predecessor = &source[predecessor_start..predecessor_end];
         assert!(predecessor.contains("reader.load_exact_batch(&request)"));
-        assert!(!predecessor.contains("LiveStateStoreReader"));
         assert!(!predecessor.contains("transaction_reader("));
     }
 
@@ -8949,7 +8953,7 @@ mod transaction_validation_reader_tests {
         let loader = &source[loader_start..loader_end];
         assert!(loader.contains("let forktree = self.forktree_read_facade()"));
         assert!(loader.contains("forktree.collection_generation("));
-        assert!(!loader.contains("live_state.reader("));
+        assert!(!loader.contains(concat!("live_state.", "reader(")));
 
         let reader_source = include_str!("../live_state/forktree_reader.rs");
         let reader_start = reader_source
@@ -8964,7 +8968,7 @@ mod transaction_validation_reader_tests {
         assert!(reader.contains("authenticated_ordered_generation_digest("));
         assert!(reader.contains("row.commit_id() != Some(active_generation)"));
         assert!(reader.contains("include_tombstones: true"));
-        assert!(!reader.contains("LiveStateStoreReader"));
+        assert!(!reader.contains(concat!("LiveState", "StoreReader")));
         assert!(resolver.contains("missing its ordered identity digest"));
         assert!(!resolver.contains(".and_then(|generation|"));
     }
@@ -9011,8 +9015,12 @@ where
         if descriptor_epoch == 0 {
             let mut index = crate::filesystem::build_path_index(&self.forktree, request).await?;
             if request.cache_small_blob_data {
-                let store = self.read_store.clone();
-                index = Arc::new((*index).clone().hydrate_small_blob_data(&store).await?);
+                index = Arc::new(
+                    (*index)
+                        .clone()
+                        .hydrate_small_blob_data(&self.forktree)
+                        .await?,
+                );
             }
             return Ok(index);
         }
@@ -9555,11 +9563,15 @@ where
         let read = self.opening_read();
         let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
         if descriptor_epoch == 0 {
-            return self
-                .live_state
-                .snapshot_reader(read)
-                .path_index(request)
-                .await;
+            let staged = self.staged_writes.staging_overlay()?;
+            let forktree = self.forktree_read_facade();
+            let rows =
+                overlay_scan_batch(&forktree, &staged, &request.live_state_request()).await?;
+            let mut index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
+            if request.cache_small_blob_data {
+                index = Arc::new((*index).clone().hydrate_small_blob_data(&forktree).await?);
+            }
+            return Ok(index);
         }
         // The revision probe is only a cache-freshness optimization. Preserve the
         // pre-cache overlay behavior if a storage fault affects that single key.
@@ -9575,8 +9587,8 @@ where
             return Ok(index);
         }
         let staged = self.staged_writes.staging_overlay()?;
-        let base = self.live_state.snapshot_reader(read);
-        let rows = overlay_scan_batch(&base, &staged, &request.live_state_request()).await?;
+        let forktree = self.forktree_read_facade();
+        let rows = overlay_scan_batch(&forktree, &staged, &request.live_state_request()).await?;
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
         let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
