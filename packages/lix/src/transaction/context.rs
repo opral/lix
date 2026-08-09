@@ -7326,12 +7326,15 @@ where
     }
 
     /// Creates a commit-graph reader over the same immutable read that opened
-    /// this transaction. The graph reader owns its positive topology cache and
-    /// cannot refresh the transaction's view.
+    /// this transaction. The graph reader is bound to the same operation-owned
+    /// ForkTree capability as SQL/live-state history and cannot refresh the
+    /// transaction's view or acquire a second facade.
     pub(crate) fn commit_graph_reader_on_opening_read(
         &self,
-    ) -> CommitGraphStoreReader<&SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
-        CommitGraphContext::new().reader(&self.opening_read)
+    ) -> CommitGraphStoreReader<
+        ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>>,
+    > {
+        CommitGraphContext::new().reader(self.opening_forktree.clone())
     }
 
     /// Applies a tracked-state transition resolved from two immutable commits.
@@ -7347,8 +7350,7 @@ where
         desired_commit_id: CommitId,
         keys: Vec<TrackedStateKey>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        let read = self.opening_read();
-        let facade = ForkTreeReadFacade::from_read_on_branch(read, &self.active_branch_id).await?;
+        let facade = self.opening_forktree.clone();
         self.execute_tracked_state_transition_with_facade(
             &facade,
             current_commit_id,
@@ -8182,7 +8184,7 @@ where
     }
 
     fn commit_graph(&self) -> Box<dyn crate::commit_graph::CommitGraphReader> {
-        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+        Box::new(CommitGraphContext::new().reader(self.forktree.clone()))
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
