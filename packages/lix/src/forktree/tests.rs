@@ -147,7 +147,7 @@ fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
     assert!(!blob.contains("fn canonical_blob_id"));
     let inline = publication
         .split_once("pub(crate) fn stage_inline_blob_payload")
-        .and_then(|(_, rest)| rest.split_once("pub(super) fn stage_json_payload"))
+        .and_then(|(_, rest)| rest.split_once("pub(crate) fn stage_json_payload"))
         .map(|(body, _)| body)
         .expect("inline publication body");
     assert!(inline.contains("semantic_id_builder.update_fixed_chunk(chunk_bytes)"));
