@@ -773,6 +773,7 @@ where
             ordinal,
             member,
             entry,
+            None,
         )
         .await?;
         let source_commit_id = match member.source() {
@@ -1196,6 +1197,7 @@ pub(super) async fn validate_member_catalog_owner<R>(
     target_ordinal: usize,
     member: CommitMemberV1,
     entry: ChangeCatalogEntry,
+    known_target_members: Option<&[CommitMemberV1]>,
 ) -> Result<(), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
@@ -1219,7 +1221,18 @@ where
                 &introduction,
             )
             .await?;
-            let introduction_members = load_commit_members(read, &introduction).await?;
+            let owned_introduction_members;
+            let introduction_members = if commit_object_id == target_commit_object_id {
+                if let Some(known_target_members) = known_target_members {
+                    known_target_members
+                } else {
+                    owned_introduction_members = load_commit_members(read, &introduction).await?;
+                    &owned_introduction_members
+                }
+            } else {
+                owned_introduction_members = load_commit_members(read, &introduction).await?;
+                &owned_introduction_members
+            };
             if introduction_members.get(ordinal as usize)
                 != Some(&CommitMemberV1::introduced(member.change_object_id()))
             {
@@ -1312,6 +1325,7 @@ where
             source_ordinal,
             source_member,
             entry,
+            None,
         )
         .await?;
         return Ok((
@@ -2128,6 +2142,7 @@ where
             ordinal,
             member,
             entry,
+            Some(&members),
         )
         .await?;
     }

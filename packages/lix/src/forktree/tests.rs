@@ -209,6 +209,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
         0,
         member,
         entry,
+        None,
     )
     .await
     .expect("older selected source is valid");
@@ -221,6 +222,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
             0,
             member,
             entry,
+            None,
         )
         .await
         .is_err(),
@@ -288,6 +290,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
             0,
             member,
             entry,
+            None,
         )
         .await
         .is_err(),
@@ -302,6 +305,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
             0,
             member,
             entry,
+            None,
         )
         .await
         .is_err(),
