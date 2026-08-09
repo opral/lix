@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 
 use crate::binary_cas::BlobId;
+use crate::common::LixTimestamp;
 use crate::storage::StorageError;
 
 use super::codec::{
@@ -655,6 +656,7 @@ pub(crate) enum ChangeObjectV1 {
     },
     BranchRef {
         change_id: ChangeId,
+        updated_at: LixTimestamp,
         branch_id: CanonicalBranchId,
         before_semantic_head_commit_object_id: Option<ObjectId>,
         after_semantic_head_commit_object_id: Option<ObjectId>,
@@ -709,6 +711,7 @@ impl ChangeObjectV1 {
                     encode_object_id_list(encoder, json_payload_object_ids)
                 }
                 Self::BranchRef {
+                    updated_at,
                     branch_id,
                     before_semantic_head_commit_object_id,
                     after_semantic_head_commit_object_id,
@@ -717,6 +720,7 @@ impl ChangeObjectV1 {
                     json_payload_object_ids,
                     ..
                 } => {
+                    encoder.u64(updated_at.packed());
                     encoder.fixed(branch_id.as_bytes());
                     encode_optional_id(encoder, *before_semantic_head_commit_object_id);
                     encode_optional_id(encoder, *after_semantic_head_commit_object_id);
@@ -747,6 +751,9 @@ impl ChangeObjectV1 {
                 let mut decoder = decode_object(id, ObjectDomain::BranchRefChange, bytes)?;
                 let value = Self::BranchRef {
                     change_id: ChangeId::from_bytes(decoder.fixed()?),
+                    updated_at: LixTimestamp::from_packed(decoder.u64()?).map_err(|error| {
+                        corruption(format!("invalid branch-ref updated_at: {error}"))
+                    })?,
                     branch_id: CanonicalBranchId::from_bytes(decoder.fixed()?),
                     before_semantic_head_commit_object_id: decode_optional_id(
                         &mut decoder,

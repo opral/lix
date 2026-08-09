@@ -514,6 +514,16 @@ impl CommitGraphLiveStateReader {
                 "id": head.branch_id,
                 "commit_id": head.commit_id.to_string(),
             });
+            let metadata = self
+                .branch_ref
+                .load_head_metadata(&head.branch_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "branch selector has no authenticated RefChange metadata",
+                    )
+                })?;
             rows.push(MaterializedLiveStateRow {
                 entity_pk,
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
@@ -531,9 +541,9 @@ impl CommitGraphLiveStateReader {
                 metadata: None,
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-                updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                updated_at: metadata.updated_at,
                 global: true,
-                change_id: None,
+                change_id: Some(metadata.change_id),
                 commit_id: Some(head.commit_id),
                 untracked: true,
                 branch_id: Arc::from(crate::GLOBAL_BRANCH_ID),

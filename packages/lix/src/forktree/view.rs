@@ -1053,7 +1053,9 @@ where
         ));
     }
     let Some(ref_id) = branch.latest_ref_change_object_id else {
-        return Ok(());
+        return Err(corruption(
+            "branch snapshot has no authenticated latest RefChange edge",
+        ));
     };
     let change = ChangeObjectV1::decode(ref_id, required_object(&objects, ref_id)?)?;
     let ChangeObjectV1::BranchRef {
