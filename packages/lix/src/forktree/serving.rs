@@ -21,7 +21,10 @@ use super::tree::{
     lookup_on_read, lookup_on_read_with_cache, scan_bounded_page_on_read, scan_page_on_read,
     validate_root_on_read,
 };
-use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
+use super::view::{
+    CoherentView, IdentityBoundRead, ReadIdentity, ReadIdentitySource, SELECTOR_SPACE,
+    open_coherent_view_on_read,
+};
 
 const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
@@ -81,8 +84,8 @@ where
 /// A retained-read-local authenticated member closure.  The read identity and
 /// the exact Commit object identity are part of the context so a caller cannot
 /// accidentally reuse a closure for another commit or another read view.
-pub(super) struct AuthenticatedMemberClosure<'a, R: ?Sized> {
-    read: &'a R,
+pub(super) struct AuthenticatedMemberClosure {
+    identity: ReadIdentity,
     commit_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     commit_id: CommitId,
@@ -93,10 +96,19 @@ pub(super) struct AuthenticatedMemberClosure<'a, R: ?Sized> {
     tree_cache: tokio::sync::Mutex<OrderedTreeReadCache>,
 }
 
-impl<'a, R: StorageAdapterRead + ?Sized> AuthenticatedMemberClosure<'a, R> {
+impl AuthenticatedMemberClosure {
+    fn check_identity(&self, identity: ReadIdentity) -> Result<(), StorageError> {
+        if self.identity != identity {
+            return Err(corruption(
+                "authenticated member closure is bound to another read view",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn members_for(
         &self,
-        read: &R,
+        identity: ReadIdentity,
         commit_object_id: ObjectId,
         commit_id: CommitId,
         generation: u64,
@@ -104,12 +116,10 @@ impl<'a, R: StorageAdapterRead + ?Sized> AuthenticatedMemberClosure<'a, R> {
         if self.commit_object_id != commit_object_id {
             return Ok(None);
         }
-        if !std::ptr::eq(self.read, read)
-            || self.commit_id != commit_id
-            || self.generation != generation
-        {
+        self.check_identity(identity)?;
+        if self.commit_id != commit_id || self.generation != generation {
             return Err(corruption(
-                "authenticated member closure is bound to another read or commit",
+                "authenticated member closure is bound to another commit",
             ));
         }
         Ok(Some(&self.members))
@@ -117,38 +127,43 @@ impl<'a, R: StorageAdapterRead + ?Sized> AuthenticatedMemberClosure<'a, R> {
 
     fn exact_commit(
         &self,
-        read: &R,
+        identity: ReadIdentity,
         commit_catalog_root: ObjectId,
         commit_object_id: ObjectId,
     ) -> Result<Option<&CommitObjectV1>, StorageError> {
         if self.commit_object_id != commit_object_id {
             return Ok(None);
         }
-        if !std::ptr::eq(self.read, read) || self.commit_catalog_root != commit_catalog_root {
+        self.check_identity(identity)?;
+        if self.commit_catalog_root != commit_catalog_root {
             return Err(corruption(
-                "authenticated member closure is bound to another read or commit",
+                "authenticated member closure is bound to another commit catalog",
             ));
         }
         Ok(Some(&self.commit))
     }
 
-    async fn validate_catalog_identity(
+    async fn validate_catalog_identity<R>(
         &self,
         read: &R,
+        identity: ReadIdentity,
         commit_catalog_root: ObjectId,
         commit_object_id: ObjectId,
         commit: &CommitObjectV1,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), StorageError>
+    where
+        R: StorageAdapterRead + ?Sized,
+    {
         if self.commit_catalog_root != commit_catalog_root
             || self.commit_object_id != commit_object_id
             || self.commit_id != commit.commit_id
             || self.generation != commit.generation
-            || !std::ptr::eq(self.read, read)
         {
             return Err(corruption(
                 "authenticated member closure identity context does not match",
             ));
         }
+        self.check_identity(identity)?;
         self.catalog_identity
             .get_or_try_init(|| async {
                 validate_commit_catalog_identity(
@@ -164,17 +179,23 @@ impl<'a, R: StorageAdapterRead + ?Sized> AuthenticatedMemberClosure<'a, R> {
     }
 }
 
-pub(super) async fn load_authenticated_member_closure<'a, R>(
-    read: &'a R,
+pub(super) async fn load_authenticated_member_closure<R>(
+    read: &R,
+    identity: ReadIdentity,
     commit_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     commit: &CommitObjectV1,
-) -> Result<AuthenticatedMemberClosure<'a, R>, StorageError>
+) -> Result<AuthenticatedMemberClosure, StorageError>
 where
-    R: StorageAdapterRead + ?Sized,
+    R: StorageAdapterRead + ReadIdentitySource + ?Sized,
 {
+    if read.read_identity() != identity {
+        return Err(corruption(
+            "authenticated member closure reader and identity do not match",
+        ));
+    }
     Ok(AuthenticatedMemberClosure {
-        read,
+        identity,
         commit_catalog_root,
         commit_object_id,
         commit_id: commit.commit_id,
@@ -200,11 +221,12 @@ fn validate_member_at_ordinal(
 
 async fn validate_member_at_ordinal_with_context<R>(
     read: &R,
+    identity: ReadIdentity,
     commit_object_id: ObjectId,
     commit: &CommitObjectV1,
     ordinal: u32,
     expected: CommitMemberV1,
-    context: Option<&AuthenticatedMemberClosure<'_, R>>,
+    context: Option<&AuthenticatedMemberClosure>,
     error: &'static str,
 ) -> Result<(), StorageError>
 where
@@ -212,7 +234,12 @@ where
 {
     if let Some(members) = context
         .map(|context| {
-            context.members_for(read, commit_object_id, commit.commit_id, commit.generation)
+            context.members_for(
+                identity,
+                commit_object_id,
+                commit.commit_id,
+                commit.generation,
+            )
         })
         .transpose()?
         .flatten()
@@ -627,8 +654,11 @@ where
         &commit,
     )
     .await?;
+    let identity =
+        ReadIdentity::for_raw_control(read, repository.commit_catalog_root, entry.commit_object_id);
     validate_retained_commit(
         read,
+        identity,
         repository.commit_catalog_root,
         repository.change_catalog_root,
         entry.commit_object_id,
@@ -944,8 +974,12 @@ where
     if commit.commit_id != commit_id {
         return Err(corruption("CommitCatalog key does not match Commit object").into());
     }
+    let identity =
+        ReadIdentity::for_raw_control(read, repository.commit_catalog_root, commit_object_id);
+    let bound_read = IdentityBoundRead::new(read, identity);
     let closure = load_authenticated_member_closure(
-        read,
+        &bound_read,
+        identity,
         repository.commit_catalog_root,
         commit_object_id,
         &commit,
@@ -953,6 +987,7 @@ where
     .await?;
     let validated_members = validate_retained_commit_with_context(
         read,
+        identity,
         repository.commit_catalog_root,
         repository.change_catalog_root,
         commit_object_id,
@@ -1013,8 +1048,11 @@ where
         &commit,
     )
     .await?;
+    let identity =
+        ReadIdentity::for_raw_control(read, repository.commit_catalog_root, entry.commit_object_id);
     validate_retained_commit(
         read,
+        identity,
         repository.commit_catalog_root,
         repository.change_catalog_root,
         entry.commit_object_id,
@@ -1410,13 +1448,14 @@ where
 
 pub(super) async fn validate_member_catalog_owner<R>(
     read: &R,
+    identity: ReadIdentity,
     commit_catalog_root: ObjectId,
     target_commit_object_id: ObjectId,
     target_generation: u64,
     target_ordinal: usize,
     member: CommitMemberV1,
     entry: ChangeCatalogEntry,
-    context: Option<&AuthenticatedMemberClosure<'_, R>>,
+    context: Option<&AuthenticatedMemberClosure>,
 ) -> Result<(), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
@@ -1433,11 +1472,12 @@ where
         } => {
             if let Some(context) = context {
                 if let Some(introduction) =
-                    context.exact_commit(read, commit_catalog_root, commit_object_id)?
+                    context.exact_commit(identity, commit_catalog_root, commit_object_id)?
                 {
                     context
                         .validate_catalog_identity(
                             read,
+                            identity,
                             commit_catalog_root,
                             commit_object_id,
                             introduction,
@@ -1461,6 +1501,7 @@ where
                     .await?;
                     validate_member_at_ordinal_with_context(
                         read,
+                        identity,
                         commit_object_id,
                         &introduction,
                         ordinal,
@@ -1482,6 +1523,7 @@ where
                 .await?;
                 validate_member_at_ordinal_with_context(
                     read,
+                    identity,
                     commit_object_id,
                     &introduction,
                     ordinal,
@@ -1526,6 +1568,7 @@ where
             }
             validate_member_at_ordinal_with_context(
                 read,
+                identity,
                 source_commit_object_id,
                 &source_commit,
                 source_ordinal,
@@ -1847,8 +1890,11 @@ where
         &commit,
     )
     .await?;
+    let identity =
+        ReadIdentity::for_raw_control(read, repository.commit_catalog_root, entry.commit_object_id);
     validate_retained_commit(
         read,
+        identity,
         repository.commit_catalog_root,
         repository.change_catalog_root,
         entry.commit_object_id,
@@ -2434,6 +2480,7 @@ where
 /// intentionally latent until its edge is visited.
 pub(super) async fn validate_retained_commit<R>(
     read: &R,
+    identity: ReadIdentity,
     commit_catalog_root: ObjectId,
     change_catalog_root: ObjectId,
     commit_object_id: ObjectId,
@@ -2442,11 +2489,18 @@ pub(super) async fn validate_retained_commit<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let closure =
-        load_authenticated_member_closure(read, commit_catalog_root, commit_object_id, commit)
-            .await?;
+    let bound_read = IdentityBoundRead::new(read, identity);
+    let closure = load_authenticated_member_closure(
+        &bound_read,
+        identity,
+        commit_catalog_root,
+        commit_object_id,
+        commit,
+    )
+    .await?;
     let _ = validate_retained_commit_with_context(
         read,
+        identity,
         commit_catalog_root,
         change_catalog_root,
         commit_object_id,
@@ -2464,11 +2518,12 @@ struct ValidatedCommitMember {
 
 async fn validate_retained_commit_with_context<R>(
     read: &R,
+    identity: ReadIdentity,
     commit_catalog_root: ObjectId,
     change_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     commit: &CommitObjectV1,
-    context: Option<&AuthenticatedMemberClosure<'_, R>>,
+    context: Option<&AuthenticatedMemberClosure>,
 ) -> Result<Vec<ValidatedCommitMember>, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
@@ -2484,7 +2539,12 @@ where
     }
     let members = if let Some(context) = context {
         context
-            .members_for(read, commit_object_id, commit.commit_id, commit.generation)?
+            .members_for(
+                identity,
+                commit_object_id,
+                commit.commit_id,
+                commit.generation,
+            )?
             .ok_or_else(|| corruption("authenticated member closure names another commit"))?
     } else {
         return Err(corruption(
@@ -2522,6 +2582,7 @@ where
         let entry = ChangeCatalogEntry::decode(&value)?;
         validate_member_catalog_owner(
             read,
+            identity,
             commit_catalog_root,
             commit_object_id,
             commit.generation,

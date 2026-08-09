@@ -31,7 +31,7 @@ use super::publication::PreparedPublication;
 use super::serving::{validate_retained_commit, validate_retained_ref_change};
 use super::state::{UNTRACKED_ROW_SPACE, decode_untracked_key, decode_untracked_value};
 use super::tree::ordered_tree_edges;
-use super::view::{SELECTOR_SPACE, load_object_bytes};
+use super::view::{ReadIdentity, SELECTOR_SPACE, load_object_bytes};
 
 const SELECTOR_PAGE_ROWS: usize = 256;
 const UNTRACKED_PAGE_ROWS: usize = 1;
@@ -1001,8 +1001,16 @@ where
             let value = CommitObjectV1::decode(id, bytes)?;
             let commit_catalog_root = repository_commit_catalog(read, repository_root_id).await?;
             let change_catalog_root = repository_change_catalog(read, repository_root_id).await?;
-            validate_retained_commit(read, commit_catalog_root, change_catalog_root, id, &value)
-                .await?;
+            let identity = ReadIdentity::for_raw_control(read, commit_catalog_root, id);
+            validate_retained_commit(
+                read,
+                identity,
+                commit_catalog_root,
+                change_catalog_root,
+                id,
+                &value,
+            )
+            .await?;
             edges.extend(
                 value
                     .parent_commit_object_ids

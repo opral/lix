@@ -240,6 +240,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     };
     super::serving::validate_member_catalog_owner(
         view.test_storage_read(),
+        view.read_identity(),
         view.repository_root().commit_catalog_root,
         content_id(0xa1),
         2,
@@ -253,6 +254,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     assert!(
         super::serving::validate_member_catalog_owner(
             view.test_storage_read(),
+            view.read_identity(),
             view.repository_root().commit_catalog_root,
             content_id(0xa1),
             1,
@@ -282,18 +284,59 @@ async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
         .await
         .expect("load source commit")
         .expect("source commit exists");
+    let raw_identity = view.read_identity();
+    let raw_read = super::view::IdentityBoundRead::new(view.test_storage_read(), raw_identity);
     let closure = super::serving::load_authenticated_member_closure(
-        view.storage_read(),
+        &raw_read,
+        raw_identity,
         view.repository_root().commit_catalog_root,
         seed.commit_object_id,
         &source_commit,
     )
     .await
     .expect("load authenticated member closure");
+    let packed = view.test_packed_read();
+    assert_eq!(packed.identity(), view.read_identity());
+    let mut mismatched_packed_identity = packed.identity();
+    mismatched_packed_identity.view_instance_id = mismatched_packed_identity
+        .view_instance_id
+        .saturating_add(1);
+    assert!(
+        super::serving::load_authenticated_member_closure(
+            &packed,
+            mismatched_packed_identity,
+            view.repository_root().commit_catalog_root,
+            seed.commit_object_id,
+            &source_commit,
+        )
+        .await
+        .is_err(),
+        "a packed reader cannot be paired with a different identity token"
+    );
+    let packed_closure = super::serving::load_authenticated_member_closure(
+        &packed,
+        packed.identity(),
+        view.repository_root().commit_catalog_root,
+        seed.commit_object_id,
+        &source_commit,
+    )
+    .await
+    .expect("load the same closure through the pack-aware read");
+    assert!(
+        packed_closure
+            .members_for(
+                packed.identity(),
+                seed.commit_object_id,
+                seed.commit_id,
+                source_commit.generation,
+            )
+            .expect("same retained view token")
+            .is_some()
+    );
     assert!(
         closure
             .members_for(
-                view.storage_read(),
+                view.read_identity(),
                 seed.commit_object_id,
                 seed.commit_id,
                 source_commit.generation,
@@ -304,7 +347,7 @@ async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
     assert!(
         closure
             .members_for(
-                second_view.storage_read(),
+                second_view.read_identity(),
                 seed.commit_object_id,
                 seed.commit_id,
                 source_commit.generation,
@@ -312,10 +355,23 @@ async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
             .is_err(),
         "a closure cannot cross retained reads"
     );
+    let mut cross_branch_identity = view.read_identity();
+    cross_branch_identity.branch_id = CanonicalBranchId::from_bytes(raw_id(0xb7));
     assert!(
         closure
             .members_for(
-                view.storage_read(),
+                cross_branch_identity,
+                seed.commit_object_id,
+                seed.commit_id,
+                source_commit.generation,
+            )
+            .is_err(),
+        "a closure cannot cross branch identity"
+    );
+    assert!(
+        closure
+            .members_for(
+                view.read_identity(),
                 seed.commit_object_id,
                 seed.commit_id,
                 source_commit.generation + 1,
@@ -326,7 +382,7 @@ async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
     assert!(
         closure
             .members_for(
-                view.storage_read(),
+                view.read_identity(),
                 content_id(0xa2),
                 seed.commit_id,
                 source_commit.generation,
@@ -390,6 +446,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     assert!(
         super::serving::validate_member_catalog_owner(
             view.test_storage_read(),
+            view.read_identity(),
             remapped_catalog.root.object_id,
             content_id(0xa1),
             2,
@@ -405,6 +462,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     assert!(
         super::serving::validate_member_catalog_owner(
             view.test_storage_read(),
+            view.read_identity(),
             empty_catalog.root.object_id,
             content_id(0xa1),
             2,

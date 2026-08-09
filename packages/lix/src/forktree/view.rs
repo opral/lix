@@ -26,10 +26,141 @@ pub(super) const SELECTOR_SPACE: crate::storage::StorageSpace =
         crate::storage::ValueSemantics::Mutable,
     );
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ReadIdentity {
+    pub(crate) view_id: [u8; 32],
+    pub(crate) view_instance_id: u64,
+    pub(crate) global_selector_digest: [u8; 32],
+    pub(crate) branch_selector_digest: [u8; 32],
+    pub(crate) repository_root_id: ObjectId,
+    pub(crate) branch_id: CanonicalBranchId,
+    pub(crate) branch_snapshot_object_id: ObjectId,
+    pub(crate) selector_generation: u64,
+    pub(crate) hot_pack_object_id: ObjectId,
+    pub(crate) snapshot_cache_key: Option<u128>,
+}
+
+impl ReadIdentity {
+    fn for_view<R: StorageAdapterRead>(
+        read: &R,
+        view_id: [u8; 32],
+        view_instance_id: u64,
+        raw_global_selector: &Bytes,
+        raw_branch_selector: &Bytes,
+        repository_root_id: ObjectId,
+        branch_id: CanonicalBranchId,
+        branch_snapshot_object_id: ObjectId,
+        selector_generation: u64,
+        hot_pack_object_id: ObjectId,
+    ) -> Self {
+        Self {
+            view_id,
+            view_instance_id,
+            global_selector_digest: keyed_hash(
+                "lix forktree retained global selector identity v1",
+                raw_global_selector,
+            ),
+            branch_selector_digest: keyed_hash(
+                "lix forktree retained branch selector identity v1",
+                raw_branch_selector,
+            ),
+            repository_root_id,
+            branch_id,
+            branch_snapshot_object_id,
+            selector_generation,
+            hot_pack_object_id,
+            snapshot_cache_key: read.snapshot_cache_key(),
+        }
+    }
+
+    pub(super) fn for_raw_control<R: StorageAdapterRead + ?Sized>(
+        read: &R,
+        commit_catalog_root: ObjectId,
+        commit_object_id: ObjectId,
+    ) -> Self {
+        let mut seed = Vec::with_capacity(72);
+        seed.extend_from_slice(commit_catalog_root.as_bytes());
+        seed.extend_from_slice(commit_object_id.as_bytes());
+        if let Some(snapshot_key) = read.snapshot_cache_key() {
+            seed.extend_from_slice(&snapshot_key.to_be_bytes());
+        }
+        let view_id = keyed_hash("lix forktree raw control identity v1", &seed);
+        Self {
+            view_id,
+            view_instance_id: NEXT_VIEW_INSTANCE_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .unwrap_or(u64::MAX),
+            global_selector_digest: keyed_hash(
+                "lix forktree raw global selector identity v1",
+                commit_catalog_root.as_bytes(),
+            ),
+            branch_selector_digest: keyed_hash(
+                "lix forktree raw branch selector identity v1",
+                commit_object_id.as_bytes(),
+            ),
+            repository_root_id: commit_catalog_root,
+            branch_id: CanonicalBranchId::from_bytes([0; 16]),
+            branch_snapshot_object_id: ObjectId::ZERO,
+            selector_generation: 0,
+            hot_pack_object_id: ObjectId::ZERO,
+            snapshot_cache_key: read.snapshot_cache_key(),
+        }
+    }
+}
+
 pub(crate) struct PackedRead<'a, R: ?Sized> {
     read: &'a R,
     objects: &'a BTreeMap<ObjectId, Bytes>,
     pack_id: ObjectId,
+    identity: ReadIdentity,
+}
+
+pub(super) trait ReadIdentitySource {
+    fn read_identity(&self) -> ReadIdentity;
+}
+
+pub(super) struct IdentityBoundRead<'a, R: ?Sized> {
+    read: &'a R,
+    identity: ReadIdentity,
+}
+
+impl<'a, R: ?Sized> IdentityBoundRead<'a, R> {
+    pub(super) fn new(read: &'a R, identity: ReadIdentity) -> Self {
+        Self { read, identity }
+    }
+}
+
+impl<R: ?Sized> ReadIdentitySource for IdentityBoundRead<'_, R> {
+    fn read_identity(&self) -> ReadIdentity {
+        self.identity
+    }
+}
+
+impl<R: ?Sized> StorageAdapterRead for IdentityBoundRead<'_, R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.read.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<crate::storage::GetManyResult, StorageError>> + Send {
+        self.read.get_many(requests)
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.read.begin_scan(space, range, opts)
+    }
 }
 
 impl<'a, R: ?Sized> StorageAdapterRead for PackedRead<'a, R>
@@ -100,6 +231,18 @@ where
     }
 }
 
+impl<'a, R: ?Sized> PackedRead<'a, R> {
+    pub(crate) fn identity(&self) -> ReadIdentity {
+        self.identity
+    }
+}
+
+impl<R: ?Sized> ReadIdentitySource for PackedRead<'_, R> {
+    fn read_identity(&self) -> ReadIdentity {
+        self.identity
+    }
+}
+
 const VIEW_ID_DOMAIN: &str = "lix forktree coherent selector view v1";
 static NEXT_VIEW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -136,6 +279,21 @@ where
         self.view_instance_id
     }
 
+    pub(crate) fn read_identity(&self) -> ReadIdentity {
+        ReadIdentity::for_view(
+            &self.read,
+            self.view_id,
+            self.view_instance_id,
+            &self.raw_global_selector,
+            &self.raw_branch_selector,
+            self.global_selector.repository_root,
+            self.branch_id,
+            self.branch_selector.branch_snapshot_object_id,
+            self.branch_selector.selector_generation,
+            self.branch_snapshot.hot_pack_object_id,
+        )
+    }
+
     pub(crate) fn raw_global_selector(&self) -> &Bytes {
         &self.raw_global_selector
     }
@@ -169,7 +327,13 @@ where
             read: &self.read,
             objects: &self.hot_objects,
             pack_id: self.branch_snapshot.hot_pack_object_id,
+            identity: self.read_identity(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_packed_read(&self) -> PackedRead<'_, R> {
+        self.packed_read()
     }
 
     #[cfg(test)]
@@ -490,9 +654,11 @@ where
         commit_catalog_root: ObjectId,
         commit_object_id: ObjectId,
         commit: &CommitObjectV1,
-    ) -> Result<super::serving::AuthenticatedMemberClosure<'_, R>, StorageError> {
+    ) -> Result<super::serving::AuthenticatedMemberClosure, StorageError> {
+        let read = self.packed_read();
         super::serving::load_authenticated_member_closure(
-            &self.read,
+            &read,
+            self.read_identity(),
             commit_catalog_root,
             commit_object_id,
             commit,
@@ -537,6 +703,7 @@ where
     ) -> Result<(), StorageError> {
         super::serving::validate_member_catalog_owner(
             &self.packed_read(),
+            self.read_identity(),
             commit_catalog_root,
             target_commit_object_id,
             target_generation,
@@ -556,10 +723,12 @@ where
         target_ordinal: usize,
         member: super::model::CommitMemberV1,
         entry: ChangeCatalogEntry,
-        context: Option<&super::serving::AuthenticatedMemberClosure<'_, R>>,
+        context: Option<&super::serving::AuthenticatedMemberClosure>,
     ) -> Result<(), StorageError> {
+        let read = self.packed_read();
         super::serving::validate_member_catalog_owner(
-            &self.read,
+            &read,
+            self.read_identity(),
             commit_catalog_root,
             target_commit_object_id,
             target_generation,
@@ -580,6 +749,7 @@ where
     ) -> Result<(), StorageError> {
         super::serving::validate_retained_commit(
             &self.packed_read(),
+            self.read_identity(),
             commit_catalog_root,
             change_catalog_root,
             commit_object_id,
@@ -643,14 +813,16 @@ where
         &self,
         ids: &[crate::changelog::ChangeId],
     ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError> {
-        super::serving::load_change_records(&self.read, ids).await
+        let read = self.packed_read();
+        super::serving::load_change_records(&read, ids).await
     }
 
     pub(crate) async fn scan_state_rows_at_commit(
         &self,
         commit_id: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
-        super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
+        let read = self.packed_read();
+        super::serving::scan_state_rows_at_commit(&read, commit_id).await
     }
 
     pub(crate) async fn diff_state_rows_between_commits(
@@ -658,7 +830,8 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, true).await
+        let read = self.packed_read();
+        diff_state_rows_between_commits_on_read(&read, before, after, true).await
     }
 }
 
@@ -1367,10 +1540,28 @@ where
         branch_selector.selector_generation,
     )
     .await?;
+    let view_instance_id = NEXT_VIEW_INSTANCE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| corruption("coherent view instance identifier space is exhausted"))?;
+    let identity = ReadIdentity::for_view(
+        &read,
+        view_id,
+        view_instance_id,
+        &raw_global_selector,
+        &raw_branch_selector,
+        global_selector.repository_root,
+        branch_id,
+        branch_selector.branch_snapshot_object_id,
+        branch_selector.selector_generation,
+        branch_snapshot.hot_pack_object_id,
+    );
     let packed_read = PackedRead {
         read: &read,
         objects: &hot_objects,
         pack_id: branch_snapshot.hot_pack_object_id,
+        identity,
     };
     authenticate_selected_graph(
         &packed_read,
@@ -1380,11 +1571,6 @@ where
         branch_snapshot,
     )
     .await?;
-    let view_instance_id = NEXT_VIEW_INSTANCE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| corruption("coherent view instance identifier space is exhausted"))?;
     Ok(CoherentView {
         read,
         hot_objects,
