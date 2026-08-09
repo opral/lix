@@ -63,6 +63,8 @@ pub(crate) mod plugin;
 mod plugin_arena;
 mod plugin_layout;
 mod plugin_wire;
+#[cfg(feature = "prepared-cas-observability")]
+pub mod prepared_cas_observability;
 mod prepared_dml;
 mod schema;
 mod session;

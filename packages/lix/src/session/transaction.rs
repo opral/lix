@@ -134,6 +134,8 @@ where
         receipt: crate::binary_cas::BlobWriteReceipt,
         metadata: Option<serde_json::Value>,
     ) -> Result<u64, LixError> {
+        #[cfg(feature = "prepared-cas-observability")]
+        crate::prepared_cas_observability::record_receipt_metadata(std::mem::size_of_val(&receipt));
         let metadata = metadata
             .map(|value| TransactionJson::from_value(value, "prepared file metadata"))
             .transpose()?;

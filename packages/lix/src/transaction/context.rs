@@ -84,6 +84,8 @@ use crate::plugin::{
     transport_splice_preserves_prefix_exclusion, transport_splice_preserves_utf8,
     validate_create_changes, validate_create_reservation,
 };
+#[cfg(feature = "prepared-cas-observability")]
+use crate::prepared_cas_observability;
 use crate::session::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
     encode_receipt,
@@ -612,6 +614,10 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// immutable ForkTree object owner before their final semantic row is
     /// staged; this map retains hashes/manifest edges, never payload bytes.
     prepared_blob_uploads: BTreeMap<String, PreparedBlobUpload>,
+    #[cfg(feature = "prepared-cas-observability")]
+    prepared_blob_object_ids_written: u64,
+    #[cfg(feature = "prepared-cas-observability")]
+    prepared_blob_object_bytes_written: u64,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -827,12 +833,21 @@ where
     const PREPARED_BLOB_OBJECT_PAGE_BYTES: usize = 64 * 1024 * 1024;
 
     async fn commit_prepared_blob_objects(
-        &self,
+        &mut self,
         objects: ImmutableObjectSet,
     ) -> Result<(), LixError> {
         if objects.is_empty() {
             return Ok(());
         }
+        #[cfg(feature = "prepared-cas-observability")]
+        let (object_count, object_bytes) =
+            objects
+                .iter()
+                .fold((0usize, 0usize), |(count, bytes), (_, object)| {
+                    (count.saturating_add(1), bytes.saturating_add(object.len()))
+                });
+        #[cfg(feature = "prepared-cas-observability")]
+        prepared_cas_observability::record_unreferenced_objects(object_count, object_bytes);
         let mut writes = StorageWriteSet::with_capacity(objects.iter().count(), 1);
         for (object_id, bytes) in objects.iter() {
             writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
@@ -842,7 +857,19 @@ where
         self.storage
             .commit_write_set(writes, options)
             .await
-            .map(|_| ())
+            .map(|_| {
+                #[cfg(feature = "prepared-cas-observability")]
+                {
+                    self.prepared_blob_object_ids_written = self
+                        .prepared_blob_object_ids_written
+                        .saturating_add(object_count as u64);
+                    self.prepared_blob_object_bytes_written = self
+                        .prepared_blob_object_bytes_written
+                        .saturating_add(object_bytes as u64);
+                    prepared_cas_observability::record_page_flush(object_bytes);
+                    prepared_cas_observability::record_resident_payload_bytes(0);
+                }
+            })
             .map_err(LixError::from)
     }
 
@@ -875,7 +902,18 @@ where
                 .prepared_blob_uploads
                 .entry(upload_key.to_owned())
                 .or_insert_with(|| PreparedBlobUpload::new(total_size));
-            upload.push_chunk(offset, content)?;
+            if upload.push_chunk(offset, content).is_err() {
+                #[cfg(feature = "prepared-cas-observability")]
+                prepared_cas_observability::record_corruption_rejection();
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "prepared blob chunk failed authenticated validation",
+                ));
+            }
+            #[cfg(feature = "prepared-cas-observability")]
+            prepared_cas_observability::record_resident_payload_bytes(
+                upload.pending_object_bytes(),
+            );
             if upload.pending_object_bytes() >= Self::PREPARED_BLOB_OBJECT_PAGE_BYTES {
                 true
             } else {
@@ -906,8 +944,17 @@ where
             })?;
         let pending = upload.take_pending_objects();
         self.commit_prepared_blob_objects(pending).await?;
-        let (receipt, manifest) = upload.finish()?;
+        let (receipt, manifest) = match upload.finish() {
+            Ok(result) => result,
+            Err(error) => {
+                #[cfg(feature = "prepared-cas-observability")]
+                prepared_cas_observability::record_corruption_rejection();
+                return Err(error.into());
+            }
+        };
         self.commit_prepared_blob_objects(manifest).await?;
+        #[cfg(feature = "prepared-cas-observability")]
+        prepared_cas_observability::record_resident_payload_bytes(0);
         Ok(Some(receipt))
     }
 
@@ -1706,6 +1753,10 @@ where
                     idempotency_receipt: None,
                     pending_forktree_publication: None,
                     prepared_blob_uploads: BTreeMap::new(),
+                    #[cfg(feature = "prepared-cas-observability")]
+                    prepared_blob_object_ids_written: 0,
+                    #[cfg(feature = "prepared-cas-observability")]
+                    prepared_blob_object_bytes_written: 0,
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
@@ -1841,6 +1892,15 @@ where
         } else {
             load_path_index_revision(&read).await.ok().flatten()
         };
+        #[cfg(feature = "prepared-cas-observability")]
+        prepared_cas_observability::record_final_transaction_payload(
+            prepared_writes
+                .file_content_writes
+                .iter()
+                .filter_map(|write| write.inline_payload())
+                .map(|payload| payload.len() as u64)
+                .sum(),
+        );
         let prepared_forktree_plan = match commit::prepare_forktree_publication_with_parent_heads(
             &transaction.active_account_id,
             &commit_parent_heads,
@@ -1946,6 +2006,11 @@ where
             "lix.perf.transaction_storage_commit"
         ))
         .await?;
+        #[cfg(feature = "prepared-cas-observability")]
+        prepared_cas_observability::record_reachable_objects(
+            transaction.prepared_blob_object_ids_written,
+            transaction.prepared_blob_object_bytes_written,
+        );
         let post_commit_read_storage = transaction.storage.clone();
         if rebuild_filesystem_path_index {
             transaction.live_state.clear_filesystem_path_indexes();
@@ -2073,6 +2138,11 @@ where
     /// buffered transaction without commit is not the API we want callers to
     /// rely on.
     pub(crate) async fn rollback(mut self) -> Result<(), LixError> {
+        #[cfg(feature = "prepared-cas-observability")]
+        prepared_cas_observability::record_orphans(
+            self.prepared_blob_object_ids_written,
+            self.prepared_blob_object_bytes_written,
+        );
         self.discard_pending_plugin_actor_publications().await;
         Ok(())
     }

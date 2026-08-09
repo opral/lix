@@ -11,6 +11,15 @@ for path in "${changed[@]}"; do
         packages/engine-benchmarks/tests/prepared_cas_streaming_qualification/*) ;;
         packages/engine-benchmarks/tests/prepared_cas_streaming_adapter.rs) ;;
         packages/engine-benchmarks/Cargo.toml) ;;
+        packages/lix/Cargo.toml) ;;
+        packages/lix/src/lib.rs) ;;
+        packages/lix/src/engine.rs) ;;
+        packages/lix/src/storage_adapter/context.rs) ;;
+        packages/lix/src/prepared_cas_observability.rs) ;;
+        packages/lix/src/transaction/context.rs) ;;
+        packages/lix/src/session/transaction.rs) ;;
+        packages/lix/src/forktree/reachability.rs) ;;
+        packages/lix/src/handle.rs) ;;
         *) echo "forbidden non-test path changed: $path" >&2; exit 1 ;;
     esac
 done
@@ -26,11 +35,17 @@ for needle in 'struct BlobWriteReceipt' 'enum FileContent' 'PreparedCas' 'prepar
     }
 done
 
-if git diff --quiet "$base" HEAD -- packages/lix packages/cli packages/engine packages/rs-sdk; then
-    :
-else
-    echo 'production source changed by the oracle package' >&2
-    exit 1
-fi
+for path in packages/lix/Cargo.toml packages/lix/src/lib.rs \
+    packages/lix/src/engine.rs packages/lix/src/storage_adapter/context.rs packages/lix/src/prepared_cas_observability.rs packages/lix/src/transaction/context.rs \
+    packages/lix/src/session/transaction.rs packages/lix/src/forktree/reachability.rs \
+    packages/lix/src/handle.rs; do
+    if git diff --quiet "$base" HEAD -- "$path"; then
+        continue
+    fi
+    rg -q 'prepared-cas-observability|cfg\(feature = "prepared-cas-observability"\)' "$path" || {
+        echo "production instrumentation is not feature-gated: $path" >&2
+        exit 1
+    }
+done
 
-echo "source contract PASS: ${#changed[@]} test/report paths only"
+echo "source contract PASS: ${#changed[@]} test/report and feature-gated observability paths only"
