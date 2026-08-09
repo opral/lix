@@ -19,11 +19,12 @@ use super::gc_index::{
 };
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1,
-    GcEdgeCursorV1, GcLiveBranchEntryV1, GcMarkEntryV2, GcPhaseV2, GcProgressSelectorV2,
-    GcProgressV2, GcQueueEntryV1, GlobalSelectorV1, RepositoryRootV1, SnapshotSelectorV1,
-    SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1, branch_selector_key,
-    gc_progress_selector_key, global_selector_key, snapshot_selector_key, upload_selector_key,
+    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberPageV1,
+    CommitObjectV1, GcEdgeCursorV1, GcLiveBranchEntryV1, GcMarkEntryV2, GcPhaseV2,
+    GcProgressSelectorV2, GcProgressV2, GcQueueEntryV1, GlobalSelectorV1, RepositoryRootV1,
+    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
+    upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId, authenticate_object_domain};
 use super::publication::PreparedPublication;
@@ -989,10 +990,15 @@ where
             edges.extend(
                 value
                     .parent_commit_object_ids
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|id| typed(id, ObjectDomain::Commit)),
             );
-            for member in value.members {
+            if let Some(page_root) = value.member_page_root {
+                edges.push(typed(page_root, ObjectDomain::CommitMemberPageV1));
+            }
+            let members = super::serving::load_commit_members(read, &value).await?;
+            for member in members {
                 edges.push(typed(
                     member.change_object_id(),
                     ObjectDomain::SemanticChange,
@@ -1005,6 +1011,21 @@ where
                 typed(value.global_state_root, ObjectDomain::OrderedTreeNode),
                 typed(value.local_state_root, ObjectDomain::OrderedTreeNode),
             ]);
+        }
+        ObjectDomain::CommitMemberPageV1 => {
+            let page = CommitMemberPageV1::decode(id, bytes)?;
+            for member in page.members {
+                edges.push(typed(
+                    member.change_object_id(),
+                    ObjectDomain::SemanticChange,
+                ));
+                if let Some((source_commit_object_id, _)) = member.source() {
+                    edges.push(typed(source_commit_object_id, ObjectDomain::Commit));
+                }
+            }
+            if let Some(next) = page.next_page_object_id {
+                edges.push(typed(next, ObjectDomain::CommitMemberPageV1));
+            }
         }
         ObjectDomain::SemanticChange => {
             if !matches!(
@@ -1212,7 +1233,8 @@ where
             ) => {
                 let bytes = load_object_bytes(read, commit_object_id).await?;
                 let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-                if commit.members.get(ordinal as usize)
+                let members = super::serving::load_commit_members(read, &commit).await?;
+                if members.get(ordinal as usize)
                     != Some(&super::model::CommitMemberV1::introduced(
                         entry.change_object_id,
                     ))

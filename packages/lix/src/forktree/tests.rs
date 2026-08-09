@@ -177,6 +177,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
         generation: 1,
         parent_commit_object_ids: Vec::new(),
         members: vec![CommitMemberV1::introduced(seed.semantic_change_object_id)],
+        member_page_root: None,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"remapped-source-commit".to_vec(),
@@ -387,6 +388,7 @@ fn build_seed() -> SeedData {
         generation: 1,
         parent_commit_object_ids: Vec::new(),
         members: vec![CommitMemberV1::introduced(semantic_change_object_id)],
+        member_page_root: None,
         global_state_root,
         local_state_root,
         metadata: b"commit".to_vec(),
@@ -661,6 +663,7 @@ async fn branch_transition<R: StorageAdapterRead>(
         generation: identity as u64,
         parent_commit_object_ids: vec![view.branch_snapshot().semantic_head_commit_object_id],
         members: Vec::new(),
+        member_page_root: None,
         global_state_root: view.repository_root().global_state_root,
         local_state_root: state_edit.root,
         metadata: vec![identity],
@@ -897,6 +900,7 @@ async fn historical_missing_state_root_fails_before_empty_result() {
         generation: 1,
         parent_commit_object_ids: Vec::new(),
         members: vec![CommitMemberV1::introduced(semantic_change_object_id)],
+        member_page_root: None,
         global_state_root: content_id(0xf1),
         local_state_root: seed.local_state_root,
         metadata: b"missing-state-root".to_vec(),
@@ -1325,6 +1329,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         generation: 1,
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
+        member_page_root: None,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"grandparent".to_vec(),
@@ -1338,6 +1343,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         generation: 2,
         parent_commit_object_ids: vec![grandparent_object_id],
         members: vec![CommitMemberV1::introduced(seed.semantic_change_object_id)],
+        member_page_root: None,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"shared-parent".to_vec(),
@@ -1351,6 +1357,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         generation: 3,
         parent_commit_object_ids: vec![parent_object_id],
         members: Vec::new(),
+        member_page_root: None,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"child-a".to_vec(),
@@ -1364,6 +1371,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         generation: 3,
         parent_commit_object_ids: vec![parent_object_id],
         members: Vec::new(),
+        member_page_root: None,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"child-b".to_vec(),
@@ -1723,6 +1731,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         generation: 2,
         parent_commit_object_ids: Vec::new(),
         members: Vec::new(),
+        member_page_root: None,
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
         metadata: b"parent".to_vec(),
@@ -1739,6 +1748,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         members: vec![CommitMemberV1::introduced(
             bad_generation.semantic_change_object_id,
         )],
+        member_page_root: None,
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
         metadata: b"child".to_vec(),
@@ -3564,4 +3574,146 @@ fn seed_provenance_and_ref_edge_are_not_aliased() {
     )
     .expect("snapshot decode");
     validate_branch_snapshot_ref_edge(&snapshot, load_from(&seed.objects)).expect("ref edge");
+}
+
+#[test]
+fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
+    for count in [255usize, 256, 257, 1002] {
+        let members = (0..count)
+            .map(|index| {
+                let mut raw = [0u8; 32];
+                raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+                raw[31] = 1;
+                CommitMemberV1::introduced(ObjectId::from_bytes(raw))
+            })
+            .collect::<Vec<_>>();
+        let mut commit = CommitObjectV1 {
+            commit_id: CommitId::from_bytes(raw_id(0xa1)),
+            generation: 1,
+            parent_commit_object_ids: Vec::new(),
+            members,
+            member_page_root: None,
+            global_state_root: content_id(0x71),
+            local_state_root: content_id(0x72),
+            metadata: b"page-boundary".to_vec(),
+        };
+        let pages = commit.prepare_member_pages().expect("page closure");
+        assert_eq!(
+            pages.len(),
+            match count {
+                255 => 1,
+                256 | 257 => 2,
+                1002 => 4,
+                _ => unreachable!(),
+            }
+        );
+        let (commit_object_id, commit_bytes) = commit.encode().expect("paged commit");
+        let decoded =
+            CommitObjectV1::decode(commit_object_id, &commit_bytes).expect("paged commit decodes");
+        let page_map = pages
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let loaded = decoded
+            .load_members_with(|id| {
+                page_map
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .expect("member closure loads");
+        assert_eq!(loaded, commit.members);
+        assert_eq!(loaded.len(), count);
+    }
+
+    let members = (0..255)
+        .map(|index| {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            raw[31] = 2;
+            CommitMemberV1::introduced(ObjectId::from_bytes(raw))
+        })
+        .collect::<Vec<_>>();
+    let mut commit = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0xa2)),
+        generation: 1,
+        parent_commit_object_ids: Vec::new(),
+        members,
+        member_page_root: None,
+        global_state_root: content_id(0x73),
+        local_state_root: content_id(0x74),
+        metadata: b"page-corruption".to_vec(),
+    };
+    let pages = commit.prepare_member_pages().expect("corruption pages");
+    let root = commit.member_page_root.expect("page root");
+    let page_map = pages
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut missing = page_map.clone();
+    missing.remove(&root);
+    let (commit_object_id, commit_bytes) = commit.encode().expect("commit");
+    let decoded = CommitObjectV1::decode(commit_object_id, &commit_bytes).expect("decode commit");
+    assert!(
+        decoded
+            .load_members_with(|id| {
+                missing
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err()
+    );
+
+    let mut corrupted = page_map.clone();
+    let first = corrupted.get_mut(&root).expect("root page");
+    first[0] ^= 0x01;
+    assert!(
+        decoded
+            .load_members_with(|id| {
+                corrupted
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err()
+    );
+
+    let mut wrong_ordinal =
+        super::model::CommitMemberPageV1::decode(root, page_map.get(&root).expect("root page"))
+            .expect("valid root page");
+    wrong_ordinal.start_ordinal = 1;
+    let (wrong_id, wrong_bytes) = wrong_ordinal.encode().expect("wrong ordinal page");
+    let mut wrong_map = page_map.clone();
+    wrong_map.remove(&root);
+    wrong_map.insert(wrong_id, wrong_bytes);
+    let mut wrong_commit = decoded.clone();
+    wrong_commit.member_page_root = Some(wrong_id);
+    assert!(
+        wrong_commit
+            .load_members_with(|id| {
+                wrong_map
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err()
+    );
+
+    let duplicate = super::model::CommitMemberPageV1 {
+        commit_id: CommitId::from_bytes(raw_id(0xa3)),
+        start_ordinal: 0,
+        members: vec![
+            CommitMemberV1::introduced(content_id(0x81)),
+            CommitMemberV1::introduced(content_id(0x81)),
+        ],
+        next_page_object_id: None,
+    };
+    assert!(duplicate.encode().is_err());
+    let zero_successor = super::model::CommitMemberPageV1 {
+        commit_id: CommitId::from_bytes(raw_id(0xa4)),
+        start_ordinal: 0,
+        members: vec![CommitMemberV1::introduced(content_id(0x82))],
+        next_page_object_id: Some(ObjectId::ZERO),
+    };
+    assert!(zero_successor.encode().is_err());
 }
