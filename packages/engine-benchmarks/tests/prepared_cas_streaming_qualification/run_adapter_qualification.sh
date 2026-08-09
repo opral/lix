@@ -28,7 +28,8 @@ run_adapter() {
         cd "$candidate"
         env "${common_env[@]}" \
             timeout 1200 \
-            cargo test -p lix --lib "${test_prefix}_${adapter}" \
+            cargo test -p lix_benchmarks --test prepared_cas_streaming_adapter \
+            --features 'storage-benches slatedb' "${test_prefix}_${adapter}" \
             -- --exact --nocapture --test-threads=1
     ) 2>&1 | tee "$log"
 }

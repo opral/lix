@@ -18,6 +18,7 @@ use tempfile::TempDir;
 use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
 use lix_storage_slatedb::SlateDB;
+use uuid::Uuid;
 
 const FILES: usize = 65;
 const CHUNK_BYTES: usize = 1024 * 1024;
@@ -86,7 +87,7 @@ where
         .expect("begin one prepared-CAS semantic transaction");
 
     for index in 0..FILES {
-        let id = format!("prepared-cas-{index:03}");
+        let id = Uuid::from_u128((index + 1) as u128).to_string();
         let path = format!("/prepared-cas/{index:03}.bin");
         let content = chunk_for(index);
         let receipt = transaction
@@ -146,7 +147,7 @@ where
         .expect("rollback receipt exists");
     rollback
         .upsert_prepared_file_content(
-            "prepared-cas-rollback".to_owned(),
+            Uuid::from_u128((FILES + 1) as u128).to_string(),
             "/prepared-cas/rollback.bin".to_owned(),
             rollback_receipt,
             None,
