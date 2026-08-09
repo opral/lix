@@ -9,12 +9,6 @@ pub(crate) struct LiveStateContext {
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
 }
 
-/// Transaction branch-control cache retained independently of the removed
-/// public current-state reader. The branch-control owner still uses this
-/// marker for its transaction-local lifecycle fence.
-#[derive(Default)]
-pub(crate) struct BranchHeadControlCache;
-
 impl LiveStateContext {
     pub(crate) fn new() -> Self {
         Self {
