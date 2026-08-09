@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.11.0 - 2026-08-09
+
+### Minor
+
+- Removed the SQLite storage option from `@lix-js/sdk` and `lix_sdk`.
+
+  Use the RocksDB-backed `LocalFilesystem` adapter for persistent local development. The standalone Rust SQLite storage adapter remains available for specialized use.
+- Unified the Rust engine and SDK as the `lix` crate, with `open_lix().await?` as the in-memory quick start and builder methods for storage, telemetry, and custom Wasm runtimes.
+
+  This is a breaking Rust API migration: `lix_engine`, `lix_sdk`, `OpenLixOptions`, and the specialized `open_lix_with_*` entry points have been removed. Persistent backends now live in independently versioned `lix-storage-*` crates.
+
+### Patch
+
+- Bounded first publication of columnar current state on long commit histories.
+
+  Lix now authenticates cumulative touched schema families in each commit-state manifest and carries that bounded absence authority across linear, merged, and selected-source lineages. Mutation scopes that cannot be bounded exactly still fail closed.
+- Reduced sparse current-state publication latency and serving-index allocation.
+
+  Lix now stores contiguous scoped-range leaves as shared scope runs and encodes immutable node fields through borrowed views, while retaining authenticated point reads, structural sharing, and opaque physical-part payloads.
+- Reduced current-state serving-index storage for large tracked repositories.
+
+  Lix now uses one authenticated scoped-range index for point reads, diffs, and sparse state sharing while preserving transactional history and branch semantics.
+
 ## 0.10.0 - 2026-08-03
 
 ### Minor
