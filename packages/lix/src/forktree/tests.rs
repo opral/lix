@@ -4473,3 +4473,24 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     };
     assert!(zero_successor.encode().is_err());
 }
+
+#[tokio::test]
+async fn qualification_foreign_valid_hot_pack_member_must_fail_closed() {
+    let mut seed = build_seed();
+    let foreign = super::tree::build_state_tree(&[state_entry(
+        "foreign-pack-member",
+        StateCellRef::Value("foreign"),
+        0x7a,
+        &[],
+    )])
+    .expect("foreign authenticated tree");
+    seed.objects
+        .extend(foreign.objects)
+        .expect("foreign object set");
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    assert!(
+        open_coherent_view(&storage, seed.branch_id).await.is_err(),
+        "a valid hot-pack entry outside the authenticated branch closure must fail closed"
+    );
+}
