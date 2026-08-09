@@ -1,0 +1,11 @@
+backend=rocksdb valid=pass changed=1 reused=63 cold_reopen=pass
+backend=rocksdb case=missing a33_accepts=true oracle_rejects_before_write=true rollback=pass selector_writes=0 receipt_writes=0
+backend=rocksdb case=malformed a33_accepts=true oracle_rejects_before_write=true rollback=pass selector_writes=0 receipt_writes=0
+backend=rocksdb case=wrong-domain a33_accepts=true oracle_rejects_before_write=true rollback=pass selector_writes=0 receipt_writes=0
+backend=rocksdb case=same-size-substituted a33_accepts=true oracle_rejects_before_write=true rollback=pass selector_writes=0 receipt_writes=0
+backend=slatedb valid=pass changed=1 reused=63 cold_reopen=pass
+backend=slatedb case=missing a33_accepts=true oracle_rejects_before_write=true rollback=pass selector_writes=0 receipt_writes=0
+backend=slatedb case=malformed a33_accepts=true oracle_rejects_before_write=true rollback=pass selector_writes=0 receipt_writes=0
+backend=slatedb case=wrong-domain a33_accepts=true oracle_rejects_before_write=true rollback=pass selector_writes=0 receipt_writes=0
+backend=slatedb case=same-size-substituted a33_accepts=true oracle_rejects_before_write=true rollback=pass selector_writes=0 receipt_writes=0
+oracle=authenticated_splice_unchanged_child_closure status=pass
