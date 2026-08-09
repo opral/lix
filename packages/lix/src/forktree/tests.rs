@@ -354,14 +354,32 @@ fn blob_ref_state_entry(
     commit_byte: u8,
     manifest: ObjectId,
 ) -> (Vec<u8>, Vec<u8>) {
-    let entity_pk = EntityPk::single(primary_key);
+    blob_ref_state_entry_with_declared_id(
+        primary_key,
+        primary_key,
+        blob_id,
+        size_bytes,
+        commit_byte,
+        manifest,
+    )
+}
+
+fn blob_ref_state_entry_with_declared_id(
+    primary_key: &str,
+    declared_id: &str,
+    blob_id: crate::binary_cas::BlobId,
+    size_bytes: u64,
+    commit_byte: u8,
+    manifest: ObjectId,
+) -> (Vec<u8>, Vec<u8>) {
+    let entity_pk = EntityPk::uuid_from_canonical(primary_key).expect("canonical blob-ref id");
     let key = encode_state_key(StateKeyRef {
         schema_key: "lix_binary_blob_ref",
         file_id: Some(primary_key),
         entity_pk: &entity_pk,
     });
     let semantic_value = serde_json::json!({
-        "id": primary_key,
+        "id": declared_id,
         "blob_hash": blob_id.to_hex(),
         "size_bytes": size_bytes,
     })
@@ -2626,7 +2644,13 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     };
     let (manifest_id, _) = manifest.encode().expect("manifest");
     let blob_id = crate::binary_cas::BlobId::from_content(b"data");
-    let (key, value) = blob_ref_state_entry("blob", blob_id, 4, 0x70, manifest_id);
+    let (key, value) = blob_ref_state_entry(
+        "01920000-0000-7000-8000-0000000000a1",
+        blob_id,
+        4,
+        0x70,
+        manifest_id,
+    );
     let wrong_owner_value = serde_json::json!({
         "id": "not-blob",
         "blob_hash": blob_id.to_hex(),
@@ -2639,8 +2663,13 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         0x70,
         &[manifest_id],
     );
-    let (mismatched_owner_key, mismatched_owner) =
-        blob_ref_state_entry("mismatched", blob_id, 5, 0x70, manifest_id);
+    let (mismatched_owner_key, mismatched_owner) = blob_ref_state_entry(
+        "01920000-0000-7000-8000-0000000000a2",
+        blob_id,
+        5,
+        0x70,
+        manifest_id,
+    );
 
     // A valid multi-chunk manifest must not be transplantable beneath a
     // same-size state owner carrying another public BlobId. The manifest's
@@ -2680,14 +2709,14 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         .encode()
         .expect("transplanted manifest");
     let (transplanted_owner_key, transplanted_owner) = blob_ref_state_entry(
-        "transplanted",
+        "01920000-0000-7000-8000-0000000000a3",
         owner_blob_id,
         owner_payload.len() as u64,
         0x70,
         transplanted_manifest_id,
     );
     let (valid_multichunk_key, valid_multichunk_owner) = blob_ref_state_entry(
-        "valid-multichunk",
+        "01920000-0000-7000-8000-0000000000a4",
         transplanted_blob_id,
         transplanted_payload.len() as u64,
         0x70,
@@ -2907,14 +2936,22 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     let (valid_manifest_id, _) = valid_manifest.encode().expect("valid duplicate manifest");
     let (wrong_manifest_id, _) = wrong_manifest.encode().expect("wrong duplicate manifest");
     let (wrong_key, wrong_value) = blob_ref_state_entry(
-        "duplicate-a-wrong",
+        "01920000-0000-7000-8000-0000000000b1",
         semantic_id,
         valid_payload.len() as u64,
         0x70,
         wrong_manifest_id,
     );
     let (valid_key, valid_value) = blob_ref_state_entry(
-        "duplicate-b-valid",
+        "01920000-0000-7000-8000-0000000000b2",
+        semantic_id,
+        valid_payload.len() as u64,
+        0x70,
+        valid_manifest_id,
+    );
+    let (wrong_identity_key, wrong_identity_value) = blob_ref_state_entry_with_declared_id(
+        "01920000-0000-7000-8000-0000000000b3",
+        "01920000-0000-7000-8000-0000000000b2",
         semantic_id,
         valid_payload.len() as u64,
         0x70,
@@ -2923,6 +2960,7 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     let mut mutations = vec![
         StateTreeMutation::insert(wrong_key, wrong_value),
         StateTreeMutation::insert(valid_key.clone(), valid_value),
+        StateTreeMutation::insert(wrong_identity_key.clone(), wrong_identity_value),
     ];
     mutations.sort_by(|left, right| {
         let left_key: &[u8] = match left {
@@ -2993,6 +3031,15 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
             .expect("selected duplicate-owner full read")
             .into_vec(),
         vec![Some(valid_payload.to_vec())]
+    );
+    let wrong_identity =
+        super::decode_state_key(&wrong_identity_key).expect("wrong-identity state key");
+    assert!(
+        reader
+            .load_bytes_for_state_keys(&[wrong_identity])
+            .await
+            .is_err(),
+        "a same-BlobId owner with a different declared id must fail before manifest load"
     );
 }
 

@@ -90,12 +90,14 @@ pub(crate) struct AuthenticatedBlobRef {
     semantic_id: crate::binary_cas::BlobId,
     expected_size: u64,
     manifest_object_id: ObjectId,
+    branch_id: CanonicalBranchId,
     view_id: [u8; 32],
     view_instance_id: u64,
 }
 
 #[derive(Deserialize)]
 struct BlobRefOwnerValue {
+    id: String,
     blob_hash: String,
     size_bytes: u64,
 }
@@ -249,12 +251,31 @@ where
 
 fn bind_state_blob_ref(
     row: &super::serving::VisibleStateRow,
+    expected_key: Option<&StateKey>,
+    branch_id: CanonicalBranchId,
     view_id: [u8; 32],
     view_instance_id: u64,
 ) -> Result<AuthenticatedBlobRef, crate::LixError> {
     let key = super::state::decode_state_key(&row.encoded_key)?;
+    if let Some(expected_key) = expected_key {
+        if &key != expected_key {
+            return Err(corruption(
+                "authenticated blob-reference row key does not match requested StateKey",
+            )
+            .into());
+        }
+    }
     if key.schema_key != "lix_binary_blob_ref" {
         return Err(corruption("authenticated state row is not a blob-reference owner").into());
+    }
+    let file_id = key
+        .file_id
+        .as_deref()
+        .ok_or_else(|| corruption("blob-reference owner has no file identity"))?;
+    let expected_entity_pk = crate::entity_pk::EntityPk::uuid_from_canonical(file_id)
+        .map_err(|_| corruption("blob-reference owner file identity is not a canonical UUID"))?;
+    if key.entity_pk != expected_entity_pk {
+        return Err(corruption("blob-reference key identity is inconsistent").into());
     }
     let value = match &row.value.cell {
         StateCell::Value(value) => value,
@@ -267,6 +288,11 @@ fn bind_state_blob_ref(
             "blob-reference owner semantic value is malformed: {error}"
         ))
     })?;
+    if owner.id != file_id {
+        return Err(
+            corruption("blob-reference payload identity does not match its StateKey").into(),
+        );
+    }
     let semantic_id = crate::binary_cas::BlobId::from_hex(&owner.blob_hash)?;
     if row.value.blob_manifest_object_ids.len() != 1 {
         return Err(
@@ -283,6 +309,7 @@ fn bind_state_blob_ref(
         semantic_id,
         expected_size: owner.size_bytes,
         manifest_object_id,
+        branch_id,
         view_id,
         view_instance_id,
     })
@@ -301,7 +328,13 @@ where
         if row.view_instance_id != self.view_instance_id() {
             return Err(StorageError::InvalidCursor.into());
         }
-        bind_state_blob_ref(row, self.view_id(), self.view_instance_id())
+        bind_state_blob_ref(
+            row,
+            None,
+            self.branch_id(),
+            self.view_id(),
+            self.view_instance_id(),
+        )
     }
 
     /// Re-resolves a filesystem blob owner through this view's authenticated
@@ -323,7 +356,16 @@ where
         let row = super::serving::state_point(self, &encoded_key, false)
             .await
             .map_err(crate::LixError::from)?;
-        row.map(|row| self.bind_blob(&row)).transpose()
+        row.map(|row| {
+            bind_state_blob_ref(
+                &row,
+                Some(key),
+                self.branch_id(),
+                self.view_id(),
+                self.view_instance_id(),
+            )
+        })
+        .transpose()
     }
 
     /// Loads complete payloads without allowing the authenticated row edge to
@@ -337,6 +379,7 @@ where
     {
         load_blob_bytes_many_on_read(
             self.storage_read(),
+            self.branch_id(),
             self.view_id(),
             self.view_instance_id(),
             refs,
@@ -355,6 +398,7 @@ where
     {
         load_blob_ranges_many_on_read(
             self.storage_read(),
+            self.branch_id(),
             self.view_id(),
             self.view_instance_id(),
             requests,
@@ -368,6 +412,7 @@ where
 /// distinct chunks, so adapter calls scale with object levels rather than rows.
 async fn load_blob_bytes_many_on_read<R>(
     read: &R,
+    branch_id: CanonicalBranchId,
     view_id: [u8; 32],
     view_instance_id: u64,
     refs: &[AuthenticatedBlobRef],
@@ -375,7 +420,7 @@ async fn load_blob_bytes_many_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    validate_blob_ref_views(view_id, view_instance_id, refs.iter())?;
+    validate_blob_ref_views(branch_id, view_id, view_instance_id, refs.iter())?;
     let manifests = load_manifests(read, refs).await?;
     for reference in refs {
         validate_manifest_owner(
@@ -548,6 +593,7 @@ fn bind_historical_state_blob_ref(
 /// same authenticated state/manifest ownership as full reads.
 async fn load_blob_ranges_many_on_read<R>(
     read: &R,
+    branch_id: CanonicalBranchId,
     view_id: [u8; 32],
     view_instance_id: u64,
     requests: &[(AuthenticatedBlobRef, Range<u64>)],
@@ -556,6 +602,7 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     validate_blob_ref_views(
+        branch_id,
         view_id,
         view_instance_id,
         requests.iter().map(|(reference, _)| reference),
@@ -619,12 +666,15 @@ where
 }
 
 fn validate_blob_ref_views<'a>(
+    branch_id: CanonicalBranchId,
     view_id: [u8; 32],
     view_instance_id: u64,
     refs: impl IntoIterator<Item = &'a AuthenticatedBlobRef>,
 ) -> Result<(), crate::LixError> {
     if refs.into_iter().any(|reference| {
-        reference.view_id != view_id || reference.view_instance_id != view_instance_id
+        reference.branch_id != branch_id
+            || reference.view_id != view_id
+            || reference.view_instance_id != view_instance_id
     }) {
         return Err(StorageError::InvalidCursor.into());
     }
