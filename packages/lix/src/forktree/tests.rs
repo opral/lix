@@ -1902,6 +1902,105 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
     seed_storage(&storage, &wrong_owner).await;
     assert!(sweep_result(&storage).await.is_err());
 
+    // RefChange chronology is authenticated by the explicit predecessor edge
+    // and the predecessor-after/successor-before head link. ChangeIds are
+    // independent identities and must not be ordered as UUIDs.
+    let mut out_of_uuid_order = build_seed();
+    let next_commit = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0x21)),
+        generation: 2,
+        parent_commit_object_ids: vec![out_of_uuid_order.commit_object_id],
+        members: Vec::new(),
+        member_page_root: None,
+        global_state_root: out_of_uuid_order.global_state_root,
+        local_state_root: out_of_uuid_order.local_state_root,
+        metadata: b"next branch head".to_vec(),
+    };
+    let (next_commit_object_id, next_commit_bytes) =
+        next_commit.encode().expect("next branch commit");
+    out_of_uuid_order
+        .objects
+        .insert(next_commit_object_id, next_commit_bytes)
+        .expect("next branch commit object");
+    let next_ref = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0x01)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+        branch_id: out_of_uuid_order.branch_id,
+        before_semantic_head_commit_object_id: Some(out_of_uuid_order.commit_object_id),
+        after_semantic_head_commit_object_id: Some(next_commit_object_id),
+        previous_ref_change_object_id: Some(out_of_uuid_order.ref_change_object_id),
+        payload: b"lower UUID identity, valid predecessor".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (next_ref_object_id, next_ref_bytes) = next_ref.encode().expect("next branch ref");
+    out_of_uuid_order
+        .objects
+        .insert(next_ref_object_id, next_ref_bytes)
+        .expect("next branch ref object");
+    let seed_commit_id = out_of_uuid_order.commit_id;
+    let seed_commit_object_id = out_of_uuid_order.commit_object_id;
+    let seed_semantic_change_id = out_of_uuid_order.semantic_change_id;
+    let seed_semantic_change_object_id = out_of_uuid_order.semantic_change_object_id;
+    let seed_ref_change_id = out_of_uuid_order.ref_change_id;
+    let seed_ref_change_object_id = out_of_uuid_order.ref_change_object_id;
+    let seed_branch_id = out_of_uuid_order.branch_id;
+    let storage = Memory::new();
+    replace_selected_history_graph(
+        &mut out_of_uuid_order,
+        &[
+            (
+                seed_commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: seed_commit_object_id,
+                },
+            ),
+            (
+                next_commit.commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: next_commit_object_id,
+                },
+            ),
+        ],
+        &[
+            (
+                next_ref.change_id(),
+                ChangeCatalogEntry {
+                    change_object_id: next_ref_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: next_ref_object_id,
+                        branch_id: seed_branch_id,
+                    },
+                },
+            ),
+            (
+                seed_semantic_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: seed_semantic_change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id: seed_commit_object_id,
+                        ordinal: 0,
+                    },
+                },
+            ),
+            (
+                seed_ref_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: seed_ref_change_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: seed_ref_change_object_id,
+                        branch_id: seed_branch_id,
+                    },
+                },
+            ),
+        ],
+        next_commit_object_id,
+        next_ref_object_id,
+    );
+    seed_storage(&storage, &out_of_uuid_order).await;
+    sweep_result(&storage)
+        .await
+        .expect("authenticated predecessor linkage accepts UUID-independent ChangeIds");
+
     // A RefChange predecessor must be on the same branch and its after target
     // must equal the successor's before target.
     let mut bad_ref_history = build_seed();

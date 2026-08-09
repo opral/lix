@@ -2248,7 +2248,6 @@ where
             let bytes = super::view::load_object_bytes(read, *previous_id).await?;
             let previous = ChangeObjectV1::decode(*previous_id, &bytes)?;
             let ChangeObjectV1::BranchRef {
-                change_id: previous_change_id,
                 branch_id: previous_branch_id,
                 after_semantic_head_commit_object_id: previous_after,
                 ..
@@ -2258,10 +2257,9 @@ where
             };
             if previous_branch_id != *branch_id
                 || previous_after != *before_semantic_head_commit_object_id
-                || previous_change_id.as_bytes() >= change_id.as_bytes()
             {
                 return Err(corruption(
-                    "RefChange predecessor chronology or branch binding is invalid",
+                    "RefChange predecessor branch binding is invalid",
                 ));
             }
         }
