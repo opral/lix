@@ -2081,7 +2081,6 @@ impl TransactionFileContent {
         self.content.inline_payload()
     }
 
-    #[cfg(test)]
     pub(crate) fn same_length_blob_splice(&self) -> Option<BlobSameLengthSplice> {
         self.same_length_blob_splice
     }

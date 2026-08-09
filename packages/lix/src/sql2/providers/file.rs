@@ -3054,7 +3054,9 @@ async fn stage_indexed_file_path_writes(
     } else {
         Vec::new()
     };
-    let existing_materializations = load_exact_existing_materializations(ctx, &existing).await?;
+    let (_, existing_materializations) =
+        load_exact_existing_materializations(ctx, existing.iter().map(|entry| entry.as_ref()))
+            .await?;
     let mut staged = LixFileStagedBatch::with_row_capacity(writes.len().saturating_mul(3));
 
     for (write, entry) in writes.into_iter().zip(indexed.existing) {
@@ -3168,62 +3170,98 @@ struct ExistingFileMaterialization {
 
 async fn load_exact_existing_materializations(
     ctx: &mut dyn SqlWriteExecutionContext,
-    entries: &[Arc<FilesystemPathEntry>],
-) -> Result<BTreeMap<FilesystemDescriptorKey, ExistingFileMaterialization>, LixError> {
+    entries: impl IntoIterator<Item = &'_ FilesystemPathEntry>,
+) -> Result<
+    (
+        MaterializedLiveStateBatch,
+        BTreeMap<FilesystemDescriptorKey, ExistingFileMaterialization>,
+    ),
+    LixError,
+> {
+    let entries = entries.into_iter().collect::<Vec<_>>();
     if entries.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok((MaterializedLiveStateBatch::default(), BTreeMap::new()));
     }
     let unique = entries
         .iter()
-        .map(|entry| (entry.key.clone(), Arc::clone(entry)))
+        .map(|entry| (entry.key.clone(), *entry))
         .collect::<BTreeMap<_, _>>();
-    let blob_requests = unique
-        .iter()
-        .map(|(key, entry)| {
-            Ok((
-                key.clone(),
-                LiveStateExactRowRequest {
-                    branch_id: entry.key.branch_id().to_string(),
-                    schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: file_id_entity_pk(entry.id())?,
-                    file_id: Some(entry.id().to_string()),
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let request = LiveStateExactBatchRequest {
-        rows: blob_requests
-            .iter()
-            .map(|(_, request)| request.clone())
-            .collect(),
-        projection: LiveStateProjection::default(),
-        untracked: Some(false),
-        include_tombstones: false,
-    };
-    let rows = ctx.load_exact_live_state_batch(&request).await?;
+
+    let mut exact_batches = Vec::new();
     let mut materializations =
         BTreeMap::<FilesystemDescriptorKey, ExistingFileMaterialization>::new();
-    for (row_index, (key, request)) in blob_requests.into_iter().enumerate() {
-        let Some(row) = rows.row(row_index) else {
-            continue;
-        };
-        let tracking_mismatch = row.untracked() ^ key.is_untracked();
-        if row.branch_id() != key.branch_id() || row.global() != key.global() || tracking_mismatch {
+
+    // Exact requests carry one untracked mode for the whole batch. Keep
+    // tracked and untracked entries in separate aligned batches so neither
+    // scope can shadow the other while still using the same transaction-owned
+    // reader and staged overlay.
+    for untracked in [false, true] {
+        let blob_requests = unique
+            .iter()
+            .filter(|(_, entry)| entry.key.is_untracked() == untracked)
+            .map(|(key, entry)| {
+                Ok((
+                    key.clone(),
+                    LiveStateExactRowRequest {
+                        branch_id: entry.key.branch_id().to_string(),
+                        schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                        entity_pk: file_id_entity_pk(entry.id())?,
+                        file_id: Some(entry.id().to_string()),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        if blob_requests.is_empty() {
             continue;
         }
-        let materialization = materializations.entry(key).or_default();
-        // A malformed old snapshot still proves that a blob row must be
-        // replaced; only the optional CAS-reuse shortcut is lost.
-        materialization.has_blob_ref = true;
-        materialization.blob_hash = row
-            .snapshot_content()
-            .map(|snapshot| snapshot.as_str())
-            .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
-            .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
-            .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
+        let request = LiveStateExactBatchRequest {
+            rows: blob_requests
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect(),
+            projection: LiveStateProjection::default(),
+            untracked: Some(untracked),
+            include_tombstones: false,
+        };
+        let rows = ctx.load_exact_live_state_batch(&request).await?;
+        for (row_index, (key, request)) in blob_requests.into_iter().enumerate() {
+            let Some(row) = rows.row(row_index) else {
+                continue;
+            };
+            let tracking_mismatch = row.untracked() ^ key.is_untracked();
+            if row.branch_id() != key.branch_id()
+                || row.global() != key.global()
+                || tracking_mismatch
+            {
+                continue;
+            }
+            let materialization = materializations.entry(key).or_default();
+            // A malformed old snapshot still proves that a blob row must be
+            // replaced; only the optional CAS-reuse shortcut is lost.
+            materialization.has_blob_ref = true;
+            materialization.blob_hash = row
+                .snapshot_content()
+                .map(|snapshot| snapshot.as_str())
+                .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
+                .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
+                .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
+        }
+        exact_batches.push(rows.into_present_batch());
     }
 
-    Ok(materializations)
+    let exact_rows = if exact_batches.len() == 1 {
+        exact_batches
+            .pop()
+            .expect("one exact request produced one exact batch")
+    } else {
+        MaterializedLiveStateBatch::from_rows(
+            exact_batches
+                .into_iter()
+                .flat_map(|batch| batch.into_rows())
+                .collect(),
+        )
+    };
+    Ok((exact_rows, materializations))
 }
 
 pub(crate) async fn execute_fast_lix_file_content_update_by_id(
@@ -3295,14 +3333,18 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     let target_file_ids = BTreeSet::from([file_id.clone()]);
     let indexed_matches = indexed_file_id_matches(index, &target_file_ids, &FilePathPredicate::All);
 
-    // Blob references are not part of the descriptor index and can change
-    // without a path-index revision.
-    let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
-    blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
-    blob_request.filter.entity_pks = vec![file_id_entity_pk(&file_id)?];
-    let rows = ctx.scan_live_state_batch(&blob_request).await?;
+    // The path index supplies only the descriptor/path projection. BlobRef
+    // ownership is loaded from the same authenticated transaction view so a
+    // stale derived index cannot become a second payload authority.
+    let (rows, _) = load_exact_existing_materializations(
+        ctx,
+        indexed_matches
+            .entries()
+            .filter(|entry| entry.kind == FilesystemPathKind::File),
+    )
+    .await?;
 
-    let prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows_without_indexed_blob_refs(&indexed_matches, rows)?;
 
     let PreparedLixFileRows {
         live_rows,
@@ -4607,6 +4649,21 @@ fn prepare_indexed_lix_file_rows(
     matches: &FilesystemPathSelection,
     rows: impl Into<MaterializedLiveStateBatch>,
 ) -> Result<PreparedLixFileRows, LixError> {
+    prepare_indexed_lix_file_rows_with_blob_authority(matches, rows, true)
+}
+
+fn prepare_indexed_lix_file_rows_without_indexed_blob_refs(
+    matches: &FilesystemPathSelection,
+    rows: impl Into<MaterializedLiveStateBatch>,
+) -> Result<PreparedLixFileRows, LixError> {
+    prepare_indexed_lix_file_rows_with_blob_authority(matches, rows, false)
+}
+
+fn prepare_indexed_lix_file_rows_with_blob_authority(
+    matches: &FilesystemPathSelection,
+    rows: impl Into<MaterializedLiveStateBatch>,
+    include_indexed_blob_refs: bool,
+) -> Result<PreparedLixFileRows, LixError> {
     let mut live_rows = LiveStateBatchOwners::default();
     let scanned_batch = live_rows.push(rows.into());
     let indexed_batch =
@@ -4637,7 +4694,7 @@ fn prepare_indexed_lix_file_rows(
                 live: live_state_row_handle(indexed_batch, descriptor_row_index),
             },
         );
-        if let Some(blob_ref) = entry.blob_ref_live_row() {
+        if include_indexed_blob_refs && let Some(blob_ref) = entry.blob_ref_live_row() {
             indexed_builder.push_materialized_ref(
                 &blob_ref.entity_pk,
                 &blob_ref.schema_key,
@@ -8816,6 +8873,7 @@ mod tests {
         blob_rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<TransactionWrite>,
         scan_requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+        exact_load_requests: Arc<Mutex<Vec<LiveStateExactBatchRequest>>>,
         path_index_requests: Arc<AtomicUsize>,
     }
 
@@ -9068,6 +9126,10 @@ mod tests {
             &mut self,
             request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            self.exact_load_requests
+                .lock()
+                .expect("exact request mutex should not be poisoned")
+                .push(request.clone());
             Ok(
                 crate::live_state::MaterializedLiveStateExactBatch::from_rows(
                     request
@@ -9080,6 +9142,9 @@ mod tests {
                                     row.schema_key == requested.schema_key
                                         && row.entity_pk == requested.entity_pk
                                         && row.file_id == requested.file_id
+                                        && request
+                                            .untracked
+                                            .is_none_or(|untracked| row.untracked == untracked)
                                         && row.branch_id.as_ref() == requested.branch_id.as_str()
                                 })
                                 .cloned()
@@ -11863,9 +11928,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_file_content_update_uses_path_index_and_target_blob_scan() {
+    async fn fast_file_content_update_uses_path_index_and_exact_blob_read() {
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let scan_requests = Arc::new(Mutex::new(Vec::new()));
+        let exact_load_requests = Arc::new(Mutex::new(Vec::new()));
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_directory_row(
@@ -11893,6 +11959,7 @@ mod tests {
             )],
             writes: Vec::new(),
             scan_requests: Arc::clone(&scan_requests),
+            exact_load_requests: Arc::clone(&exact_load_requests),
             path_index_requests: Arc::clone(&path_index_requests),
         };
 
@@ -11910,14 +11977,21 @@ mod tests {
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         {
             let requests = scan_requests.lock().expect("scan request mutex");
+            assert!(requests.is_empty());
+        }
+        {
+            let requests = exact_load_requests.lock().expect("exact request mutex");
             assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].rows.len(), 1);
+            assert_eq!(requests[0].untracked, Some(false));
+            assert_eq!(requests[0].rows[0].schema_key, super::BLOB_REF_SCHEMA_KEY);
             assert_eq!(
-                requests[0].filter.schema_keys,
-                vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+                requests[0].rows[0].entity_pk,
+                uuid_pk("01920000-0000-7000-8000-0000000000d2")
             );
             assert_eq!(
-                requests[0].filter.entity_pks,
-                vec![uuid_pk("01920000-0000-7000-8000-0000000000d2")]
+                requests[0].rows[0].file_id.as_deref(),
+                Some("01920000-0000-7000-8000-0000000000d2")
             );
         }
 
