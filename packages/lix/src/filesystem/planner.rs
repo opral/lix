@@ -1920,7 +1920,7 @@ mod tests {
     fn blob_ref_row_builds_state_row() {
         let row = blob_ref_row(BlobRefRowInput {
             file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
-            blob_hash: BlobId::from_content(b"Hello"),
+            blob_hash: BlobId::from_canonical_content(b"Hello"),
             size_bytes: 5,
             plugin_checkpoint: None,
             context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
@@ -1941,7 +1941,7 @@ mod tests {
         assert_eq!(snapshot["size_bytes"], 5);
         assert_eq!(
             snapshot["blob_hash"].as_str(),
-            Some(BlobId::from_content(b"Hello").to_hex().as_str())
+            Some(BlobId::from_canonical_content(b"Hello").to_hex().as_str())
         );
         assert_eq!(
             snapshot

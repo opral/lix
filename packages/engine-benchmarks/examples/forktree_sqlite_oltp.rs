@@ -11,12 +11,16 @@ use blake3::Hasher;
 use lix::{ExecuteResult, Value};
 
 #[path = "../benches/tracked_state_crud/raw_sqlite.rs"]
+#[expect(dead_code)]
 mod raw_sqlite;
 #[path = "../benches/tracked_state_crud/sql_session.rs"]
+#[expect(dead_code)]
 mod sql_session;
 #[path = "../benches/tracked_state_crud/storage.rs"]
+#[expect(dead_code)]
 mod storage;
 #[path = "../benches/tracked_state_crud/workload.rs"]
+#[expect(dead_code)]
 mod workload;
 
 const READ_MANY_PK_COUNT: usize = 10;

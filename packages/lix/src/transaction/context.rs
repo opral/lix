@@ -43,7 +43,6 @@ use crate::filesystem::{
     BlobRefPluginCheckpoint, BlobRefRowInput, FileDescriptorWriteIntent, FilesystemPathIndex,
     FilesystemPathIndexCache, FilesystemPathIndexReader, FilesystemPathIndexRequest,
     FilesystemPathKind, FilesystemRowContext, append_blob_ref_tombstone_row,
-    load_path_index_revision,
 };
 use crate::forktree::{
     AuthenticatedBlobReader, CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow,
@@ -54,8 +53,6 @@ use crate::gc::{
     CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef,
     load_checkpoint_publication_state,
 };
-#[cfg(test)]
-use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
     CertifiedCurrentStatePredecessor, LiveStateContext, LiveStateExactBatchRequest,
     LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
@@ -99,9 +96,7 @@ use crate::storage_adapter::{
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateKey, TrackedStateKeyRef,
-};
+use crate::tracked_state::{TrackedStateDiffKind, TrackedStateKey, TrackedStateKeyRef};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
     NormalizedRowFacts, REGISTERED_SCHEMA_KEY, normalize_raw_write_row_in_place,
@@ -116,14 +111,15 @@ use crate::transaction::staging::{
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
+#[cfg(test)]
+use crate::transaction::types::CertifiedRawWriteBatchPreparation;
 use crate::transaction::types::{
-    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
-    CertifiedRawWriteBatchPreparation, PreparedRowFacts, PreparedStateBatch,
-    PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
-    StagedCommitChangeBatchBuilder, TransactionFileContent, TransactionJson, TransactionWrite,
-    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
-    TransactionWriteOutcome, TransactionWriteRow, TypedMutationJournalBatch,
-    canonicalize_transaction_json_batch, stage_json_from_value,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
+    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
+    TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
 };
 
 use crate::transaction::validation::{
@@ -384,19 +380,6 @@ enum VisibleMaterializationBytes {
     Blob { hash: BlobId },
 }
 
-#[cfg(test)]
-fn decode_visible_materialization(
-    row: &MaterializedLiveStateRow,
-    file_id: &str,
-) -> Result<VisibleMaterialization, LixError> {
-    decode_visible_materialization_parts(
-        row.schema_key.as_str(),
-        row.change_id,
-        row.snapshot_content.as_deref(),
-        file_id,
-    )
-}
-
 fn decode_visible_materialization_ref(
     row: MaterializedLiveStateRowRef<'_>,
     file_id: &str,
@@ -529,16 +512,6 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn reset_transaction_path_index_build_stats() {
-    TRANSACTION_PATH_INDEX_BUILD_STATS.set(TransactionPathIndexBuildStats::default());
-}
-
-#[cfg(test)]
-fn transaction_path_index_build_stats() -> TransactionPathIndexBuildStats {
-    TRANSACTION_PATH_INDEX_BUILD_STATS.get()
-}
-
-#[cfg(test)]
 fn record_transaction_path_index_build(descriptor_rows: usize) {
     let stats = TRANSACTION_PATH_INDEX_BUILD_STATS.get();
     TRANSACTION_PATH_INDEX_BUILD_STATS.set(TransactionPathIndexBuildStats {
@@ -562,7 +535,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
     active_account_id: String,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     schema_resolver: TransactionSchemaResolver,
@@ -928,7 +900,7 @@ where
                     "visible upload target BlobRef identity is absent",
                 )
             })?;
-        let expected = BlobId::from_content(content).to_hex();
+        let expected = BlobId::from_canonical_content(content).to_hex();
         if byte_offset == 0
             && total_size == content.len() as u64
             && declared_size == total_size
@@ -1483,7 +1455,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
@@ -1588,7 +1559,6 @@ where
                     active_branch_id,
                     active_account_id,
                     live_state,
-                    tracked_state,
                     plugin_host,
                     branch_ctx,
                     schema_resolver,
@@ -1742,17 +1712,13 @@ where
                 .map(MaterializedLiveStateRow::from)
                 .collect::<Vec<_>>()
         };
-        let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
-            None
-        } else {
-            load_path_index_revision(&read).await.ok().flatten()
-        };
         let prepared_forktree_plan = match commit::prepare_forktree_publication_with_parent_heads(
             &transaction.active_account_id,
             &commit_parent_heads,
             runtime_functions.deterministic_sequence_checkpoint(),
             read.clone(),
             prepared_writes,
+            transaction.pending_forktree_publication.take(),
         )
         .instrument(tracing::debug_span!(
             target: "lix_perf",
@@ -1767,20 +1733,6 @@ where
                     .await;
                 return Err(error);
             }
-        };
-        let prepared_forktree_plan = match (
-            prepared_forktree_plan,
-            transaction.pending_forktree_publication.take(),
-        ) {
-            (commit::PreparedForkTreePlan::Noop, None) => commit::PreparedForkTreePlan::Noop,
-            (commit::PreparedForkTreePlan::Noop, Some(publication)) => {
-                commit::PreparedForkTreePlan::Publication(publication)
-            }
-            (commit::PreparedForkTreePlan::Publication(mut publication), Some(upload)) => {
-                publication.merge_from(upload)?;
-                commit::PreparedForkTreePlan::Publication(publication)
-            }
-            (publication, None) => publication,
         };
         // ForkTree never commits independently. Its authenticated objects,
         // selectors, untracked rows, and exact CAS fences are lowered once
@@ -1852,23 +1804,8 @@ where
             "lix.perf.transaction_storage_commit"
         ))
         .await?;
-        let post_commit_read_storage = transaction.storage.clone();
-        if rebuild_filesystem_path_index {
+        if rebuild_filesystem_path_index || !filesystem_delta_rows.is_empty() {
             transaction.live_state.clear_filesystem_path_indexes();
-        } else if !filesystem_delta_rows.is_empty()
-            && incremental_filesystem_index_enabled()
-            && let Ok(next_read) = post_commit_read_storage
-                .begin_read(StorageReadOptions::default())
-                .await
-        {
-            let next_read = SharedStorageAdapterRead::new(next_read);
-            if let Ok(next_revision) = load_path_index_revision(&next_read).await {
-                transaction.live_state.advance_filesystem_path_indexes(
-                    previous_filesystem_revision.as_deref(),
-                    next_revision.as_deref(),
-                    &filesystem_delta_rows,
-                );
-            }
         }
         for publication in std::mem::take(&mut transaction.pending_plugin_actor_publications) {
             let session_key = publication.session_key().clone();
@@ -3054,13 +2991,12 @@ where
                         })?;
                     BlobRefRowInput {
                         file_id: file_key.file_id.clone(),
-                        blob_hash: payload.blob_hash().unwrap_or_else(|| {
-                            BlobId::from_content(
-                                payload
-                                    .inline_data()
-                                    .expect("plugin materializations require inline file content"),
+                        blob_hash: payload.blob_hash().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin materialization payload has no authenticated Merkle BlobId",
                             )
-                        }),
+                        })?,
                         size_bytes: payload.len(),
                         plugin_checkpoint: payload.plugin_checkpoint().map(|checkpoint| {
                             BlobRefPluginCheckpoint {
@@ -3146,13 +3082,12 @@ where
                         })?;
                     BlobRefRowInput {
                         file_id: file_key.file_id.clone(),
-                        blob_hash: payload.blob_hash().unwrap_or_else(|| {
-                            BlobId::from_content(
-                                payload
-                                    .inline_data()
-                                    .expect("plugin materializations require inline file content"),
+                        blob_hash: payload.blob_hash().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin materialization payload has no authenticated Merkle BlobId",
                             )
-                        }),
+                        })?,
                         size_bytes: payload.len(),
                         plugin_checkpoint: payload.plugin_checkpoint().map(|checkpoint| {
                             BlobRefPluginCheckpoint {
@@ -3552,9 +3487,7 @@ where
         }
 
         let staged = self.staged_writes.staging_overlay()?;
-        let storage = self.storage.clone();
-        let read =
-            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+        let read = self.opening_read();
         let base = ForkTreeReadFacade::new(read.clone());
 
         if !lifecycle_schema_rows.is_empty() {
@@ -4150,7 +4083,7 @@ where
                     Some(PluginContentMatcher::Text) => {
                         write.splice_provenance().is_some_and(|provenance| {
                             observation.bytes_sha256().is_some_and(|digest| {
-                                digest.matches_lower_hex(provenance.base_sha256())
+                                digest.matches_lower_hex(provenance.transport_base_digest_hex())
                             }) && transport_splice_preserves_utf8(write_data, provenance)
                         })
                     }
@@ -4159,7 +4092,7 @@ where
                         bytes: scan_bytes,
                     }) => write.splice_provenance().is_some_and(|provenance| {
                         observation.bytes_sha256().is_some_and(|digest| {
-                            digest.matches_lower_hex(provenance.base_sha256())
+                            digest.matches_lower_hex(provenance.transport_base_digest_hex())
                         }) && transport_splice_preserves_prefix_exclusion(
                             write_data, provenance, byte, scan_bytes,
                         )
@@ -4360,7 +4293,7 @@ where
             if let Some((installed_hash, bytes)) =
                 current_install_plugin_wasm.get(&(key.branch_id.clone(), entry.key().to_owned()))
             {
-                if *installed_hash != hash || BlobId::from_content(bytes) != hash {
+                if *installed_hash != hash || BlobId::from_canonical_content(bytes) != hash {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
@@ -4981,11 +4914,7 @@ where
                             && observation_matches_visible_root
                         {
                             let staged = self.staged_writes.staging_overlay()?;
-                            let read = SharedStorageAdapterRead::new(
-                                self.storage
-                                    .begin_read(StorageReadOptions::default())
-                                    .await?,
-                            );
+                            let read = self.opening_read();
                             let base = ForkTreeReadFacade::new(read.clone());
                             let (
                                 cold_before,
@@ -6306,11 +6235,7 @@ where
             return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
         }
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let live_state = ForkTreeReadFacade::new(read.clone());
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
@@ -6466,7 +6391,7 @@ where
 
     async fn validate_prepared_writes_by_branch(
         &mut self,
-        read: &(impl StorageAdapterRead + ?Sized),
+        _read: &(impl StorageAdapterRead + ?Sized),
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
         let validation_live_state = self.validation_live_state_reader();
@@ -6555,12 +6480,7 @@ where
         &mut self,
         write: &TransactionWrite,
     ) -> Result<(), LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let reader = self.branch_ctx.ref_reader(read);
+        let reader = self.branch_ref_reader_on_opening_read();
         for branch_id in transaction_write_branch_ids(write) {
             if branch_id == GLOBAL_BRANCH_ID {
                 continue;
@@ -7194,7 +7114,6 @@ where
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
         let staged = self.staged_writes.staging_overlay()?;
-        let staged_writes = Arc::clone(&self.staged_writes);
         let filesystem_path_index_cache = Arc::clone(&self.filesystem_path_index_cache);
         let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
         let plugin_host = self.plugin_host.clone();
@@ -7210,7 +7129,6 @@ where
             visible_schemas,
             functions,
             staged,
-            staged_writes,
             filesystem_path_index_cache,
             filesystem_path_index_epoch,
             plugin_host,
@@ -7316,34 +7234,11 @@ where
         load_checkpoint_publication_state(&read, branch_id).await
     }
 
-    /// Creates a branch-ref reader scoped to this write transaction.
-    pub(crate) async fn branch_ref_reader(&mut self) -> impl BranchRefReader + '_ {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        self.branch_ctx
-            .ref_reader(SharedStorageAdapterRead::new(read))
-    }
-
     /// Creates a branch-ref reader over this transaction's retained opening
     /// read. Merge planning must not acquire a second snapshot just to resolve
     /// branch selectors.
     pub(crate) fn branch_ref_reader_on_opening_read(&self) -> impl BranchRefReader + '_ {
         self.branch_ctx.ref_reader(&self.opening_read)
-    }
-
-    /// Creates a commit-graph reader scoped to this write transaction.
-    pub(crate) async fn commit_graph_reader(
-        &mut self,
-    ) -> CommitGraphStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
     }
 
     /// Creates a commit-graph reader over the same immutable read that opened
@@ -7362,6 +7257,7 @@ where
     /// strings. The transaction's coherent opening head certifies the current
     /// side, so undo/redo does not need to reload visible live state after it
     /// has already read that exact historical root.
+    #[cfg(test)]
     pub(crate) async fn execute_tracked_state_transition(
         &mut self,
         current_commit_id: CommitId,
@@ -7545,11 +7441,7 @@ where
             .flat_map(|(_, sides)| [sides.before, sides.after])
             .flatten()
             .collect::<BTreeSet<_>>();
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let records = load_change_records(&read, change_ids.into_iter()).await?;
         let mut forktree_reader = ForkTreeReadFacade::new(read.clone());
         let mut payloads = materialize_known_change_payloads(
@@ -8128,7 +8020,6 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
     staged: PreparedStateRowOverlay,
-    staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
     plugin_host: PluginRuntimeHost,
@@ -8177,7 +8068,6 @@ where
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
         Arc::new(TransactionReadLiveStateReader {
             forktree: self.forktree.clone(),
-            read_store: self.read_store.clone(),
             staged: self.staged.clone(),
             filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
             filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
@@ -8187,7 +8077,6 @@ where
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         Arc::new(TransactionReadLiveStateReader {
             forktree: self.forktree.clone(),
-            read_store: self.read_store.clone(),
             staged: self.staged.clone(),
             filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
             filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
@@ -8212,9 +8101,7 @@ where
         Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
     }
 
-    fn authenticated_blob_reader(
-        &self,
-    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+    fn authenticated_blob_reader(&self) -> Result<Arc<dyn AuthenticatedBlobReader>, LixError> {
         Ok(Arc::new(crate::forktree::blob_reader_on_read(
             self.read_store.clone(),
             &self.active_branch_id,
@@ -8261,7 +8148,7 @@ where
             .transpose()?
             .flatten();
         if let Some(bytes) = staged {
-            if BlobId::from_content(&bytes) != *expected {
+            if BlobId::from_canonical_content(&bytes) != *expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "staged plugin payload does not match its authenticated BlobRef identity",
@@ -8272,7 +8159,7 @@ where
             && let Some((actual, bytes)) =
                 pending_plugin_wasm_by_owner.get(&(branch_id.to_owned(), file_id.to_owned()))
         {
-            if *actual != *expected || BlobId::from_content(bytes) != *expected {
+            if *actual != *expected || BlobId::from_canonical_content(bytes) != *expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "staged plugin payload owner does not match its authenticated BlobRef identity",
@@ -8303,7 +8190,7 @@ where
                     "authenticated plugin BlobRef owner has no payload",
                 )
             })?;
-            if BlobId::from_content(&bytes) != expected {
+            if BlobId::from_canonical_content(&bytes) != expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "authenticated plugin BlobRef payload identity does not match the requested owner",
@@ -8970,7 +8857,6 @@ mod transaction_validation_reader_tests {
 
 struct TransactionReadLiveStateReader<R: crate::storage_adapter::StorageRead> {
     forktree: ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
-    read_store: SharedStorageAdapterRead<R>,
     staged: PreparedStateRowOverlay,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
@@ -9006,28 +8892,13 @@ where
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
+        let cache_revision = transaction_path_index_cache_revision(descriptor_epoch);
         if descriptor_epoch == 0 {
-            let mut index = crate::filesystem::build_path_index(&self.forktree, request).await?;
-            if request.cache_small_blob_data {
-                index = Arc::new(
-                    (*index)
-                        .clone()
-                        .hydrate_small_blob_data(&self.forktree)
-                        .await?,
-                );
-            }
-            return Ok(index);
+            return crate::filesystem::build_path_index(&self.forktree, request).await;
         }
-        // The revision probe is only a cache-freshness optimization. Preserve the
-        // pre-cache overlay behavior if a storage fault affects that single key.
-        let cache_revision = load_path_index_revision(&self.read_store)
-            .await
-            .ok()
-            .map(|revision| transaction_path_index_cache_revision(revision, descriptor_epoch));
-        if let Some(cache_revision) = cache_revision.as_deref()
-            && let Some(index) = self
-                .filesystem_path_index_cache
-                .get(request, Some(cache_revision))
+        if let Some(index) = self
+            .filesystem_path_index_cache
+            .get(request, Some(&cache_revision))
         {
             return Ok(index);
         }
@@ -9036,13 +8907,9 @@ where
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
         let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
-        Ok(match cache_revision {
-            Some(cache_revision) => {
-                self.filesystem_path_index_cache
-                    .insert(request, Some(&cache_revision), index)
-            }
-            None => index,
-        })
+        Ok(self
+            .filesystem_path_index_cache
+            .insert(request, Some(&cache_revision), index))
     }
 }
 
@@ -9419,7 +9286,6 @@ pub(crate) async fn open_transaction<StorageImpl>(
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -9434,7 +9300,6 @@ where
         active_account_id,
         storage,
         live_state,
-        tracked_state,
         plugin_host,
         branch_ctx,
         catalog_context,
@@ -9451,7 +9316,6 @@ pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -9468,7 +9332,6 @@ where
         active_account_id,
         storage,
         live_state,
-        tracked_state,
         plugin_host,
         branch_ctx,
         catalog_context,
@@ -9523,9 +9386,7 @@ where
         None
     }
 
-    fn authenticated_blob_reader(
-        &self,
-    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+    fn authenticated_blob_reader(&self) -> Result<Arc<dyn AuthenticatedBlobReader>, LixError> {
         Ok(Arc::new(crate::forktree::blob_reader_on_read(
             self.opening_read(),
             &self.active_branch_id,
@@ -9550,29 +9411,18 @@ where
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        let read = self.opening_read();
         let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
+        let cache_revision = transaction_path_index_cache_revision(descriptor_epoch);
         if descriptor_epoch == 0 {
             let staged = self.staged_writes.staging_overlay()?;
             let forktree = self.forktree_read_facade();
             let rows =
                 overlay_scan_batch(&forktree, &staged, &request.live_state_request()).await?;
-            let mut index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
-            if request.cache_small_blob_data {
-                index = Arc::new((*index).clone().hydrate_small_blob_data(&forktree).await?);
-            }
-            return Ok(index);
+            return Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?));
         }
-        // The revision probe is only a cache-freshness optimization. Preserve the
-        // pre-cache overlay behavior if a storage fault affects that single key.
-        let cache_revision = load_path_index_revision(&read)
-            .await
-            .ok()
-            .map(|revision| transaction_path_index_cache_revision(revision, descriptor_epoch));
-        if let Some(cache_revision) = cache_revision.as_deref()
-            && let Some(index) = self
-                .filesystem_path_index_cache
-                .get(request, Some(cache_revision))
+        if let Some(index) = self
+            .filesystem_path_index_cache
+            .get(request, Some(&cache_revision))
         {
             return Ok(index);
         }
@@ -9582,13 +9432,9 @@ where
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
         let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
-        Ok(match cache_revision {
-            Some(cache_revision) => {
-                self.filesystem_path_index_cache
-                    .insert(request, Some(&cache_revision), index)
-            }
-            None => index,
-        })
+        Ok(self
+            .filesystem_path_index_cache
+            .insert(request, Some(&cache_revision), index))
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
@@ -10006,21 +9852,8 @@ fn prepared_transaction_write_rows(write: &PreparedTransactionWrite) -> &Prepare
     }
 }
 
-fn transaction_path_index_cache_revision(
-    filesystem_revision: Option<Vec<u8>>,
-    descriptor_epoch: usize,
-) -> Vec<u8> {
-    let mut cache_revision = b"transaction-path-index-v1".to_vec();
-    cache_revision.extend_from_slice(&descriptor_epoch.to_be_bytes());
-    match filesystem_revision {
-        Some(revision) => {
-            cache_revision.push(1);
-            cache_revision.extend_from_slice(&revision.len().to_be_bytes());
-            cache_revision.extend_from_slice(&revision);
-        }
-        None => cache_revision.push(0),
-    }
-    cache_revision
+fn transaction_path_index_cache_revision(descriptor_epoch: usize) -> Vec<u8> {
+    descriptor_epoch.to_be_bytes().to_vec()
 }
 
 fn advance_transaction_path_index_cache_revision(
@@ -10028,17 +9861,10 @@ fn advance_transaction_path_index_cache_revision(
     previous_epoch: usize,
     next_epoch: usize,
 ) -> Option<Vec<u8>> {
-    const PREFIX: &[u8] = b"transaction-path-index-v1";
-    let epoch_end = PREFIX.len().checked_add(size_of::<usize>())?;
-    if revision.len() < epoch_end
-        || !revision.starts_with(PREFIX)
-        || revision[PREFIX.len()..epoch_end] != previous_epoch.to_be_bytes()
-    {
+    if revision != previous_epoch.to_be_bytes() {
         return None;
     }
-    let mut next_revision = revision.to_vec();
-    next_revision[PREFIX.len()..epoch_end].copy_from_slice(&next_epoch.to_be_bytes());
-    Some(next_revision)
+    Some(next_epoch.to_be_bytes().to_vec())
 }
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -10085,13 +9911,6 @@ fn v2_actor_key_is_descriptor_successor(
         && observed.owner_change_id == desired.owner_change_id
         && observed.plugin_key == desired.plugin_key
         && observed.plugin_generation == desired.plugin_generation
-}
-
-#[cfg(test)]
-fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm::WasmCreateContext {
-    BoundCreateContext::bind(local_mutation_identity(seed), actor_key)
-        .expect("local mutation seeds are generated as UUIDv7")
-        .creates()
 }
 
 fn suppress_format_only_noops_against_batch(
@@ -10238,7 +10057,7 @@ fn append_plugin_change_rows(
 fn append_certified_entity_changes(
     changes: &mut WasmHostEntityChanges,
     batches: &[WasmCertifiedEntityBatch],
-    schemas: &crate::plugin::SchemaAllowlist,
+    schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     for batch in batches {
         changes
@@ -12114,11 +11933,6 @@ fn plugin_reconciliation_origin() -> TransactionWriteOrigin {
         operation: TransactionWriteOperation::Update,
         primary_key: None,
     }
-}
-
-#[cfg(test)]
-fn mark_plugin_reconciliation_row(row: &mut TransactionWriteRow) {
-    row.origin = Some(plugin_reconciliation_origin());
 }
 
 fn mark_plugin_reconciliation_batch(

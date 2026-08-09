@@ -105,12 +105,6 @@ impl TransactionSchemaResolver {
     pub(crate) fn clear_cached_catalogs(&mut self) {
         self.catalogs_by_domain.clear();
     }
-
-    #[cfg(test)]
-    pub(crate) fn has_cached_catalog_for_test(&self, domain: &Domain) -> bool {
-        self.catalogs_by_domain
-            .contains_key(&domain.schema_catalog_domain())
-    }
 }
 
 struct TransactionSchemaLiveStateReader<'a, S: StagedLiveStateRows + Sync + ?Sized> {

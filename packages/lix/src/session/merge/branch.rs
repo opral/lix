@@ -14,7 +14,6 @@ use crate::plugin::{
     load_plugin_registry_at_commit,
 };
 use crate::storage_adapter::Storage;
-use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateKey};
 use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateMergeConflict};
 use crate::transaction::types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
@@ -703,45 +702,6 @@ fn common_live_plugin_owner_ref(
     Ok(Some(base_owner))
 }
 
-/// A semantic resolver can run only within a single live file incarnation.
-/// `PluginFileOwner::change_id` is the immutable incarnation key used by the
-/// actor cache and ID namespace. Equal owner payloads alone are not enough:
-/// a delete/recreate may intentionally reuse a file ID and plugin key.
-#[cfg(test)]
-fn common_live_plugin_owner(
-    base: Option<&MaterializedTrackedStateRow>,
-    target: Option<&MaterializedTrackedStateRow>,
-    source: Option<&MaterializedTrackedStateRow>,
-) -> Result<Option<PluginFileOwner>, LixError> {
-    let Some(base) = base.filter(|row| !row.deleted) else {
-        return Ok(None);
-    };
-    let Some(target) = target.filter(|row| !row.deleted) else {
-        return Ok(None);
-    };
-    let Some(source) = source.filter(|row| !row.deleted) else {
-        return Ok(None);
-    };
-    let Some(base_owner) = PluginFileOwner::from_tracked_state_row(base)? else {
-        return Ok(None);
-    };
-    let Some(target_owner) = PluginFileOwner::from_tracked_state_row(target)? else {
-        return Ok(None);
-    };
-    let Some(source_owner) = PluginFileOwner::from_tracked_state_row(source)? else {
-        return Ok(None);
-    };
-    if base_owner == target_owner
-        && base_owner == source_owner
-        && base.change_id == target.change_id
-        && base.change_id == source.change_id
-    {
-        Ok(Some(base_owner))
-    } else {
-        Ok(None)
-    }
-}
-
 fn is_derived_blob_conflict(
     conflict: &TrackedStateMergeConflict,
     derived_blob_files: &DerivedPluginConflictIndex,
@@ -1102,30 +1062,6 @@ fn common_historical_file_descriptor_ref(
     let base = historical_file_descriptor_row_ref(base, expected_file_id)?;
     let target = historical_file_descriptor_row_ref(target, expected_file_id)?;
     let source = historical_file_descriptor_row_ref(source, expected_file_id)?;
-    (base == target && base == source).then_some(base)
-}
-
-#[cfg(test)]
-fn historical_file_descriptor_row(
-    row: Option<&MaterializedTrackedStateRow>,
-    expected_file_id: &str,
-) -> Option<(Option<String>, HistoricalFileDescriptor)> {
-    let row = row.filter(|row| !row.deleted)?;
-    let snapshot = row.snapshot_content.as_deref()?;
-    let descriptor = serde_json::from_str::<HistoricalFileDescriptor>(snapshot).ok()?;
-    (descriptor.id == expected_file_id).then_some((row.file_id.clone(), descriptor))
-}
-
-#[cfg(test)]
-fn common_historical_file_descriptor(
-    expected_file_id: &str,
-    base: Option<MaterializedTrackedStateRow>,
-    target: Option<MaterializedTrackedStateRow>,
-    source: Option<MaterializedTrackedStateRow>,
-) -> Option<(Option<String>, HistoricalFileDescriptor)> {
-    let base = historical_file_descriptor_row(base.as_ref(), expected_file_id)?;
-    let target = historical_file_descriptor_row(target.as_ref(), expected_file_id)?;
-    let source = historical_file_descriptor_row(source.as_ref(), expected_file_id)?;
     (base == target && base == source).then_some(base)
 }
 

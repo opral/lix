@@ -492,8 +492,8 @@ fn branch_ref_change(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU8, Ordering};
-    use std::sync::{Mutex, MutexGuard};
 
     use bytes::Bytes;
 
@@ -509,10 +509,10 @@ mod tests {
 
     static SELECTOR_RACE: AtomicU8 = AtomicU8::new(NO_SELECTOR_RACE);
     static LAST_INJECTED_SELECTOR_KEY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-    static RACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static RACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn race_test_lock() -> MutexGuard<'static, ()> {
-        RACE_TEST_LOCK.lock().unwrap()
+    async fn race_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        RACE_TEST_LOCK.lock().await
     }
 
     fn arm_selector_race(kind: u8) {
@@ -576,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn selector_insertion_race_is_atomic_for_global_and_branch_keys() {
-        let _race_test_lock = race_test_lock();
+        let _race_test_lock = race_test_lock().await;
         for (kind, expected_key_is_global) in
             [(GLOBAL_SELECTOR_RACE, true), (BRANCH_SELECTOR_RACE, false)]
         {

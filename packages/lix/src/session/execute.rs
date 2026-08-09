@@ -5,7 +5,6 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
 use crate::common::ExecuteStatementMetadata;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -13,8 +12,8 @@ use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch}
 use crate::sql2;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
-    StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadDurability,
+    StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
@@ -36,7 +35,7 @@ use tracing::Instrument as _;
 use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
-use super::transaction::{SessionTransaction, transaction_state_error};
+use super::transaction::SessionTransaction;
 use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
@@ -2498,7 +2497,7 @@ fn native_file_read_from_exact_result(
 ) -> Result<Option<FileRead>, LixError> {
     if requested_range.is_none() {
         return native_file_content_from_exact_result(result, requested_paths)?
-            .map(|data| materialize_file_read(data, None))
+            .map(|(data, identity)| materialize_file_read(data, identity, None))
             .transpose();
     }
     if result.columns.as_slice()
@@ -2584,8 +2583,8 @@ fn native_file_read_from_exact_result(
 fn native_file_content_from_exact_result(
     result: SqlQueryResult,
     requested_paths: &BTreeSet<String>,
-) -> Result<Option<Blob>, LixError> {
-    if result.columns.as_slice() != ["path", "content"] {
+) -> Result<Option<(Blob, String)>, LixError> {
+    if result.columns.as_slice() != ["path", "content", "content_identity"] {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "native file read returned an unexpected result schema",
@@ -2601,7 +2600,7 @@ fn native_file_content_from_exact_result(
             "native file read returned more than one path",
         ));
     }
-    let [Value::Text(path), data] = row.as_mut_slice() else {
+    let [Value::Text(path), data, Value::Text(content_identity)] = row.as_mut_slice() else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "native file read returned an invalid row",
@@ -2626,11 +2625,12 @@ fn native_file_content_from_exact_result(
             ));
         }
     };
-    Ok(Some(content))
+    Ok(Some((content, std::mem::take(content_identity))))
 }
 
 fn materialize_file_read(
     data: Blob,
+    content_identity: String,
     requested_range: Option<Range<u64>>,
 ) -> Result<FileRead, LixError> {
     let total_size = u64::try_from(data.len()).map_err(|_| {
@@ -2639,7 +2639,6 @@ fn materialize_file_read(
             "native file size does not fit the public 64-bit range",
         )
     })?;
-    let content_identity = BlobId::from_content(data.as_ref()).to_hex();
     let range = match requested_range {
         None => 0..total_size,
         Some(range) => {

@@ -89,6 +89,7 @@ pub(crate) struct VisibleStateRow {
     pub(crate) encoded_key: Vec<u8>,
     pub(crate) value: StateValue,
     pub(crate) source: StateSource,
+    #[cfg(test)]
     pub(super) view_instance_id: u64,
 }
 
@@ -1453,6 +1454,7 @@ where
                 encoded_key: key.clone(),
                 value,
                 source,
+                #[cfg(test)]
                 view_instance_id: view.view_instance_id(),
             })
         })
@@ -1573,6 +1575,7 @@ where
             encoded_key,
             value,
             source,
+            #[cfg(test)]
             view_instance_id: view.view_instance_id(),
         })
         .collect())

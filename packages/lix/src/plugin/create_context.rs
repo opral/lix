@@ -131,7 +131,7 @@ fn framed_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
         input.extend_from_slice(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
         input.extend_from_slice(field);
     }
-    BlobId::from_content(&input).into_bytes()
+    BlobId::from_canonical_content(&input).into_bytes()
 }
 
 /// Result of validating generated identities in one sparse guest transition.

@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use smallvec::SmallVec;
-
 use crate::catalog::CatalogFingerprint;
 use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::observe_invalidation::ObserveInvalidation;
@@ -35,10 +33,6 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) has_started_statement: bool,
-    /// Reusable storage only for SQL literals containing doubled quote
-    /// escapes. Ordinary warm literals continue to borrow the SQL text.
-    pub(super) prepared_literal_escape_scratch: SmallVec<[String; 4]>,
-    pub(super) prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -64,7 +58,6 @@ where
                 self.active_account_id.to_string(),
                 self.storage.clone(),
                 Arc::clone(&self.live_state),
-                Arc::clone(&self.tracked_state),
                 self.plugin_host.clone(),
                 Arc::clone(&self.branch_ctx),
                 Arc::clone(&self.catalog_context),
@@ -103,8 +96,6 @@ where
             commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
             has_started_statement: false,
-            prepared_literal_escape_scratch: SmallVec::new(),
-            prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape::default(),
         })
     }
 }

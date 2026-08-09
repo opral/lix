@@ -74,8 +74,10 @@ impl VerifiedRequestBlob {
             sha256: actual_result_sha256,
         };
         let provenance = RequestBlobSpliceProvenance {
-            base_sha256: self.sha256.clone(),
-            result_sha256: result.sha256.clone(),
+            transport_base_digest_hex: self.sha256.clone(),
+            base_blob_id: crate::forktree::canonical_blob_id_for_content(&self.blob)
+                .map_err(LixError::from)?,
+            transport_result_digest_hex: result.sha256.clone(),
             prefix_bytes,
             suffix_bytes,
             insert,
@@ -96,8 +98,12 @@ impl VerifiedRequestBlob {
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestBlobSpliceProvenance {
-    base_sha256: String,
-    result_sha256: String,
+    transport_base_digest_hex: String,
+    /// Canonical Merkle identity of the exact verified base bytes. The
+    /// publication owner binds this to the selected StateKey BlobRef before
+    /// any object is staged.
+    base_blob_id: crate::binary_cas::BlobId,
+    transport_result_digest_hex: String,
     prefix_bytes: usize,
     suffix_bytes: usize,
     insert: Blob,
@@ -152,8 +158,10 @@ impl RequestBlobSpliceProvenance {
             ));
         }
         Ok(Self {
-            base_sha256: actual_base_sha256,
-            result_sha256: actual_result_sha256,
+            transport_base_digest_hex: actual_base_sha256,
+            base_blob_id: crate::forktree::canonical_blob_id_for_content(base)
+                .map_err(LixError::from)?,
+            transport_result_digest_hex: actual_result_sha256,
             prefix_bytes,
             suffix_bytes,
             insert,
@@ -161,12 +169,21 @@ impl RequestBlobSpliceProvenance {
         })
     }
 
-    pub(crate) fn base_sha256(&self) -> &str {
-        &self.base_sha256
+    /// Returns the transport protocol's full-byte witness. This is used only
+    /// to retain already-established plugin matcher observations; it is not a
+    /// file identity or publication authority.
+    pub(crate) fn transport_base_digest_hex(&self) -> &str {
+        &self.transport_base_digest_hex
     }
 
-    pub(crate) fn result_sha256(&self) -> &str {
-        &self.result_sha256
+    pub(crate) fn base_blob_id(&self) -> crate::binary_cas::BlobId {
+        self.base_blob_id
+    }
+
+    /// Returns the transport protocol's successor byte witness for plugin
+    /// input bookkeeping. It is never a durable file identity.
+    pub(crate) fn transport_result_digest_hex(&self) -> &str {
+        &self.transport_result_digest_hex
     }
 
     pub(crate) fn prefix_bytes(&self) -> usize {

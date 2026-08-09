@@ -16,7 +16,9 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BlobBytesBatch, BlobId};
+#[cfg(test)]
+use crate::binary_cas::BlobBytesBatch;
+use crate::binary_cas::BlobId;
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
@@ -358,6 +360,7 @@ impl ImmutableMutationJournalChunk {
             .expect("validated immutable mutation journal UTF-8")
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot_slot(&self, index: usize) -> crate::json_store::JsonSlotRef<'_> {
         let snapshot = self.snapshot(index);
         if snapshot.len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
@@ -445,34 +448,6 @@ pub(crate) struct OrderedMutationJournal {
     overlay_uniform_created_at: Option<LixTimestamp>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct OrderedMutationJournalRowRef<'a> {
-    chunk: &'a ImmutableMutationJournalChunk,
-    row_index: usize,
-}
-
-impl<'a> OrderedMutationJournalRowRef<'a> {
-    pub(crate) fn identity(&self) -> &'a str {
-        self.chunk.identity(self.row_index)
-    }
-
-    pub(crate) fn snapshot(&self) -> &'a str {
-        self.chunk.snapshot(self.row_index)
-    }
-
-    pub(crate) fn snapshot_slot(&self) -> crate::json_store::JsonSlotRef<'a> {
-        self.chunk.snapshot_slot(self.row_index)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct OrderedMutationJournalRows<'a> {
-    journal: &'a OrderedMutationJournal,
-    chunk_index: usize,
-    row_index: usize,
-    remaining: usize,
-}
-
 /// Cheap read-only identity projection used to bulk-hydrate provisional
 /// predecessor evidence before generic lowering.
 #[derive(Clone)]
@@ -506,48 +481,7 @@ impl ProvisionalMutationJournalDescriptor {
     }
 }
 
-impl<'a> Iterator for OrderedMutationJournalRows<'a> {
-    type Item = OrderedMutationJournalRowRef<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.chunk_index < self.journal.chunks.len() {
-            let chunk = &self.journal.chunks[self.chunk_index];
-            if self.row_index < chunk.len() {
-                let row = OrderedMutationJournalRowRef {
-                    chunk,
-                    row_index: self.row_index,
-                };
-                self.row_index += 1;
-                self.remaining -= 1;
-                return Some(row);
-            }
-            self.chunk_index += 1;
-            self.row_index = 0;
-        }
-        None
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl ExactSizeIterator for OrderedMutationJournalRows<'_> {}
-
 impl OrderedMutationJournal {
-    pub(crate) fn iter(&self) -> OrderedMutationJournalRows<'_> {
-        OrderedMutationJournalRows {
-            journal: self,
-            chunk_index: 0,
-            row_index: 0,
-            remaining: self.row_count,
-        }
-    }
-
-    pub(crate) fn row_count(&self) -> usize {
-        self.row_count
-    }
-
     pub(crate) fn commit_id(&self) -> CommitId {
         self.commit_id
     }
@@ -562,11 +496,6 @@ impl OrderedMutationJournal {
 
     pub(crate) fn timestamp(&self) -> LixTimestamp {
         self.chunks[0].timestamp()
-    }
-
-    pub(crate) fn replacement_proof(&self) -> CompleteCollectionReplacementProof {
-        self.replacement_proof
-            .expect("drained ordered mutation journal is replacement-certified")
     }
 
     fn into_prepared(self) -> Result<PreparedStateBatch, LixError> {
@@ -923,10 +852,6 @@ impl PreparedInsertSelection {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.count == 0
-    }
-
-    pub(crate) fn covers_all(&self, row_count: usize) -> bool {
-        self.row_count == row_count && self.count == row_count
     }
 
     pub(crate) fn contains(&self, row_index: usize) -> bool {
@@ -2832,63 +2757,6 @@ impl TransactionWriteBuffer {
     /// The normal monotonically ordered journal answers future identities from
     /// its tail without building an index; irregular/overlapping transactions
     /// already have the exact identity map.
-    pub(crate) fn staged_identity_may_affect(
-        &self,
-        branch_id: &str,
-        schema_key: &str,
-        file_id: Option<&str>,
-        entity_pk: &EntityPk,
-    ) -> Result<bool, LixError> {
-        let ordered = self.ordered_mutations.lock().map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "failed to acquire immutable transaction mutation journal",
-            )
-        })?;
-        if ordered.as_ref().is_some_and(|journal| {
-            ordered_mutation_journal_row(journal, branch_id, schema_key, file_id, entity_pk)
-                .is_some()
-        }) {
-            return Ok(true);
-        }
-        drop(ordered);
-        let rows = self.rows.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged writes lock",
-            )
-        })?;
-        Ok(match &*rows {
-            StagedPreparedRows::AppendOnly { last_key, .. } => {
-                last_key.as_ref().is_some_and(|last_key| {
-                    compare_tracked_key_to_parts(last_key, schema_key, file_id, entity_pk)
-                        != std::cmp::Ordering::Less
-                })
-            }
-            StagedPreparedRows::Indexed { by_identity, .. } => {
-                by_identity.contains_key(&PreparedStateRowIdentity {
-                    schema_key: schema_key.into(),
-                    entity_pk: entity_pk.clone(),
-                    file_id: file_id.map(Into::into),
-                    branch_id: branch_id.into(),
-                })
-            }
-        })
-    }
-
-    pub(crate) fn has_staged_state_rows(&self) -> Result<bool, LixError> {
-        let rows = self.rows.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged writes lock",
-            )
-        })?;
-        Ok(match &*rows {
-            StagedPreparedRows::AppendOnly { rows, .. }
-            | StagedPreparedRows::Indexed { rows, .. } => !rows.is_empty(),
-        })
-    }
-
     #[cfg(test)]
     fn uses_identity_index_for_tests(&self) -> bool {
         matches!(
@@ -2906,6 +2774,7 @@ impl TransactionWriteBuffer {
     /// can observe the staged `lix_binary_blob_ref` rows immediately. This lookup
     /// lets transaction-scoped blob readers satisfy those hashes from the same
     /// staged file payloads that commit will later write.
+    #[cfg(test)]
     pub(crate) fn load_staged_file_bytes_many(
         &self,
         hashes: &[BlobId],
@@ -2931,9 +2800,12 @@ impl TransactionWriteBuffer {
                 // unresolved lets the transaction reader fall through to CAS.
                 continue;
             };
-            let hash = write
-                .blob_hash()
-                .unwrap_or_else(|| BlobId::from_content(data));
+            let hash = write.blob_hash().ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_STORAGE",
+                    "staged file payload has no authenticated Merkle BlobId",
+                )
+            })?;
             if let Some(bytes) = requested.get_mut(&hash)
                 && bytes.is_none()
             {
@@ -2944,9 +2816,9 @@ impl TransactionWriteBuffer {
                 }
             }
             for payload in write.auxiliary_payloads() {
-                let hash = payload
-                    .hash()
-                    .unwrap_or_else(|| BlobId::from_content(payload.bytes()));
+                let Some(hash) = payload.hash() else {
+                    continue;
+                };
                 if let Some(bytes) = requested.get_mut(&hash)
                     && bytes.is_none()
                 {
@@ -2994,9 +2866,12 @@ impl TransactionWriteBuffer {
             let Some(data) = write.inline_data() else {
                 continue;
             };
-            let actual = write
-                .blob_hash()
-                .unwrap_or_else(|| BlobId::from_content(data));
+            let actual = write.blob_hash().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "staged plugin payload has no authenticated Merkle BlobId",
+                )
+            })?;
             if actual != expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
@@ -3826,13 +3701,6 @@ fn push_ordered_mutation_materialized(
         false,
         chunk.branch_id(),
     );
-    if let Some(predecessor) = chunk
-        .durable_predecessors
-        .as_ref()
-        .and_then(|predecessors| predecessors.get(row_index))
-    {
-        output.set_durable_predecessor(ordinal, predecessor.clone());
-    }
     Ok(ordinal)
 }
 
@@ -5625,9 +5493,9 @@ mod tests {
             })
             .expect("file payloads should stage");
 
-        let auxiliary_hash = BlobId::from_content(b"requested-auxiliary");
-        let missing_hash = BlobId::from_content(b"missing");
-        let main_hash = BlobId::from_content(b"requested-main");
+        let auxiliary_hash = BlobId::from_canonical_content(b"requested-auxiliary");
+        let missing_hash = BlobId::from_canonical_content(b"missing");
+        let main_hash = BlobId::from_canonical_content(b"requested-main");
         let loaded = staged_writes
             .load_staged_file_bytes_many(&[auxiliary_hash, missing_hash, main_hash, auxiliary_hash])
             .expect("staged payload lookup should succeed")

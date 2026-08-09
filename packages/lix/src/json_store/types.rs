@@ -1,20 +1,6 @@
-use std::sync::Arc;
-
+#[cfg(test)]
 use bytes::Bytes;
 use musli::{Allocator, Decode, Decoder, Encode, Encoder};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NormalizedJson(Arc<str>);
-
-impl NormalizedJson {
-    pub(crate) fn from_arc_unchecked(normalized: Arc<str>) -> Self {
-        Self(normalized)
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        self.0.as_ref()
-    }
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct JsonRef {
@@ -36,14 +22,17 @@ impl JsonRef {
         Self::from_hash(blake3::hash(bytes))
     }
 
+    #[cfg(test)]
     pub(crate) fn as_hash_bytes(&self) -> &[u8] {
         &self.hash
     }
 
+    #[cfg(test)]
     pub(crate) fn as_hash_array(&self) -> &[u8; 32] {
         &self.hash
     }
 
+    #[cfg(test)]
     pub(crate) fn to_hex(self) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -87,12 +76,14 @@ where
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NormalizedJsonRef<'a> {
     normalized: &'a str,
     trusted_json_ref: Option<JsonRef>,
 }
 
+#[cfg(test)]
 impl<'a> NormalizedJsonRef<'a> {
     pub(crate) fn new(normalized: &'a str) -> Self {
         Self {
@@ -104,13 +95,6 @@ impl<'a> NormalizedJsonRef<'a> {
     /// Uses a caller-owned invariant that `json_ref` was computed from
     /// `normalized`. This avoids rehashing JSON already normalized by the
     /// transaction staging boundary.
-    pub(crate) fn trusted_prehashed(normalized: &'a str, json_ref: JsonRef) -> Self {
-        Self {
-            normalized,
-            trusted_json_ref: Some(json_ref),
-        }
-    }
-
     pub(crate) fn normalized(&self) -> &'a str {
         self.normalized
     }
@@ -120,33 +104,32 @@ impl<'a> NormalizedJsonRef<'a> {
     }
 }
 
-impl<'a> From<&'a NormalizedJson> for NormalizedJsonRef<'a> {
-    fn from(value: &'a NormalizedJson) -> Self {
-        Self::new(value.as_str())
-    }
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JsonWritePlacementRef {
     OutOfBand,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JsonReadScopeRef {
     OutOfBand,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JsonLoadRequestRef<'a> {
     pub(crate) refs: &'a [JsonRef],
     pub(crate) scope: JsonReadScopeRef,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JsonLoadBatch {
     values: Vec<Option<Bytes>>,
 }
 
+#[cfg(test)]
 impl JsonLoadBatch {
     pub(crate) fn new(values: Vec<Option<Bytes>>) -> Self {
         Self { values }
@@ -253,13 +236,6 @@ pub(crate) mod json_slot_storage {
     use musli::de::SequenceDecoder;
 
     use super::{JsonRef, JsonSlot};
-
-    pub(crate) fn encode<E>(value: &JsonSlot, encoder: E) -> Result<(), E::Error>
-    where
-        E: musli::Encoder,
-    {
-        super::json_slot_storage_ref::encode(&value.as_ref_slot(), encoder)
-    }
 
     pub(crate) fn decode<'de, D>(decoder: D) -> Result<JsonSlot, D::Error>
     where

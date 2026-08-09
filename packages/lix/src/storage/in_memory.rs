@@ -596,8 +596,8 @@ mod tests {
     use crate::storage::conformance::{ConformanceStatus, run_storage_conformance};
     use crate::storage::{
         BeginScanOptions, GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory,
-        ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError,
-        StorageRead, StorageSpace, StorageWrite, StoredValue, ValueSemantics, WriteOptions,
+        ProjectedValue, PutBatch, PutEntry, ReadOptions, Storage, StorageError, StorageRead,
+        StorageSpace, StorageWrite, StoredValue, ValueSemantics, WriteOptions,
     };
 
     #[tokio::test]

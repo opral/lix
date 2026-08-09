@@ -144,6 +144,7 @@ impl ImmutableObjectSet {
         self.objects.iter().map(|(id, bytes)| (*id, bytes))
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.objects.is_empty()
     }

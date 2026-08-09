@@ -1,8 +1,6 @@
 use crate::LixError;
 use std::ops::Range;
 
-const MEDIA_CHUNK_BYTES: usize = 1024 * 1024;
-
 fn hash_bytes_to_hex(bytes: &[u8; 32]) -> String {
     let mut encoded = String::with_capacity(64);
     for byte in bytes {
@@ -43,33 +41,12 @@ impl BlobId {
         Self(bytes)
     }
 
-    pub(crate) fn from_content(content: &[u8]) -> Self {
-        if content.len() <= MEDIA_CHUNK_BYTES {
-            return Self::from_single_chunk(ChunkHash::from_content(content));
-        }
-        let chunks = content
-            .chunks(MEDIA_CHUNK_BYTES)
-            .map(|chunk| (ChunkHash::from_content(chunk), chunk.len() as u64));
-        Self::from_chunks(content.len() as u64, chunks)
-    }
-
-    pub(crate) fn from_single_chunk(chunk_hash: ChunkHash) -> Self {
-        Self(chunk_hash.into_bytes())
-    }
-
-    /// Computes the canonical identity of a fixed-chunk blob without opening
-    /// its payload. Upload recovery persists precisely these bounded receipts.
-    pub(crate) fn from_chunks(
-        size_bytes: u64,
-        chunks: impl IntoIterator<Item = (ChunkHash, u64)>,
-    ) -> Self {
-        let mut hasher = blake3::Hasher::new_derive_key("lix binary cas fixed manifest v3");
-        hasher.update(&size_bytes.to_le_bytes());
-        for (hash, size) in chunks {
-            hasher.update(&size.to_le_bytes());
-            hasher.update(hash.as_bytes());
-        }
-        Self(*hasher.finalize().as_bytes())
+    /// Derives the sole semantic identity from the canonical authenticated
+    /// Merkle layout. This name deliberately excludes the retired flat/fixed
+    /// manifest constructor contract.
+    pub(crate) fn from_canonical_content(content: &[u8]) -> Self {
+        crate::forktree::canonical_blob_id_for_content(content)
+            .expect("in-memory content has canonical Merkle geometry")
     }
 
     pub(crate) fn from_hex(hash_hex: &str) -> Result<Self, LixError> {
@@ -98,24 +75,8 @@ impl BlobId {
 pub(crate) struct ChunkHash([u8; 32]);
 
 impl ChunkHash {
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
     pub(crate) fn from_content(content: &[u8]) -> Self {
         Self(binary_blob_hash_bytes(content))
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    pub(crate) fn into_bytes(self) -> [u8; 32] {
-        self.0
-    }
-
-    pub(crate) fn to_hex(self) -> String {
-        hash_bytes_to_hex(&self.0)
     }
 }
 
@@ -164,7 +125,7 @@ pub(crate) struct BlobPayload {
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        let hash = (!bytes.is_empty()).then(|| BlobId::from_content(&bytes));
+        let hash = (!bytes.is_empty()).then(|| BlobId::from_canonical_content(&bytes));
         Self { bytes, hash }
     }
 
@@ -190,56 +151,10 @@ impl BlobPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobDeltaSegment {
-    Copy { offset: u64, length: u64 },
-    Insert { bytes: Vec<u8> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobDeltaBaseLayout {
-    SingleChunk { chunk_hash: ChunkHash },
-    Chunked { chunk_count: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlobLayout {
     Empty,
-    SingleChunk {
-        chunk_hash: ChunkHash,
-    },
-    Chunked {
-        chunk_count: u32,
-    },
-    /// One-level, flattened copy/insert program against a canonical full blob,
-    /// so reads never walk a history chain.
-    Delta {
-        base_blob_hash: BlobId,
-        base_size_bytes: u64,
-        base_layout: BlobDeltaBaseLayout,
-        segments: Vec<BlobDeltaSegment>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlobMetadata {
-    pub(crate) hash: BlobId,
-    pub(crate) size_bytes: u64,
-    pub(crate) layout: BlobLayout,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlobMetadataBatch {
-    entries: Vec<Option<BlobMetadata>>,
-}
-
-impl BlobMetadataBatch {
-    pub(crate) fn new(entries: Vec<Option<BlobMetadata>>) -> Self {
-        Self { entries }
-    }
-
-    pub(crate) fn into_vec(self) -> Vec<Option<BlobMetadata>> {
-        self.entries
-    }
+    SingleChunk { chunk_hash: ChunkHash },
+    Chunked { chunk_count: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,13 +206,4 @@ pub(crate) struct BlobWriteReceipt {
     /// already present in the retained read; this is an in-memory proof bit,
     /// not a second persisted authority.
     pub(crate) manifest_was_existing: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BlobChunkReceipt {
-    pub(crate) hash: ChunkHash,
-    pub(crate) size_bytes: u64,
-    /// The authenticated ForkTree chunk object carrying this content hash.
-    /// The physical owner is retained across resumable receipt rows.
-    pub(crate) object_id: [u8; 32],
 }

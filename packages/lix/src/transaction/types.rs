@@ -77,12 +77,6 @@ impl TransactionJson {
             .expect("serializing serde_json::Value should not fail")
     }
 
-    #[cfg(feature = "storage-benches")]
-    pub(crate) fn from_shared_value_unchecked(value: Arc<JsonValue>) -> Self {
-        Self::from_shared_value(value, "transaction JSON")
-            .expect("serializing serde_json::Value should not fail")
-    }
-
     #[cfg(test)]
     pub(crate) fn from_value_for_test(value: JsonValue) -> Self {
         Self::from_value(value, "test transaction JSON").expect("test JSON should normalize")
@@ -1960,6 +1954,7 @@ impl TransactionFileContent {
         self.mutation_identity
     }
 
+    #[cfg(test)]
     pub(crate) fn add_auxiliary_payload(&mut self, data: impl Into<crate::Blob>) {
         self.auxiliary_payloads.push(BlobPayload::from_bytes(data));
     }
@@ -1993,10 +1988,6 @@ impl TransactionFileContent {
 
     pub(crate) fn retain_certified_batches_only(&mut self) {
         self.stage_payload_at_commit = false;
-    }
-
-    pub(crate) fn stage_payload_at_commit(&self) -> bool {
-        self.stage_payload_at_commit && matches!(self.content, FileContent::Inline(_))
     }
 
     pub(crate) fn inline_data(&self) -> Option<&[u8]> {
@@ -2094,6 +2085,7 @@ impl TransactionFileContent {
         self.same_length_blob_splice
     }
 
+    #[cfg(test)]
     pub(crate) fn edit_blob_splice(&self) -> Option<BlobEditSplice> {
         self.edit_blob_splice
     }
@@ -2103,6 +2095,7 @@ impl TransactionFileContent {
         self.base_blob_hash
     }
 
+    #[cfg(test)]
     pub(crate) fn auxiliary_payloads(&self) -> &[BlobPayload] {
         &self.auxiliary_payloads
     }
@@ -2183,6 +2176,7 @@ enum StageJsonStorage {
     /// The parsed batch column is deliberately gone at this boundary. Commit
     /// materialization and storage lowering consume only the certified bytes,
     /// so making decoded access impossible prevents an accidental second parse.
+    #[cfg(test)]
     ValidatedShared {
         normalized: SharedStr,
     },
@@ -2191,6 +2185,7 @@ enum StageJsonStorage {
     /// Direct entity writes already arrive in an `Arc<str>`. Keeping that
     /// owner avoids allocating and copying the full JSON payload merely to
     /// discard an empty (or no-longer-needed) decoded-value cache.
+    #[cfg(test)]
     ValidatedOwned {
         normalized: Arc<str>,
     },
@@ -2216,6 +2211,7 @@ impl StageJson {
                     )
                 })
                 .as_ref(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedShared { .. } | StageJsonStorage::ValidatedOwned { .. } => {
                 panic!("validated staged JSON must not be decoded after transaction validation")
             }
@@ -2227,7 +2223,9 @@ impl StageJson {
         match &self.storage {
             StageJsonStorage::Owned { normalized, .. } => normalized.as_ref(),
             StageJsonStorage::CertifiedShared { normalized, .. } => normalized.as_str(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedShared { normalized } => normalized.as_str(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedOwned { normalized } => normalized.as_ref(),
             StageJsonStorage::CanonicalBatch(value) => value.normalized(),
         }
@@ -2249,6 +2247,7 @@ impl StageJson {
     /// Every row retains only a cheap slice of the canonical batch arena. The
     /// final row releases the shared DOM and offset columns before commit
     /// materialization allocates its storage buffers.
+    #[cfg(test)]
     pub(crate) fn release_validated_canonical_value_column(&mut self) -> bool {
         let storage = match &self.storage {
             StageJsonStorage::CanonicalBatch(value) => StageJsonStorage::ValidatedShared {
@@ -2291,7 +2290,9 @@ impl StageJson {
         match &self.storage {
             StageJsonStorage::Owned { normalized, .. } => SharedStr::from(normalized.as_ref()),
             StageJsonStorage::CertifiedShared { normalized, .. } => normalized.clone(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedShared { normalized } => normalized.clone(),
+            #[cfg(test)]
             StageJsonStorage::ValidatedOwned { normalized } => SharedStr::from(normalized.as_ref()),
             StageJsonStorage::CanonicalBatch(value) => value.normalized_shared(),
         }
@@ -2300,14 +2301,6 @@ impl StageJson {
     /// Whether this payload inlines into values instead of the json store.
     pub(crate) fn is_inline(&self) -> bool {
         self.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES
-    }
-
-    pub(crate) fn slot_ref(&self) -> crate::json_store::JsonSlotRef<'_> {
-        if self.is_inline() {
-            crate::json_store::JsonSlotRef::Inline(self.normalized())
-        } else {
-            crate::json_store::JsonSlotRef::Ref(&self.json_ref)
-        }
     }
 }
 
@@ -2929,37 +2922,6 @@ impl PreparedStateBatch {
             .map_or_else(|| self.slots.len(), |dense| dense.len)
     }
 
-    #[cfg(feature = "storage-benches")]
-    pub(crate) fn record_ownership(&self, stage: usize) {
-        let mut key_bytes = 0usize;
-        let mut value_bytes = 0usize;
-        let mut string_entries = 0usize;
-        for row in self.iter() {
-            key_bytes = key_bytes
-                .saturating_add(row.entity_pk.estimated_heap_bytes())
-                .saturating_add(row.schema_key.len())
-                .saturating_add(row.file_id.map_or(0, |value| value.len()))
-                .saturating_add(row.origin_key.map_or(0, |value| value.len()))
-                .saturating_add(row.branch_id.len());
-            value_bytes = value_bytes
-                .saturating_add(row.snapshot.map_or(0, |value| value.normalized().len()))
-                .saturating_add(row.metadata.map_or(0, |value| value.normalized().len()));
-            string_entries = string_entries
-                .saturating_add(2)
-                .saturating_add(usize::from(row.file_id.is_some()))
-                .saturating_add(usize::from(row.origin_key.is_some()));
-        }
-        crate::storage_bench::record_crud_ownership(
-            stage,
-            self.len(),
-            key_bytes,
-            value_bytes,
-            self.len().saturating_mul(6),
-            string_entries,
-            self.len().saturating_mul(2),
-        );
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -2968,6 +2930,7 @@ impl PreparedStateBatch {
         self.certified_tracked_keys_strictly_ordered
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_collection_replacement_proof(
         &self,
     ) -> Option<CompleteCollectionReplacementProof> {
@@ -3551,6 +3514,7 @@ impl PreparedStateBatch {
         self.slots[index].change_id = change_id;
     }
 
+    #[cfg(test)]
     pub(crate) fn release_validated_canonical_value_columns(&mut self) {
         if let Some(dense) = &self.dense_certified_parameter {
             debug_assert_eq!(dense.len, self.json.len());
@@ -3628,7 +3592,7 @@ impl PreparedStateBatch {
             .iter()
             .filter_map(|(_, value)| {
                 source_buffers
-                    .insert(value.retained_buffer_identity())
+                    .insert((value.as_bytes().as_ptr(), value.len()))
                     .then_some(value.retained_buffer_len())
             })
             .sum::<usize>();
@@ -4156,6 +4120,7 @@ impl StagedCommitChangeBatch {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn source_membership_certified(&self) -> bool {
         self.source_membership_certified
     }
@@ -5676,8 +5641,8 @@ mod tests {
 
     #[test]
     fn verified_same_length_splice_requires_the_visible_blob_base() {
-        let base = BlobId::from_content(b"before");
-        let wrong_base = BlobId::from_content(b"other!");
+        let base = BlobId::from_canonical_content(b"before");
+        let wrong_base = BlobId::from_canonical_content(b"other!");
         let mut write = TransactionFileContent::new(
             "file".to_string(),
             None,
@@ -5705,8 +5670,8 @@ mod tests {
 
     #[test]
     fn verified_edit_splice_is_format_neutral_and_cleared_by_rematerialization() {
-        let base = BlobId::from_content(b"before");
-        let wrong_base = BlobId::from_content(b"other!");
+        let base = BlobId::from_canonical_content(b"before");
+        let wrong_base = BlobId::from_canonical_content(b"other!");
         let mut write = TransactionFileContent::new(
             "file".to_string(),
             None,
