@@ -23,7 +23,6 @@ use crate::live_state::{
     scan_forktree_view,
 };
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::MaterializedTrackedStateRowRef;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
@@ -804,33 +803,6 @@ impl PluginFileOwner {
         }
         let snapshot = serde_json::from_str(
             row.snapshot_content.as_deref().expect("checked above"),
-        )
-        .map_err(|error| {
-            invalid_registry(format!(
-                "tracked plugin owner snapshot is invalid JSON: {error}"
-            ))
-        })?;
-        Self::from_snapshot(file_id, &snapshot).map(Some)
-    }
-
-    pub(crate) fn from_tracked_state_row_ref(
-        row: MaterializedTrackedStateRowRef<'_>,
-    ) -> Result<Option<Self>, LixError> {
-        let file_id = row.file_id().ok_or_else(|| {
-            invalid_registry("plugin owner row is missing its file_id storage identity")
-        })?;
-        if row.schema_key() != KEY_VALUE_SCHEMA_KEY
-            || row.entity_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
-        {
-            return Err(invalid_registry(
-                "tracked plugin owner row has an invalid storage identity",
-            ));
-        }
-        if row.deleted() || row.snapshot_content().is_none() {
-            return Ok(None);
-        }
-        let snapshot = serde_json::from_str(
-            row.snapshot_content().expect("checked above").as_str(),
         )
         .map_err(|error| {
             invalid_registry(format!(
