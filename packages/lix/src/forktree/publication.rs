@@ -1485,6 +1485,26 @@ impl PreparedPublication {
             .await?;
         branch_snapshot.hot_pack_object_id = pack_id;
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
+        let no_retired_commits = BTreeSet::new();
+        let no_retired_changes = BTreeSet::new();
+        self.rebind_surviving_branch_packs(
+            view,
+            repository_root_id,
+            repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            Some(view.branch_id()),
+        )
+        .await?;
+        self.rebind_retained_snapshot_packs(
+            view,
+            repository_root_id,
+            repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            None,
+        )
+        .await?;
         self.install_branch_selector(view, snapshot_id)
     }
 
