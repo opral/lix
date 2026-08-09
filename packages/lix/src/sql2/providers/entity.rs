@@ -72,6 +72,7 @@ struct AuthenticatedEntityRow {
     file_id: Option<String>,
     snapshot_content: Option<SharedStr>,
     metadata: Option<SharedStr>,
+    deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
     global: bool,
@@ -170,6 +171,7 @@ where
                 if value.cell.deleted() && !request.include_tombstones {
                     None
                 } else {
+                    let deleted = value.cell.deleted();
                     Some(AuthenticatedEntityRow {
                         entity_pk: key.entity_pk,
                         schema_key: key.schema_key,
@@ -179,6 +181,7 @@ where
                             StateCell::Null | StateCell::Tombstone => None,
                         },
                         metadata: value.metadata,
+                        deleted,
                         created_at: value.created_at,
                         updated_at: value.updated_at,
                         global: owner
@@ -210,6 +213,7 @@ where
                     None
                 } else {
                     let value = row.value;
+                    let deleted = value.cell.deleted();
                     Some(AuthenticatedEntityRow {
                         entity_pk: key.entity_pk,
                         schema_key: key.schema_key,
@@ -219,6 +223,7 @@ where
                             StateCell::Null | StateCell::Tombstone => None,
                         },
                         metadata: value.metadata,
+                        deleted,
                         created_at: value.created_at,
                         updated_at: value.updated_at,
                         global: matches!(row.source, StateSource::Global),
@@ -723,7 +728,7 @@ impl EntitySpec {
         let exact_request = exact_live_state_batch_request(&request);
         let batch_projection = EntityBatchProjection::for_request(&request);
         let authenticated_exact_reader = self.authenticated_exact_reader.clone();
-        let direct_authenticated_exact = exact_request.is_some() && row_filters.is_empty();
+        let direct_authenticated_exact = exact_request.is_some();
         let source = row_source(
             (
                 Arc::clone(&self.spec),
@@ -756,14 +761,15 @@ impl EntitySpec {
                             "typed entity exact update lost its exact request".into(),
                         )
                     })?;
-                    let rows = exact_reader
-                        .load_exact(authenticated_entity_exact_request(exact_request))
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>();
-                    return authenticated_entity_record_batch(&spec, schema, &rows);
+                    return load_authenticated_entity_record_batch(
+                        &spec,
+                        schema,
+                        exact_reader.as_ref(),
+                        exact_request,
+                        &row_filters,
+                        None,
+                    )
+                    .await;
                 }
                 let rows = load_entity_live_state_batch(
                     live_state.as_ref(),
@@ -890,7 +896,7 @@ impl TableSpec for EntitySpec {
         let live_state = Arc::clone(&self.live_state);
         let batch_projection = EntityBatchProjection::for_request(&request);
         let exact_request = exact_live_state_batch_request(&request);
-        let direct_authenticated_exact = exact_request.is_some() && row_filters.is_empty();
+        let direct_authenticated_exact = exact_request.is_some();
         let exact_limit_requires_materialization =
             exact_request.is_some() && request.limit.is_some();
         let direct_entity_snapshot = !exact_limit_requires_materialization
@@ -940,17 +946,15 @@ impl TableSpec for EntitySpec {
                                 "typed entity exact projection lost its exact request".into(),
                             )
                         })?;
-                        let mut rows = exact_reader
-                            .load_exact(authenticated_entity_exact_request(exact_request))
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
-                            .into_iter()
-                            .flatten()
-                            .collect::<Vec<_>>();
-                        if let Some(limit) = request.limit {
-                            rows.truncate(limit);
-                        }
-                        return authenticated_entity_record_batch(&spec, schema, &rows);
+                        return load_authenticated_entity_record_batch(
+                            &spec,
+                            schema,
+                            exact_reader.as_ref(),
+                            exact_request,
+                            &row_filters,
+                            request.limit,
+                        )
+                        .await;
                     }
                     let entity_snapshot_reader = entity_snapshot_reader.ok_or_else(|| {
                         DataFusionError::Execution(
@@ -1580,6 +1584,65 @@ fn authenticated_entity_exact_request(
         untracked: request.untracked,
         include_tombstones: request.include_tombstones,
     }
+}
+
+async fn load_authenticated_entity_record_batch(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    reader: &dyn AuthenticatedEntityExactReader,
+    request: &LiveStateExactBatchRequest,
+    row_filters: &[EntityRowFilter],
+    limit: Option<usize>,
+) -> Result<RecordBatch> {
+    let mut rows = reader
+        .load_exact(authenticated_entity_exact_request(request))
+        .await
+        .map_err(lix_error_to_datafusion_error)?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    apply_authenticated_entity_filters(&mut rows, row_filters)?;
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    authenticated_entity_record_batch(spec, schema, &rows)
+}
+
+fn apply_authenticated_entity_filters(
+    rows: &mut Vec<AuthenticatedEntityRow>,
+    filters: &[EntityRowFilter],
+) -> Result<()> {
+    if filters.is_empty() {
+        return Ok(());
+    }
+    let mut filtered = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let snapshot = row
+            .snapshot_content
+            .as_deref()
+            .map(parse_snapshot_value)
+            .transpose()
+            .map_err(|error| {
+                DataFusionError::External(Box::new(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "entity exact filter could not parse snapshot_content for schema '{}' entity_pk '{:?}': {error}",
+                        row.schema_key, row.entity_pk
+                    ),
+                )))
+            })?;
+        let matches = filters.iter().try_fold(true, |matches, filter| {
+            if !matches {
+                return Ok(false);
+            }
+            filter.matches_snapshot(snapshot.as_ref(), &row.schema_key)
+        })?;
+        if matches {
+            filtered.push(row);
+        }
+    }
+    *rows = filtered;
+    Ok(())
 }
 
 async fn load_entity_live_state_batch(
@@ -2771,6 +2834,14 @@ fn authenticated_entity_record_batch(
     schema: SchemaRef,
     rows: &[AuthenticatedEntityRow],
 ) -> Result<RecordBatch> {
+    if rows
+        .iter()
+        .any(|row| row.deleted && row.snapshot_content.is_some())
+    {
+        return Err(DataFusionError::Execution(
+            "authenticated entity tombstone carried payload bytes".into(),
+        ));
+    }
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
         return RecordBatch::try_new_with_options(schema, vec![], &options)
@@ -3070,7 +3141,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
+    use datafusion::arrow::array::{Array, Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::catalog::TableProvider;
@@ -3288,6 +3359,258 @@ mod tests {
 
     fn live_batch(rows: Vec<MaterializedLiveStateRow>) -> MaterializedLiveStateBatch {
         MaterializedLiveStateBatch::from_rows(rows)
+    }
+
+    struct ExactEntityReaderFixture {
+        result: Vec<Option<super::AuthenticatedEntityRow>>,
+        expected_file_ids: Vec<Option<String>>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl super::AuthenticatedEntityExactReader for ExactEntityReaderFixture {
+        async fn load_exact(
+            &self,
+            request: super::AuthenticatedEntityExactBatchRequest,
+        ) -> Result<Vec<Option<super::AuthenticatedEntityRow>>, LixError> {
+            assert_eq!(
+                request
+                    .rows
+                    .iter()
+                    .map(|row| row.file_id.clone())
+                    .collect::<Vec<_>>(),
+                self.expected_file_ids
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+    }
+
+    fn authenticated_row(
+        entity_pk: &str,
+        snapshot_content: Option<&str>,
+        deleted: bool,
+    ) -> super::AuthenticatedEntityRow {
+        authenticated_row_with_file(entity_pk, None, snapshot_content, deleted)
+    }
+
+    fn authenticated_row_with_file(
+        entity_pk: &str,
+        file_id: Option<&str>,
+        snapshot_content: Option<&str>,
+        deleted: bool,
+    ) -> super::AuthenticatedEntityRow {
+        super::AuthenticatedEntityRow {
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+            schema_key: "project_message".to_string(),
+            file_id: file_id.map(str::to_string),
+            snapshot_content: snapshot_content.map(Into::into),
+            metadata: None,
+            deleted,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-04-23T01:00:00Z"),
+            global: false,
+            change_id: Some(ChangeId::for_test_label("change")),
+            commit_id: Some(CommitId::for_test_label("commit")),
+            untracked: false,
+            branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_exact_projection_preserves_slots_order_and_tombstones() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "project_message",
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string" }
+                },
+                "required": []
+            }))
+            .expect("tombstone control schema should derive"),
+        );
+        let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
+        let entity_a = crate::entity_pk::EntityPk::single("a");
+        let entity_b = crate::entity_pk::EntityPk::single("b");
+        let request = crate::live_state::LiveStateExactBatchRequest {
+            rows: vec![
+                crate::live_state::LiveStateExactRowRequest {
+                    schema_key: "project_message".to_string(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
+                    entity_pk: entity_a.clone(),
+                    file_id: None,
+                },
+                crate::live_state::LiveStateExactRowRequest {
+                    schema_key: "project_message".to_string(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
+                    entity_pk: entity_b.clone(),
+                    file_id: Some("file-b".to_string()),
+                },
+                crate::live_state::LiveStateExactRowRequest {
+                    schema_key: "project_message".to_string(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
+                    entity_pk: entity_a,
+                    file_id: None,
+                },
+            ],
+            include_tombstones: true,
+            ..Default::default()
+        };
+        let reader = ExactEntityReaderFixture {
+            result: vec![
+                Some(authenticated_row(
+                    "a",
+                    Some(r#"{"id":"a","body":"first"}"#),
+                    false,
+                )),
+                Some(authenticated_row_with_file("b", Some("file-b"), None, true)),
+                Some(authenticated_row(
+                    "a",
+                    Some(r#"{"id":"a","body":"last"}"#),
+                    false,
+                )),
+            ],
+            expected_file_ids: vec![None, Some("file-b".to_string()), None],
+            calls: AtomicUsize::new(0),
+        };
+        let batch = super::load_authenticated_entity_record_batch(
+            &spec,
+            schema,
+            &reader,
+            &request,
+            &[],
+            None,
+        )
+        .await
+        .expect("authenticated exact projection");
+
+        assert_eq!(reader.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(batch.num_rows(), 3);
+        let body = batch
+            .column_by_name("body")
+            .expect("body column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("body is utf8");
+        assert_eq!(body.value(0), "first");
+        assert!(body.is_null(1), "tombstone stays a visible null row");
+        assert_eq!(body.value(2), "last");
+    }
+
+    #[tokio::test]
+    async fn authenticated_exact_projection_applies_residual_filters_before_projection() {
+        let spec = entity_insert_spec_with_primary_key();
+        let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
+        let request = crate::live_state::LiveStateExactBatchRequest {
+            rows: vec![
+                crate::live_state::LiveStateExactRowRequest {
+                    schema_key: "project_message".to_string(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
+                    entity_pk: crate::entity_pk::EntityPk::single("a"),
+                    file_id: None,
+                },
+                crate::live_state::LiveStateExactRowRequest {
+                    schema_key: "project_message".to_string(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
+                    entity_pk: crate::entity_pk::EntityPk::single("b"),
+                    file_id: Some("file-b".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+        let reader = ExactEntityReaderFixture {
+            result: vec![
+                Some(authenticated_row(
+                    "a",
+                    Some(r#"{"id":"a","body":"drop"}"#),
+                    false,
+                )),
+                Some(authenticated_row_with_file(
+                    "b",
+                    Some("file-b"),
+                    Some(r#"{"id":"b","body":"keep"}"#),
+                    false,
+                )),
+            ],
+            expected_file_ids: vec![None, Some("file-b".to_string())],
+            calls: AtomicUsize::new(0),
+        };
+        let filters = vec![super::EntityRowFilter::ColumnEq {
+            column: "body".to_string(),
+            column_type: EntityColumnType::String,
+            value: super::EntityFilterValue::String("keep".to_string()),
+        }];
+        let batch = super::load_authenticated_entity_record_batch(
+            &spec,
+            schema,
+            &reader,
+            &request,
+            &filters,
+            None,
+        )
+        .await
+        .expect("authenticated exact residual filter");
+        assert_eq!(reader.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column_by_name("body")
+                .expect("body column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("body is utf8")
+                .value(0),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn exact_typed_scan_and_update_bypass_generic_materialization() {
+        let source = include_str!("entity.rs");
+        for owner_name in ["async fn plan_update_with_post_image", "async fn plan_scan"] {
+            let start = source.find(owner_name).expect("typed owner exists");
+            let owner = &source[start..];
+            let direct = owner
+                .find("if direct_authenticated_exact")
+                .expect("exact dispatch guard");
+            let typed = owner
+                .find("load_authenticated_entity_record_batch")
+                .expect("typed exact materialization");
+            let generic = owner
+                .find("load_entity_live_state_batch")
+                .expect("generic path remains for non-exact scans");
+            assert!(
+                direct < typed && typed < generic,
+                "{owner_name} re-entered generic materialization before typed exact dispatch"
+            );
+            let residual_gate = ["exact_request.is_some() &&", " row_filters.is_empty()"].concat();
+            assert!(
+                !owner.contains(&residual_gate),
+                "{owner_name} must not gate authenticated exact reads on residual-filter absence"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_reader_overlay_order_and_cell_contract_is_explicit() {
+        let source = include_str!("entity.rs");
+        let start = source
+            .find(
+                "impl<S> AuthenticatedEntityExactReader for ForkTreeAuthenticatedEntityExactReader",
+            )
+            .expect("ForkTree exact reader owner");
+        let end = source[start..]
+            .find("pub(crate) async fn register_entity_providers")
+            .map(|offset| start + offset)
+            .expect("exact reader owner end");
+        let owner = &source[start..end];
+        assert!(owner.contains("state_points(&view, &encoded_keys, true)"));
+        assert!(owner.contains("load_untracked_overlay_points(&encoded_keys)"));
+        assert!(owner.contains("if let Some((owner, key, value)) = untracked"));
+        assert!(owner.contains("row.value.cell.deleted() && !request.include_tombstones"));
+        assert!(owner.contains("StateCell::Null | StateCell::Tombstone"));
+        assert!(owner.contains("request.rows.into_iter().zip(tracked).zip(untracked)"));
     }
 
     fn entity_insert_spec_with_primary_key() -> Arc<super::EntitySurfaceSpec> {
