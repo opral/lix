@@ -15,7 +15,6 @@ use crate::live_state::{
     MaterializedLiveStateRowRef,
 };
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::TrackedStateContext;
 #[cfg(test)]
 use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns};
 use async_trait::async_trait;
@@ -43,10 +42,7 @@ pub(crate) struct LiveStateContext {
 }
 
 impl LiveStateContext {
-    pub(crate) fn new(
-        _tracked_state: TrackedStateContext,
-        commit_graph: CommitGraphContext,
-    ) -> Self {
+    pub(crate) fn new(commit_graph: CommitGraphContext) -> Self {
         Self {
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),

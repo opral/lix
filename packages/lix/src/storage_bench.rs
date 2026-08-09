@@ -1796,7 +1796,6 @@ mod obsolete_benchmark_support {
         use crate::live_state::LiveStateScanRequest;
 
         let live_state = crate::live_state::LiveStateContext::new(
-            crate::tracked_state::TrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         );
         let current_rows = live_state

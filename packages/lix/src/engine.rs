@@ -158,10 +158,7 @@ where
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let commit_graph = CommitGraphContext::new();
-        let live_state = Arc::new(LiveStateContext::new(
-            tracked_state.as_ref().clone(),
-            commit_graph,
-        ));
+        let live_state = Arc::new(LiveStateContext::new(commit_graph));
         let branch_ctx = Arc::new(BranchContext::new());
         assert_initialized(storage.clone(), live_state.as_ref()).await?;
 
