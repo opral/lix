@@ -65,14 +65,39 @@ impl BranchRefReader for PreparedBranchRefReader {
         &self,
         branch_ids: &[String],
     ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
-        self.inner.load_head_metadata_batch(branch_ids).await
+        let rows = self.inner.load_head_metadata_batch(branch_ids).await?;
+        if branch_ids
+            .iter()
+            .any(|branch_id| branch_id == &self.prepared.branch_id)
+        {
+            match rows
+                .iter()
+                .find(|(head, _metadata)| head.branch_id == self.prepared.branch_id)
+            {
+                Some((head, _metadata)) if head == &self.prepared => {}
+                Some(_) => {
+                    return Err(LixError::new(
+                        LixError::CODE_TRANSACTION_CONFLICT,
+                        "prepared SQL metadata batch head no longer matches the authenticated branch selector",
+                    ));
+                }
+                None => {
+                    return Err(LixError::new(
+                        LixError::CODE_TRANSACTION_CONFLICT,
+                        "prepared SQL metadata batch branch selector is absent",
+                    ));
+                }
+            }
+        }
+        Ok(rows)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::changelog::CommitId;
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
 
     struct CountingBranchRefReader {
         heads: Vec<BranchHead>,
@@ -96,6 +121,30 @@ mod tests {
 
         async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
             Ok(self.heads.clone())
+        }
+
+        async fn load_head_metadata_batch(
+            &self,
+            branch_ids: &[String],
+        ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
+            Ok(branch_ids
+                .iter()
+                .filter_map(|branch_id| {
+                    self.heads
+                        .iter()
+                        .find(|head| &head.branch_id == branch_id)
+                        .cloned()
+                        .map(|head| {
+                            (
+                                head,
+                                BranchRefMetadata {
+                                    change_id: ChangeId::for_test_label("change"),
+                                    updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                                },
+                            )
+                        })
+                })
+                .collect())
         }
     }
 
@@ -177,5 +226,47 @@ mod tests {
                 .unwrap(),
             Some(head("01920000-0000-7000-8000-0000000000b2", "commit-other",))
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_metadata_batch_requires_the_authenticated_prepared_head() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let inner = Arc::new(CountingBranchRefReader::new(vec![head(
+            branch_id, "commit-a",
+        )]));
+        let prepared = PreparedBranchRefReader::new(inner, head(branch_id, "commit-prepared"));
+
+        let error = prepared
+            .load_head_metadata_batch(&[branch_id.to_owned()])
+            .await
+            .expect_err("a changed prepared head must fail closed");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn prepared_metadata_batch_rejects_missing_prepared_branch() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let inner = Arc::new(CountingBranchRefReader::new(Vec::new()));
+        let prepared = PreparedBranchRefReader::new(inner, head(branch_id, "commit-prepared"));
+
+        let error = prepared
+            .load_head_metadata_batch(&[branch_id.to_owned()])
+            .await
+            .expect_err("an absent prepared branch must fail closed");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn prepared_metadata_batch_accepts_the_exact_prepared_head() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let prepared_head = head(branch_id, "commit-prepared");
+        let inner = Arc::new(CountingBranchRefReader::new(vec![prepared_head.clone()]));
+        let prepared = PreparedBranchRefReader::new(inner, prepared_head.clone());
+
+        let rows = prepared
+            .load_head_metadata_batch(&[branch_id.to_owned()])
+            .await
+            .expect("the exact prepared head must remain readable");
+        assert_eq!(rows[0].0, prepared_head);
     }
 }
