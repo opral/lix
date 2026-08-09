@@ -160,8 +160,6 @@ where
 
 #[cfg(test)]
 enum MaterializedJsonSlot {
-    None,
-    Inline(Box<str>),
     Loaded(usize),
 }
 
@@ -172,10 +170,6 @@ fn materialized_json_string(
     json_values: &mut [Option<Bytes>],
 ) -> Result<Option<SharedStr>, LixError> {
     let index = match slot {
-        MaterializedJsonSlot::None => return Ok(None),
-        MaterializedJsonSlot::Inline(json) => {
-            return Ok(Some(SharedStr::from(json.into_string())));
-        }
         MaterializedJsonSlot::Loaded(index) => index,
     };
     let json_ref = json_refs.get(index).ok_or_else(|| {

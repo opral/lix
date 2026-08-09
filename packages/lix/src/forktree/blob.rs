@@ -108,6 +108,7 @@ struct HistoricalBlobRefOwnerValue {
 }
 
 impl AuthenticatedBlobRef {
+    #[cfg(test)]
     pub(crate) fn semantic_id(self) -> crate::binary_cas::BlobId {
         self.semantic_id
     }
@@ -319,6 +320,7 @@ where
 {
     /// Binds a public blob identity to an immutable manifest edge carried by
     /// a row authenticated on this exact coherent view.
+    #[cfg(test)]
     pub(crate) fn bind_blob(
         &self,
         row: &super::serving::VisibleStateRow,
@@ -500,17 +502,6 @@ where
         entries.push(Some(bytes));
     }
     Ok(crate::binary_cas::BlobBytesBatch::new(entries))
-}
-
-/// Extracts the semantic identity from one authenticated historical BlobRef
-/// owner without turning its BlobId into a physical lookup key.  GC uses this
-/// only after the exact historical state key and manifest edge have passed the
-/// same owner validation as payload reads.
-pub(crate) fn historical_blob_semantic_id(
-    key: &StateKey,
-    value: &super::state::StateValue,
-) -> Result<crate::binary_cas::BlobId, crate::LixError> {
-    Ok(bind_historical_state_blob_ref(key, value)?.semantic_id)
 }
 
 #[derive(Clone, Copy)]

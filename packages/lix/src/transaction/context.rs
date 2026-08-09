@@ -97,9 +97,7 @@ use crate::storage_adapter::{
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateKey, TrackedStateKeyRef,
-};
+use crate::tracked_state::{TrackedStateDiffKind, TrackedStateKey, TrackedStateKeyRef};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
     NormalizedRowFacts, REGISTERED_SCHEMA_KEY, normalize_raw_write_row_in_place,
@@ -383,19 +381,6 @@ enum VisibleMaterializationBytes {
     Blob { hash: BlobId },
 }
 
-#[cfg(test)]
-fn decode_visible_materialization(
-    row: &MaterializedLiveStateRow,
-    file_id: &str,
-) -> Result<VisibleMaterialization, LixError> {
-    decode_visible_materialization_parts(
-        row.schema_key.as_str(),
-        row.change_id,
-        row.snapshot_content.as_deref(),
-        file_id,
-    )
-}
-
 fn decode_visible_materialization_ref(
     row: MaterializedLiveStateRowRef<'_>,
     file_id: &str,
@@ -528,16 +513,6 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn reset_transaction_path_index_build_stats() {
-    TRANSACTION_PATH_INDEX_BUILD_STATS.set(TransactionPathIndexBuildStats::default());
-}
-
-#[cfg(test)]
-fn transaction_path_index_build_stats() -> TransactionPathIndexBuildStats {
-    TRANSACTION_PATH_INDEX_BUILD_STATS.get()
-}
-
-#[cfg(test)]
 fn record_transaction_path_index_build(descriptor_rows: usize) {
     let stats = TRANSACTION_PATH_INDEX_BUILD_STATS.get();
     TRANSACTION_PATH_INDEX_BUILD_STATS.set(TransactionPathIndexBuildStats {
@@ -561,7 +536,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
     active_account_id: String,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     schema_resolver: TransactionSchemaResolver,
@@ -1482,7 +1456,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
@@ -1587,7 +1560,6 @@ where
                     active_branch_id,
                     active_account_id,
                     live_state,
-                    tracked_state,
                     plugin_host,
                     branch_ctx,
                     schema_resolver,
@@ -7178,7 +7150,6 @@ where
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
         let staged = self.staged_writes.staging_overlay()?;
-        let staged_writes = Arc::clone(&self.staged_writes);
         let filesystem_path_index_cache = Arc::clone(&self.filesystem_path_index_cache);
         let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
         let plugin_host = self.plugin_host.clone();
@@ -7194,7 +7165,6 @@ where
             visible_schemas,
             functions,
             staged,
-            staged_writes,
             filesystem_path_index_cache,
             filesystem_path_index_epoch,
             plugin_host,
@@ -7323,6 +7293,7 @@ where
     /// strings. The transaction's coherent opening head certifies the current
     /// side, so undo/redo does not need to reload visible live state after it
     /// has already read that exact historical root.
+    #[cfg(test)]
     pub(crate) async fn execute_tracked_state_transition(
         &mut self,
         current_commit_id: CommitId,
@@ -8085,7 +8056,6 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
     staged: PreparedStateRowOverlay,
-    staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
     plugin_host: PluginRuntimeHost,
@@ -9374,7 +9344,6 @@ pub(crate) async fn open_transaction<StorageImpl>(
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -9389,7 +9358,6 @@ where
         active_account_id,
         storage,
         live_state,
-        tracked_state,
         plugin_host,
         branch_ctx,
         catalog_context,
@@ -9406,7 +9374,6 @@ pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -9423,7 +9390,6 @@ where
         active_account_id,
         storage,
         live_state,
-        tracked_state,
         plugin_host,
         branch_ctx,
         catalog_context,
@@ -10038,13 +10004,6 @@ fn v2_actor_key_is_descriptor_successor(
         && observed.owner_change_id == desired.owner_change_id
         && observed.plugin_key == desired.plugin_key
         && observed.plugin_generation == desired.plugin_generation
-}
-
-#[cfg(test)]
-fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm::WasmCreateContext {
-    BoundCreateContext::bind(local_mutation_identity(seed), actor_key)
-        .expect("local mutation seeds are generated as UUIDv7")
-        .creates()
 }
 
 fn suppress_format_only_noops_against_batch(
@@ -12067,11 +12026,6 @@ fn plugin_reconciliation_origin() -> TransactionWriteOrigin {
         operation: TransactionWriteOperation::Update,
         primary_key: None,
     }
-}
-
-#[cfg(test)]
-fn mark_plugin_reconciliation_row(row: &mut TransactionWriteRow) {
-    row.origin = Some(plugin_reconciliation_origin());
 }
 
 fn mark_plugin_reconciliation_batch(

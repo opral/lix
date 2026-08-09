@@ -21,7 +21,7 @@ use crate::live_state::{
 };
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StorageProjectedValue, StorageSpace, StorageValue, StorageWriteSet,
+    StorageProjectedValue, StorageSpace,
 };
 
 use super::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
@@ -43,20 +43,6 @@ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 static FULL_REBUILD_BUILDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static FULL_REBUILD_DESCRIPTOR_ROWS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn reset_full_rebuild_stats() {
-    FULL_REBUILD_BUILDS.store(0, Ordering::SeqCst);
-    FULL_REBUILD_DESCRIPTOR_ROWS.store(0, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-pub(crate) fn full_rebuild_stats() -> (usize, usize) {
-    (
-        FULL_REBUILD_BUILDS.load(Ordering::SeqCst),
-        FULL_REBUILD_DESCRIPTOR_ROWS.load(Ordering::SeqCst),
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FilesystemPathKind {
@@ -155,10 +141,6 @@ impl FilesystemPathEntry {
 
     pub(crate) fn blob_ref_live_row(&self) -> Option<&MaterializedLiveStateRow> {
         self.blob_ref.as_ref()
-    }
-
-    pub(crate) fn cached_blob_data(&self) -> Option<&crate::Blob> {
-        self.cached_blob_data.as_ref()
     }
 
     fn estimated_heap_bytes(&self) -> usize {
@@ -1444,16 +1426,6 @@ pub(crate) async fn load_path_index_revision(
             StorageProjectedValue::FullValue(bytes) => Some(bytes.to_vec()),
             StorageProjectedValue::KeyOnly => None,
         }))
-}
-
-pub(crate) fn stage_path_index_revision(writes: &mut StorageWriteSet) {
-    writes.put(
-        FILESYSTEM_PATH_REVISION_SPACE,
-        StorageKey(Bytes::from_static(FILESYSTEM_PATH_REVISION_KEY)),
-        StorageValue {
-            bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
-        },
-    );
 }
 
 fn file_directory_parent_keys(

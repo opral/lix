@@ -11,9 +11,7 @@ use bytes::Bytes;
 
 use crate::LixError;
 use crate::entity_pk::EntityPk;
-use crate::forktree::ForkTreeReadFacade;
 use crate::live_state::{LiveStateReader, LiveStateScanRequest};
-use crate::storage_adapter::StorageAdapterRead;
 
 /// Optional private capability supplied by a SQL execution context.
 ///
@@ -37,16 +35,6 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
         _request: LiveStateScanRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
         Ok(None)
-    }
-}
-
-pub(crate) struct CurrentEntitySnapshotReader<S> {
-    forktree: ForkTreeReadFacade<S>,
-}
-
-impl<S> CurrentEntitySnapshotReader<S> {
-    pub(crate) fn new(forktree: ForkTreeReadFacade<S>) -> Self {
-        Self { forktree }
     }
 }
 
@@ -82,32 +70,6 @@ impl EntitySnapshotReader for CanonicalEntitySnapshotProjection {
         validate_terminal_projection_request(&request)?;
         Ok(Some(
             canonical_primary_key_projection(self.live_state.as_ref(), &request).await?,
-        ))
-    }
-}
-
-#[async_trait]
-impl<S> EntitySnapshotReader for CurrentEntitySnapshotReader<S>
-where
-    S: StorageAdapterRead + Clone + Send + Sync + 'static,
-{
-    async fn scan_entity_snapshots(
-        &self,
-        request: LiveStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        validate_terminal_projection_request(&request)?;
-        Ok(Some(
-            canonical_snapshot_projection(&self.forktree, &request).await?,
-        ))
-    }
-
-    async fn scan_entity_primary_keys(
-        &self,
-        request: LiveStateScanRequest,
-    ) -> Result<Option<Vec<EntityPk>>, LixError> {
-        validate_terminal_projection_request(&request)?;
-        Ok(Some(
-            canonical_primary_key_projection(&self.forktree, &request).await?,
         ))
     }
 }

@@ -2471,6 +2471,7 @@ impl PluginRenderContext {
 #[derive(Debug, Clone)]
 struct BlobRefRecord {
     blob_hash: String,
+    #[cfg(test)]
     inline_data: Option<Vec<u8>>,
     live: LiveStateRowHandle,
     state_key: crate::forktree::StateKey,
@@ -2542,6 +2543,7 @@ fn blob_ref_record_from_live_row(
         key,
         BlobRefRecord {
             blob_hash: snapshot.blob_hash,
+            #[cfg(test)]
             inline_data: None,
             live: handle,
             state_key: crate::forktree::StateKey {
@@ -8932,10 +8934,6 @@ mod tests {
             Ok(Vec::new().into())
         }
 
-        async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            BlobDataReader::load_bytes_many(self, hashes).await
-        }
-
         async fn scan_live_state_batch(
             &mut self,
             _request: &LiveStateScanRequest,
@@ -9051,10 +9049,6 @@ mod tests {
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(Vec::new().into())
-        }
-
-        async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            Ok(BlobBytesBatch::new(vec![None; hashes.len()]))
         }
 
         async fn scan_live_state_batch(

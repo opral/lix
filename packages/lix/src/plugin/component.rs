@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobId;
@@ -45,6 +47,7 @@ struct CachedPluginFactory {
     factory: Arc<dyn WasmComponentFactory>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct PluginRegistryReadCache {
     snapshot: Option<u128>,
@@ -59,6 +62,7 @@ pub(crate) struct PluginRuntimeHost {
     plugin_actor_cache: PluginActorCache,
     plugin_transition_counters: Arc<Mutex<WasmTransitionCounters>>,
     plugin_catalog_cache: Arc<Mutex<PluginCatalogCache>>,
+    #[cfg(test)]
     plugin_registry_read_cache: Arc<Mutex<PluginRegistryReadCache>>,
     /// Ordinary plugin writes share this gate; lifecycle replacements take it
     /// exclusively. The guards live on transactions through durable commit,
@@ -89,6 +93,7 @@ impl PluginRuntimeHost {
             plugin_actor_cache: PluginActorCache::new(max_live_stores)?,
             plugin_transition_counters: Arc::new(Mutex::new(WasmTransitionCounters::default())),
             plugin_catalog_cache: Arc::new(Mutex::new(PluginCatalogCache::default())),
+            #[cfg(test)]
             plugin_registry_read_cache: Arc::new(Mutex::new(PluginRegistryReadCache::default())),
             plugin_generation_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
@@ -127,6 +132,7 @@ impl PluginRuntimeHost {
             .get_or_compile(registry)
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_plugin_registries(
         &self,
         snapshot: u128,
@@ -154,6 +160,7 @@ impl PluginRuntimeHost {
         Ok(registries)
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_plugin_registries(
         &self,
         snapshot: u128,

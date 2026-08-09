@@ -3,13 +3,11 @@ use crate::json_store::store;
 use crate::json_store::types::{
     JsonLoadBatch, JsonLoadRequestRef, JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
+#[cfg(test)]
+use crate::storage_adapter::StorageKey;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, StorageAdapterRead, StorageSpace,
     StorageWriteSet,
-};
-#[cfg(test)]
-use crate::storage_adapter::{
-    StorageBeginScanOptions, StorageCoreProjection, StorageKey, StoragePrefix,
 };
 use bytes::Bytes;
 use std::collections::HashSet;
@@ -38,13 +36,6 @@ const JSON_REF_BYTES: usize = 32;
 /// Malformed keys are retained as `None` so GC can reclaim the derived record
 /// without treating a corrupt hint as a reason to touch an arbitrary JSON
 /// payload.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct UntrackedJsonReclaimCandidate {
-    pub(crate) key: StorageKey,
-    pub(crate) json_ref: Option<JsonRef>,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JsonStoreContext;
 
@@ -74,50 +65,6 @@ impl JsonStoreContext {
         store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
             .await
             .map(JsonLoadBatch::new)
-    }
-
-    /// Lists the durable hints for out-of-band untracked payloads that may no
-    /// longer have an owner. This is deliberately a key-only, paged scan: the
-    /// hint value carries no data and the caller already holds the complete
-    /// logical root set from the same pinned read.
-    #[cfg(test)]
-    pub(crate) async fn scan_untracked_reclaim_candidates(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-    ) -> Result<Vec<UntrackedJsonReclaimCandidate>, LixError> {
-        let range = StoragePrefix {
-            bytes: Bytes::new(),
-        }
-        .to_range()?;
-        let mut candidates = Vec::new();
-        let mut cursor = store
-            .begin_scan(
-                UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-                range,
-                StorageBeginScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    ..StorageBeginScanOptions::default()
-                },
-            )
-            .await?;
-        loop {
-            let page = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            candidates.extend(page.entries.into_iter().map(|entry| {
-                let json_ref = <[u8; 32]>::try_from(entry.key.0.as_ref())
-                    .ok()
-                    .map(JsonRef::from_hash_bytes);
-                UntrackedJsonReclaimCandidate {
-                    key: entry.key,
-                    json_ref,
-                }
-            }));
-            if !page.has_more {
-                break;
-            }
-        }
-        Ok(candidates)
     }
 }
 
@@ -189,7 +136,6 @@ impl JsonStoreWriter {
                 .try_into()
                 .expect("json ref hash is fixed size");
             #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_json_store_stage_bytes(hash);
             order.push(json_ref);
             if seen.insert(hash) {
                 value_plan.push_json(normalized)?;
@@ -270,7 +216,7 @@ impl JsonStoreWriter {
         .expect("JSON reclaim candidate descriptors are built from arena offsets");
         // The write-set helper coalesces an identical hint emitted by an
         // earlier current-state staging call in the same atomic commit.
-        writes.stage_content_addressed_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
+        writes.stage_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
     }
 
     /// Removes only candidate hints whose payload was proved dead (or whose

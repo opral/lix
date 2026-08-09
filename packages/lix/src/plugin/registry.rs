@@ -6,7 +6,7 @@
 //! exact registry read and one batched owner read instead of a filesystem
 //! scan.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -18,22 +18,17 @@ use serde_json::{Value as JsonValue, json};
 use crate::binary_cas::BlobId;
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateScanRequest, MaterializedLiveStateRow,
-    scan_forktree_view,
-};
+use crate::live_state::MaterializedLiveStateRow;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
+use crate::{GLOBAL_BRANCH_ID, LixError};
 
 use super::InstalledPlugin;
 use super::manifest::{
     PluginContentMatcher, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
     validate_runtime_api_version,
 };
-use super::storage::{
-    plugin_storage_archive_file_id, plugin_storage_archive_path, plugin_storage_wasm_file_id,
-};
+use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 
 pub(crate) const PLUGIN_REGISTRY_KEY: &str = "lix_plugin_registry_v2";
 pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v2";
@@ -373,28 +368,6 @@ impl PluginRegistry {
         Self::from_optional_snapshot(Some(&snapshot))
     }
 
-    /// Decode the selected registry row for GC. A missing, deleted, null, or
-    /// malformed selected cell is corruption; only an authenticated Value
-    /// payload may represent the registry, including an explicitly empty one.
-    pub(crate) fn from_required_live_state_row(
-        row: &MaterializedLiveStateRow,
-        branch_id: &str,
-    ) -> Result<Self, LixError> {
-        validate_live_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id)?;
-        if row.deleted {
-            return Err(invalid_registry(
-                "selected plugin registry row is a tombstone",
-            ));
-        }
-        if row.snapshot_content.is_none() {
-            return Err(invalid_registry(
-                "selected plugin registry row is not an authenticated Value",
-            ));
-        }
-        let snapshot = parse_snapshot_content(row, "plugin registry")?;
-        Self::from_optional_snapshot(Some(&snapshot))
-    }
-
     pub(crate) fn to_value(&self) -> Result<JsonValue, LixError> {
         self.validate()?;
         serde_json::to_value(PluginRegistryWire {
@@ -520,161 +493,6 @@ where
     PluginRegistry::from_optional_snapshot(snapshot.as_ref())
 }
 
-/// Re-derives every WASM payload root owned by current and retained plugin
-/// registry generations. Registry snapshots remain the sole serving authority;
-/// this returns only their authenticated content hashes for binary-CAS marking.
-pub(crate) async fn collect_gc_wasm_blob_roots<O, C>(
-    retained: &O,
-    controls: &[(String, C)],
-    retained_commits: &BTreeSet<CommitId>,
-) -> Result<BTreeSet<BlobId>, LixError>
-where
-    O: StorageAdapterRead + Clone,
-{
-    let facade = crate::forktree::ForkTreeReadFacade::new(retained.clone());
-    let mut roots = BTreeSet::new();
-    for (branch_id, _) in controls {
-        let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
-        let rows = scan_forktree_view(
-            &view,
-            &LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
-                    entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
-                    branch_ids: vec![branch_id.clone()],
-                    file_ids: vec![NullableKeyFilter::Null],
-                    untracked: Some(false),
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection {
-                    columns: vec!["snapshot_content".to_owned()],
-                },
-                limit: None,
-            },
-        )
-        .await?;
-        let rows = rows.into_rows();
-        if rows.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                format!(
-                    "selected plugin registry is missing for branch '{branch_id}'; only an authenticated explicit bootstrap-empty row may be empty"
-                ),
-            ));
-        }
-        for row in rows {
-            let registry = PluginRegistry::from_required_live_state_row(&row, branch_id)?;
-            extend_registry_wasm_roots_on_view(&view, &registry, &mut roots).await?;
-        }
-    }
-
-    for commit_id in retained_commits {
-        let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-            schema_key: KEY_VALUE_SCHEMA_KEY,
-            entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
-            file_id: None,
-        });
-        let value = facade
-            .load_state_value_at_commit(*commit_id, &key, true)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    format!("retained plugin registry is missing at commit '{commit_id}'"),
-                )
-            })?;
-        let snapshot = match &value.0.cell {
-            crate::forktree::StateCell::Value(value) => {
-                Some(serde_json::from_str(value.as_str()).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!("historical plugin registry snapshot is invalid JSON: {error}"),
-                    )
-                })?)
-            }
-            crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
-                return Err(LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    format!("retained plugin registry is deleted at commit '{commit_id}'"),
-                ));
-            }
-        };
-        let registry = PluginRegistry::from_optional_snapshot(snapshot.as_ref())?;
-        for plugin in registry.plugins() {
-            let file_id = plugin_storage_wasm_file_id(plugin.key());
-            let owner_key = crate::forktree::StateKey {
-                schema_key: "lix_binary_blob_ref".to_owned(),
-                file_id: Some(file_id.clone()),
-                entity_pk: EntityPk::uuid_from_canonical(&file_id)
-                    .expect("deterministic plugin WASM owner ID is a UUID"),
-            };
-            let encoded_owner_key =
-                crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                    schema_key: &owner_key.schema_key,
-                    file_id: owner_key.file_id.as_deref(),
-                    entity_pk: &owner_key.entity_pk,
-                });
-            let owner_value = facade
-                .load_state_value_at_commit(*commit_id, &encoded_owner_key, true)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_STORAGE_ERROR,
-                        format!(
-                            "retained plugin '{}' WASM BlobRef owner is missing at commit '{commit_id}'",
-                            plugin.key()
-                        ),
-                    )
-                })?;
-            let semantic_id =
-                crate::forktree::historical_blob_semantic_id(&owner_key, &owner_value.0)?;
-            let expected = BlobId::from_hex(plugin.wasm_blob_hash())?;
-            if semantic_id != expected {
-                return Err(invalid_registry(format!(
-                    "plugin '{}' registry WASM hash does not match its authenticated BlobRef owner",
-                    plugin.key()
-                )));
-            }
-            roots.insert(semantic_id);
-        }
-    }
-    Ok(roots)
-}
-
-async fn extend_registry_wasm_roots_on_view<R: StorageAdapterRead>(
-    view: &crate::forktree::CoherentView<R>,
-    registry: &PluginRegistry,
-    roots: &mut BTreeSet<BlobId>,
-) -> Result<(), LixError>
-where
-    R: Sync,
-{
-    for plugin in registry.plugins() {
-        let file_id = plugin_storage_wasm_file_id(plugin.key());
-        let key = crate::forktree::StateKey {
-            schema_key: "lix_binary_blob_ref".to_owned(),
-            file_id: Some(file_id.clone()),
-            entity_pk: EntityPk::uuid_from_canonical(&file_id)
-                .expect("deterministic plugin WASM owner ID is a UUID"),
-        };
-        let reference = view.bind_blob_at_state_key(&key).await?.ok_or_else(|| {
-            invalid_registry(format!(
-                "plugin '{}' has no authenticated WASM BlobRef owner",
-                plugin.key()
-            ))
-        })?;
-        let expected = BlobId::from_hex(plugin.wasm_blob_hash())?;
-        if reference.semantic_id() != expected {
-            return Err(invalid_registry(format!(
-                "plugin '{}' registry WASM hash does not match its authenticated BlobRef owner",
-                plugin.key()
-            )));
-        }
-        roots.insert(reference.semantic_id());
-    }
-    Ok(())
-}
-
 /// Durable per-file ownership. `file_id` is storage identity, not duplicated
 /// in the snapshot payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -779,34 +597,6 @@ impl PluginFileOwner {
         .map_err(|error| {
             invalid_registry(format!(
                 "historical plugin owner snapshot is invalid JSON: {error}"
-            ))
-        })?;
-        Self::from_snapshot(file_id, &snapshot).map(Some)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_tracked_state_row(
-        row: &crate::tracked_state::MaterializedTrackedStateRow,
-    ) -> Result<Option<Self>, LixError> {
-        let file_id = row.file_id.as_deref().ok_or_else(|| {
-            invalid_registry("plugin owner row is missing its file_id storage identity")
-        })?;
-        if row.schema_key != KEY_VALUE_SCHEMA_KEY
-            || row.entity_pk != EntityPk::single(PLUGIN_OWNER_KEY)
-        {
-            return Err(invalid_registry(
-                "tracked plugin owner row has an invalid storage identity",
-            ));
-        }
-        if row.deleted || row.snapshot_content.is_none() {
-            return Ok(None);
-        }
-        let snapshot = serde_json::from_str(
-            row.snapshot_content.as_deref().expect("checked above"),
-        )
-        .map_err(|error| {
-            invalid_registry(format!(
-                "tracked plugin owner snapshot is invalid JSON: {error}"
             ))
         })?;
         Self::from_snapshot(file_id, &snapshot).map(Some)

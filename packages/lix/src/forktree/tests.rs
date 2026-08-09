@@ -4081,7 +4081,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     let members = (0..255)
         .map(|index| {
             let mut raw = [0u8; 32];
-            raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            raw[..8].copy_from_slice(&(index + 1_u64).to_be_bytes());
             raw[31] = 2;
             CommitMemberV1::introduced(ObjectId::from_bytes(raw))
         })

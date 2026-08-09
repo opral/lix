@@ -10,24 +10,9 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::json_store::JsonSlot;
-use crate::tracked_state::TrackedStateFilter;
-use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
-
-/// Filter for comparing two tracked-state commit roots.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateDiffRequest {
-    pub(crate) filter: TrackedStateFilter,
-    pub(crate) retain_payloads: bool,
-}
-
-impl Default for TrackedStateDiffRequest {
-    fn default() -> Self {
-        Self {
-            filter: TrackedStateFilter::default(),
-            retain_payloads: true,
-        }
-    }
-}
+use crate::tracked_state::types::TrackedStateKey;
+#[cfg(test)]
+use crate::tracked_state::types::TrackedStateKeyRef;
 
 /// Changed tracked-state rows between two commit roots.
 #[derive(Debug, Clone, Default)]
@@ -168,34 +153,6 @@ struct TrackedStateDiffKey {
     entity_pk: crate::entity_pk::EntityPk,
 }
 
-/// Typed tree-diff stage shared directly with diff validation/classification.
-///
-/// Identity metadata is dictionary encoded once, entity keys occupy one typed
-/// column, and both root sides are aligned `TrackedStateIndexValue` columns.
-/// No production `TrackedStateTreeDiffEntry` or row-owned key exists between
-/// tree traversal and the final public diff entries.
-#[derive(Debug, Default)]
-pub(crate) struct TrackedStateTreeDiffBatch {
-    identities: Option<Arc<TrackedStateDiffIdentityBatch>>,
-    before: Vec<Option<TrackedStateIndexValue>>,
-    after: Vec<Option<TrackedStateIndexValue>>,
-}
-
-pub(crate) struct TrackedStateTreeDiffBatchBuilder {
-    schema_keys: TrackedStateDiffStringInterner,
-    file_ids: TrackedStateDiffStringInterner,
-    rows: Vec<TrackedStateDiffKeyRow>,
-    before: Vec<Option<TrackedStateIndexValue>>,
-    after: Vec<Option<TrackedStateIndexValue>>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct TrackedStateTreeDiffRowRef<'a> {
-    identities: &'a TrackedStateDiffIdentityBatch,
-    ordinal: u32,
-    value: &'a TrackedStateIndexValue,
-}
-
 /// Root-local tracked-state identity view.
 ///
 /// Equality and ordering are key-based, so identities from different diff
@@ -283,38 +240,14 @@ impl TrackedStatePayloadBatch {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn contains(&self, change_id: ChangeId) -> bool {
         self.columns.id_ordinals.contains_key(&change_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.columns.change_ids.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.columns.change_ids.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_owner_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.columns, &other.columns)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn large_buffer_count(&self) -> usize {
-        if self.is_empty() {
-            0
-        } else {
-            // Three dense columns plus one change-id ordinal index, regardless
-            // of logical row count.
-            4
-        }
     }
 }
 
 impl TrackedStateDiff {
+    #[cfg(test)]
     pub(crate) fn from_entries(entries: Vec<TrackedStateDiffEntry>) -> Self {
         Self {
             entries,
@@ -343,216 +276,6 @@ impl TrackedStateDiff {
 /// reachability, inherited creation time, and absence of omitted unchanged
 /// rows belong to the explicit full-root integrity audit; proving those here
 /// would make sparse diff O(total rows).
-impl TrackedStateTreeDiffBatchBuilder {
-    pub(crate) fn with_row_capacity(row_count: usize) -> Self {
-        Self {
-            schema_keys: TrackedStateDiffStringInterner::new(row_count),
-            file_ids: TrackedStateDiffStringInterner::new(row_count),
-            rows: Vec::with_capacity(row_count),
-            before: Vec::with_capacity(row_count),
-            after: Vec::with_capacity(row_count),
-        }
-    }
-
-    /// Reserves the aligned columns once after the tree root exposes its
-    /// subtree count. Corrupt or overflowing hints are ignored by callers;
-    /// logical rows remain checked when the batch seals.
-    pub(crate) fn reserve_exact_once(&mut self, row_count: usize) {
-        if self.rows.capacity() == 0 {
-            let _ = self.rows.try_reserve_exact(row_count);
-            let _ = self.before.try_reserve_exact(row_count);
-            let _ = self.after.try_reserve_exact(row_count);
-            self.schema_keys.set_expected_cardinality(row_count);
-            self.file_ids.set_expected_cardinality(row_count);
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub(crate) fn finish(self) -> Result<TrackedStateTreeDiffBatch, LixError> {
-        let row_count = self.rows.len();
-        debug_assert_eq!(self.before.len(), row_count);
-        debug_assert_eq!(self.after.len(), row_count);
-        if row_count == 0 {
-            return Ok(TrackedStateTreeDiffBatch::default());
-        }
-        if row_count > u32::MAX as usize {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-state tree diff batch exceeds the identity ordinal range",
-            ));
-        }
-        let identities = Arc::new(TrackedStateDiffIdentityBatch {
-            keys: TrackedStateDiffKeyStorage::Batch(TrackedStateDiffKeyColumns {
-                schema_keys: self.schema_keys.finish(),
-                file_ids: self.file_ids.finish(),
-                rows: self.rows,
-            }),
-        });
-        Ok(TrackedStateTreeDiffBatch {
-            identities: Some(identities),
-            before: self.before,
-            after: self.after,
-        })
-    }
-}
-
-impl TrackedStateTreeDiffBatch {
-    pub(crate) fn len(&self) -> usize {
-        self.before.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.before.is_empty()
-    }
-
-    pub(crate) fn swap_sides(&mut self) {
-        std::mem::swap(&mut self.before, &mut self.after);
-    }
-
-    pub(crate) fn side_rows(&self) -> impl Iterator<Item = TrackedStateTreeDiffRowRef<'_>> {
-        let identities = self.identities.as_deref();
-        self.before.iter().zip(&self.after).enumerate().flat_map(
-            move |(ordinal, (before, after))| {
-                [before.as_ref(), after.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .map(move |value| TrackedStateTreeDiffRowRef {
-                        identities: identities
-                            .expect("non-empty tree diff columns retain identities"),
-                        ordinal: u32::try_from(ordinal)
-                            .expect("tree diff batch row count is bounded to u32"),
-                        value,
-                    })
-            },
-        )
-    }
-
-    pub(crate) fn comparison_rows(&self) -> Vec<TrackedStateTreeDiffRowRef<'_>> {
-        let Some(identities) = self.identities.as_deref() else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        for (ordinal, (before, after)) in self.before.iter().zip(&self.after).enumerate() {
-            let (Some(before), Some(after)) = (before.as_ref(), after.as_ref()) else {
-                continue;
-            };
-            if before.deleted || after.deleted || before.change_id == after.change_id {
-                continue;
-            }
-            let ordinal =
-                u32::try_from(ordinal).expect("tree diff batch row count is bounded to u32");
-            rows.push(TrackedStateTreeDiffRowRef {
-                identities,
-                ordinal,
-                value: before,
-            });
-            rows.push(TrackedStateTreeDiffRowRef {
-                identities,
-                ordinal,
-                value: after,
-            });
-        }
-        rows
-    }
-
-    fn into_columns(
-        self,
-    ) -> (
-        Option<Arc<TrackedStateDiffIdentityBatch>>,
-        Vec<Option<TrackedStateIndexValue>>,
-        Vec<Option<TrackedStateIndexValue>>,
-    ) {
-        (self.identities, self.before, self.after)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn large_buffer_count(&self) -> usize {
-        if self.is_empty() {
-            0
-        } else {
-            // Identity rows plus two aligned side columns. Tiny dictionaries
-            // stay below the large-buffer threshold.
-            3
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn row_capacity(&self) -> usize {
-        let identity_capacity = self
-            .identities
-            .as_ref()
-            .map_or(0, |identities| match &identities.keys {
-                TrackedStateDiffKeyStorage::Singleton(_) => 1,
-                TrackedStateDiffKeyStorage::Batch(keys) => keys.rows.capacity(),
-            });
-        identity_capacity
-            .max(self.before.capacity())
-            .max(self.after.capacity())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_rows_for_test(
-        self,
-    ) -> Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry> {
-        let (identities, before, after) = self.into_columns();
-        let Some(identities) = identities else {
-            return Vec::new();
-        };
-        before
-            .into_iter()
-            .zip(after)
-            .enumerate()
-            .map(|(ordinal, (before, after))| {
-                let ordinal =
-                    u32::try_from(ordinal).expect("test tree diff batch was bounded to u32");
-                crate::tracked_state::types::TrackedStateTreeDiffEntry {
-                    key: TrackedStateKey {
-                        schema_key: identities.schema_key(ordinal).to_owned(),
-                        file_id: identities.file_id(ordinal).map(str::to_owned),
-                        entity_pk: identities.entity_pk(ordinal).clone(),
-                    },
-                    before,
-                    after,
-                }
-            })
-            .collect()
-    }
-}
-
-impl<'a> TrackedStateTreeDiffRowRef<'a> {
-    pub(crate) fn schema_key(self) -> &'a str {
-        self.identities.schema_key(self.ordinal)
-    }
-
-    pub(crate) fn file_id(self) -> Option<&'a str> {
-        self.identities.file_id(self.ordinal)
-    }
-
-    pub(crate) fn entity_pk(self) -> &'a crate::entity_pk::EntityPk {
-        self.identities.entity_pk(self.ordinal)
-    }
-
-    pub(crate) fn change_id(self) -> ChangeId {
-        self.value.change_id
-    }
-
-    pub(crate) fn commit_id(self) -> CommitId {
-        self.value.commit_id
-    }
-
-    pub(crate) fn deleted(self) -> bool {
-        self.value.deleted
-    }
-
-    pub(crate) fn updated_at(self) -> LixTimestamp {
-        self.value.updated_at()
-    }
-}
-
 impl TrackedStateDiffIdentityBatch {
     fn from_keys(keys: Vec<TrackedStateKey>) -> Arc<Self> {
         debug_assert!(!keys.is_empty());
@@ -580,6 +303,7 @@ impl TrackedStateDiffIdentityBatch {
         })
     }
 
+    #[cfg(test)]
     fn from_key_refs<'a>(
         row_count: usize,
         mut key_at: impl FnMut(usize) -> TrackedStateKeyRef<'a>,
@@ -656,17 +380,6 @@ impl TrackedStateDiffIdentityBatch {
         }
     }
 
-    #[cfg(test)]
-    fn into_key(self, ordinal: u32) -> TrackedStateKey {
-        match self.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => {
-                debug_assert_eq!(ordinal, 0);
-                key.into_key()
-            }
-            TrackedStateDiffKeyStorage::Batch(keys) => keys.key(ordinal).into_key(),
-        }
-    }
-
     fn len(&self) -> usize {
         match &self.keys {
             TrackedStateDiffKeyStorage::Singleton(_) => 1,
@@ -686,16 +399,6 @@ impl TrackedStateDiffStringInterner {
         }
     }
 
-    fn set_expected_cardinality(&mut self, expected_cardinality: usize) {
-        self.expected_cardinality = self.expected_cardinality.max(expected_cardinality);
-        if self.values.capacity() == 0 {
-            let small_capacity = self
-                .expected_cardinality
-                .min(DIFF_SMALL_STRING_DICTIONARY_LIMIT);
-            let _ = self.values.try_reserve_exact(small_capacity);
-        }
-    }
-
     fn intern_owned(&mut self, value: String) -> u32 {
         if let Some(ordinal) = self.ordinal(value.as_str()) {
             return ordinal;
@@ -703,18 +406,12 @@ impl TrackedStateDiffStringInterner {
         self.insert_new(SharedStr::from(value))
     }
 
+    #[cfg(test)]
     fn intern_str(&mut self, value: &str) -> u32 {
         if let Some(ordinal) = self.ordinal(value) {
             return ordinal;
         }
         self.insert_new(SharedStr::from(value))
-    }
-
-    fn intern_shared(&mut self, value: SharedStr) -> u32 {
-        if let Some(ordinal) = self.ordinal(value.as_str()) {
-            return ordinal;
-        }
-        self.insert_new(value)
     }
 
     fn ordinal(&self, value: &str) -> Option<u32> {
@@ -762,29 +459,7 @@ impl TrackedStateDiffStringInterner {
     }
 }
 
-impl TrackedStateDiffKeyColumns {
-    #[cfg(test)]
-    fn key(&self, ordinal: u32) -> TrackedStateDiffKey {
-        let row = &self.rows[ordinal as usize];
-        TrackedStateDiffKey {
-            schema_key: self.schema_keys[row.schema_key_ordinal as usize].clone(),
-            file_id: (row.file_id_ordinal != u32::MAX)
-                .then(|| self.file_ids[row.file_id_ordinal as usize].clone()),
-            entity_pk: row.entity_pk.clone(),
-        }
-    }
-}
-
-impl TrackedStateDiffKey {
-    #[cfg(test)]
-    fn into_key(self) -> TrackedStateKey {
-        TrackedStateKey {
-            schema_key: self.schema_key.to_string(),
-            file_id: self.file_id.map(|file_id| file_id.to_string()),
-            entity_pk: self.entity_pk,
-        }
-    }
-}
+impl TrackedStateDiffKeyColumns {}
 
 impl TrackedStateDiffIdentity {
     pub(crate) fn from_key(key: TrackedStateKey) -> Self {
@@ -827,6 +502,7 @@ impl TrackedStateDiffIdentity {
     /// interned once into batch dictionaries and entity primary keys clone
     /// only their shared descriptors, avoiding a terminal `String` allocation
     /// per discovered key.
+    #[cfg(test)]
     pub(crate) fn from_key_refs<'a>(
         row_count: usize,
         key_at: impl FnMut(usize) -> TrackedStateKeyRef<'a>,
@@ -858,14 +534,6 @@ impl TrackedStateDiffIdentity {
 
     pub(crate) fn schema_key(&self) -> &str {
         self.batch.schema_key(self.ordinal)
-    }
-
-    pub(crate) fn as_key_ref(&self) -> TrackedStateKeyRef<'_> {
-        TrackedStateKeyRef {
-            schema_key: self.schema_key(),
-            file_id: self.file_id(),
-            entity_pk: self.entity_pk(),
-        }
     }
 
     /// Clones the shared schema owner without allocating decoded text.
@@ -904,50 +572,15 @@ impl TrackedStateDiffIdentity {
     }
 
     #[cfg(test)]
-    pub(crate) fn into_key(self) -> TrackedStateKey {
-        match Arc::try_unwrap(self.batch) {
-            Ok(batch) => batch.into_key(self.ordinal),
-            Err(batch) => TrackedStateKey {
-                schema_key: batch.schema_key(self.ordinal).to_owned(),
-                file_id: batch.file_id(self.ordinal).map(str::to_owned),
-                entity_pk: batch.entity_pk(self.ordinal).clone(),
-            },
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn shares_key_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.batch, &other.batch) && self.ordinal == other.ordinal
+        self.schema_key() == other.schema_key()
+            && self.file_id() == other.file_id()
+            && self.entity_pk() == other.entity_pk()
     }
 
     #[cfg(test)]
     pub(crate) fn shares_batch_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.batch, &other.batch)
-    }
-
-    #[cfg(test)]
-    fn batch_len(&self) -> usize {
-        self.batch.len()
-    }
-
-    #[cfg(test)]
-    fn batch_dictionary_counts(&self) -> (usize, usize) {
-        match &self.batch.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => (1, usize::from(key.file_id.is_some())),
-            TrackedStateDiffKeyStorage::Batch(keys) => {
-                (keys.schema_keys.len(), keys.file_ids.len())
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn batch_dictionary_capacities(&self) -> (usize, usize) {
-        match &self.batch.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => (1, usize::from(key.file_id.is_some())),
-            TrackedStateDiffKeyStorage::Batch(keys) => {
-                (keys.schema_keys.capacity(), keys.file_ids.capacity())
-            }
-        }
     }
 }
 
@@ -996,21 +629,6 @@ impl Hash for TrackedStateDiffIdentity {
 }
 
 impl TrackedStateDiffRow {
-    pub(crate) fn from_tree_entry(key: TrackedStateKey, value: TrackedStateIndexValue) -> Self {
-        Self::from_index_value(TrackedStateDiffIdentity::from_key(key), value)
-    }
-
-    fn from_index_value(identity: TrackedStateDiffIdentity, value: TrackedStateIndexValue) -> Self {
-        Self {
-            identity,
-            deleted: value.deleted,
-            created_at: value.created_at(),
-            updated_at: value.updated_at(),
-            change_id: value.change_id,
-            commit_id: value.commit_id,
-        }
-    }
-
     pub(crate) fn schema_key(&self) -> &str {
         self.identity.schema_key()
     }
@@ -1021,43 +639,5 @@ impl TrackedStateDiffRow {
 
     pub(crate) fn entity_pk(&self) -> &crate::entity_pk::EntityPk {
         self.identity.entity_pk()
-    }
-
-    pub(crate) fn index_value(&self) -> TrackedStateIndexValue {
-        TrackedStateIndexValue {
-            change_id: self.change_id,
-            commit_id: self.commit_id,
-            deleted: self.deleted,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_index_entry(self) -> (TrackedStateKey, TrackedStateIndexValue) {
-        let value = self.index_value();
-        (self.identity.into_key(), value)
-    }
-}
-
-impl TrackedStateDiffEntry {
-    #[cfg(test)]
-    pub(crate) fn before_is_live(&self) -> bool {
-        self.visible_before().is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn after_is_live(&self) -> bool {
-        self.visible_after().is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn visible_before(&self) -> Option<&TrackedStateDiffRow> {
-        self.before.as_ref().filter(|row| !row.deleted)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn visible_after(&self) -> Option<&TrackedStateDiffRow> {
-        self.after.as_ref().filter(|row| !row.deleted)
     }
 }

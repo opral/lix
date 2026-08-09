@@ -339,32 +339,11 @@ pub(crate) struct RepositoryGcProfile {
     pub(crate) total_us: u64,
 }
 
-pub(crate) fn stage_recovery_ref_rotation(
-    _writes: &mut StorageWriteSet,
-    _recovery: &CheckpointRecoveryRef,
-) -> Result<(), LixError> {
-    Err(gc_not_lowered())
-}
-
 pub(crate) fn stage_checkpoint_gc_state(
     _writes: &mut StorageWriteSet,
     _state: &CheckpointGcState,
 ) -> Result<(), LixError> {
     Err(gc_not_lowered())
-}
-
-pub(crate) fn stage_reachability_queue_seed(_writes: &mut StorageWriteSet) -> Result<(), LixError> {
-    Err(gc_not_lowered())
-}
-
-pub(crate) async fn load_recovery_ref<R>(
-    read: &R,
-    branch_id: &str,
-) -> Result<Option<CheckpointRecoveryRef>, LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    Ok(load_checkpoint_publication_state(read, branch_id).await?.0)
 }
 
 pub(crate) async fn load_checkpoint_gc_state<R>(read: &R) -> Result<CheckpointGcState, LixError>
@@ -376,16 +355,6 @@ where
             .await?
             .1,
     )
-}
-
-pub(crate) async fn stage_repository_gc<S>(
-    _store: S,
-    _writes: &mut StorageWriteSet,
-) -> Result<RepositoryGcPlan, LixError>
-where
-    S: StorageAdapterRead,
-{
-    Err(gc_not_lowered())
 }
 
 pub(crate) async fn stage_repository_gc_with_preconditions<S>(

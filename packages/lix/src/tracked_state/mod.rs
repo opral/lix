@@ -15,5 +15,5 @@ pub(crate) use diff_id::{decode_diff_id, encode_diff_id};
 pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan, plan_merge,
 };
-pub(crate) use types::{MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateIndexValue};
+pub(crate) use types::{TrackedStateFilter, TrackedStateIndexValue};
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};

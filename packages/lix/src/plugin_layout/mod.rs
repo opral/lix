@@ -355,6 +355,7 @@ impl Error {
         }
     }
 
+    #[cfg(test)]
     pub fn message(&self) -> &str {
         &self.message
     }

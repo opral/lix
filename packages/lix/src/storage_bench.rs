@@ -6,25 +6,14 @@ static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
-static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
-static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
-static CRUD_COMMIT_STATE_MANIFEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_SCOPED_RANGE_HITS: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
-static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
-static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
-static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -201,15 +190,6 @@ pub struct MediaStructuralAccounting {
     pub segment_identity_hash_bytes: u64,
 }
 
-pub(crate) fn record_media_upload_manifest_leaf(chunk_count: usize) {
-    MEDIA_UPLOAD_MANIFEST_LEAF_ROWS.fetch_add(1, Ordering::Relaxed);
-    MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS.fetch_add(chunk_count as u64, Ordering::Relaxed);
-}
-
-pub(crate) fn record_media_upload_chunk_payload_hash_bytes(payload_bytes: usize) {
-    MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES.fetch_add(payload_bytes as u64, Ordering::Relaxed);
-}
-
 pub(crate) fn record_immutable_segment_identity_hash_bytes(bytes: usize) {
     IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
@@ -296,27 +276,6 @@ pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateA
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EntityPointSnapshotCacheAccounting {
-    pub hits: u64,
-    pub misses: u64,
-}
-
-pub(crate) fn record_entity_point_snapshot_cache_hit() {
-    ENTITY_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_entity_point_snapshot_cache_miss() {
-    ENTITY_POINT_SNAPSHOT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn take_entity_point_snapshot_cache_accounting() -> EntityPointSnapshotCacheAccounting {
-    EntityPointSnapshotCacheAccounting {
-        hits: ENTITY_POINT_SNAPSHOT_CACHE_HITS.swap(0, Ordering::Relaxed),
-        misses: ENTITY_POINT_SNAPSHOT_CACHE_MISSES.swap(0, Ordering::Relaxed),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrudPhysicalWriteAccounting {
     pub puts: u64,
     pub deletes: u64,
@@ -334,67 +293,6 @@ pub fn take_crud_physical_write_accounting() -> CrudPhysicalWriteAccounting {
         puts: CRUD_PHYSICAL_PUTS.swap(0, Ordering::Relaxed),
         deletes: CRUD_PHYSICAL_DELETES.swap(0, Ordering::Relaxed),
         written_bytes: CRUD_PHYSICAL_WRITTEN_BYTES.swap(0, Ordering::Relaxed),
-    }
-}
-
-pub(crate) fn record_crud_commit_state_manifest_bytes(bytes: usize) {
-    CRUD_COMMIT_STATE_MANIFEST_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-}
-
-pub fn take_crud_commit_state_manifest_bytes() -> u64 {
-    CRUD_COMMIT_STATE_MANIFEST_BYTES.swap(0, Ordering::Relaxed)
-}
-
-pub(crate) fn record_crud_current_state_scoped_range_fallback() {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn take_crud_current_state_scoped_range_fallbacks() -> u64 {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS.swap(0, Ordering::Relaxed)
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CrudCurrentStateScopedRangeAccounting {
-    pub attempts: u64,
-    pub hits: u64,
-    pub errors: u64,
-    pub sealed_manifest_loads: u64,
-    pub replay_manifest_loads: u64,
-    pub ordered_delta_fallbacks: u64,
-}
-
-pub(crate) fn record_crud_current_state_scoped_range_attempt() {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_current_state_scoped_range_hit() {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_HITS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_current_state_scoped_range_error() {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_sealed_manifest_load() {
-    CRUD_SEALED_MANIFEST_LOADS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_replay_manifest_load() {
-    CRUD_REPLAY_MANIFEST_LOADS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_ordered_delta_fallback() {
-    CRUD_ORDERED_DELTA_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScopedRangeAccounting {
-    CrudCurrentStateScopedRangeAccounting {
-        attempts: CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS.swap(0, Ordering::Relaxed),
-        hits: CRUD_CURRENT_STATE_SCOPED_RANGE_HITS.swap(0, Ordering::Relaxed),
-        errors: CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS.swap(0, Ordering::Relaxed),
-        sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
-        replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
-        ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -416,8 +314,4 @@ pub(crate) fn record_transaction_schema_catalog_load() {
 
 pub(crate) fn record_transaction_schema_catalog_compile() {
     TRANSACTION_SCHEMA_CATALOG_COMPILES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {
-    JSON_STORE_STAGE_BYTES.fetch_add(hash.len() as u64, Ordering::Relaxed);
 }

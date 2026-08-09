@@ -11,50 +11,14 @@ use bytes::Bytes;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
 
 #[derive(Debug, Clone)]
-pub(crate) enum CertifiedCurrentStatePredecessor {
-    Encoded(Bytes),
-    Packed(PackedHeadValue),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PackedHeadValue {
-    pub(crate) change_id: ChangeId,
-    pub(crate) commit_id: CommitId,
-    pub(crate) deleted: bool,
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) updated_at: LixTimestamp,
-    pub(crate) checkpoint_commit_id: Option<CommitId>,
-}
+pub(crate) enum CertifiedCurrentStatePredecessor {}
 
 impl CertifiedCurrentStatePredecessor {
     pub(crate) fn created_at(&self) -> Result<LixTimestamp, crate::LixError> {
-        match self {
-            Self::Packed(value) => Ok(value.created_at),
-            Self::Encoded(bytes) => {
-                if bytes.len() < 59 || bytes.first().copied() != Some(8) {
-                    return Err(crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        "encoded current-state predecessor has an invalid fixed header",
-                    ));
-                }
-                let packed = u64::from_be_bytes(bytes[34..42].try_into().map_err(|_| {
-                    crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        "encoded current-state predecessor has an invalid timestamp",
-                    )
-                })?);
-                LixTimestamp::from_packed(packed).map_err(|error| {
-                    crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        format!("encoded current-state predecessor timestamp is invalid: {error}"),
-                    )
-                })
-            }
-        }
+        match *self {}
     }
 }
 
@@ -666,29 +630,6 @@ impl MaterializedLiveStateExactBatch {
             .copied()
             .flatten()
             .map(|ordinal| self.batch.row(ordinal as usize))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn filter(
-        &self,
-        mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
-    ) -> Result<Self, crate::LixError> {
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(self.len());
-        let mut slots = Vec::with_capacity(self.len());
-        for index in 0..self.len() {
-            let Some(row) = self.row(index).filter(|row| keep(*row)) else {
-                slots.push(None);
-                continue;
-            };
-            let ordinal = u32::try_from(builder.push_ref(row, None)).map_err(|_| {
-                crate::LixError::new(
-                    crate::LixError::CODE_INTERNAL_ERROR,
-                    "exact live-state result exceeds u32 rows",
-                )
-            })?;
-            slots.push(Some(ordinal));
-        }
-        Self::new(builder.finish(), slots)
     }
 
     /// Consumes an aligned exact result into one compact owner containing only
@@ -1367,44 +1308,6 @@ impl MaterializedLiveStateBatchBuilder {
             untracked: self.untracked,
             durable_predecessor: self.durable_predecessor,
         }
-    }
-}
-
-impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
-    type Error = crate::LixError;
-
-    fn try_from(row: &MaterializedLiveStateRow) -> Result<Self, Self::Error> {
-        if row.untracked {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked_state cannot store untracked live-state rows",
-            ));
-        }
-        let Some(change_id) = row.change_id else {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked_state rows require change_id",
-            ));
-        };
-        let Some(commit_id) = row.commit_id else {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked_state rows require commit_id",
-            ));
-        };
-
-        Ok(Self {
-            entity_pk: row.entity_pk.clone(),
-            schema_key: row.schema_key.clone(),
-            file_id: row.file_id.clone(),
-            snapshot_content: row.snapshot_content.clone(),
-            metadata: row.metadata.clone(),
-            deleted: row.deleted,
-            created_at: row.created_at.to_string(),
-            updated_at: row.updated_at.to_string(),
-            change_id,
-            commit_id,
-        })
     }
 }
 

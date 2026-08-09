@@ -493,13 +493,6 @@ where
         super::serving::load_change_records(&self.read, ids).await
     }
 
-    pub(crate) async fn scan_state_rows_at_commit(
-        &self,
-        commit_id: crate::changelog::CommitId,
-    ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
-        super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
-    }
-
     pub(crate) async fn diff_state_rows_between_commits(
         &self,
         before: crate::changelog::CommitId,
@@ -675,7 +668,6 @@ where
                     updated_at: value.updated_at,
                     change_id: value.change_id,
                     commit_id: value.commit_id,
-                    blob_manifest_object_ids: value.blob_manifest_object_ids,
                 }
             }));
         }
@@ -1440,7 +1432,6 @@ mod tests {
             snapshot_content: snapshot_content.map(Into::into),
             metadata: None,
             deleted,
-            blob_manifest_object_ids: Vec::new(),
         }
     }
 
