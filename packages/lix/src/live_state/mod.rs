@@ -15,13 +15,15 @@ pub(crate) use forktree_reader::{
 pub(crate) use reader::load_exact_batch_via_scan_for_test;
 #[allow(unused_imports)]
 pub(crate) use reader::{LiveStateReadDomain, LiveStateReader};
+#[cfg(test)]
+pub(crate) use types::LiveStateRowRequest;
 #[allow(unused_imports)]
 pub(crate) use types::{
     Bound, CertifiedCurrentStatePredecessor, LiveStateExactBatchRequest, LiveStateExactRowRequest,
     LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentityRef,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef, ScanConstraint, ScanField, ScanOperator,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    ScanConstraint, ScanField, ScanOperator,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{
