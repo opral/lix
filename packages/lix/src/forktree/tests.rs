@@ -1716,10 +1716,146 @@ async fn coherent_open_defers_ref_target_authentication_until_visited() {
     seed.branch_selector.selector_generation += 1;
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
-    let view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("bounded open authenticates only selected root envelopes");
-    assert!(load_change(&view, bad_ref.change_id()).await.is_err());
+    assert!(
+        open_coherent_view(&storage, seed.branch_id).await.is_err(),
+        "coherent open must reject a latest RefChange whose authenticated target is malformed"
+    );
+}
+
+#[tokio::test]
+async fn coherent_open_requires_latest_ref_change_catalog_owner() {
+    let mut orphan = build_seed();
+    let semantic_change_id = orphan.semantic_change_id;
+    let semantic_change_object_id = orphan.semantic_change_object_id;
+    let commit_id = orphan.commit_id;
+    let commit_object_id = orphan.commit_object_id;
+    let ref_change_id = orphan.ref_change_id;
+    let ref_change_object_id = orphan.ref_change_object_id;
+    let branch_id = orphan.branch_id;
+    replace_selected_history_graph(
+        &mut orphan,
+        &[(commit_id, CommitCatalogEntry { commit_object_id })],
+        &[(
+            semantic_change_id,
+            ChangeCatalogEntry {
+                change_object_id: semantic_change_object_id,
+                owner: ChangeCatalogOwner::CommitMember {
+                    commit_object_id,
+                    ordinal: 0,
+                },
+            },
+        )],
+        commit_object_id,
+        ref_change_object_id,
+    );
+    let storage = Memory::new();
+    seed_storage(&storage, &orphan).await;
+    assert!(
+        open_coherent_view(&storage, branch_id).await.is_err(),
+        "a missing ChangeCatalog entry for the selected RefChange must fail at open"
+    );
+
+    let mut substituted = build_seed();
+    let alternate_ref = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0x44)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        branch_id: substituted.branch_id,
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(substituted.commit_object_id),
+        previous_ref_change_object_id: None,
+        payload: b"substituted ref".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (alternate_ref_object_id, alternate_ref_bytes) =
+        alternate_ref.encode().expect("alternate ref");
+    substituted
+        .objects
+        .insert(alternate_ref_object_id, alternate_ref_bytes)
+        .expect("alternate ref object");
+    let semantic_change_id = substituted.semantic_change_id;
+    let semantic_change_object_id = substituted.semantic_change_object_id;
+    let commit_id = substituted.commit_id;
+    let commit_object_id = substituted.commit_object_id;
+    let ref_change_id = substituted.ref_change_id;
+    let ref_change_object_id = substituted.ref_change_object_id;
+    let branch_id = substituted.branch_id;
+    replace_selected_history_graph(
+        &mut substituted,
+        &[(commit_id, CommitCatalogEntry { commit_object_id })],
+        &[
+            (
+                semantic_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: semantic_change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: 0,
+                    },
+                },
+            ),
+            (
+                ref_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: alternate_ref_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: alternate_ref_object_id,
+                        branch_id,
+                    },
+                },
+            ),
+        ],
+        commit_object_id,
+        ref_change_object_id,
+    );
+    let storage = Memory::new();
+    seed_storage(&storage, &substituted).await;
+    assert!(
+        open_coherent_view(&storage, branch_id).await.is_err(),
+        "a substituted ChangeCatalog object must fail at open"
+    );
+
+    let mut wrong_owner = build_seed();
+    let semantic_change_id = wrong_owner.semantic_change_id;
+    let semantic_change_object_id = wrong_owner.semantic_change_object_id;
+    let commit_id = wrong_owner.commit_id;
+    let commit_object_id = wrong_owner.commit_object_id;
+    let ref_change_id = wrong_owner.ref_change_id;
+    let ref_change_object_id = wrong_owner.ref_change_object_id;
+    let branch_id = wrong_owner.branch_id;
+    replace_selected_history_graph(
+        &mut wrong_owner,
+        &[(commit_id, CommitCatalogEntry { commit_object_id })],
+        &[
+            (
+                semantic_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: semantic_change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: 0,
+                    },
+                },
+            ),
+            (
+                ref_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: ref_change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: 0,
+                    },
+                },
+            ),
+        ],
+        commit_object_id,
+        ref_change_object_id,
+    );
+    let storage = Memory::new();
+    seed_storage(&storage, &wrong_owner).await;
+    assert!(
+        open_coherent_view(&storage, branch_id).await.is_err(),
+        "a non-BranchRef ChangeCatalog owner must fail at open"
+    );
 }
 
 #[tokio::test]
