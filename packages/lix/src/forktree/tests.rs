@@ -33,19 +33,19 @@ use super::tree::{
 use super::view::SELECTOR_SPACE;
 use super::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,
-    BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage,
+    BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, CanonicalUploadId,
     ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView,
-    CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, ForkTreeReadFacade, GcBudget,
-    GcStepStatus, GlobalSelectorV1, ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT,
-    RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot, RepositoryRootV1,
-    SelectorExpectation, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
-    StateCell, StateCellRef, StateKey, StateKeyRef, StateSource, StateTreeMutation, StateValueRef,
-    UNTRACKED_ROW_SPACE, UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree,
-    encode_state_key, encode_state_value, load_change, load_commit, load_commit_member_records,
-    load_commit_summary, load_commit_topologies, open_coherent_view, page_changes, page_commits,
-    prepare_upload_completion, prepare_upload_part, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_points, state_range,
+    CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, CommitTopologyReader,
+    ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId, PreparedPublication,
+    RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
+    RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1,
+    SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef, StateSource,
+    StateTreeMutation, StateValueRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, UploadBindingRef,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
+    advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_commit,
+    load_commit_member_records, load_commit_summary, open_coherent_view, prepare_upload_completion,
+    prepare_upload_part, put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    state_points, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -1196,76 +1196,6 @@ fn catalogs_use_one_raw_uuid_tree_and_fail_closed_on_owner_mismatch() {
     );
 }
 
-#[tokio::test]
-async fn path_copy_catalog_put_and_view_bound_resume_are_bounded() {
-    let seed = build_seed();
-    let storage = Memory::new();
-    seed_storage(&storage, &seed).await;
-    let view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("view");
-    let old_token = page_commits(&view, None, 1)
-        .await
-        .expect("first page")
-        .resume_token
-        .expect("resume token");
-    let state_edit = edit_state_tree(
-        view.branch_snapshot().local_state_root,
-        Vec::new(),
-        view.test_storage_read(),
-    )
-    .await
-    .expect("no-op state edit");
-    let transition = branch_transition(&view, state_edit, 0x60).await;
-    assert!(transition.commit_catalog_edit.copied_nodes() <= 2);
-    assert_eq!(transition.commit_catalog_edit.entry_count(), 2);
-    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
-    publication
-        .publish_state_transition(&view, transition)
-        .await
-        .expect("typed transition");
-    drop(view);
-    commit_publication_for_test(publication, &storage)
-        .await
-        .expect("commit transition");
-    let reopened = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("reopen");
-    assert!(matches!(
-        page_commits(&reopened, Some(&old_token), 1).await,
-        Err(StorageError::InvalidCursor)
-    ));
-    let first: CatalogPage<(CommitId, CommitObjectV1)> =
-        page_commits(&reopened, None, 1).await.expect("page one");
-    let second = page_commits(&reopened, first.resume_token.as_deref(), 1)
-        .await
-        .expect("page two");
-    assert_eq!(first.entries.len(), 1);
-    assert_eq!(second.entries.len(), 1);
-    assert_eq!(
-        load_commit(&reopened, CommitId::from_bytes(raw_id(0x60)))
-            .await
-            .expect("load")
-            .expect("new commit")
-            .commit_id,
-        CommitId::from_bytes(raw_id(0x60))
-    );
-    assert!(
-        load_change(&reopened, ChangeId::from_bytes(raw_id(0x61)))
-            .await
-            .expect("change")
-            .is_some()
-    );
-    assert_eq!(
-        page_changes(&reopened, None, 2)
-            .await
-            .expect("changes")
-            .entries
-            .len(),
-        2
-    );
-}
-
 #[derive(Clone)]
 struct CountingStorage {
     inner: Memory,
@@ -1492,15 +1422,6 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
         .await
         .expect("open");
     assert_eq!(storage.begin_reads.load(Ordering::Relaxed), 1);
-    let token = view.bind_resume_key(
-        view.repository_root().change_catalog_root,
-        seed.semantic_change_id.as_bytes(),
-    );
-    assert_eq!(
-        view.validate_resume_key(view.repository_root().change_catalog_root, &token)
-            .expect("token"),
-        seed.semantic_change_id.as_bytes()
-    );
     drop(view);
 
     let read = StorageAdapterReadScope::new(
@@ -1524,7 +1445,11 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("bounded open does not traverse an unrelated catalog member");
-    assert!(load_change(&view, seed.semantic_change_id).await.is_err());
+    assert!(
+        view.load_object_bytes(seed.semantic_change_object_id)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1831,10 +1756,13 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
             .await
             .expect("post-corruption read"),
     );
+    let mut topology_reader = CommitTopologyReader::new(&read);
     assert!(
-        load_commit_topologies(&read, &[public_commit_id(0x52), public_commit_id(0x53)],)
+        topology_reader
+            .load(&[public_commit_id(0x52), public_commit_id(0x53)])
             .await
             .expect("member corruption remains latent for sibling topology")
+            .requested
             .into_iter()
             .all(|topology| topology.is_some())
     );
@@ -2720,7 +2648,7 @@ async fn publication_cancels_active_gc_without_becoming_a_global_writer_lock() {
 }
 
 #[tokio::test]
-async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
+async fn deterministic_reader_pin_safe_point_and_reclamation_oracle() {
     let seed = build_seed();
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
@@ -2746,8 +2674,6 @@ async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
     let old_view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("old coherent view");
-    let old_catalog_root = old_view.repository_root().change_catalog_root;
-    let old_resume = old_view.bind_resume_key(old_catalog_root, seed.semantic_change_id.as_bytes());
     assert!(old_view.load_object_bytes(target_id).await.is_ok());
 
     let current = open_coherent_view(&storage, seed.branch_id)
@@ -2812,19 +2738,9 @@ async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
         old_view.load_object_bytes(target_id).await.is_ok(),
         "the retained StorageRead must continue to authenticate its old object version"
     );
-    assert_eq!(
-        old_view
-            .validate_resume_key(old_catalog_root, &old_resume)
-            .expect("old cursor"),
-        seed.semantic_change_id.as_bytes()
-    );
     let new_view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("new coherent view");
-    assert!(matches!(
-        new_view.validate_resume_key(old_catalog_root, &old_resume),
-        Err(StorageError::InvalidCursor)
-    ));
     drop(new_view);
     drop(old_view);
 

@@ -22,7 +22,7 @@ use super::tree::{
     apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
     scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
 };
-use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
+use super::view::{CoherentView, SELECTOR_SPACE};
 
 const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
@@ -158,27 +158,9 @@ impl StateTreeEdit {
 pub(crate) struct CatalogTreeEdit {
     pub(super) base_root: ObjectId,
     pub(crate) root: ObjectId,
-    entry_count: u64,
-    copied_nodes: usize,
     pub(crate) commit_entries: BTreeMap<CommitId, CommitCatalogEntry>,
     pub(crate) change_entries: BTreeMap<ChangeId, ChangeCatalogEntry>,
     pub(super) objects: ImmutableObjectSet,
-}
-
-impl CatalogTreeEdit {
-    pub(crate) fn entry_count(&self) -> u64 {
-        self.entry_count
-    }
-
-    pub(crate) fn copied_nodes(&self) -> usize {
-        self.copied_nodes
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CatalogPage<T> {
-    pub(crate) entries: Vec<T>,
-    pub(crate) resume_token: Option<Vec<u8>>,
 }
 
 /// The complete authenticated input required by commit-DAG algorithms. It
@@ -240,24 +222,6 @@ where
     }
 }
 
-/// Loads one authenticated moving branch head through the ForkTree selector
-/// owner. Missing selectors are ordinary branch absence; malformed selectors,
-/// snapshots, and selected commit edges fail closed.
-pub(crate) async fn load_branch_head<R>(
-    read: &R,
-    branch_id: &str,
-) -> Result<Option<crate::changelog::CommitId>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let requested = [branch_id.to_string()];
-    Ok(load_branch_heads_with_metadata(read, Some(&requested))
-        .await?
-        .into_iter()
-        .next()
-        .map(|row| row.head_commit_id))
-}
-
 /// One authenticated branch result returned by the selector/control-plane
 /// batch. The head, RefChange identity, and timestamp are all derived from
 /// the same retained read and validated against the same branch snapshot.
@@ -267,46 +231,6 @@ pub(crate) struct AuthenticatedBranchHead {
     pub(crate) head_commit_id: crate::changelog::CommitId,
     pub(crate) change_id: crate::changelog::ChangeId,
     pub(crate) updated_at: LixTimestamp,
-}
-
-/// Loads the authenticated semantic identity of a moving branch selector.
-/// The identity is the latest RefChange object named by the selected snapshot;
-/// no head-only live-state projection can manufacture it.
-pub(crate) async fn load_branch_ref_metadata<R>(
-    read: &R,
-    branch_id: &str,
-) -> Result<crate::branch::BranchRefMetadata, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let branch_id = canonical_branch_id(branch_id)?;
-    let view = open_coherent_view_on_read(read, branch_id).await?;
-    let ChangeObjectV1::BranchRef {
-        change_id,
-        updated_at,
-        ..
-    } = view.latest_ref_change()
-    else {
-        return Err(
-            corruption("branch snapshot latest RefChange edge names a semantic Change").into(),
-        );
-    };
-    Ok(crate::branch::BranchRefMetadata {
-        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
-        updated_at: updated_at.clone(),
-    })
-}
-
-pub(crate) async fn load_branch_ref_change_id<R>(
-    read: &R,
-    branch_id: &str,
-) -> Result<Option<crate::changelog::ChangeId>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    Ok(Some(
-        load_branch_ref_metadata(read, branch_id).await?.change_id,
-    ))
 }
 
 /// Loads selected branch heads and their authenticated RefChange metadata in
@@ -602,20 +526,6 @@ where
         .collect())
 }
 
-/// Scans every authenticated branch selector and returns only head IDs.
-pub(crate) async fn scan_branch_heads<R>(
-    read: &R,
-) -> Result<Vec<(String, crate::changelog::CommitId)>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    Ok(load_branch_heads_with_metadata(read, None)
-        .await?
-        .into_iter()
-        .map(|row| (row.branch_id, row.head_commit_id))
-        .collect())
-}
-
 fn canonical_branch_id(branch_id: &str) -> Result<CanonicalBranchId, crate::LixError> {
     let id = uuid::Uuid::parse_str(branch_id).map_err(|error| {
         crate::LixError::new(
@@ -850,20 +760,6 @@ where
         records.push(semantic_commit_record(commit, &topology)?);
     }
     Ok(records)
-}
-
-/// Loads exact authenticated commit-DAG topology and nothing else. No Change
-/// object, ChangeCatalog entry, member payload, or semantic Commit metadata is
-/// decoded by this path.
-pub(crate) async fn load_commit_topologies<R>(
-    read: &R,
-    ids: &[crate::changelog::CommitId],
-) -> Result<Vec<Option<CommitTopology>>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let mut reader = CommitTopologyReader::new(read);
-    Ok(reader.load(ids).await?.requested)
 }
 
 /// Loads one exact topology batch through one retained StorageRead. Requested
@@ -2360,105 +2256,6 @@ where
         .await?;
     Ok(Some(commit))
 }
-pub(crate) async fn load_change<R>(
-    view: &CoherentView<R>,
-    id: ChangeId,
-) -> Result<Option<ChangeObjectV1>, StorageError>
-where
-    R: StorageAdapterRead,
-{
-    let Some(value) = view
-        .lookup_tree_value(
-            view.repository_root().change_catalog_root,
-            "change",
-            id.as_bytes(),
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    let entry = ChangeCatalogEntry::decode(&value)?;
-    validate_change_entry(view, id, entry).await.map(Some)
-}
-
-pub(crate) async fn page_commits<R>(
-    view: &CoherentView<R>,
-    resume_token: Option<&[u8]>,
-    page_size: usize,
-) -> Result<CatalogPage<(CommitId, CommitObjectV1)>, StorageError>
-where
-    R: StorageAdapterRead,
-{
-    let root = view.repository_root().commit_catalog_root;
-    let start_after = resume_token
-        .map(|token| view.validate_resume_key(root, token))
-        .transpose()?;
-    let rows = view
-        .scan_tree_page(root, "commit", start_after.as_deref(), page_size)
-        .await?;
-    let mut entries = Vec::with_capacity(rows.len());
-    for (key, value) in &rows {
-        let id = CommitId::from_bytes(
-            key.as_slice()
-                .try_into()
-                .map_err(|_| corruption("CommitCatalog key is not a raw UUID"))?,
-        );
-        let entry = CommitCatalogEntry::decode(value)?;
-        let bytes = view.load_object_bytes(entry.commit_object_id).await?;
-        let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
-        if commit.commit_id != id {
-            return Err(corruption(
-                "CommitCatalog page has a mismatched key/object ID",
-            ));
-        }
-        view.validate_retained_commit(
-            view.repository_root().commit_catalog_root,
-            view.repository_root().change_catalog_root,
-            entry.commit_object_id,
-            &commit,
-        )
-        .await?;
-        entries.push((id, commit));
-    }
-    Ok(CatalogPage {
-        resume_token: (rows.len() == page_size)
-            .then(|| view.bind_resume_key(root, &rows[rows.len() - 1].0)),
-        entries,
-    })
-}
-
-pub(crate) async fn page_changes<R>(
-    view: &CoherentView<R>,
-    resume_token: Option<&[u8]>,
-    page_size: usize,
-) -> Result<CatalogPage<(ChangeId, ChangeObjectV1)>, StorageError>
-where
-    R: StorageAdapterRead,
-{
-    let root = view.repository_root().change_catalog_root;
-    let start_after = resume_token
-        .map(|token| view.validate_resume_key(root, token))
-        .transpose()?;
-    let rows = view
-        .scan_tree_page(root, "change", start_after.as_deref(), page_size)
-        .await?;
-    let mut entries = Vec::with_capacity(rows.len());
-    for (key, value) in &rows {
-        let id = ChangeId::from_bytes(
-            key.as_slice()
-                .try_into()
-                .map_err(|_| corruption("ChangeCatalog key is not a raw UUID"))?,
-        );
-        let entry = ChangeCatalogEntry::decode(value)?;
-        entries.push((id, validate_change_entry(view, id, entry).await?));
-    }
-    Ok(CatalogPage {
-        resume_token: (rows.len() == page_size)
-            .then(|| view.bind_resume_key(root, &rows[rows.len() - 1].0)),
-        entries,
-    })
-}
-
 async fn edit_catalog<R>(
     root: ObjectId,
     kind: &'static str,
@@ -2478,68 +2275,10 @@ where
     Ok(CatalogTreeEdit {
         base_root: root.object_id,
         root: edit.root.object_id,
-        entry_count: edit.root.entry_count,
-        copied_nodes: edit.copied_nodes,
         commit_entries: BTreeMap::new(),
         change_entries: BTreeMap::new(),
         objects: edit.objects,
     })
-}
-
-async fn validate_change_entry<R>(
-    view: &CoherentView<R>,
-    id: ChangeId,
-    entry: ChangeCatalogEntry,
-) -> Result<ChangeObjectV1, StorageError>
-where
-    R: StorageAdapterRead,
-{
-    let bytes = view.load_object_bytes(entry.change_object_id).await?;
-    let change = ChangeObjectV1::decode(entry.change_object_id, &bytes)?;
-    if change.change_id() != id {
-        return Err(corruption(
-            "ChangeCatalog key does not match embedded ChangeId",
-        ));
-    }
-    match (entry.owner, &change) {
-        (
-            ChangeCatalogOwner::CommitMember {
-                commit_object_id,
-                ordinal,
-            },
-            ChangeObjectV1::Semantic { .. },
-        ) => {
-            let bytes = view.load_object_bytes(commit_object_id).await?;
-            let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            let members = view.load_commit_members(&commit).await?;
-            if members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(entry.change_object_id))
-            {
-                return Err(corruption(
-                    "ChangeCatalog commit owner does not point back at its ordinal member",
-                ));
-            }
-        }
-        (
-            ChangeCatalogOwner::BranchRef {
-                ref_change_object_id,
-                branch_id,
-            },
-            ChangeObjectV1::BranchRef {
-                branch_id: object_branch,
-                ..
-            },
-        ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {
-            view.validate_retained_ref_change(
-                view.repository_root().change_catalog_root,
-                entry.change_object_id,
-                &change,
-            )
-            .await?;
-        }
-        _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid")),
-    }
-    Ok(change)
 }
 
 /// Authenticates the immediate retained-history edges of one visited commit.

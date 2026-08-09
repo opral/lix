@@ -41,8 +41,6 @@ pub(crate) struct CoherentView<R> {
     branch_selector: BranchSelectorV1,
     repository_root: RepositoryRootV1,
     branch_snapshot: BranchSnapshotV1,
-    semantic_head_commit: CommitObjectV1,
-    latest_ref_change: ChangeObjectV1,
     view_id: [u8; 32],
     view_instance_id: u64,
 }
@@ -85,17 +83,6 @@ where
 
     pub(crate) fn branch_snapshot(&self) -> BranchSnapshotV1 {
         self.branch_snapshot
-    }
-
-    pub(crate) fn semantic_head_commit(&self) -> &CommitObjectV1 {
-        &self.semantic_head_commit
-    }
-
-    /// Returns the RefChange authenticated from the selected snapshot while
-    /// opening this view. Callers must reuse it instead of reloading the
-    /// latest-ref object through a second metadata path.
-    pub(crate) fn latest_ref_change(&self) -> &ChangeObjectV1 {
-        &self.latest_ref_change
     }
 
     #[cfg(test)]
@@ -409,43 +396,6 @@ where
         Ok(rows)
     }
 
-    pub(crate) fn bind_resume_key(&self, catalog_root: ObjectId, last_key: &[u8]) -> Vec<u8> {
-        let mut encoder = Encoder::with_prefix(b"LIXFTR\0\x01");
-        encoder.fixed(&self.view_id);
-        encoder.fixed(self.global_selector.repository_root.as_bytes());
-        encoder.fixed(catalog_root.as_bytes());
-        encoder
-            .bytes(last_key)
-            .expect("storage keys necessarily fit the canonical u32 envelope");
-        let mut token = encoder.into_vec();
-        token.extend_from_slice(&keyed_hash("lix forktree resume token v1", &token));
-        token
-    }
-
-    pub(crate) fn validate_resume_key(
-        &self,
-        catalog_root: ObjectId,
-        token: &[u8],
-    ) -> Result<Vec<u8>, StorageError> {
-        let checksum_offset = token
-            .len()
-            .checked_sub(32)
-            .ok_or_else(|| corruption("resume token is shorter than its checksum"))?;
-        let (body, checksum) = token.split_at(checksum_offset);
-        if keyed_hash("lix forktree resume token v1", body).as_slice() != checksum {
-            return Err(StorageError::InvalidCursor);
-        }
-        let mut decoder = super::codec::Decoder::after_prefix(body, b"LIXFTR\0\x01")?;
-        if decoder.fixed::<32>()? != self.view_id
-            || decoder.fixed::<32>()? != *self.global_selector.repository_root.as_bytes()
-            || decoder.fixed::<32>()? != *catalog_root.as_bytes()
-        {
-            return Err(StorageError::InvalidCursor);
-        }
-        let last_key = decoder.bytes("resume key")?;
-        decoder.finish()?;
-        Ok(last_key)
-    }
     pub(crate) async fn load_object_bytes(&self, id: ObjectId) -> Result<Bytes, StorageError> {
         load_object_bytes(&self.read, id).await
     }
@@ -628,21 +578,6 @@ where
             .await
     }
 
-    pub(crate) async fn validate_retained_ref_change(
-        &self,
-        change_catalog_root: ObjectId,
-        ref_object_id: ObjectId,
-        change: &ChangeObjectV1,
-    ) -> Result<(), StorageError> {
-        super::serving::validate_retained_ref_change(
-            &self.read,
-            change_catalog_root,
-            ref_object_id,
-            change,
-        )
-        .await
-    }
-
     pub(crate) async fn state_range_at_roots(
         &self,
         global_root: ObjectId,
@@ -768,8 +703,6 @@ where
                 .await
                 .map_err(crate::LixError::from)?;
         let _view_identity = view.view_id();
-        let _resume_identity_validator = CoherentView::<&R>::validate_resume_key;
-        let _ = _resume_identity_validator;
         Ok(view)
     }
 
@@ -1388,7 +1321,7 @@ where
             "branch snapshot does not match the selected branch id",
         ));
     }
-    let (semantic_head_commit, latest_ref_change) = authenticate_selected_graph(
+    authenticate_selected_graph(
         &read,
         global_selector.repository_root,
         branch_selector.branch_snapshot_object_id,
@@ -1411,8 +1344,6 @@ where
         branch_selector,
         repository_root,
         branch_snapshot,
-        semantic_head_commit,
-        latest_ref_change,
         view_id,
         view_instance_id,
     })
@@ -1444,7 +1375,7 @@ async fn authenticate_selected_graph<R>(
     _branch_snapshot_id: ObjectId,
     repository: RepositoryRootV1,
     branch: BranchSnapshotV1,
-) -> Result<(CommitObjectV1, ChangeObjectV1), StorageError>
+) -> Result<(), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1521,7 +1452,7 @@ where
         &change,
     )
     .await?;
-    Ok((head, change))
+    Ok(())
 }
 
 pub(super) async fn load_object_map<R>(
