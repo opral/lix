@@ -97,6 +97,19 @@ pub(crate) trait LiveStateReader: Send + Sync {
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError>;
 
+    /// Checks a derived commit identity through the authenticated commit-graph
+    /// owner when constraint validation needs to resolve a branch reference.
+    /// Readers without that owner conservatively report absence.
+    async fn has_committed_commit(&self, _commit_id: &str) -> Result<bool, LixError> {
+        Ok(false)
+    }
+
+    /// Checks a derived branch-reference identity through the authenticated
+    /// selector owner when constraint validation needs to resolve a ref row.
+    async fn has_committed_branch_ref(&self, _branch_id: &str) -> Result<bool, LixError> {
+        Ok(false)
+    }
+
     /// Loads collection control from this reader's coherent storage snapshot.
     ///
     /// Readers without a published tracked-head projection conservatively

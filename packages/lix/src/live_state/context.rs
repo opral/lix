@@ -4,6 +4,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 #[cfg(test)]
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
+use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphContext;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
@@ -229,6 +230,18 @@ where
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         Self::load_exact_batch(self, request).await
+    }
+
+    async fn has_committed_commit(&self, commit_id: &str) -> Result<bool, LixError> {
+        let commit_id = CommitId::parse_lix(commit_id, "lix_commit foreign-key target")?;
+        let mut reader = self.commit_graph.reader(&self.store);
+        Ok(reader.load_node(&commit_id).await?.is_some())
+    }
+
+    async fn has_committed_branch_ref(&self, branch_id: &str) -> Result<bool, LixError> {
+        Ok(crate::forktree::load_branch_head(&self.store, branch_id)
+            .await?
+            .is_some())
     }
 
     async fn collection_generation(

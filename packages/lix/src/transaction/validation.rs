@@ -54,6 +54,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 
@@ -1525,6 +1526,37 @@ where
             first.row.untracked,
             first.row.file_id.map(ToString::to_string),
         );
+        if first.row.schema_key == BRANCH_REF_SCHEMA_KEY {
+            for insert in group {
+                let branch_id = insert.row.entity_pk.as_single_string_owned()?;
+                let identity = DomainRowIdentity::in_domain(
+                    domain.clone(),
+                    BRANCH_REF_SCHEMA_KEY,
+                    insert.row.entity_pk.clone(),
+                );
+                if pending_constraints
+                    .is_some_and(|pending| pending.tombstones_target_identity(&identity))
+                {
+                    continue;
+                }
+                if live_state.has_committed_branch_ref(&branch_id).await? {
+                    return Err(with_insert_statement_index(
+                        LixError::new(
+                            LixError::CODE_UNIQUE,
+                            duplicate_insert_identity_message(
+                                insert.row.schema_key,
+                                insert.row.entity_pk,
+                                None,
+                                insert.origin,
+                            ),
+                        ),
+                        insert.statement_index,
+                    ));
+                }
+            }
+            group_start = group_end;
+            continue;
+        }
         let entity_pks = group
             .iter()
             .map(|insert| insert.row.entity_pk.clone())
@@ -2562,6 +2594,34 @@ async fn validate_committed_normal_delete_restriction_batches(
     >,
 ) -> Result<(), LixError> {
     for (batch, tombstones_by_value) in batches {
+        if batch.source_key.schema_key == BRANCH_REF_SCHEMA_KEY {
+            // Branch refs are ForkTree selector-owned moving pointers, not
+            // live-state scan rows.  Deleting a branch descriptor normally
+            // stages the matching ref tombstone in the same transaction;
+            // validate that exact identity instead of asking the current
+            // reader to scan a derived schema.
+            for tombstone in tombstones_by_value.values().flatten() {
+                let branch_id = tombstone.entity_pk().as_single_string_owned()?;
+                let ref_identity = DomainRowIdentity::in_domain(
+                    Domain::exact_file(crate::GLOBAL_BRANCH_ID, true, None),
+                    BRANCH_REF_SCHEMA_KEY,
+                    tombstone.entity_pk_owned(),
+                );
+                if pending_constraints.tombstones_target_identity(&ref_identity) {
+                    continue;
+                }
+                if live_state.has_committed_branch_ref(&branch_id).await? {
+                    return Err(LixError::new(
+                        LixError::CODE_FOREIGN_KEY,
+                        format!(
+                            "cannot delete branch descriptor '{}' while its ForkTree branch selector remains live",
+                            branch_id
+                        ),
+                    ));
+                }
+            }
+            continue;
+        }
         let rows = scan_committed_constraint_rows(
             live_state,
             &batch.source_domain,
@@ -2901,6 +2961,24 @@ async fn committed_normal_foreign_key_target_exists(
     let entity_pks: Vec<EntityPk> = primary_key_entity_pk_for_target(schema_catalog, target)
         .into_iter()
         .collect();
+    if target.schema_key == COMMIT_SCHEMA_KEY {
+        let Some(commit_id) = entity_pks
+            .first()
+            .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
+        else {
+            return Ok(false);
+        };
+        return live_state.has_committed_commit(&commit_id).await;
+    }
+    if target.schema_key == BRANCH_REF_SCHEMA_KEY {
+        let Some(branch_id) = entity_pks
+            .first()
+            .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
+        else {
+            return Ok(false);
+        };
+        return live_state.has_committed_branch_ref(&branch_id).await;
+    }
     for domain in target.domain.fk_target_domains() {
         let rows = scan_committed_constraint_rows(
             live_state,
