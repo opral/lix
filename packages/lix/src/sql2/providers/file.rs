@@ -8871,6 +8871,7 @@ mod tests {
         blob_rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<TransactionWrite>,
         scan_requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+        exact_load_requests: Arc<Mutex<Vec<LiveStateExactBatchRequest>>>,
         path_index_requests: Arc<AtomicUsize>,
     }
 
@@ -9131,6 +9132,10 @@ mod tests {
             &mut self,
             request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            self.exact_load_requests
+                .lock()
+                .expect("exact request mutex should not be poisoned")
+                .push(request.clone());
             Ok(
                 crate::live_state::MaterializedLiveStateExactBatch::from_rows(
                     request
@@ -9143,6 +9148,9 @@ mod tests {
                                     row.schema_key == requested.schema_key
                                         && row.entity_pk == requested.entity_pk
                                         && row.file_id == requested.file_id
+                                        && request
+                                            .untracked
+                                            .is_none_or(|untracked| row.untracked == untracked)
                                         && row.branch_id.as_ref() == requested.branch_id.as_str()
                                 })
                                 .cloned()
@@ -11926,9 +11934,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_file_content_update_uses_path_index_and_target_blob_scan() {
+    async fn fast_file_content_update_uses_path_index_and_exact_blob_read() {
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let scan_requests = Arc::new(Mutex::new(Vec::new()));
+        let exact_load_requests = Arc::new(Mutex::new(Vec::new()));
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_directory_row(
@@ -11956,6 +11965,7 @@ mod tests {
             )],
             writes: Vec::new(),
             scan_requests: Arc::clone(&scan_requests),
+            exact_load_requests: Arc::clone(&exact_load_requests),
             path_index_requests: Arc::clone(&path_index_requests),
         };
 
@@ -11973,14 +11983,21 @@ mod tests {
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         {
             let requests = scan_requests.lock().expect("scan request mutex");
+            assert!(requests.is_empty());
+        }
+        {
+            let requests = exact_load_requests.lock().expect("exact request mutex");
             assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].rows.len(), 1);
+            assert_eq!(requests[0].untracked, Some(false));
+            assert_eq!(requests[0].rows[0].schema_key, super::BLOB_REF_SCHEMA_KEY);
             assert_eq!(
-                requests[0].filter.schema_keys,
-                vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+                requests[0].rows[0].entity_pk,
+                uuid_pk("01920000-0000-7000-8000-0000000000d2")
             );
             assert_eq!(
-                requests[0].filter.entity_pks,
-                vec![uuid_pk("01920000-0000-7000-8000-0000000000d2")]
+                requests[0].rows[0].file_id.as_deref(),
+                Some("01920000-0000-7000-8000-0000000000d2")
             );
         }
 
