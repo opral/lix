@@ -15,7 +15,7 @@ use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
     BlobChunkV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry,
     ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, branch_selector_key, global_selector_key,
+    HotObjectPackV1, RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 
@@ -26,6 +26,80 @@ pub(super) const SELECTOR_SPACE: crate::storage::StorageSpace =
         crate::storage::ValueSemantics::Mutable,
     );
 
+pub(crate) struct PackedRead<'a, R: ?Sized> {
+    read: &'a R,
+    objects: &'a BTreeMap<ObjectId, Bytes>,
+    pack_id: ObjectId,
+}
+
+impl<'a, R: ?Sized> StorageAdapterRead for PackedRead<'a, R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.read.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<crate::storage::GetManyResult, StorageError>> + Send {
+        async move {
+            let has_objects = requests.iter().any(|request| request.space == OBJECT_SPACE);
+            if has_objects {
+                if requests.iter().any(|request| request.space != OBJECT_SPACE) {
+                    return Err(corruption(
+                        "hot pack read mixed object and non-object spaces",
+                    ));
+                }
+                let mut values = Vec::new();
+                for request in requests {
+                    for key in request.keys {
+                        let id =
+                            ObjectId::from_bytes(key.0.as_ref().try_into().map_err(|_| {
+                                corruption("hot pack object key has the wrong length")
+                            })?);
+                        let bytes = if let Some(bytes) = self.objects.get(&id) {
+                            bytes.clone()
+                        } else {
+                            let canonical = load_object_bytes(self.read, id).await?;
+                            let domain = super::object::authenticate_object_domain(id, &canonical)?;
+                            if super::object::hot_packable_object(id, &canonical)? {
+                                return Err(corruption(format!(
+                                    "hot pack object {id} is absent for authenticated domain {domain:?} (pack={}, entries={})",
+                                    self.pack_id,
+                                    self.objects.len(),
+                                )));
+                            }
+                            canonical
+                        };
+                        values.push(match request.opts.projection {
+                            CoreProjection::KeyOnly => Some(ProjectedValue::KeyOnly),
+                            CoreProjection::FullValue => Some(ProjectedValue::FullValue(bytes)),
+                        });
+                    }
+                }
+                return Ok(crate::storage::GetManyResult { values });
+            }
+            self.read.get_many(requests).await
+        }
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        async move {
+            if space == OBJECT_SPACE {
+                return Err(corruption("hot pack object scans are not supported"));
+            }
+            self.read.begin_scan(space, range, opts).await
+        }
+    }
+}
+
 const VIEW_ID_DOMAIN: &str = "lix forktree coherent selector view v1";
 static NEXT_VIEW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -34,6 +108,7 @@ static NEXT_VIEW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// catalog traversal, so a caller cannot silently refresh either selector.
 pub(crate) struct CoherentView<R> {
     read: R,
+    hot_objects: BTreeMap<ObjectId, Bytes>,
     branch_id: CanonicalBranchId,
     raw_global_selector: Bytes,
     raw_branch_selector: Bytes,
@@ -85,8 +160,24 @@ where
         self.branch_snapshot
     }
 
+    pub(crate) fn hot_pack_object_id(&self) -> ObjectId {
+        self.branch_snapshot.hot_pack_object_id
+    }
+
+    fn packed_read(&self) -> PackedRead<'_, R> {
+        PackedRead {
+            read: &self.read,
+            objects: &self.hot_objects,
+            pack_id: self.branch_snapshot.hot_pack_object_id,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_storage_read(&self) -> &R {
+        &self.read
+    }
+
+    pub(super) fn operation_read(&self) -> &R {
         &self.read
     }
 
@@ -107,7 +198,8 @@ where
         root: ObjectId,
         mutations: Vec<super::serving::StateTreeMutation>,
     ) -> Result<super::serving::StateTreeEdit, StorageError> {
-        super::serving::edit_state_tree(root, mutations, &self.read).await
+        let read = self.packed_read();
+        super::serving::edit_state_tree(root, mutations, &read).await
     }
 
     /// Applies ordered intermediate state edits while retaining the same
@@ -117,7 +209,8 @@ where
         root: ObjectId,
         mutation_batches: Vec<Vec<super::serving::StateTreeMutation>>,
     ) -> Result<Vec<super::serving::StateTreeEdit>, StorageError> {
-        super::serving::edit_state_tree_sequence(root, mutation_batches, &self.read).await
+        let read = self.packed_read();
+        super::serving::edit_state_tree_sequence(root, mutation_batches, &read).await
     }
 
     pub(crate) async fn put_commit_catalog_entries(
@@ -125,7 +218,8 @@ where
         root: ObjectId,
         entries: &[(CommitId, CommitCatalogEntry)],
     ) -> Result<super::serving::CatalogTreeEdit, StorageError> {
-        super::serving::put_commit_catalog_entries(root, entries, &self.read).await
+        let read = self.packed_read();
+        super::serving::put_commit_catalog_entries(root, entries, &read).await
     }
 
     pub(crate) async fn put_change_catalog_entries(
@@ -133,7 +227,8 @@ where
         root: ObjectId,
         entries: &[(ChangeId, ChangeCatalogEntry)],
     ) -> Result<super::serving::CatalogTreeEdit, StorageError> {
-        super::serving::put_change_catalog_entries(root, entries, &self.read).await
+        let read = self.packed_read();
+        super::serving::put_change_catalog_entries(root, entries, &read).await
     }
 
     pub(crate) async fn state_point_at_roots(
@@ -143,14 +238,9 @@ where
         key: &[u8],
         include_tombstone: bool,
     ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, StorageError> {
-        super::serving::state_point_on_read(
-            global_root,
-            local_root,
-            key,
-            include_tombstone,
-            &self.read,
-        )
-        .await
+        let read = self.packed_read();
+        super::serving::state_point_on_read(global_root, local_root, key, include_tombstone, &read)
+            .await
     }
 
     /// Scans authenticated untracked rows for this branch without exposing
@@ -281,6 +371,11 @@ where
         Ok(last_key)
     }
     pub(crate) async fn load_object_bytes(&self, id: ObjectId) -> Result<Bytes, StorageError> {
+        let read = self.packed_read();
+        load_object_bytes(&read, id).await
+    }
+
+    pub(super) async fn load_raw_object_bytes(&self, id: ObjectId) -> Result<Bytes, StorageError> {
         load_object_bytes(&self.read, id).await
     }
 
@@ -312,7 +407,8 @@ where
         &self,
         root: super::tree::ReceiptTreeRoot,
     ) -> Result<(), StorageError> {
-        super::tree::validate_receipt_root_on_read(root, &self.read).await
+        let read = self.packed_read();
+        super::tree::validate_receipt_root_on_read(root, &read).await
     }
 
     pub(crate) async fn insert_receipt_part(
@@ -322,8 +418,8 @@ where
         part: &super::model::UploadPartV1,
         overlay: &super::tree::ImmutableObjectSet,
     ) -> Result<super::tree::ReceiptTreeEdit, StorageError> {
-        super::tree::insert_receipt_part_on_read(root, part_object_id, part, &self.read, overlay)
-            .await
+        let read = self.packed_read();
+        super::tree::insert_receipt_part_on_read(root, part_object_id, part, &read, overlay).await
     }
 
     pub(super) async fn authenticate_chunk(
@@ -334,7 +430,7 @@ where
         semantic_id_builder: &mut super::blob::CanonicalBlobIdBuilder,
     ) -> Result<(), StorageError> {
         super::blob::authenticate_chunk(
-            &self.read,
+            &self.packed_read(),
             chunk_ref,
             part_hasher,
             final_hasher,
@@ -348,7 +444,7 @@ where
         refs: &[super::blob::AuthenticatedBlobRef],
     ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError> {
         super::blob::load_blob_bytes_many_on_read(
-            &self.read,
+            &self.packed_read(),
             self.branch_id(),
             self.view_id(),
             self.view_instance_id(),
@@ -362,7 +458,7 @@ where
         requests: &[(super::blob::AuthenticatedBlobRef, std::ops::Range<u64>)],
     ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError> {
         super::blob::load_blob_ranges_many_on_read(
-            &self.read,
+            &self.packed_read(),
             self.branch_id(),
             self.view_id(),
             self.view_instance_id(),
@@ -377,14 +473,16 @@ where
         expected_kind: &'static str,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        super::tree::lookup_on_read(root, expected_kind, key, &self.read).await
+        let read = self.packed_read();
+        super::tree::lookup_on_read(root, expected_kind, key, &read).await
     }
 
     pub(crate) async fn load_commit_members(
         &self,
         commit: &CommitObjectV1,
     ) -> Result<Vec<super::model::CommitMemberV1>, StorageError> {
-        super::serving::load_commit_members(&self.read, commit).await
+        let read = self.packed_read();
+        super::serving::load_commit_members(&read, commit).await
     }
 
     pub(super) async fn load_authenticated_member_closure(
@@ -424,8 +522,8 @@ where
         start_after: Option<&[u8]>,
         page_size: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-        super::tree::scan_page_on_read(root, expected_kind, start_after, page_size, &self.read)
-            .await
+        let read = self.packed_read();
+        super::tree::scan_page_on_read(root, expected_kind, start_after, page_size, &read).await
     }
 
     pub(crate) async fn validate_member_catalog_owner(
@@ -438,7 +536,7 @@ where
         entry: ChangeCatalogEntry,
     ) -> Result<(), StorageError> {
         super::serving::validate_member_catalog_owner(
-            &self.read,
+            &self.packed_read(),
             commit_catalog_root,
             target_commit_object_id,
             target_generation,
@@ -481,7 +579,7 @@ where
         commit: &CommitObjectV1,
     ) -> Result<(), StorageError> {
         super::serving::validate_retained_commit(
-            &self.read,
+            &self.packed_read(),
             commit_catalog_root,
             change_catalog_root,
             commit_object_id,
@@ -497,7 +595,7 @@ where
         change: &ChangeObjectV1,
     ) -> Result<(), StorageError> {
         super::serving::validate_retained_ref_change(
-            &self.read,
+            &self.packed_read(),
             change_catalog_root,
             ref_object_id,
             change,
@@ -521,10 +619,11 @@ where
         )>,
         StorageError,
     > {
+        let read = self.packed_read();
         super::serving::state_range_on_roots(
             global_root,
             local_root,
-            &self.read,
+            &read,
             lower,
             upper,
             limit,
@@ -1258,15 +1357,29 @@ where
             "branch snapshot does not match the selected branch id",
         ));
     }
-    authenticate_selected_graph(
+    let view_id = derive_view_id(&raw_global_selector, &raw_branch_selector);
+    let hot_objects = load_hot_object_map(
         &read,
+        branch_snapshot.hot_pack_object_id,
+        branch_id,
+        global_selector.repository_root,
+        global_selector.epoch,
+        branch_selector.selector_generation,
+    )
+    .await?;
+    let packed_read = PackedRead {
+        read: &read,
+        objects: &hot_objects,
+        pack_id: branch_snapshot.hot_pack_object_id,
+    };
+    authenticate_selected_graph(
+        &packed_read,
         global_selector.repository_root,
         branch_selector.branch_snapshot_object_id,
         repository_root,
         branch_snapshot,
     )
     .await?;
-    let view_id = derive_view_id(&raw_global_selector, &raw_branch_selector);
     let view_instance_id = NEXT_VIEW_INSTANCE_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
@@ -1274,6 +1387,7 @@ where
         .map_err(|_| corruption("coherent view instance identifier space is exhausted"))?;
     Ok(CoherentView {
         read,
+        hot_objects,
         branch_id,
         raw_global_selector,
         raw_branch_selector,
@@ -1284,6 +1398,71 @@ where
         view_id,
         view_instance_id,
     })
+}
+
+async fn load_hot_object_map<R>(
+    read: &R,
+    pack_id: ObjectId,
+    branch_id: CanonicalBranchId,
+    repository_root_id: ObjectId,
+    epoch: u64,
+    selector_generation: u64,
+) -> Result<BTreeMap<ObjectId, Bytes>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let pack_bytes = load_object_bytes(read, pack_id).await?;
+    let pack = HotObjectPackV1::decode(pack_id, &pack_bytes)?;
+    if pack.branch_id != branch_id
+        || pack.repository_root_id != repository_root_id
+        || pack.epoch > epoch
+        || pack.view_id != derive_pack_view_id(repository_root_id, branch_id, selector_generation)
+    {
+        return Err(corruption(format!(
+            "hot object pack binding does not match selector view: pack_branch={:?} selected_branch={:?} pack_root={} selected_root={} pack_epoch={} selected_epoch={} pack_view={:02x?} expected_view={:02x?} pack_id={}",
+            pack.branch_id,
+            branch_id,
+            pack.repository_root_id,
+            repository_root_id,
+            pack.epoch,
+            epoch,
+            pack.view_id,
+            derive_pack_view_id(repository_root_id, branch_id, selector_generation),
+            pack_id,
+        )));
+    }
+    let mut objects = BTreeMap::new();
+    if let Some(base_id) = pack.base_pack_object_id {
+        let base_bytes = load_object_bytes(read, base_id).await?;
+        let base = HotObjectPackV1::decode(base_id, &base_bytes)?;
+        let expected_base_generation = selector_generation
+            .checked_sub(1)
+            .ok_or_else(|| corruption("hot object pack base has no predecessor generation"))?;
+        if base.branch_id != branch_id
+            || base.base_pack_object_id.is_some()
+            || base.epoch > pack.epoch
+            || base.view_id
+                != derive_pack_view_id(base.repository_root_id, branch_id, expected_base_generation)
+        {
+            return Err(corruption(
+                "hot object pack base chain exceeds one generation",
+            ));
+        }
+        for entry in base.entries {
+            objects.insert(entry.object_id, entry.bytes);
+        }
+    }
+    for entry in pack.entries {
+        if objects.insert(entry.object_id, entry.bytes).is_some() {
+            return Err(corruption(
+                "hot object pack repeats an object across generations",
+            ));
+        }
+    }
+    if objects.is_empty() {
+        return Err(corruption("hot object pack has no authenticated objects"));
+    }
+    Ok(objects)
 }
 
 pub(super) async fn load_object_bytes(
@@ -1439,7 +1618,7 @@ fn required_object(
         .ok_or_else(|| corruption(format!("selected object {id} is absent")))
 }
 
-fn derive_view_id(raw_global: &[u8], raw_branch: &[u8]) -> [u8; 32] {
+pub(super) fn derive_view_id(raw_global: &[u8], raw_branch: &[u8]) -> [u8; 32] {
     let mut encoder = Encoder::default();
     encoder
         .bytes(raw_global)
@@ -1448,6 +1627,18 @@ fn derive_view_id(raw_global: &[u8], raw_branch: &[u8]) -> [u8; 32] {
         .bytes(raw_branch)
         .expect("selector value necessarily fits canonical u32 length");
     keyed_hash(VIEW_ID_DOMAIN, &encoder.into_vec())
+}
+
+pub(super) fn derive_pack_view_id(
+    repository_root_id: ObjectId,
+    branch_id: CanonicalBranchId,
+    selector_generation: u64,
+) -> [u8; 32] {
+    let mut encoder = Encoder::default();
+    encoder.fixed(repository_root_id.as_bytes());
+    encoder.fixed(branch_id.as_bytes());
+    encoder.u64(selector_generation);
+    keyed_hash("lix forktree hot pack binding v1", &encoder.into_vec())
 }
 
 fn projected_required(

@@ -653,6 +653,7 @@ where
             semantic_head_commit_object_id: commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: global_state_root,
+            hot_pack_object_id: ObjectId::ZERO,
         },
         repository_root,
     };
@@ -1312,6 +1313,7 @@ where
             semantic_head_commit_object_id: final_commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: final_global_state_root,
+            hot_pack_object_id: ObjectId::ZERO,
         },
         repository_root,
     };

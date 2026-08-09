@@ -21,10 +21,10 @@ use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberPageV1,
     CommitObjectV1, GcEdgeCursorV1, GcLiveBranchEntryV1, GcMarkEntryV2, GcPhaseV2,
-    GcProgressSelectorV2, GcProgressV2, GcQueueEntryV1, GlobalSelectorV1, RepositoryRootV1,
-    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
-    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
-    upload_selector_key,
+    GcProgressSelectorV2, GcProgressV2, GcQueueEntryV1, GlobalSelectorV1, HotObjectPackV1,
+    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
+    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
+    snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId, authenticate_object_domain};
 use super::publication::PreparedPublication;
@@ -980,6 +980,22 @@ where
             if let Some(id) = value.latest_ref_change_object_id {
                 edges.push(typed(id, ObjectDomain::BranchRefChange));
             }
+            edges.push(typed(
+                value.hot_pack_object_id,
+                ObjectDomain::HotObjectPackV1,
+            ));
+        }
+        ObjectDomain::HotObjectPackV1 => {
+            let value = HotObjectPackV1::decode(id, bytes)?;
+            if let Some(base) = value.base_pack_object_id {
+                edges.push(typed(base, ObjectDomain::HotObjectPackV1));
+            }
+            edges.extend(
+                value
+                    .entries
+                    .into_iter()
+                    .map(|entry| typed(entry.object_id, entry.domain)),
+            );
         }
         ObjectDomain::Commit => {
             let value = CommitObjectV1::decode(id, bytes)?;

@@ -131,6 +131,7 @@ pub(crate) struct BranchSnapshotV1 {
     pub(crate) semantic_head_commit_object_id: ObjectId,
     pub(crate) latest_ref_change_object_id: Option<ObjectId>,
     pub(crate) historical_global_state_root: ObjectId,
+    pub(crate) hot_pack_object_id: ObjectId,
 }
 
 impl BranchSnapshotV1 {
@@ -141,6 +142,7 @@ impl BranchSnapshotV1 {
                 self.local_state_root,
                 self.semantic_head_commit_object_id,
                 self.historical_global_state_root,
+                self.hot_pack_object_id,
             ],
         )?;
         if self.latest_ref_change_object_id == Some(ObjectId::ZERO) {
@@ -152,6 +154,7 @@ impl BranchSnapshotV1 {
             encode_id(encoder, self.semantic_head_commit_object_id);
             encode_optional_id(encoder, self.latest_ref_change_object_id);
             encode_id(encoder, self.historical_global_state_root);
+            encode_id(encoder, self.hot_pack_object_id);
             Ok(())
         })
     }
@@ -164,6 +167,7 @@ impl BranchSnapshotV1 {
             semantic_head_commit_object_id: decode_id(&mut decoder)?,
             latest_ref_change_object_id: decode_optional_id(&mut decoder, "ref-change edge")?,
             historical_global_state_root: decode_id(&mut decoder)?,
+            hot_pack_object_id: decode_id(&mut decoder)?,
         };
         decoder.finish()?;
         validate_nonzero_ids(
@@ -172,11 +176,130 @@ impl BranchSnapshotV1 {
                 value.local_state_root,
                 value.semantic_head_commit_object_id,
                 value.historical_global_state_root,
+                value.hot_pack_object_id,
             ],
         )?;
         if value.latest_ref_change_object_id == Some(ObjectId::ZERO) {
             return Err(corruption("branch snapshot ref-change edge is zero"));
         }
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HotObjectPackEntry {
+    pub(crate) object_id: ObjectId,
+    pub(crate) domain: ObjectDomain,
+    pub(crate) bytes: Bytes,
+}
+
+/// Authenticated physical co-location for the selected branch's hot object
+/// closure. Canonical object IDs and bytes remain independently verifiable;
+/// this envelope is the only serving path once a snapshot names it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HotObjectPackV1 {
+    pub(crate) branch_id: CanonicalBranchId,
+    pub(crate) repository_root_id: ObjectId,
+    pub(crate) epoch: u64,
+    pub(crate) view_id: [u8; 32],
+    pub(crate) base_pack_object_id: Option<ObjectId>,
+    pub(crate) entries: Vec<HotObjectPackEntry>,
+}
+
+impl HotObjectPackV1 {
+    pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
+        if self.branch_id.as_bytes() == &[0; 16]
+            || self.repository_root_id == ObjectId::ZERO
+            || self.epoch == 0
+            || self.view_id == [0; 32]
+            || self.entries.is_empty()
+        {
+            return Err(corruption("hot object pack has an invalid binding"));
+        }
+        let mut previous = None;
+        for entry in &self.entries {
+            if entry.object_id == ObjectId::ZERO
+                || previous.is_some_and(|previous| previous >= entry.object_id)
+            {
+                return Err(corruption(
+                    "hot object pack entries are not strictly ordered",
+                ));
+            }
+            if super::object::authenticate_object_domain(entry.object_id, &entry.bytes)?
+                != entry.domain
+            {
+                return Err(corruption(
+                    "hot object pack entry domain is not authenticated",
+                ));
+            }
+            previous = Some(entry.object_id);
+        }
+        let count = u32::try_from(self.entries.len())
+            .map_err(|_| corruption("hot object pack has too many entries"))?;
+        encode_object(ObjectDomain::HotObjectPackV1, |encoder| {
+            encoder.fixed(self.branch_id.as_bytes());
+            encode_id(encoder, self.repository_root_id);
+            encoder.u64(self.epoch);
+            encoder.fixed(&self.view_id);
+            encode_optional_id(encoder, self.base_pack_object_id);
+            encoder.u32(count);
+            for entry in &self.entries {
+                encode_id(encoder, entry.object_id);
+                encoder.u32(entry.domain.code() as u32);
+                encoder.bytes(&entry.bytes)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::HotObjectPackV1, bytes)?;
+        let branch_id = CanonicalBranchId::from_bytes(decoder.fixed()?);
+        let repository_root_id = decode_id(&mut decoder)?;
+        let epoch = decoder.u64()?;
+        let view_id = decoder.fixed()?;
+        let base_pack_object_id = decode_optional_id(&mut decoder, "hot pack base")?;
+        let count = decoder.usize("hot object pack entry count")?;
+        if count == 0 || count > 65_536 {
+            return Err(corruption("hot object pack entry count is invalid"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut previous = None;
+        for _ in 0..count {
+            let object_id = decode_id(&mut decoder)?;
+            if object_id == ObjectId::ZERO || previous.is_some_and(|previous| previous >= object_id)
+            {
+                return Err(corruption(
+                    "hot object pack entries are not strictly ordered",
+                ));
+            }
+            let domain = ObjectDomain::decode(
+                u16::try_from(decoder.u32()?)
+                    .map_err(|_| corruption("hot object pack domain exceeds u16"))?,
+            )?;
+            let bytes = Bytes::from(decoder.bytes("hot object pack entry")?);
+            if super::object::authenticate_object_domain(object_id, &bytes)? != domain {
+                return Err(corruption(
+                    "hot object pack entry failed ID/domain validation",
+                ));
+            }
+            previous = Some(object_id);
+            entries.push(HotObjectPackEntry {
+                object_id,
+                domain,
+                bytes,
+            });
+        }
+        decoder.finish()?;
+        let value = Self {
+            branch_id,
+            repository_root_id,
+            epoch,
+            view_id,
+            base_pack_object_id,
+            entries,
+        };
+        let _ = value.encode()?;
         Ok(value)
     }
 }

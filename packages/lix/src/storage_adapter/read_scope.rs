@@ -1,9 +1,70 @@
 use std::sync::Arc;
 
+#[cfg(feature = "storage-benches")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, ScanCursor, StorageError,
     StorageRead, StorageSpace,
 };
+
+#[cfg(feature = "storage-benches")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StorageAdapterReadCounters {
+    pub get_many_calls: u64,
+    pub requested_keys: u64,
+    pub returned_values: u64,
+    pub returned_bytes: u64,
+}
+
+#[cfg(feature = "storage-benches")]
+static GET_MANY_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "storage-benches")]
+static REQUESTED_KEYS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "storage-benches")]
+static RETURNED_VALUES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "storage-benches")]
+static RETURNED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "storage-benches")]
+pub fn reset_storage_adapter_read_counters() {
+    GET_MANY_CALLS.store(0, Ordering::Relaxed);
+    REQUESTED_KEYS.store(0, Ordering::Relaxed);
+    RETURNED_VALUES.store(0, Ordering::Relaxed);
+    RETURNED_BYTES.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "storage-benches")]
+pub fn storage_adapter_read_counters() -> StorageAdapterReadCounters {
+    StorageAdapterReadCounters {
+        get_many_calls: GET_MANY_CALLS.load(Ordering::Relaxed),
+        requested_keys: REQUESTED_KEYS.load(Ordering::Relaxed),
+        returned_values: RETURNED_VALUES.load(Ordering::Relaxed),
+        returned_bytes: RETURNED_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(feature = "storage-benches")]
+fn record_get_many(requests: &[GetManyRequest<'_>], result: &GetManyResult) {
+    GET_MANY_CALLS.fetch_add(1, Ordering::Relaxed);
+    REQUESTED_KEYS.fetch_add(
+        requests
+            .iter()
+            .map(|request| request.keys.len() as u64)
+            .sum(),
+        Ordering::Relaxed,
+    );
+    let mut returned_values = 0;
+    let mut returned_bytes = 0;
+    for value in &result.values {
+        if let Some(crate::storage::ProjectedValue::FullValue(bytes)) = value {
+            returned_values += 1;
+            returned_bytes += bytes.len() as u64;
+        }
+    }
+    RETURNED_VALUES.fetch_add(returned_values, Ordering::Relaxed);
+    RETURNED_BYTES.fetch_add(returned_bytes, Ordering::Relaxed);
+}
 
 /// The async read capability consumed by engine stores.
 ///
@@ -98,7 +159,15 @@ where
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        self.read.get_many(requests)
+        let future = self.read.get_many(requests);
+        async move {
+            let result = future.await;
+            #[cfg(feature = "storage-benches")]
+            if let Ok(result) = &result {
+                record_get_many(requests, result);
+            }
+            result
+        }
     }
 
     fn begin_scan(
@@ -123,7 +192,15 @@ where
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        self.read.get_many(requests)
+        let future = self.read.get_many(requests);
+        async move {
+            let result = future.await;
+            #[cfg(feature = "storage-benches")]
+            if let Ok(result) = &result {
+                record_get_many(requests, result);
+            }
+            result
+        }
     }
 
     fn begin_scan(

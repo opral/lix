@@ -8,8 +8,8 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage::{
     BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
-    KeyRange, Memory, MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage,
-    StorageError, StorageRead, StorageWrite, WriteOptions,
+    KeyRange, Memory, MemoryRead, MemoryWrite, ProjectedValue, PutBatch, ReadOptions, ScanCursor,
+    Storage, StorageError, StorageRead, StorageWrite, WriteOptions,
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
@@ -17,8 +17,9 @@ use crate::storage_adapter::{
 };
 
 use super::model::{
-    GcProgressSelectorV2, GcProgressV2, branch_selector_key, gc_progress_selector_key,
-    global_selector_key, snapshot_selector_key, upload_binding_digest, upload_selector_key,
+    GcProgressSelectorV2, GcProgressV2, HotObjectPackEntry, HotObjectPackV1, branch_selector_key,
+    gc_progress_selector_key, global_selector_key, snapshot_selector_key, upload_binding_digest,
+    upload_selector_key,
 };
 use super::object::OBJECT_SPACE;
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
@@ -213,6 +214,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     let seed = build_seed();
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
+
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("open selected history view");
@@ -645,12 +647,18 @@ fn build_seed() -> SeedData {
     objects
         .insert(repository_root_id, repository_root_bytes)
         .expect("repository object");
+    let (hot_pack_object_id, hot_pack_bytes) =
+        test_hot_pack(&objects, branch_id, repository_root_id, 1, 1, &[]);
+    objects
+        .insert(hot_pack_object_id, hot_pack_bytes)
+        .expect("seed hot pack object");
     let branch_snapshot = BranchSnapshotV1 {
         branch_id,
         local_state_root,
         semantic_head_commit_object_id: commit_object_id,
         latest_ref_change_object_id: Some(ref_change_object_id),
         historical_global_state_root: global_state_root,
+        hot_pack_object_id,
     };
     let (branch_snapshot_id, branch_snapshot_bytes) =
         branch_snapshot.encode().expect("branch snapshot");
@@ -693,6 +701,45 @@ fn build_seed() -> SeedData {
         orphan_object_id,
         orphan_object_bytes,
     }
+}
+
+fn test_hot_pack(
+    objects: &ImmutableObjectSet,
+    branch_id: CanonicalBranchId,
+    repository_root_id: ObjectId,
+    epoch: u64,
+    selector_generation: u64,
+    excluded: &[ObjectId],
+) -> (ObjectId, Bytes) {
+    let entries = objects
+        .iter()
+        .filter(|(object_id, _)| !excluded.contains(object_id))
+        .filter_map(|(object_id, bytes)| {
+            let domain = super::object::authenticate_object_domain(object_id, bytes).ok()?;
+            if !super::object::hot_packable_object(object_id, bytes).ok()? {
+                return None;
+            }
+            Some(HotObjectPackEntry {
+                object_id,
+                domain,
+                bytes: bytes.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    HotObjectPackV1 {
+        branch_id,
+        repository_root_id,
+        epoch,
+        view_id: super::view::derive_pack_view_id(
+            repository_root_id,
+            branch_id,
+            selector_generation,
+        ),
+        base_pack_object_id: None,
+        entries,
+    }
+    .encode()
+    .expect("test hot pack")
 }
 
 fn replace_selected_history_graph(
@@ -756,8 +803,35 @@ async fn seed_storage<S>(storage: &S, seed: &SeedData)
 where
     S: Storage,
 {
+    let mut objects = seed.objects.clone();
+    let (pack_id, pack_bytes) = test_hot_pack(
+        &objects,
+        seed.branch_id,
+        seed.global_selector.repository_root,
+        seed.global_selector.epoch,
+        seed.branch_selector.selector_generation,
+        &[seed.orphan_object_id],
+    );
+    objects
+        .insert(pack_id, pack_bytes)
+        .expect("test pack object");
+    let current_snapshot = BranchSnapshotV1::decode(
+        seed.branch_snapshot_id,
+        objects
+            .get(seed.branch_snapshot_id)
+            .expect("seed branch snapshot"),
+    )
+    .expect("seed branch snapshot decode");
+    let snapshot = BranchSnapshotV1 {
+        hot_pack_object_id: pack_id,
+        ..current_snapshot
+    };
+    let (snapshot_id, snapshot_bytes) = snapshot.encode().expect("seed packed snapshot");
+    objects
+        .insert(snapshot_id, snapshot_bytes)
+        .expect("seed snapshot");
     let mut writes = StorageWriteSet::new();
-    for (id, bytes) in seed.objects.iter() {
+    for (id, bytes) in objects.iter() {
         writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
     }
     writes.put(
@@ -768,13 +842,12 @@ where
             .expect("global selector")
             .to_vec(),
     );
+    let mut branch_selector = seed.branch_selector.clone();
+    branch_selector.branch_snapshot_object_id = snapshot_id;
     writes.put(
         SELECTOR_SPACE,
         branch_selector_key(seed.branch_id).to_vec(),
-        seed.branch_selector
-            .encode()
-            .expect("branch selector")
-            .to_vec(),
+        branch_selector.encode().expect("branch selector").to_vec(),
     );
     commit_write_set_for_test(writes, storage).await;
 }
@@ -918,6 +991,7 @@ async fn branch_transition<R: StorageAdapterRead>(
             semantic_head_commit_object_id: commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: view.repository_root().global_state_root,
+            hot_pack_object_id: ObjectId::ZERO,
         },
     }
 }
@@ -1275,6 +1349,55 @@ struct CountingRead {
     inner: MemoryRead,
 }
 
+struct CorruptPackRead<R> {
+    inner: R,
+    pack_id: ObjectId,
+}
+
+impl<R> StorageAdapterRead for CorruptPackRead<R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.inner.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        let pack_id = self.pack_id;
+        async move {
+            let mut result = self.inner.get_many(requests).await?;
+            let mut result_index = 0;
+            for request in requests {
+                for key in request.keys {
+                    if request.space == OBJECT_SPACE && key.0.as_ref() == pack_id.as_bytes() {
+                        if let Some(Some(ProjectedValue::FullValue(bytes))) =
+                            result.values.get_mut(result_index)
+                        {
+                            let mut corrupted = bytes.to_vec();
+                            *corrupted.last_mut().expect("nonempty pack") ^= 1;
+                            *bytes = Bytes::from(corrupted);
+                        }
+                    }
+                    result_index += 1;
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.inner.begin_scan(space, range, opts)
+    }
+}
+
 struct SharedParentCountingRead<R> {
     inner: R,
     parent_object: ObjectId,
@@ -1501,18 +1624,25 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
         .await
         .expect("same-handle open");
     assert_eq!(manual.branch_id(), seed.branch_id);
+    let pack_id = manual.branch_snapshot().hot_pack_object_id;
     drop(manual);
-
-    let mut writes = StorageWriteSet::new();
-    writes.delete(
-        OBJECT_SPACE,
-        seed.semantic_change_object_id.as_bytes().to_vec(),
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("tamper read"),
     );
-    commit_write_set_for_test(writes, &storage).await;
-    let view = open_coherent_view(&storage, seed.branch_id)
+    assert!(
+        super::open_coherent_view_on_read(
+            CorruptPackRead {
+                inner: read,
+                pack_id
+            },
+            seed.branch_id,
+        )
         .await
-        .expect("bounded open does not traverse an unrelated catalog member");
-    assert!(load_change(&view, seed.semantic_change_id).await.is_err());
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -2526,6 +2656,7 @@ async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
             checkpoint_id,
             SelectorExpectation::Absent,
         )
+        .await
         .expect("checkpoint target");
     drop(view);
     commit_publication_for_test(checkpoint, &storage)
@@ -2589,6 +2720,7 @@ async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
             change_catalog_edit,
             repository,
         )
+        .await
         .expect("release checkpoint");
     drop(current);
     commit_publication_for_test(release, &storage)
@@ -2640,6 +2772,7 @@ async fn deterministic_crash_recovery_publication_and_gc_oracle() {
                 checkpoint_id,
                 SelectorExpectation::Absent,
             )
+            .await
             .expect("recovery pin");
         drop(view);
         storage.inject(crash);
@@ -3535,6 +3668,17 @@ async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBr
     seed.objects
         .insert(repository_id, repository_bytes)
         .expect("repository object");
+    let (disposable_pack_id, disposable_pack_bytes) = test_hot_pack(
+        &seed.objects,
+        disposable,
+        repository_id,
+        seed.global_selector.epoch,
+        1,
+        &[seed.orphan_object_id],
+    );
+    seed.objects
+        .insert(disposable_pack_id, disposable_pack_bytes)
+        .expect("disposable pack object");
     seed.repository_root_id = repository_id;
     seed.global_selector.repository_root = repository_id;
     seed.global_selector.selector_generation += 1;
@@ -3544,6 +3688,7 @@ async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBr
         semantic_head_commit_object_id: seed.commit_object_id,
         latest_ref_change_object_id: Some(disposable_ref_object_id),
         historical_global_state_root: seed.global_state_root,
+        hot_pack_object_id: disposable_pack_id,
     };
     let (snapshot_id, snapshot_bytes) = snapshot.encode().expect("disposable snapshot");
     seed.objects
@@ -3639,6 +3784,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
             checkpoint_id,
             SelectorExpectation::Absent,
         )
+        .await
         .expect("checkpoint pin");
     drop(view);
     commit_publication_for_test(checkpoint, &storage)
@@ -3670,6 +3816,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     let mut retire = PreparedPublication::from_branch_view(&view).expect("retire branch");
     retire
         .publish_branch_retirement(&view, commit_catalog_edit, change_catalog_edit, repository)
+        .await
         .expect("branch retirement");
     drop(view);
     commit_publication_for_test(retire, &storage)
@@ -3729,6 +3876,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
             change_catalog_edit,
             repository,
         )
+        .await
         .expect("release checkpoint");
     drop(view);
     commit_publication_for_test(release, &storage)
@@ -3852,6 +4000,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
                 target.selector_id,
                 SelectorExpectation::Absent,
             )
+            .await
             .expect("checkpoint selector"),
         target_id
     );
@@ -3885,6 +4034,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
             target.selector_id,
             SelectorExpectation::Absent,
         )
+        .await
         .expect("root selector");
     drop(publish_view);
     sweep(&inverse, seed.branch_id).await;
@@ -3903,6 +4053,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
             target.selector_id,
             SelectorExpectation::Absent,
         )
+        .await
         .expect("retry selector");
     drop(retry_view);
     commit_publication_for_test(retry, &inverse)
@@ -3926,6 +4077,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
         let selector_id = SnapshotSelectorId::from_bytes(raw_id(index as u8 + 2));
         roles
             .publish_current_snapshot_pin(&view, role, selector_id, SelectorExpectation::Absent)
+            .await
             .expect("role selector");
     }
     drop(view);
@@ -3957,6 +4109,7 @@ async fn full_selector_scan_crosses_storage_page_and_corruption_fails_closed() {
                 selector_id,
                 SelectorExpectation::Absent,
             )
+            .await
             .expect("selector");
     }
     drop(view);

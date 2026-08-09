@@ -57,6 +57,7 @@ pub(super) enum ObjectDomain {
     GcQueuePackV1 = 15,
     GcLiveBranchPackV1 = 16,
     CommitMemberPageV1 = 17,
+    HotObjectPackV1 = 18,
 }
 
 impl ObjectDomain {
@@ -79,6 +80,7 @@ impl ObjectDomain {
             15 => Ok(Self::GcQueuePackV1),
             16 => Ok(Self::GcLiveBranchPackV1),
             17 => Ok(Self::CommitMemberPageV1),
+            18 => Ok(Self::HotObjectPackV1),
             _ => Err(corruption(format!("unknown object domain {value}"))),
         }
     }
@@ -102,6 +104,39 @@ pub(super) fn authenticate_object_domain(
     let domain =
         u16::try_from(decoder.u32()?).map_err(|_| corruption("object domain exceeds u16"))?;
     ObjectDomain::decode(domain)
+}
+
+pub(super) const fn hot_packable_domain(domain: ObjectDomain) -> bool {
+    !matches!(
+        domain,
+        ObjectDomain::BranchSnapshot
+            | ObjectDomain::Commit
+            | ObjectDomain::CommitMemberPageV1
+            | ObjectDomain::SemanticChange
+            | ObjectDomain::BranchRefChange
+            | ObjectDomain::UploadPart
+            | ObjectDomain::UploadProgress
+            | ObjectDomain::BlobChunk
+            | ObjectDomain::BlobManifest
+            | ObjectDomain::SnapshotTarget
+            | ObjectDomain::GcMarkPackV2
+            | ObjectDomain::GcProgressV2
+            | ObjectDomain::GcRadixNodeV1
+            | ObjectDomain::GcQueuePackV1
+            | ObjectDomain::GcLiveBranchPackV1
+            | ObjectDomain::HotObjectPackV1
+    )
+}
+
+pub(super) fn hot_packable_object(id: ObjectId, bytes: &[u8]) -> Result<bool, StorageError> {
+    let domain = authenticate_object_domain(id, bytes)?;
+    if !hot_packable_domain(domain) {
+        return Ok(false);
+    }
+    if domain == ObjectDomain::OrderedTreeNode {
+        return super::tree::is_serving_tree_node(id, bytes);
+    }
+    Ok(true)
 }
 
 pub(super) fn encode_object(

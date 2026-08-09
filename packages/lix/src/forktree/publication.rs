@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
-use crate::storage::{Key, Precondition, StorageError};
+use crate::storage::{
+    BeginScanOptions, CoreProjection, Key, Precondition, Prefix, ProjectedValue, ScanOrder,
+    StorageError,
+};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
 
@@ -10,12 +13,13 @@ use super::blob::{CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
-    ChangeCatalogEntry, ChangeCatalogOwner, ChangeObjectV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
-    snapshot_selector_key, upload_selector_key,
+    ChangeCatalogEntry, ChangeCatalogOwner, ChangeObjectV1, CommitMemberPageV1, CommitObjectV1,
+    GlobalSelectorV1, HotObjectPackEntry, HotObjectPackV1, RepositoryRootV1, SnapshotRole,
+    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
+    upload_selector_key,
 };
-use super::object::{OBJECT_SPACE, ObjectId};
+use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId};
 use super::serving::{CatalogTreeEdit, StateTreeEdit};
 use super::state::{
     StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
@@ -372,6 +376,114 @@ impl PreparedPublication {
         self.object_puts.insert(id, bytes)
     }
 
+    async fn stage_hot_pack<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        repository_root_id: ObjectId,
+        branch_id: super::model::CanonicalBranchId,
+        selector_generation: u64,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        let current_id = view.hot_pack_object_id();
+        let current_bytes = view.load_raw_object_bytes(current_id).await?;
+        let current = HotObjectPackV1::decode(current_id, &current_bytes)?;
+        if current.branch_id != branch_id
+            || current.repository_root_id != view.global_selector().repository_root
+            || current.epoch > view.global_selector().epoch
+            || current.view_id
+                != super::view::derive_pack_view_id(
+                    current.repository_root_id,
+                    branch_id,
+                    view.branch_selector().selector_generation,
+                )
+        {
+            return Err(corruption(
+                "hot pack source binding does not match the selected view",
+            ));
+        }
+        let mut entries = BTreeMap::new();
+        let compact = current.base_pack_object_id.is_some();
+        let mut base_pack_object_id = None;
+        if let Some(base_id) = current.base_pack_object_id {
+            let base_bytes = view.load_raw_object_bytes(base_id).await?;
+            let base = HotObjectPackV1::decode(base_id, &base_bytes)?;
+            let expected_base_generation = view
+                .branch_selector()
+                .selector_generation
+                .checked_sub(1)
+                .ok_or_else(|| corruption("hot pack base has no predecessor generation"))?;
+            if base.branch_id != branch_id
+                || base.base_pack_object_id.is_some()
+                || base.epoch > current.epoch
+                || base.view_id
+                    != super::view::derive_pack_view_id(
+                        base.repository_root_id,
+                        branch_id,
+                        expected_base_generation,
+                    )
+            {
+                return Err(corruption(
+                    "hot pack base binding does not match the selected view",
+                ));
+            }
+            for entry in base.entries {
+                entries.insert(entry.object_id, entry);
+            }
+            for entry in current.entries {
+                if entries.insert(entry.object_id, entry).is_some() {
+                    return Err(corruption("hot pack source repeats an object"));
+                }
+            }
+        } else {
+            base_pack_object_id = Some(current_id);
+            for entry in current.entries {
+                entries.insert(entry.object_id, entry);
+            }
+        }
+        let mut staged = Vec::new();
+        for (id, bytes) in self.object_puts.iter() {
+            let domain = super::object::authenticate_object_domain(id, bytes)?;
+            if !super::object::hot_packable_object(id, bytes)? {
+                continue;
+            }
+            let entry = HotObjectPackEntry {
+                object_id: id,
+                domain,
+                bytes: bytes.clone(),
+            };
+            if let Some(existing) = entries.get(&id) {
+                if existing.bytes != entry.bytes {
+                    return Err(corruption("hot pack reuses an object ID with new bytes"));
+                }
+            } else {
+                staged.push(entry);
+            }
+        }
+        if compact {
+            entries.extend(staged.into_iter().map(|entry| (entry.object_id, entry)));
+            staged = entries.into_values().collect();
+            base_pack_object_id = None;
+        }
+        staged.sort_by_key(|entry| entry.object_id);
+        let pack = HotObjectPackV1 {
+            branch_id,
+            repository_root_id,
+            epoch: self.next_global.epoch,
+            view_id: super::view::derive_pack_view_id(
+                repository_root_id,
+                branch_id,
+                selector_generation,
+            ),
+            base_pack_object_id,
+            entries: staged,
+        };
+        let (pack_id, pack_bytes) = pack.encode()?;
+        self.stage_encoded_object(pack_id, pack_bytes)?;
+        Ok(pack_id)
+    }
+
     fn stage_object_set(&mut self, objects: ImmutableObjectSet) -> Result<(), StorageError> {
         for (id, bytes) in objects.iter() {
             self.stage_encoded_object(id, bytes.clone())?;
@@ -445,16 +557,22 @@ impl PreparedPublication {
             semantic_head_commit_object_id: source_commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: source_commit.global_state_root,
+            hot_pack_object_id: ObjectId::ZERO,
         };
-        let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
         self.stage_catalog_edit(change_catalog_edit)?;
-        self.stage_repository_root(RepositoryRootV1 {
+        let repository_root_id = self.stage_repository_root(RepositoryRootV1 {
             global_state_root: base_repository_root.global_state_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
             retention_policy_root: base_repository_root.retention_policy_root,
         })?;
+        let pack_id = self
+            .stage_hot_pack(view, repository_root_id, branch_id, 1)
+            .await?;
+        let mut branch_snapshot = branch_snapshot;
+        branch_snapshot.hot_pack_object_id = pack_id;
+        let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
         self.put_branch_selector(
             BranchSelectorV1 {
                 branch_id,
@@ -530,26 +648,38 @@ impl PreparedPublication {
             semantic_head_commit_object_id: next_commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: next_commit.global_state_root,
+            hot_pack_object_id: ObjectId::ZERO,
         };
-        let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
         let next_change_catalog_root = change_catalog_edit.root;
         self.stage_catalog_edit(change_catalog_edit)?;
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
-        self.stage_repository_root(RepositoryRootV1 {
+        let repository_root_id = self.stage_repository_root(RepositoryRootV1 {
             global_state_root: base_repository_root.global_state_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
             retention_policy_root: base_repository_root.retention_policy_root,
         })?;
+        let selector_generation = view
+            .branch_selector()
+            .selector_generation
+            .checked_add(1)
+            .ok_or_else(|| corruption("branch selector generation overflowed"))?;
+        let pack_id = self
+            .stage_hot_pack(
+                view,
+                repository_root_id,
+                branch_snapshot.branch_id,
+                selector_generation,
+            )
+            .await?;
+        let mut branch_snapshot = branch_snapshot;
+        branch_snapshot.hot_pack_object_id = pack_id;
+        let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
         self.put_branch_selector(
             BranchSelectorV1 {
                 branch_id: view.branch_id(),
                 branch_snapshot_object_id: snapshot_id,
-                selector_generation: view
-                    .branch_selector()
-                    .selector_generation
-                    .checked_add(1)
-                    .ok_or_else(|| corruption("branch selector generation overflowed"))?,
+                selector_generation,
             },
             SelectorExpectation::Equals(view.raw_branch_selector().clone()),
         )?;
@@ -733,10 +863,10 @@ impl PreparedPublication {
 
     /// Pins the exact selected branch snapshot/head under any retained-root
     /// role without letting a caller supply an unrelated object edge.
-    pub(crate) fn publish_current_snapshot_pin<R>(
+    pub(crate) async fn publish_current_snapshot_pin<R>(
         &mut self,
         view: &CoherentView<R>,
-        role: super::model::SnapshotRole,
+        role: SnapshotRole,
         selector_id: super::model::SnapshotSelectorId,
         expected: SelectorExpectation,
     ) -> Result<ObjectId, StorageError>
@@ -783,7 +913,7 @@ impl PreparedPublication {
     /// moving the epoch, selector, RepositoryRoot, and catalog roots in one
     /// commit prevents either a dangling back-edge or an early reclamation
     /// window.
-    pub(crate) fn release_snapshot_pin_with_catalog_retirement<R>(
+    pub(crate) async fn release_snapshot_pin_with_catalog_retirement<R>(
         &mut self,
         view: &CoherentView<R>,
         selector: SnapshotSelectorV1,
@@ -807,9 +937,29 @@ impl PreparedPublication {
                 "snapshot release catalog retirement was derived from another coherent view",
             ));
         }
+        let retired_commit_ids = commit_catalog_edit.retired_commit_ids.clone();
+        let retired_change_ids = change_catalog_edit.retired_change_ids.clone();
         self.stage_catalog_edit(commit_catalog_edit)?;
         self.stage_catalog_edit(change_catalog_edit)?;
-        self.stage_repository_root(repository_root)?;
+        let repository_root_id = self.stage_repository_root(repository_root)?;
+        self.rebind_surviving_branch_packs(
+            view,
+            repository_root_id,
+            repository_root,
+            &retired_commit_ids,
+            &retired_change_ids,
+            None,
+        )
+        .await?;
+        self.rebind_retained_snapshot_packs(
+            view,
+            repository_root_id,
+            repository_root,
+            &retired_commit_ids,
+            &retired_change_ids,
+            Some(selector),
+        )
+        .await?;
         self.release_snapshot_pin(selector, raw_selector)
     }
 
@@ -1018,8 +1168,43 @@ impl PreparedPublication {
         for (id, (_, bytes)) in encoded_changes {
             self.stage_encoded_object(id, bytes)?;
         }
+        let repository_root_id = self.stage_repository_root(repository_root)?;
+        let selector_generation = view
+            .branch_selector()
+            .selector_generation
+            .checked_add(1)
+            .ok_or_else(|| corruption("branch selector generation overflowed"))?;
+        let pack_id = self
+            .stage_hot_pack(
+                view,
+                repository_root_id,
+                branch_snapshot.branch_id,
+                selector_generation,
+            )
+            .await?;
+        let mut branch_snapshot = branch_snapshot;
+        branch_snapshot.hot_pack_object_id = pack_id;
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
-        self.stage_repository_root(repository_root)?;
+        let no_retired_commits = BTreeSet::new();
+        let no_retired_changes = BTreeSet::new();
+        self.rebind_surviving_branch_packs(
+            view,
+            repository_root_id,
+            repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            Some(view.branch_id()),
+        )
+        .await?;
+        self.rebind_retained_snapshot_packs(
+            view,
+            repository_root_id,
+            repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            None,
+        )
+        .await?;
         self.install_branch_selector(view, snapshot_id)
     }
 
@@ -1044,7 +1229,7 @@ impl PreparedPublication {
             mut semantic_commits,
             fresh_changes,
             branch_ref_change,
-            branch_snapshot,
+            mut branch_snapshot,
             repository_root,
         } = transition;
         let mut member_pages = Vec::new();
@@ -1283,8 +1468,22 @@ impl PreparedPublication {
             self.stage_encoded_object(object_id, bytes)?;
         }
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
+        let repository_root_id = self.stage_repository_root(repository_root)?;
+        let selector_generation = view
+            .branch_selector()
+            .selector_generation
+            .checked_add(1)
+            .ok_or_else(|| corruption("branch selector generation overflowed"))?;
+        let pack_id = self
+            .stage_hot_pack(
+                view,
+                repository_root_id,
+                branch_snapshot.branch_id,
+                selector_generation,
+            )
+            .await?;
+        branch_snapshot.hot_pack_object_id = pack_id;
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
-        self.stage_repository_root(repository_root)?;
         self.install_branch_selector(view, snapshot_id)
     }
 
@@ -1457,7 +1656,7 @@ impl PreparedPublication {
     /// catalog pruning under the same epoch. The path-copied catalog edits are
     /// the retirement proof; immutable branch/commit/state objects become
     /// sweep candidates only after this selector/catalog move commits.
-    pub(crate) fn publish_branch_retirement<R>(
+    pub(crate) async fn publish_branch_retirement<R>(
         &mut self,
         view: &CoherentView<R>,
         commit_catalog_edit: CatalogTreeEdit,
@@ -1475,10 +1674,536 @@ impl PreparedPublication {
                 "branch retirement catalogs or global view are inconsistent",
             ));
         }
+        let retired_commit_ids = commit_catalog_edit.retired_commit_ids.clone();
+        let retired_change_ids = change_catalog_edit.retired_change_ids.clone();
         self.stage_catalog_edit(commit_catalog_edit)?;
         self.stage_catalog_edit(change_catalog_edit)?;
-        self.stage_repository_root(repository_root)?;
+        let repository_root_id = self.stage_repository_root(repository_root)?;
+        self.rebind_surviving_branch_packs(
+            view,
+            repository_root_id,
+            repository_root,
+            &retired_commit_ids,
+            &retired_change_ids,
+            Some(view.branch_id()),
+        )
+        .await?;
+        self.rebind_retained_snapshot_packs(
+            view,
+            repository_root_id,
+            repository_root,
+            &retired_commit_ids,
+            &retired_change_ids,
+            None,
+        )
+        .await?;
         self.delete_branch_selector(view.branch_selector(), view.raw_branch_selector().clone())
+    }
+
+    async fn authenticated_ordered_tree_closure<R>(
+        &self,
+        read: &R,
+        roots: &[ObjectId],
+    ) -> Result<BTreeSet<ObjectId>, StorageError>
+    where
+        R: StorageAdapterRead + ?Sized,
+    {
+        let mut pending = roots.to_vec();
+        let mut closure = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !closure.insert(id) {
+                continue;
+            }
+            let bytes = match self.object_puts.get(id) {
+                Some(bytes) => bytes.clone(),
+                None => super::view::load_object_bytes(read, id).await?,
+            };
+            if super::object::authenticate_object_domain(id, &bytes)?
+                != ObjectDomain::OrderedTreeNode
+            {
+                return Err(corruption(
+                    "pack tree closure root is not an authenticated ordered-tree node",
+                ));
+            }
+            let edges = super::tree::ordered_tree_edges(id, &bytes)?;
+            for (child, domain) in edges.object_ids {
+                if domain == ObjectDomain::OrderedTreeNode {
+                    pending.push(child);
+                }
+            }
+        }
+        Ok(closure)
+    }
+
+    async fn rebind_surviving_branch_packs<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        repository_root_id: ObjectId,
+        repository_root: RepositoryRootV1,
+        retired_commit_ids: &BTreeSet<super::model::CommitId>,
+        retired_change_ids: &BTreeSet<super::model::ChangeId>,
+        skip_branch: Option<super::model::CanonicalBranchId>,
+    ) -> Result<(), StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        let range = Prefix {
+            bytes: Bytes::from_static(b"branch/"),
+        }
+        .to_range()?;
+        let read = view.operation_read();
+        let mut cursor = read
+            .begin_scan(
+                SELECTOR_SPACE,
+                range,
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    order: ScanOrder::Ascending,
+                },
+            )
+            .await?;
+        loop {
+            let page = cursor.next_page(256).await?;
+            for entry in page.entries {
+                let raw_selector = match entry.value {
+                    ProjectedValue::FullValue(bytes) => bytes,
+                    ProjectedValue::KeyOnly => {
+                        return Err(corruption("branch selector rebind returned key-only data"));
+                    }
+                };
+                let selector = BranchSelectorV1::decode(&raw_selector)?;
+                if entry.key.0 != branch_selector_key(selector.branch_id) {
+                    return Err(corruption(
+                        "branch selector rebind key and branch identity differ",
+                    ));
+                }
+                if skip_branch == Some(selector.branch_id) {
+                    continue;
+                }
+                let snapshot_bytes =
+                    super::view::load_object_bytes(read, selector.branch_snapshot_object_id)
+                        .await?;
+                let snapshot =
+                    BranchSnapshotV1::decode(selector.branch_snapshot_object_id, &snapshot_bytes)?;
+                if snapshot.branch_id != selector.branch_id {
+                    return Err(corruption(
+                        "surviving branch snapshot identity is not authenticated",
+                    ));
+                }
+                let pack_bytes =
+                    super::view::load_object_bytes(read, snapshot.hot_pack_object_id).await?;
+                let pack = HotObjectPackV1::decode(snapshot.hot_pack_object_id, &pack_bytes)?;
+                if pack.branch_id != selector.branch_id {
+                    return Err(corruption(
+                        "surviving branch hot pack identity is not authenticated",
+                    ));
+                }
+                let mut entries = BTreeMap::new();
+                if let Some(base_id) = pack.base_pack_object_id {
+                    let base_bytes = super::view::load_object_bytes(read, base_id).await?;
+                    let base = HotObjectPackV1::decode(base_id, &base_bytes)?;
+                    if base.branch_id != selector.branch_id || base.base_pack_object_id.is_some() {
+                        return Err(corruption(
+                            "surviving branch hot pack base is not a single authenticated generation",
+                        ));
+                    }
+                    for entry in base.entries {
+                        if entries.insert(entry.object_id, entry).is_some() {
+                            return Err(corruption("surviving branch hot pack repeats an object"));
+                        }
+                    }
+                }
+                for entry in pack.entries {
+                    if entries.insert(entry.object_id, entry).is_some() {
+                        return Err(corruption("surviving branch hot pack repeats an object"));
+                    }
+                }
+                let tree_closure = self
+                    .authenticated_ordered_tree_closure(
+                        read,
+                        &[
+                            repository_root.global_state_root,
+                            repository_root.commit_catalog_root,
+                            repository_root.change_catalog_root,
+                            repository_root.retention_policy_root,
+                            snapshot.local_state_root,
+                            snapshot.historical_global_state_root,
+                        ],
+                    )
+                    .await?;
+                for (object_id, bytes) in self.object_puts.iter() {
+                    let domain = super::object::authenticate_object_domain(object_id, bytes)?;
+                    if !super::object::hot_packable_object(object_id, bytes)? {
+                        continue;
+                    }
+                    let entry = HotObjectPackEntry {
+                        object_id,
+                        domain,
+                        bytes: bytes.clone(),
+                    };
+                    if let Some(existing) = entries.get(&object_id) {
+                        if existing.bytes != entry.bytes {
+                            return Err(corruption(
+                                "surviving branch hot pack assigns new bytes to an object",
+                            ));
+                        }
+                    } else {
+                        entries.insert(object_id, entry);
+                    }
+                }
+                for object_id in [
+                    repository_root_id,
+                    repository_root.global_state_root,
+                    repository_root.commit_catalog_root,
+                    repository_root.change_catalog_root,
+                    repository_root.retention_policy_root,
+                    snapshot.local_state_root,
+                    snapshot.historical_global_state_root,
+                    snapshot.semantic_head_commit_object_id,
+                ] {
+                    let bytes = match self.object_puts.get(object_id) {
+                        Some(bytes) => bytes.clone(),
+                        None => super::view::load_object_bytes(read, object_id).await?,
+                    };
+                    let domain = super::object::authenticate_object_domain(object_id, &bytes)?;
+                    if !super::object::hot_packable_object(object_id, &bytes)? {
+                        continue;
+                    }
+                    let entry = HotObjectPackEntry {
+                        object_id,
+                        domain,
+                        bytes,
+                    };
+                    if let Some(existing) = entries.get(&object_id) {
+                        if existing.bytes != entry.bytes {
+                            return Err(corruption("surviving branch hot pack root bytes changed"));
+                        }
+                    } else {
+                        entries.insert(object_id, entry);
+                    }
+                }
+                entries.retain(|object_id, entry| match entry.domain {
+                    ObjectDomain::RepositoryRoot => *object_id == repository_root_id,
+                    ObjectDomain::OrderedTreeNode => tree_closure.contains(object_id),
+                    ObjectDomain::SemanticChange => {
+                        let Ok(change) = ChangeObjectV1::decode(*object_id, &entry.bytes) else {
+                            return false;
+                        };
+                        !retired_change_ids.contains(&change.change_id())
+                    }
+                    ObjectDomain::BranchRefChange => {
+                        let Ok(ChangeObjectV1::BranchRef {
+                            change_id,
+                            branch_id,
+                            ..
+                        }) = ChangeObjectV1::decode(*object_id, &entry.bytes)
+                        else {
+                            return false;
+                        };
+                        !retired_change_ids.contains(&change_id) && branch_id == selector.branch_id
+                    }
+                    ObjectDomain::Commit => {
+                        let Ok(commit) = CommitObjectV1::decode(*object_id, &entry.bytes) else {
+                            return false;
+                        };
+                        !retired_commit_ids.contains(&commit.commit_id)
+                    }
+                    ObjectDomain::CommitMemberPageV1 => {
+                        let Ok(page) = CommitMemberPageV1::decode(*object_id, &entry.bytes) else {
+                            return false;
+                        };
+                        !retired_commit_ids.contains(&page.commit_id)
+                    }
+                    _ => true,
+                });
+                let rebound = HotObjectPackV1 {
+                    branch_id: selector.branch_id,
+                    repository_root_id,
+                    epoch: self.next_global.epoch,
+                    view_id: super::view::derive_pack_view_id(
+                        repository_root_id,
+                        selector.branch_id,
+                        selector.selector_generation,
+                    ),
+                    base_pack_object_id: None,
+                    entries: entries.into_values().collect(),
+                };
+                let (rebound_id, rebound_bytes) = rebound.encode()?;
+                self.stage_encoded_object(rebound_id, rebound_bytes)?;
+                let rebound_snapshot = BranchSnapshotV1 {
+                    hot_pack_object_id: rebound_id,
+                    ..snapshot
+                };
+                let (snapshot_id, snapshot_bytes) = rebound_snapshot.encode()?;
+                self.stage_encoded_object(snapshot_id, snapshot_bytes)?;
+                let next_selector = BranchSelectorV1 {
+                    branch_id: selector.branch_id,
+                    branch_snapshot_object_id: snapshot_id,
+                    selector_generation: selector.selector_generation,
+                };
+                self.put_selector(
+                    Bytes::from(entry.key.0),
+                    next_selector.encode()?,
+                    SelectorExpectation::Equals(raw_selector),
+                )?;
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn rebind_retained_snapshot_packs<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        repository_root_id: ObjectId,
+        repository_root: RepositoryRootV1,
+        retired_commit_ids: &BTreeSet<super::model::CommitId>,
+        retired_change_ids: &BTreeSet<super::model::ChangeId>,
+        skip_selector: Option<SnapshotSelectorV1>,
+    ) -> Result<(), StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        let read = view.operation_read();
+        for role in [
+            SnapshotRole::Checkpoint,
+            SnapshotRole::Recovery,
+            SnapshotRole::Undo,
+            SnapshotRole::Redo,
+            SnapshotRole::BranchTombstone,
+        ] {
+            let range = Prefix {
+                bytes: Bytes::copy_from_slice(role.key_prefix()),
+            }
+            .to_range()?;
+            let mut cursor = read
+                .begin_scan(
+                    SELECTOR_SPACE,
+                    range,
+                    BeginScanOptions {
+                        projection: CoreProjection::FullValue,
+                        order: ScanOrder::Ascending,
+                    },
+                )
+                .await?;
+            loop {
+                let page = cursor.next_page(256).await?;
+                for entry in page.entries {
+                    if let Some(skip) = skip_selector
+                        && entry.key.0 == snapshot_selector_key(skip.role, skip.selector_id)
+                    {
+                        continue;
+                    }
+                    let raw_selector = match entry.value {
+                        ProjectedValue::FullValue(bytes) => bytes,
+                        ProjectedValue::KeyOnly => {
+                            return Err(corruption(
+                                "retained snapshot rebind returned key-only data",
+                            ));
+                        }
+                    };
+                    let selector = SnapshotSelectorV1::decode(&raw_selector)?;
+                    if selector.role != role
+                        || entry.key.0 != snapshot_selector_key(role, selector.selector_id)
+                    {
+                        return Err(corruption(
+                            "retained snapshot selector key and identity differ",
+                        ));
+                    }
+                    let target_bytes =
+                        super::view::load_object_bytes(read, selector.target_object_id).await?;
+                    let target =
+                        SnapshotTargetV1::decode(selector.target_object_id, &target_bytes)?;
+                    if target.role != selector.role || target.selector_id != selector.selector_id {
+                        return Err(corruption(
+                            "retained snapshot target and selector identity differ",
+                        ));
+                    }
+                    let snapshot_bytes =
+                        super::view::load_object_bytes(read, target.branch_snapshot_object_id)
+                            .await?;
+                    let snapshot = BranchSnapshotV1::decode(
+                        target.branch_snapshot_object_id,
+                        &snapshot_bytes,
+                    )?;
+                    if snapshot.branch_id != target.branch_id
+                        || snapshot.semantic_head_commit_object_id
+                            != target.semantic_commit_object_id
+                    {
+                        return Err(corruption(
+                            "retained snapshot target and branch snapshot disagree",
+                        ));
+                    }
+                    let semantic_commit_bytes =
+                        super::view::load_object_bytes(read, target.semantic_commit_object_id)
+                            .await?;
+                    let semantic_commit = CommitObjectV1::decode(
+                        target.semantic_commit_object_id,
+                        &semantic_commit_bytes,
+                    )?;
+                    if retired_commit_ids.contains(&semantic_commit.commit_id) {
+                        return Err(corruption(
+                            "retained snapshot semantic commit is retired before selector release",
+                        ));
+                    }
+                    if let Some(ref_id) = snapshot.latest_ref_change_object_id {
+                        let ref_bytes = super::view::load_object_bytes(read, ref_id).await?;
+                        let change = ChangeObjectV1::decode(ref_id, &ref_bytes)?;
+                        if retired_change_ids.contains(&change.change_id()) {
+                            return Err(corruption(
+                                "retained snapshot ref change is retired before selector release",
+                            ));
+                        }
+                    }
+                    let pack_bytes =
+                        super::view::load_object_bytes(read, snapshot.hot_pack_object_id).await?;
+                    let pack = HotObjectPackV1::decode(snapshot.hot_pack_object_id, &pack_bytes)?;
+                    if pack.branch_id != snapshot.branch_id {
+                        return Err(corruption(
+                            "retained snapshot hot pack identity is not authenticated",
+                        ));
+                    }
+                    let mut entries = BTreeMap::new();
+                    if let Some(base_id) = pack.base_pack_object_id {
+                        let base_bytes = super::view::load_object_bytes(read, base_id).await?;
+                        let base = HotObjectPackV1::decode(base_id, &base_bytes)?;
+                        if base.branch_id != snapshot.branch_id
+                            || base.base_pack_object_id.is_some()
+                        {
+                            return Err(corruption(
+                                "retained snapshot hot pack base is not one generation",
+                            ));
+                        }
+                        for item in base.entries {
+                            if entries.insert(item.object_id, item).is_some() {
+                                return Err(corruption(
+                                    "retained snapshot hot pack repeats an object",
+                                ));
+                            }
+                        }
+                    }
+                    for item in pack.entries {
+                        if entries.insert(item.object_id, item).is_some() {
+                            return Err(corruption("retained snapshot hot pack repeats an object"));
+                        }
+                    }
+                    let tree_closure = self
+                        .authenticated_ordered_tree_closure(
+                            read,
+                            &[
+                                repository_root.global_state_root,
+                                repository_root.commit_catalog_root,
+                                repository_root.change_catalog_root,
+                                repository_root.retention_policy_root,
+                                snapshot.local_state_root,
+                                snapshot.historical_global_state_root,
+                            ],
+                        )
+                        .await?;
+                    for (object_id, bytes) in self.object_puts.iter() {
+                        let domain = super::object::authenticate_object_domain(object_id, bytes)?;
+                        if !super::object::hot_packable_object(object_id, bytes)? {
+                            continue;
+                        }
+                        let item = HotObjectPackEntry {
+                            object_id,
+                            domain,
+                            bytes: bytes.clone(),
+                        };
+                        if let Some(existing) = entries.get(&object_id) {
+                            if existing.bytes != item.bytes {
+                                return Err(corruption(
+                                    "retained snapshot hot pack assigns new bytes to an object",
+                                ));
+                            }
+                        } else {
+                            entries.insert(object_id, item);
+                        }
+                    }
+                    let mut roots = vec![
+                        repository_root_id,
+                        repository_root.global_state_root,
+                        repository_root.commit_catalog_root,
+                        repository_root.change_catalog_root,
+                        repository_root.retention_policy_root,
+                        snapshot.local_state_root,
+                        snapshot.historical_global_state_root,
+                        snapshot.semantic_head_commit_object_id,
+                    ];
+                    if let Some(ref_id) = snapshot.latest_ref_change_object_id {
+                        roots.push(ref_id);
+                    }
+                    for object_id in roots {
+                        let bytes = match self.object_puts.get(object_id) {
+                            Some(bytes) => bytes.clone(),
+                            None => super::view::load_object_bytes(read, object_id).await?,
+                        };
+                        let domain = super::object::authenticate_object_domain(object_id, &bytes)?;
+                        if !super::object::hot_packable_object(object_id, &bytes)? {
+                            continue;
+                        }
+                        let item = HotObjectPackEntry {
+                            object_id,
+                            domain,
+                            bytes,
+                        };
+                        if let Some(existing) = entries.get(&object_id) {
+                            if existing.bytes != item.bytes {
+                                return Err(corruption(
+                                    "retained snapshot hot pack root bytes changed",
+                                ));
+                            }
+                        } else {
+                            entries.insert(object_id, item);
+                        }
+                    }
+                    entries.retain(|object_id, entry| match entry.domain {
+                        ObjectDomain::RepositoryRoot => *object_id == repository_root_id,
+                        ObjectDomain::OrderedTreeNode => tree_closure.contains(object_id),
+                        _ => true,
+                    });
+                    let rebound = HotObjectPackV1 {
+                        branch_id: snapshot.branch_id,
+                        repository_root_id,
+                        epoch: self.next_global.epoch,
+                        view_id: super::view::derive_pack_view_id(
+                            repository_root_id,
+                            snapshot.branch_id,
+                            selector.selector_generation,
+                        ),
+                        base_pack_object_id: None,
+                        entries: entries.into_values().collect(),
+                    };
+                    let (rebound_id, rebound_bytes) = rebound.encode()?;
+                    self.stage_encoded_object(rebound_id, rebound_bytes)?;
+                    let rebound_snapshot = BranchSnapshotV1 {
+                        hot_pack_object_id: rebound_id,
+                        ..snapshot
+                    };
+                    let (snapshot_id, snapshot_bytes) = rebound_snapshot.encode()?;
+                    self.stage_encoded_object(snapshot_id, snapshot_bytes)?;
+                    let rebound_target = SnapshotTargetV1 {
+                        branch_snapshot_object_id: snapshot_id,
+                        ..target
+                    };
+                    let target_id = self.stage_snapshot_target(rebound_target)?;
+                    let rebound_selector = SnapshotSelectorV1 {
+                        target_object_id: target_id,
+                        ..selector
+                    };
+                    self.put_snapshot_selector(
+                        rebound_selector,
+                        SelectorExpectation::Equals(raw_selector),
+                    )?;
+                }
+                if !page.has_more {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Lowers one authenticated publication into the engine's canonical
