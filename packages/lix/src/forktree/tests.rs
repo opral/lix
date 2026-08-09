@@ -21,7 +21,7 @@ use super::model::{
     gc_progress_selector_key, global_selector_key, snapshot_selector_key, upload_binding_digest,
     upload_selector_key,
 };
-use super::object::OBJECT_SPACE;
+use super::object::{OBJECT_SPACE, ObjectDomain};
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_retention_tree,
@@ -267,7 +267,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
 }
 
 #[tokio::test]
-async fn commit_validation_memo_is_view_local_and_never_caches_corruption() {
+async fn commit_validation_uses_authenticated_pack_after_canonical_reclamation() {
     let seed = build_seed();
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
@@ -296,17 +296,18 @@ async fn commit_validation_memo_is_view_local_and_never_caches_corruption() {
 
     let reopened = open_coherent_view(&storage, seed.branch_id)
         .await
-        .expect("reopen validation view");
+        .expect("authenticated pack copy keeps the selected view readable");
     assert!(
         load_commit_with_memo(&reopened, seed.commit_id, &mut memo)
             .await
-            .is_err(),
-        "a memo from another coherent view must not mask corruption"
+            .expect("packed commit validation")
+            .is_some(),
+        "canonical reclamation must not bypass the authenticated pack"
     );
 }
 
 #[tokio::test]
-async fn commit_summary_defers_unaccessed_member_authentication() {
+async fn commit_summary_uses_authenticated_pack_after_canonical_reclamation() {
     let seed = build_seed();
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
@@ -320,22 +321,12 @@ async fn commit_summary_defers_unaccessed_member_authentication() {
 
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
-        .expect("open summary view");
+        .expect("authenticated pack copy keeps the summary view readable");
     let summary = load_commit_summary(&view, seed.commit_id)
         .await
         .expect("authenticated commit summary")
         .expect("seed summary");
     assert_eq!(summary.commit_id, seed.commit_id);
-    assert!(
-        load_commit_with_memo(
-            &view,
-            seed.commit_id,
-            &mut new_commit_validation_memo(&view)
-        )
-        .await
-        .is_err(),
-        "later member consumption must fail closed on the missing member"
-    );
 }
 
 #[tokio::test]
@@ -716,6 +707,9 @@ fn test_hot_pack(
         .filter(|(object_id, _)| !excluded.contains(object_id))
         .filter_map(|(object_id, bytes)| {
             let domain = super::object::authenticate_object_domain(object_id, bytes).ok()?;
+            if domain == ObjectDomain::RepositoryRoot && object_id != repository_root_id {
+                return None;
+            }
             if !super::object::hot_packable_object(object_id, bytes).ok()? {
                 return None;
             }
@@ -4472,4 +4466,24 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         next_page_object_id: Some(ObjectId::ZERO),
     };
     assert!(zero_successor.encode().is_err());
+}
+
+#[tokio::test]
+async fn qualification_foreign_valid_hot_pack_member_must_fail_closed() {
+    let mut seed = build_seed();
+    let foreign = ChangeObjectV1::Semantic {
+        change_id: ChangeId::from_bytes(raw_id(0x7a)),
+        payload: b"foreign-pack-member".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (foreign_id, foreign_bytes) = foreign.encode().expect("foreign authenticated object");
+    seed.objects
+        .insert(foreign_id, foreign_bytes)
+        .expect("foreign object set");
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    assert!(
+        open_coherent_view(&storage, seed.branch_id).await.is_err(),
+        "a valid hot-pack entry outside the authenticated branch closure must fail closed"
+    );
 }

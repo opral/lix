@@ -107,24 +107,9 @@ pub(super) fn authenticate_object_domain(
 }
 
 pub(super) const fn hot_packable_domain(domain: ObjectDomain) -> bool {
-    !matches!(
+    matches!(
         domain,
-        ObjectDomain::BranchSnapshot
-            | ObjectDomain::Commit
-            | ObjectDomain::CommitMemberPageV1
-            | ObjectDomain::SemanticChange
-            | ObjectDomain::BranchRefChange
-            | ObjectDomain::UploadPart
-            | ObjectDomain::UploadProgress
-            | ObjectDomain::BlobChunk
-            | ObjectDomain::BlobManifest
-            | ObjectDomain::SnapshotTarget
-            | ObjectDomain::GcMarkPackV2
-            | ObjectDomain::GcProgressV2
-            | ObjectDomain::GcRadixNodeV1
-            | ObjectDomain::GcQueuePackV1
-            | ObjectDomain::GcLiveBranchPackV1
-            | ObjectDomain::HotObjectPackV1
+        ObjectDomain::RepositoryRoot | ObjectDomain::SemanticChange
     )
 }
 

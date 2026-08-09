@@ -31,7 +31,7 @@ use super::publication::PreparedPublication;
 use super::serving::{validate_retained_commit, validate_retained_ref_change};
 use super::state::{UNTRACKED_ROW_SPACE, decode_untracked_key, decode_untracked_value};
 use super::tree::ordered_tree_edges;
-use super::view::{SELECTOR_SPACE, load_object_bytes};
+use super::view::{PackedRead, SELECTOR_SPACE, load_facade_hot_objects, load_object_bytes};
 
 const SELECTOR_PAGE_ROWS: usize = 256;
 const UNTRACKED_PAGE_ROWS: usize = 1;
@@ -74,6 +74,7 @@ pub(crate) enum GcStepStatus {
 
 struct GcSnapshot<R> {
     read: R,
+    hot_objects: BTreeMap<ObjectId, Bytes>,
     raw_global: Bytes,
     global: GlobalSelectorV1,
     raw_progress_selector: Option<Bytes>,
@@ -205,6 +206,7 @@ where
     }
     let raw_global = required_full(loaded.values[0].clone(), "global selector is absent")?;
     let global = GlobalSelectorV1::decode(&raw_global)?;
+    let hot_objects = load_facade_hot_objects(&read).await?;
     let raw_progress_selector = match loaded.values[1].clone() {
         None => None,
         Some(ProjectedValue::FullValue(bytes)) => Some(bytes),
@@ -232,6 +234,7 @@ where
     };
     Ok(GcSnapshot {
         read,
+        hot_objects,
         raw_global,
         global,
         raw_progress_selector,
@@ -588,6 +591,7 @@ where
     R: StorageAdapterRead,
 {
     let mut edit = MaintenanceEdit::default();
+    let packed = PackedRead::new(&snapshot.read, &snapshot.hot_objects, ObjectId::ZERO);
     let work = budget.max_claims.min(TRAVERSAL_BATCH_CLAIMS).max(1);
     let mut paged_edges = 0_usize;
     for _ in 0..work {
@@ -608,7 +612,7 @@ where
             .queue_pop_sequence
             .checked_add(1)
             .ok_or_else(|| corruption("GC queue pop sequence overflowed"))?;
-        let page = edge_page(&snapshot.read, snapshot.global.repository_root, &claim).await?;
+        let page = edge_page(&packed, snapshot.global.repository_root, &claim).await?;
         paged_edges = paged_edges.saturating_add(page.edges.len());
         for edge in page.edges {
             enqueue_root(&snapshot.read, &mut edit, progress, edge.id, edge.domain).await?;
