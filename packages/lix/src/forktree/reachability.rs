@@ -965,6 +965,9 @@ where
                 typed(value.change_catalog_root, ObjectDomain::OrderedTreeNode),
                 typed(value.retention_policy_root, ObjectDomain::OrderedTreeNode),
             ]);
+            if let Some(pack) = value.global_entity_pack_root {
+                edges.push(typed(pack, ObjectDomain::EntityStatePackV1));
+            }
         }
         ObjectDomain::BranchSnapshot => {
             let value = BranchSnapshotV1::decode(id, bytes)?;
@@ -977,6 +980,9 @@ where
                     ObjectDomain::OrderedTreeNode,
                 ),
             ]);
+            if let Some(pack) = value.local_entity_pack_root {
+                edges.push(typed(pack, ObjectDomain::EntityStatePackV1));
+            }
             if let Some(id) = value.latest_ref_change_object_id {
                 edges.push(typed(id, ObjectDomain::BranchRefChange));
             }
@@ -1025,6 +1031,26 @@ where
             }
             if let Some(next) = page.next_page_object_id {
                 edges.push(typed(next, ObjectDomain::CommitMemberPageV1));
+            }
+        }
+        ObjectDomain::EntityStatePackV1 => {
+            let pack = super::pack::EntityStatePackV1::decode(id, bytes)?;
+            edges.push(typed(pack.state_root, ObjectDomain::OrderedTreeNode));
+            for page in pack.pages {
+                edges.extend(
+                    [typed(page.object_id, ObjectDomain::EntityStatePackPageV1)].into_iter(),
+                );
+            }
+        }
+        ObjectDomain::EntityStatePackPageV1 => {
+            let page = super::pack::EntityStatePackPageV1::decode(id, bytes)?;
+            for (_, value) in page.rows {
+                edges.extend(
+                    value
+                        .blob_manifest_object_ids
+                        .into_iter()
+                        .map(|id| typed(id, ObjectDomain::BlobManifest)),
+                );
             }
         }
         ObjectDomain::SemanticChange => {

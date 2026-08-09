@@ -40,11 +40,11 @@ use super::{
     SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
     StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef,
     UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
-    advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
-    load_commit_member_records, load_commit_summary, load_commit_topologies, load_commit_with_memo,
-    new_commit_validation_memo, open_coherent_view, page_changes, page_commits,
-    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
-    state_range,
+    advance_gc, edit_state_tree, encode_state_key, encode_state_schema_bounds, encode_state_value,
+    load_change, load_commit, load_commit_member_records, load_commit_summary,
+    load_commit_topologies, load_commit_with_memo, new_commit_validation_memo, open_coherent_view,
+    page_changes, page_commits, prepare_upload_completion, put_change_catalog_entries,
+    put_commit_catalog_entries, state_point, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -636,6 +636,7 @@ fn build_seed() -> SeedData {
         .expect("change catalog objects");
     let repository_root = RepositoryRootV1 {
         global_state_root,
+        global_entity_pack_root: None,
         commit_catalog_root,
         change_catalog_root,
         retention_policy_root: retention_root,
@@ -648,6 +649,7 @@ fn build_seed() -> SeedData {
     let branch_snapshot = BranchSnapshotV1 {
         branch_id,
         local_state_root,
+        local_entity_pack_root: None,
         semantic_head_commit_object_id: commit_object_id,
         latest_ref_change_object_id: Some(ref_change_object_id),
         historical_global_state_root: global_state_root,
@@ -915,6 +917,7 @@ async fn branch_transition<R: StorageAdapterRead>(
         branch_snapshot: BranchSnapshotV1 {
             branch_id: view.branch_id(),
             local_state_root,
+            local_entity_pack_root: view.branch_snapshot().local_entity_pack_root,
             semantic_head_commit_object_id: commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: view.repository_root().global_state_root,
@@ -1010,6 +1013,31 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     .expect("update/remove path copy");
     assert_eq!(edit.entry_count(), 2);
     assert!(edit.copied_nodes() >= 2);
+}
+
+#[test]
+fn state_schema_bounds_cover_all_authenticated_key_dimensions() {
+    let (lower, upper) = encode_state_schema_bounds("app.row");
+    let no_file = encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: None,
+        entity_pk: &EntityPk::single("alpha"),
+    });
+    let with_file = encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: Some("file-1"),
+        entity_pk: &EntityPk::single("alpha"),
+    });
+    let other_schema = encode_state_key(StateKeyRef {
+        schema_key: "app.rows",
+        file_id: None,
+        entity_pk: &EntityPk::single("alpha"),
+    });
+    assert!(lower.as_slice() <= no_file.as_slice());
+    assert!(no_file.as_slice() < upper.as_slice());
+    assert!(lower.as_slice() <= with_file.as_slice());
+    assert!(with_file.as_slice() < upper.as_slice());
+    assert!(other_schema.as_slice() >= upper.as_slice());
 }
 
 #[tokio::test]
@@ -3540,6 +3568,7 @@ async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBr
     let snapshot = BranchSnapshotV1 {
         branch_id: disposable,
         local_state_root: seed.local_state_root,
+        local_entity_pack_root: None,
         semantic_head_commit_object_id: seed.commit_object_id,
         latest_ref_change_object_id: Some(disposable_ref_object_id),
         historical_global_state_root: seed.global_state_root,

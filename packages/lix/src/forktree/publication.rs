@@ -372,6 +372,17 @@ impl PreparedPublication {
         self.object_puts.insert(id, bytes)
     }
 
+    fn stage_entity_pack(
+        &mut self,
+        pack: super::pack::EncodedEntityStatePack,
+    ) -> Result<(), StorageError> {
+        self.stage_encoded_object(pack.root_id, pack.root_bytes)?;
+        for (id, bytes) in pack.page_objects {
+            self.stage_encoded_object(id, bytes)?;
+        }
+        Ok(())
+    }
+
     fn stage_object_set(&mut self, objects: ImmutableObjectSet) -> Result<(), StorageError> {
         for (id, bytes) in objects.iter() {
             self.stage_encoded_object(id, bytes.clone())?;
@@ -421,6 +432,12 @@ impl PreparedPublication {
             json_payload_object_ids: Vec::new(),
         };
         let (ref_object_id, ref_bytes) = branch_ref.encode()?;
+        let local_entity_pack = {
+            let overlay = view.object_overlay(&self.object_puts);
+            view.entity_pack_for_state_root_with_read(source_commit.local_state_root, &overlay)
+                .await?
+        };
+        let local_entity_pack_root = local_entity_pack.root_id;
         let base_repository_root = self.next_repository_root.unwrap_or(view.repository_root());
         let overlay = view.object_overlay(&self.object_puts);
         let change_catalog_edit = super::serving::put_change_catalog_entries(
@@ -442,15 +459,18 @@ impl PreparedPublication {
         let branch_snapshot = BranchSnapshotV1 {
             branch_id,
             local_state_root: source_commit.local_state_root,
+            local_entity_pack_root: Some(local_entity_pack_root),
             semantic_head_commit_object_id: source_commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: source_commit.global_state_root,
         };
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
+        self.stage_entity_pack(local_entity_pack)?;
         self.stage_catalog_edit(change_catalog_edit)?;
         self.stage_repository_root(RepositoryRootV1 {
             global_state_root: base_repository_root.global_state_root,
+            global_entity_pack_root: base_repository_root.global_entity_pack_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
             retention_policy_root: base_repository_root.retention_policy_root,
@@ -503,6 +523,12 @@ impl PreparedPublication {
             json_payload_object_ids: Vec::new(),
         };
         let (ref_object_id, ref_bytes) = branch_ref.encode()?;
+        let local_entity_pack = {
+            let overlay = view.object_overlay(&self.object_puts);
+            view.entity_pack_for_state_root_with_read(next_commit.local_state_root, &overlay)
+                .await?
+        };
+        let local_entity_pack_root = local_entity_pack.root_id;
         let base_repository_root = self.next_repository_root.unwrap_or(view.repository_root());
         // A preceding semantic publication may have produced the catalog root
         // in this same PreparedPublication. Read those immutable path-copy
@@ -527,6 +553,7 @@ impl PreparedPublication {
         let branch_snapshot = BranchSnapshotV1 {
             branch_id: view.branch_id(),
             local_state_root: next_commit.local_state_root,
+            local_entity_pack_root: Some(local_entity_pack_root),
             semantic_head_commit_object_id: next_commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: next_commit.global_state_root,
@@ -535,8 +562,10 @@ impl PreparedPublication {
         let next_change_catalog_root = change_catalog_edit.root;
         self.stage_catalog_edit(change_catalog_edit)?;
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
+        self.stage_entity_pack(local_entity_pack)?;
         self.stage_repository_root(RepositoryRootV1 {
             global_state_root: base_repository_root.global_state_root,
+            global_entity_pack_root: base_repository_root.global_entity_pack_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
             retention_policy_root: base_repository_root.retention_policy_root,
@@ -853,6 +882,26 @@ impl PreparedPublication {
         if is_global == is_branch_local {
             return Err(corruption(
                 "state edit must install at exactly one global or branch-local root",
+            ));
+        }
+        let pack_edges_match = if repository_root.global_entity_pack_root.is_none()
+            && branch_snapshot.local_entity_pack_root.is_none()
+            && view.repository_root().global_entity_pack_root.is_none()
+            && view.branch_snapshot().local_entity_pack_root.is_none()
+        {
+            true
+        } else if is_global {
+            repository_root.global_entity_pack_root == Some(state_edit.entity_pack_root)
+                && branch_snapshot.local_entity_pack_root
+                    == view.branch_snapshot().local_entity_pack_root
+        } else {
+            repository_root.global_entity_pack_root
+                == view.repository_root().global_entity_pack_root
+                && branch_snapshot.local_entity_pack_root == Some(state_edit.entity_pack_root)
+        };
+        if !pack_edges_match {
+            return Err(corruption(
+                "state transition entity pack is not bound to its published state root",
             ));
         }
         let expected_state_base = if is_global {
@@ -1232,6 +1281,30 @@ impl PreparedPublication {
         {
             return Err(corruption(
                 "final ordered Commit does not authenticate selected branch/repository roots",
+            ));
+        }
+        let final_pack = state_edits
+            .last()
+            .ok_or_else(|| corruption("ordered history has no final state pack"))?
+            .entity_pack_root;
+        let pack_edges_match = if repository_root.global_entity_pack_root.is_none()
+            && branch_snapshot.local_entity_pack_root.is_none()
+            && view.repository_root().global_entity_pack_root.is_none()
+            && view.branch_snapshot().local_entity_pack_root.is_none()
+        {
+            true
+        } else if is_global {
+            repository_root.global_entity_pack_root == Some(final_pack)
+                && branch_snapshot.local_entity_pack_root
+                    == view.branch_snapshot().local_entity_pack_root
+        } else {
+            repository_root.global_entity_pack_root
+                == view.repository_root().global_entity_pack_root
+                && branch_snapshot.local_entity_pack_root == Some(final_pack)
+        };
+        if !pack_edges_match {
+            return Err(corruption(
+                "ordered history entity pack is not bound to its published state root",
             ));
         }
         let (ref_object_id, ref_bytes) = branch_ref_change.encode()?;

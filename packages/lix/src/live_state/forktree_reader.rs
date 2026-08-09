@@ -15,7 +15,7 @@ use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_key, state_point, state_range,
+    encode_state_key, state_point,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -106,10 +106,10 @@ where
             "current ForkTree reader view does not match requested branch",
         ));
     }
-    let rows = state_range(&view, None, None, None, true).await?;
+    let rows = view.current_entity_state_rows().await?;
     let mut output = Vec::with_capacity(rows.len());
-    for row in rows {
-        let key = decode_state_key(&row.encoded_key)?;
+    for (encoded_key, value, source) in rows {
+        let key = decode_state_key(&encoded_key)?;
         if !request.filter.schema_keys.is_empty()
             && !request
                 .filter
@@ -136,14 +136,20 @@ where
         {
             continue;
         }
-        if row.value.cell.deleted() && !request.filter.include_tombstones {
+        if value.cell.deleted() && !request.filter.include_tombstones {
             continue;
         }
-        let branch_owner = match row.source {
+        let branch_owner = match source {
             StateSource::Global | StateSource::Branch => branch_id_text(branch_id),
         };
         output.push(materialize_row(
-            row,
+            crate::forktree::VisibleStateRow {
+                encoded_key,
+                value,
+                source,
+                #[cfg(test)]
+                view_instance_id: view.view_instance_id(),
+            },
             key.entity_pk,
             key.schema_key,
             key.file_id,
@@ -673,9 +679,19 @@ fn materialize_row(
     file_id: Option<String>,
     branch_id: String,
 ) -> MaterializedLiveStateRow {
-    let deleted = row.value.cell.deleted();
-    let snapshot_content = match &row.value.cell {
-        StateCell::Value(value) => Some(value.clone()),
+    let crate::forktree::VisibleStateRow { value, source, .. } = row;
+    let crate::forktree::StateValue {
+        change_id,
+        commit_id,
+        created_at,
+        updated_at,
+        cell,
+        metadata,
+        ..
+    } = value;
+    let deleted = cell.deleted();
+    let snapshot_content = match cell {
+        StateCell::Value(value) => Some(value),
         StateCell::Null | StateCell::Tombstone => None,
     };
     MaterializedLiveStateRow {
@@ -683,13 +699,13 @@ fn materialize_row(
         schema_key,
         file_id,
         snapshot_content,
-        metadata: row.value.metadata,
+        metadata,
         deleted,
-        created_at: row.value.created_at,
-        updated_at: row.value.updated_at,
-        global: matches!(row.source, StateSource::Global),
-        change_id: Some(row.value.change_id),
-        commit_id: Some(row.value.commit_id),
+        created_at,
+        updated_at,
+        global: matches!(source, StateSource::Global),
+        change_id: Some(change_id),
+        commit_id: Some(commit_id),
         untracked: false,
         branch_id: Arc::from(branch_id),
     }
@@ -703,9 +719,16 @@ fn materialize_untracked_row(
     branch_id: String,
     global: bool,
 ) -> MaterializedLiveStateRow {
-    let deleted = value.cell.deleted();
-    let snapshot_content = match &value.cell {
-        StateCell::Value(value) => Some(value.clone()),
+    let crate::forktree::UntrackedValue {
+        created_at,
+        updated_at,
+        cell,
+        metadata,
+        ..
+    } = value;
+    let deleted = cell.deleted();
+    let snapshot_content = match cell {
+        StateCell::Value(value) => Some(value),
         StateCell::Null | StateCell::Tombstone => None,
     };
     MaterializedLiveStateRow {
@@ -713,10 +736,10 @@ fn materialize_untracked_row(
         schema_key,
         file_id,
         snapshot_content,
-        metadata: value.metadata,
+        metadata,
         deleted,
-        created_at: value.created_at,
-        updated_at: value.updated_at,
+        created_at,
+        updated_at,
         global,
         change_id: None,
         commit_id: None,

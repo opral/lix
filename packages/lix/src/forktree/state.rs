@@ -209,6 +209,23 @@ pub(crate) fn encode_state_prefix(schema_key: &str, file_id: Option<&str>) -> Ve
     output
 }
 
+/// Returns the half-open raw-key interval containing every state row for one
+/// schema, regardless of its file-id or entity primary key. The bounds are
+/// only a traversal hint: every returned row is still decoded and
+/// authenticated by the state reader before it can reach a caller.
+#[cfg(test)]
+pub(crate) fn encode_state_schema_bounds(schema_key: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut lower = Vec::with_capacity(schema_key.len() + 2);
+    write_key_string(&mut lower, schema_key, KEY_PART_FINAL);
+    let mut upper = lower.clone();
+    let last = upper
+        .last_mut()
+        .expect("schema prefix always contains its terminator");
+    debug_assert_eq!(*last, KEY_PART_FINAL);
+    *last = KEY_PART_MORE;
+    (lower, upper)
+}
+
 pub(crate) fn decode_state_key(bytes: &[u8]) -> Result<StateKey, LixError> {
     let mut offset = 0_usize;
     let (schema_key, terminator) = read_key_string(bytes, &mut offset, "state schema key")?;

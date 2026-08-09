@@ -57,7 +57,7 @@ where
         self.view_id
     }
 
-    pub(super) fn view_instance_id(&self) -> u64 {
+    pub(crate) fn view_instance_id(&self) -> u64 {
         self.view_instance_id
     }
 
@@ -107,7 +107,14 @@ where
         root: ObjectId,
         mutations: Vec<super::serving::StateTreeMutation>,
     ) -> Result<super::serving::StateTreeEdit, StorageError> {
-        super::serving::edit_state_tree(root, mutations, &self.read).await
+        let base_pack_root = if root == self.repository_root.global_state_root {
+            self.repository_root.global_entity_pack_root
+        } else if root == self.branch_snapshot.local_state_root {
+            self.branch_snapshot.local_entity_pack_root
+        } else {
+            None
+        };
+        super::serving::edit_state_tree_with_pack(root, base_pack_root, mutations, &self.read).await
     }
 
     /// Applies ordered intermediate state edits while retaining the same
@@ -117,7 +124,20 @@ where
         root: ObjectId,
         mutation_batches: Vec<Vec<super::serving::StateTreeMutation>>,
     ) -> Result<Vec<super::serving::StateTreeEdit>, StorageError> {
-        super::serving::edit_state_tree_sequence(root, mutation_batches, &self.read).await
+        let base_pack_root = if root == self.repository_root.global_state_root {
+            self.repository_root.global_entity_pack_root
+        } else if root == self.branch_snapshot.local_state_root {
+            self.branch_snapshot.local_entity_pack_root
+        } else {
+            None
+        };
+        super::serving::edit_state_tree_sequence_with_pack(
+            root,
+            base_pack_root,
+            mutation_batches,
+            &self.read,
+        )
+        .await
     }
 
     pub(crate) async fn put_commit_catalog_entries(
@@ -487,6 +507,59 @@ where
             include_tombstones,
         )
         .await
+    }
+
+    pub(crate) async fn current_entity_state_rows(
+        &self,
+    ) -> Result<
+        Vec<(
+            Vec<u8>,
+            super::state::StateValue,
+            super::serving::StateSource,
+        )>,
+        StorageError,
+    > {
+        let global_branch = uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .map_err(|_| corruption("GLOBAL_BRANCH_ID is not a UUID"))?;
+        let is_global = self.branch_id.as_bytes() == global_branch.as_bytes();
+        super::serving::entity_pack_on_roots(
+            self.repository_root.global_state_root,
+            self.repository_root
+                .global_entity_pack_root
+                .ok_or_else(|| corruption("selected repository has no current entity pack"))?,
+            (!is_global).then_some(self.branch_snapshot.local_state_root),
+            (!is_global)
+                .then_some(
+                    self.branch_snapshot
+                        .local_entity_pack_root
+                        .ok_or_else(|| corruption("selected branch has no current entity pack")),
+                )
+                .transpose()?,
+            &self.read,
+        )
+        .await
+    }
+
+    pub(crate) async fn entity_pack_for_state_root_with_read<S>(
+        &self,
+        state_root: ObjectId,
+        read: &S,
+    ) -> Result<super::pack::EncodedEntityStatePack, StorageError>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        let rows = super::serving::state_rows_for_entity_pack(state_root, read)
+            .await?
+            .into_iter()
+            .map(|(encoded_key, value)| {
+                Ok((
+                    super::state::decode_state_key(&encoded_key)
+                        .map_err(|error| corruption(error.to_string()))?,
+                    value,
+                ))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        super::EntityStatePackV1::from_rows(state_root, rows)
     }
 
     pub(crate) async fn branch_view(
@@ -1281,9 +1354,29 @@ where
     if let Some(id) = branch.latest_ref_change_object_id {
         ids.push(id);
     }
+    let pack_bindings = [
+        (
+            repository.global_entity_pack_root,
+            repository.global_state_root,
+        ),
+        (branch.local_entity_pack_root, branch.local_state_root),
+    ];
+    ids.extend(pack_bindings.iter().filter_map(|(pack, _)| *pack));
     ids.sort_unstable();
     ids.dedup();
     let objects = load_object_map(read, ids).await?;
+    for (pack_id, state_root) in pack_bindings
+        .into_iter()
+        .filter_map(|(pack, state)| pack.map(|pack| (pack, state)))
+    {
+        let pack =
+            super::pack::EntityStatePackV1::decode(pack_id, required_object(&objects, pack_id)?)?;
+        if pack.state_root != state_root {
+            return Err(corruption(
+                "selected current entity pack does not authenticate its state root",
+            ));
+        }
+    }
     for (id, kind) in [
         (repository.global_state_root, "state"),
         (branch.local_state_root, "state"),
