@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::storage_adapter::StorageWriteSet;
+
 #[cfg(any())]
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
