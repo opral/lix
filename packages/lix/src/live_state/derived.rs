@@ -20,7 +20,7 @@ pub(super) fn request_may_include_derived(request: &LiveStateScanRequest) -> boo
             .any(|schema_key| is_derived_schema(schema_key))
 }
 
-pub(super) fn is_derived_schema(schema_key: &str) -> bool {
+pub(crate) fn is_derived_schema(schema_key: &str) -> bool {
     DERIVED_SCHEMA_KEYS
         .iter()
         .any(|candidate| *candidate == schema_key)
