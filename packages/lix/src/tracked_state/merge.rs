@@ -146,6 +146,7 @@ pub(crate) struct TrackedStateMergeConflict {
 
 /// Change ids whose payloads the merge planner needs for cross-change
 /// equality (live/live after-pairs with differing change ids).
+#[cfg(test)]
 pub(crate) fn merge_payload_fallback_ids(
     target_diff: &TrackedStateDiff,
     source_diff: &TrackedStateDiff,
@@ -174,6 +175,7 @@ pub(crate) fn merge_payload_fallback_ids(
 /// Tree diffs are already identity sorted, so the production path performs
 /// one linear intersection without an index or candidate buffer. Defensive
 /// unsorted callers are normalized once by [`SortedMergeInputs`].
+#[cfg(test)]
 fn sorted_merge_payload_fallback_ids<T, S>(
     target_entries: &[T],
     source_entries: &[S],
