@@ -11,7 +11,5 @@ use crate::branch::BRANCH_REF_SCHEMA_KEY;
 const DERIVED_SCHEMA_KEYS: &[&str] = &["lix_commit", "lix_commit_edge", BRANCH_REF_SCHEMA_KEY];
 
 pub(crate) fn is_derived_schema(schema_key: &str) -> bool {
-    DERIVED_SCHEMA_KEYS
-        .iter()
-        .any(|candidate| *candidate == schema_key)
+    DERIVED_SCHEMA_KEYS.contains(&schema_key)
 }

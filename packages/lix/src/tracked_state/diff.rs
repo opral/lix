@@ -14,13 +14,6 @@ use crate::json_store::JsonSlot;
 use crate::tracked_state::TrackedStateFilter;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
 
-#[derive(Clone)]
-struct DecodedTrackedStateKeyShared {
-    schema_key: SharedStr,
-    file_id: Option<SharedStr>,
-    entity_pk: EntityPk,
-}
-
 /// Filter for comparing two tracked-state commit roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateDiffRequest {
@@ -377,26 +370,6 @@ impl TrackedStateTreeDiffBatchBuilder {
 
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
-    }
-
-    pub(crate) fn push_shared(
-        &mut self,
-        key: DecodedTrackedStateKeyShared,
-        before: Option<TrackedStateIndexValue>,
-        after: Option<TrackedStateIndexValue>,
-    ) {
-        debug_assert!(before.is_some() || after.is_some());
-        let schema_key_ordinal = self.schema_keys.intern_shared(key.schema_key);
-        let file_id_ordinal = key
-            .file_id
-            .map_or(u32::MAX, |file_id| self.file_ids.intern_shared(file_id));
-        self.rows.push(TrackedStateDiffKeyRow {
-            schema_key_ordinal,
-            file_id_ordinal,
-            entity_pk: key.entity_pk,
-        });
-        self.before.push(before);
-        self.after.push(after);
     }
 
     pub(crate) fn finish(self) -> Result<TrackedStateTreeDiffBatch, LixError> {
