@@ -169,9 +169,7 @@ where
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_base"))
                 .await?;
 
-                let read = transaction.opening_read_for_forktree();
-                let facade =
-                    ForkTreeReadFacade::from_read_on_branch(read, &active_branch_id).await?;
+                let facade = transaction.forktree_read_facade();
                 let analysis = super::analysis::analyze(
                     &facade,
                     &active_branch_id,
@@ -286,8 +284,7 @@ where
                 "lix.perf.merge_base"
             ))
             .await?;
-            let read = transaction.opening_read_for_forktree();
-            let facade = ForkTreeReadFacade::from_read_on_branch(read, &active_branch_id).await?;
+            let facade = transaction.forktree_read_facade();
             let analysis = super::analysis::analyze(
                 &facade,
                 &active_branch_id,

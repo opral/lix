@@ -31,8 +31,7 @@ use crate::catalog::{
     stage_catalog_revision,
 };
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeRecordProjection, CommitId, load_change_records,
-    materialize_known_change_payloads,
+    ChangeId, ChangeRecord, ChangeRecordProjection, CommitId, materialize_known_change_payloads,
 };
 use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_row};
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader, ReachableCommitGraphNode};
@@ -7527,18 +7526,25 @@ where
             .flat_map(|(_, sides)| [sides.before, sides.after])
             .flatten()
             .collect::<BTreeSet<_>>();
-        let read = self.opening_read();
-        let records = load_change_records(&read, change_ids.into_iter()).await?;
-        let mut forktree_reader =
-            ForkTreeReadFacade::from_read_on_branch(read.clone(), &self.active_branch_id).await?;
+        let mut forktree_reader = self.forktree_read_facade();
+        let records = if change_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let change_ids = change_ids.into_iter().collect::<Vec<_>>();
+            forktree_reader
+                .load_change_records(&change_ids)
+                .await?
+                .into_iter()
+                .zip(change_ids)
+                .filter_map(|(record, change_id)| record.map(|record| (change_id, record)))
+                .collect::<HashMap<_, _>>()
+        };
         let mut payloads = materialize_known_change_payloads(
             &mut forktree_reader,
             records.values().cloned(),
             ChangeRecordProjection::full(),
         )
         .await?;
-        drop(forktree_reader);
-        drop(read);
         let branch_id = self.active_branch_id.clone();
         let mut identities = BTreeSet::new();
         let mut plans = Vec::with_capacity(selections.len());
@@ -7698,8 +7704,7 @@ where
             .load_branch_head(&branch_id)
             .await?
             .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
-        let read = self.opening_read();
-        let historical = ForkTreeReadFacade::from_read_on_branch(read, &branch_id).await?;
+        let historical = self.forktree_read_facade();
         let previous_checkpoint_commit_id = historical
             .checkpoint_history_from_head(head_commit_id, &branch_id)
             .await?

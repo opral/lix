@@ -58,13 +58,7 @@ where
                             )
                             .await?
                     };
-                    let read = transaction.opening_read_for_forktree();
-                    let historical =
-                        crate::forktree::ForkTreeReadFacade::from_read_on_branch(
-                            read,
-                            &branch_id,
-                        )
-                        .await?;
+                    let historical = transaction.forktree_read_facade();
                     let previous_checkpoint_commit_id = historical
                         .checkpoint_history_from_head(head_commit_id, &branch_id)
                         .await?
