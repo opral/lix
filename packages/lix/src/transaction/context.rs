@@ -6442,7 +6442,8 @@ where
                 &branch_prepared_writes,
                 schema_catalog,
                 &validation_live_state,
-            );
+            )
+            .with_branch_ref_intents(&prepared_writes.branch_ref_intents);
             if self.trust_filesystem_planner {
                 validation_input = validation_input.with_trusted_filesystem_planner();
             }

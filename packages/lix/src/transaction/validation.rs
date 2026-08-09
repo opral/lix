@@ -43,7 +43,8 @@ use crate::schema::{
 use crate::transaction::normalization::reject_reserved_schema_namespace;
 use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{
-    PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
+    BranchRefPublicationIntent, PreparedInsertRef, PreparedValidationRow, PreparedWriteSet,
+    PreparedWriteValidationSet,
 };
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteOrigin;
@@ -66,6 +67,7 @@ pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a PreparedWriteValidationSet<'a>,
     schema_catalog: &'a CatalogSnapshot,
     live_state: &'a dyn LiveStateReader,
+    branch_ref_intents: &'a [BranchRefPublicationIntent],
     trust_filesystem_planner: bool,
 }
 
@@ -79,8 +81,36 @@ impl<'a> TransactionValidationInput<'a> {
             staged_writes,
             schema_catalog,
             live_state,
+            branch_ref_intents: &[],
             trust_filesystem_planner: false,
         }
+    }
+
+    /// Bind selector lifecycle intents from the same drained transaction.
+    ///
+    /// The public branch owner retires its descriptor and selector in one
+    /// prepared publication. Validation may therefore omit the otherwise
+    /// redundant full `lix_branch_ref` FK scan only when this exact matching
+    /// delete intent is present; all other FK/state-reference checks remain.
+    pub(crate) fn with_branch_ref_intents(
+        mut self,
+        branch_ref_intents: &'a [BranchRefPublicationIntent],
+    ) -> Self {
+        self.branch_ref_intents = branch_ref_intents;
+        self
+    }
+
+    fn retires_branch_ref_for_descriptor(
+        &self,
+        descriptor: &DomainRowIdentity,
+    ) -> Result<bool, LixError> {
+        if descriptor.schema_key() != BRANCH_DESCRIPTOR_SCHEMA_KEY {
+            return Ok(false);
+        }
+        let branch_id = descriptor.entity_pk().as_single_string_owned()?;
+        Ok(self.branch_ref_intents.iter().any(|intent| {
+            !intent.create && intent.commit_id.is_none() && intent.branch_id == branch_id
+        }))
     }
 
     /// Trust namespace checks performed while a serialized, bounded write
@@ -2495,7 +2525,11 @@ async fn validate_committed_delete_restrictions(
         if !delete_plan.has_committed_checks() {
             continue;
         }
+        let retires_branch_ref = input.retires_branch_ref_for_descriptor(&tombstone.identity)?;
         for reference in delete_plan.foreign_key_references {
+            if retires_branch_ref && reference.source_key.schema_key == BRANCH_REF_SCHEMA_KEY {
+                continue;
+            }
             let Some(deleted_value) = committed_deleted_row_value(
                 input.live_state,
                 tombstone,
@@ -6654,6 +6688,111 @@ mod tests {
             live_state.scan_count.load(Ordering::Relaxed),
             3,
             "two target point loads should share the committed source-schema scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_retirement_omits_redundant_committed_branch_ref_scan() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let mut descriptor_delete = staged_row(BRANCH_DESCRIPTOR_SCHEMA_KEY, None);
+        descriptor_delete.entity_pk = EntityPk::uuid_from_canonical(branch_id)
+            .expect("branch fixture identity should be canonical");
+        descriptor_delete.branch_id = crate::GLOBAL_BRANCH_ID.into();
+
+        let mut committed_descriptor = staged_row(
+            BRANCH_DESCRIPTOR_SCHEMA_KEY,
+            Some(
+                json!({
+                    "id": branch_id,
+                    "name": "Retiring branch",
+                    "hidden": false,
+                })
+                .to_string(),
+            ),
+        );
+        committed_descriptor.entity_pk = EntityPk::uuid_from_canonical(branch_id)
+            .expect("branch fixture identity should be canonical");
+        committed_descriptor.branch_id = crate::GLOBAL_BRANCH_ID.into();
+
+        let mut branch_ref = staged_row(
+            BRANCH_REF_SCHEMA_KEY,
+            Some(
+                json!({
+                    "id": branch_id,
+                    "commit_id": CommitId::for_test_label("branch-head").to_string(),
+                })
+                .to_string(),
+            ),
+        );
+        branch_ref.entity_pk = EntityPk::uuid_from_canonical(branch_id)
+            .expect("branch fixture identity should be canonical");
+        branch_ref.branch_id = crate::GLOBAL_BRANCH_ID.into();
+
+        let visible_schemas = vec![
+            seed_schema_definition(BRANCH_DESCRIPTOR_SCHEMA_KEY)
+                .expect("branch descriptor schema should exist")
+                .clone(),
+            seed_schema_definition(BRANCH_REF_SCHEMA_KEY)
+                .expect("branch ref schema should exist")
+                .clone(),
+            seed_schema_definition("lix_commit")
+                .expect("commit schema should exist")
+                .clone(),
+        ];
+        let catalog = CatalogSnapshot::from_visible_schemas(&visible_schemas)
+            .expect("branch schemas should compile");
+        let live_state = CountingStaticLiveStateReader {
+            rows: vec![
+                MaterializedLiveStateRow::from(committed_descriptor.clone()),
+                MaterializedLiveStateRow::from(branch_ref.clone()),
+            ],
+            scan_count: AtomicUsize::new(0),
+        };
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![descriptor_delete],
+            branch_ref_intents: vec![BranchRefPublicationIntent {
+                branch_id: branch_id.to_string(),
+                commit_id: None,
+                create: false,
+                change_id: ChangeId::for_test_label("branch-retirement"),
+                updated_at: ts("2026-04-29T00:00:00.000Z"),
+            }],
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            pending_constraints.remember_tombstone(row);
+        }
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state)
+            .with_branch_ref_intents(&staged_writes.branch_ref_intents);
+
+        validate_committed_delete_restrictions(&input, &catalog, &pending_constraints)
+            .await
+            .expect("one-publication branch retirement should not need a branch-ref scan");
+
+        assert_eq!(
+            live_state.scan_count.load(Ordering::Relaxed),
+            0,
+            "the authenticated selector retirement owns the matching branch-ref edge"
+        );
+
+        let control_live_state = CountingStaticLiveStateReader {
+            rows: vec![
+                MaterializedLiveStateRow::from(committed_descriptor),
+                MaterializedLiveStateRow::from(branch_ref),
+            ],
+            scan_count: AtomicUsize::new(0),
+        };
+        let control_input =
+            TransactionValidationInput::new(&validation_set, &catalog, &control_live_state);
+        validate_committed_delete_restrictions(&control_input, &catalog, &pending_constraints)
+            .await
+            .expect("the legacy validator admits the matching branch-ref row after scanning it");
+        assert_eq!(
+            control_live_state.scan_count.load(Ordering::Relaxed),
+            3,
+            "without the one-publication proof, validation must load the descriptor and scan refs"
         );
     }
 
