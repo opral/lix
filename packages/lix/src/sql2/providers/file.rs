@@ -2718,22 +2718,29 @@ pub(crate) async fn execute_fast_lix_file_prepared_path_write(
     .await
 }
 
-pub(crate) async fn execute_fast_lix_file_prepared_id_path_write(
+pub(crate) async fn execute_fast_lix_file_prepared_id_path_writes_batch(
     ctx: &mut dyn SqlWriteExecutionContext,
-    id: String,
-    path: String,
-    receipt: crate::binary_cas::BlobWriteReceipt,
-    metadata: Option<TransactionJson>,
+    writes: Vec<(
+        String,
+        String,
+        crate::binary_cas::BlobWriteReceipt,
+        Option<TransactionJson>,
+    )>,
 ) -> Result<Option<u64>, LixError> {
     execute_fast_lix_file_id_path_writes_inner(
         ctx,
-        vec![(
-            Some(id),
-            path,
-            FileContent::PreparedCas(receipt),
-            metadata,
-            None,
-        )],
+        writes
+            .into_iter()
+            .map(|(id, path, receipt, metadata)| {
+                (
+                    Some(id),
+                    path,
+                    FileContent::PreparedCas(receipt),
+                    metadata,
+                    None,
+                )
+            })
+            .collect(),
         FastLixFilePathWriteConflict::IdUpdateContentAndMetadata,
         None,
     )
@@ -12131,6 +12138,100 @@ mod tests {
         let blob_id_hex = blob_id.to_hex();
         assert_eq!(snapshot["blob_hash"].as_str(), Some(blob_id_hex.as_str()));
         assert_eq!(snapshot["size_bytes"].as_u64(), Some(size_bytes));
+    }
+
+    #[tokio::test]
+    async fn prepared_cas_path_write_batch_uses_one_indexed_transaction_plan() {
+        let old_payload_a = b"old media payload a";
+        let old_payload_b = b"old media payload b";
+        let file_a = "01920000-0000-7000-8000-0000000000d2";
+        let file_b = "01920000-0000-7000-8000-0000000000d3";
+        let branch_id = "01920000-0000-7000-8000-0000000000b1";
+        let rows = vec![
+            live_file_row(
+                file_a,
+                branch_id,
+                &format!(r#"{{"id":"{file_a}","directory_id":null,"name":"proxy.mov"}}"#),
+            ),
+            live_blob_ref_row(
+                file_a,
+                branch_id,
+                file_a,
+                &BlobId::from_content(old_payload_a).to_hex(),
+                old_payload_a.len(),
+            ),
+            live_file_row(
+                file_b,
+                branch_id,
+                &format!(r#"{{"id":"{file_b}","directory_id":null,"name":"clip.mov"}}"#),
+            ),
+            live_blob_ref_row(
+                file_b,
+                branch_id,
+                file_b,
+                &BlobId::from_content(old_payload_b).to_hex(),
+                old_payload_b.len(),
+            ),
+        ];
+        let mut write_context = CapturingWriteContext {
+            rows,
+            ..CapturingWriteContext::default()
+        };
+        let receipt = |content: &[u8]| {
+            let chunk_hash = ChunkHash::from_content(content);
+            let size_bytes = 1024 * 1024;
+            BlobWriteReceipt {
+                hash: BlobId::from_chunks(size_bytes, std::iter::once((chunk_hash, size_bytes))),
+                size_bytes,
+                layout: BlobLayout::Chunked { chunk_count: 1 },
+                manifest_object_id: [0; 32],
+                manifest_was_existing: false,
+            }
+        };
+
+        let outcome = super::execute_fast_lix_file_prepared_id_path_writes_batch(
+            &mut write_context,
+            vec![
+                (
+                    file_a.to_string(),
+                    "/proxy.mov".to_string(),
+                    receipt(b"new media payload a"),
+                    None,
+                ),
+                (
+                    file_b.to_string(),
+                    "/clip.mov".to_string(),
+                    receipt(b"new media payload b"),
+                    None,
+                ),
+            ],
+        )
+        .await
+        .expect("prepared path batch should stage");
+
+        assert_eq!(outcome, Some(2));
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.exact_load_requests.len(), 1);
+        assert_eq!(write_context.exact_load_requests[0].rows.len(), 2);
+        assert_eq!(write_context.scan_count, 0);
+        assert_eq!(write_context.writes.len(), 1);
+        let TransactionWrite::RowsWithFileContent { file_content, .. } = &write_context.writes[0]
+        else {
+            panic!("prepared path batch should use one ordinary file transaction write");
+        };
+        assert_eq!(file_content.len(), 2);
+        assert_eq!(
+            file_content
+                .iter()
+                .map(|content| content.path.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("/proxy.mov"), Some("/clip.mov")]
+        );
+        assert!(
+            file_content
+                .iter()
+                .all(|content| content.inline_data().is_none())
+        );
     }
 
     #[tokio::test]

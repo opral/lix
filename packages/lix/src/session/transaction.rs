@@ -1,3 +1,5 @@
+#[cfg(feature = "prepared-cas-observability")]
+use std::mem::size_of_val;
 use std::sync::Arc;
 
 use crate::catalog::CatalogFingerprint;
@@ -118,24 +120,30 @@ where
             .await
     }
 
-    pub(crate) async fn upsert_prepared_file_content(
+    pub(crate) async fn upsert_prepared_file_content_batch(
         &mut self,
-        id: String,
-        path: String,
-        receipt: crate::binary_cas::BlobWriteReceipt,
-        metadata: Option<serde_json::Value>,
+        writes: Vec<(
+            String,
+            String,
+            crate::binary_cas::BlobWriteReceipt,
+            Option<serde_json::Value>,
+        )>,
     ) -> Result<u64, LixError> {
-        #[cfg(feature = "prepared-cas-observability")]
-        crate::prepared_cas_observability::record_receipt_metadata(std::mem::size_of_val(&receipt));
-        let metadata = metadata
-            .map(|value| TransactionJson::from_value(value, "prepared file metadata"))
-            .transpose()?;
-        crate::sql2::execute_fast_lix_file_prepared_id_path_write(
+        let write_count = writes.len();
+        let writes = writes
+            .into_iter()
+            .map(|(id, path, receipt, metadata)| -> Result<_, LixError> {
+                #[cfg(feature = "prepared-cas-observability")]
+                crate::prepared_cas_observability::record_receipt_metadata(size_of_val(&receipt));
+                let metadata = metadata
+                    .map(|value| TransactionJson::from_value(value, "prepared file metadata"))
+                    .transpose()?;
+                Ok((id, path, receipt, metadata))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let applied = crate::sql2::execute_fast_lix_file_prepared_id_path_writes_batch(
             self.transaction_mut()?,
-            id,
-            path,
-            receipt,
-            metadata,
+            writes,
         )
         .await?
         .ok_or_else(|| {
@@ -143,7 +151,14 @@ where
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 "prepared file content path was not handled by the ForkTree owner",
             )
-        })
+        })?;
+        if applied != write_count as u64 {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!("prepared file content owner applied {applied} of {write_count} rows"),
+            ));
+        }
+        Ok(applied)
     }
 
     pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<StorageImpl>, LixError> {

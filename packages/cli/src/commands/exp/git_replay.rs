@@ -3,7 +3,7 @@ use crate::db;
 use crate::error::CliError;
 use lix::storage::Storage;
 use lix::wasm::WasmTransitionCounters;
-use lix::{Lix, LixTransaction, PreparedDmlParameterBatch, Value, open_lix};
+use lix::{Lix, LixTransaction, PreparedDmlParameterBatch, PreparedFileContent, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use serde::Serialize;
@@ -890,6 +890,12 @@ fn execute_planned_rows_with_prepared_receipts<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    let mut pending_prepared = Vec::<(
+        String,
+        String,
+        PreparedFileContent,
+        Option<serde_json::Value>,
+    )>::new();
     for (row_index, row) in rows.iter().enumerate() {
         log_replay_phase(
             diagnostics_started,
@@ -933,28 +939,14 @@ where
             "git_oid": row.git_oid,
         });
         if let Some(prepared) = prepared {
-            let execute_started = Instant::now();
-            db::block_on(transaction.upsert_prepared_file_content(
-                row.id.clone(),
-                row.path.clone(),
-                prepared,
-                Some(metadata),
-            ))
-            .map_err(|error| {
-                CliError::msg(format!(
-                    "failed at commit {commit_sha} while binding prepared blob {}: {error}",
-                    row.blob_oid
-                ))
-            })?;
-            totals.execute_ms += duration_to_ms(execute_started.elapsed());
-            totals.physical_execution_groups += 1;
-            totals.logical_statement_count += 1;
+            pending_prepared.push((row.id.clone(), row.path.clone(), prepared, Some(metadata)));
             log_replay_phase(
                 diagnostics_started,
                 &format!("row[{row_index}].receipt_bind.complete"),
                 Some(commit_sha),
             );
         } else if streamed_bytes == 0 {
+            bind_prepared_receipts(transaction, &mut pending_prepared, commit_sha, totals)?;
             // Empty regular Git blobs have no ForkTree BlobRef. Keep their
             // ordinary empty value in the same final transaction; no large
             // payload is retained and the metadata remains identical.
@@ -998,6 +990,39 @@ where
             )));
         }
     }
+    bind_prepared_receipts(transaction, &mut pending_prepared, commit_sha, totals)?;
+    Ok(())
+}
+
+fn bind_prepared_receipts<StorageImpl>(
+    transaction: &mut LixTransaction<StorageImpl>,
+    pending: &mut Vec<(
+        String,
+        String,
+        PreparedFileContent,
+        Option<serde_json::Value>,
+    )>,
+    commit_sha: &str,
+    totals: &mut ReplayExecutionTotals,
+) -> Result<(), CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let row_count = pending.len();
+    let execute_started = Instant::now();
+    db::block_on(transaction.upsert_prepared_file_content_batch(std::mem::take(pending))).map_err(
+        |error| {
+            CliError::msg(format!(
+                "failed at commit {commit_sha} while binding {row_count} prepared blobs: {error}"
+            ))
+        },
+    )?;
+    totals.execute_ms += duration_to_ms(execute_started.elapsed());
+    totals.physical_execution_groups += 1;
+    totals.logical_statement_count += row_count;
     Ok(())
 }
 

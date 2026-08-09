@@ -599,7 +599,34 @@ where
         metadata: Option<serde_json::Value>,
     ) -> Result<u64, LixError> {
         self.inner
-            .upsert_prepared_file_content(id.into(), path.into(), prepared.receipt, metadata)
+            .upsert_prepared_file_content_batch(vec![(
+                id.into(),
+                path.into(),
+                prepared.receipt,
+                metadata,
+            )])
+            .await
+    }
+
+    /// Binds several authenticated prepared file contents through the one
+    /// ForkTree filesystem owner. The receipts remain identities only; all
+    /// payload objects stay outside the final semantic transaction.
+    pub async fn upsert_prepared_file_content_batch(
+        &mut self,
+        writes: Vec<(
+            String,
+            String,
+            PreparedFileContent,
+            Option<serde_json::Value>,
+        )>,
+    ) -> Result<u64, LixError> {
+        self.inner
+            .upsert_prepared_file_content_batch(
+                writes
+                    .into_iter()
+                    .map(|(id, path, prepared, metadata)| (id, path, prepared.receipt, metadata))
+                    .collect(),
+            )
             .await
     }
 
