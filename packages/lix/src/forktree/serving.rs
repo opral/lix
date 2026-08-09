@@ -1762,9 +1762,15 @@ where
     Ok(edits)
 }
 
-struct ObjectOverlayRead<'a, R: ?Sized> {
+pub(super) struct ObjectOverlayRead<'a, R: ?Sized> {
     read: &'a R,
     objects: &'a ImmutableObjectSet,
+}
+
+impl<'a, R: ?Sized> ObjectOverlayRead<'a, R> {
+    pub(super) fn new(read: &'a R, objects: &'a ImmutableObjectSet) -> Self {
+        Self { read, objects }
+    }
 }
 
 impl<R> StorageAdapterRead for ObjectOverlayRead<'_, R>
