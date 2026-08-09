@@ -523,9 +523,9 @@ where
     let mut encoded_semantic_changes = Vec::with_capacity(changes.len());
     let mut member_object_ids = Vec::with_capacity(changes.len());
     for change in &changes {
-        let (object_id, _) = change.encode()?;
+        let (object_id, bytes) = change.encode()?;
         member_object_ids.push(object_id);
-        encoded_semantic_changes.push((change.change_id(), object_id));
+        encoded_semantic_changes.push((change.change_id(), object_id, bytes));
     }
     let global_state_root = if global {
         state_edit.root
@@ -560,7 +560,8 @@ where
         metadata: crate::changelog::encode_forktree_commit_payload(&commit_record)?,
     };
     let _member_pages = semantic_commit.prepare_member_pages()?;
-    let (commit_object_id, _) = semantic_commit.encode()?;
+    let (commit_object_id, commit_bytes) = semantic_commit.encode()?;
+    let encoded_commit = (commit_object_id, commit_bytes);
 
     let ref_payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
         format_version: 2,
@@ -592,7 +593,7 @@ where
         payload: ref_payload,
         json_payload_object_ids: Vec::new(),
     };
-    let (ref_object_id, _) = ref_change.encode()?;
+    let (ref_object_id, ref_bytes) = ref_change.encode()?;
     changes.push(ref_change);
 
     let commit_catalog_edit = view
@@ -606,7 +607,7 @@ where
         .await?;
     let mut change_entries = Vec::with_capacity(catalog_order.len());
     for index in catalog_order {
-        if let Some((change_id, change_object_id)) = encoded_semantic_changes.get(index) {
+        if let Some((change_id, change_object_id, _)) = encoded_semantic_changes.get(index) {
             change_entries.push((
                 *change_id,
                 ChangeCatalogEntry {
@@ -646,6 +647,14 @@ where
         commit_catalog_edit,
         change_catalog_edit,
         semantic_commit,
+        encoded_commit: Some(encoded_commit),
+        encoded_changes: Some(
+            encoded_semantic_changes
+                .into_iter()
+                .map(|(_, object_id, bytes)| (object_id, bytes))
+                .chain(std::iter::once((ref_object_id, ref_bytes)))
+                .collect(),
+        ),
         changes,
         branch_snapshot: BranchSnapshotV1 {
             branch_id: publication_branch_id,

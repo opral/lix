@@ -1141,7 +1141,9 @@ async fn branch_transition<R: StorageAdapterRead>(
         commit_catalog_edit,
         change_catalog_edit,
         semantic_commit,
+        encoded_commit: None,
         changes: vec![ref_change],
+        encoded_changes: None,
         branch_snapshot: BranchSnapshotV1 {
             branch_id: view.branch_id(),
             local_state_root,

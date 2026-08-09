@@ -43,7 +43,9 @@ pub(crate) struct BranchStateTransition {
     pub(crate) commit_catalog_edit: CatalogTreeEdit,
     pub(crate) change_catalog_edit: CatalogTreeEdit,
     pub(crate) semantic_commit: CommitObjectV1,
+    pub(crate) encoded_commit: Option<(ObjectId, Bytes)>,
     pub(crate) changes: Vec<ChangeObjectV1>,
+    pub(crate) encoded_changes: Option<Vec<(ObjectId, Bytes)>>,
     pub(crate) branch_snapshot: BranchSnapshotV1,
     pub(crate) repository_root: super::model::RepositoryRootV1,
 }
@@ -984,7 +986,9 @@ impl PreparedPublication {
             commit_catalog_edit,
             change_catalog_edit,
             mut semantic_commit,
+            encoded_commit,
             changes,
+            encoded_changes: pre_encoded_changes,
             branch_snapshot,
             repository_root,
         } = transition;
@@ -1019,7 +1023,21 @@ impl PreparedPublication {
             return Err(corruption("global state publication contains a tombstone"));
         }
         let member_pages = semantic_commit.prepare_member_pages()?;
-        let (commit_id, commit_bytes) = semantic_commit.encode()?;
+        let (commit_id, commit_bytes) = if let Some((encoded_id, encoded_bytes)) = encoded_commit {
+            let decoded = CommitObjectV1::decode(encoded_id, &encoded_bytes)?;
+            let mut expected_decoded = semantic_commit.clone();
+            if expected_decoded.member_page_root.is_some() {
+                expected_decoded.members.clear();
+            }
+            if decoded != expected_decoded {
+                return Err(corruption(
+                    "pre-encoded semantic commit does not match its authenticated value",
+                ));
+            }
+            (encoded_id, encoded_bytes)
+        } else {
+            semantic_commit.encode()?
+        };
         if state_edit
             .written_commit_ids
             .iter()
@@ -1076,10 +1094,32 @@ impl PreparedPublication {
         }
 
         let mut encoded_changes = BTreeMap::new();
-        for change in &changes {
-            let (id, bytes) = change.encode()?;
-            if encoded_changes.insert(id, (change, bytes)).is_some() {
-                return Err(corruption("state transition repeats one Change object"));
+        if let Some(pre_encoded_changes) = pre_encoded_changes {
+            if pre_encoded_changes.len() != changes.len() {
+                return Err(corruption(
+                    "pre-encoded Change object count does not match the transition",
+                ));
+            }
+            for (change, (id, bytes)) in changes.iter().zip(pre_encoded_changes.iter()) {
+                let decoded = ChangeObjectV1::decode(*id, bytes)?;
+                if decoded != *change {
+                    return Err(corruption(
+                        "pre-encoded Change object does not match its authenticated value",
+                    ));
+                }
+                if encoded_changes
+                    .insert(*id, (change, bytes.clone()))
+                    .is_some()
+                {
+                    return Err(corruption("state transition repeats one Change object"));
+                }
+            }
+        } else {
+            for change in &changes {
+                let (id, bytes) = change.encode()?;
+                if encoded_changes.insert(id, (change, bytes)).is_some() {
+                    return Err(corruption("state transition repeats one Change object"));
+                }
             }
         }
         let mut expected_changes = BTreeSet::new();
