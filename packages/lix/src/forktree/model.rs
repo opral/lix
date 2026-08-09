@@ -449,6 +449,11 @@ impl CommitChangePageV2 {
         if self.members.is_empty() {
             return Err(corruption("commit member page must not be empty"));
         }
+        if self.members.len() > AUTHENTICATED_EDGE_PAGE_ENTRIES {
+            return Err(corruption(
+                "commit member page exceeds its authenticated member bound",
+            ));
+        }
         let member_edges = self
             .members
             .iter()
@@ -501,9 +506,10 @@ impl CommitChangePageV2 {
                 return Err(corruption("one commit member exceeds the page byte bound"));
             }
             if !current.is_empty()
-                && (current_edges
-                    .checked_add(member_edges)
-                    .is_none_or(|edges| edges > COMMIT_MEMBER_PAGE_EDGE_BUDGET)
+                && (current.len() == AUTHENTICATED_EDGE_PAGE_ENTRIES
+                    || current_edges
+                        .checked_add(member_edges)
+                        .is_none_or(|edges| edges > COMMIT_MEMBER_PAGE_EDGE_BUDGET)
                     || current_bytes.checked_add(member_bytes).is_none_or(|bytes| {
                         bytes > COMMIT_CHANGE_PAGE_TARGET_BYTES.saturating_sub(128)
                     }))

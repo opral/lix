@@ -1663,6 +1663,100 @@ impl Storage for CrashStorage {
 }
 
 #[tokio::test]
+async fn zero_edge_commit_change_pages_reopen_at_member_count_boundary() {
+    for count in [256usize, 257] {
+        let members = (0..count).map(zero_edge_page_member).collect::<Vec<_>>();
+        let mut commit = CommitObjectV1 {
+            commit_id: CommitId::from_bytes(raw_id(0xb1)),
+            generation: 1,
+            parent_commit_object_ids: Vec::new(),
+            members,
+            member_page_object_ids: Vec::new(),
+            global_state_root: content_id(0xb2),
+            local_state_root: content_id(0xb3),
+            metadata: b"zero-edge-page-reopen".to_vec(),
+        };
+        let pages = commit.prepare_member_pages().expect("zero-edge pages");
+        assert_eq!(pages.len(), if count == 256 { 1 } else { 2 });
+        let (commit_object_id, commit_bytes) = commit.encode().expect("commit envelope");
+
+        let storage = CrashStorage::new();
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            OBJECT_SPACE,
+            commit_object_id.as_bytes().to_vec(),
+            commit_bytes.to_vec(),
+        );
+        for (page_id, page_bytes) in &pages {
+            writes.put(
+                OBJECT_SPACE,
+                page_id.as_bytes().to_vec(),
+                page_bytes.to_vec(),
+            );
+        }
+        commit_write_set_for_test(writes, &storage).await;
+
+        let reopened = storage.reopen();
+        let object_ids = std::iter::once(commit_object_id)
+            .chain(commit.member_page_object_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let keys = object_ids
+            .iter()
+            .map(|id| Key(Bytes::copy_from_slice(id.as_bytes())))
+            .collect::<Vec<_>>();
+        let read = reopened
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("reopen read");
+        let loaded = read
+            .get_many(&[GetManyRequest {
+                space: OBJECT_SPACE,
+                keys: &keys,
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            }])
+            .await
+            .expect("reopen objects");
+        let object_bytes = object_ids
+            .into_iter()
+            .zip(loaded.values.into_iter())
+            .map(|(id, value)| match value {
+                Some(crate::storage::ProjectedValue::FullValue(bytes)) => (id, bytes),
+                other => panic!("expected reopened object {id:?}, got {other:?}"),
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let reopened_commit = CommitObjectV1::decode(
+            commit_object_id,
+            object_bytes
+                .get(&commit_object_id)
+                .expect("reopened commit bytes"),
+        )
+        .expect("reopened commit decodes");
+        let reopened_members = reopened_commit
+            .load_members_with(|id| {
+                object_bytes
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing reopened member page".to_owned()))
+            })
+            .expect("reopened member closure");
+        assert_eq!(reopened_members, commit.members);
+
+        let first_page_id = commit.member_page_object_ids[0];
+        let mut corrupted = object_bytes
+            .get(&first_page_id)
+            .expect("first reopened page")
+            .to_vec();
+        corrupted[0] ^= 0x01;
+        assert!(
+            CommitChangePageV2::decode(first_page_id, &corrupted).is_err(),
+            "corrupt zero-edge page must fail closed after reopen"
+        );
+    }
+}
+
+#[tokio::test]
 async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
     let seed = build_seed();
     let storage = CountingStorage::new();
@@ -4474,6 +4568,19 @@ fn seed_provenance_and_ref_edge_are_not_aliased() {
     validate_branch_snapshot_ref_edge(&snapshot, load_from(&seed.objects)).expect("ref edge");
 }
 
+fn zero_edge_page_member(index: usize) -> CommitMemberV1 {
+    let mut change_raw = [0_u8; 16];
+    change_raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+    change_raw[15] = 1;
+    CommitMemberV1::introduced(
+        ChangeId::from_bytes(change_raw),
+        vec![b'x'],
+        false,
+        LixTimestamp::from_unix_millis_utc_lossy(1),
+        Vec::new(),
+    )
+}
+
 #[test]
 fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     fn page_member(index: usize) -> CommitMemberV1 {
@@ -4531,6 +4638,34 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         assert_eq!(loaded, commit.members);
         assert_eq!(loaded.len(), count);
     }
+
+    for count in [256usize, 257] {
+        let members = (0..count).map(zero_edge_page_member).collect::<Vec<_>>();
+        let pages = CommitChangePageV2::encode_pages(CommitId::from_bytes(raw_id(0xa5)), &members)
+            .expect("zero-edge page closure");
+        assert_eq!(pages.objects.len(), if count == 256 { 1 } else { 2 });
+        assert_eq!(pages.member_locations.len(), count);
+        for (id, bytes) in pages.objects {
+            assert!(
+                CommitChangePageV2::decode(id, &bytes)
+                    .expect("zero-edge page decodes")
+                    .members
+                    .len()
+                    <= 256
+            );
+        }
+    }
+
+    assert!(
+        CommitChangePageV2 {
+            commit_id: CommitId::from_bytes(raw_id(0xa6)),
+            start_ordinal: 0,
+            members: (0..257).map(zero_edge_page_member).collect(),
+        }
+        .encode()
+        .is_err(),
+        "a direct oversized zero-edge page must fail before publication"
+    );
 
     let members = (0..255).map(page_member).collect::<Vec<_>>();
     let mut commit = CommitObjectV1 {
