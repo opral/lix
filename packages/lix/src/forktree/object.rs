@@ -81,7 +81,12 @@ impl ObjectDomain {
             16 => Ok(Self::GcLiveBranchPackV1),
             17 => Ok(Self::CommitMemberPageV1),
             18 => Ok(Self::HotObjectPackV1),
-            _ => Err(corruption(format!("unknown object domain {value}"))),
+            _ => {
+                let unknown_domain = value;
+                Err(corruption(format!(
+                    "unknown object domain {unknown_domain}"
+                )))
+            }
         }
     }
 

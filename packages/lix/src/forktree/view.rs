@@ -34,7 +34,9 @@ pub(crate) struct ReadIdentity {
     pub(crate) branch_selector_digest: [u8; 32],
     pub(crate) repository_root_id: ObjectId,
     pub(crate) branch_id: CanonicalBranchId,
+    pub(crate) branch_root_id: ObjectId,
     pub(crate) branch_snapshot_object_id: ObjectId,
+    pub(crate) snapshot_commit_id: ObjectId,
     pub(crate) selector_generation: u64,
     pub(crate) hot_pack_object_id: ObjectId,
     pub(crate) snapshot_cache_key: Option<u128>,
@@ -50,6 +52,7 @@ impl ReadIdentity {
         repository_root_id: ObjectId,
         branch_id: CanonicalBranchId,
         branch_snapshot_object_id: ObjectId,
+        snapshot_commit_id: ObjectId,
         selector_generation: u64,
         hot_pack_object_id: ObjectId,
     ) -> Self {
@@ -66,7 +69,9 @@ impl ReadIdentity {
             ),
             repository_root_id,
             branch_id,
+            branch_root_id: branch_snapshot_object_id,
             branch_snapshot_object_id,
+            snapshot_commit_id,
             selector_generation,
             hot_pack_object_id,
             snapshot_cache_key: read.snapshot_cache_key(),
@@ -102,7 +107,9 @@ impl ReadIdentity {
             ),
             repository_root_id: commit_catalog_root,
             branch_id: CanonicalBranchId::from_bytes([0; 16]),
+            branch_root_id: commit_object_id,
             branch_snapshot_object_id: ObjectId::ZERO,
+            snapshot_commit_id: commit_object_id,
             selector_generation: 0,
             hot_pack_object_id: ObjectId::ZERO,
             snapshot_cache_key: read.snapshot_cache_key(),
@@ -289,6 +296,7 @@ where
             self.global_selector.repository_root,
             self.branch_id,
             self.branch_selector.branch_snapshot_object_id,
+            self.branch_snapshot.semantic_head_commit_object_id,
             self.branch_selector.selector_generation,
             self.branch_snapshot.hot_pack_object_id,
         )
@@ -323,11 +331,13 @@ where
     }
 
     fn packed_read(&self) -> PackedRead<'_, R> {
+        let raw_control_read = &self.read;
+        let identity = self.read_identity();
         PackedRead {
-            read: &self.read,
+            read: raw_control_read,
             objects: &self.hot_objects,
             pack_id: self.branch_snapshot.hot_pack_object_id,
-            identity: self.read_identity(),
+            identity,
         }
     }
 
@@ -1554,6 +1564,7 @@ where
         global_selector.repository_root,
         branch_id,
         branch_selector.branch_snapshot_object_id,
+        branch_snapshot.semantic_head_commit_object_id,
         branch_selector.selector_generation,
         branch_snapshot.hot_pack_object_id,
     );
