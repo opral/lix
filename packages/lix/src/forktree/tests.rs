@@ -282,6 +282,7 @@ async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
         .expect("source commit exists");
     let closure = super::serving::load_authenticated_member_closure(
         view.storage_read(),
+        view.repository_root().commit_catalog_root,
         seed.commit_object_id,
         &source_commit,
     )
