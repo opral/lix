@@ -3617,3 +3617,146 @@ fn seed_provenance_and_ref_edge_are_not_aliased() {
     .expect("snapshot decode");
     validate_branch_snapshot_ref_edge(&snapshot, load_from(&seed.objects)).expect("ref edge");
 }
+#[test]
+fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
+    for count in [255usize, 256, 257, 1002] {
+        let members = (0..count)
+            .map(|index| {
+                let mut raw = [0u8; 32];
+                raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+                raw[31] = 1;
+                CommitMemberV1::introduced(ObjectId::from_bytes(raw))
+            })
+            .collect::<Vec<_>>();
+        let mut commit = CommitObjectV1 {
+            commit_id: CommitId::from_bytes(raw_id(0xa1)),
+            generation: 1,
+            parent_commit_object_ids: Vec::new(),
+            members,
+            member_page_root: None,
+            global_state_root: content_id(0x71),
+            local_state_root: content_id(0x72),
+            metadata: b"page-boundary".to_vec(),
+        };
+        let pages = commit.prepare_member_pages().expect("page closure");
+        assert_eq!(
+            pages.len(),
+            match count {
+                255 => 1,
+                256 | 257 => 2,
+                1002 => 4,
+                _ => unreachable!(),
+            }
+        );
+        let (commit_object_id, commit_bytes) = commit.encode().expect("paged commit");
+        let decoded =
+            CommitObjectV1::decode(commit_object_id, &commit_bytes).expect("paged commit decodes");
+        let page_map = pages
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let loaded = decoded
+            .load_members_with(|id| {
+                page_map
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .expect("member closure loads");
+        assert_eq!(loaded, commit.members);
+        assert_eq!(loaded.len(), count);
+    }
+
+    let members = (0..255)
+        .map(|index| {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            raw[31] = 2;
+            CommitMemberV1::introduced(ObjectId::from_bytes(raw))
+        })
+        .collect::<Vec<_>>();
+    let mut commit = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0xa2)),
+        generation: 1,
+        parent_commit_object_ids: Vec::new(),
+        members,
+        member_page_root: None,
+        global_state_root: content_id(0x73),
+        local_state_root: content_id(0x74),
+        metadata: b"page-corruption".to_vec(),
+    };
+    let pages = commit.prepare_member_pages().expect("corruption pages");
+    let root = commit.member_page_root.expect("page root");
+    let page_map = pages
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut missing = page_map.clone();
+    missing.remove(&root);
+    let (commit_object_id, commit_bytes) = commit.encode().expect("commit");
+    let decoded = CommitObjectV1::decode(commit_object_id, &commit_bytes).expect("decode commit");
+    assert!(
+        decoded
+            .load_members_with(|id| {
+                missing
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err()
+    );
+
+    let mut corrupted = page_map.clone();
+    let first = corrupted.remove(&root).expect("root page");
+    let mut first_bytes = first.to_vec();
+    first_bytes[0] ^= 0x01;
+    corrupted.insert(root, Bytes::from(first_bytes));
+    assert!(
+        decoded
+            .load_members_with(|id| {
+                corrupted
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err()
+    );
+
+    let mut wrong_ordinal =
+        super::model::CommitMemberPageV1::decode(root, page_map.get(&root).expect("root page"))
+            .expect("valid root page");
+    wrong_ordinal.start_ordinal = 1;
+    let (wrong_id, wrong_bytes) = wrong_ordinal.encode().expect("wrong ordinal page");
+    let mut wrong_map = page_map.clone();
+    wrong_map.remove(&root);
+    wrong_map.insert(wrong_id, wrong_bytes);
+    let mut wrong_commit = decoded.clone();
+    wrong_commit.member_page_root = Some(wrong_id);
+    assert!(
+        wrong_commit
+            .load_members_with(|id| {
+                wrong_map
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err()
+    );
+
+    let duplicate = super::model::CommitMemberPageV1 {
+        commit_id: CommitId::from_bytes(raw_id(0xa3)),
+        start_ordinal: 0,
+        members: vec![
+            CommitMemberV1::introduced(content_id(0x81)),
+            CommitMemberV1::introduced(content_id(0x81)),
+        ],
+        next_page_object_id: None,
+    };
+    assert!(duplicate.encode().is_err());
+    let zero_successor = super::model::CommitMemberPageV1 {
+        commit_id: CommitId::from_bytes(raw_id(0xa4)),
+        start_ordinal: 0,
+        members: vec![CommitMemberV1::introduced(content_id(0x82))],
+        next_page_object_id: Some(ObjectId::ZERO),
+    };
+    assert!(zero_successor.encode().is_err());
+}
