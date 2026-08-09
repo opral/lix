@@ -394,6 +394,36 @@ async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
 }
 
 #[tokio::test]
+async fn zero_pack_raw_control_rejects_packable_history_objects() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open retained view");
+    let zero_pack = view.test_zero_pack_read();
+    let root_key = [Key(Bytes::copy_from_slice(
+        view.test_packable_object_id()
+            .expect("seed view has a packable serving object")
+            .as_bytes(),
+    ))];
+    let error = zero_pack
+        .get_many(&[GetManyRequest {
+            space: OBJECT_SPACE,
+            keys: &root_key,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect_err("packable history object must not fall through to raw storage");
+    assert!(
+        error.to_string().contains("zero-pack control view"),
+        "unexpected fail-closed error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry() {
     let seed = build_seed();
     let storage = Memory::new();
@@ -1150,13 +1180,9 @@ async fn historical_absence_requires_authenticated_commit_and_root() {
     let seed = build_seed();
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
-    let read = StorageAdapterReadScope::new(
-        storage
-            .begin_read(ReadOptions::default())
-            .await
-            .expect("historical absence read"),
-    );
-    let facade = ForkTreeReadFacade::new(read);
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("historical absence retained view");
     let public_commit_id = public_commit_id(0x20);
     let absent_key = encode_state_key(StateKeyRef {
         schema_key: "app.row",
@@ -1164,11 +1190,15 @@ async fn historical_absence_requires_authenticated_commit_and_root() {
         entity_pk: &EntityPk::single("absent"),
     });
     assert!(
-        facade
-            .load_state_value_at_commit(public_commit_id, &absent_key, true)
-            .await
-            .expect("authenticated absent key")
-            .is_none(),
+        super::serving::load_state_value_at_commit(
+            &view.test_packed_read(),
+            public_commit_id,
+            &absent_key,
+            true,
+        )
+        .await
+        .expect("authenticated absent key")
+        .is_none(),
         "a missing key is None only after commit and roots authenticate"
     );
 }

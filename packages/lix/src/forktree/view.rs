@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -202,13 +204,21 @@ where
                         } else {
                             let canonical = load_object_bytes(self.read, id).await?;
                             let domain = super::object::authenticate_object_domain(id, &canonical)?;
-                            if self.pack_id != ObjectId::ZERO
-                                && super::object::hot_packable_object(id, &canonical)?
-                            {
+                            if super::object::hot_packable_object(id, &canonical)? {
+                                if self.pack_id == ObjectId::ZERO {
+                                    return Err(corruption(format!(
+                                        "packable object {id} cannot be read through an unbound zero-pack control view"
+                                    )));
+                                }
                                 return Err(corruption(format!(
                                     "hot pack object {id} is absent for authenticated domain {domain:?} (pack={}, entries={})",
                                     self.pack_id,
                                     self.objects.len(),
+                                )));
+                            }
+                            if !super::object::raw_control_object(id, &canonical)? {
+                                return Err(corruption(format!(
+                                    "object {id} has no sealed raw-control permission for domain {domain:?}"
                                 )));
                             }
                             canonical
@@ -346,6 +356,26 @@ where
     #[cfg(test)]
     pub(crate) fn test_packed_read(&self) -> PackedRead<'_, R> {
         self.packed_read()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_zero_pack_read(&self) -> PackedRead<'_, R> {
+        PackedRead {
+            read: &self.read,
+            objects: empty_test_hot_objects(),
+            pack_id: ObjectId::ZERO,
+            identity: self.read_identity(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_packable_object_id(&self) -> Option<ObjectId> {
+        self.hot_objects.iter().find_map(|(id, bytes)| {
+            super::object::hot_packable_object(*id, bytes)
+                .ok()
+                .filter(|packable| *packable)
+                .map(|_| *id)
+        })
     }
 
     #[cfg(test)]
@@ -853,6 +883,12 @@ where
         let read = self.packed_read();
         diff_state_rows_between_commits_on_read(&read, before, after, true).await
     }
+}
+
+#[cfg(test)]
+fn empty_test_hot_objects() -> &'static BTreeMap<ObjectId, Bytes> {
+    static EMPTY: OnceLock<BTreeMap<ObjectId, Bytes>> = OnceLock::new();
+    EMPTY.get_or_init(BTreeMap::new)
 }
 
 /// One operation-scoped ForkTree read facade. Branch views borrow the same

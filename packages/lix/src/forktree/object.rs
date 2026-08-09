@@ -133,6 +133,40 @@ pub(super) const fn hot_packable_domain(domain: ObjectDomain) -> bool {
     )
 }
 
+/// The only object domains that may be read by an explicitly unbound raw
+/// control read.  Serving/history objects are deliberately not inferred from
+/// `hot_packable_domain`: adding a new domain must make this allow-list fail
+/// compilation until its control status is reviewed.
+pub(super) const fn raw_control_domain(domain: ObjectDomain) -> bool {
+    matches!(
+        domain,
+        ObjectDomain::BranchSnapshot
+            | ObjectDomain::Commit
+            | ObjectDomain::CommitMemberPageV1
+            | ObjectDomain::SemanticChange
+            | ObjectDomain::BranchRefChange
+            | ObjectDomain::UploadPart
+            | ObjectDomain::UploadProgress
+            | ObjectDomain::BlobChunk
+            | ObjectDomain::BlobManifest
+            | ObjectDomain::SnapshotTarget
+            | ObjectDomain::GcMarkPackV2
+            | ObjectDomain::GcProgressV2
+            | ObjectDomain::GcRadixNodeV1
+            | ObjectDomain::GcQueuePackV1
+            | ObjectDomain::GcLiveBranchPackV1
+            | ObjectDomain::HotObjectPackV1
+    )
+}
+
+pub(super) fn raw_control_object(id: ObjectId, bytes: &[u8]) -> Result<bool, StorageError> {
+    let domain = authenticate_object_domain(id, bytes)?;
+    if raw_control_domain(domain) {
+        return Ok(true);
+    }
+    Ok(domain == ObjectDomain::OrderedTreeNode && !super::tree::is_serving_tree_node(id, bytes)?)
+}
+
 pub(super) fn hot_packable_object(id: ObjectId, bytes: &[u8]) -> Result<bool, StorageError> {
     let domain = authenticate_object_domain(id, bytes)?;
     if !hot_packable_domain(domain) {
