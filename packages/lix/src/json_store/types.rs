@@ -1,20 +1,5 @@
-use std::sync::Arc;
-
 use bytes::Bytes;
 use musli::{Allocator, Decode, Decoder, Encode, Encoder};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NormalizedJson(Arc<str>);
-
-impl NormalizedJson {
-    pub(crate) fn from_arc_unchecked(normalized: Arc<str>) -> Self {
-        Self(normalized)
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        self.0.as_ref()
-    }
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct JsonRef {
@@ -117,12 +102,6 @@ impl<'a> NormalizedJsonRef<'a> {
 
     pub(crate) fn trusted_json_ref(&self) -> Option<JsonRef> {
         self.trusted_json_ref
-    }
-}
-
-impl<'a> From<&'a NormalizedJson> for NormalizedJsonRef<'a> {
-    fn from(value: &'a NormalizedJson) -> Self {
-        Self::new(value.as_str())
     }
 }
 

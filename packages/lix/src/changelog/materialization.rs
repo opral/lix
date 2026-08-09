@@ -26,24 +26,6 @@ impl ChangeRecordProjection {
         }
     }
 
-    /// Loads identity and revision columns without hydrating JSON payloads.
-    pub(crate) fn identity_only() -> Self {
-        Self {
-            snapshot_content: false,
-            metadata: false,
-        }
-    }
-
-    pub(crate) fn from_columns(columns: &[String]) -> Self {
-        if columns.is_empty() {
-            return Self::full();
-        }
-        Self {
-            snapshot_content: columns.iter().any(|column| column == "snapshot_content"),
-            metadata: columns.iter().any(|column| column == "metadata"),
-        }
-    }
-
     pub(crate) fn requires_payload(self) -> bool {
         self.snapshot_content || self.metadata
     }
