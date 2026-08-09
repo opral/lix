@@ -7917,7 +7917,7 @@ async fn resolve_prepared_mutation_collection_generation(
     if let Some(generation) = generation {
         return Ok(Some((schema_key, generation)));
     }
-    let generation = forktree
+    let Some(generation) = forktree
         .collection_generation(
             &branch_id,
             crate::collection_generation::CollectionScopeRef {
@@ -7926,12 +7926,24 @@ async fn resolve_prepared_mutation_collection_generation(
             },
         )
         .await?
-        .and_then(|generation| {
-            generation
-                .ordered_identity_digest
-                .map(|digest| (generation.live_count, digest))
-        });
-    Ok(generation.map(|generation| (schema_key, generation)))
+    else {
+        return Ok(None);
+    };
+    if generation.live_count == crate::collection_generation::DEFERRED_LIVE_COUNT
+        || generation.live_count == 0
+    {
+        return Ok(None);
+    }
+    let ordered_identity_digest = generation.ordered_identity_digest.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "authenticated collection generation is missing its ordered identity digest",
+        )
+    })?;
+    Ok(Some((
+        schema_key,
+        (generation.live_count, ordered_identity_digest),
+    )))
 }
 
 async fn load_opening_exact_live_state_batch(
@@ -8555,8 +8567,12 @@ mod transaction_validation_reader_tests {
             .expect("ForkTree collection-generation reader end");
         let reader = &reader_source[reader_start..reader_end];
         assert!(reader.contains("scan_facade("));
+        assert!(reader.contains("authenticated_ordered_generation_digest("));
+        assert!(reader.contains("row.commit_id() != Some(active_generation)"));
         assert!(reader.contains("include_tombstones: true"));
         assert!(!reader.contains("LiveStateStoreReader"));
+        assert!(resolver.contains("missing its ordered identity digest"));
+        assert!(!resolver.contains(".and_then(|generation|"));
     }
 }
 
