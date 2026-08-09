@@ -14,6 +14,7 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
+use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonRef;
 use crate::live_state::{CertifiedCurrentStatePredecessor, MaterializedLiveStateRow};
 use crate::tracked_state::TrackedStateDiffIdentity;
@@ -645,13 +646,28 @@ impl CertifiedParameterBatch {
         origin_key: Option<&SharedStr>,
         timestamp: LixTimestamp,
     ) -> Result<PreparedStateBatch, LixError> {
-        self.into_dense_prepared_timestamps(origin_key, DenseParameterTimestamps::Scalar(timestamp))
+        let functions = FunctionProviderHandle::system();
+        self.into_dense_prepared_with_functions(origin_key, timestamp, &functions)
+    }
+
+    pub(crate) fn into_dense_prepared_with_functions(
+        self,
+        origin_key: Option<&SharedStr>,
+        timestamp: LixTimestamp,
+        functions: &FunctionProviderHandle,
+    ) -> Result<PreparedStateBatch, LixError> {
+        self.into_dense_prepared_timestamps(
+            origin_key,
+            DenseParameterTimestamps::Scalar(timestamp),
+            functions,
+        )
     }
 
     fn into_dense_prepared_timestamps(
         self,
         origin_key: Option<&SharedStr>,
         timestamps: DenseParameterTimestamps,
+        functions: &FunctionProviderHandle,
     ) -> Result<PreparedStateBatch, LixError> {
         let Self {
             entity_pks,
@@ -662,6 +678,9 @@ impl CertifiedParameterBatch {
             certificate,
         } = self;
         let row_count = entity_pks.len();
+        let change_ids = (0..row_count)
+            .map(|_| ChangeId::from(functions.call_uuid_v7()))
+            .collect();
         let (mut strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
             (vec![schema_key], 0_u32, 0_u32)
         } else {
@@ -705,6 +724,7 @@ impl CertifiedParameterBatch {
                 schema_key: schema_key_ordinal,
                 origin_key,
                 timestamps,
+                change_ids,
                 commit_id: None,
                 branch_id: branch_id_ordinal,
                 untracked,
@@ -1117,6 +1137,7 @@ impl RawWriteBatch {
         certificate: CertifiedRawWriteBatchPreparation,
         origin_key: Option<&SharedStr>,
         timestamp: LixTimestamp,
+        functions: &FunctionProviderHandle,
     ) -> Result<PreparedStateBatch, LixError> {
         if self.certified_preparation != Some(certificate) {
             return Err(LixError::new(
@@ -1241,7 +1262,7 @@ impl RawWriteBatch {
                 created_at: timestamp,
                 updated_at: timestamp,
                 global: false,
-                change_id: Some(ChangeId::default()),
+                change_id: Some(ChangeId::from(functions.call_uuid_v7())),
                 addressable_change_id: true,
                 commit_id: None,
                 untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
@@ -2798,6 +2819,7 @@ struct DenseCertifiedParameterSlots {
     schema_key: u32,
     origin_key: Option<u32>,
     timestamps: DenseParameterTimestamps,
+    change_ids: Vec<ChangeId>,
     commit_id: Option<CommitId>,
     branch_id: u32,
     untracked: bool,
@@ -3066,7 +3088,7 @@ impl PreparedStateBatch {
                 created_at: dense.timestamps.get(index),
                 updated_at: dense.timestamps.get(index),
                 global: false,
-                change_id: Some(ChangeId::default()),
+                change_id: Some(dense.change_ids[index]),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
                 untracked: dense.untracked,
@@ -3267,7 +3289,7 @@ impl PreparedStateBatch {
                 created_at: dense.timestamps.get(row_index),
                 updated_at: dense.timestamps.get(row_index),
                 global: false,
-                change_id: Some(ChangeId::default()),
+                change_id: Some(dense.change_ids[row_index]),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
                 untracked: false,
@@ -3337,7 +3359,7 @@ impl PreparedStateBatch {
             return false;
         }
 
-        let right = other
+        let mut right = other
             .dense_certified_parameter
             .take()
             .expect("compatible dense parameter batch");
@@ -3347,6 +3369,7 @@ impl PreparedStateBatch {
             .expect("compatible dense parameter batch");
         left.timestamps
             .append(left.len, right.len, right.timestamps);
+        left.change_ids.append(&mut right.change_ids);
         left.len = left
             .len
             .checked_add(right.len)

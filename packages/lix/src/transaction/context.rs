@@ -6057,7 +6057,12 @@ where
             && let Some(certificate) = certified_preparation
         {
             let timestamp = self.functions.call_timestamp();
-            return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
+            return rows.into_certified_prepared(
+                certificate,
+                self.origin_key.as_ref(),
+                timestamp,
+                &self.functions,
+            );
         }
         let staged = self.staged_writes.staging_overlay()?;
         let read = SharedStorageAdapterRead::new(
@@ -8665,7 +8670,11 @@ where
                 ))
                 .await?
         } else {
-            rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
+            rows.into_dense_prepared_with_functions(
+                self.origin_key.as_ref(),
+                self.functions.call_timestamp(),
+                &self.functions,
+            )?
         };
         if prepared.len() != row_count {
             return Err(LixError::new(
@@ -8731,7 +8740,11 @@ where
                 ))
                 .await?
         } else {
-            rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
+            rows.into_dense_prepared_with_functions(
+                self.origin_key.as_ref(),
+                self.functions.call_timestamp(),
+                &self.functions,
+            )?
         };
         if prepared.len() != row_count {
             return Err(LixError::new(
