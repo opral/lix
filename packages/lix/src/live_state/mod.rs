@@ -9,19 +9,20 @@ pub(crate) use context::LiveStateContext;
 pub(crate) use derived::is_derived_schema;
 pub(crate) use forktree_reader::{
     load_exact_facade as load_forktree_exact_facade, scan_facade as scan_forktree_facade,
-    scan_view as scan_forktree_view,
 };
 #[cfg(test)]
 pub(crate) use reader::load_exact_batch_via_scan_for_test;
 #[allow(unused_imports)]
 pub(crate) use reader::{LiveStateReadDomain, LiveStateReader};
+#[cfg(test)]
+pub(crate) use types::LiveStateRowRequest;
 #[allow(unused_imports)]
 pub(crate) use types::{
-    Bound, CertifiedCurrentStatePredecessor, CurrentStateDeltaRef, LiveStateExactBatchRequest,
-    LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection, LiveStateRowFilter,
-    LiveStateRowIdentityRef, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef, PackedHeadValue, ScanConstraint, ScanField, ScanOperator,
+    Bound, CertifiedCurrentStatePredecessor, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentityRef,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    ScanConstraint, ScanField, ScanOperator,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{

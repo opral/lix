@@ -1025,7 +1025,8 @@ fn validate_file_history_materialization(
             descriptor.id, blob_hash
         ))
     })?;
-    if declared_size != payload_size || BlobId::from_content(payload) != expected_blob_id {
+    if declared_size != payload_size || BlobId::from_canonical_content(payload) != expected_blob_id
+    {
         return Err(invalid_file_history_state(format!(
             "file '{}' blob reference '{}' does not authenticate its payload at observed commit '{observed_commit_id}'",
             descriptor.id, blob_hash
@@ -2544,7 +2545,6 @@ mod tests {
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 
-    use crate::LixError;
     use crate::binary_cas::BlobId;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};
@@ -2863,9 +2863,11 @@ mod tests {
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(plugin_key),
             archive_path: plugin_storage_archive_path(plugin_key),
-            archive_blob_hash: BlobId::from_content(format!("archive-{plugin_key}").as_bytes())
-                .to_hex(),
-            wasm_blob_hash: BlobId::from_content(wasm).to_hex(),
+            archive_blob_hash: BlobId::from_canonical_content(
+                format!("archive-{plugin_key}").as_bytes(),
+            )
+            .to_hex(),
+            wasm_blob_hash: BlobId::from_canonical_content(wasm).to_hex(),
         })
         .expect("test plugin registry entry should be valid");
         PluginRegistry::new(vec![entry]).expect("test plugin registry should be valid")
@@ -2895,7 +2897,7 @@ mod tests {
 
     #[test]
     fn public_id_and_path_filters_prune_before_hydration() {
-        let hash = BlobId::from_content(b"content");
+        let hash = BlobId::from_canonical_content(b"content");
         let live_a = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
         let live_b = descriptor("01920000-0000-7000-8000-0000000000b2", Some("b.md"), 0);
         let tombstone = descriptor("file-deleted", None, 0);
@@ -3120,7 +3122,7 @@ mod tests {
             "a live file without a BlobRef is not an authenticated empty file"
         );
 
-        let empty_hash = BlobId::from_content(b"");
+        let empty_hash = BlobId::from_canonical_content(b"");
         let blob = blob_record(file_id, empty_hash, 0);
         let state = Arc::new(observed_state_from_entries(
             [descriptor.entry.clone(), blob.entry],

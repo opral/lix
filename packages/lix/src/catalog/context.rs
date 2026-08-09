@@ -240,11 +240,6 @@ impl CatalogContext {
         Ok(schemas.into_values().collect())
     }
 
-    #[cfg(test)]
-    pub(crate) fn sql_read_schema_load_count_for_test(&self) -> usize {
-        self.sql_read_schema_loads.load(Ordering::Relaxed)
-    }
-
     /// Loads schema facts reachable from a row domain for catalog tests.
     #[cfg(test)]
     pub(crate) async fn schema_facts_for_domain<R>(

@@ -11,10 +11,8 @@ pub(crate) use self::path_index::{
     FilesystemPathEntry, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, FilesystemPathKind, FilesystemPathSelection,
     ForkTreeFilesystemPathIndexReader, UncachedFilesystemPathIndexReader, build_path_index,
-    load_path_index_revision, stage_path_index_revision,
+    load_path_index_revision,
 };
-#[cfg(test)]
-pub(crate) use self::path_index::{full_rebuild_stats, reset_full_rebuild_stats};
 pub(crate) use self::persistent_map::{PersistentMap, PersistentMapRangeCursor};
 pub(crate) use self::planner::directory_path_resolvers_from_state_batch;
 pub(crate) use self::planner::{
@@ -28,7 +26,5 @@ pub(crate) use self::planner::{
     plan_parsed_file_path_update_with_resolvers, plan_parsed_file_path_write_with_resolvers,
     plan_recursive_directory_delete,
 };
-pub(crate) use self::read::{
-    FilesystemIndex, collect_gc_binary_blob_roots, filesystem_schema_keys,
-};
+pub(crate) use self::read::{FilesystemIndex, filesystem_schema_keys};
 pub(crate) use self::visibility::VisibleFilesystem;

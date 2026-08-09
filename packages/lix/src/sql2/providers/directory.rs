@@ -2614,13 +2614,6 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn load_bytes_many(
-            &mut self,
-            hashes: &[crate::binary_cas::BlobId],
-        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            BlobDataReader::load_bytes_many(self, hashes).await
-        }
-
         async fn scan_live_state_batch(
             &mut self,
             _request: &LiveStateScanRequest,

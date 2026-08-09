@@ -11,70 +11,14 @@ use bytes::Bytes;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonSlotRef;
-use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
 
-/// Neutral current-state mutation input shared by initialization and the
-/// transaction writer.  This belongs to the live-state owner rather than the
-/// deleted tracked-head module so the writer does not retain a dependency on
-/// the superseded physical reader.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CurrentStateDeltaRef<'a> {
-    pub(crate) schema_key: &'a str,
-    pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a EntityPk,
-    pub(crate) change_id: Option<ChangeId>,
-    pub(crate) commit_id: Option<CommitId>,
-    pub(crate) untracked: bool,
-    pub(crate) deleted: bool,
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) updated_at: LixTimestamp,
-    pub(crate) snapshot: JsonSlotRef<'a>,
-    pub(crate) metadata: JsonSlotRef<'a>,
-}
-
 #[derive(Debug, Clone)]
-pub(crate) enum CertifiedCurrentStatePredecessor {
-    Encoded(Bytes),
-    Packed(PackedHeadValue),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PackedHeadValue {
-    pub(crate) change_id: ChangeId,
-    pub(crate) commit_id: CommitId,
-    pub(crate) deleted: bool,
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) updated_at: LixTimestamp,
-    pub(crate) checkpoint_commit_id: Option<CommitId>,
-}
+pub(crate) enum CertifiedCurrentStatePredecessor {}
 
 impl CertifiedCurrentStatePredecessor {
     pub(crate) fn created_at(&self) -> Result<LixTimestamp, crate::LixError> {
-        match self {
-            Self::Packed(value) => Ok(value.created_at),
-            Self::Encoded(bytes) => {
-                if bytes.len() < 59 || bytes.first().copied() != Some(8) {
-                    return Err(crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        "encoded current-state predecessor has an invalid fixed header",
-                    ));
-                }
-                let packed = u64::from_be_bytes(bytes[34..42].try_into().map_err(|_| {
-                    crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        "encoded current-state predecessor has an invalid timestamp",
-                    )
-                })?);
-                LixTimestamp::from_packed(packed).map_err(|error| {
-                    crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        format!("encoded current-state predecessor timestamp is invalid: {error}"),
-                    )
-                })
-            }
-        }
+        match *self {}
     }
 }
 
@@ -338,6 +282,7 @@ impl MaterializedLiveStateBatch {
             .map_or_else(|| self.branch_ids[index].0 as usize, |_| 0)
     }
 
+    #[cfg(test)]
     pub(crate) fn filter(
         &self,
         mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
@@ -685,28 +630,6 @@ impl MaterializedLiveStateExactBatch {
             .copied()
             .flatten()
             .map(|ordinal| self.batch.row(ordinal as usize))
-    }
-
-    pub(crate) fn filter(
-        &self,
-        mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
-    ) -> Result<Self, crate::LixError> {
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(self.len());
-        let mut slots = Vec::with_capacity(self.len());
-        for index in 0..self.len() {
-            let Some(row) = self.row(index).filter(|row| keep(*row)) else {
-                slots.push(None);
-                continue;
-            };
-            let ordinal = u32::try_from(builder.push_ref(row, None)).map_err(|_| {
-                crate::LixError::new(
-                    crate::LixError::CODE_INTERNAL_ERROR,
-                    "exact live-state result exceeds u32 rows",
-                )
-            })?;
-            slots.push(Some(ordinal));
-        }
-        Self::new(builder.finish(), slots)
     }
 
     /// Consumes an aligned exact result into one compact owner containing only
@@ -1201,63 +1124,6 @@ impl MaterializedLiveStateBatchBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push_materialized(
-        &mut self,
-        entity_pk: EntityPk,
-        schema_key: String,
-        file_id: Option<String>,
-        snapshot_content: Option<SharedStr>,
-        metadata: Option<SharedStr>,
-        deleted: bool,
-        created_at: LixTimestamp,
-        updated_at: LixTimestamp,
-        global: bool,
-        change_id: Option<ChangeId>,
-        commit_id: Option<CommitId>,
-        untracked: bool,
-        branch_id: &str,
-    ) -> usize {
-        let ordinal = self.len();
-        if self.singleton_capacity {
-            self.push_owned(MaterializedLiveStateRow {
-                entity_pk,
-                schema_key,
-                file_id,
-                snapshot_content,
-                metadata,
-                deleted,
-                created_at,
-                updated_at,
-                global,
-                change_id,
-                commit_id,
-                untracked,
-                branch_id: Arc::from(branch_id),
-            });
-            return ordinal;
-        }
-        let schema_key = SchemaKeyId(self.intern_owned(schema_key));
-        let file_id = file_id.map(|file_id| FileIdId::from_ordinal(self.intern_owned(file_id)));
-        let branch_id = BranchIdId(self.intern_ref(branch_id));
-        self.push_columns(
-            schema_key,
-            file_id,
-            branch_id,
-            entity_pk,
-            snapshot_content,
-            metadata,
-            deleted,
-            created_at,
-            updated_at,
-            global,
-            change_id,
-            commit_id,
-            untracked,
-        );
-        ordinal
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_materialized_ref(
         &mut self,
         entity_pk: &EntityPk,
@@ -1390,6 +1256,7 @@ impl MaterializedLiveStateBatchBuilder {
         self.durable_predecessor.push(None);
     }
 
+    #[cfg(test)]
     pub(crate) fn set_snapshot_content(&mut self, row: usize, value: SharedStr) {
         if let Some(singleton) = self.singleton.as_mut() {
             assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
@@ -1399,6 +1266,7 @@ impl MaterializedLiveStateBatchBuilder {
         self.snapshot_content[row] = Some(value);
     }
 
+    #[cfg(test)]
     pub(crate) fn set_metadata(&mut self, row: usize, value: SharedStr) {
         if let Some(singleton) = self.singleton.as_mut() {
             assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
@@ -1440,44 +1308,6 @@ impl MaterializedLiveStateBatchBuilder {
             untracked: self.untracked,
             durable_predecessor: self.durable_predecessor,
         }
-    }
-}
-
-impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
-    type Error = crate::LixError;
-
-    fn try_from(row: &MaterializedLiveStateRow) -> Result<Self, Self::Error> {
-        if row.untracked {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked_state cannot store untracked live-state rows",
-            ));
-        }
-        let Some(change_id) = row.change_id else {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked_state rows require change_id",
-            ));
-        };
-        let Some(commit_id) = row.commit_id else {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked_state rows require commit_id",
-            ));
-        };
-
-        Ok(Self {
-            entity_pk: row.entity_pk.clone(),
-            schema_key: row.schema_key.clone(),
-            file_id: row.file_id.clone(),
-            snapshot_content: row.snapshot_content.clone(),
-            metadata: row.metadata.clone(),
-            deleted: row.deleted,
-            created_at: row.created_at.to_string(),
-            updated_at: row.updated_at.to_string(),
-            change_id,
-            commit_id,
-        })
     }
 }
 
@@ -1560,6 +1390,7 @@ pub(crate) struct LiveStateScanRequest {
 }
 
 /// Point lookup request for one visible live-state row.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LiveStateRowRequest {
     pub(crate) schema_key: String,
@@ -1595,6 +1426,7 @@ pub(crate) struct LiveStateExactBatchRequest {
 }
 
 impl LiveStateExactBatchRequest {
+    #[cfg(test)]
     pub(crate) fn row_scan_request(&self, row: &LiveStateExactRowRequest) -> LiveStateScanRequest {
         LiveStateScanRequest {
             filter: LiveStateFilter {
