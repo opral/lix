@@ -16,14 +16,16 @@ use serde_json::Value as JsonValue;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
-    BranchHead, BranchRefReader, branch_descriptor_stage_row, branch_descriptor_tombstone_row,
+    BRANCH_DESCRIPTOR_SCHEMA_KEY, BranchHead, BranchRefReader, branch_descriptor_stage_row,
+    branch_descriptor_tombstone_row,
 };
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
-    MaterializedLiveStateRowRef,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
+    LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRowRef,
 };
+use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
@@ -1161,6 +1163,83 @@ fn push_branch_descriptor_row(
         (!tombstone).then_some(row.commit_id),
         matches!(operation, TransactionWriteOperation::Insert),
     )
+}
+
+/// Deletes one exact public branch identity without constructing a DataFusion
+/// candidate batch.
+///
+/// The bound executor admits only `DELETE ... WHERE id = <text>` without
+/// `RETURNING`. This owner still authenticates the descriptor and matching
+/// selector through the transaction's retained read, then stages the same
+/// descriptor tombstone and selector-retirement intent consumed by the sole
+/// `PreparedPublication` at commit.
+pub(crate) async fn execute_exact_branch_delete(
+    write_ctx: &mut dyn SqlWriteExecutionContext,
+    branch_id: String,
+) -> Result<u64, LixError> {
+    let Ok(entity_pk) = EntityPk::uuid_from_canonical(&branch_id) else {
+        // Preserve predicate semantics: a noncanonical text literal cannot
+        // identify a public branch row, so exact deletion is a no-op rather
+        // than a branch-ID API validation error.
+        return Ok(0);
+    };
+    let exact = write_ctx
+        .load_exact_live_state_batch(&LiveStateExactBatchRequest {
+            rows: vec![LiveStateExactRowRequest {
+                schema_key: BRANCH_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                entity_pk,
+                file_id: None,
+            }],
+            projection: LiveStateProjection::default(),
+            untracked: Some(false),
+            include_tombstones: false,
+        })
+        .await?;
+    let Some(descriptor_row) = exact.row(0) else {
+        return Ok(0);
+    };
+    let descriptor = parse_descriptor(descriptor_row)?;
+    if descriptor.id != branch_id {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "authenticated branch descriptor identity differs from its snapshot id",
+        ));
+    }
+    let Some(commit_id) = write_ctx.load_branch_head(&branch_id).await? else {
+        // Preserve the public joined-surface contract: a descriptor without
+        // its authenticated branch selector is not a deletable lix_branch row.
+        return Ok(0);
+    };
+    let branch_row = BranchRow {
+        id: descriptor.id,
+        name: descriptor.name,
+        hidden: descriptor.hidden,
+        commit_id,
+    };
+    reject_protected_branch_deletes(
+        std::slice::from_ref(&branch_row),
+        write_ctx.active_branch_id(),
+    )
+    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+
+    let mut rows = RawWriteBatch::with_capacity(1);
+    let (branch_id, commit_id, create) = push_branch_descriptor_row(
+        &mut rows,
+        branch_row,
+        TransactionWriteOperation::Delete,
+        true,
+    );
+    write_ctx
+        .stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows,
+        })
+        .await?;
+    write_ctx
+        .stage_branch_ref_intent(&branch_id, commit_id, create)
+        .await?;
+    Ok(1)
 }
 
 async fn stage_branch_ref_intents(
