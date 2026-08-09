@@ -3542,12 +3542,7 @@ mod tests {
             value: super::EntityFilterValue::String("keep".to_string()),
         }];
         let batch = super::load_authenticated_entity_record_batch(
-            &spec,
-            schema,
-            &reader,
-            &request,
-            &filters,
-            None,
+            &spec, schema, &reader, &request, &filters, None,
         )
         .await
         .expect("authenticated exact residual filter");
