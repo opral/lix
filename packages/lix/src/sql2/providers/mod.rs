@@ -489,7 +489,12 @@ where
                         &surface.kind,
                         PublicSurfaceKind::EntityBase { schema_key }
                             | PublicSurfaceKind::EntityByBranch { schema_key }
-                                if matches!(schema_key.as_str(), "lix_commit" | "lix_commit_edge")
+                                if matches!(
+                                    schema_key.as_str(),
+                                    "lix_commit"
+                                        | "lix_commit_edge"
+                                        | crate::branch::BRANCH_REF_SCHEMA_KEY
+                                )
                     )
             }))
         .then(|| Arc::clone(&commit_graph)),
