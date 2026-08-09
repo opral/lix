@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, ready_for_review]
   push:
     branches:
       - main
@@ -20,6 +20,7 @@ defaults:
 jobs:
   changelog:
     name: Changelog
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
 
     steps:
@@ -31,6 +32,7 @@ jobs:
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -52,6 +54,7 @@ jobs:
 
   cargo:
     name: Cargo ${{ matrix.name }}
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
     strategy:
       fail-fast: false
@@ -132,6 +135,7 @@ jobs:
 
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: blacksmith-32vcpu-ubuntu-2404
     strategy:
       fail-fast: false
