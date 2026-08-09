@@ -65,23 +65,6 @@ impl LiveStateContext {
         }
     }
 
-    /// Creates a reader whose branch generation selectors are pinned to one
-    /// transaction-local cache.
-    pub(crate) fn transaction_reader<S>(
-        &self,
-        store: S,
-        _branch_head_control_cache: std::sync::Arc<BranchHeadControlCache>,
-    ) -> LiveStateStoreReader<S>
-    where
-        S: StorageAdapterRead,
-    {
-        LiveStateStoreReader {
-            store,
-            commit_graph: self.commit_graph.clone(),
-            filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-        }
-    }
-
     /// Creates a reader whose derived indexes are private to one retained
     /// storage snapshot. Process-wide caches intentionally advance with live
     /// commits and therefore cannot serve an older explicit transaction.
