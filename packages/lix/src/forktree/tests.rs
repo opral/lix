@@ -34,16 +34,17 @@ use super::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView, CommitCatalogEntry, CommitId,
-    CommitMemberV1, CommitObjectV1, ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1,
-    ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
-    ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
-    SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
-    StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef,
-    UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
-    advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
-    load_commit_member_records, load_commit_topologies, open_coherent_view, page_changes,
-    page_commits, prepare_upload_completion, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_range,
+    CommitMemberV1, CommitObjectV1, EncodedChange, EncodedCommit, ForkTreeReadFacade, GcBudget,
+    GcStepStatus, GlobalSelectorV1, ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT,
+    RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot, RepositoryRootV1,
+    SelectorExpectation, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
+    StateCell, StateCellRef, StateKey, StateKeyRef, StateSource, StateTreeMutation, StateValueRef,
+    UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree, encode_state_key,
+    encode_state_value, load_change, load_commit, load_commit_member_records,
+    load_commit_topologies, open_coherent_view, page_changes, page_commits,
+    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -846,6 +847,8 @@ async fn branch_transition<R: StorageAdapterRead>(
     .await
     .expect("change catalog edit");
     let local_state_root = state_edit.root;
+    let encoded_semantic_commit = EncodedCommit::new(semantic_commit).expect("encoded commit");
+    let encoded_ref_change = EncodedChange::new(ref_change).expect("encoded ref change");
     BranchStateTransition {
         state_edit,
         repository_root: RepositoryRootV1 {
@@ -855,8 +858,8 @@ async fn branch_transition<R: StorageAdapterRead>(
         },
         commit_catalog_edit,
         change_catalog_edit,
-        semantic_commit,
-        changes: vec![ref_change],
+        semantic_commit: encoded_semantic_commit,
+        changes: vec![encoded_ref_change],
         branch_snapshot: BranchSnapshotV1 {
             branch_id: view.branch_id(),
             local_state_root,

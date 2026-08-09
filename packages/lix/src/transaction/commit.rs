@@ -21,8 +21,8 @@ use crate::transaction::types::{PreparedStateRowRef, StageJson};
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
-    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
+    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, EncodedChange, EncodedCommit,
+    ObjectId, OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
     StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
     encode_state_key, encode_state_value, load_commit, open_coherent_view_on_read,
     select_historical_commit_member, state_point,
@@ -521,11 +521,13 @@ where
         .ok_or_else(|| writer_error("commit generation overflows u64"))?;
 
     let mut encoded_semantic_changes = Vec::with_capacity(changes.len());
+    let mut encoded_changes = Vec::with_capacity(changes.len() + 1);
     let mut member_object_ids = Vec::with_capacity(changes.len());
-    for change in &changes {
-        let (object_id, _) = change.encode()?;
-        member_object_ids.push(object_id);
-        encoded_semantic_changes.push((change.change_id(), object_id));
+    for change in changes {
+        let encoded = EncodedChange::new(change)?;
+        member_object_ids.push(encoded.id);
+        encoded_semantic_changes.push((encoded.value.change_id(), encoded.id));
+        encoded_changes.push(encoded);
     }
     let global_state_root = if global {
         state_edit.root
@@ -546,7 +548,7 @@ where
         account_id: active_account_id.to_string(),
         created_at: change_refs.created_at,
     };
-    let mut semantic_commit = CommitObjectV1 {
+    let semantic_commit = CommitObjectV1 {
         commit_id: forktree_commit_id(commit_id),
         generation,
         parent_commit_object_ids: parent_object_ids,
@@ -559,8 +561,8 @@ where
         local_state_root,
         metadata: crate::changelog::encode_forktree_commit_payload(&commit_record)?,
     };
-    let _member_pages = semantic_commit.prepare_member_pages()?;
-    let (commit_object_id, _) = semantic_commit.encode()?;
+    let encoded_semantic_commit = EncodedCommit::new(semantic_commit)?;
+    let commit_object_id = encoded_semantic_commit.id;
 
     let ref_payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
         format_version: 2,
@@ -591,8 +593,9 @@ where
         payload: ref_payload,
         json_payload_object_ids: Vec::new(),
     };
-    let (ref_object_id, _) = ref_change.encode()?;
-    changes.push(ref_change);
+    let encoded_ref_change = EncodedChange::new(ref_change)?;
+    let ref_object_id = encoded_ref_change.id;
+    encoded_changes.push(encoded_ref_change);
 
     let commit_catalog_edit = view
         .put_commit_catalog_entries(
@@ -644,8 +647,8 @@ where
         state_edit,
         commit_catalog_edit,
         change_catalog_edit,
-        semantic_commit,
-        changes,
+        semantic_commit: encoded_semantic_commit,
+        changes: encoded_changes,
         branch_snapshot: BranchSnapshotV1 {
             branch_id: publication_branch_id,
             local_state_root,

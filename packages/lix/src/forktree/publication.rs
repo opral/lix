@@ -38,10 +38,52 @@ pub(crate) struct BranchStateTransition {
     pub(crate) state_edit: StateTreeEdit,
     pub(crate) commit_catalog_edit: CatalogTreeEdit,
     pub(crate) change_catalog_edit: CatalogTreeEdit,
-    pub(crate) semantic_commit: CommitObjectV1,
-    pub(crate) changes: Vec<ChangeObjectV1>,
+    pub(crate) semantic_commit: EncodedCommit,
+    pub(crate) changes: Vec<EncodedChange>,
     pub(crate) branch_snapshot: BranchSnapshotV1,
     pub(crate) repository_root: super::model::RepositoryRootV1,
+}
+
+/// Canonical bytes produced once at the typed commit-construction boundary.
+/// The wrapper is crate-private and carries the model value with its exact
+/// authenticated encoding, so publication can reuse the value/bytes pair
+/// without introducing a second serializer, hash, or authority.
+#[derive(Debug)]
+pub(crate) struct EncodedCommit {
+    pub(crate) value: CommitObjectV1,
+    pub(crate) id: ObjectId,
+    pub(crate) bytes: Bytes,
+    pub(crate) member_pages: Vec<(ObjectId, Bytes)>,
+}
+
+impl EncodedCommit {
+    pub(crate) fn new(mut value: CommitObjectV1) -> Result<Self, StorageError> {
+        let member_pages = value.prepare_member_pages()?;
+        let (id, bytes) = value.encode()?;
+        Ok(Self {
+            value,
+            id,
+            bytes,
+            member_pages,
+        })
+    }
+}
+
+/// Canonical bytes produced once at the typed change-construction boundary.
+/// Publication validates the value/catalog edges as before and stages these
+/// exact bytes; no caller can supply a detached byte slice to this wrapper.
+#[derive(Debug)]
+pub(crate) struct EncodedChange {
+    pub(crate) value: ChangeObjectV1,
+    pub(crate) id: ObjectId,
+    pub(crate) bytes: Bytes,
+}
+
+impl EncodedChange {
+    pub(crate) fn new(value: ChangeObjectV1) -> Result<Self, StorageError> {
+        let (id, bytes) = value.encode()?;
+        Ok(Self { value, id, bytes })
+    }
 }
 
 /// One ordered single-branch history publication. Intermediate commits and
@@ -783,7 +825,13 @@ impl PreparedPublication {
             state_edit,
             commit_catalog_edit,
             change_catalog_edit,
-            mut semantic_commit,
+            semantic_commit:
+                EncodedCommit {
+                    value: semantic_commit,
+                    id: commit_id,
+                    bytes: commit_bytes,
+                    member_pages,
+                },
             changes,
             branch_snapshot,
             repository_root,
@@ -818,8 +866,6 @@ impl PreparedPublication {
         if is_global && state_edit.wrote_tombstone {
             return Err(corruption("global state publication contains a tombstone"));
         }
-        let member_pages = semantic_commit.prepare_member_pages()?;
-        let (commit_id, commit_bytes) = semantic_commit.encode()?;
         if state_edit
             .written_commit_ids
             .iter()
@@ -876,9 +922,8 @@ impl PreparedPublication {
         }
 
         let mut encoded_changes = BTreeMap::new();
-        for change in &changes {
-            let (id, bytes) = change.encode()?;
-            if encoded_changes.insert(id, (change, bytes)).is_some() {
+        for EncodedChange { value, id, bytes } in changes {
+            if encoded_changes.insert(id, (value, bytes)).is_some() {
                 return Err(corruption("state transition repeats one Change object"));
             }
         }
