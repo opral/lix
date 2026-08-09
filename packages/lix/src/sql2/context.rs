@@ -166,6 +166,20 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         None
     }
 
+    /// Supplies the authenticated payload reader for pre-image SQL reads.
+    ///
+    /// A transaction may override this with a reader bound to its retained
+    /// opening view. The default is deliberately unavailable so lightweight
+    /// test/write contexts cannot silently fall back to BlobId-only reads.
+    fn authenticated_blob_reader(
+        &self,
+    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "authenticated ForkTree blob reader is unavailable for this SQL write context",
+        ))
+    }
+
     async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
 
     async fn scan_live_state_batch(
@@ -367,6 +381,12 @@ impl SqlWriteContext {
 
     pub(crate) fn session_file_views(&self) -> Option<SessionFileViews> {
         unsafe { self.ptr.0.as_ref().session_file_views() }
+    }
+
+    pub(crate) fn authenticated_blob_reader(
+        &self,
+    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+        unsafe { self.ptr.0.as_ref().authenticated_blob_reader() }
     }
 
     pub(crate) async fn scan_live_state_batch(
