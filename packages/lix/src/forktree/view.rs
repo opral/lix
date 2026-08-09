@@ -291,7 +291,7 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after).await
+        diff_state_rows_between_commits_on_read(&self.read, before, after, true).await
     }
 }
 
@@ -408,7 +408,7 @@ where
             let value = self
                 .load_state_value_at_commit(commit_id, &encoded_key, true)
                 .await?;
-            rows.push(value.map(|(value, _source)| {
+            rows.push(value.map(|(value, source)| {
                 let (snapshot_content, deleted) = match value.cell {
                     super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
                     super::state::StateCell::Null => (None, false),
@@ -416,6 +416,7 @@ where
                 };
                 super::state::HistoricalStateRow {
                     key: key.clone(),
+                    global: source == super::serving::StateSource::Global,
                     snapshot_content,
                     metadata: value.metadata,
                     deleted,
@@ -564,7 +565,18 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after).await
+        diff_state_rows_between_commits_on_read(&self.read, before, after, true).await
+    }
+
+    /// Diffs only the branch-local state domain for checkpoint and working
+    /// diff projections. Global rows remain visible through the complete
+    /// historical API above, but are not re-staged into a branch checkpoint.
+    pub(crate) async fn diff_branch_state_rows_between_commits(
+        &self,
+        before: crate::changelog::CommitId,
+        after: crate::changelog::CommitId,
+    ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
+        diff_state_rows_between_commits_on_read(&self.read, before, after, false).await
     }
 
     /// Returns authenticated state-write identity changes separately from
@@ -744,12 +756,17 @@ async fn diff_state_rows_between_commits_on_read<R>(
     read: &R,
     before: crate::changelog::CommitId,
     after: crate::changelog::CommitId,
+    include_global: bool,
 ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
-    let after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
+    let mut before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
+    let mut after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
+    if !include_global {
+        before_rows.retain(|row| !row.global);
+        after_rows.retain(|row| !row.global);
+    }
     let mut by_key = BTreeMap::new();
     for row in before_rows {
         by_key.entry(row.key.clone()).or_insert((Some(row), None));
@@ -1164,6 +1181,7 @@ mod tests {
                 file_id: Some("file-a".to_owned()),
                 entity_pk: EntityPk::single("row-a"),
             },
+            global: false,
             change_id,
             commit_id,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),

@@ -35,7 +35,7 @@ use crate::changelog::{
     materialize_known_change_payloads,
 };
 use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_row};
-use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
+use crate::commit_graph::{CommitGraphContext, CommitGraphLiveStateReader, CommitGraphStoreReader};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
@@ -58,7 +58,7 @@ use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
     BranchHeadControlCache, CertifiedCurrentStatePredecessor, LiveStateContext,
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+    LiveStateReader, LiveStateScanRequest, LiveStateStoreReader, MaterializedLiveStateBatch,
     MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
     StagedLiveStateRows, overlay_load_exact_batch, overlay_scan_batch,
 };
@@ -6334,6 +6334,7 @@ where
         read: &(impl StorageAdapterRead + ?Sized),
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
+        let validation_live_state = self.validation_live_state_reader();
         if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
             // Row-local certificates avoid rebuilding the O(rows) validation
             // index, but they do not prove that a public INSERT identity is
@@ -6341,13 +6342,15 @@ where
             if !prepared_writes.insert_selection.is_empty() {
                 #[cfg(feature = "storage-benches")]
                 crate::storage_bench::record_transaction_validation_branch();
-                let live_state = self.live_state.reader(read);
-                validate_certified_tracked_insert_identities(&live_state, prepared_writes)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.validation.insert_identities"
-                    ))
-                    .await?;
+                validate_certified_tracked_insert_identities(
+                    &validation_live_state,
+                    prepared_writes,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.validation.insert_identities"
+                ))
+                .await?;
             }
             return Ok(());
         }
@@ -6361,8 +6364,8 @@ where
             // coherent commit snapshot before skipping the O(rows) index.
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_branch();
-            let live_state = self.live_state.reader(read);
-            validate_certified_fresh_plugin_file_import(&live_state, certificate).await?;
+            validate_certified_fresh_plugin_file_import(&validation_live_state, certificate)
+                .await?;
             return Ok(());
         }
         let staged = self.staged_writes.staging_overlay()?;
@@ -6371,15 +6374,14 @@ where
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_branch();
             let branch_prepared_writes = validation_index.validation_set_for_schema_scope(scope);
-            let live_state = self.live_state.reader(read);
             let schema_catalog = self
                 .schema_resolver
-                .catalog_for_validation(&live_state, &staged, scope)
+                .catalog_for_validation(&validation_live_state, &staged, scope)
                 .await?;
             let mut validation_input = TransactionValidationInput::new(
                 &branch_prepared_writes,
                 schema_catalog,
-                &live_state,
+                &validation_live_state,
             );
             if self.trust_filesystem_planner {
                 validation_input = validation_input.with_trusted_filesystem_planner();
@@ -6387,6 +6389,46 @@ where
             validate_prepared_writes(validation_input).await?;
         }
         Ok(())
+    }
+
+    fn validation_live_state_reader(
+        &self,
+    ) -> TransactionValidationLiveStateReader<SharedStorageAdapterRead<StorageImpl::Read<'static>>>
+    {
+        let read = self.opening_read();
+        let graph = Arc::new(tokio::sync::Mutex::new(Box::new(
+            CommitGraphContext::new().reader(read.clone()),
+        )
+            as Box<dyn crate::commit_graph::CommitGraphReader>));
+        let branch_ref: Arc<dyn BranchRefReader> =
+            Arc::new(self.branch_ctx.ref_reader(read.clone()));
+        TransactionValidationLiveStateReader {
+            current: self.live_state.reader(read.clone()),
+            commit: CommitGraphLiveStateReader::new(
+                "lix_commit",
+                Arc::clone(&graph),
+                Arc::clone(&branch_ref),
+                None,
+                false,
+                false,
+            ),
+            commit_edge: CommitGraphLiveStateReader::new(
+                "lix_commit_edge",
+                Arc::clone(&graph),
+                Arc::clone(&branch_ref),
+                None,
+                false,
+                false,
+            ),
+            branch_ref: CommitGraphLiveStateReader::new(
+                BRANCH_REF_SCHEMA_KEY,
+                graph,
+                branch_ref,
+                None,
+                false,
+                false,
+            ),
+        }
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
@@ -7588,7 +7630,7 @@ where
             .commit_id;
         let diff = self
             .forktree_read_facade()
-            .diff_state_rows_between_commits(previous_checkpoint_commit_id, head_commit_id)
+            .diff_branch_state_rows_between_commits(previous_checkpoint_commit_id, head_commit_id)
             .await?;
         let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
         if requested.len() != diff_ids.len() {
@@ -8122,6 +8164,88 @@ async fn load_transaction_blob_bytes(
         entries[index] = entry;
     }
     Ok(BlobBytesBatch::new(entries))
+}
+
+struct TransactionValidationLiveStateReader<R: crate::storage_adapter::StorageAdapterRead> {
+    current: LiveStateStoreReader<R>,
+    commit: CommitGraphLiveStateReader,
+    commit_edge: CommitGraphLiveStateReader,
+    branch_ref: CommitGraphLiveStateReader,
+}
+
+fn derived_validation_reader<'a>(
+    request: &LiveStateScanRequest,
+    commit: &'a CommitGraphLiveStateReader,
+    commit_edge: &'a CommitGraphLiveStateReader,
+    branch_ref: &'a CommitGraphLiveStateReader,
+) -> Option<&'a CommitGraphLiveStateReader> {
+    match request.filter.schema_keys.as_slice() {
+        [schema_key] if schema_key == "lix_commit" => Some(commit),
+        [schema_key] if schema_key == "lix_commit_edge" => Some(commit_edge),
+        [schema_key] if schema_key == BRANCH_REF_SCHEMA_KEY => Some(branch_ref),
+        _ => None,
+    }
+}
+
+#[async_trait]
+impl<R> LiveStateReader for TransactionValidationLiveStateReader<R>
+where
+    R: crate::storage_adapter::StorageAdapterRead + 'static,
+{
+    async fn scan_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        if let Some(reader) =
+            derived_validation_reader(request, &self.commit, &self.commit_edge, &self.branch_ref)
+        {
+            return reader.scan_batch(request).await;
+        }
+        self.current.scan_batch(request).await
+    }
+
+    async fn scan_constraint_batch(
+        &self,
+        request: &LiveStateScanRequest,
+        tracked_only: bool,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        if let Some(reader) =
+            derived_validation_reader(request, &self.commit, &self.commit_edge, &self.branch_ref)
+        {
+            let _ = tracked_only;
+            return reader.scan_batch(request).await;
+        }
+        self.current
+            .scan_constraint_batch(request, tracked_only)
+            .await
+    }
+
+    async fn scan_tracked_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        if let Some(reader) =
+            derived_validation_reader(request, &self.commit, &self.commit_edge, &self.branch_ref)
+        {
+            return reader.scan_batch(request).await;
+        }
+        self.current.scan_tracked_batch(request).await
+    }
+
+    async fn load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        if !request.rows.is_empty()
+            && request
+                .rows
+                .iter()
+                .all(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        {
+            return self.branch_ref.load_exact_batch(request).await;
+        }
+        self.current.load_exact_batch(request).await
+    }
 }
 
 struct TransactionReadLiveStateReader<R: crate::storage_adapter::StorageRead> {

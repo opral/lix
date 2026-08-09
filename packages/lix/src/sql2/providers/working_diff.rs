@@ -138,7 +138,10 @@ where
                                 ))
                             })?;
                         let diff = historical
-                            .diff_state_rows_between_commits(checkpoint_commit_id, head.commit_id)
+                            .diff_branch_state_rows_between_commits(
+                                checkpoint_commit_id,
+                                head.commit_id,
+                            )
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                         for entry in diff.into_iter().filter(|entry| {

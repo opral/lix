@@ -382,6 +382,42 @@ impl PreparedPublication {
         Ok(id)
     }
 
+    /// Publishes the selector for a newly-created branch into this same
+    /// transaction-owned publication. The source commit is already
+    /// authenticated through the caller's retained view; its state roots are
+    /// copied into the new branch snapshot and the selector is fenced with an
+    /// absent-key CAS, so creation cannot overwrite an existing branch.
+    pub(crate) fn publish_new_branch_selector(
+        &mut self,
+        view: &CoherentView<impl StorageAdapterRead>,
+        branch_id: super::model::CanonicalBranchId,
+        source_commit: &super::model::CommitObjectV1,
+    ) -> Result<ObjectId, StorageError> {
+        if branch_id == view.branch_id() {
+            return Err(corruption(
+                "branch creation selector targets the selected branch",
+            ));
+        }
+        let (source_commit_object_id, _) = source_commit.encode()?;
+        let branch_snapshot = BranchSnapshotV1 {
+            branch_id,
+            local_state_root: source_commit.local_state_root,
+            semantic_head_commit_object_id: source_commit_object_id,
+            latest_ref_change_object_id: None,
+            historical_global_state_root: source_commit.global_state_root,
+        };
+        let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
+        self.put_branch_selector(
+            BranchSelectorV1 {
+                branch_id,
+                branch_snapshot_object_id: snapshot_id,
+                selector_generation: 1,
+            },
+            SelectorExpectation::Absent,
+        )?;
+        Ok(snapshot_id)
+    }
+
     pub(super) fn stage_blob_chunk(
         &mut self,
         value: &BlobChunkV1,

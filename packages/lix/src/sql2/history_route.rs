@@ -501,45 +501,58 @@ where
             .map(|entry| entry.change.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         for certified_commit_id in certified_commit_ids {
-            let Some((depth, commit_created_at)) = reachable_by_id.get(&certified_commit_id) else {
+            if !reachable_by_id.contains_key(&certified_commit_id) {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("certified commit '{certified_commit_id}' is not reachable"),
                 ));
-            };
-            let account_id = accounts_by_commit
-                .get(&certified_commit_id)
-                .cloned()
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("certified commit '{certified_commit_id}' has no account"),
-                    )
-                })?;
+            }
             let certified_rows = query_source
                 .forktree_reader
                 .scan_state_rows_at_commit(certified_commit_id)
                 .await?;
             for row in certified_rows {
-                if row.commit_id != certified_commit_id {
+                let Some((row_depth, row_commit_created_at)) = reachable_by_id.get(&row.commit_id)
+                else {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!(
-                            "certified historical row commit identity mismatch for '{certified_commit_id}'"
+                            "certified historical row references commit '{}' that is not reachable from '{certified_commit_id}'",
+                            row.commit_id
                         ),
                     ));
-                }
+                };
                 if !historical_row_matches_request(&row, &request) {
+                    continue;
+                }
+                if request
+                    .min_depth
+                    .is_some_and(|minimum| *row_depth < minimum)
+                    || request
+                        .max_depth
+                        .is_some_and(|maximum| *row_depth > maximum)
+                {
                     continue;
                 }
                 let change_id = row.change_id.to_string();
                 if !existing_change_ids.insert(change_id.clone()) {
                     continue;
                 }
+                let account_id = accounts_by_commit.get(&row.commit_id).cloned().ok_or_else(
+                    || {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "certified historical row commit '{}' has no authenticated account",
+                                row.commit_id
+                            ),
+                        )
+                    },
+                )?;
                 rows.push(HistoryEntry {
                     change: MaterializedChange {
                         id: change_id,
-                        account_id: account_id.clone(),
+                        account_id,
                         entity_pk: row.key.entity_pk,
                         schema_key: row.key.schema_key,
                         file_id: row.key.file_id,
@@ -548,12 +561,12 @@ where
                         created_at: row.created_at.to_string(),
                         origin_key: None,
                     },
-                    observed_commit_id: certified_commit_id.to_string(),
+                    observed_commit_id: row.commit_id.to_string(),
                     commit_created_at: metadata_projection
                         .commit_created_at
-                        .then(|| commit_created_at.clone()),
+                        .then(|| row_commit_created_at.clone()),
                     as_of_commit_id: as_of_commit_id.to_string(),
-                    depth: *depth,
+                    depth: *row_depth,
                 });
             }
         }

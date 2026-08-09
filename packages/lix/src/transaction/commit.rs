@@ -189,6 +189,15 @@ where
     let mut publication = PreparedPublication::from_branch_view(&view)?;
     let prepared_blob_manifests = prepared_blob_manifest_ids(&mut publication, &prepared_writes)?;
 
+    if let Some((branch_id, source_head)) = branch_creation_intent(&prepared_writes)? {
+        let source_commit = load_commit(&view, forktree_commit_id(source_head))
+            .await?
+            .ok_or_else(|| writer_error("branch creation source commit is absent"))?;
+        publication
+            .publish_new_branch_selector(&view, branch_id, &source_commit)
+            .map_err(LixError::from)?;
+    }
+
     for checkpoint in &prepared_writes.checkpoint_publications {
         crate::gc::stage_checkpoint_publication(&mut publication, checkpoint)?;
     }
@@ -1318,6 +1327,73 @@ fn prepared_blob_manifest_ids(
         }
     }
     Ok(manifests)
+}
+
+fn branch_creation_intent(
+    prepared: &PreparedWriteSet,
+) -> Result<Option<(CanonicalBranchId, CommitId)>, LixError> {
+    let mut descriptor = None;
+    let mut branch_ref = None;
+    for (row_index, row) in prepared.state_rows.iter().enumerate() {
+        if !prepared.insert_selection.contains(row_index) {
+            continue;
+        }
+        let Some(snapshot) = row.snapshot else {
+            continue;
+        };
+        if row.schema_key.as_str() == crate::branch::BRANCH_DESCRIPTOR_SCHEMA_KEY
+            && !row.untracked
+            && row.global
+        {
+            let value: serde_json::Value =
+                serde_json::from_str(snapshot.normalized()).map_err(|error| {
+                    writer_error(format!("branch descriptor is malformed: {error}"))
+                })?;
+            let branch_id = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| writer_error("branch descriptor has no authenticated id"))?;
+            let branch_id = canonical_branch_id(branch_id)?;
+            if descriptor.replace(branch_id).is_some() {
+                return Err(writer_error(
+                    "one transaction creates more than one branch selector",
+                ));
+            }
+        } else if row.schema_key.as_str() == crate::branch::BRANCH_REF_SCHEMA_KEY
+            && row.untracked
+            && row.global
+        {
+            let value: serde_json::Value = serde_json::from_str(snapshot.normalized())
+                .map_err(|error| writer_error(format!("branch ref is malformed: {error}")))?;
+            let branch_id = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| writer_error("branch ref has no authenticated id"))?;
+            let source_head = value
+                .get("commit_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| writer_error("branch ref has no authenticated source commit"))?;
+            let branch_id = canonical_branch_id(branch_id)?;
+            let source_head = CommitId::parse_lix(source_head, "branch source commit")?;
+            if branch_ref.replace((branch_id, source_head)).is_some() {
+                return Err(writer_error(
+                    "one transaction inserts more than one branch reference",
+                ));
+            }
+        }
+    }
+    match (descriptor, branch_ref) {
+        (None, None) => Ok(None),
+        (Some(branch_id), Some((ref_branch_id, source_head))) if branch_id == ref_branch_id => {
+            Ok(Some((branch_id, source_head)))
+        }
+        (Some(_), Some(_)) => Err(writer_error(
+            "branch descriptor and branch ref identities do not match",
+        )),
+        _ => Err(writer_error(
+            "branch creation requires an inserted descriptor and reference",
+        )),
+    }
 }
 
 fn blob_manifest_object_ids_for_row(
