@@ -106,7 +106,7 @@ fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
     assert!(!model.contains("pub(crate) canonical_blob_id"));
     assert!(!facade.contains("canonical_blob_id"));
     assert!(blob.contains("canonical_blob_id: semantic_id_builder.finish()"));
-    assert!(blob.contains("manifest.canonical_blob_id != reference.semantic_id"));
+    assert!(blob.contains("manifest.canonical_blob_id != semantic_id"));
     assert!(!blob.contains("BTreeMap<crate::binary_cas::BlobId"));
     assert!(!blob.contains("fn canonical_blob_id"));
 }
