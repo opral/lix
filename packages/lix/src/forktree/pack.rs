@@ -217,6 +217,20 @@ impl EntityStatePackV1 {
             .partition_point(|page| page.last_key < *key)
             .min(self.pages.len().saturating_sub(1))
     }
+
+    /// Returns the page containing an existing key for read-time selection.
+    ///
+    /// `page_index_for_key` intentionally returns the insertion-neighbor page
+    /// used by the publication path. Reads must not use that rule: an absent
+    /// key before, between, or after authenticated page ranges must select no
+    /// page rather than decode an unrelated page.
+    pub(crate) fn page_index_for_existing_key(&self, key: &StateKey) -> Option<usize> {
+        let index = self.pages.partition_point(|page| page.last_key < *key);
+        self.pages
+            .get(index)
+            .filter(|page| page.first_key <= *key && *key <= page.last_key)
+            .map(|_| index)
+    }
 }
 
 impl EntityStatePackPageV1 {
@@ -377,5 +391,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn read_page_selection_does_not_decode_an_unrelated_page_for_absent_keys() {
+        let state_root = ObjectId::from_bytes([0x22; 32]);
+        let manifest = EntityStatePackV1 {
+            state_root,
+            row_count: 3,
+            pages: vec![
+                EntityStatePackPageRef {
+                    object_id: ObjectId::from_bytes([0x23; 32]),
+                    first_key: sample_key("a"),
+                    last_key: sample_key("b"),
+                    row_count: 2,
+                },
+                EntityStatePackPageRef {
+                    object_id: ObjectId::from_bytes([0x24; 32]),
+                    first_key: sample_key("d"),
+                    last_key: sample_key("e"),
+                    row_count: 1,
+                },
+            ],
+        };
+
+        assert_eq!(
+            manifest.page_index_for_existing_key(&sample_key("a")),
+            Some(0)
+        );
+        assert_eq!(
+            manifest.page_index_for_existing_key(&sample_key("e")),
+            Some(1)
+        );
+        assert_eq!(manifest.page_index_for_existing_key(&sample_key("0")), None);
+        assert_eq!(manifest.page_index_for_existing_key(&sample_key("c")), None);
+        assert_eq!(manifest.page_index_for_existing_key(&sample_key("z")), None);
     }
 }

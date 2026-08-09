@@ -2217,7 +2217,7 @@ where
     let manifest = load_entity_pack_manifest(read, pack_root, state_root).await?;
     let selected_pages = keys.map(|keys| {
         keys.iter()
-            .map(|key| manifest.page_index_for_key(key))
+            .filter_map(|key| manifest.page_index_for_existing_key(key))
             .collect::<BTreeSet<_>>()
     });
     let mut pages = Vec::with_capacity(
@@ -2254,7 +2254,7 @@ where
     let manifest = load_entity_pack_manifest(read, pack_root, state_root).await?;
     let selected_pages = keys.map(|keys| {
         keys.iter()
-            .map(|key| manifest.page_index_for_key(key))
+            .filter_map(|key| manifest.page_index_for_existing_key(key))
             .collect::<BTreeSet<_>>()
     });
     let mut pages = Vec::with_capacity(
