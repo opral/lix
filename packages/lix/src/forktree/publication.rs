@@ -16,7 +16,9 @@ use super::model::{
     snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::serving::{CatalogTreeEdit, StateTreeEdit, validate_member_catalog_owner};
+use super::serving::{
+    CatalogTreeEdit, ObjectOverlayRead, StateTreeEdit, validate_member_catalog_owner,
+};
 use super::state::{
     StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
     encode_untracked_value,
