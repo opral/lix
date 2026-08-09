@@ -299,10 +299,28 @@ impl CommitGraphLiveStateReader {
             matches!(self.schema_key.as_str(), "lix_commit" | "lix_commit_edge")
                 && self.include_recovery_roots
                 && self.include_retained_nodes;
+        let (recovery_roots, retained_nodes_until_gc) = if self.include_recovery_roots {
+            self.checkpoint_roots().await?
+        } else {
+            (BTreeMap::new(), false)
+        };
+        let global_root_ids = if global_commit_surface {
+            let mut root_ids = BTreeSet::new();
+            for head in self.branch_ref.scan_heads().await? {
+                root_ids.insert(head.commit_id);
+            }
+            for roots in recovery_roots.values() {
+                root_ids.extend(roots.iter().copied());
+            }
+            root_ids
+        } else {
+            BTreeSet::new()
+        };
         let branch_ids = if global_commit_surface {
             // Global commit entities are facts of the one authenticated
-            // ForkTree topology, not one projection per branch selector. The
-            // branch column is the global scope marker for this surface.
+            // ForkTree topology, not one projection per branch selector. Walk
+            // every authenticated branch/recovery root once and emit the
+            // deduplicated result in the global scope below.
             vec![crate::GLOBAL_BRANCH_ID.to_owned()]
         } else if request.filter.branch_ids.is_empty() {
             self.branch_ref
@@ -313,11 +331,6 @@ impl CommitGraphLiveStateReader {
                 .collect::<Vec<_>>()
         } else {
             request.filter.branch_ids.clone()
-        };
-        let (recovery_roots, retained_nodes_until_gc) = if self.include_recovery_roots {
-            self.checkpoint_roots().await?
-        } else {
-            (BTreeMap::new(), false)
         };
         let mut rows = Vec::new();
         for branch_id in branch_ids {
@@ -333,11 +346,12 @@ impl CommitGraphLiveStateReader {
                     )
                 })?;
             let mut reachable_by_id = BTreeMap::new();
-            if global_commit_surface {
-                // `retained_nodes` is the existing authenticated complete
-                // topology scan. Read it once for the global surface and let
-                // the entity identity/order below provide the sole stream;
-                // never rebuild the same stream once per branch selector.
+            if global_commit_surface && retained_nodes_until_gc {
+                // Before the scheduled sweep, expose the complete
+                // authenticated topology so readers do not observe a partial
+                // retirement window. Once the cadence passes, the root walk
+                // below hides expired, unreachable commits from the semantic
+                // projection even if physical reclamation is still pending.
                 let retained = {
                     let mut graph = self.commit_graph.lock().await;
                     graph.retained_nodes().await?
@@ -346,6 +360,18 @@ impl CommitGraphLiveStateReader {
                     reachable_by_id
                         .entry(commit.commit_id)
                         .or_insert(ReachableCommitGraphNode { commit, depth: 0 });
+                }
+            } else if global_commit_surface {
+                for root_id in &global_root_ids {
+                    let reachable = {
+                        let mut graph = self.commit_graph.lock().await;
+                        graph.reachable_nodes(root_id).await?.to_vec()
+                    };
+                    for reachable in reachable {
+                        reachable_by_id
+                            .entry(reachable.commit.commit_id)
+                            .or_insert(reachable);
+                    }
                 }
             } else if self.include_retained_nodes && retained_nodes_until_gc {
                 let retained = {
