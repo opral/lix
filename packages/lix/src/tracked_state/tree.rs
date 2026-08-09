@@ -1307,7 +1307,10 @@ impl TrackedStateTree {
             {
                 leaf_summaries.retain(|summary| summary.subtree_count != 0);
             } else {
-                leaf_summaries.truncate(1);
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state authenticated frontier contains multiple empty leaf summaries",
+                ));
             }
         }
         let row_count = leaf_summaries
@@ -4213,6 +4216,29 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn multiple_empty_authenticated_leaf_summaries_fail_closed() {
+        let tree = TrackedStateTree::new();
+        let first = ChildSummary {
+            first_key: Bytes::new(),
+            last_key: Bytes::new(),
+            child_hash: [1; TRACKED_STATE_HASH_BYTES],
+            subtree_count: 0,
+        };
+        let mut second = first.clone();
+        second.child_hash = [2; TRACKED_STATE_HASH_BYTES];
+
+        let result = tree.build_tree_from_leaf_summaries(
+            vec![first, second],
+            PendingChunkBatchBuilder::default(),
+        );
+
+        assert!(
+            result.is_err(),
+            "empty authenticated children must not be truncated"
+        );
     }
 
     fn leaf_chunk_boundary_keys(
