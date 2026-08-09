@@ -397,6 +397,35 @@ pub(super) async fn apply_ordered_mutations<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    apply_ordered_mutations_with_policy(root, expected_kind, mutations, read, false).await
+}
+
+/// Applies one authenticated batch of ordered mutations. Each affected node
+/// is loaded at most once, then all mutations for that leaf are merged before
+/// any ancestor is encoded. This keeps the tree as the sole authority while
+/// avoiding one authenticated path-copy/object encoding per row.
+pub(super) async fn apply_ordered_mutations_idempotent_inserts<R>(
+    root: OrderedTreeRoot,
+    expected_kind: &'static str,
+    mutations: &[OrderedTreeMutation],
+    read: &R,
+) -> Result<OrderedTreeEdit, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    apply_ordered_mutations_with_policy(root, expected_kind, mutations, read, true).await
+}
+
+async fn apply_ordered_mutations_with_policy<R>(
+    root: OrderedTreeRoot,
+    expected_kind: &'static str,
+    mutations: &[OrderedTreeMutation],
+    read: &R,
+    idempotent_inserts: bool,
+) -> Result<OrderedTreeEdit, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     if mutations
         .windows(2)
         .any(|pair| pair[0].key() >= pair[1].key())
@@ -406,26 +435,216 @@ where
         ));
     }
     let kind = parse_kind(expected_kind)?;
-    let mut objects = ImmutableObjectSet::default();
-    let mut current_root = root;
-    let mut copied_nodes = 0_usize;
-    for mutation in mutations {
-        current_root = apply_one_mutation(
-            current_root,
-            kind,
-            mutation,
-            read,
-            &mut objects,
-            &mut copied_nodes,
-        )
-        .await?;
+    if mutations.is_empty() {
+        return Ok(OrderedTreeEdit {
+            root,
+            objects: ImmutableObjectSet::default(),
+            copied_nodes: 0,
+        });
     }
-    retain_reachable_new_nodes(current_root.object_id, kind, &mut objects)?;
+    let loaded = load_affected_nodes(root, kind, mutations, read).await?;
+    let mut objects = ImmutableObjectSet::default();
+    let mut copied_nodes = 0_usize;
+    let rewritten = rewrite_batch_node(
+        kind,
+        root.object_id,
+        None,
+        mutations,
+        &loaded,
+        &mut objects,
+        &mut copied_nodes,
+        idempotent_inserts,
+    )?;
+    let mut roots = match rewritten.as_slice() {
+        [] => vec![stage_leaf(kind, &[], &mut objects)?],
+        _ => rewritten,
+    };
+    while roots.len() > 1 {
+        roots = stage_internal_level(kind, &roots, &mut objects)?;
+        copied_nodes = copied_nodes.saturating_add(roots.len());
+    }
+    let next_root = roots
+        .pop()
+        .ok_or_else(|| corruption("ordered-tree batch emitted no root"))?;
+    let next_root = OrderedTreeRoot {
+        object_id: next_root.id,
+        entry_count: next_root.summary.entry_count,
+    };
+    retain_reachable_new_nodes(next_root.object_id, kind, &mut objects)?;
     Ok(OrderedTreeEdit {
-        root: current_root,
+        root: next_root,
         objects,
         copied_nodes,
     })
+}
+
+async fn load_affected_nodes<R>(
+    root: OrderedTreeRoot,
+    kind: TreeKind,
+    mutations: &[OrderedTreeMutation],
+    read: &R,
+) -> Result<BTreeMap<ObjectId, Node>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut loaded = BTreeMap::<ObjectId, Node>::new();
+    let mut pending = vec![(root.object_id, None::<NodeRef>, 0usize, mutations.len())];
+    while let Some((id, expected, start, end)) = pending.pop() {
+        if let Some(node) = loaded.get(&id) {
+            // A content-addressed node may be reached through more than one
+            // authenticated edge. Reuse its decoded body only after checking
+            // this edge's expected reference as well; the batch loader must
+            // never turn an unchecked alias into an authority shortcut.
+            validate_loaded_node(id, node, kind, expected.as_ref())?;
+            if id == root.object_id && node.summary.entry_count != root.entry_count {
+                return Err(corruption(
+                    "ordered-tree root count does not match its authenticated node",
+                ));
+            }
+            continue;
+        }
+        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+        validate_loaded_node(id, &node, kind, expected.as_ref())?;
+        if id == root.object_id && node.summary.entry_count != root.entry_count {
+            return Err(corruption(
+                "ordered-tree root count does not match its authenticated node",
+            ));
+        }
+        if let NodeBody::Internal(children) = &node.body {
+            let mut offset = start;
+            while offset < end {
+                let index = child_index(children, mutations[offset].key());
+                let child_start = offset;
+                offset += 1;
+                while offset < end && child_index(children, mutations[offset].key()) == index {
+                    offset += 1;
+                }
+                let child = children
+                    .get(index)
+                    .ok_or_else(|| corruption("ordered-tree mutation child index is invalid"))?;
+                pending.push((child.id, Some(child.clone()), child_start, offset));
+            }
+        }
+        loaded.insert(id, node);
+    }
+    Ok(loaded)
+}
+
+fn rewrite_batch_node(
+    kind: TreeKind,
+    id: ObjectId,
+    expected: Option<&NodeRef>,
+    mutations: &[OrderedTreeMutation],
+    loaded: &BTreeMap<ObjectId, Node>,
+    objects: &mut ImmutableObjectSet,
+    copied_nodes: &mut usize,
+    idempotent_inserts: bool,
+) -> Result<Vec<NodeRef>, StorageError> {
+    let node = loaded
+        .get(&id)
+        .ok_or_else(|| corruption("ordered-tree batch path references an unloaded node"))?;
+    validate_loaded_node(id, node, kind, expected)?;
+    match &node.body {
+        NodeBody::Leaf(original_entries) => {
+            let mut entries = original_entries.clone();
+            let mut changed = false;
+            for mutation in mutations {
+                match entries.binary_search_by(|entry| entry.key.as_slice().cmp(mutation.key())) {
+                    Ok(index) => match mutation {
+                        OrderedTreeMutation::Insert { value, .. } if idempotent_inserts => {
+                            if entries[index].value != *value {
+                                return Err(corruption(
+                                    "ordered-tree idempotent insert remaps an existing key",
+                                ));
+                            }
+                        }
+                        OrderedTreeMutation::Insert { .. } => {
+                            return Err(StorageError::WriteConflict);
+                        }
+                        OrderedTreeMutation::Update { value, .. } => {
+                            entries[index].value.clone_from(value);
+                            changed = true;
+                        }
+                        OrderedTreeMutation::Delete { .. } => {
+                            entries.remove(index);
+                            changed = true;
+                        }
+                    },
+                    Err(index) => match mutation {
+                        OrderedTreeMutation::Insert { key, value } => {
+                            entries.insert(
+                                index,
+                                LeafEntry {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                    receipt: None,
+                                },
+                            );
+                            changed = true;
+                        }
+                        OrderedTreeMutation::Update { .. } | OrderedTreeMutation::Delete { .. } => {
+                            return Err(StorageError::WriteConflict);
+                        }
+                    },
+                }
+            }
+            if !changed {
+                return Ok(vec![node_ref(id, node)]);
+            }
+            *copied_nodes = copied_nodes.saturating_add(1);
+            if entries.is_empty() {
+                Ok(Vec::new())
+            } else {
+                stage_leaf_level(kind, &entries, objects)
+            }
+        }
+        NodeBody::Internal(children) => {
+            let mut next = Vec::with_capacity(children.len());
+            let mut mutation_offset = 0usize;
+            let mut changed = false;
+            for (child_idx, child) in children.iter().enumerate() {
+                let start = mutation_offset;
+                while mutation_offset < mutations.len()
+                    && child_index(children, mutations[mutation_offset].key()) == child_idx
+                {
+                    mutation_offset += 1;
+                }
+                let child_mutations = &mutations[start..mutation_offset];
+                let rewritten = if child_mutations.is_empty() {
+                    vec![child.clone()]
+                } else {
+                    rewrite_batch_node(
+                        kind,
+                        child.id,
+                        Some(child),
+                        child_mutations,
+                        loaded,
+                        objects,
+                        copied_nodes,
+                        idempotent_inserts,
+                    )?
+                };
+                if rewritten.len() != 1 || rewritten.first() != Some(child) {
+                    changed = true;
+                }
+                next.extend(rewritten);
+            }
+            if mutation_offset != mutations.len() {
+                return Err(corruption(
+                    "ordered-tree batch mutations were not routed to a child",
+                ));
+            }
+            if !changed {
+                return Ok(vec![node_ref(id, node)]);
+            }
+            *copied_nodes = copied_nodes.saturating_add(1);
+            match next.as_slice() {
+                [] => Ok(Vec::new()),
+                [only] => Ok(vec![only.clone()]),
+                _ => stage_internal_level(kind, &next, objects),
+            }
+        }
+    }
 }
 
 pub(super) async fn lookup_on_read<R>(
@@ -1119,118 +1338,6 @@ fn rewrite_insert(
             stage_internal_level(kind, &next, objects)
         }
     }
-}
-
-async fn apply_one_mutation<R>(
-    root: OrderedTreeRoot,
-    kind: TreeKind,
-    mutation: &OrderedTreeMutation,
-    read: &R,
-    objects: &mut ImmutableObjectSet,
-    copied_nodes: &mut usize,
-) -> Result<OrderedTreeRoot, StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let mut path = Vec::<(ObjectId, Node, usize)>::new();
-    let mut current = root.object_id;
-    let mut expected: Option<NodeRef> = None;
-    let leaf = loop {
-        let bytes = match objects.get(current) {
-            Some(bytes) => bytes.clone(),
-            None => load_object_on_read(read, current).await?,
-        };
-        let node = decode_node(current, &bytes)?;
-        validate_loaded_node(current, &node, kind, expected.as_ref())?;
-        if path.is_empty() && node.summary.entry_count != root.entry_count {
-            return Err(corruption(
-                "ordered-tree root count does not match its authenticated node",
-            ));
-        }
-        match node.body {
-            NodeBody::Leaf(entries) => break entries,
-            NodeBody::Internal(ref children) => {
-                let index = child_index(children, mutation.key());
-                expected = Some(children[index].clone());
-                let next = children[index].id;
-                path.push((current, node, index));
-                current = next;
-            }
-        }
-    };
-
-    let mut entries = leaf;
-    match entries.binary_search_by(|entry| entry.key.as_slice().cmp(mutation.key())) {
-        Ok(index) => match mutation {
-            OrderedTreeMutation::Insert { .. } => return Err(StorageError::WriteConflict),
-            OrderedTreeMutation::Update { value, .. } => entries[index].value.clone_from(value),
-            OrderedTreeMutation::Delete { .. } => {
-                entries.remove(index);
-            }
-        },
-        Err(index) => match mutation {
-            OrderedTreeMutation::Insert { key, value } => entries.insert(
-                index,
-                LeafEntry {
-                    key: key.clone(),
-                    value: value.clone(),
-                    receipt: None,
-                },
-            ),
-            OrderedTreeMutation::Update { .. } | OrderedTreeMutation::Delete { .. } => {
-                return Err(StorageError::WriteConflict);
-            }
-        },
-    }
-
-    *copied_nodes = copied_nodes.saturating_add(1);
-    let mut rewritten = if entries.is_empty() && !path.is_empty() {
-        Vec::new()
-    } else {
-        stage_leaf_level(kind, &entries, objects)?
-    };
-    while let Some((_parent_id, parent, child_index)) = path.pop() {
-        let NodeBody::Internal(children) = parent.body else {
-            return Err(corruption(
-                "ordered-tree edit path contains a non-internal parent",
-            ));
-        };
-        if child_index >= children.len() || children[child_index].id != current {
-            return Err(corruption(
-                "ordered-tree edit path no longer matches its authenticated parent",
-            ));
-        }
-        let mut next = Vec::with_capacity(
-            children
-                .len()
-                .saturating_sub(1)
-                .saturating_add(rewritten.len()),
-        );
-        next.extend_from_slice(&children[..child_index]);
-        next.extend(rewritten);
-        next.extend_from_slice(&children[child_index + 1..]);
-        rewritten = match next.as_slice() {
-            [] => Vec::new(),
-            [only] => vec![only.clone()],
-            _ => stage_internal_level(kind, &next, objects)?,
-        };
-        *copied_nodes = copied_nodes.saturating_add(1);
-        current = _parent_id;
-    }
-    if rewritten.is_empty() {
-        rewritten.push(stage_leaf(kind, &[], objects)?);
-    }
-    while rewritten.len() > 1 {
-        rewritten = stage_internal_level(kind, &rewritten, objects)?;
-        *copied_nodes = copied_nodes.saturating_add(rewritten.len());
-    }
-    let root = rewritten
-        .pop()
-        .ok_or_else(|| corruption("ordered-tree edit emitted no root"))?;
-    Ok(OrderedTreeRoot {
-        object_id: root.id,
-        entry_count: root.summary.entry_count,
-    })
 }
 
 fn retain_reachable_new_nodes(

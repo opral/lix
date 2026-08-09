@@ -963,7 +963,9 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     .await
     .expect("update/remove path copy");
     assert_eq!(edit.entry_count(), 2);
-    assert!(edit.copied_nodes() >= 2);
+    // Both mutations are lowered through one authenticated batch edit; they
+    // may share the same copied leaf and ancestor path.
+    assert!(edit.copied_nodes() >= 1);
 }
 
 #[tokio::test]

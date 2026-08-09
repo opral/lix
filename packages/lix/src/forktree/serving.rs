@@ -17,8 +17,9 @@ use super::state::{
     HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
 };
 use super::tree::{
-    ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
+    ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
+    apply_ordered_mutations_idempotent_inserts, lookup_on_read, scan_bounded_page_on_read,
+    scan_page_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -1833,21 +1834,15 @@ where
             "CommitCatalog entries are not strictly ordered and distinct",
         ));
     }
-    let mut mutations = Vec::new();
+    let mut mutations = Vec::with_capacity(entries.len());
     for (id, entry) in entries {
         let value = entry.encode()?;
-        match lookup_on_read(root, "commit", id.as_bytes(), read).await? {
-            None => mutations.push(OrderedTreeMutation::Insert {
-                key: id.as_bytes().to_vec(),
-                value,
-            }),
-            Some(existing) if existing == value => {}
-            Some(_) => {
-                return Err(corruption("CommitCatalog cannot remap one stable CommitId"));
-            }
-        }
+        mutations.push(OrderedTreeMutation::Insert {
+            key: id.as_bytes().to_vec(),
+            value,
+        });
     }
-    let mut edit = edit_catalog(root, "commit", &mutations, read).await?;
+    let mut edit = edit_catalog(root, "commit", &mutations, read, true).await?;
     edit.commit_entries.extend(entries.iter().copied());
     Ok(edit)
 }
@@ -1865,23 +1860,15 @@ where
             "ChangeCatalog entries are not strictly ordered and distinct",
         ));
     }
-    let mut mutations = Vec::new();
+    let mut mutations = Vec::with_capacity(entries.len());
     for (id, entry) in entries {
         let value = entry.encode()?;
-        match lookup_on_read(root, "change", id.as_bytes(), read).await? {
-            None => mutations.push(OrderedTreeMutation::Insert {
-                key: id.as_bytes().to_vec(),
-                value,
-            }),
-            Some(existing) if existing == value => {}
-            Some(_) => {
-                return Err(corruption(
-                    "ChangeCatalog cannot remap one stable ChangeId or owner",
-                ));
-            }
-        }
+        mutations.push(OrderedTreeMutation::Insert {
+            key: id.as_bytes().to_vec(),
+            value,
+        });
     }
-    let mut edit = edit_catalog(root, "change", &mutations, read).await?;
+    let mut edit = edit_catalog(root, "change", &mutations, read, true).await?;
     edit.change_entries.extend(entries.iter().copied());
     Ok(edit)
 }
@@ -1900,7 +1887,7 @@ where
             key: id.as_bytes().to_vec(),
         })
         .collect::<Vec<_>>();
-    edit_catalog(root, "commit", &mutations, read).await
+    edit_catalog(root, "commit", &mutations, read, false).await
 }
 
 pub(crate) async fn retire_change_catalog_entries<R>(
@@ -1917,7 +1904,7 @@ where
             key: id.as_bytes().to_vec(),
         })
         .collect::<Vec<_>>();
-    edit_catalog(root, "change", &mutations, read).await
+    edit_catalog(root, "change", &mutations, read, false).await
 }
 
 pub(crate) async fn load_commit<R>(
@@ -2090,12 +2077,17 @@ async fn edit_catalog<R>(
     kind: &'static str,
     mutations: &[OrderedTreeMutation],
     read: &R,
+    idempotent_inserts: bool,
 ) -> Result<CatalogTreeEdit, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
     let root = validate_root_on_read(root, kind, read).await?;
-    let edit = apply_ordered_mutations(root, kind, mutations, read).await?;
+    let edit = if idempotent_inserts {
+        apply_ordered_mutations_idempotent_inserts(root, kind, mutations, read).await?
+    } else {
+        apply_ordered_mutations(root, kind, mutations, read).await?
+    };
     Ok(CatalogTreeEdit {
         base_root: root.object_id,
         root: edit.root.object_id,
