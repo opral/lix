@@ -7,7 +7,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
+use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
@@ -180,7 +180,12 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         ))
     }
 
-    async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
+    async fn load_bytes_many(&mut self, _hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "hash-only SQL blob reads are not supported; resolve an authenticated ForkTree BlobRef",
+        ))
+    }
 
     async fn scan_live_state_batch(
         &mut self,
@@ -359,10 +364,6 @@ impl SqlWriteContext {
         unsafe { self.ptr.0.as_ref().functions() }
     }
 
-    pub(crate) fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(WriteContextBlobDataReader::new(self.clone()))
-    }
-
     pub(crate) fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
         unsafe { self.ptr.0.as_ref().public_catalog() }
     }
@@ -500,23 +501,6 @@ impl SqlWriteContext {
                 .execute_diff_command(command, diff_ids)
                 .await
         }
-    }
-}
-
-pub(crate) struct WriteContextBlobDataReader {
-    ctx: SqlWriteContext,
-}
-
-impl WriteContextBlobDataReader {
-    pub(crate) fn new(ctx: SqlWriteContext) -> Self {
-        Self { ctx }
-    }
-}
-
-#[async_trait]
-impl BlobDataReader for WriteContextBlobDataReader {
-    async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-        self.ctx.load_bytes_many(hashes).await
     }
 }
 

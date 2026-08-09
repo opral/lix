@@ -1,7 +1,7 @@
 use std::io::{Cursor, Write as _};
 use std::path::Path;
 
-use lix::storage::Storage;
+use lix::storage::{Memory, Storage};
 use lix::{CreateBranchOptions, Lix, MergeBranchOptions, SwitchBranchOptions, Value, open_lix};
 
 #[tokio::test]
@@ -57,6 +57,60 @@ async fn plugin_resolved_rows_are_included_in_semantic_merge_change_stats() {
         b"very quick,sleepy dog\n"
     );
     lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn plugin_wasm_owner_survives_memory_snapshot_reopen() {
+    let storage = Memory::new();
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Memory plugin fixture");
+    install_csv_plugin(&lix).await;
+    let owner_rows = lix
+        .execute(
+            "SELECT path FROM lix_file WHERE path = $1",
+            &[Value::Text("/plugin_csv.wasm".into())],
+        )
+        .await
+        .expect("inspect plugin WASM owner");
+    assert_eq!(
+        owner_rows.rows().len(),
+        1,
+        "plugin WASM owner must be durable"
+    );
+    let owner_content = lix
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text("/plugin_csv.wasm".into())],
+        )
+        .await
+        .expect("inspect plugin WASM bytes");
+    assert_eq!(
+        owner_content.rows().len(),
+        1,
+        "plugin WASM owner payload must be readable"
+    );
+    write_file(&lix, "/memory-reopen.csv", b"quick,dog\n").await;
+    assert_eq!(read_file(&lix, "/memory-reopen.csv").await, b"quick,dog\n");
+    let snapshot = storage
+        .export_snapshot()
+        .expect("export authenticated plugin owner snapshot");
+    lix.close().await.expect("close Memory plugin fixture");
+
+    let reopened_storage = Memory::from_snapshot(&snapshot).expect("restore Memory snapshot");
+    let reopened = open_lix()
+        .with_storage(reopened_storage)
+        .await
+        .expect("reopen Memory plugin fixture");
+    assert_eq!(
+        read_file(&reopened, "/memory-reopen.csv").await,
+        b"quick,dog\n"
+    );
+    reopened
+        .close()
+        .await
+        .expect("close reopened Memory plugin fixture");
 }
 
 const CONFLICT_COUNT: usize = 1_500;
