@@ -17,6 +17,7 @@ use super::gc_index::{
     MaintenanceEdit, live_contains, live_insert, mark_insert, mark_range_iter, queue_pop,
     queue_push,
 };
+use super::merkle::authenticated_merkle_edges;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberPageV1,
@@ -1121,6 +1122,20 @@ where
                     .ordered_chunks
                     .into_iter()
                     .map(|chunk| typed(chunk.chunk_object_id, ObjectDomain::BlobChunk)),
+            );
+        }
+        ObjectDomain::BlobMerkleLeafV1 => {
+            edges.extend(
+                authenticated_merkle_edges(id, bytes)?
+                    .into_iter()
+                    .map(|(id, domain)| typed(id, domain)),
+            );
+        }
+        ObjectDomain::BlobMerkleInternalV1 => {
+            edges.extend(
+                authenticated_merkle_edges(id, bytes)?
+                    .into_iter()
+                    .map(|(id, domain)| typed(id, domain)),
             );
         }
         ObjectDomain::SnapshotTarget => {

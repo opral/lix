@@ -57,6 +57,8 @@ pub(super) enum ObjectDomain {
     GcQueuePackV1 = 15,
     GcLiveBranchPackV1 = 16,
     CommitMemberPageV1 = 17,
+    BlobMerkleLeafV1 = 18,
+    BlobMerkleInternalV1 = 19,
 }
 
 impl ObjectDomain {
@@ -79,6 +81,8 @@ impl ObjectDomain {
             15 => Ok(Self::GcQueuePackV1),
             16 => Ok(Self::GcLiveBranchPackV1),
             17 => Ok(Self::CommitMemberPageV1),
+            18 => Ok(Self::BlobMerkleLeafV1),
+            19 => Ok(Self::BlobMerkleInternalV1),
             _ => Err(corruption(format!("unknown object domain {value}"))),
         }
     }

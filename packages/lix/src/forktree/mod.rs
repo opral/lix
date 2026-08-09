@@ -8,6 +8,7 @@ mod blob;
 mod bootstrap;
 mod codec;
 mod gc_index;
+mod merkle;
 mod model;
 mod object;
 mod publication;
@@ -22,8 +23,13 @@ pub(crate) use blob::{
     blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
 };
 pub(crate) use bootstrap::initialize_empty_repository;
+pub(crate) use merkle::{
+    BlobMerkleProofV1, BlobMerkleTreeBuild, build_blob_merkle_tree,
+    derive_blob_merkle_successor_id, prove_blob_merkle_range, verify_blob_merkle_range,
+};
 pub(crate) use model::{
-    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
+    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BlobMerkleInternalV1, BlobMerkleLeafV1,
+    BlobMerkleManifestV1, BlobMerkleNodeRefV1, BranchSelectorV1, BranchSnapshotV1,
     CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
     ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
     RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
@@ -69,6 +75,10 @@ const _: () = {
             BlobChunkRefV1,
             BlobChunkV1,
             BlobManifestV1,
+            BlobMerkleInternalV1,
+            BlobMerkleLeafV1,
+            BlobMerkleManifestV1,
+            BlobMerkleNodeRefV1,
             BranchSelectorV1,
             BranchSnapshotV1,
             CanonicalBranchId,
@@ -119,6 +129,14 @@ const _: () = {
         let _ = RECEIPT_TREE_FANOUT;
         let _ = RECEIPT_TREE_LEAF_ENTRIES;
         let _ = prepare_upload_completion::<R>;
+        let _ = build_blob_merkle_tree;
+        let _ = derive_blob_merkle_successor_id;
+        let _ = prove_blob_merkle_range;
+        let _ = verify_blob_merkle_range;
+        let _: Option<(BlobMerkleProofV1, BlobMerkleTreeBuild)> = None;
+        let _ = BlobMerkleProofV1::manifest;
+        let _ = BlobMerkleProofV1::requested_range;
+        let _ = BlobMerkleProofV1::object_count;
         let _ = advance_gc::<S>;
         let _ = abort_corrupt_gc::<S>;
         let _ = GcBudget::default;
