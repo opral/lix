@@ -529,7 +529,7 @@ impl CommitGraphLiveStateReader {
 
     async fn branch_ref_rows(&self) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let mut rows = Vec::new();
-        for head in self.branch_ref.scan_heads().await? {
+        for (head, metadata) in self.branch_ref.scan_head_metadata().await? {
             let entity_pk = EntityPk::uuid_from_canonical(&head.branch_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
@@ -540,16 +540,6 @@ impl CommitGraphLiveStateReader {
                 "id": head.branch_id,
                 "commit_id": head.commit_id.to_string(),
             });
-            let metadata = self
-                .branch_ref
-                .load_head_metadata(&head.branch_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_STORAGE_ERROR,
-                        "branch selector has no authenticated RefChange metadata",
-                    )
-                })?;
             rows.push(MaterializedLiveStateRow {
                 entity_pk,
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
