@@ -63,9 +63,13 @@ where
         .filter(|branch_id| branch_id.as_str() != crate::GLOBAL_BRANCH_ID)
         .collect::<Vec<_>>();
     if concrete_branch_ids.is_empty() {
-        return Err(unsupported(
-            "current ForkTree reader requires a concrete branch scope",
-        ));
+        if facade.bound_branch_id().is_some() {
+            return Err(unsupported(
+                "branch-bound ForkTree reader cannot serve a global-only request",
+            ));
+        }
+        let view = facade.branch(crate::GLOBAL_BRANCH_ID).await?;
+        return scan_view(&view, request).await;
     }
     if let Some(bound_branch_id) = facade.bound_branch_id() {
         if concrete_branch_ids
