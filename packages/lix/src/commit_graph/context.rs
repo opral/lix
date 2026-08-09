@@ -304,9 +304,14 @@ impl CommitGraphLiveStateReader {
         } else {
             (BTreeMap::new(), false)
         };
+        let authenticated_heads = self.branch_ref.scan_head_metadata().await?;
+        let authenticated_heads_by_branch = authenticated_heads
+            .iter()
+            .map(|(head, _metadata)| (head.branch_id.clone(), head.clone()))
+            .collect::<BTreeMap<_, _>>();
         let global_root_ids = if global_commit_surface {
             let mut root_ids = BTreeSet::new();
-            for head in self.branch_ref.scan_heads().await? {
+            for (head, _metadata) in &authenticated_heads {
                 root_ids.insert(head.commit_id);
             }
             for roots in recovery_roots.values() {
@@ -323,28 +328,38 @@ impl CommitGraphLiveStateReader {
             // deduplicated result in the global scope below.
             vec![crate::GLOBAL_BRANCH_ID.to_owned()]
         } else if request.filter.branch_ids.is_empty() {
-            self.branch_ref
-                .scan_heads()
-                .await?
-                .into_iter()
-                .map(|head| head.branch_id)
+            authenticated_heads_by_branch
+                .keys()
+                .cloned()
                 .collect::<Vec<_>>()
         } else {
             request.filter.branch_ids.clone()
         };
         let mut rows = Vec::new();
         for branch_id in branch_ids {
-            let head = self
-                .branch_ref
-                .load_head(&branch_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::branch_not_found(
-                        branch_id.clone(),
-                        "scan ForkTree derived commit surface",
-                        "branch head",
-                    )
-                })?;
+            let head = if global_commit_surface {
+                self.branch_ref
+                    .load_head(&branch_id)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::branch_not_found(
+                            branch_id.clone(),
+                            "scan ForkTree derived commit surface",
+                            "branch head",
+                        )
+                    })?
+            } else {
+                authenticated_heads_by_branch
+                    .get(&branch_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LixError::branch_not_found(
+                            branch_id.clone(),
+                            "scan ForkTree derived commit surface",
+                            "branch head",
+                        )
+                    })?
+            };
             let mut reachable_by_id = BTreeMap::new();
             if global_commit_surface && retained_nodes_until_gc {
                 // Before the scheduled sweep, expose the complete
@@ -1376,5 +1391,135 @@ pub(crate) fn canonical_commit_change(record: &CommitRecord) -> CommitGraphChang
         metadata: crate::json_store::JsonSlot::None,
         created_at: record.created_at,
         origin_key: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::branch::{BranchHead, BranchRefMetadata};
+    use crate::common::LixTimestamp;
+    use crate::live_state::{LiveStateFilter, LiveStateRowFilter};
+
+    struct CountingBatchBranchRefReader {
+        rows: Vec<(BranchHead, BranchRefMetadata)>,
+        scan_calls: AtomicUsize,
+        load_calls: AtomicUsize,
+    }
+
+    impl CountingBatchBranchRefReader {
+        fn new(branch_count: usize) -> Self {
+            Self {
+                rows: (0..branch_count)
+                    .map(|index| {
+                        (
+                            BranchHead {
+                                branch_id: format!("01930000-0000-7000-8000-{index:012x}"),
+                                commit_id: CommitId::for_test_label(&format!("commit-{index}")),
+                            },
+                            BranchRefMetadata {
+                                change_id: ChangeId::for_test_label(&format!("change-{index}")),
+                                updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                            },
+                        )
+                    })
+                    .collect(),
+                scan_calls: AtomicUsize::new(0),
+                load_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BranchRefReader for CountingBatchBranchRefReader {
+        async fn load_head(&self, _branch_id: &str) -> Result<Option<BranchHead>, LixError> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
+            Ok(self.rows.iter().map(|(head, _)| head.clone()).collect())
+        }
+
+        async fn scan_head_metadata(
+            &self,
+        ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.rows.clone())
+        }
+    }
+
+    struct EmptyCommitGraphReader;
+
+    #[async_trait::async_trait]
+    impl CommitGraphReader for EmptyCommitGraphReader {
+        async fn load_node(
+            &mut self,
+            _commit_id: &CommitId,
+        ) -> Result<Option<CommitGraphNode>, LixError> {
+            Ok(None)
+        }
+
+        async fn reachable_nodes(
+            &mut self,
+            _head_commit_id: &CommitId,
+        ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+            Ok(Vec::new().into())
+        }
+
+        async fn load_commit_records(
+            &mut self,
+            commit_ids: &[CommitId],
+        ) -> Result<Vec<Option<CommitRecord>>, LixError> {
+            Ok(vec![None; commit_ids.len()])
+        }
+
+        async fn change_history_from_commit(
+            &mut self,
+            _start_commit_id: &CommitId,
+            _request: &CommitGraphChangeHistoryRequest,
+        ) -> Result<CommitGraphHistory, LixError> {
+            Ok(CommitGraphHistory {
+                entries: Vec::new(),
+                reachable_nodes: Vec::new().into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn derived_empty_branch_filter_batches_heads_without_point_reload() {
+        for branch_count in [32, 128] {
+            let branch_ref = Arc::new(CountingBatchBranchRefReader::new(branch_count));
+            let graph = Arc::new(tokio::sync::Mutex::new(
+                Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
+            ));
+            let reader = CommitGraphLiveStateReader::new(
+                "lix_commit_by_branch",
+                graph,
+                branch_ref.clone(),
+                None,
+                false,
+                false,
+            );
+            let request = LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    rows: LiveStateRowFilter::All,
+                    schema_keys: vec!["lix_commit_by_branch".to_owned()],
+                    branch_ids: Vec::new(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let rows = reader
+                .rows_for_request(&request)
+                .await
+                .expect("derived commit surface should scan authenticated heads");
+            assert!(rows.is_empty());
+            assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+        }
     }
 }
