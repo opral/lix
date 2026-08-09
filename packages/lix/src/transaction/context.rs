@@ -2353,10 +2353,10 @@ where
         {
             Some(factory) => factory,
             None => {
-                let read = self.opening_read();
+                let forktree = self.forktree_read_facade();
                 let wasm_key = plugin_wasm_state_key(&self.active_branch_id, plugin.key());
                 let wasm = load_transaction_authenticated_plugin_bytes(
-                    &read,
+                    &forktree,
                     &self.active_branch_id,
                     &self.staged_writes,
                     &self.pending_plugin_wasm_by_owner,
@@ -2499,7 +2499,6 @@ where
         let cache = self.plugin_host.actor_cache();
         let _cold_open_guard = cache.cold_open_guard().await;
         let staged = self.staged_writes.staging_overlay()?;
-        let read = self.opening_read();
         let base = self.forktree_read_facade();
         let file_key = PluginFileWriteKey {
             branch_id: actor_key.branch_id.clone(),
@@ -2602,7 +2601,7 @@ where
         let entity_count = entity_ordinals.len();
         let VisibleMaterializationBytes::Blob { hash } = materialization.bytes;
         let materialized_bytes: crate::Blob = load_transaction_authenticated_plugin_bytes(
-            &read,
+            &base,
             &actor_key.branch_id,
             &self.staged_writes,
             &self.pending_plugin_wasm_by_owner,
@@ -3485,7 +3484,6 @@ where
         }
 
         let staged = self.staged_writes.staging_overlay()?;
-        let read = self.opening_read();
         let base = self.forktree_read_facade();
 
         if !lifecycle_schema_rows.is_empty() {
@@ -3712,7 +3710,7 @@ where
                 &self.plugin_host,
                 &base,
                 &staged,
-                &read,
+                &base,
                 &self.staged_writes,
                 &generation_upgrades,
                 &current_install_wasm,
@@ -4305,7 +4303,7 @@ where
             }
             let wasm_key = plugin_wasm_state_key(&key.branch_id, entry.key());
             let bytes = load_transaction_authenticated_plugin_bytes(
-                &read,
+                &base,
                 &key.branch_id,
                 &self.staged_writes,
                 &self.pending_plugin_wasm_by_owner,
@@ -4912,7 +4910,6 @@ where
                             && observation_matches_visible_root
                         {
                             let staged = self.staged_writes.staging_overlay()?;
-                            let read = self.opening_read();
                             let base = self.forktree_read_facade();
                             let (
                                 cold_before,
@@ -4927,7 +4924,7 @@ where
                                     visible_materialization.bytes;
                                 let before_bytes: crate::Blob =
                                         load_transaction_authenticated_plugin_bytes(
-                                            &read,
+                                            &base,
                                             &actor_key.branch_id,
                                             &self.staged_writes,
                                             &self.pending_plugin_wasm_by_owner,
@@ -5063,7 +5060,6 @@ where
                                 PluginEntityAuthorities::empty();
                             let transition_result = if let Some(checkpoint) = decoded_checkpoint {
                                 drop(base);
-                                drop(read);
                                 let document = actor.restore_document(&checkpoint).await?;
                                 actor
                                     .file_changed(
@@ -5093,7 +5089,6 @@ where
                                     .expect("a restored durable document retains its authority");
                                 cold_base_authorities = checkpoint.authorities;
                                 drop(base);
-                                drop(read);
                                 actor
                                     .file_changed(
                                         document,
@@ -5153,7 +5148,6 @@ where
                                     cold_limits,
                                 )?;
                                 drop(base);
-                                drop(read);
                                 actor
                                     .cold_file_changed(
                                         cold_limits,
@@ -8086,7 +8080,7 @@ where
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            forktree_reader: ForkTreeReadFacade::new(self.read_store.clone()),
+            forktree_reader: self.forktree.clone(),
         }
     }
 
@@ -8121,7 +8115,7 @@ where
 /// the retained ForkTree read.  The old hash-only BinaryCas reader is not a
 /// valid plugin payload source.
 async fn load_transaction_authenticated_plugin_bytes<R>(
-    read: &SharedStorageAdapterRead<R>,
+    forktree: &ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
     branch_id: &str,
     staged_writes: &TransactionWriteBuffer,
     pending_plugin_wasm_by_owner: &BTreeMap<(String, String), (BlobId, Vec<u8>)>,
@@ -8168,7 +8162,7 @@ where
         }
     }
     if !missing.is_empty() {
-        let reader = crate::forktree::blob_reader_on_read(read.clone(), branch_id)?;
+        let reader = crate::forktree::blob_reader_on_facade(forktree.clone(), branch_id)?;
         let keys = missing
             .iter()
             .map(|(_, key, _)| key.clone())
@@ -8748,6 +8742,44 @@ mod transaction_validation_reader_tests {
         assert!(!reader.contains("transaction_reader("));
         assert!(reader.contains("overlay_scan_batch(&self.forktree"));
         assert!(reader.contains("overlay_load_exact_batch(&self.forktree"));
+    }
+
+    #[test]
+    fn transaction_plugin_and_changelog_reads_reuse_the_operation_forktree_owner() {
+        let source = include_str!("context.rs");
+
+        let helper_start = source
+            .find("async fn load_transaction_authenticated_plugin_bytes")
+            .expect("transaction plugin payload helper");
+        let helper_end = source[helper_start..]
+            .find("struct TransactionValidationLiveStateReader")
+            .map(|offset| helper_start + offset)
+            .expect("transaction plugin payload helper end");
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("ForkTreeReadFacade<SharedStorageAdapterRead<R>>"));
+        assert!(helper.contains("blob_reader_on_facade(forktree.clone(), branch_id)"));
+        assert!(!helper.contains("blob_reader_on_read"));
+        assert!(!helper.contains("ForkTreeReadFacade::new"));
+
+        let context_start = source
+            .find("impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext")
+            .expect("transaction SQL execution context");
+        let context_end = source[context_start..]
+            .find("/// Loads plugin WASM")
+            .map(|offset| context_start + offset)
+            .expect("transaction SQL execution context end");
+        let context = &source[context_start..context_end];
+        let changelog_start = context
+            .find("fn changelog_query_source")
+            .expect("transaction changelog source");
+        let changelog_end = context[changelog_start..]
+            .find("fn commit_graph")
+            .map(|offset| changelog_start + offset)
+            .expect("transaction changelog source end");
+        let changelog = &context[changelog_start..changelog_end];
+        assert!(changelog.contains("forktree_reader: self.forktree.clone()"));
+        assert!(!changelog.contains("ForkTreeReadFacade::new"));
+        assert!(!changelog.contains("read_store.clone()"));
     }
 
     #[test]
@@ -11309,7 +11341,7 @@ async fn preflight_owned_generation_upgrades<R>(
     host: &PluginRuntimeHost,
     base: &dyn LiveStateReader,
     staged: &impl StagedLiveStateRows,
-    read: &SharedStorageAdapterRead<R>,
+    forktree: &ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
     staged_writes: &TransactionWriteBuffer,
     upgrades: &[PluginGenerationUpgrade],
     install_wasm: &BTreeMap<BlobId, Vec<u8>>,
@@ -11672,7 +11704,7 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let materialized_bytes = load_transaction_authenticated_plugin_bytes(
-            read,
+            forktree,
             &upgrade.branch_id,
             staged_writes,
             &BTreeMap::new(),
