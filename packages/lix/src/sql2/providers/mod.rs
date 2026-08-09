@@ -481,7 +481,18 @@ where
         ctx.live_state(),
         ctx.entity_snapshot_reader(),
         Arc::clone(&branch_ref),
-        needs_entity_history.then(|| Arc::clone(&commit_graph)),
+        (needs_entity_history
+            || catalog.surfaces().any(|surface| {
+                scope.includes(surface)
+                    && selection.includes(surface)
+                    && matches!(
+                        &surface.kind,
+                        PublicSurfaceKind::EntityBase { schema_key }
+                            | PublicSurfaceKind::EntityByBranch { schema_key }
+                                if matches!(schema_key.as_str(), "lix_commit" | "lix_commit_edge")
+                    )
+            }))
+        .then(|| Arc::clone(&commit_graph)),
         if needs_entity_history {
             Some(query_source_for_provider()?)
         } else {

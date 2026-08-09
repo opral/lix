@@ -80,6 +80,9 @@ pub(crate) struct StateValue {
 #[derive(Clone, Debug)]
 pub(crate) struct HistoricalStateRow {
     pub(crate) key: StateKey,
+    /// Whether this visible row was selected from the authenticated global
+    /// state root rather than the branch-local overlay.
+    pub(crate) global: bool,
     pub(crate) change_id: crate::changelog::ChangeId,
     pub(crate) commit_id: crate::changelog::CommitId,
     pub(crate) created_at: LixTimestamp,

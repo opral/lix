@@ -81,29 +81,47 @@ where
         match &surface.kind {
             PublicSurfaceKind::EntityBase { schema_key } if include_write_surfaces => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
+                let (surface_live_state, surface_snapshot_reader) = derived_surface_reader(
+                    schema_key,
+                    &live_state,
+                    &entity_snapshot_reader,
+                    &commit_graph,
+                    &branch_ref,
+                    true,
+                    true,
+                )?;
                 register_spec_table(
                     ctx,
                     &surface.name,
                     Arc::new(EntitySpec::active(
                         spec,
-                        Arc::clone(&live_state),
+                        surface_live_state,
                         Arc::clone(&branch_ref),
                         active_branch_id.to_string(),
-                        entity_snapshot_reader.clone(),
+                        surface_snapshot_reader,
                     )),
                     WriteAccess::read_only(),
                 )?;
             }
             PublicSurfaceKind::EntityByBranch { schema_key } if include_write_surfaces => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
+                let (surface_live_state, surface_snapshot_reader) = derived_surface_reader(
+                    schema_key,
+                    &live_state,
+                    &entity_snapshot_reader,
+                    &commit_graph,
+                    &branch_ref,
+                    true,
+                    false,
+                )?;
                 register_spec_table(
                     ctx,
                     &surface.name,
                     Arc::new(EntitySpec::by_branch(
                         spec,
-                        Arc::clone(&live_state),
+                        surface_live_state,
                         Arc::clone(&branch_ref),
-                        entity_snapshot_reader.clone(),
+                        surface_snapshot_reader,
                     )),
                     WriteAccess::read_only(),
                 )?;
@@ -137,6 +155,43 @@ where
     }
 
     Ok(())
+}
+
+fn derived_surface_reader(
+    schema_key: &str,
+    live_state: &Arc<dyn LiveStateReader>,
+    entity_snapshot_reader: &Option<Arc<dyn EntitySnapshotReader>>,
+    commit_graph: &Option<Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>>,
+    branch_ref: &Arc<dyn BranchRefReader>,
+    include_recovery_roots: bool,
+    include_retained_nodes: bool,
+) -> Result<
+    (
+        Arc<dyn LiveStateReader>,
+        Option<Arc<dyn EntitySnapshotReader>>,
+    ),
+    LixError,
+> {
+    if !matches!(schema_key, "lix_commit" | "lix_commit_edge") {
+        return Ok((Arc::clone(live_state), entity_snapshot_reader.clone()));
+    }
+    let commit_graph = commit_graph.as_ref().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("derived surface '{schema_key}' is missing its ForkTree graph reader"),
+        )
+    })?;
+    Ok((
+        Arc::new(crate::commit_graph::CommitGraphLiveStateReader::new(
+            schema_key,
+            Arc::clone(commit_graph),
+            Arc::clone(branch_ref),
+            Some(Arc::clone(live_state)),
+            include_recovery_roots,
+            include_retained_nodes,
+        )),
+        None,
+    ))
 }
 
 pub(crate) async fn register_entity_write_providers(

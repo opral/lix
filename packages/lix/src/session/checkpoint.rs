@@ -77,7 +77,7 @@ where
                         head_commit_id != previous_checkpoint_commit_id;
                     let selected_changes = {
                         let entries = historical
-                            .diff_state_rows_between_commits(
+                            .diff_branch_state_rows_between_commits(
                                 previous_checkpoint_commit_id,
                                 head_commit_id,
                             )

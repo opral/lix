@@ -1504,7 +1504,7 @@ where
     )
     .await?;
     rows.into_iter()
-        .map(|(encoded_key, value, _source)| {
+        .map(|(encoded_key, value, source)| {
             let key = decode_state_key(&encoded_key)?;
             let (snapshot_content, deleted) = match value.cell {
                 StateCell::Value(snapshot) => (Some(snapshot), false),
@@ -1513,6 +1513,7 @@ where
             };
             Ok(HistoricalStateRow {
                 key,
+                global: source == StateSource::Global,
                 change_id: value.change_id,
                 commit_id: value.commit_id,
                 created_at: value.created_at,

@@ -11,13 +11,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::LixError;
+use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchRefReader};
 use crate::changelog::{ChangeId, ChangeRecord, CommitId, CommitRecord};
 use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
     CommitGraphHistory, CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
 };
 use crate::common::ExactBatch;
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
+use crate::live_state::{
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateBatchBuilder, MaterializedLiveStateRow,
+};
 use crate::storage_adapter::StorageAdapterRead;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -34,6 +40,592 @@ const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 /// tracked data; metadata topology does not require that physical projection.
 #[derive(Clone)]
 pub(crate) struct CommitGraphContext;
+
+/// Derived commit surfaces must not enter the current-state reader. This
+/// reader is the SQL adapter for the authenticated ForkTree commit topology:
+/// it obtains branch heads and reachable topology from the operation's graph
+/// capability, then exposes only terminal row snapshots to the existing entity
+/// projection machinery.
+pub(crate) struct CommitGraphLiveStateReader {
+    schema_key: String,
+    commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    current_state: Option<Arc<dyn LiveStateReader>>,
+    include_recovery_roots: bool,
+    include_retained_nodes: bool,
+}
+
+impl CommitGraphLiveStateReader {
+    pub(crate) fn new(
+        schema_key: impl Into<String>,
+        commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        current_state: Option<Arc<dyn LiveStateReader>>,
+        include_recovery_roots: bool,
+        include_retained_nodes: bool,
+    ) -> Self {
+        Self {
+            schema_key: schema_key.into(),
+            commit_graph,
+            branch_ref,
+            current_state,
+            include_recovery_roots,
+            include_retained_nodes,
+        }
+    }
+
+    async fn checkpoint_roots(
+        &self,
+    ) -> Result<(BTreeMap<String, BTreeSet<CommitId>>, bool), LixError> {
+        let Some(current_state) = self.current_state.as_ref() else {
+            return Ok((BTreeMap::new(), false));
+        };
+        let rows = current_state
+            .scan_batch(&LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    rows: crate::live_state::LiveStateRowFilter::All,
+                    schema_keys: vec![
+                        "lix_checkpoint_recovery".to_owned(),
+                        "lix_checkpoint_gc_state".to_owned(),
+                    ],
+                    branch_ids: vec![crate::GLOBAL_BRANCH_ID.to_owned()],
+                    untracked: Some(true),
+                    include_tombstones: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?
+            .into_rows();
+        let mut roots = BTreeMap::<String, BTreeSet<CommitId>>::new();
+        let mut collectible_interval_count = 0;
+        let mut checkpoint_sequence = None;
+        let mut last_gc_sequence = None;
+        let mut gc_state_seen = false;
+        for row in rows {
+            if row.schema_key == "lix_checkpoint_gc_state" {
+                if row.file_id.is_some()
+                    || row.deleted
+                    || row.snapshot_content.is_none()
+                    || row.entity_pk != EntityPk::single("repository")
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "checkpoint GC state is missing an authenticated live value",
+                    ));
+                }
+                let snapshot = row
+                    .snapshot_content
+                    .as_ref()
+                    .expect("checkpoint GC state snapshot checked above");
+                let object = serde_json::from_str::<serde_json::Value>(snapshot.as_str()).map_err(
+                    |error| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!("checkpoint GC state is malformed: {error}"),
+                        )
+                    },
+                )?;
+                if object.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "checkpoint GC state version is unsupported",
+                    ));
+                }
+                let debt = object
+                    .get("collectible_interval_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "checkpoint GC state is missing collectible debt",
+                        )
+                    })?;
+                collectible_interval_count = debt;
+                checkpoint_sequence = Some(
+                    object
+                        .get("checkpoint_sequence")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                "checkpoint GC state is missing its checkpoint sequence",
+                            )
+                        })?,
+                );
+                last_gc_sequence = Some(
+                    object
+                        .get("last_gc_sequence")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                "checkpoint GC state is missing its last GC sequence",
+                            )
+                        })?,
+                );
+                if std::mem::replace(&mut gc_state_seen, true) {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "checkpoint GC state is duplicated",
+                    ));
+                }
+                continue;
+            }
+            if row.schema_key != "lix_checkpoint_recovery"
+                || row.file_id.is_some()
+                || row.deleted
+                || row.snapshot_content.is_none()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "checkpoint recovery root is missing an authenticated live value",
+                ));
+            }
+            let snapshot = row
+                .snapshot_content
+                .as_ref()
+                .expect("checkpoint recovery snapshot checked above");
+            let object =
+                serde_json::from_str::<serde_json::Value>(snapshot.as_str()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("checkpoint recovery root is malformed: {error}"),
+                    )
+                })?;
+            let branch_id = object
+                .get("branch_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "checkpoint recovery root is missing its branch identity",
+                    )
+                })?;
+            if row.entity_pk != EntityPk::single(branch_id) {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "checkpoint recovery root identity does not match its state key",
+                ));
+            }
+            let recovered_head = CommitId::parse_lix(
+                object
+                    .get("recovered_head_commit_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "checkpoint recovery root is missing its recovered head",
+                        )
+                    })?,
+                "checkpoint recovery recovered head",
+            )?;
+            let checkpoint_commit = CommitId::parse_lix(
+                object
+                    .get("checkpoint_commit_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "checkpoint recovery root is missing its checkpoint commit",
+                        )
+                    })?,
+                "checkpoint recovery checkpoint commit",
+            )?;
+            let branch_roots = roots.entry(branch_id.to_owned()).or_default();
+            branch_roots.insert(recovered_head);
+            branch_roots.insert(checkpoint_commit);
+        }
+        let retain_unreached_until_sweep = if collectible_interval_count == 0 {
+            false
+        } else {
+            let checkpoint_sequence = checkpoint_sequence.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "checkpoint GC state is missing its authenticated sequence",
+                )
+            })?;
+            let last_gc_sequence = last_gc_sequence.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "checkpoint GC state is missing its authenticated GC sequence",
+                )
+            })?;
+            let age = checkpoint_sequence
+                .checked_sub(last_gc_sequence)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "checkpoint GC state sequence is inconsistent",
+                    )
+                })?;
+            let age_limit = 64_u64.max(last_gc_sequence);
+            age < age_limit
+        };
+        Ok((roots, retain_unreached_until_sweep))
+    }
+
+    async fn rows_for_request(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        if self.schema_key == BRANCH_REF_SCHEMA_KEY {
+            return self.branch_ref_rows_for_request(request).await;
+        }
+        if !matches!(
+            request.filter.rows,
+            crate::live_state::LiveStateRowFilter::All
+        ) {
+            return Ok(Vec::new());
+        }
+        if !request.filter.schema_keys.is_empty()
+            && !request
+                .filter
+                .schema_keys
+                .iter()
+                .any(|schema_key| schema_key == &self.schema_key)
+        {
+            return Ok(Vec::new());
+        }
+
+        // The base commit/edge surfaces are global derived views: their
+        // logical contents must not depend on whichever branch happens to be
+        // active in the SQL session.  EntityBase still seeds the generic
+        // request with that active branch for ordinary schemas, so resolve
+        // the authenticated branch-selector set here for these two ForkTree
+        // owned schemas.  The by-branch surfaces deliberately keep their
+        // caller-provided branch scope below.
+        let branch_ids = if matches!(self.schema_key.as_str(), "lix_commit" | "lix_commit_edge")
+            && self.include_recovery_roots
+            && self.include_retained_nodes
+        {
+            self.branch_ref
+                .scan_heads()
+                .await?
+                .into_iter()
+                .map(|head| head.branch_id)
+                .collect::<Vec<_>>()
+        } else if request.filter.branch_ids.is_empty() {
+            self.branch_ref
+                .scan_heads()
+                .await?
+                .into_iter()
+                .map(|head| head.branch_id)
+                .collect::<Vec<_>>()
+        } else {
+            request.filter.branch_ids.clone()
+        };
+        let (recovery_roots, retained_nodes_until_gc) = if self.include_recovery_roots {
+            self.checkpoint_roots().await?
+        } else {
+            (BTreeMap::new(), false)
+        };
+        let mut rows = Vec::new();
+        for branch_id in branch_ids {
+            let head = self
+                .branch_ref
+                .load_head(&branch_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::branch_not_found(
+                        branch_id.clone(),
+                        "scan ForkTree derived commit surface",
+                        "branch head",
+                    )
+                })?;
+            let mut reachable_by_id = BTreeMap::new();
+            if self.include_retained_nodes && retained_nodes_until_gc {
+                let retained = {
+                    let mut graph = self.commit_graph.lock().await;
+                    graph.retained_nodes().await?
+                };
+                for commit in retained {
+                    reachable_by_id
+                        .entry(commit.commit_id)
+                        .or_insert(ReachableCommitGraphNode { commit, depth: 0 });
+                }
+            } else {
+                let mut root_ids = BTreeSet::from([head.commit_id]);
+                if let Some(roots) = recovery_roots.get(&branch_id) {
+                    root_ids.extend(roots.iter().copied());
+                }
+                if self.schema_key == "lix_commit" && !self.include_retained_nodes {
+                    for entity_pk in &request.filter.entity_pks {
+                        let Ok(commit_text) = entity_pk.as_single_string_owned() else {
+                            continue;
+                        };
+                        if let Ok(commit_id) = CommitId::parse_lix(&commit_text, "requested commit")
+                        {
+                            root_ids.insert(commit_id);
+                        }
+                    }
+                }
+                for root_id in root_ids {
+                    let reachable = {
+                        let mut graph = self.commit_graph.lock().await;
+                        graph.reachable_nodes(&root_id).await?.to_vec()
+                    };
+                    for reachable in reachable {
+                        reachable_by_id
+                            .entry(reachable.commit.commit_id)
+                            .or_insert(reachable);
+                    }
+                }
+            }
+            for reachable in reachable_by_id.into_values() {
+                let commit = &reachable.commit;
+                if self.schema_key == "lix_commit" {
+                    let snapshot =
+                        crate::changelog::commit_row_snapshot_json(&commit.commit_id.to_string())?;
+                    let entity_pk = EntityPk::uuid_from_canonical(&commit.commit_id.to_string())
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                format!("authenticated commit ID is not a UUID: {error}"),
+                            )
+                        })?;
+                    rows.push(MaterializedLiveStateRow {
+                        entity_pk,
+                        schema_key: self.schema_key.clone(),
+                        file_id: None,
+                        snapshot_content: Some(snapshot.into()),
+                        metadata: None,
+                        deleted: false,
+                        created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                        updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                        global: branch_id == crate::GLOBAL_BRANCH_ID,
+                        change_id: None,
+                        commit_id: Some(commit.commit_id),
+                        untracked: false,
+                        branch_id: Arc::from(branch_id.as_str()),
+                    });
+                } else if self.schema_key == "lix_commit_edge" {
+                    for (parent_order, parent_id) in commit.parent_commit_ids.iter().enumerate() {
+                        let parent_order = i64::try_from(parent_order).map_err(|_| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                "authenticated commit parent order exceeds SQL integer range",
+                            )
+                        })?;
+                        let snapshot = serde_json::json!({
+                            "parent_id": parent_id.to_string(),
+                            "child_id": commit.commit_id.to_string(),
+                            "parent_order": parent_order,
+                        });
+                        let entity_pk = EntityPk::from_json_values(
+                            &[
+                                serde_json::Value::String(commit.commit_id.to_string()),
+                                serde_json::Value::Number(parent_order.into()),
+                            ],
+                            &[
+                                crate::entity_pk::EntityPkComponentType::Uuid,
+                                crate::entity_pk::EntityPkComponentType::Integer,
+                            ],
+                        )
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                format!("authenticated commit edge identity is invalid: {error}"),
+                            )
+                        })?;
+                        rows.push(MaterializedLiveStateRow {
+                            entity_pk,
+                            schema_key: self.schema_key.clone(),
+                            file_id: None,
+                            snapshot_content: Some(
+                                serde_json::to_string(&snapshot)
+                                    .map_err(|error| {
+                                        LixError::new(
+                                            LixError::CODE_STORAGE_ERROR,
+                                            format!(
+                                                "commit edge snapshot serialization failed: {error}"
+                                            ),
+                                        )
+                                    })?
+                                    .into(),
+                            ),
+                            metadata: None,
+                            deleted: false,
+                            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                            global: branch_id == crate::GLOBAL_BRANCH_ID,
+                            change_id: None,
+                            commit_id: Some(commit.commit_id),
+                            untracked: false,
+                            branch_id: Arc::from(branch_id.as_str()),
+                        });
+                    }
+                } else {
+                    return Err(LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        format!(
+                            "ForkTree derived reader does not serve '{}'",
+                            self.schema_key
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if !request.filter.entity_pks.is_empty() {
+            rows.retain(|row| request.filter.entity_pks.contains(&row.entity_pk));
+        }
+        rows.retain(|_| {
+            request
+                .filter
+                .file_ids
+                .iter()
+                .all(|file_id| file_id.matches(None))
+        });
+        rows.sort_by(|left, right| {
+            left.branch_id
+                .cmp(&right.branch_id)
+                .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+        });
+        if let Some(limit) = request.limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
+    }
+
+    async fn branch_ref_rows(&self) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let mut rows = Vec::new();
+        for head in self.branch_ref.scan_heads().await? {
+            let entity_pk = EntityPk::uuid_from_canonical(&head.branch_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("authenticated branch ID is not a UUID: {error}"),
+                )
+            })?;
+            let snapshot = serde_json::json!({
+                "id": head.branch_id,
+                "commit_id": head.commit_id.to_string(),
+            });
+            rows.push(MaterializedLiveStateRow {
+                entity_pk,
+                schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
+                file_id: None,
+                snapshot_content: Some(
+                    serde_json::to_string(&snapshot)
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                format!("branch-ref snapshot serialization failed: {error}"),
+                            )
+                        })?
+                        .into(),
+                ),
+                metadata: None,
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                global: true,
+                change_id: None,
+                commit_id: Some(head.commit_id),
+                untracked: true,
+                branch_id: Arc::from(crate::GLOBAL_BRANCH_ID),
+            });
+        }
+        rows.sort_by(|left, right| left.entity_pk.cmp(&right.entity_pk));
+        Ok(rows)
+    }
+
+    async fn branch_ref_rows_for_request(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        if !matches!(
+            request.filter.rows,
+            crate::live_state::LiveStateRowFilter::All
+        ) {
+            return Ok(Vec::new());
+        }
+        if request.filter.untracked == Some(false)
+            || (!request.filter.branch_ids.is_empty()
+                && !request
+                    .filter
+                    .branch_ids
+                    .iter()
+                    .any(|branch_id| branch_id == crate::GLOBAL_BRANCH_ID))
+        {
+            return Ok(Vec::new());
+        }
+        let mut rows = self.branch_ref_rows().await?;
+        rows.retain(|row| {
+            request.filter.entity_pks.is_empty()
+                || request.filter.entity_pks.contains(&row.entity_pk)
+        });
+        rows.retain(|row| {
+            request
+                .filter
+                .file_ids
+                .iter()
+                .all(|file_id| file_id.matches(None))
+        });
+        if let Some(limit) = request.limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
+    }
+}
+
+#[async_trait::async_trait]
+impl LiveStateReader for CommitGraphLiveStateReader {
+    async fn scan_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        Ok(MaterializedLiveStateBatch::from_rows(
+            self.rows_for_request(request).await?,
+        ))
+    }
+
+    async fn load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+        if self.schema_key == BRANCH_REF_SCHEMA_KEY {
+            let mut slots = Vec::with_capacity(request.rows.len());
+            let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+            if request.untracked == Some(false) {
+                slots.resize(request.rows.len(), None);
+                return crate::live_state::MaterializedLiveStateExactBatch::new(
+                    builder.finish(),
+                    slots,
+                );
+            }
+            let rows = self.branch_ref_rows().await?;
+            for requested in &request.rows {
+                if requested.branch_id != crate::GLOBAL_BRANCH_ID {
+                    return Err(LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        "ForkTree branch-ref exact reads require the global branch",
+                    ));
+                }
+                let Some(row) = rows.iter().find(|row| row.entity_pk == requested.entity_pk) else {
+                    slots.push(None);
+                    continue;
+                };
+                let ordinal = u32::try_from(builder.len()).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "exact branch-ref result exceeds u32 rows",
+                    )
+                })?;
+                builder.push_owned(row.clone());
+                slots.push(Some(ordinal));
+            }
+            return crate::live_state::MaterializedLiveStateExactBatch::new(
+                builder.finish(),
+                slots,
+            );
+        }
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "ForkTree derived commit surfaces do not support current-state exact reads",
+        ))
+    }
+}
 
 impl CommitGraphContext {
     pub(crate) fn new() -> Self {
@@ -135,11 +727,21 @@ where
         ExactBatch::try_new("commit graph", commit_ids, nodes)
     }
 
-    /// Loads every direct commit fact from the commit-state authority.
-    ///
-    /// This is used by global commit surfaces where the caller wants the durable
-    /// graph facts themselves, not reachability from a particular branch head.
-    pub(crate) async fn all_nodes(&mut self) -> Result<Vec<CommitGraphNode>, LixError> {
+    /// Walks from `head_commit_id` through parent commits and records nearest depth.
+    pub(crate) async fn reachable_nodes(
+        &mut self,
+        head_commit_id: &CommitId,
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+        if let Some(nodes) = self.reachable_nodes_cache.get(head_commit_id) {
+            return Ok(Arc::clone(nodes));
+        }
+        let nodes = Arc::from(walk_reachable_nodes(self, head_commit_id).await?);
+        self.reachable_nodes_cache
+            .insert(*head_commit_id, Arc::clone(&nodes));
+        Ok(nodes)
+    }
+
+    pub(crate) async fn retained_nodes(&mut self) -> Result<Vec<CommitGraphNode>, LixError> {
         let mut commits = Vec::new();
         let mut start_after = None;
         loop {
@@ -161,20 +763,6 @@ where
             start_after = commits.last().map(|node| node.commit_id);
         }
         Ok(commits)
-    }
-
-    /// Walks from `head_commit_id` through parent commits and records nearest depth.
-    pub(crate) async fn reachable_nodes(
-        &mut self,
-        head_commit_id: &CommitId,
-    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
-        if let Some(nodes) = self.reachable_nodes_cache.get(head_commit_id) {
-            return Ok(Arc::clone(nodes));
-        }
-        let nodes = Arc::from(walk_reachable_nodes(self, head_commit_id).await?);
-        self.reachable_nodes_cache
-            .insert(*head_commit_id, Arc::clone(&nodes));
-        Ok(nodes)
     }
 
     /// Returns the best common ancestors shared by two commit heads.
@@ -687,6 +1275,10 @@ where
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
         Self::reachable_nodes(self, head_commit_id).await
+    }
+
+    async fn retained_nodes(&mut self) -> Result<Vec<CommitGraphNode>, LixError> {
+        Self::retained_nodes(self).await
     }
 
     async fn load_commit_records(
