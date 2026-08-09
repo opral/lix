@@ -6,8 +6,6 @@ use crate::schema::lix_schema_definition;
 const LIX_REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ACCOUNT_SCHEMA_KEY: &str = "lix_account";
-const LIX_LABEL_SCHEMA_KEY: &str = "lix_label";
-const LIX_LABEL_ASSIGNMENT_SCHEMA_KEY: &str = "lix_label_assignment";
 const LIX_CHANGE_SCHEMA_KEY: &str = "lix_change";
 const LIX_COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const LIX_BRANCH_DESCRIPTOR_SCHEMA_KEY: &str = "lix_branch_descriptor";
@@ -23,8 +21,6 @@ const LIX_COLLECTION_GENERATION_SCHEMA_KEY: &str = "lix_collection_generation";
 const LIX_REGISTERED_SCHEMA_JSON: &str = include_str!("lix_registered_schema.json");
 const LIX_KEY_VALUE_SCHEMA_JSON: &str = include_str!("lix_key_value.json");
 const LIX_ACCOUNT_SCHEMA_JSON: &str = include_str!("lix_account.json");
-const LIX_LABEL_SCHEMA_JSON: &str = include_str!("lix_label.json");
-const LIX_LABEL_ASSIGNMENT_SCHEMA_JSON: &str = include_str!("lix_label_assignment.json");
 const LIX_CHANGE_SCHEMA_JSON: &str = include_str!("lix_change.json");
 const LIX_COMMIT_SCHEMA_JSON: &str = include_str!("lix_commit.json");
 const LIX_BRANCH_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_branch_descriptor.json");
@@ -40,8 +36,6 @@ const LIX_COLLECTION_GENERATION_SCHEMA_JSON: &str = include_str!("lix_collection
 static LIX_REGISTERED_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_KEY_VALUE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_ACCOUNT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
-static LIX_LABEL_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
-static LIX_LABEL_ASSIGNMENT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COMMIT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_BRANCH_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -58,8 +52,6 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_REGISTERED_SCHEMA_KEY,
     LIX_KEY_VALUE_SCHEMA_KEY,
     LIX_ACCOUNT_SCHEMA_KEY,
-    LIX_LABEL_SCHEMA_KEY,
-    LIX_LABEL_ASSIGNMENT_SCHEMA_KEY,
     LIX_CHANGE_SCHEMA_KEY,
     LIX_COMMIT_SCHEMA_KEY,
     LIX_BRANCH_DESCRIPTOR_SCHEMA_KEY,
@@ -101,16 +93,6 @@ pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonVa
             LIX_ACCOUNT_SCHEMA
                 .get_or_init(|| parse_builtin_schema("lix_account.json", LIX_ACCOUNT_SCHEMA_JSON)),
         ),
-        LIX_LABEL_SCHEMA_KEY => Some(
-            LIX_LABEL_SCHEMA
-                .get_or_init(|| parse_builtin_schema("lix_label.json", LIX_LABEL_SCHEMA_JSON)),
-        ),
-        LIX_LABEL_ASSIGNMENT_SCHEMA_KEY => Some(LIX_LABEL_ASSIGNMENT_SCHEMA.get_or_init(|| {
-            parse_builtin_schema(
-                "lix_label_assignment.json",
-                LIX_LABEL_ASSIGNMENT_SCHEMA_JSON,
-            )
-        })),
         LIX_CHANGE_SCHEMA_KEY => Some(
             LIX_CHANGE_SCHEMA
                 .get_or_init(|| parse_builtin_schema("lix_change.json", LIX_CHANGE_SCHEMA_JSON)),

@@ -7,9 +7,8 @@ pub(crate) use context::CatalogContext;
 pub(crate) use revision::{load_catalog_revision, stage_catalog_revision};
 pub(crate) use schema::{
     ForeignKeyPlan, SchemaCatalogFact, SchemaCatalogKey, SchemaPlan, SchemaPlanFingerprint,
-    SchemaPlanId, StateForeignKeyPlan,
+    SchemaPlanId,
 };
 pub(crate) use snapshot::{
-    CatalogFingerprint, CatalogSnapshot, DefaultPlan, StateDeleteReferencePlan, TransactionCatalog,
-    TypedJsonScalarRef,
+    CatalogFingerprint, CatalogSnapshot, DefaultPlan, TransactionCatalog, TypedJsonScalarRef,
 };

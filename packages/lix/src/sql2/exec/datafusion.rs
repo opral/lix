@@ -4470,7 +4470,7 @@ mod tests {
         }));
         assert!(!tables_result.rows.iter().any(|row| {
             row.iter()
-                .any(|value| matches!(value, Value::Text(value) if value == "lix_state"))
+                .any(|value| matches!(value, Value::Text(value) if value == "removed_surface"))
         }));
     }
 
