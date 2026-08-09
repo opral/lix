@@ -7775,15 +7775,12 @@ where
     }
 }
 
-async fn load_immutable_mutation_predecessors<R>(
-    reader: &R,
+async fn load_immutable_mutation_predecessors(
+    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + 'static>,
     schema_key: &str,
     branch_id: &str,
     entity_pk_chunks: &[Arc<[EntityPk]>],
-) -> Result<Vec<CertifiedCurrentStatePredecessor>, LixError>
-where
-    R: LiveStateReader + ?Sized,
-{
+) -> Result<Vec<CertifiedCurrentStatePredecessor>, LixError> {
     let row_count = entity_pk_chunks.iter().map(|chunk| chunk.len()).sum();
     let mut predecessors = Vec::with_capacity(row_count);
     for entity_pks in entity_pk_chunks {
@@ -7802,7 +7799,7 @@ where
             untracked: Some(false),
             include_tombstones: false,
         };
-        let current = reader.load_exact_batch(&request).await?;
+        let current = load_opening_exact_live_state_batch(forktree, &request).await?;
         for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
             let row = current.row(slot).ok_or_else(|| {
                 LixError::new(
@@ -8764,8 +8761,22 @@ mod transaction_validation_reader_tests {
             .find("fn conflict_resolution_limits")
             .expect("mutation predecessor helper end");
         let predecessor = &source[predecessor_start..predecessor_end];
-        assert!(predecessor.contains("reader.load_exact_batch(&request)"));
+        assert!(predecessor.contains("load_opening_exact_live_state_batch(forktree, &request)"));
+        assert!(predecessor.contains("&ForkTreeReadFacade<impl StorageAdapterRead + 'static>"));
+        assert!(!predecessor.contains("R: LiveStateReader"));
         assert!(!predecessor.contains("transaction_reader("));
+
+        let upgrade_start = source
+            .rfind("async fn preflight_owned_generation_upgrades")
+            .expect("plugin generation preflight");
+        let upgrade_end = source[upgrade_start..]
+            .find("fn plugin_upgrade_error")
+            .map(|offset| upgrade_start + offset)
+            .expect("plugin generation preflight end");
+        let upgrade = &source[upgrade_start..upgrade_end];
+        assert!(upgrade.contains("forktree: &ForkTreeReadFacade<"));
+        assert!(upgrade.contains("SharedStorageAdapterRead<R>"));
+        assert!(!upgrade.contains("base: &dyn LiveStateReader"));
     }
 
     #[test]
@@ -11307,7 +11318,7 @@ struct DurableBlobCheckpointSnapshot {
 
 async fn preflight_owned_generation_upgrades<R>(
     host: &PluginRuntimeHost,
-    base: &dyn LiveStateReader,
+    forktree: &ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
     staged: &impl StagedLiveStateRows,
     read: &SharedStorageAdapterRead<R>,
     staged_writes: &TransactionWriteBuffer,
@@ -11316,7 +11327,7 @@ async fn preflight_owned_generation_upgrades<R>(
     install_schema_definitions: &BTreeMap<PluginLifecycleKey, BTreeMap<String, JsonValue>>,
 ) -> Result<(), LixError>
 where
-    R: crate::storage_adapter::StorageRead,
+    R: crate::storage_adapter::StorageRead + 'static,
 {
     let branch_ids = upgrades
         .iter()
@@ -11325,7 +11336,7 @@ where
         .into_iter()
         .collect::<Vec<_>>();
     let owner_rows = overlay_scan_batch(
-        base,
+        forktree,
         staged,
         &LiveStateScanRequest {
             filter: LiveStateFilter {
@@ -11388,7 +11399,7 @@ where
     }
 
     let descriptor_rows = overlay_scan_batch(
-        base,
+        forktree,
         staged,
         &FilesystemPathIndexRequest::new(branch_ids).live_state_request(),
     )
@@ -11405,7 +11416,7 @@ where
         .map(EntityPk::single)
         .collect::<Vec<_>>();
     let registered_schema_rows = overlay_scan_batch(
-        base,
+        forktree,
         staged,
         &LiveStateScanRequest {
             filter: LiveStateFilter {
@@ -11517,7 +11528,7 @@ where
             .map(NullableKeyFilter::Value)
             .collect::<Vec<_>>();
         let state_rows = overlay_scan_batch(
-            base,
+            forktree,
             staged,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
@@ -11584,7 +11595,7 @@ where
         }
 
         let blob_rows = overlay_scan_batch(
-            base,
+            forktree,
             staged,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
