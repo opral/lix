@@ -24,6 +24,7 @@ use super::view::{CoherentView, load_object_bytes, load_object_map};
 const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const UPLOAD_PART_BYTES: u64 = CANONICAL_BLOB_CHUNK_BYTES as u64 * 16;
 const UPLOAD_PART_WINDOW: u64 = 4;
+pub(crate) const PREPARED_BLOB_CHUNK_BYTES: usize = CANONICAL_BLOB_CHUNK_BYTES;
 
 /// Computes the existing public fixed-chunk BlobId while upload completion is
 /// already authenticating payload bytes. Memory is one canonical chunk plus
@@ -77,6 +78,138 @@ impl CanonicalBlobIdBuilder {
             ));
         }
         crate::binary_cas::BlobId::from_chunks(self.total_size, self.chunks)
+    }
+}
+
+/// A transaction-owned, receipt-only blob pre-stager.
+///
+/// Payload bytes are accepted only one canonical chunk at a time.  The
+/// caller commits `pending_objects` through the existing immutable object
+/// owner before accepting another page, so this state retains hashes,
+/// manifest edges, and at most the configured object page—not file bytes.
+pub(crate) struct PreparedBlobUpload {
+    total_size: u64,
+    next_offset: u64,
+    content_digest: blake3::Hasher,
+    blob_id: CanonicalBlobIdBuilder,
+    ordered_chunks: Vec<BlobChunkRefV1>,
+    first_chunk_hash: Option<crate::binary_cas::ChunkHash>,
+    seen_chunk_ids: BTreeSet<ObjectId>,
+    pending_objects: ImmutableObjectSet,
+    pending_object_bytes: usize,
+}
+
+impl PreparedBlobUpload {
+    pub(crate) fn new(total_size: u64) -> Self {
+        Self {
+            total_size,
+            next_offset: 0,
+            content_digest: blake3::Hasher::new(),
+            blob_id: CanonicalBlobIdBuilder::default(),
+            ordered_chunks: Vec::new(),
+            first_chunk_hash: None,
+            seen_chunk_ids: BTreeSet::new(),
+            pending_objects: ImmutableObjectSet::default(),
+            pending_object_bytes: 0,
+        }
+    }
+
+    pub(crate) fn push_chunk(&mut self, offset: u64, bytes: &[u8]) -> Result<(), StorageError> {
+        if offset != self.next_offset {
+            return Err(corruption("prepared blob chunks are not contiguous"));
+        }
+        if bytes.is_empty() || bytes.len() > PREPARED_BLOB_CHUNK_BYTES {
+            return Err(corruption("prepared blob chunk has an invalid size"));
+        }
+        let next_offset = self
+            .next_offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| corruption("prepared blob size overflows u64"))?;
+        if next_offset > self.total_size {
+            return Err(corruption("prepared blob exceeds its declared size"));
+        }
+        // The authenticated BlobManifestV1 layout is fixed-width except for
+        // its final chunk.  Enforce that framing at the receipt boundary so a
+        // producer cannot create a semantically equivalent but non-canonical
+        // chunk sequence that a later reader would interpret differently.
+        if next_offset != self.total_size && bytes.len() != PREPARED_BLOB_CHUNK_BYTES {
+            return Err(corruption(
+                "prepared blob chunks do not follow canonical fixed boundaries",
+            ));
+        }
+
+        self.blob_id.update(bytes)?;
+        self.content_digest.update(bytes);
+        let chunk = BlobChunkV1 {
+            bytes: Bytes::copy_from_slice(bytes),
+        };
+        let (chunk_object_id, encoded) = chunk.encode()?;
+        if self.first_chunk_hash.is_none() {
+            self.first_chunk_hash = Some(crate::binary_cas::ChunkHash::from_content(bytes));
+        }
+        if self.seen_chunk_ids.insert(chunk_object_id) {
+            self.pending_object_bytes = self.pending_object_bytes.saturating_add(encoded.len());
+            self.pending_objects.insert(chunk_object_id, encoded)?;
+        }
+        self.ordered_chunks.push(BlobChunkRefV1 {
+            chunk_object_id,
+            declared_len: bytes.len() as u64,
+        });
+        self.next_offset = next_offset;
+        Ok(())
+    }
+
+    pub(crate) fn pending_object_bytes(&self) -> usize {
+        self.pending_object_bytes
+    }
+
+    pub(crate) fn take_pending_objects(&mut self) -> ImmutableObjectSet {
+        self.pending_object_bytes = 0;
+        std::mem::take(&mut self.pending_objects)
+    }
+
+    pub(crate) fn finish(
+        self,
+    ) -> Result<(crate::binary_cas::BlobWriteReceipt, ImmutableObjectSet), StorageError> {
+        if self.next_offset != self.total_size || self.ordered_chunks.is_empty() {
+            return Err(corruption("prepared blob does not match its declared size"));
+        }
+        let canonical_blob_id = self.blob_id.finish();
+        let manifest = BlobManifestV1::from_authenticated_chunks(
+            self.total_size,
+            self.ordered_chunks,
+            canonical_blob_id,
+            *self.content_digest.finalize().as_bytes(),
+        );
+        let (manifest_object_id, manifest_bytes) = manifest.encode()?;
+        let mut objects = self.pending_objects;
+        objects.insert(manifest_object_id, manifest_bytes)?;
+        let layout = if self.total_size <= PREPARED_BLOB_CHUNK_BYTES as u64 {
+            crate::binary_cas::BlobLayout::SingleChunk {
+                chunk_hash: self
+                    .first_chunk_hash
+                    .ok_or_else(|| corruption("prepared blob has no chunk"))?,
+            }
+        } else {
+            crate::binary_cas::BlobLayout::Chunked {
+                chunk_count: u32::try_from(
+                    // The manifest has already validated this count; the
+                    // ordered edge count is bounded by the builder state.
+                    manifest.ordered_chunks.len(),
+                )
+                .map_err(|_| corruption("prepared blob has too many chunks"))?,
+            }
+        };
+        Ok((
+            crate::binary_cas::BlobWriteReceipt {
+                hash: canonical_blob_id,
+                size_bytes: self.total_size,
+                layout,
+                manifest_object_id: *manifest_object_id.as_bytes(),
+                manifest_was_existing: false,
+            },
+            objects,
+        ))
     }
 }
 
@@ -1431,7 +1564,10 @@ where
 
 #[cfg(test)]
 mod canonical_blob_id_tests {
-    use super::{CanonicalBlobIdBuilder, bind_historical_state_blob_ref};
+    use super::{
+        CanonicalBlobIdBuilder, PREPARED_BLOB_CHUNK_BYTES, PreparedBlobUpload,
+        bind_historical_state_blob_ref,
+    };
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::forktree::ObjectId;
@@ -1471,6 +1607,30 @@ mod canonical_blob_id_tests {
         assert_eq!(
             builder.finish(),
             crate::binary_cas::BlobId::from_content(&payload)
+        );
+    }
+
+    #[test]
+    fn prepared_blob_receipt_requires_canonical_non_final_chunks() {
+        let mut upload = PreparedBlobUpload::new((2 * PREPARED_BLOB_CHUNK_BYTES + 1) as u64);
+        assert!(upload.push_chunk(0, &[0_u8]).is_err());
+
+        let full = vec![0x5a_u8; PREPARED_BLOB_CHUNK_BYTES];
+        upload
+            .push_chunk(0, &full)
+            .expect("first prepared chunk uses the canonical boundary");
+        upload
+            .push_chunk(PREPARED_BLOB_CHUNK_BYTES as u64, &full)
+            .expect("second prepared chunk uses the canonical boundary");
+        upload
+            .push_chunk((2 * PREPARED_BLOB_CHUNK_BYTES) as u64, &[0x5a])
+            .expect("only the final chunk may be short");
+        let (receipt, _) = upload
+            .finish()
+            .expect("prepared receipt should authenticate");
+        assert_eq!(
+            receipt.size_bytes,
+            (2 * PREPARED_BLOB_CHUNK_BYTES + 1) as u64
         );
     }
 

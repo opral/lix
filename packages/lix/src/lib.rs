@@ -106,7 +106,10 @@ pub use client_state::ClientState;
 #[cfg(feature = "default_wasm_runtime")]
 #[doc(hidden)]
 pub use default_wasm_runtime::runtime as default_wasm_runtime;
-pub use handle::{Lix, LixTransaction, OpenLixBuilder, open_lix};
+pub use handle::{
+    Lix, LixTransaction, OpenLixBuilder, PREPARED_FILE_CONTENT_CHUNK_BYTES, PreparedFileContent,
+    open_lix,
+};
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,

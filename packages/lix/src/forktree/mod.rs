@@ -18,8 +18,9 @@ mod tree;
 mod view;
 
 pub(crate) use blob::{
-    AuthenticatedBlobReader, AuthenticatedBlobRef, PreparedUploadPart, UploadBindingRef,
-    blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
+    AuthenticatedBlobReader, AuthenticatedBlobRef, PREPARED_BLOB_CHUNK_BYTES, PreparedBlobUpload,
+    PreparedUploadPart, UploadBindingRef, blob_reader_on_read, historical_blob_semantic_id,
+    prepare_upload_completion, prepare_upload_part,
 };
 pub(crate) use bootstrap::initialize_empty_repository;
 pub(crate) use model::{
@@ -50,7 +51,8 @@ pub(crate) use state::{
     encode_untracked_value,
 };
 pub(crate) use tree::{
-    RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
+    ImmutableObjectSet, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
+    ReceiptTreeRoot,
 };
 pub(crate) use view::{
     CoherentView, ForkTreeReadFacade, open_coherent_view, open_coherent_view_on_read,

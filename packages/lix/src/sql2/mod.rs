@@ -82,7 +82,7 @@ pub(crate) use providers::{
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
     execute_exact_lix_file_root_listing, execute_fast_lix_file_path_writes,
-    execute_fast_lix_file_prepared_path_write,
+    execute_fast_lix_file_prepared_id_path_write, execute_fast_lix_file_prepared_path_write,
 };
 pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 mod aggregate_statistics;

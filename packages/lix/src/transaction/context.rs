@@ -47,6 +47,7 @@ use crate::filesystem::{
 };
 use crate::forktree::{
     AuthenticatedBlobReader, CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow,
+    ImmutableObjectSet, OBJECT_SPACE, PREPARED_BLOB_CHUNK_BYTES, PreparedBlobUpload,
     PreparedPublication, StateKey, UploadBindingRef, prepare_upload_part,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -92,7 +93,8 @@ use crate::sql2::{
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
+    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    StorageWriteSetStats,
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
@@ -579,6 +581,10 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// this transaction's file rows and history. Resumable media finalization
     /// uses this lane for its completed manifest and upload receipt.
     pending_forktree_publication: Option<PreparedPublication>,
+    /// Receipt-only blob uploads. Chunk objects are committed through the
+    /// immutable ForkTree object owner before their final semantic row is
+    /// staged; this map retains hashes/manifest edges, never payload bytes.
+    prepared_blob_uploads: BTreeMap<String, PreparedBlobUpload>,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -791,6 +797,93 @@ impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    const PREPARED_BLOB_OBJECT_PAGE_BYTES: usize = 64 * 1024 * 1024;
+
+    async fn commit_prepared_blob_objects(
+        &self,
+        objects: ImmutableObjectSet,
+    ) -> Result<(), LixError> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let mut writes = StorageWriteSet::with_capacity(objects.iter().count(), 1);
+        for (object_id, bytes) in objects.iter() {
+            writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+        }
+        let mut options = StorageWriteOptions::default();
+        options.await_durable = self.await_durable_commit;
+        self.storage
+            .commit_write_set(writes, options)
+            .await
+            .map(|_| ())
+            .map_err(LixError::from)
+    }
+
+    /// Streams one authenticated fixed-size blob chunk into unreferenced
+    /// ForkTree objects. Only immutable object bytes for the current bounded
+    /// page cross the storage boundary; the final semantic transaction keeps
+    /// only the returned manifest receipt.
+    pub(crate) async fn stage_prepared_blob_chunk(
+        &mut self,
+        upload_key: &str,
+        total_size: u64,
+        offset: u64,
+        content: &[u8],
+        final_chunk: bool,
+    ) -> Result<Option<crate::binary_cas::BlobWriteReceipt>, LixError> {
+        if upload_key.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "prepared blob upload key must not be empty",
+            ));
+        }
+        if content.len() > PREPARED_BLOB_CHUNK_BYTES {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "prepared blob chunks must be at most 1 MiB",
+            ));
+        }
+        let should_flush = {
+            let upload = self
+                .prepared_blob_uploads
+                .entry(upload_key.to_owned())
+                .or_insert_with(|| PreparedBlobUpload::new(total_size));
+            upload.push_chunk(offset, content)?;
+            if upload.pending_object_bytes() >= Self::PREPARED_BLOB_OBJECT_PAGE_BYTES {
+                true
+            } else {
+                false
+            }
+        };
+        if should_flush {
+            let objects = self
+                .prepared_blob_uploads
+                .get_mut(upload_key)
+                .expect("prepared blob upload exists after staging")
+                .take_pending_objects();
+            self.commit_prepared_blob_objects(objects).await?;
+        }
+
+        if !final_chunk {
+            return Ok(None);
+        }
+
+        let mut upload = self
+            .prepared_blob_uploads
+            .remove(upload_key)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "prepared blob upload disappeared before finish",
+                )
+            })?;
+        let pending = upload.take_pending_objects();
+        self.commit_prepared_blob_objects(pending).await?;
+        let (receipt, manifest) = upload.finish()?;
+        self.commit_prepared_blob_objects(manifest).await?;
+        Ok(Some(receipt))
+    }
+
     pub(crate) async fn stage_forktree_upload_part(
         &mut self,
         upload_id: &str,
@@ -1583,6 +1676,7 @@ where
                     origin_key: None,
                     idempotency_receipt: None,
                     pending_forktree_publication: None,
+                    prepared_blob_uploads: BTreeMap::new(),
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
