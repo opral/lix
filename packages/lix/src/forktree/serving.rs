@@ -16,7 +16,6 @@ use super::model::{
 use super::object::ObjectId;
 use super::state::{
     HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
-    encode_state_key,
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
@@ -76,9 +75,6 @@ where
 struct ResolvedSemanticMember {
     change_id: ChangeId,
     payload: Vec<u8>,
-    global: bool,
-    updated_at: crate::common::LixTimestamp,
-    blob_manifest_object_ids: Vec<ObjectId>,
 }
 
 async fn resolve_semantic_member<R>(
@@ -94,24 +90,14 @@ where
     loop {
         match current {
             CommitMemberV1::Introduced {
-                change_id,
-                payload,
-                global,
-                updated_at,
-                blob_manifest_object_ids,
+                change_id, payload, ..
             } => {
                 if change_id != expected_change_id {
                     return Err(corruption(
                         "selected member source changes its authenticated ChangeId",
                     ));
                 }
-                return Ok(ResolvedSemanticMember {
-                    change_id,
-                    payload,
-                    global,
-                    updated_at,
-                    blob_manifest_object_ids,
-                });
+                return Ok(ResolvedSemanticMember { change_id, payload });
             }
             CommitMemberV1::Selected {
                 change_id,
@@ -1976,101 +1962,19 @@ where
 }
 
 async fn resolve_state_values_on_read<R>(
-    read: &R,
+    _read: &R,
     selected: &[Option<(Vec<u8>, Vec<u8>, StateSource)>],
 ) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let mut refs = Vec::with_capacity(selected.len());
-    let mut page_ids = BTreeSet::new();
-    for row in selected {
-        let value_ref = row
-            .as_ref()
-            .map(|(_, encoded, _)| decode_state_value_storage(encoded))
-            .transpose()?;
-        if let Some(value_ref) = value_ref {
-            page_ids.insert(value_ref.page_object_id);
-        }
-        refs.push(value_ref);
-    }
-    let pages = super::view::load_object_map(read, page_ids).await?;
-    let mut decoded_pages = BTreeMap::new();
-    for (id, bytes) in pages {
-        decoded_pages.insert(id, super::model::CommitChangePageV2::decode(id, &bytes)?);
-    }
-
     let mut output = Vec::with_capacity(selected.len());
-    for (row, value_ref) in selected.iter().zip(refs) {
-        let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
+    for row in selected {
+        let Some((_, encoded, source)) = row else {
             output.push(None);
             continue;
         };
-        let page = decoded_pages
-            .get(&value_ref.page_object_id)
-            .ok_or_else(|| corruption("state value page is absent"))?;
-        let member = page
-            .members
-            .get(value_ref.page_ordinal as usize)
-            .ok_or_else(|| corruption("state value page ordinal is absent"))?;
-        let resolved = resolve_semantic_member(read, member).await?;
-        let expected_global = *source == StateSource::Global;
-        if resolved.global != expected_global {
-            return Err(corruption(
-                "state value page domain differs from its state root",
-            ));
-        }
-        let public_change_id =
-            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
-        let record =
-            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
-                .map_err(|error| corruption(error.to_string()))?;
-        if encode_state_key(super::state::StateKeyRef {
-            schema_key: &record.schema_key,
-            file_id: record.file_id.as_deref(),
-            entity_pk: &record.entity_pk,
-        }) != *encoded_key
-        {
-            return Err(corruption(
-                "state value page identity differs from its state key",
-            ));
-        }
-        let cell = match record.snapshot {
-            crate::json_store::JsonSlot::None => StateCell::Tombstone,
-            crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => {
-                StateCell::Null
-            }
-            crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
-            crate::json_store::JsonSlot::Ref(_)
-            | crate::json_store::JsonSlot::ForkTreeObject(_) => {
-                return Err(corruption(
-                    "state value page contains an out-of-page JSON reference",
-                ));
-            }
-        };
-        let metadata = match record.metadata {
-            crate::json_store::JsonSlot::None => None,
-            crate::json_store::JsonSlot::Inline(value) => Some(value),
-            crate::json_store::JsonSlot::Ref(_)
-            | crate::json_store::JsonSlot::ForkTreeObject(_) => {
-                return Err(corruption("state value page contains out-of-page metadata"));
-            }
-        };
-        output.push(Some((
-            StateValue {
-                change_id: public_change_id,
-                commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-                    *page.commit_id.as_bytes(),
-                )),
-                created_at: record.created_at,
-                updated_at: resolved.updated_at,
-                cell,
-                metadata: metadata.map(Into::into),
-                origin_key: record.origin_key,
-                blob_manifest_object_ids: resolved.blob_manifest_object_ids,
-            },
-            *source,
-        )));
+        output.push(Some((decode_state_value_storage(encoded)?, *source)));
     }
     Ok(output)
 }
@@ -2906,6 +2810,6 @@ where
     Ok(())
 }
 
-fn decode_state_value_storage(bytes: &[u8]) -> Result<super::state::StateValueRef, StorageError> {
+fn decode_state_value_storage(bytes: &[u8]) -> Result<StateValue, StorageError> {
     decode_state_value(bytes).map_err(|error| corruption(error.to_string()))
 }

@@ -55,6 +55,29 @@ struct SeedRow {
     metadata: JsonSlot,
 }
 
+fn seed_state_cell(snapshot: &JsonSlot) -> Result<StateCellRef<'_>, LixError> {
+    match snapshot {
+        JsonSlot::None => Ok(StateCellRef::Tombstone),
+        JsonSlot::Inline(value) if value.as_ref() == "null" => Ok(StateCellRef::Null),
+        JsonSlot::Inline(value) => Ok(StateCellRef::Value(value)),
+        JsonSlot::Ref(_) | JsonSlot::ForkTreeObject(_) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "bootstrap state payload is not canonical inline JSON",
+        )),
+    }
+}
+
+fn seed_optional_json(value: &JsonSlot) -> Result<Option<&str>, LixError> {
+    match value {
+        JsonSlot::None => Ok(None),
+        JsonSlot::Inline(value) => Ok(Some(value)),
+        JsonSlot::Ref(_) | JsonSlot::ForkTreeObject(_) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "bootstrap state metadata is not canonical inline JSON",
+        )),
+    }
+}
+
 pub(crate) async fn initialize_empty_repository<S>(
     storage: StorageAdapter<S>,
 ) -> Result<crate::init::InitReceipt, LixError>
@@ -210,26 +233,36 @@ where
         .map_err(LixError::from)?;
     let global_entries = rows
         .iter()
-        .zip(&member_pages.member_locations[..rows.len()])
-        .map(|(row, location)| {
+        .map(|row| {
             Ok((
                 row.key.clone(),
                 encode_state_value(StateValueRef {
-                    page_object_id: location.page_object_id,
-                    page_ordinal: location.page_ordinal,
+                    change_id: row.change_id,
+                    commit_id: initial_commit,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    cell: seed_state_cell(&row.snapshot)?,
+                    metadata: seed_optional_json(&row.metadata)?,
+                    origin_key: None,
+                    blob_manifest_object_ids: &[],
                 })?,
             ))
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let local_entries = rows
         .iter()
-        .zip(&member_pages.member_locations[rows.len()..])
-        .map(|(row, location)| {
+        .map(|row| {
             Ok((
                 row.key.clone(),
                 encode_state_value(StateValueRef {
-                    page_object_id: location.page_object_id,
-                    page_ordinal: location.page_ordinal,
+                    change_id: row.local_change_id,
+                    commit_id: initial_commit,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    cell: seed_state_cell(&row.snapshot)?,
+                    metadata: seed_optional_json(&row.metadata)?,
+                    origin_key: None,
+                    blob_manifest_object_ids: &[],
                 })?,
             ))
         })

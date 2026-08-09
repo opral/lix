@@ -362,11 +362,11 @@ impl CommitMemberV1 {
 }
 
 /// One byte-bounded authenticated page in a commit's ordered semantic-change
-/// closure. Introduced payloads live only in these pages; there is no per-row
-/// immutable SemanticChange object or alternate lookup path. The commit
-/// object authenticates the complete ordered page-ID vector. State leaves
-/// point directly at one of these immutable pages, so an exact batch resolves
-/// every selected payload with one object-space `get_many`.
+/// closure. Introduced historical payloads live only in these pages; there is
+/// no per-row immutable SemanticChange object or alternate history lookup
+/// path. The commit object authenticates the complete ordered page-ID vector.
+/// Current state is independently authoritative in the selected state tree;
+/// it never rehydrates current values through these historical pages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitChangePageV2 {
     pub(crate) commit_id: CommitId,

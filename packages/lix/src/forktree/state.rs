@@ -9,7 +9,7 @@ use super::model::CanonicalBranchId;
 use super::object::ObjectId;
 
 const MAX_BLOB_ROOTS_PER_STATE_ROW: usize = 4;
-const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x02";
+const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x03";
 const UNTRACKED_KEY_MAGIC: &[u8; 8] = b"LIXFTU\0\x01";
 const UNTRACKED_VALUE_MAGIC: &[u8; 8] = b"LIXFTW\0\x01";
 
@@ -47,10 +47,16 @@ pub(crate) struct StateKey {
     pub(crate) entity_pk: EntityPk,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StateValueRef {
-    pub(crate) page_object_id: ObjectId,
-    pub(crate) page_ordinal: u32,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StateValueRef<'a> {
+    pub(crate) change_id: crate::changelog::ChangeId,
+    pub(crate) commit_id: crate::changelog::CommitId,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
+    pub(crate) cell: StateCellRef<'a>,
+    pub(crate) metadata: Option<&'a str>,
+    pub(crate) origin_key: Option<&'a str>,
+    pub(crate) blob_manifest_object_ids: &'a [ObjectId],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,28 +232,58 @@ pub(crate) fn decode_state_key(bytes: &[u8]) -> Result<StateKey, LixError> {
     })
 }
 
-pub(crate) fn encode_state_value(value: StateValueRef) -> Result<Vec<u8>, LixError> {
-    if value.page_object_id == ObjectId::ZERO {
-        return Err(state_error("state value page object id is zero"));
+pub(crate) fn encode_state_value(value: StateValueRef<'_>) -> Result<Vec<u8>, LixError> {
+    if value.change_id.as_uuid().is_nil() || value.commit_id.as_uuid().is_nil() {
+        return Err(state_error(
+            "state value contains a nil change or commit id",
+        ));
     }
-    let mut output = Vec::with_capacity(STATE_VALUE_MAGIC.len() + 32 + 4);
+    let mut output = Vec::new();
     output.extend_from_slice(STATE_VALUE_MAGIC);
-    output.extend_from_slice(value.page_object_id.as_bytes());
-    output.extend_from_slice(&value.page_ordinal.to_be_bytes());
+    output.extend_from_slice(value.change_id.as_uuid().as_bytes());
+    output.extend_from_slice(value.commit_id.as_uuid().as_bytes());
+    output.extend_from_slice(&value.created_at.packed().to_be_bytes());
+    output.extend_from_slice(&value.updated_at.packed().to_be_bytes());
+    put_state_cell(&mut output, value.cell)?;
+    put_optional_bytes(&mut output, value.metadata.map(str::as_bytes))?;
+    put_optional_bytes(&mut output, value.origin_key.map(str::as_bytes))?;
+    put_object_ids(&mut output, value.blob_manifest_object_ids)?;
     Ok(output)
 }
 
-pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<StateValueRef, LixError> {
+pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<StateValue, LixError> {
     let mut decoder = ValueDecoder::after_magic(bytes, STATE_VALUE_MAGIC, "state value")?;
-    let page_object_id = ObjectId::from_bytes(decoder.fixed_32("state page object id")?);
-    if page_object_id == ObjectId::ZERO {
-        return Err(state_error("state value page object id is zero"));
+    let change_id = crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+        decoder.fixed_16("state change id")?,
+    ));
+    let commit_id = crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+        decoder.fixed_16("state commit id")?,
+    ));
+    if change_id.as_uuid().is_nil() || commit_id.as_uuid().is_nil() {
+        return Err(state_error(
+            "state value contains a nil change or commit id",
+        ));
     }
-    let page_ordinal = decoder.u32("state page ordinal")?;
+    let created_at = LixTimestamp::from_packed(decoder.u64("state created_at")?)
+        .map_err(|error| state_error(error.to_string()))?;
+    let updated_at = LixTimestamp::from_packed(decoder.u64("state updated_at")?)
+        .map_err(|error| state_error(error.to_string()))?;
+    let cell = decoder.state_cell("state cell")?;
+    let metadata = decoder
+        .optional_string("state metadata")?
+        .map(SharedStr::from);
+    let origin_key = decoder.optional_string("state origin key")?;
+    let blob_manifest_object_ids = decoder.object_ids("state blob manifests")?;
     decoder.finish("state value")?;
-    Ok(StateValueRef {
-        page_object_id,
-        page_ordinal,
+    Ok(StateValue {
+        change_id,
+        commit_id,
+        created_at,
+        updated_at,
+        cell,
+        metadata,
+        origin_key,
+        blob_manifest_object_ids,
     })
 }
 
@@ -591,21 +627,6 @@ impl<'a> ValueDecoder<'a> {
             .take(16, field)?
             .try_into()
             .expect("decoder returned fixed UUID width"))
-    }
-
-    fn fixed_32(&mut self, field: &str) -> Result<[u8; 32], LixError> {
-        Ok(self
-            .take(32, field)?
-            .try_into()
-            .expect("decoder returned fixed object-id width"))
-    }
-
-    fn u32(&mut self, field: &str) -> Result<u32, LixError> {
-        Ok(u32::from_be_bytes(
-            self.take(4, field)?
-                .try_into()
-                .expect("decoder returned fixed u32 width"),
-        ))
     }
 
     fn u64(&mut self, field: &str) -> Result<u64, LixError> {

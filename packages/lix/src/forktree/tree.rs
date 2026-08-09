@@ -224,7 +224,12 @@ pub(super) fn ordered_tree_edges(
                     TreeKind::State => {
                         let value = super::state::decode_state_value(&entry.value)
                             .map_err(|error| corruption(error.to_string()))?;
-                        object_ids.push((value.page_object_id, ObjectDomain::CommitChangePageV2));
+                        object_ids.extend(
+                            value
+                                .blob_manifest_object_ids
+                                .into_iter()
+                                .map(|id| (id, ObjectDomain::BlobManifest)),
+                        );
                     }
                     TreeKind::CommitCatalog => {
                         let key = CommitId::from_bytes(

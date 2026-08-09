@@ -404,25 +404,34 @@ where
             row.updated_at,
             blob_manifest_object_ids.clone(),
         ));
-        pending_rows.push((row, key, previous, blob_manifest_object_ids));
+        let cell = match canonical_snapshot.as_deref() {
+            None => StateCellRef::Tombstone,
+            Some("null") => StateCellRef::Null,
+            Some(value) => StateCellRef::Value(value),
+        };
+        let encoded_state = encode_state_value(StateValueRef {
+            change_id,
+            commit_id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            cell,
+            metadata: row.metadata.map(StageJson::normalized),
+            origin_key: row.origin_key.map(|value| value.as_str()),
+            blob_manifest_object_ids: &blob_manifest_object_ids,
+        })?;
+        let audit = StateMutationAudit {
+            commit_id: *commit_id.as_uuid().as_bytes(),
+            tombstone: row.snapshot.is_none(),
+            blob_manifest_object_ids,
+        };
+        pending_rows.push((row, key, previous, encoded_state, audit));
     }
     let member_pages = CommitChangePageV2::encode_pages(forktree_commit_id(commit_id), &members)?;
     let mut state_mutations = Vec::with_capacity(pending_rows.len());
-    for ((row, key, previous, blob_manifest_object_ids), location) in
-        pending_rows.into_iter().zip(&member_pages.member_locations)
-    {
+    for (row, key, previous, encoded, audit) in pending_rows {
         let mutation = if global && row.snapshot.is_none() {
             StateTreeMutation::remove(key)
         } else {
-            let encoded = encode_state_value(StateValueRef {
-                page_object_id: location.page_object_id,
-                page_ordinal: location.page_ordinal,
-            })?;
-            let audit = StateMutationAudit {
-                commit_id: *commit_id.as_uuid().as_bytes(),
-                tombstone: row.snapshot.is_none(),
-                blob_manifest_object_ids,
-            };
             let exists_at_target_root = previous
                 .as_ref()
                 .is_some_and(|value| global || value.source == StateSource::Branch);
@@ -745,7 +754,7 @@ enum PendingStateMutation {
         key: Vec<u8>,
         existed: bool,
         tombstone: bool,
-        blob_manifest_object_ids: Vec<ObjectId>,
+        value: crate::forktree::StateValue,
     },
 }
 
@@ -963,7 +972,20 @@ where
                     key,
                     existed,
                     tombstone: row.snapshot.is_none(),
-                    blob_manifest_object_ids,
+                    value: crate::forktree::StateValue {
+                        change_id,
+                        commit_id: draft.commit_id,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        cell: match canonical_snapshot.as_deref() {
+                            None => crate::forktree::StateCell::Tombstone,
+                            Some("null") => crate::forktree::StateCell::Null,
+                            Some(value) => crate::forktree::StateCell::Value(value.into()),
+                        },
+                        metadata: row.metadata.map(|value| value.normalized().into()),
+                        origin_key: row.origin_key.map(ToString::to_string),
+                        blob_manifest_object_ids,
+                    },
                 }
             };
             pending_mutations.push(mutation);
@@ -1055,7 +1077,7 @@ where
                         key: identity,
                         existed,
                         tombstone: selected.deleted,
-                        blob_manifest_object_ids: source_value.blob_manifest_object_ids.clone(),
+                        value: source_value,
                     }
                 };
                 pending_mutations.push(mutation);
@@ -1071,24 +1093,35 @@ where
         }
         let mutations = pending_mutations
             .into_iter()
-            .zip(&member_pages.member_locations)
-            .map(|(pending, location)| {
+            .map(|pending| {
                 Ok(match pending {
                     PendingStateMutation::Remove { key } => StateTreeMutation::remove(key),
                     PendingStateMutation::Put {
                         key,
                         existed,
                         tombstone,
-                        blob_manifest_object_ids,
+                        value,
                     } => {
                         let encoded = encode_state_value(StateValueRef {
-                            page_object_id: location.page_object_id,
-                            page_ordinal: location.page_ordinal,
+                            change_id: value.change_id,
+                            commit_id: draft.commit_id,
+                            created_at: value.created_at,
+                            updated_at: value.updated_at,
+                            cell: match &value.cell {
+                                crate::forktree::StateCell::Value(value) => {
+                                    StateCellRef::Value(value.as_str())
+                                }
+                                crate::forktree::StateCell::Null => StateCellRef::Null,
+                                crate::forktree::StateCell::Tombstone => StateCellRef::Tombstone,
+                            },
+                            metadata: value.metadata.as_deref(),
+                            origin_key: value.origin_key.as_deref(),
+                            blob_manifest_object_ids: &value.blob_manifest_object_ids,
                         })?;
                         let audit = StateMutationAudit {
                             commit_id: *draft.commit_id.as_uuid().as_bytes(),
                             tombstone,
-                            blob_manifest_object_ids,
+                            blob_manifest_object_ids: value.blob_manifest_object_ids,
                         };
                         if existed {
                             StateTreeMutation::update_bound(key, encoded, audit)

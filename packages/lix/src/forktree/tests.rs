@@ -524,13 +524,48 @@ fn encode_test_state_entries(
             .expect("test change pages");
     let rows = entries
         .into_iter()
-        .zip(&pages.member_locations)
-        .map(|((key, _), location)| {
+        .map(|(key, member)| {
+            let CommitMemberV1::Introduced {
+                change_id,
+                payload,
+                updated_at,
+                blob_manifest_object_ids,
+                ..
+            } = member
+            else {
+                panic!("current test state must be introduced by its commit");
+            };
+            let public_change_id =
+                crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes()));
+            let record =
+                crate::changelog::decode_forktree_change_payload(&payload, public_change_id)
+                    .expect("test state payload");
+            let cell = match &record.snapshot {
+                JsonSlot::None => StateCellRef::Tombstone,
+                JsonSlot::Inline(value) if value.as_ref() == "null" => StateCellRef::Null,
+                JsonSlot::Inline(value) => StateCellRef::Value(value),
+                JsonSlot::Ref(_) | JsonSlot::ForkTreeObject(_) => {
+                    panic!("test state payload must be canonical inline JSON")
+                }
+            };
+            let metadata = match &record.metadata {
+                JsonSlot::None => None,
+                JsonSlot::Inline(value) => Some(value.as_ref()),
+                JsonSlot::Ref(_) | JsonSlot::ForkTreeObject(_) => {
+                    panic!("test state metadata must be canonical inline JSON")
+                }
+            };
             (
                 key,
                 encode_state_value(StateValueRef {
-                    page_object_id: location.page_object_id,
-                    page_ordinal: location.page_ordinal,
+                    change_id: public_change_id,
+                    commit_id: public_commit_id(commit_byte),
+                    created_at: record.created_at,
+                    updated_at,
+                    cell,
+                    metadata,
+                    origin_key: record.origin_key.as_deref(),
+                    blob_manifest_object_ids: &blob_manifest_object_ids,
                 })
                 .expect("state value"),
             )
@@ -541,9 +576,9 @@ fn encode_test_state_entries(
 
 fn state_entry(
     primary_key: &str,
-    _cell: StateCellRef<'_>,
+    cell: StateCellRef<'_>,
     commit_byte: u8,
-    _manifests: &[ObjectId],
+    manifests: &[ObjectId],
 ) -> (Vec<u8>, Vec<u8>) {
     let entity_pk = EntityPk::single(primary_key);
     let key = encode_state_key(StateKeyRef {
@@ -551,9 +586,16 @@ fn state_entry(
         file_id: Some("file"),
         entity_pk: &entity_pk,
     });
+    let change_id = test_change_id(commit_byte, &key, false);
     let value = encode_state_value(StateValueRef {
-        page_object_id: content_id(commit_byte),
-        page_ordinal: 0,
+        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
+        commit_id: public_commit_id(commit_byte),
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+        cell,
+        metadata: None,
+        origin_key: None,
+        blob_manifest_object_ids: manifests,
     })
     .expect("state value");
     (key, value)
@@ -1079,16 +1121,68 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
     assert!(RepositoryRootV1::decode(seed.repository_root_id, &corrupted).is_err());
     assert!(BranchSnapshotV1::decode(seed.repository_root_id, encoded).is_err());
 
-    let page_object_id = content_id(7);
+    let change_id = crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(raw_id(6)));
+    let commit_id = public_commit_id(7);
+    let manifest = content_id(8);
     let encoded = encode_state_value(StateValueRef {
-        page_object_id,
-        page_ordinal: 3,
+        change_id,
+        commit_id,
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+        cell: StateCellRef::Value("{\"v\":1}"),
+        metadata: Some("{\"m\":2}"),
+        origin_key: Some("origin"),
+        blob_manifest_object_ids: &[manifest],
     })
     .expect("typed state");
     let decoded = super::decode_state_value(&encoded).expect("typed state");
-    assert_eq!(decoded.page_object_id, page_object_id);
-    assert_eq!(decoded.page_ordinal, 3);
+    assert_eq!(decoded.change_id, change_id);
+    assert_eq!(decoded.commit_id, commit_id);
+    assert_eq!(
+        decoded.created_at,
+        LixTimestamp::from_unix_millis_utc_lossy(1)
+    );
+    assert_eq!(
+        decoded.updated_at,
+        LixTimestamp::from_unix_millis_utc_lossy(2)
+    );
+    assert_eq!(decoded.cell, StateCell::Value("{\"v\":1}".into()));
+    assert_eq!(decoded.metadata.as_deref(), Some("{\"m\":2}"));
+    assert_eq!(decoded.origin_key.as_deref(), Some("origin"));
+    assert_eq!(decoded.blob_manifest_object_ids, vec![manifest]);
+    assert!(super::decode_state_value(&encoded[..encoded.len() - 1]).is_err());
+    let mut nil_change = encoded.clone();
+    nil_change[8..24].fill(0);
+    assert!(super::decode_state_value(&nil_change).is_err());
+    let mut nil_commit = encoded.clone();
+    nil_commit[24..40].fill(0);
+    assert!(super::decode_state_value(&nil_commit).is_err());
+    assert!(
+        encode_state_value(StateValueRef {
+            change_id: crate::changelog::ChangeId::new(uuid::Uuid::nil()),
+            commit_id,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+            cell: StateCellRef::Null,
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: &[],
+        })
+        .is_err()
+    );
     let (key, _) = state_entry("typed-key", StateCellRef::Null, 7, &[]);
+    let state_tree = build_state_tree(&[(key.clone(), encoded.clone())]).expect("state tree");
+    let root_bytes = state_tree
+        .objects
+        .get(state_tree.root.object_id)
+        .expect("state root bytes");
+    assert_eq!(
+        super::tree::ordered_tree_edges(state_tree.root.object_id, root_bytes)
+            .expect("state leaf edges")
+            .object_ids,
+        vec![(manifest, super::object::ObjectDomain::BlobManifest)],
+        "current state leaves own blob-manifest reachability directly"
+    );
     let decoded_key: StateKey = super::decode_state_key(&key).expect("typed key");
     assert_eq!(decoded_key.schema_key, "app.row");
     let entity_pk = EntityPk::single("typed-key");
@@ -1183,6 +1277,45 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
 }
 
 #[tokio::test]
+async fn current_state_does_not_depend_on_historical_change_pages() {
+    let mut seed = build_seed();
+    let missing_history_page = seed.semantic_change_object_id;
+    seed.objects.remove(missing_history_page);
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("current view does not load history pages");
+    assert!(
+        state_point(&view, &seed.state_keys[0], false)
+            .await
+            .expect("current point")
+            .is_some()
+    );
+    assert_eq!(
+        state_range(&view, None, None, None, false)
+            .await
+            .expect("current range")
+            .len(),
+        3
+    );
+
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("history read"),
+    );
+    assert!(
+        load_commit_member_records(&read, public_commit_id(0x20))
+            .await
+            .is_err(),
+        "historical member access must still fail closed on its missing page"
+    );
+}
+
+#[tokio::test]
 async fn historical_absence_requires_authenticated_commit_and_root() {
     let seed = build_seed();
     let storage = Memory::new();
@@ -1255,7 +1388,6 @@ async fn historical_missing_state_root_fails_before_empty_result() {
     let storage = Memory::new();
     let commit_id = seed.commit_id;
     let semantic_change_id = seed.semantic_change_id;
-    let semantic_change_object_id = seed.semantic_change_object_id;
     let ref_change_id = seed.ref_change_id;
     let ref_change_object_id = seed.ref_change_object_id;
     let branch_id = seed.branch_id;
@@ -2214,7 +2346,6 @@ async fn coherent_open_defers_ref_target_authentication_until_visited() {
 async fn coherent_open_requires_latest_ref_change_catalog_owner() {
     let mut orphan = build_seed();
     let semantic_change_id = orphan.semantic_change_id;
-    let semantic_change_object_id = orphan.semantic_change_object_id;
     let commit_id = orphan.commit_id;
     let commit_object_id = orphan.commit_object_id;
     let ref_change_object_id = orphan.ref_change_object_id;
@@ -2259,7 +2390,6 @@ async fn coherent_open_requires_latest_ref_change_catalog_owner() {
         .insert(alternate_ref_object_id, alternate_ref_bytes)
         .expect("alternate ref object");
     let semantic_change_id = substituted.semantic_change_id;
-    let semantic_change_object_id = substituted.semantic_change_object_id;
     let commit_id = substituted.commit_id;
     let commit_object_id = substituted.commit_object_id;
     let ref_change_id = substituted.ref_change_id;
@@ -2300,7 +2430,6 @@ async fn coherent_open_requires_latest_ref_change_catalog_owner() {
 
     let mut wrong_owner = build_seed();
     let semantic_change_id = wrong_owner.semantic_change_id;
-    let semantic_change_object_id = wrong_owner.semantic_change_object_id;
     let commit_id = wrong_owner.commit_id;
     let commit_object_id = wrong_owner.commit_object_id;
     let ref_change_id = wrong_owner.ref_change_id;
@@ -2348,7 +2477,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
     let commit_id = wrong_owner.commit_id;
     let commit_object_id = wrong_owner.commit_object_id;
     let semantic_change_id = wrong_owner.semantic_change_id;
-    let semantic_change_object_id = wrong_owner.semantic_change_object_id;
     let ref_change_id = wrong_owner.ref_change_id;
     let ref_change_object_id = wrong_owner.ref_change_object_id;
     let branch_id = wrong_owner.branch_id;
@@ -2488,7 +2616,6 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
     let commit_id = bad_ref_history.commit_id;
     let commit_object_id = bad_ref_history.commit_object_id;
     let semantic_change_id = bad_ref_history.semantic_change_id;
-    let semantic_change_object_id = bad_ref_history.semantic_change_object_id;
     let ref_change_id = bad_ref_history.ref_change_id;
     let ref_change_object_id = bad_ref_history.ref_change_object_id;
     let branch_id = bad_ref_history.branch_id;
