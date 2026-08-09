@@ -760,7 +760,7 @@ async fn prepare_ordered_single_branch_history<R>(
     view: &crate::forktree::CoherentView<R>,
     mut publication: PreparedPublication,
     prepared: PreparedWriteSet,
-    prepared_blob_manifests: BTreeMap<(String, String, bool, bool), ObjectId>,
+    prepared_blob_manifests: PreparedBlobManifestMap,
 ) -> Result<PreparedForkTreePlan, LixError>
 where
     R: StorageAdapterRead + Clone,
@@ -1417,7 +1417,7 @@ fn classify_publication_intent(
     })
 }
 
-type PreparedBlobManifestMap = BTreeMap<(String, String, bool, bool), ObjectId>;
+type PreparedBlobManifestMap = BTreeMap<(String, String, bool, bool), Option<ObjectId>>;
 
 fn prepared_blob_manifest_ids(
     publication: &mut PreparedPublication,
@@ -1426,7 +1426,7 @@ fn prepared_blob_manifest_ids(
     let mut manifests = PreparedBlobManifestMap::new();
     for write in &prepared.file_content_writes {
         let manifest = if let Some(receipt) = write.prepared_cas_receipt() {
-            ObjectId::from_bytes(receipt.manifest_object_id)
+            Some(ObjectId::from_bytes(receipt.manifest_object_id))
         } else if let Some(payload) = write.inline_payload() {
             publication
                 .stage_inline_blob_payload(payload.bytes())
@@ -1436,7 +1436,7 @@ fn prepared_blob_manifest_ids(
                 "file payload is missing an authenticated ForkTree blob representation",
             ));
         };
-        if manifest == ObjectId::ZERO {
+        if manifest.is_some_and(|manifest| manifest == ObjectId::ZERO) {
             return Err(writer_error(
                 "file payload has a zero ForkTree manifest identity",
             ));
@@ -1477,10 +1477,12 @@ fn blob_manifest_object_ids_for_row(
         row.global,
         row.untracked,
     );
-    let manifest = manifests.get(&key).copied().ok_or_else(|| {
+    match manifests.get(&key).copied().ok_or_else(|| {
         writer_error("blob-ref state row has no matching prepared ForkTree manifest")
-    })?;
-    Ok(vec![manifest])
+    })? {
+        None => Ok(Vec::new()),
+        Some(manifest) => Ok(vec![manifest]),
+    }
 }
 
 fn sole_publication_branch(

@@ -581,11 +581,12 @@ impl PreparedPublication {
     pub(crate) fn stage_inline_blob_payload(
         &mut self,
         bytes: &[u8],
-    ) -> Result<ObjectId, StorageError> {
+    ) -> Result<Option<ObjectId>, StorageError> {
         if bytes.is_empty() {
-            return Err(corruption(
-                "empty inline payload has no blob manifest; omit its BlobRef row",
-            ));
+            // An authenticated empty semantic value has no chunk or manifest
+            // object. Its state row remains authoritative; the corresponding
+            // BlobRef row is omitted by the planner.
+            return Ok(None);
         }
         let mut ordered_chunks = Vec::with_capacity(bytes.len().div_ceil(1024 * 1024));
         for chunk_bytes in bytes.chunks(1024 * 1024) {
@@ -605,7 +606,7 @@ impl PreparedPublication {
             crate::binary_cas::BlobId::from_content(bytes),
             *blake3::hash(bytes).as_bytes(),
         );
-        self.stage_blob_manifest(&manifest)
+        self.stage_blob_manifest(&manifest).map(Some)
     }
 
     /// Lowers one large JSON value into an authenticated ForkTree payload
