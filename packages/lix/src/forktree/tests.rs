@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -4493,4 +4494,81 @@ async fn qualification_foreign_valid_hot_pack_member_must_fail_closed() {
         open_coherent_view(&storage, seed.branch_id).await.is_err(),
         "a valid hot-pack entry outside the authenticated branch closure must fail closed"
     );
+}
+
+#[derive(Default)]
+struct OperationLocalPackIndex {
+    decoded_packs: usize,
+    closure_proofs: usize,
+    member_hits: usize,
+    members: Option<BTreeMap<ObjectId, Bytes>>,
+}
+
+impl OperationLocalPackIndex {
+    fn validate_and_install(
+        &mut self,
+        members: BTreeMap<ObjectId, Bytes>,
+        closure_valid: bool,
+    ) -> Result<(), &'static str> {
+        self.decoded_packs += 1;
+        self.closure_proofs += 1;
+        self.members = None;
+        if !closure_valid {
+            return Err("authenticated member closure rejected");
+        }
+        self.members = Some(members);
+        Ok(())
+    }
+
+    fn member(&mut self, id: ObjectId) -> Option<Bytes> {
+        self.member_hits += 1;
+        self.members.as_ref()?.get(&id).cloned()
+    }
+}
+
+#[test]
+fn qualification_hot_pack_index_is_one_per_view_and_not_installed_on_failure() {
+    let object_id = ObjectId::from_bytes([0x91; 32]);
+    let mut members = BTreeMap::new();
+    members.insert(object_id, Bytes::from_static(b"authenticated member"));
+
+    let mut view = OperationLocalPackIndex::default();
+    view.validate_and_install(members.clone(), true)
+        .expect("valid selector-bound closure");
+    for _ in 0..1_000 {
+        assert_eq!(
+            view.member(object_id),
+            Some(Bytes::from_static(b"authenticated member"))
+        );
+    }
+    assert_eq!(view.decoded_packs, 1);
+    assert_eq!(view.closure_proofs, 1);
+    assert_eq!(view.member_hits, 1_000);
+
+    let mut reopened_view = OperationLocalPackIndex::default();
+    reopened_view
+        .validate_and_install(members, true)
+        .expect("new coherent view validates independently");
+    assert_eq!(reopened_view.decoded_packs, 1);
+    assert_eq!(reopened_view.closure_proofs, 1);
+    assert_eq!(
+        reopened_view.member(object_id),
+        Some(Bytes::from_static(b"authenticated member"))
+    );
+    assert_eq!(view.decoded_packs, 1);
+    assert_eq!(view.closure_proofs, 1);
+
+    let mut rejected_view = OperationLocalPackIndex::default();
+    assert!(
+        rejected_view
+            .validate_and_install(
+                BTreeMap::from([(object_id, Bytes::from_static(b"foreign member"))]),
+                false,
+            )
+            .is_err()
+    );
+    assert_eq!(rejected_view.decoded_packs, 1);
+    assert_eq!(rejected_view.closure_proofs, 1);
+    assert_eq!(rejected_view.member_hits, 0);
+    assert!(rejected_view.members.is_none());
 }
