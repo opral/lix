@@ -64,6 +64,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 name = "forktree_sqlite_oltp"
 path = "examples/forktree_sqlite_oltp.rs"
 required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "git_replay_real_repo"
+path = "examples/git_replay_real_repo.rs"
 [[test]]
 name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"
