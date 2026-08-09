@@ -25,7 +25,6 @@ use lix::Memory;
 const PROGRESS_EVERY: usize = 10;
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
 const TREE_BLOB_READ_BATCH_ROWS: usize = 8;
-const TREE_TRANSACTION_TARGET_BYTES: usize = 128 * 1024 * 1024;
 const FINAL_VERIFY_MAX_ROWS: usize = 512;
 const FINAL_VERIFY_TARGET_BYTES: usize = 128 * 1024 * 1024;
 // Four SHA-256 `<oid>\n` requests are 260 bytes, below POSIX `PIPE_BUF`.
@@ -38,6 +37,36 @@ const CSV_PLUGIN_KEY: &str = "plugin_csv";
 const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown";
 const EXCALIDRAW_PLUGIN_KEY: &str = "plugin_excalidraw";
 const GIT_REPLAY_MARKER_KEY: &str = "git_replay_marker_v1";
+
+// Disposable phase diagnostics for the real-repository timeout investigation.
+// These are intentionally boundary-only: they retain no replay data and are
+// removed before any production candidate is considered.
+fn replay_proc_counter(path: &str, key: &str) -> u64 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                let mut fields = line.split_ascii_whitespace();
+                (fields.next() == Some(key))
+                    .then(|| fields.next())
+                    .flatten()
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn log_replay_phase(started: Instant, phase: &str, commit: Option<&str>) {
+    let rss_kib = replay_proc_counter("/proc/self/status", "VmRSS:");
+    let hwm_kib = replay_proc_counter("/proc/self/status", "VmHWM:");
+    let read_bytes = replay_proc_counter("/proc/self/io", "read_bytes:");
+    let write_bytes = replay_proc_counter("/proc/self/io", "write_bytes:");
+    eprintln!(
+        "[git-replay-phase] elapsed_ms={:.3} phase={phase} commit={} rss_kib={rss_kib} hwm_kib={hwm_kib} read_bytes={read_bytes} write_bytes={write_bytes}",
+        duration_to_ms(started.elapsed()),
+        commit.unwrap_or("-")
+    );
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Change {
@@ -378,14 +407,18 @@ fn run_with_storage<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    let diagnostics_started = Instant::now();
+    log_replay_phase(diagnostics_started, "run_with_storage.enter", None);
     let baseline_seed_parent = commits
         .first()
         .and_then(|commit| commit.first_parent.clone());
     let mut replay_scope = collect_replay_scope(&repo_path, &commits)?;
+    log_replay_phase(diagnostics_started, "scope.collected", None);
     if args.parent_tree == GitReplayParentTree::Full
         && let Some(parent) = baseline_seed_parent.as_deref()
     {
         extend_replay_scope_with_tree(&repo_path, parent, &mut replay_scope)?;
+        log_replay_phase(diagnostics_started, "scope.parent_tree_extended", None);
     }
     let history_scope = if commits
         .first()
@@ -399,18 +432,21 @@ where
     };
     let lix = db::block_on(open_lix().with_storage(storage.clone()))
         .map_err(|error| CliError::msg(format!("failed to open replay Lix: {error}")))?;
+    log_replay_phase(diagnostics_started, "lix.opened", None);
     db::block_on(lix.execute(
         "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
          VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
         &[],
     ))
     .map_err(|error| CliError::msg(format!("failed to enable deterministic mode: {error}")))?;
+    log_replay_phase(diagnostics_started, "deterministic_mode.enabled", None);
 
     let plugin_install_started = Instant::now();
     if args.plugins == GitReplayPlugins::All {
         install_embedded_replay_plugins(&lix)?;
     }
     let plugin_install_ms = duration_to_ms(plugin_install_started.elapsed());
+    log_replay_phase(diagnostics_started, "plugins.installed", None);
 
     let mut state = ReplayState::default();
     let mut baseline_seed_ms = 0.0;
@@ -430,6 +466,7 @@ where
         baseline_seed_files = seeded.files;
         baseline_seed_batches = seeded.batches;
         baseline_seed_ms = duration_to_ms(seed_started.elapsed());
+        log_replay_phase(diagnostics_started, "parent_tree.seeded", None);
         Some(blob_reader)
     } else {
         None
@@ -443,6 +480,7 @@ where
         Some(reader) => reader,
         None => GitBlobReader::spawn(&repo_path)?,
     };
+    log_replay_phase(diagnostics_started, "replay.readers.opened", None);
     let mut applied = 0usize;
     let mut marker_only = 0usize;
     let mut changed_paths = 0usize;
@@ -457,6 +495,7 @@ where
         repo_path.display(),
         args.storage.as_str()
     );
+    log_replay_phase(diagnostics_started, "replay.loop.begin", None);
 
     for (index, commit) in commits.iter().enumerate() {
         let commit_sha = &commit.sha;
@@ -467,10 +506,12 @@ where
         let read_diff_ms = duration_to_ms(read_diff_started.elapsed());
         phase_totals.read_diff_ms += read_diff_ms;
         changed_paths += changes.len();
+        log_replay_phase(commit_started, "commit.diff.read", Some(commit_sha));
 
         let prepare_started = Instant::now();
         let planned = plan_commit_changes(&mut state, &changes)?;
         let plan_ms = duration_to_ms(prepare_started.elapsed());
+        log_replay_phase(commit_started, "commit.plan.complete", Some(commit_sha));
 
         let inserts = planned.inserts.len();
         let updates = planned.updates.len();
@@ -481,7 +522,14 @@ where
             marker_only += 1;
         }
         lix.reset_plugin_transition_counters();
-        let execution = execute_replay_commit_bounded(&lix, &mut blob_reader, commit, planned)?;
+        log_replay_phase(commit_started, "commit.execution.begin", Some(commit_sha));
+        let execution =
+            execute_replay_commit_bounded(&lix, &mut blob_reader, commit, planned, commit_started)?;
+        log_replay_phase(
+            commit_started,
+            "commit.execution.complete",
+            Some(commit_sha),
+        );
         let read_blobs_ms = execution.read_blobs_ms;
         let prepare_ms = plan_ms + execution.prepare_ms;
         let build_sql_ms = execution.build_sql_ms;
@@ -732,6 +780,7 @@ fn execute_replay_commit_bounded<StorageImpl>(
     blob_reader: &mut GitBlobReader,
     commit: &ReplayCommit,
     planned: PlannedBatch,
+    diagnostics_started: Instant,
 ) -> Result<ReplayExecutionTotals, CliError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -742,6 +791,7 @@ where
             commit.sha
         ))
     })?;
+    log_replay_phase(diagnostics_started, "transaction.opened", Some(&commit.sha));
     let mut totals = ReplayExecutionTotals::default();
 
     let mut delete_batch = PreparedBatch {
@@ -762,6 +812,11 @@ where
         )?;
         totals.execute_ms += duration_to_ms(execute_started.elapsed());
     }
+    log_replay_phase(
+        diagnostics_started,
+        "transaction.deletes.complete",
+        Some(&commit.sha),
+    );
 
     execute_planned_rows_with_prepared_receipts(
         &mut transaction,
@@ -770,7 +825,13 @@ where
         true,
         &commit.sha,
         &mut totals,
+        diagnostics_started,
     )?;
+    log_replay_phase(
+        diagnostics_started,
+        "transaction.inserts.complete",
+        Some(&commit.sha),
+    );
     execute_planned_rows_with_prepared_receipts(
         &mut transaction,
         blob_reader,
@@ -778,7 +839,13 @@ where
         false,
         &commit.sha,
         &mut totals,
+        diagnostics_started,
     )?;
+    log_replay_phase(
+        diagnostics_started,
+        "transaction.updates.complete",
+        Some(&commit.sha),
+    );
 
     let build_started = Instant::now();
     let mut marker_statements = vec![git_replay_marker_statement(commit)];
@@ -789,6 +856,11 @@ where
     totals.physical_execution_groups +=
         execute_statements_in_transaction(&mut transaction, &mut marker_statements, &commit.sha)?;
     totals.execute_ms += duration_to_ms(execute_started.elapsed());
+    log_replay_phase(
+        diagnostics_started,
+        "transaction.marker.complete",
+        Some(&commit.sha),
+    );
 
     let commit_started = Instant::now();
     db::block_on(transaction.commit()).map_err(|error| {
@@ -798,6 +870,11 @@ where
         ))
     })?;
     totals.execute_ms += duration_to_ms(commit_started.elapsed());
+    log_replay_phase(
+        diagnostics_started,
+        "transaction.commit.complete",
+        Some(&commit.sha),
+    );
     Ok(totals)
 }
 
@@ -808,11 +885,17 @@ fn execute_planned_rows_with_prepared_receipts<StorageImpl>(
     inserts: bool,
     commit_sha: &str,
     totals: &mut ReplayExecutionTotals,
+    diagnostics_started: Instant,
 ) -> Result<(), CliError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    for row in rows {
+    for (row_index, row) in rows.iter().enumerate() {
+        log_replay_phase(
+            diagnostics_started,
+            &format!("row[{row_index}].begin"),
+            Some(commit_sha),
+        );
         let upload_key = format!("git-replay/{commit_sha}/{}", row.id);
         let mut prepared = None;
         let mut streamed_bytes = 0_usize;
@@ -839,6 +922,11 @@ where
             Ok(())
         })?;
         totals.read_blobs_ms += duration_to_ms(read_started.elapsed());
+        log_replay_phase(
+            diagnostics_started,
+            &format!("row[{row_index}].blob_read.complete"),
+            Some(commit_sha),
+        );
 
         let metadata = json!({
             "git_mode": row.git_mode,
@@ -861,6 +949,11 @@ where
             totals.execute_ms += duration_to_ms(execute_started.elapsed());
             totals.physical_execution_groups += 1;
             totals.logical_statement_count += 1;
+            log_replay_phase(
+                diagnostics_started,
+                &format!("row[{row_index}].receipt_bind.complete"),
+                Some(commit_sha),
+            );
         } else if streamed_bytes == 0 {
             // Empty regular Git blobs have no ForkTree BlobRef. Keep their
             // ordinary empty value in the same final transaction; no large
@@ -893,6 +986,11 @@ where
             totals.sql_chars += total_statement_sql_chars(&statements);
             totals.physical_execution_groups +=
                 execute_statements_in_transaction(transaction, &mut statements, commit_sha)?;
+            log_replay_phase(
+                diagnostics_started,
+                &format!("row[{row_index}].empty_value.complete"),
+                Some(commit_sha),
+            );
         } else {
             return Err(CliError::msg(format!(
                 "prepared blob {} produced no receipt after non-empty streaming",
@@ -920,16 +1018,6 @@ fn git_replay_marker_statement(commit: &ReplayCommit) -> SqlStatement {
             })),
         ],
     }
-}
-
-fn prepared_blob_bytes(prepared: &PreparedBatch) -> usize {
-    prepared
-        .inserts
-        .iter()
-        .chain(prepared.updates.iter())
-        .filter_map(|row| row.data.as_ref())
-        .map(Vec::len)
-        .sum()
 }
 
 fn total_statement_sql_chars(statements: &[SqlStatement]) -> usize {
@@ -1122,55 +1210,131 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let changes = read_scoped_tree_snapshot_changes(repo_path, parent_commit, replay_scope)?;
-    let mut pending = PreparedBatch::default();
     let mut result = SeedResult::default();
     for change_batch in changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
-        let wanted_blob_ids = collect_wanted_blob_ids(change_batch);
-        let blob_by_oid = blob_reader.read_blobs(&wanted_blob_ids)?;
-        let prepared = prepare_commit_changes(state, change_batch, &blob_by_oid)?;
-        let pending_bytes = prepared_blob_bytes(&pending);
-        let prepared_bytes = prepared_blob_bytes(&prepared);
-        if pending_bytes > 0
-            && pending_bytes.saturating_add(prepared_bytes) > TREE_TRANSACTION_TARGET_BYTES
-        {
-            let inserted = flush_seed_batch(&mut pending, lix, parent_commit)?;
-            result.files += inserted;
-            result.batches += usize::from(inserted > 0);
-        }
-        append_prepared_batch(&mut pending, prepared);
-        if prepared_blob_bytes(&pending) >= TREE_TRANSACTION_TARGET_BYTES {
-            let inserted = flush_seed_batch(&mut pending, lix, parent_commit)?;
-            result.files += inserted;
-            result.batches += usize::from(inserted > 0);
-        }
+        // Keep the parent snapshot's semantic batch boundary, but stream each
+        // payload through the same authenticated receipt owner as ordinary
+        // replay writes. The transaction retains only receipts and semantic
+        // rows; raw file bytes never accumulate in a PreparedBatch.
+        let planned = plan_commit_changes(state, change_batch)?;
+        let inserted = flush_seed_batch(&mut *blob_reader, lix, parent_commit, planned)?;
+        result.files += inserted;
+        result.batches += usize::from(inserted > 0);
     }
-    let inserted = flush_seed_batch(&mut pending, lix, parent_commit)?;
-    result.files += inserted;
-    result.batches += usize::from(inserted > 0);
     Ok(result)
 }
 
-fn append_prepared_batch(target: &mut PreparedBatch, mut source: PreparedBatch) {
-    target.deletes.append(&mut source.deletes);
-    target.inserts.append(&mut source.inserts);
-    target.updates.append(&mut source.updates);
-}
-
 fn flush_seed_batch<StorageImpl>(
-    pending: &mut PreparedBatch,
+    blob_reader: &mut GitBlobReader,
     lix: &Lix<StorageImpl>,
     parent_commit: &str,
+    planned: PlannedBatch,
 ) -> Result<usize, CliError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    if pending.deletes.is_empty() && pending.inserts.is_empty() && pending.updates.is_empty() {
+    if planned.deletes.is_empty() && planned.inserts.is_empty() && planned.updates.is_empty() {
         return Ok(0);
     }
-    let mut prepared = std::mem::take(pending);
-    let inserted = prepared.inserts.len();
-    let mut statements = build_replay_commit_statements(&mut prepared, DEFAULT_INSERT_BATCH_ROWS);
-    execute_statements_as_transaction(lix, &mut statements, parent_commit)?;
+
+    let inserted = planned.inserts.len();
+    let mut transaction = db::block_on(lix.begin_transaction()).map_err(|error| {
+        CliError::msg(format!(
+            "failed to begin parent-tree receipt transaction {parent_commit}: {error}"
+        ))
+    })?;
+
+    if !planned.deletes.is_empty() {
+        let mut delete_batch = PreparedBatch {
+            deletes: planned.deletes,
+            ..PreparedBatch::default()
+        };
+        let mut statements = build_replay_commit_statements(&mut delete_batch, 0);
+        execute_statements_in_transaction(&mut transaction, &mut statements, parent_commit)?;
+    }
+
+    for (is_insert, row) in planned
+        .inserts
+        .into_iter()
+        .map(|row| (true, row))
+        .chain(planned.updates.into_iter().map(|row| (false, row)))
+    {
+        let upload_key = format!("git-replay/seed/{parent_commit}/{}", row.id);
+        let mut prepared = None;
+        let mut streamed_bytes = 0_u64;
+        blob_reader.read_blob_chunks(&row.blob_oid, |bytes, offset, total_size, final_chunk| {
+            prepared = db::block_on(transaction.stage_prepared_file_content_chunk(
+                upload_key.as_str(),
+                total_size,
+                offset,
+                bytes,
+                final_chunk,
+            ))
+            .map_err(|error| {
+                CliError::msg(format!(
+                    "failed while staging parent-tree blob {}: {error}",
+                    row.blob_oid
+                ))
+            })?;
+            streamed_bytes = streamed_bytes.saturating_add(bytes.len() as u64);
+            Ok(())
+        })?;
+
+        if let Some(receipt) = prepared {
+            db::block_on(transaction.upsert_prepared_file_content(
+                row.id,
+                row.path,
+                receipt,
+                Some(json!({
+                    "git_mode": row.git_mode,
+                    "git_oid": row.git_oid,
+                })),
+            ))
+            .map_err(|error| {
+                CliError::msg(format!(
+                    "failed to bind prepared parent-tree blob {}: {error}",
+                    row.blob_oid
+                ))
+            })?;
+        } else if streamed_bytes == 0 {
+            let mut empty_batch = if is_insert {
+                PreparedBatch {
+                    inserts: vec![WriteRow {
+                        id: row.id,
+                        path: row.path,
+                        data: Some(Vec::new()),
+                        git_mode: row.git_mode,
+                        git_oid: row.git_oid,
+                    }],
+                    ..PreparedBatch::default()
+                }
+            } else {
+                PreparedBatch {
+                    updates: vec![WriteRow {
+                        id: row.id,
+                        path: row.path,
+                        data: Some(Vec::new()),
+                        git_mode: row.git_mode,
+                        git_oid: row.git_oid,
+                    }],
+                    ..PreparedBatch::default()
+                }
+            };
+            let mut statements = build_replay_commit_statements(&mut empty_batch, 1);
+            execute_statements_in_transaction(&mut transaction, &mut statements, parent_commit)?;
+        } else {
+            return Err(CliError::msg(format!(
+                "prepared parent-tree blob {} produced no receipt after non-empty streaming",
+                row.blob_oid
+            )));
+        }
+    }
+
+    db::block_on(transaction.commit()).map_err(|error| {
+        CliError::msg(format!(
+            "failed to commit parent-tree receipt transaction {parent_commit}: {error}"
+        ))
+    })?;
     Ok(inserted)
 }
 
