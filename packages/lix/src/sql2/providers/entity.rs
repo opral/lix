@@ -15,8 +15,14 @@ use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 
 use crate::branch::BranchRefReader;
+use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::CommitGraphReader;
+use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
+use crate::forktree::{
+    CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
+    encode_state_key, state_points,
+};
 #[cfg(test)]
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
@@ -59,6 +65,178 @@ use super::values::{
 };
 use crate::storage_adapter::StorageAdapterRead;
 
+#[derive(Clone, Debug)]
+struct AuthenticatedEntityRow {
+    entity_pk: EntityPk,
+    schema_key: String,
+    file_id: Option<String>,
+    snapshot_content: Option<SharedStr>,
+    metadata: Option<SharedStr>,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+    global: bool,
+    change_id: Option<ChangeId>,
+    commit_id: Option<CommitId>,
+    untracked: bool,
+    branch_id: SharedStr,
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedEntityExactRowRequest {
+    entity_pk: EntityPk,
+    file_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedEntityExactBatchRequest {
+    schema_key: String,
+    branch_id: String,
+    rows: Vec<AuthenticatedEntityExactRowRequest>,
+    untracked: Option<bool>,
+    include_tombstones: bool,
+}
+
+#[async_trait]
+trait AuthenticatedEntityExactReader: Send + Sync {
+    async fn load_exact(
+        &self,
+        request: AuthenticatedEntityExactBatchRequest,
+    ) -> Result<Vec<Option<AuthenticatedEntityRow>>, LixError>;
+}
+
+struct ForkTreeAuthenticatedEntityExactReader<S> {
+    facade: ForkTreeReadFacade<S>,
+}
+
+impl<S> ForkTreeAuthenticatedEntityExactReader<S> {
+    fn new(facade: ForkTreeReadFacade<S>) -> Self {
+        Self { facade }
+    }
+}
+
+#[async_trait]
+impl<S> AuthenticatedEntityExactReader for ForkTreeAuthenticatedEntityExactReader<S>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    async fn load_exact(
+        &self,
+        request: AuthenticatedEntityExactBatchRequest,
+    ) -> Result<Vec<Option<AuthenticatedEntityRow>>, LixError> {
+        let view = self.facade.branch(&request.branch_id).await?;
+        let encoded_keys = request
+            .rows
+            .iter()
+            .map(|row| {
+                encode_state_key(StateKeyRef {
+                    schema_key: &request.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                })
+            })
+            .collect::<Vec<_>>();
+        let tracked = if request.untracked == Some(true) {
+            vec![None; encoded_keys.len()]
+        } else {
+            state_points(&view, &encoded_keys, true).await?
+        };
+        let untracked = if request.untracked == Some(false) {
+            vec![None; encoded_keys.len()]
+        } else {
+            view.load_untracked_overlay_points(&encoded_keys).await?
+        };
+        if tracked.len() != request.rows.len() || untracked.len() != request.rows.len() {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "ForkTree exact entity lookup returned the wrong slot count",
+            ));
+        }
+
+        let branch_id = SharedStr::from(request.branch_id);
+        let mut output = Vec::with_capacity(request.rows.len());
+        for ((requested, tracked), untracked) in
+            request.rows.into_iter().zip(tracked).zip(untracked)
+        {
+            let row = if let Some((owner, key, value)) = untracked {
+                if key.schema_key != request.schema_key
+                    || key.entity_pk != requested.entity_pk
+                    || key.file_id != requested.file_id
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "ForkTree exact entity untracked row identity does not match the request",
+                    ));
+                }
+                if value.cell.deleted() && !request.include_tombstones {
+                    None
+                } else {
+                    Some(AuthenticatedEntityRow {
+                        entity_pk: key.entity_pk,
+                        schema_key: key.schema_key,
+                        file_id: key.file_id,
+                        snapshot_content: match value.cell {
+                            StateCell::Value(value) => Some(value),
+                            StateCell::Null | StateCell::Tombstone => None,
+                        },
+                        metadata: value.metadata,
+                        created_at: value.created_at,
+                        updated_at: value.updated_at,
+                        global: owner
+                            == CanonicalBranchId::from_bytes(
+                                *uuid::Uuid::parse_str(GLOBAL_BRANCH_ID)
+                                    .expect("GLOBAL_BRANCH_ID must be a UUID")
+                                    .as_bytes(),
+                            ),
+                        change_id: None,
+                        commit_id: None,
+                        untracked: true,
+                        branch_id: SharedStr::from(
+                            uuid::Uuid::from_bytes(*owner.as_bytes()).to_string(),
+                        ),
+                    })
+                }
+            } else if let Some(row) = tracked {
+                let key = decode_state_key(&row.encoded_key)?;
+                if key.schema_key != request.schema_key
+                    || key.entity_pk != requested.entity_pk
+                    || key.file_id != requested.file_id
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "ForkTree exact entity tracked row identity does not match the request",
+                    ));
+                }
+                if row.value.cell.deleted() && !request.include_tombstones {
+                    None
+                } else {
+                    let value = row.value;
+                    Some(AuthenticatedEntityRow {
+                        entity_pk: key.entity_pk,
+                        schema_key: key.schema_key,
+                        file_id: key.file_id,
+                        snapshot_content: match value.cell {
+                            StateCell::Value(value) => Some(value),
+                            StateCell::Null | StateCell::Tombstone => None,
+                        },
+                        metadata: value.metadata,
+                        created_at: value.created_at,
+                        updated_at: value.updated_at,
+                        global: matches!(row.source, StateSource::Global),
+                        change_id: Some(value.change_id),
+                        commit_id: Some(value.commit_id),
+                        untracked: false,
+                        branch_id: branch_id.clone(),
+                    })
+                }
+            } else {
+                None
+            };
+            output.push(row);
+        }
+        Ok(output)
+    }
+}
+
 pub(crate) async fn register_entity_providers<S>(
     ctx: &SessionContext,
     active_branch_id: &str,
@@ -75,6 +253,12 @@ pub(crate) async fn register_entity_providers<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    let authenticated_exact_reader = query_source.as_ref().map(|source| {
+        let reader: Arc<dyn AuthenticatedEntityExactReader> = Arc::new(
+            ForkTreeAuthenticatedEntityExactReader::new(source.forktree_reader.clone()),
+        );
+        reader
+    });
     for surface in catalog.surfaces() {
         if !selection.includes(surface) {
             continue;
@@ -94,13 +278,20 @@ where
                 register_spec_table(
                     ctx,
                     &surface.name,
-                    Arc::new(EntitySpec::active(
-                        spec,
-                        surface_live_state,
-                        Arc::clone(&branch_ref),
-                        active_branch_id.to_string(),
-                        surface_snapshot_reader,
-                    )),
+                    Arc::new(
+                        EntitySpec::active(
+                            spec,
+                            surface_live_state,
+                            Arc::clone(&branch_ref),
+                            active_branch_id.to_string(),
+                            surface_snapshot_reader,
+                        )
+                        .with_authenticated_exact_reader(
+                            (!crate::live_state::is_derived_schema(schema_key))
+                                .then(|| authenticated_exact_reader.as_ref().map(Arc::clone))
+                                .flatten(),
+                        ),
+                    ),
                     WriteAccess::read_only(),
                 )?;
             }
@@ -118,12 +309,19 @@ where
                 register_spec_table(
                     ctx,
                     &surface.name,
-                    Arc::new(EntitySpec::by_branch(
-                        spec,
-                        surface_live_state,
-                        Arc::clone(&branch_ref),
-                        surface_snapshot_reader,
-                    )),
+                    Arc::new(
+                        EntitySpec::by_branch(
+                            spec,
+                            surface_live_state,
+                            Arc::clone(&branch_ref),
+                            surface_snapshot_reader,
+                        )
+                        .with_authenticated_exact_reader(
+                            (!crate::live_state::is_derived_schema(schema_key))
+                                .then(|| authenticated_exact_reader.as_ref().map(Arc::clone))
+                                .flatten(),
+                        ),
+                    ),
                     WriteAccess::read_only(),
                 )?;
             }
@@ -270,6 +468,7 @@ struct EntitySpec {
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
     entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
+    authenticated_exact_reader: Option<Arc<dyn AuthenticatedEntityExactReader>>,
     branch_ref: Arc<dyn BranchRefReader>,
     schema: SchemaRef,
     branch_binding: BranchBinding,
@@ -289,9 +488,18 @@ impl EntitySpec {
             spec,
             live_state,
             entity_snapshot_reader,
+            authenticated_exact_reader: None,
             branch_ref,
             branch_binding: BranchBinding::active(active_branch_id),
         }
+    }
+
+    fn with_authenticated_exact_reader(
+        mut self,
+        reader: Option<Arc<dyn AuthenticatedEntityExactReader>>,
+    ) -> Self {
+        self.authenticated_exact_reader = reader;
+        self
     }
 
     fn active_with_write(
@@ -326,6 +534,7 @@ impl EntitySpec {
             spec,
             live_state,
             entity_snapshot_reader,
+            authenticated_exact_reader: None,
             branch_ref,
             branch_binding: BranchBinding::explicit(),
         }
@@ -513,6 +722,8 @@ impl EntitySpec {
         let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
         let exact_request = exact_live_state_batch_request(&request);
         let batch_projection = EntityBatchProjection::for_request(&request);
+        let authenticated_exact_reader = self.authenticated_exact_reader.clone();
+        let direct_authenticated_exact = exact_request.is_some() && row_filters.is_empty();
         let source = row_source(
             (
                 Arc::clone(&self.spec),
@@ -522,8 +733,38 @@ impl EntitySpec {
                 exact_request,
                 row_filters,
                 batch_projection,
+                authenticated_exact_reader,
             ),
-            |(spec, live_state, schema, request, exact_request, row_filters, batch_projection)| async move {
+            move |(
+                spec,
+                live_state,
+                schema,
+                request,
+                exact_request,
+                row_filters,
+                batch_projection,
+                authenticated_exact_reader,
+            )| async move {
+                if direct_authenticated_exact {
+                    let exact_reader = authenticated_exact_reader.ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "typed entity exact update has no retained ForkTree capability".into(),
+                        )
+                    })?;
+                    let exact_request = exact_request.as_ref().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "typed entity exact update lost its exact request".into(),
+                        )
+                    })?;
+                    let rows = exact_reader
+                        .load_exact(authenticated_entity_exact_request(exact_request))
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    return authenticated_entity_record_batch(&spec, schema, &rows);
+                }
                 let rows = load_entity_live_state_batch(
                     live_state.as_ref(),
                     &request,
@@ -645,9 +886,11 @@ impl TableSpec for EntitySpec {
         let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
         let entity_snapshot_reader = self.entity_snapshot_reader.clone();
+        let authenticated_exact_reader = self.authenticated_exact_reader.clone();
         let live_state = Arc::clone(&self.live_state);
         let batch_projection = EntityBatchProjection::for_request(&request);
         let exact_request = exact_live_state_batch_request(&request);
+        let direct_authenticated_exact = exact_request.is_some() && row_filters.is_empty();
         let exact_limit_requires_materialization =
             exact_request.is_some() && request.limit.is_some();
         let direct_entity_snapshot = !exact_limit_requires_materialization
@@ -667,11 +910,12 @@ impl TableSpec for EntitySpec {
                     row_filters,
                     batch_projection,
                     entity_snapshot_reader,
+                    authenticated_exact_reader,
                     live_state,
                     direct_entity_snapshot,
                     direct_primary_key_projection,
                 ),
-                |(
+                move |(
                     spec,
                     schema,
                     request,
@@ -679,10 +923,35 @@ impl TableSpec for EntitySpec {
                     row_filters,
                     batch_projection,
                     entity_snapshot_reader,
+                    authenticated_exact_reader,
                     live_state,
                     direct_entity_snapshot,
                     direct_primary_key_projection,
                 )| async move {
+                    if direct_authenticated_exact {
+                        let exact_reader = authenticated_exact_reader.ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "typed entity exact projection has no retained ForkTree capability"
+                                    .into(),
+                            )
+                        })?;
+                        let exact_request = exact_request.as_ref().ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "typed entity exact projection lost its exact request".into(),
+                            )
+                        })?;
+                        let mut rows = exact_reader
+                            .load_exact(authenticated_entity_exact_request(exact_request))
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>();
+                        if let Some(limit) = request.limit {
+                            rows.truncate(limit);
+                        }
+                        return authenticated_entity_record_batch(&spec, schema, &rows);
+                    }
                     let entity_snapshot_reader = entity_snapshot_reader.ok_or_else(|| {
                         DataFusionError::Execution(
                             "entity projection has no authenticated ForkTree capability".into(),
@@ -1288,6 +1557,29 @@ fn exact_live_state_batch_request(
         untracked: request.filter.untracked,
         include_tombstones: request.filter.include_tombstones,
     })
+}
+
+fn authenticated_entity_exact_request(
+    request: &LiveStateExactBatchRequest,
+) -> AuthenticatedEntityExactBatchRequest {
+    let first = request
+        .rows
+        .first()
+        .expect("an exact entity request must have at least one row");
+    AuthenticatedEntityExactBatchRequest {
+        schema_key: first.schema_key.clone(),
+        branch_id: first.branch_id.clone(),
+        rows: request
+            .rows
+            .iter()
+            .map(|row| AuthenticatedEntityExactRowRequest {
+                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.clone(),
+            })
+            .collect(),
+        untracked: request.untracked,
+        include_tombstones: request.include_tombstones,
+    }
 }
 
 async fn load_entity_live_state_batch(
@@ -2265,6 +2557,7 @@ fn direct_entity_batch_eligible(
     !schema.fields().is_empty()
         && matches!(request.filter.rows, LiveStateRowFilter::All)
         && !request.filter.include_tombstones
+        && request.filter.file_ids.is_empty()
         && row_filters.is_empty()
         && request.filter.constraints.is_empty()
         && schema
@@ -2284,6 +2577,7 @@ fn direct_primary_key_projection_eligible(
     row_filters: &[EntityRowFilter],
 ) -> bool {
     direct_entity_batch_eligible(schema, request, row_filters)
+        && request.filter.entity_pks.is_empty()
         && !schema.fields().is_empty()
         && schema
             .fields()
@@ -2470,6 +2764,111 @@ fn entity_record_batch_from_raw_projection(
         .collect::<Result<Vec<_>>>()?;
 
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+fn authenticated_entity_record_batch(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    rows: &[AuthenticatedEntityRow],
+) -> Result<RecordBatch> {
+    if schema.fields().is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+        return RecordBatch::try_new_with_options(schema, vec![], &options)
+            .map_err(DataFusionError::from);
+    }
+    let decoder = EntityProjectionDecoder::new(
+        spec,
+        schema.fields().iter().filter_map(|field| {
+            (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
+        }),
+    )
+    .map_err(entity_projection_error_to_datafusion_error)?;
+    let mut visible_columns = decoder
+        .decode_arrow_columns(
+            rows.iter()
+                .map(|row| row.snapshot_content.as_ref().map(AsRef::<[u8]>::as_ref)),
+        )
+        .map_err(entity_projection_error_to_datafusion_error)?
+        .into_iter();
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            field.name().strip_prefix("lixcol_").map_or_else(
+                || {
+                    visible_columns.next().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "authenticated entity projection decoder did not return a visible column"
+                                .to_string(),
+                        )
+                    })
+                },
+                |property_name| authenticated_entity_system_column_array(property_name, rows),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+#[expect(trivial_casts)]
+fn authenticated_entity_system_column_array(
+    column_name: &str,
+    rows: &[AuthenticatedEntityRow],
+) -> Result<ArrayRef> {
+    let array = match column_name {
+        "entity_pk" => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.entity_pk.as_json_array_text().map(Some))
+                .collect::<std::result::Result<Vec<_>, LixError>>()
+                .map_err(lix_error_to_datafusion_error)?,
+        )) as ArrayRef,
+        "schema_key" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| Some(row.schema_key.as_str())),
+        )) as ArrayRef,
+        "file_id" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| row.file_id.as_deref()),
+        )) as ArrayRef,
+        "snapshot_content" => {
+            Arc::new(StringArray::from_iter(rows.iter().map(|row| {
+                row.snapshot_content.as_ref().map(AsRef::<str>::as_ref)
+            }))) as ArrayRef
+        }
+        "metadata" => Arc::new(StringArray::from_iter(rows.iter().map(|row| {
+            row.metadata
+                .as_ref()
+                .map(AsRef::<str>::as_ref)
+                .map(crate::serialize_row_metadata)
+        }))) as ArrayRef,
+        "created_at" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| Some(row.created_at.to_string())),
+        )) as ArrayRef,
+        "updated_at" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| Some(row.updated_at.to_string())),
+        )) as ArrayRef,
+        "global" => Arc::new(BooleanArray::from_iter(
+            rows.iter().map(|row| Some(row.global)),
+        )) as ArrayRef,
+        "change_id" => Arc::new(StringArray::from_iter(
+            rows.iter()
+                .map(|row| row.change_id.map(|id| id.to_string())),
+        )) as ArrayRef,
+        "commit_id" => Arc::new(StringArray::from_iter(
+            rows.iter()
+                .map(|row| row.commit_id.map(|id| id.to_string())),
+        )) as ArrayRef,
+        "untracked" => Arc::new(BooleanArray::from_iter(
+            rows.iter().map(|row| Some(row.untracked)),
+        )) as ArrayRef,
+        "branch_id" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| Some::<&str>(row.branch_id.as_ref())),
+        )) as ArrayRef,
+        _ => {
+            return Err(DataFusionError::Execution(format!(
+                "sql2 entity provider does not support system column 'lixcol_{column_name}'"
+            )));
+        }
+    };
+    Ok(array)
 }
 
 #[expect(trivial_casts)]
