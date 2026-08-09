@@ -1059,7 +1059,6 @@ where
     };
     let change = ChangeObjectV1::decode(ref_id, required_object(&objects, ref_id)?)?;
     let ChangeObjectV1::BranchRef {
-        change_id,
         branch_id,
         before_semantic_head_commit_object_id: _,
         after_semantic_head_commit_object_id,
@@ -1078,7 +1077,13 @@ where
             "branch snapshot latest ref-change does not match its branch/head",
         ));
     }
-    let _ = change_id;
+    super::serving::validate_retained_ref_change(
+        read,
+        repository.change_catalog_root,
+        ref_id,
+        &change,
+    )
+    .await?;
     Ok(())
 }
 

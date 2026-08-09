@@ -298,8 +298,8 @@ mod tests {
         assert_eq!(delta.scan_calls, 0);
         assert_eq!(
             (delta.get_many_calls, delta.get_many_keys),
-            (5, 13),
-            "pinned switching must authenticate the target through one retained read"
+            (7, 15),
+            "pinned switching must authenticate the target and its catalog owner through one retained read"
         );
     }
 }
