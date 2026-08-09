@@ -32,7 +32,9 @@ use super::manifest::{
     PluginContentMatcher, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
     validate_runtime_api_version,
 };
-use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
+use super::storage::{
+    plugin_storage_archive_file_id, plugin_storage_archive_path, plugin_storage_wasm_file_id,
+};
 
 pub(crate) const PLUGIN_REGISTRY_KEY: &str = "lix_plugin_registry_v2";
 pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v2";
@@ -563,7 +565,7 @@ where
         }
         for row in rows {
             let registry = PluginRegistry::from_required_live_state_row(&row, branch_id)?;
-            extend_registry_wasm_roots(&registry, &mut roots)?;
+            extend_registry_wasm_roots_on_view(&view, &registry, &mut roots).await?;
         }
     }
 
@@ -582,7 +584,7 @@ where
                     format!("retained plugin registry is missing at commit '{commit_id}'"),
                 )
             })?;
-        let snapshot = match value.0.cell {
+        let snapshot = match &value.0.cell {
             crate::forktree::StateCell::Value(value) => {
                 Some(serde_json::from_str(value.as_str()).map_err(|error| {
                     LixError::new(
@@ -599,17 +601,77 @@ where
             }
         };
         let registry = PluginRegistry::from_optional_snapshot(snapshot.as_ref())?;
-        extend_registry_wasm_roots(&registry, &mut roots)?;
+        for plugin in registry.plugins() {
+            let file_id = plugin_storage_wasm_file_id(plugin.key());
+            let owner_key = crate::forktree::StateKey {
+                schema_key: "lix_binary_blob_ref".to_owned(),
+                file_id: Some(file_id.clone()),
+                entity_pk: EntityPk::uuid_from_canonical(&file_id)
+                    .expect("deterministic plugin WASM owner ID is a UUID"),
+            };
+            let encoded_owner_key =
+                crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key: &owner_key.schema_key,
+                    file_id: owner_key.file_id.as_deref(),
+                    entity_pk: &owner_key.entity_pk,
+                });
+            let owner_value = facade
+                .load_state_value_at_commit(*commit_id, &encoded_owner_key, true)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "retained plugin '{}' WASM BlobRef owner is missing at commit '{commit_id}'",
+                            plugin.key()
+                        ),
+                    )
+                })?;
+            let semantic_id =
+                crate::forktree::historical_blob_semantic_id(&owner_key, &owner_value.0)?;
+            let expected = BlobId::from_hex(plugin.wasm_blob_hash())?;
+            if semantic_id != expected {
+                return Err(invalid_registry(format!(
+                    "plugin '{}' registry WASM hash does not match its authenticated BlobRef owner",
+                    plugin.key()
+                )));
+            }
+            roots.insert(semantic_id);
+        }
     }
     Ok(roots)
 }
 
-fn extend_registry_wasm_roots(
+async fn extend_registry_wasm_roots_on_view<R: StorageAdapterRead>(
+    view: &crate::forktree::CoherentView<R>,
     registry: &PluginRegistry,
     roots: &mut BTreeSet<BlobId>,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: Sync,
+{
     for plugin in registry.plugins() {
-        roots.insert(BlobId::from_hex(plugin.wasm_blob_hash())?);
+        let file_id = plugin_storage_wasm_file_id(plugin.key());
+        let key = crate::forktree::StateKey {
+            schema_key: "lix_binary_blob_ref".to_owned(),
+            file_id: Some(file_id.clone()),
+            entity_pk: EntityPk::uuid_from_canonical(&file_id)
+                .expect("deterministic plugin WASM owner ID is a UUID"),
+        };
+        let reference = view.bind_blob_at_state_key(&key).await?.ok_or_else(|| {
+            invalid_registry(format!(
+                "plugin '{}' has no authenticated WASM BlobRef owner",
+                plugin.key()
+            ))
+        })?;
+        let expected = BlobId::from_hex(plugin.wasm_blob_hash())?;
+        if reference.semantic_id() != expected {
+            return Err(invalid_registry(format!(
+                "plugin '{}' registry WASM hash does not match its authenticated BlobRef owner",
+                plugin.key()
+            )));
+        }
+        roots.insert(reference.semantic_id());
     }
     Ok(())
 }

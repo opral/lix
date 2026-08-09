@@ -2965,6 +2965,56 @@ impl TransactionWriteBuffer {
         ))
     }
 
+    /// Returns staged bytes only when the payload's eventual branch/file
+    /// owner matches the caller's authenticated request.  Plugin preflight
+    /// must not select an unrelated staged payload merely because it has the
+    /// same BlobId as the requested owner.
+    pub(crate) fn load_staged_file_bytes_for_owner(
+        &self,
+        branch_id: &str,
+        file_id: &str,
+        expected: BlobId,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        let file_content_guard = self.file_content_writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        let mut owner_seen = false;
+        let mut result = None;
+        for write in file_content_guard.iter().filter(|write| {
+            write.branch_id == branch_id
+                && !write.global
+                && !write.untracked
+                && write.file_id == file_id
+        }) {
+            owner_seen = true;
+            let Some(data) = write.inline_data() else {
+                continue;
+            };
+            let actual = write
+                .blob_hash()
+                .unwrap_or_else(|| BlobId::from_content(data));
+            if actual != expected {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "staged plugin payload owner does not match its requested BlobRef identity",
+                ));
+            }
+            if result.replace(data.to_vec()).is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "staged plugin BlobRef owner has duplicate payloads",
+                ));
+            }
+        }
+        if owner_seen {
+            return Ok(result);
+        }
+        Ok(None)
+    }
+
     /// Stages one prepared write batch into this transaction.
     ///
     /// Frontends hand a `RawWriteBatch` to `Transaction`; normalization

@@ -1155,7 +1155,6 @@ where
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let plugin_cache_snapshot = read_store.snapshot_cache_key();
                 let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                     Arc::new(self.live_state.reader(read_store.clone()));
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
@@ -1179,7 +1178,6 @@ where
                     authenticated_blob_reader,
                     self.plugin_host.clone(),
                     Some(file_view_collector.clone()),
-                    plugin_cache_snapshot,
                     &paths,
                     requested_range.clone(),
                 )
@@ -2366,7 +2364,6 @@ where
                                 authenticated_blob_reader,
                                 self.plugin_host.clone(),
                                 file_view_collector.clone(),
-                                None,
                                 &paths,
                                 None,
                             )
@@ -2721,7 +2718,6 @@ async fn hydrate_lix_file_content_result(
         authenticated_blob_reader,
         plugin_host,
         session_file_views,
-        None,
         &paths,
         None,
     )
