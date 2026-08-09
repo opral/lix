@@ -270,7 +270,20 @@ static NEXT_VIEW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// catalog traversal, so a caller cannot silently refresh either selector.
 pub(crate) struct CoherentView<R> {
     read: R,
-    hot_objects: BTreeMap<ObjectId, Bytes>,
+    hot_objects: std::sync::Arc<BTreeMap<ObjectId, Bytes>>,
+    branch_id: CanonicalBranchId,
+    raw_global_selector: Bytes,
+    raw_branch_selector: Bytes,
+    global_selector: GlobalSelectorV1,
+    branch_selector: BranchSelectorV1,
+    repository_root: RepositoryRootV1,
+    branch_snapshot: BranchSnapshotV1,
+    view_id: [u8; 32],
+    view_instance_id: u64,
+}
+
+#[derive(Clone)]
+struct BoundViewMetadata {
     branch_id: CanonicalBranchId,
     raw_global_selector: Bytes,
     raw_branch_selector: Bytes,
@@ -323,6 +336,17 @@ where
             read: self.read,
             identity: Some(identity),
             hot_objects: self.hot_objects,
+            bound_view: Some(std::sync::Arc::new(BoundViewMetadata {
+                branch_id: self.branch_id,
+                raw_global_selector: self.raw_global_selector,
+                raw_branch_selector: self.raw_branch_selector,
+                global_selector: self.global_selector,
+                branch_selector: self.branch_selector,
+                repository_root: self.repository_root,
+                branch_snapshot: self.branch_snapshot,
+                view_id: self.view_id,
+                view_instance_id: self.view_instance_id,
+            })),
         }
     }
 
@@ -359,7 +383,7 @@ where
         let identity = self.read_identity();
         PackedRead {
             read: raw_control_read,
-            objects: &self.hot_objects,
+            objects: self.hot_objects.as_ref(),
             pack_id: self.branch_snapshot.hot_pack_object_id,
             identity,
         }
@@ -909,7 +933,8 @@ fn empty_test_hot_objects() -> &'static BTreeMap<ObjectId, Bytes> {
 pub(crate) struct ForkTreeReadFacade<R> {
     read: R,
     identity: Option<ReadIdentity>,
-    hot_objects: BTreeMap<ObjectId, Bytes>,
+    hot_objects: std::sync::Arc<BTreeMap<ObjectId, Bytes>>,
+    bound_view: Option<std::sync::Arc<BoundViewMetadata>>,
 }
 
 /// Let snapshot-bound ForkTree serving primitives consume the operation-owned
@@ -964,7 +989,8 @@ where
         Self {
             identity: None,
             read,
-            hot_objects: BTreeMap::new(),
+            hot_objects: std::sync::Arc::new(BTreeMap::new()),
+            bound_view: None,
         }
     }
 
@@ -1008,7 +1034,7 @@ where
         }
         Ok(PackedRead {
             read: &self.read,
-            objects: &self.hot_objects,
+            objects: self.hot_objects.as_ref(),
             pack_id: identity.hot_pack_object_id,
             identity,
         })
@@ -1024,6 +1050,23 @@ where
                 format!("branch ID must be a UUID: {error}"),
             )
         })?;
+        if let Some(bound_view) = self.bound_view.as_deref()
+            && bound_view.branch_id == CanonicalBranchId::from_bytes(*uuid.as_bytes())
+        {
+            return Ok(CoherentView {
+                read: &self.read,
+                hot_objects: std::sync::Arc::clone(&self.hot_objects),
+                branch_id: bound_view.branch_id,
+                raw_global_selector: bound_view.raw_global_selector.clone(),
+                raw_branch_selector: bound_view.raw_branch_selector.clone(),
+                global_selector: bound_view.global_selector,
+                branch_selector: bound_view.branch_selector,
+                repository_root: bound_view.repository_root,
+                branch_snapshot: bound_view.branch_snapshot,
+                view_id: bound_view.view_id,
+                view_instance_id: bound_view.view_instance_id,
+            });
+        }
         let view =
             open_coherent_view_on_read(&self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
                 .await
@@ -1690,9 +1733,10 @@ where
         branch_selector.selector_generation,
         branch_snapshot.hot_pack_object_id,
     );
+    let hot_objects = std::sync::Arc::new(hot_objects);
     let packed_read = PackedRead {
         read: &read,
-        objects: &hot_objects,
+        objects: hot_objects.as_ref(),
         pack_id: branch_snapshot.hot_pack_object_id,
         identity,
     };
