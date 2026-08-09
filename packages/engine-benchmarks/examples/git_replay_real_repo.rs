@@ -8,18 +8,18 @@
 //! external resource sampler; `timed` enables `/usr/bin/time -v` for a later
 //! controlled sample. No timed sample is run by this source target.
 //!
-//! The default semantic digest is the canonical JSON result of the ordered
-//! public query `SELECT path, content FROM lix_file ORDER BY path`. Callers
-//! may provide a different deterministic query for a plugin-specific result.
-//! The Git tree digest is SHA-256 over `git ls-tree -r -l --full-name` at the
-//! selected `--to` commit. Adapter-level calls/bytes are not exposed by the
-//! existing CLI profile; the report records that boundary explicitly while
-//! retaining the profile's physical execution groups, plugin counters,
-//! filesystem counters, RSS, and settled output size.
+//! The semantic digest enumerates every public table advertised by
+//! `information_schema.tables`, canonicalizes every row, and hashes the
+//! complete ordered table/column/row surface. The Git tree digest is SHA-256
+//! over one frozen NUL-delimited `git ls-tree -r -z --full-tree` encoding.
+//! Adapter-level calls/bytes are not exposed by the existing CLI profile; the
+//! report records that boundary explicitly while retaining the profile's
+//! physical execution groups, plugin counters, filesystem counters, RSS, and
+//! settled output size.
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
@@ -27,19 +27,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
-const FORKTREE_COMMIT: &str = "790b00e4c71ca3369cffedbd802f57b4e823f0be";
-const FORKTREE_TREE: &str = "3cb0d2269bf37007d83d127996647f5603fb2de1";
-const FIXTURE_COMMIT: &str = "74f6c45c91823e59b72d0a60787fccf482900023";
-const FIXTURE_TREE: &str = "15729cd85f5434cc7e056db8cbbf6f7ae6e6cd63";
-const FIXTURE_FIRST_PARENT: &str = "a68095505a536ca8cd80c378f40d901fcde5080b";
-const FIXTURE_TREE_MANIFEST_SHA256: &str =
-    "9313eea8cf8788489bdcc06f67c2f64dfce3e440ad6ec1994c970054e1faca0d";
-const FIXTURE_FIRST_PARENT_DIFF_SHA256: &str =
-    "7710610168c2b543f84aadc58285628886db8b3bed25bcf216782e3e9ee0abcc";
-const FIXTURE_FILE_COUNT: usize = 8_380;
-const FIXTURE_LFS_POINTER_FILES: usize = 7_215;
-const FIXTURE_LFS_DECLARED_BYTES: u64 = 2_782_593_092;
-const DEFAULT_SEMANTIC_SQL: &str = "SELECT path, content FROM lix_file ORDER BY path";
+const FROZEN_FROM: &str = "7bffc534f48c2dd1110aff0b7bf618c1d1c030b1";
+const FROZEN_TO: &str = "74f6c45c91823e59b72d0a60787fccf482900023";
+const FROZEN_COMMIT_COUNT: usize = 32;
+const FROZEN_TREE: &str = "15729cd85f5434cc7e056db8cbbf6f7ae6e6cd63";
+const FROZEN_TREE_SHA256: &str = "8102fc51c0358b6e916733d99d6949c29f24ffe6ef5650809ee156c7931985fd";
+const PUBLIC_TABLE_QUERY: &str = "SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'datafusion' AND table_schema = 'public' ORDER BY table_schema, table_name";
+const KNOWN_PLUGIN_TABLES: &[&str] = &[
+    "csv_row",
+    "csv_table",
+    "excalidraw_element",
+    "excalidraw_file",
+    "excalidraw_scene",
+    "markdown_node",
+    "text_line",
+];
 const LFS_POINTER_VERSION: &str = "version https://git-lfs.github.com/spec/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,8 +82,25 @@ struct Config {
     storage: String,
     parent_tree: String,
     checkpoint_every: Option<u32>,
-    semantic_sql: String,
+    lix_source_repo: PathBuf,
+    lix_source_commit: String,
+    lix_source_tree: String,
+    expected_lix_bin_sha256: String,
+    harness_source_repo: PathBuf,
+    harness_source_commit: String,
+    harness_source_tree: String,
+    expected_harness_bin_sha256: String,
     force: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct VerifiedProvenance {
+    lix_source_commit: String,
+    lix_source_tree: String,
+    lix_binary_sha256: String,
+    harness_source_commit: String,
+    harness_source_tree: String,
+    harness_binary_sha256: String,
 }
 
 #[derive(Debug)]
@@ -103,15 +122,24 @@ fn main() {
 fn run() -> Result<(), String> {
     let config = Config::parse(std::env::args_os().skip(1))?;
     validate_config(&config)?;
+    let provenance = verify_provenance(&config)?;
 
     let window = resolve_window(&config.repo, &config.branch, &config.from, &config.to)?;
+    validate_frozen_window(&window)?;
     let lfs = inspect_lfs(&config.repo, &window)?;
 
-    let tree_listing = git_capture(
+    let tree_oid = git_text(
         &config.repo,
-        &["ls-tree", "-r", "-l", "--full-name", &window.to],
+        &["rev-parse", &format!("{}^{{tree}}", window.to)],
     )?;
+    if tree_oid != FROZEN_TREE {
+        return Err(format!(
+            "frozen endpoint tree mismatch: expected {FROZEN_TREE}, got {tree_oid}"
+        ));
+    }
+    let tree_listing = git_capture(&config.repo, &canonical_tree_args(&window.to))?;
     let tree_digest = sha256_hex(&tree_listing.stdout);
+    validate_tree_digest(FROZEN_TREE_SHA256, &tree_digest)?;
     let profile_path = profile_path(&config.report);
     ensure_parent(&config.output)?;
     ensure_parent(&config.report)?;
@@ -128,7 +156,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("read replay profile {}: {error}", profile_path.display()))?;
     let profile: Value = serde_json::from_slice(&profile_bytes)
         .map_err(|error| format!("parse replay profile {}: {error}", profile_path.display()))?;
-    let semantic = read_semantic_digest(&config, &config.semantic_sql)?;
+    let semantic = read_public_semantic_digest(&config)?;
     let disk_bytes = directory_bytes(&config.output).map_err(|error| {
         format!(
             "measure settled output {}: {error}",
@@ -147,11 +175,10 @@ fn run() -> Result<(), String> {
     };
 
     let report = json!({
-        "schema": "lix.real_git_replay_comparator.v1",
+        "schema": "lix.real_git_replay_comparator.v2",
         "mode": config.mode.as_str(),
         "provenance": {
-            "forktree_commit": FORKTREE_COMMIT,
-            "forktree_tree": FORKTREE_TREE,
+            "verified": provenance,
             "git_replay_plugins": "GitReplayPlugins::All (--plugins all)",
         },
         "fixture": {
@@ -161,25 +188,24 @@ fn run() -> Result<(), String> {
             "to": window.to,
             "commit_count": window.count,
             "selected_first_parent_commits": window.commits,
-            "pinned_vscode_docs_head": FIXTURE_COMMIT,
-            "pinned_vscode_docs_tree": FIXTURE_TREE,
-            "pinned_vscode_docs_first_parent": FIXTURE_FIRST_PARENT,
-            "pinned_vscode_docs_file_count": FIXTURE_FILE_COUNT,
-            "pinned_vscode_docs_tree_manifest_sha256": FIXTURE_TREE_MANIFEST_SHA256,
-            "pinned_vscode_docs_first_parent_diff_sha256": FIXTURE_FIRST_PARENT_DIFF_SHA256,
-            "pinned_vscode_docs_lfs_pointer_files": FIXTURE_LFS_POINTER_FILES,
-            "pinned_vscode_docs_lfs_declared_bytes": FIXTURE_LFS_DECLARED_BYTES,
+            "inclusive_window": true,
+            "frozen_commit_count": FROZEN_COMMIT_COUNT,
+            "pinned_vscode_docs_head": FROZEN_TO,
+            "pinned_vscode_docs_tree": FROZEN_TREE,
             "lfs": lfs,
         },
         "git": {
-            "tree_listing": "git ls-tree -r -l --full-name <to>",
+            "tree_listing": "git ls-tree -r -z --full-tree <to>",
             "tree_digest_sha256": tree_digest,
+            "expected_tree_digest_sha256": FROZEN_TREE_SHA256,
         },
         "semantic": {
-            "sql": config.semantic_sql,
             "canonical_json_digest_sha256": semantic.digest,
-            "canonicalization": "recursive object-key ordering; arrays retain SQL order",
+            "canonicalization": "public tables ordered by (schema, table); columns retain advertised order; rows ordered by canonical typed JSON bytes",
             "row_bytes": semantic.bytes,
+            "table_count": semantic.table_count,
+            "row_count": semantic.row_count,
+            "tables": semantic.tables,
         },
         "replay": {
             "storage": config.storage,
@@ -190,6 +216,14 @@ fn run() -> Result<(), String> {
             "profile": profile,
         },
         "backend_counters": backend,
+        "operation_coverage": {
+            "replay": "supported by git_replay with plugins all",
+            "commit": "represented by selected first-parent replay commits",
+            "branch": "unsupported by this harness; not relabeled",
+            "diff": "unsupported by this harness; not relabeled",
+            "merge": "unsupported by this harness; not relabeled",
+            "adapter_calls_bytes": "unsupported by the current git_replay profile; not inferred",
+        },
         "resource_counters": resource,
         "settled_output_bytes": disk_bytes,
         "child_exit_code": replay.status.code(),
@@ -217,7 +251,14 @@ impl Config {
         let mut storage = String::from("rocksdb");
         let mut parent_tree = String::from("window");
         let mut checkpoint_every = None;
-        let mut semantic_sql = String::from(DEFAULT_SEMANTIC_SQL);
+        let mut lix_source_repo = None;
+        let mut lix_source_commit = None;
+        let mut lix_source_tree = None;
+        let mut expected_lix_bin_sha256 = None;
+        let mut harness_source_repo = None;
+        let mut harness_source_commit = None;
+        let mut harness_source_tree = None;
+        let mut expected_harness_bin_sha256 = None;
         let mut force = false;
         let mut args = args.into_iter();
 
@@ -259,8 +300,55 @@ impl Config {
                             .map_err(|error| format!("invalid --checkpoint-every: {error}"))?,
                     )
                 }
-                "--semantic-sql" => {
-                    semantic_sql = value()?.to_str().ok_or("invalid semantic SQL")?.to_owned()
+                "--lix-source-repo" => lix_source_repo = Some(PathBuf::from(value()?)),
+                "--lix-source-commit" => {
+                    lix_source_commit = Some(
+                        value()?
+                            .to_str()
+                            .ok_or("invalid Lix source commit")?
+                            .to_owned(),
+                    )
+                }
+                "--lix-source-tree" => {
+                    lix_source_tree = Some(
+                        value()?
+                            .to_str()
+                            .ok_or("invalid Lix source tree")?
+                            .to_owned(),
+                    )
+                }
+                "--expected-lix-bin-sha256" => {
+                    expected_lix_bin_sha256 = Some(
+                        value()?
+                            .to_str()
+                            .ok_or("invalid Lix binary SHA-256")?
+                            .to_owned(),
+                    )
+                }
+                "--harness-source-repo" => harness_source_repo = Some(PathBuf::from(value()?)),
+                "--harness-source-commit" => {
+                    harness_source_commit = Some(
+                        value()?
+                            .to_str()
+                            .ok_or("invalid harness source commit")?
+                            .to_owned(),
+                    )
+                }
+                "--harness-source-tree" => {
+                    harness_source_tree = Some(
+                        value()?
+                            .to_str()
+                            .ok_or("invalid harness source tree")?
+                            .to_owned(),
+                    )
+                }
+                "--expected-harness-bin-sha256" => {
+                    expected_harness_bin_sha256 = Some(
+                        value()?
+                            .to_str()
+                            .ok_or("invalid harness binary SHA-256")?
+                            .to_owned(),
+                    )
                 }
                 other => return Err(format!("unknown argument {other}; use --help")),
             }
@@ -278,7 +366,17 @@ impl Config {
             storage,
             parent_tree,
             checkpoint_every,
-            semantic_sql,
+            lix_source_repo: lix_source_repo.ok_or("--lix-source-repo is required")?,
+            lix_source_commit: lix_source_commit.ok_or("--lix-source-commit is required")?,
+            lix_source_tree: lix_source_tree.ok_or("--lix-source-tree is required")?,
+            expected_lix_bin_sha256: expected_lix_bin_sha256
+                .ok_or("--expected-lix-bin-sha256 is required")?,
+            harness_source_repo: harness_source_repo.ok_or("--harness-source-repo is required")?,
+            harness_source_commit: harness_source_commit
+                .ok_or("--harness-source-commit is required")?,
+            harness_source_tree: harness_source_tree.ok_or("--harness-source-tree is required")?,
+            expected_harness_bin_sha256: expected_harness_bin_sha256
+                .ok_or("--expected-harness-bin-sha256 is required")?,
             force,
         })
     }
@@ -286,8 +384,9 @@ impl Config {
 
 fn print_help() {
     println!(
-        "Usage: git_replay_real_repo --mode <verify-only|timed> --lix-bin <path> --repo <path> \\\n+  --from <commit> --to <commit> --output <path.lix> --report <path.json> [options]\n\n\
-Options:\n  --branch <ref>                 first-parent ref (default: main)\n  --storage <rocksdb|slatedb>    replay adapter (default: rocksdb)\n  --parent-tree <window|full>    parent bootstrap scope (default: window)\n  --checkpoint-every <N>         pass through to git-replay\n  --semantic-sql <SQL>           deterministic result query\n  --force                        replace output/profile paths\n\n\
+        "Usage: git_replay_real_repo --mode <verify-only|timed> --lix-bin <path> --repo <path> \\\n  --from <commit> --to <commit> --output <path.lix> --report <path.json> [options]\n\n\
+Options:\n  --branch <ref>                 first-parent ref (default: main)\n  --storage <rocksdb|slatedb>    replay adapter (default: rocksdb)\n  --parent-tree <window|full>    parent bootstrap scope (default: window)\n  --checkpoint-every <N>         pass through to git-replay\n  --force                        replace output/profile paths\n\n\
+Required provenance:\n  --lix-source-repo <path> --lix-source-commit <oid> --lix-source-tree <oid>\n  --expected-lix-bin-sha256 <sha256>\n  --harness-source-repo <path> --harness-source-commit <oid> --harness-source-tree <oid>\n  --expected-harness-bin-sha256 <sha256>\n\n\
 The timed mode is a later one-sample gate; this source target does not run it.\n\
 LFS pointers are authenticated by the delegated git-replay reader; missing\n\
 objects fail closed and are never treated as pointer bytes."
@@ -305,6 +404,49 @@ fn validate_config(config: &Config) -> Result<(), String> {
         return Err(format!(
             "--repo is not a directory: {}",
             config.repo.display()
+        ));
+    }
+    if !config.lix_source_repo.is_dir() {
+        return Err(format!(
+            "--lix-source-repo is not a directory: {}",
+            config.lix_source_repo.display()
+        ));
+    }
+    if !config.harness_source_repo.is_dir() {
+        return Err(format!(
+            "--harness-source-repo is not a directory: {}",
+            config.harness_source_repo.display()
+        ));
+    }
+    for (label, value, length) in [
+        ("Lix source commit", config.lix_source_commit.as_str(), 40),
+        ("Lix source tree", config.lix_source_tree.as_str(), 40),
+        (
+            "harness source commit",
+            config.harness_source_commit.as_str(),
+            40,
+        ),
+        (
+            "harness source tree",
+            config.harness_source_tree.as_str(),
+            40,
+        ),
+        (
+            "Lix binary SHA-256",
+            config.expected_lix_bin_sha256.as_str(),
+            64,
+        ),
+        (
+            "harness binary SHA-256",
+            config.expected_harness_bin_sha256.as_str(),
+            64,
+        ),
+    ] {
+        validate_lower_hex(label, value, length)?;
+    }
+    if config.from != FROZEN_FROM || config.to != FROZEN_TO {
+        return Err(format!(
+            "frozen workload requires inclusive --from {FROZEN_FROM} --to {FROZEN_TO}"
         ));
     }
     if config.output.extension().and_then(|value| value.to_str()) != Some("lix") {
@@ -329,6 +471,104 @@ fn validate_config(config: &Config) -> Result<(), String> {
         return Err(format!(
             "output already exists: {} (pass --force to replace it)",
             config.output.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lower_hex(label: &str, value: &str, length: usize) -> Result<(), String> {
+    if value.len() != length
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{label} must be exactly {length} lowercase hexadecimal characters"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_provenance(config: &Config) -> Result<VerifiedProvenance, String> {
+    verify_commit_tree(
+        &config.lix_source_repo,
+        &config.lix_source_commit,
+        &config.lix_source_tree,
+        "Lix source",
+    )?;
+    verify_commit_tree(
+        &config.harness_source_repo,
+        &config.harness_source_commit,
+        &config.harness_source_tree,
+        "harness source",
+    )?;
+    let lix_binary_sha256 = sha256_file(&config.lix_bin)
+        .map_err(|error| format!("hash Lix binary {}: {error}", config.lix_bin.display()))?;
+    let harness_binary = std::env::current_exe()
+        .map_err(|error| format!("resolve current harness executable: {error}"))?;
+    let harness_binary_sha256 = sha256_file(&harness_binary)
+        .map_err(|error| format!("hash harness binary {}: {error}", harness_binary.display()))?;
+    validate_provenance_hash(
+        "Lix binary",
+        &config.expected_lix_bin_sha256,
+        &lix_binary_sha256,
+    )?;
+    validate_provenance_hash(
+        "harness binary",
+        &config.expected_harness_bin_sha256,
+        &harness_binary_sha256,
+    )?;
+    Ok(VerifiedProvenance {
+        lix_source_commit: config.lix_source_commit.clone(),
+        lix_source_tree: config.lix_source_tree.clone(),
+        lix_binary_sha256,
+        harness_source_commit: config.harness_source_commit.clone(),
+        harness_source_tree: config.harness_source_tree.clone(),
+        harness_binary_sha256,
+    })
+}
+
+fn verify_commit_tree(repo: &Path, commit: &str, tree: &str, label: &str) -> Result<(), String> {
+    let actual_commit = git_text(
+        repo,
+        &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+    )?;
+    if actual_commit != commit {
+        return Err(format!(
+            "{label} commit substitution: expected {commit}, got {actual_commit}"
+        ));
+    }
+    let actual_tree = git_text(repo, &["rev-parse", &format!("{commit}^{{tree}}")])?;
+    validate_provenance_hash(&format!("{label} tree"), tree, &actual_tree)
+}
+
+fn validate_provenance_hash(label: &str, expected: &str, actual: &str) -> Result<(), String> {
+    if expected != actual {
+        return Err(format!(
+            "{label} substitution: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_frozen_window(window: &CommitWindow) -> Result<(), String> {
+    if window.from != FROZEN_FROM || window.to != FROZEN_TO || window.count != FROZEN_COMMIT_COUNT {
+        return Err(format!(
+            "frozen inclusive window mismatch: expected {FROZEN_FROM}..={FROZEN_TO} ({FROZEN_COMMIT_COUNT} commits), got {}..={} ({} commits)",
+            window.from, window.to, window.count
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_tree_args(to: &str) -> [&str; 5] {
+    ["ls-tree", "-r", "-z", "--full-tree", to]
+}
+
+fn validate_tree_digest(expected: &str, actual: &str) -> Result<(), String> {
+    if expected != actual {
+        return Err(format!(
+            "canonical Git tree digest mismatch: expected {expected}, got {actual}"
         ));
     }
     Ok(())
@@ -361,26 +601,36 @@ fn resolve_window(repo: &Path, branch: &str, from: &str, to: &str) -> Result<Com
         .lines()
         .filter_map(|line| line.split_ascii_whitespace().next().map(str::to_owned))
         .collect::<Vec<_>>();
-    let from_index = commits
-        .iter()
-        .position(|commit| *commit == from_oid)
-        .ok_or_else(|| format!("--from {from_oid} is not on first-parent history of {branch}"))?;
-    let to_index = commits
-        .iter()
-        .position(|commit| *commit == to_oid)
-        .ok_or_else(|| format!("--to {to_oid} is not on first-parent history of {branch}"))?;
-    if from_index > to_index {
-        return Err(format!(
-            "--from {from_oid} occurs after --to {to_oid} on first-parent history"
-        ));
-    }
+    let selected = inclusive_first_parent_window(&commits, &from_oid, &to_oid, branch)?;
     Ok(CommitWindow {
         branch: branch.to_owned(),
         from: from_oid,
         to: to_oid,
-        count: to_index - from_index + 1,
-        commits: commits[from_index..=to_index].to_vec(),
+        count: selected.len(),
+        commits: selected,
     })
+}
+
+fn inclusive_first_parent_window(
+    commits: &[String],
+    from: &str,
+    to: &str,
+    branch: &str,
+) -> Result<Vec<String>, String> {
+    let from_index = commits
+        .iter()
+        .position(|commit| commit == from)
+        .ok_or_else(|| format!("--from {from} is not on first-parent history of {branch}"))?;
+    let to_index = commits
+        .iter()
+        .position(|commit| commit == to)
+        .ok_or_else(|| format!("--to {to} is not on first-parent history of {branch}"))?;
+    if from_index > to_index {
+        return Err(format!(
+            "--from {from} occurs after --to {to} on first-parent history"
+        ));
+    }
+    Ok(commits[from_index..=to_index].to_vec())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -721,13 +971,91 @@ mod tests {
         );
 
         fs::remove_file(unrelated).expect("remove unrelated object");
-        fs::write(&object, b"wrong").expect("wrong object bytes");
+        fs::write(&object, b"PAYLOAD").expect("wrong object bytes with preserved size");
         let local_with_wrong_hash =
             collect_local_lfs_objects(temp.path()).expect("wrong-hash object scan");
         assert!(
             validate_lfs_objects(temp.path(), &required, &local_with_wrong_hash)
                 .expect_err("wrong hash must fail")
                 .contains("hashes as")
+        );
+    }
+
+    #[test]
+    fn inclusive_window_rejects_the_prior_off_by_one_start() {
+        let preceding = "05f14b".to_string();
+        let mut commits = vec![preceding.clone(), FROZEN_FROM.to_string()];
+        commits.extend((0..30).map(|index| format!("middle-{index:02}")));
+        commits.push(FROZEN_TO.to_string());
+
+        let selected =
+            inclusive_first_parent_window(&commits, FROZEN_FROM, FROZEN_TO, "fixture-main")
+                .expect("frozen inclusive window");
+        assert_eq!(selected.len(), FROZEN_COMMIT_COUNT);
+        assert_eq!(selected.first().map(String::as_str), Some(FROZEN_FROM));
+        assert_eq!(selected.last().map(String::as_str), Some(FROZEN_TO));
+
+        let off_by_one =
+            inclusive_first_parent_window(&commits, &preceding, FROZEN_TO, "fixture-main")
+                .expect("prior mixed inclusive window");
+        assert_eq!(off_by_one.len(), FROZEN_COMMIT_COUNT + 1);
+    }
+
+    #[test]
+    fn canonical_tree_encoding_mismatch_fails_closed() {
+        assert_eq!(
+            canonical_tree_args(FROZEN_TO),
+            ["ls-tree", "-r", "-z", "--full-tree", FROZEN_TO]
+        );
+        assert!(
+            validate_tree_digest(FROZEN_TREE_SHA256, &"0".repeat(64))
+                .expect_err("tree encoding substitution must fail")
+                .contains("canonical Git tree digest mismatch")
+        );
+    }
+
+    #[test]
+    fn omitted_plugin_rows_change_digest_and_missing_plugin_surface_fails() {
+        let lix_file = CanonicalSemanticTable {
+            schema: "public".to_string(),
+            table: "lix_file".to_string(),
+            columns: vec!["path".to_string()],
+            rows: vec![json!(["README.md"])],
+        };
+        let markdown = CanonicalSemanticTable {
+            schema: "public".to_string(),
+            table: "markdown_node".to_string(),
+            columns: vec!["file_id".to_string(), "type".to_string()],
+            rows: vec![json!(["readme", "heading"])],
+        };
+        let full = digest_public_tables(&[lix_file.clone(), markdown.clone()])
+            .expect("full semantic digest");
+        let omitted = digest_public_tables(&[lix_file]).expect("omitted semantic digest");
+        assert_ne!(full.digest, omitted.digest);
+        assert_eq!(full.table_count, 2);
+        assert_eq!(full.row_count, 2);
+
+        let full_names = BTreeSet::from([
+            ("public".to_string(), "lix_file".to_string()),
+            ("public".to_string(), "markdown_node".to_string()),
+        ]);
+        require_plugin_surface(&full_names).expect("known plugin table present");
+        let omitted_names = BTreeSet::from([("public".to_string(), "lix_file".to_string())]);
+        assert!(
+            require_plugin_surface(&omitted_names)
+                .expect_err("omitted plugin surface must fail")
+                .contains("omitted every known plugin table")
+        );
+    }
+
+    #[test]
+    fn provenance_substitution_fails_closed() {
+        let expected = "1".repeat(64);
+        let substituted = "2".repeat(64);
+        assert!(
+            validate_provenance_hash("harness binary", &expected, &substituted)
+                .expect_err("substituted binary provenance must fail")
+                .contains("harness binary substitution")
         );
     }
 }
@@ -787,9 +1115,71 @@ fn run_replay(config: &Config, window: &CommitWindow, profile: &Path) -> Result<
 struct SemanticDigest {
     digest: String,
     bytes: usize,
+    table_count: usize,
+    row_count: usize,
+    tables: Vec<SemanticTableSummary>,
 }
 
-fn read_semantic_digest(config: &Config, sql: &str) -> Result<SemanticDigest, String> {
+#[derive(Clone, Debug, serde::Serialize)]
+struct CanonicalSemanticTable {
+    schema: String,
+    table: String,
+    columns: Vec<String>,
+    rows: Vec<Value>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SemanticTableSummary {
+    schema: String,
+    table: String,
+    columns: Vec<String>,
+    row_count: usize,
+    canonical_sha256: String,
+}
+
+fn read_public_semantic_digest(config: &Config) -> Result<SemanticDigest, String> {
+    let inventory = run_sql_json(config, PUBLIC_TABLE_QUERY, "public table inventory")?;
+    let (inventory_columns, inventory_rows) =
+        parse_query_envelope(inventory, "public table inventory")?;
+    column_index(&inventory_columns, "table_schema", "public table inventory")?;
+    column_index(&inventory_columns, "table_name", "public table inventory")?;
+    let mut names = BTreeSet::new();
+    for row in inventory_rows {
+        let schema = row_string(&row, "table_schema", "public table inventory")?;
+        let table = row_string(&row, "table_name", "public table inventory")?;
+        names.insert((schema, table));
+    }
+    if names.is_empty() {
+        return Err("public table inventory is empty after plugins-all replay".to_string());
+    }
+    require_plugin_surface(&names)?;
+
+    let mut tables = Vec::with_capacity(names.len());
+    for (schema, table) in names {
+        let sql = format!("SELECT * FROM {}", quote_identifier(&table));
+        let value = run_sql_json(config, &sql, &format!("public table {schema}.{table}"))?;
+        let (columns, rows) =
+            parse_query_envelope(value, &format!("public table {schema}.{table}"))?;
+        let mut canonical_rows = rows
+            .into_iter()
+            .map(|row| canonical_row(&row, &columns, &schema, &table))
+            .collect::<Result<Vec<_>, _>>()?;
+        canonical_rows.sort_by(|left, right| {
+            serde_json::to_vec(left)
+                .expect("canonical row serialization")
+                .cmp(&serde_json::to_vec(right).expect("canonical row serialization"))
+        });
+        tables.push(CanonicalSemanticTable {
+            schema,
+            table,
+            columns,
+            rows: canonical_rows,
+        });
+    }
+    digest_public_tables(&tables)
+}
+
+fn run_sql_json(config: &Config, sql: &str, label: &str) -> Result<Value, String> {
     let output = Command::new(&config.lix_bin)
         .args([
             OsString::from("--no-hints"),
@@ -802,18 +1192,130 @@ fn read_semantic_digest(config: &Config, sql: &str) -> Result<SemanticDigest, St
             OsString::from(sql),
         ])
         .output()
-        .map_err(|error| format!("spawn semantic SQL query: {error}"))?;
+        .map_err(|error| format!("spawn {label} SQL query: {error}"))?;
     if !output.status.success() {
-        return Err(format_child_failure("semantic SQL query failed", &output));
+        return Err(format_child_failure(
+            &format!("{label} SQL query failed"),
+            &output,
+        ));
     }
-    let value: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("semantic SQL output was not JSON: {error}"))?;
-    let canonical = canonical_json(value);
-    let bytes = serde_json::to_vec(&canonical)
-        .map_err(|error| format!("serialize canonical semantic result: {error}"))?;
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("{label} SQL output was not JSON: {error}"))
+}
+
+fn parse_query_envelope(
+    value: Value,
+    label: &str,
+) -> Result<(Vec<String>, Vec<Map<String, Value>>), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{label} result must be a JSON object"))?;
+    let columns = object
+        .get("columns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{label} result has no columns array"))?
+        .iter()
+        .map(|column| {
+            column
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{label} contains a non-string column name"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() {
+        return Err(format!("{label} contains duplicate column names"));
+    }
+    let rows = object
+        .get("rows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{label} result has no rows array"))?
+        .iter()
+        .map(|row| {
+            row.as_object()
+                .cloned()
+                .ok_or_else(|| format!("{label} contains a non-object row"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((columns, rows))
+}
+
+fn column_index(columns: &[String], name: &str, label: &str) -> Result<usize, String> {
+    columns
+        .iter()
+        .position(|column| column == name)
+        .ok_or_else(|| format!("{label} is missing required column {name}"))
+}
+
+fn row_string(row: &Map<String, Value>, name: &str, label: &str) -> Result<String, String> {
+    row.get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{label} row has non-string or missing {name}"))
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn canonical_row(
+    row: &Map<String, Value>,
+    columns: &[String],
+    schema: &str,
+    table: &str,
+) -> Result<Value, String> {
+    if row.len() != columns.len() || row.keys().any(|key| !columns.contains(key)) {
+        return Err(format!(
+            "public table {schema}.{table} row keys do not exactly match advertised columns"
+        ));
+    }
+    columns
+        .iter()
+        .map(|column| {
+            row.get(column).cloned().map(canonical_json).ok_or_else(|| {
+                format!("public table {schema}.{table} row is missing column {column}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+fn require_plugin_surface(names: &BTreeSet<(String, String)>) -> Result<(), String> {
+    if names
+        .iter()
+        .any(|(schema, table)| schema == "public" && KNOWN_PLUGIN_TABLES.contains(&table.as_str()))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "plugins-all public surface omitted every known plugin table ({})",
+        KNOWN_PLUGIN_TABLES.join(", ")
+    ))
+}
+
+fn digest_public_tables(tables: &[CanonicalSemanticTable]) -> Result<SemanticDigest, String> {
+    let bytes = serde_json::to_vec(tables)
+        .map_err(|error| format!("serialize canonical public semantic surface: {error}"))?;
+    let row_count = tables.iter().map(|table| table.rows.len()).sum();
+    let summaries = tables
+        .iter()
+        .map(|table| {
+            let table_bytes = serde_json::to_vec(table)
+                .expect("canonical semantic table serialization cannot fail");
+            SemanticTableSummary {
+                schema: table.schema.clone(),
+                table: table.table.clone(),
+                columns: table.columns.clone(),
+                row_count: table.rows.len(),
+                canonical_sha256: sha256_hex(&table_bytes),
+            }
+        })
+        .collect();
     Ok(SemanticDigest {
         digest: sha256_hex(&bytes),
         bytes: bytes.len(),
+        table_count: tables.len(),
+        row_count,
+        tables: summaries,
     })
 }
 
