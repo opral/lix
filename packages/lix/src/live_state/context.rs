@@ -22,16 +22,6 @@ use async_trait::async_trait;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
 
-/// Transaction-local branch publication controls.
-///
-/// A transaction is fenced by the tracked mutation revision observed when it
-/// opens, so repeatedly loading the same immutable generation selector only
-/// adds storage round trips. Missing controls are cached as well: branch
-/// creation rotates that revision and therefore conflicts with the pinned
-/// transaction before commit.
-#[derive(Default)]
-pub(crate) struct BranchHeadControlCache;
-
 /// Serving facade for visible live-state reads.
 ///
 /// Normal rows are resolved from one durable hot-state projection. Each row
