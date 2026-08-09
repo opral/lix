@@ -15,7 +15,7 @@ use crate::changelog::{ChangeRecord, CommitId, CommitRecord};
 use crate::common::LixTimestamp;
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use crate::transaction::staging::PreparedWriteSet;
+use crate::transaction::staging::{BranchRefPublicationIntent, PreparedWriteSet};
 use crate::transaction::types::PreparedStateRowRef;
 
 use crate::forktree::{
@@ -136,6 +136,13 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
                 .iter()
                 .map(|commit| commit.branch_id.as_str()),
         )
+        .chain(
+            prepared_writes
+                .branch_ref_intents
+                .iter()
+                .filter(|intent| !intent.create)
+                .map(|intent| intent.branch_id.as_str()),
+        )
         .collect::<BTreeSet<_>>();
     required_branch_ids.extend(commit_parent_branch_ids.iter().copied());
 
@@ -188,15 +195,7 @@ where
     let view = open_coherent_view_on_read(read, publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
     let prepared_blob_manifests = prepared_blob_manifest_ids(&mut publication, &prepared_writes)?;
-
-    if let Some((branch_id, source_head)) = branch_creation_intent(&prepared_writes)? {
-        let source_commit = load_commit(&view, forktree_commit_id(source_head))
-            .await?
-            .ok_or_else(|| writer_error("branch creation source commit is absent"))?;
-        publication
-            .publish_new_branch_selector(&view, branch_id, &source_commit)
-            .map_err(LixError::from)?;
-    }
+    let branch_ref_intents = prepared_writes.branch_ref_intents.clone();
 
     for checkpoint in &prepared_writes.checkpoint_publications {
         crate::gc::stage_checkpoint_publication(&mut publication, checkpoint)?;
@@ -305,7 +304,8 @@ where
     }
 
     if !semantic_commit {
-        return Ok(PreparedForkTreePlan::Publication(publication));
+        let plan = PreparedForkTreePlan::Publication(publication);
+        return append_branch_ref_intents(plan, &view, &branch_ref_intents).await;
     }
     let ordered_history = !prepared_writes.intermediate_commits.is_empty()
         || !prepared_writes
@@ -316,7 +316,7 @@ where
             .values()
             .any(crate::transaction::types::StagedCommitChangeRefs::has_selected_changes);
     if ordered_history {
-        return prepare_ordered_single_branch_history(
+        let plan = prepare_ordered_single_branch_history(
             active_account_id,
             commit_parent_heads,
             &view,
@@ -325,6 +325,7 @@ where
             prepared_blob_manifests,
         )
         .await;
+        return append_branch_ref_intents(plan?, &view, &branch_ref_intents).await;
     }
     let tracked_rows = prepared_writes
         .state_rows
@@ -615,6 +616,63 @@ where
     publication
         .publish_state_transition(&view, transition)
         .await?;
+    append_branch_ref_intents(
+        PreparedForkTreePlan::Publication(publication),
+        &view,
+        &branch_ref_intents,
+    )
+    .await
+}
+
+async fn append_branch_ref_intents<R>(
+    plan: PreparedForkTreePlan,
+    view: &crate::forktree::CoherentView<R>,
+    intents: &[BranchRefPublicationIntent],
+) -> Result<PreparedForkTreePlan, LixError>
+where
+    R: StorageAdapterRead + Clone,
+{
+    let PreparedForkTreePlan::Publication(mut publication) = plan else {
+        return Ok(plan);
+    };
+    let mut branch_intent_ids = BTreeSet::new();
+    for intent in intents {
+        let branch_id = canonical_branch_id(&intent.branch_id)?;
+        if !branch_intent_ids.insert(branch_id) {
+            return Err(writer_error(
+                "one transaction publishes one branch selector more than once",
+            ));
+        }
+        if intent.create {
+            let source_head = intent
+                .commit_id
+                .ok_or_else(|| writer_error("branch creation has no source commit"))?;
+            let source_commit = load_commit(view, forktree_commit_id(source_head))
+                .await?
+                .ok_or_else(|| writer_error("branch creation source commit is absent"))?;
+            publication
+                .publish_new_branch_selector(view, branch_id, &source_commit)
+                .map_err(LixError::from)?;
+        } else {
+            let target_view = open_coherent_view_on_read(view.storage_read(), branch_id).await?;
+            let target_commit = match intent.commit_id {
+                Some(commit_id) => Some(
+                    load_commit(&target_view, forktree_commit_id(commit_id))
+                        .await?
+                        .ok_or_else(|| writer_error("branch selector target commit is absent"))?,
+                ),
+                None => None,
+            };
+            publication
+                .publish_branch_selector_intent(
+                    &target_view,
+                    target_commit,
+                    forktree_change_id(intent.change_id),
+                )
+                .await
+                .map_err(LixError::from)?;
+        }
+    }
     Ok(PreparedForkTreePlan::Publication(publication))
 }
 
@@ -1263,11 +1321,12 @@ fn classify_publication_intent(
     }
 
     let has_state_rows = !prepared.state_rows.is_empty();
+    let has_branch_ref_intent = !prepared.branch_ref_intents.is_empty();
     let has_commit_intent = !prepared.commit_change_refs_by_branch.is_empty()
         || !prepared.extra_commit_parents_by_branch.is_empty()
         || !prepared.intermediate_commits.is_empty()
         || !prepared.first_commit_parent_override_by_branch.is_empty();
-    if !has_state_rows && !has_commit_intent {
+    if !has_state_rows && !has_commit_intent && !has_branch_ref_intent {
         return match runtime_checkpoint {
             None => Ok(PublicationIntent::Noop),
             Some(_) => Ok(PublicationIntent::Ordinary {
@@ -1323,73 +1382,6 @@ fn prepared_blob_manifest_ids(
         }
     }
     Ok(manifests)
-}
-
-fn branch_creation_intent(
-    prepared: &PreparedWriteSet,
-) -> Result<Option<(CanonicalBranchId, CommitId)>, LixError> {
-    let mut descriptor = None;
-    let mut branch_ref = None;
-    for (row_index, row) in prepared.state_rows.iter().enumerate() {
-        if !prepared.insert_selection.contains(row_index) {
-            continue;
-        }
-        let Some(snapshot) = row.snapshot else {
-            continue;
-        };
-        if row.schema_key.as_str() == crate::branch::BRANCH_DESCRIPTOR_SCHEMA_KEY
-            && !row.untracked
-            && row.global
-        {
-            let value: serde_json::Value =
-                serde_json::from_str(snapshot.normalized()).map_err(|error| {
-                    writer_error(format!("branch descriptor is malformed: {error}"))
-                })?;
-            let branch_id = value
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| writer_error("branch descriptor has no authenticated id"))?;
-            let branch_id = canonical_branch_id(branch_id)?;
-            if descriptor.replace(branch_id).is_some() {
-                return Err(writer_error(
-                    "one transaction creates more than one branch selector",
-                ));
-            }
-        } else if row.schema_key.as_str() == crate::branch::BRANCH_REF_SCHEMA_KEY
-            && row.untracked
-            && row.global
-        {
-            let value: serde_json::Value = serde_json::from_str(snapshot.normalized())
-                .map_err(|error| writer_error(format!("branch ref is malformed: {error}")))?;
-            let branch_id = value
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| writer_error("branch ref has no authenticated id"))?;
-            let source_head = value
-                .get("commit_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| writer_error("branch ref has no authenticated source commit"))?;
-            let branch_id = canonical_branch_id(branch_id)?;
-            let source_head = CommitId::parse_lix(source_head, "branch source commit")?;
-            if branch_ref.replace((branch_id, source_head)).is_some() {
-                return Err(writer_error(
-                    "one transaction inserts more than one branch reference",
-                ));
-            }
-        }
-    }
-    match (descriptor, branch_ref) {
-        (None, None) => Ok(None),
-        (Some(branch_id), Some((ref_branch_id, source_head))) if branch_id == ref_branch_id => {
-            Ok(Some((branch_id, source_head)))
-        }
-        (Some(_), Some(_)) => Err(writer_error(
-            "branch descriptor and branch ref identities do not match",
-        )),
-        _ => Err(writer_error(
-            "branch creation requires an inserted descriptor and reference",
-        )),
-    }
 }
 
 fn blob_manifest_object_ids_for_row(
@@ -1450,6 +1442,14 @@ fn sole_publication_branch(
                 .map(|commit| commit.branch_id.as_str()),
         )
         .collect::<BTreeSet<_>>();
+    if branches.is_empty() {
+        branches.extend(
+            prepared
+                .branch_ref_intents
+                .iter()
+                .map(|intent| intent.branch_id.as_str()),
+        );
+    }
     if branches.is_empty() && runtime_checkpoint_present {
         branches.insert(crate::GLOBAL_BRANCH_ID);
     }
@@ -1570,6 +1570,7 @@ mod intent_tests {
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
             file_content_writes: Vec::new(),
+            branch_ref_intents: Vec::new(),
         }
     }
 

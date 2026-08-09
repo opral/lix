@@ -10,9 +10,10 @@ use super::blob::CompletedUpload;
 use super::codec::corruption;
 use super::model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
-    ChangeObjectV1, CommitObjectV1, GlobalSelectorV1, SnapshotSelectorV1, SnapshotTargetV1,
-    UploadPartV1, UploadProgressV1, UploadSelectorV1, branch_selector_key,
-    gc_progress_selector_key, global_selector_key, snapshot_selector_key, upload_selector_key,
+    ChangeCatalogEntry, ChangeCatalogOwner, ChangeObjectV1, CommitObjectV1, GlobalSelectorV1,
+    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
+    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
+    snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, StateTreeEdit, validate_member_catalog_owner};
@@ -66,6 +67,7 @@ pub(crate) struct OrderedBranchHistoryTransition {
 pub(crate) struct PreparedPublication {
     expected_global: Bytes,
     next_global: GlobalSelectorV1,
+    next_repository_root: Option<RepositoryRootV1>,
     selector_expectations: BTreeMap<Bytes, SelectorExpectation>,
     selector_puts: BTreeMap<Bytes, Bytes>,
     selector_deletes: BTreeSet<Bytes>,
@@ -100,6 +102,7 @@ impl PreparedPublication {
         Ok(Self {
             expected_global: view.raw_global_selector().clone(),
             next_global: view.global_selector().rotated()?,
+            next_repository_root: Some(view.repository_root()),
             selector_expectations: BTreeMap::new(),
             selector_puts: BTreeMap::new(),
             selector_deletes: BTreeSet::new(),
@@ -126,6 +129,7 @@ impl PreparedPublication {
         Ok(Self {
             expected_global: raw_global,
             next_global: global.rotated()?,
+            next_repository_root: None,
             selector_expectations: BTreeMap::new(),
             selector_puts: BTreeMap::new(),
             selector_deletes: BTreeSet::new(),
@@ -187,6 +191,7 @@ impl PreparedPublication {
         let (id, bytes) = root.encode()?;
         self.stage_encoded_object(id, bytes)?;
         self.next_global.repository_root = id;
+        self.next_repository_root = Some(root);
         Ok(id)
     }
 
@@ -297,6 +302,88 @@ impl PreparedPublication {
             SelectorExpectation::Absent,
         )?;
         Ok(snapshot_id)
+    }
+
+    /// Publishes an existing branch's moving head or retires its selector in
+    /// this same transaction-owned publication. The target view is opened
+    /// from the caller's retained read, so selector generation, repository
+    /// roots, and RefChange ancestry all use one coherent identity.
+    pub(crate) async fn publish_branch_selector_intent<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        next_commit: Option<CommitObjectV1>,
+        change_id: super::model::ChangeId,
+    ) -> Result<(), StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        let Some(next_commit) = next_commit else {
+            return self.delete_branch_selector(
+                view.branch_selector(),
+                view.raw_branch_selector().clone(),
+            );
+        };
+        let (next_commit_object_id, _) = next_commit.encode()?;
+        if next_commit_object_id == view.branch_snapshot().semantic_head_commit_object_id {
+            return Ok(());
+        }
+        let branch_ref = ChangeObjectV1::BranchRef {
+            change_id,
+            branch_id: view.branch_id(),
+            before_semantic_head_commit_object_id: Some(
+                view.branch_snapshot().semantic_head_commit_object_id,
+            ),
+            after_semantic_head_commit_object_id: Some(next_commit_object_id),
+            previous_ref_change_object_id: view.branch_snapshot().latest_ref_change_object_id,
+            payload: Vec::new(),
+        };
+        let (ref_object_id, ref_bytes) = branch_ref.encode()?;
+        let base_repository_root = self.next_repository_root.unwrap_or(view.repository_root());
+        let change_catalog_edit = view
+            .put_change_catalog_entries(
+                base_repository_root.change_catalog_root,
+                &[(
+                    change_id,
+                    ChangeCatalogEntry {
+                        change_object_id: ref_object_id,
+                        owner: ChangeCatalogOwner::BranchRef {
+                            ref_change_object_id: ref_object_id,
+                            branch_id: view.branch_id(),
+                        },
+                    },
+                )],
+            )
+            .await?;
+        let branch_snapshot = BranchSnapshotV1 {
+            branch_id: view.branch_id(),
+            local_state_root: next_commit.local_state_root,
+            semantic_head_commit_object_id: next_commit_object_id,
+            latest_ref_change_object_id: Some(ref_object_id),
+            historical_global_state_root: next_commit.global_state_root,
+        };
+        let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
+        let next_change_catalog_root = change_catalog_edit.root;
+        self.stage_catalog_edit(change_catalog_edit)?;
+        self.stage_encoded_object(ref_object_id, ref_bytes)?;
+        self.stage_repository_root(RepositoryRootV1 {
+            global_state_root: base_repository_root.global_state_root,
+            commit_catalog_root: base_repository_root.commit_catalog_root,
+            change_catalog_root: next_change_catalog_root,
+            retention_policy_root: base_repository_root.retention_policy_root,
+        })?;
+        self.put_branch_selector(
+            BranchSelectorV1 {
+                branch_id: view.branch_id(),
+                branch_snapshot_object_id: snapshot_id,
+                selector_generation: view
+                    .branch_selector()
+                    .selector_generation
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("branch selector generation overflowed"))?,
+            },
+            SelectorExpectation::Equals(view.raw_branch_selector().clone()),
+        )?;
+        Ok(())
     }
 
     pub(super) fn stage_blob_chunk(

@@ -209,6 +209,7 @@ mod tests {
             extra_commit_parents_by_branch: Default::default(),
             intermediate_commits: Vec::new(),
             file_content_writes: Vec::new(),
+            branch_ref_intents: Vec::new(),
         };
         let unrelated = TrackedStateKey {
             schema_key: "plugin_entity".to_owned(),

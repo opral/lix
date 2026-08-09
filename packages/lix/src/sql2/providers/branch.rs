@@ -17,7 +17,6 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
     BranchHead, BranchRefReader, branch_descriptor_stage_row, branch_descriptor_tombstone_row,
-    branch_ref_stage_row, branch_ref_tombstone_row,
 };
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
@@ -176,6 +175,7 @@ impl TableSpec for BranchSpec {
             .sum::<usize>()
             .saturating_mul(2);
         let mut rows = RawWriteBatch::with_capacity(row_capacity);
+        let mut branch_ref_intents = Vec::new();
         let mut count = 0u64;
         for batch in batches {
             let branch_rows = branch_insert_rows_from_batch(&batch, &default_commit_id)?;
@@ -185,7 +185,12 @@ impl TableSpec for BranchSpec {
                 })?)
                 .ok_or_else(|| DataFusionError::Execution("INSERT row count overflow".into()))?;
             for row in branch_rows {
-                push_branch_stage_rows(&mut rows, row, TransactionWriteOperation::Insert, false);
+                branch_ref_intents.push(push_branch_descriptor_row(
+                    &mut rows,
+                    row,
+                    TransactionWriteOperation::Insert,
+                    false,
+                ));
             }
         }
 
@@ -198,6 +203,7 @@ impl TableSpec for BranchSpec {
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
         }
+        stage_branch_ref_intents(write_ctx, branch_ref_intents).await?;
 
         Ok(count)
     }
@@ -231,6 +237,7 @@ impl TableSpec for BranchSpec {
                     .sum::<usize>()
                     .saturating_mul(2);
                 let mut stage_rows = RawWriteBatch::with_capacity(row_capacity);
+                let mut branch_ref_intents = Vec::new();
                 let mut post_rows = Vec::new();
                 let mut count = 0u64;
                 for batch in batches {
@@ -243,12 +250,12 @@ impl TableSpec for BranchSpec {
                             DataFusionError::Execution("INSERT row count overflow".to_string())
                         })?;
                     for row in &branch_rows {
-                        push_branch_stage_rows(
+                        branch_ref_intents.push(push_branch_descriptor_row(
                             &mut stage_rows,
                             row.clone(),
                             TransactionWriteOperation::Insert,
                             false,
-                        );
+                        ));
                     }
                     post_rows.extend(branch_rows);
                 }
@@ -262,6 +269,7 @@ impl TableSpec for BranchSpec {
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
                 }
+                stage_branch_ref_intents(&write_ctx, branch_ref_intents).await?;
 
                 let post_image = LIX_BRANCH_COLS
                     .build(lix_branch_schema(), &post_rows)
@@ -296,13 +304,14 @@ impl TableSpec for BranchSpec {
                     })?;
                     let mut rows =
                         RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+                    let mut branch_ref_intents = Vec::new();
                     for row in branch_rows {
-                        push_branch_stage_rows(
+                        branch_ref_intents.push(push_branch_descriptor_row(
                             &mut rows,
                             row,
                             TransactionWriteOperation::Delete,
                             true,
-                        );
+                        ));
                     }
 
                     if !rows.is_empty() {
@@ -314,6 +323,7 @@ impl TableSpec for BranchSpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                     }
+                    stage_branch_ref_intents(&write_ctx, branch_ref_intents).await?;
 
                     Ok(count)
                 }
@@ -344,13 +354,14 @@ impl TableSpec for BranchSpec {
                     })?;
                     let mut rows =
                         RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+                    let mut branch_ref_intents = Vec::new();
                     for row in branch_rows {
-                        push_branch_stage_rows(
+                        branch_ref_intents.push(push_branch_descriptor_row(
                             &mut rows,
                             row,
                             TransactionWriteOperation::Update,
                             false,
-                        );
+                        ));
                     }
 
                     if !rows.is_empty() {
@@ -362,6 +373,7 @@ impl TableSpec for BranchSpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                     }
+                    stage_branch_ref_intents(&write_ctx, branch_ref_intents).await?;
 
                     Ok(count)
                 }
@@ -397,13 +409,14 @@ impl TableSpec for BranchSpec {
                         .map_err(branch_batch_error)?;
                     let mut rows =
                         RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+                    let mut branch_ref_intents = Vec::new();
                     for row in branch_rows {
-                        push_branch_stage_rows(
+                        branch_ref_intents.push(push_branch_descriptor_row(
                             &mut rows,
                             row,
                             TransactionWriteOperation::Update,
                             false,
-                        );
+                        ));
                     }
 
                     if !rows.is_empty() {
@@ -415,6 +428,7 @@ impl TableSpec for BranchSpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                     }
+                    stage_branch_ref_intents(&write_ctx, branch_ref_intents).await?;
 
                     returning.capture(returning.project(&post_image)?);
                     Ok(count)
@@ -480,10 +494,19 @@ impl UpsertSupport for BranchSpec {
             })?;
         let branch_rows = branch_insert_rows_from_batch(batch, &default_commit_id)?;
         let mut rows = RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+        let mut branch_ref_intents = Vec::new();
         for row in branch_rows {
-            push_branch_stage_rows(&mut rows, row, TransactionWriteOperation::Insert, false);
+            branch_ref_intents.push(push_branch_descriptor_row(
+                &mut rows,
+                row,
+                TransactionWriteOperation::Insert,
+                false,
+            ));
         }
-        Ok(StagedUpsert::rows(rows))
+        Ok(StagedUpsert::rows_with_branch_ref_intents(
+            rows,
+            branch_ref_intents,
+        ))
     }
 
     fn validate_proposed_batch(&self, batch: &RecordBatch) -> Result<()> {
@@ -632,10 +655,19 @@ impl UpsertSupport for BranchSpec {
             branch_update_rows_from_batch(augmented, assignments, &lix_branch_schema())?;
         reject_protected_branch_updates(&branch_rows)?;
         let mut rows = RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+        let mut branch_ref_intents = Vec::new();
         for row in branch_rows {
-            push_branch_stage_rows(&mut rows, row, TransactionWriteOperation::Update, false);
+            branch_ref_intents.push(push_branch_descriptor_row(
+                &mut rows,
+                row,
+                TransactionWriteOperation::Update,
+                false,
+            ));
         }
-        Ok(StagedUpsert::rows(rows))
+        Ok(StagedUpsert::rows_with_branch_ref_intents(
+            rows,
+            branch_ref_intents,
+        ))
     }
 }
 
@@ -1106,29 +1138,42 @@ fn parse_branch_row_commit_id(
     })
 }
 
-fn push_branch_stage_rows(
+fn push_branch_descriptor_row(
     rows: &mut RawWriteBatch,
     row: BranchRow,
     operation: TransactionWriteOperation,
     tombstone: bool,
-) {
+) -> (String, Option<CommitId>, bool) {
     let origin = Some(lix_branch_origin(operation, &row.id));
     if tombstone {
         rows.push(with_origin(
             branch_descriptor_tombstone_row(&row.id),
-            origin.clone(),
+            origin,
         ));
-        rows.push(with_origin(branch_ref_tombstone_row(&row.id), origin));
     } else {
         rows.push(with_origin(
             branch_descriptor_stage_row(&row.id, &row.name, row.hidden),
-            origin.clone(),
-        ));
-        rows.push(with_origin(
-            branch_ref_stage_row(&row.id, &row.commit_id),
             origin,
         ));
     }
+    (
+        row.id,
+        (!tombstone).then_some(row.commit_id),
+        matches!(operation, TransactionWriteOperation::Insert),
+    )
+}
+
+async fn stage_branch_ref_intents(
+    write_ctx: &SqlWriteContext,
+    intents: Vec<(String, Option<CommitId>, bool)>,
+) -> Result<()> {
+    for (branch_id, commit_id, create) in intents {
+        write_ctx
+            .stage_branch_ref_intent(&branch_id, commit_id, create)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+    }
+    Ok(())
 }
 
 fn with_origin(
@@ -1380,10 +1425,10 @@ mod tests {
 
     #[test]
     fn branch_multi_row_stage_uses_one_shared_metadata_dictionary() {
-        let mut rows = RawWriteBatch::with_capacity(200);
+        let mut rows = RawWriteBatch::with_capacity(100);
         for index in 0..100 {
             let id = format!("01920000-0000-7000-8000-{index:012x}");
-            push_branch_stage_rows(
+            push_branch_descriptor_row(
                 &mut rows,
                 BranchRow {
                     name: format!("Branch {index}"),
@@ -1396,11 +1441,15 @@ mod tests {
             );
         }
 
-        assert_eq!(rows.len(), 200);
+        assert_eq!(rows.len(), 100);
+        assert!(
+            rows.iter()
+                .all(|row| row.schema_key.as_str() == crate::branch::BRANCH_DESCRIPTOR_SCHEMA_KEY)
+        );
         assert_eq!(
             rows.shared_string_count(),
-            3,
-            "descriptor schema, ref schema, and global branch are batch-wide dictionary values"
+            2,
+            "descriptor schema and global branch are batch-wide dictionary values"
         );
         assert!(std::ptr::eq(
             rows.row(0).branch_id,

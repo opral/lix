@@ -7483,6 +7483,7 @@ mod tests {
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
             file_content_writes: Vec::new(),
+            branch_ref_intents: Vec::new(),
         }
     }
 

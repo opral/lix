@@ -24,6 +24,7 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::physical_expr::PhysicalExpr;
 
+use crate::changelog::CommitId;
 use crate::sql2::SqlWriteContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::exec::datafusion::LIX_INSERT_COLUMN_OMITTED_METADATA_KEY;
@@ -88,6 +89,7 @@ impl UpsertConflictTarget {
 pub(super) struct StagedUpsert {
     pub(super) rows: RawWriteBatch,
     pub(super) file_content: Vec<TransactionFileContent>,
+    pub(super) branch_ref_intents: Vec<(String, Option<CommitId>, bool)>,
 }
 
 impl StagedUpsert {
@@ -96,6 +98,18 @@ impl StagedUpsert {
         Self {
             rows,
             file_content: Vec::new(),
+            branch_ref_intents: Vec::new(),
+        }
+    }
+
+    pub(super) fn rows_with_branch_ref_intents(
+        rows: RawWriteBatch,
+        branch_ref_intents: Vec<(String, Option<CommitId>, bool)>,
+    ) -> Self {
+        Self {
+            rows,
+            file_content: Vec::new(),
+            branch_ref_intents,
         }
     }
 
@@ -103,12 +117,17 @@ impl StagedUpsert {
         rows: RawWriteBatch,
         file_content: Vec<TransactionFileContent>,
     ) -> Self {
-        Self { rows, file_content }
+        Self {
+            rows,
+            file_content,
+            branch_ref_intents: Vec::new(),
+        }
     }
 
     fn extend(&mut self, other: Self) {
         self.rows.append(other.rows);
         self.file_content.extend(other.file_content);
+        self.branch_ref_intents.extend(other.branch_ref_intents);
     }
 
     fn is_empty(&self) -> bool {
@@ -471,24 +490,35 @@ async fn stage_upsert(
     if staged.is_empty() {
         return Ok(());
     }
-    let write = if staged.file_content.is_empty() {
+    let StagedUpsert {
+        rows,
+        file_content,
+        branch_ref_intents,
+    } = staged;
+    let write = if file_content.is_empty() {
         TransactionWrite::Rows {
             mode: TransactionWriteMode::Replace,
-            rows: staged.rows,
+            rows,
         }
     } else {
         TransactionWrite::RowsWithFileContent {
             mode: TransactionWriteMode::Replace,
-            rows: staged.rows,
-            file_content: staged.file_content,
+            rows,
+            file_content,
             count: affected,
         }
     };
     write_ctx
         .stage_write(write)
         .await
-        .map_err(lix_error_to_datafusion_error)
-        .map(|_| ())
+        .map_err(lix_error_to_datafusion_error)?;
+    for (branch_id, commit_id, create) in branch_ref_intents {
+        write_ctx
+            .stage_branch_ref_intent(&branch_id, commit_id, create)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+    }
+    Ok(())
 }
 
 /// Replace one omitted INSERT placeholder with its provider-evaluated default.
