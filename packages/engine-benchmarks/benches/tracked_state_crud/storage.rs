@@ -1,52 +1,7 @@
 pub(crate) use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
-pub(crate) use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
+pub(crate) use lix_storage_slatedb::SlateDB;
 use tempfile::TempDir;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct BackendIoSnapshot {
-    pub(crate) read_objects: u64,
-    pub(crate) read_bytes: u64,
-    pub(crate) write_objects: u64,
-    pub(crate) write_bytes: u64,
-}
-
-impl BackendIoSnapshot {
-    pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
-        Self {
-            read_objects: self.read_objects.saturating_sub(earlier.read_objects),
-            read_bytes: self.read_bytes.saturating_sub(earlier.read_bytes),
-            write_objects: self.write_objects.saturating_sub(earlier.write_objects),
-            write_bytes: self.write_bytes.saturating_sub(earlier.write_bytes),
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-pub(crate) enum BackendIoCounters {
-    #[default]
-    Unavailable,
-    #[cfg(feature = "slatedb")]
-    SlateDB(SlateDBIoCounters),
-}
-
-impl BackendIoCounters {
-    pub(crate) fn snapshot(&self) -> Option<BackendIoSnapshot> {
-        match self {
-            Self::Unavailable => None,
-            #[cfg(feature = "slatedb")]
-            Self::SlateDB(counters) => {
-                let snapshot = counters.snapshot();
-                Some(BackendIoSnapshot {
-                    read_objects: snapshot.read_objects,
-                    read_bytes: snapshot.read_bytes,
-                    write_objects: snapshot.write_objects,
-                    write_bytes: snapshot.write_bytes,
-                })
-            }
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(crate) enum StorageProfile {
@@ -75,29 +30,17 @@ impl StorageProfile {
             Self::SlateDBRemoteObjectStore => "lix_slatedb_remote_object_store",
         }
     }
-
-    pub(crate) fn durability_mode(self) -> &'static str {
-        match self {
-            Self::RocksDB => "rocksdb-default-options+explicit-flush",
-            #[cfg(feature = "slatedb")]
-            Self::SlateDB => "slatedb-default-options+explicit-flush",
-            #[cfg(feature = "slatedb")]
-            Self::SlateDBRemoteObjectStore => "slatedb-default-object-store-options+explicit-flush",
-        }
-    }
 }
 
 pub(crate) enum ProfileStorage {
     RocksDB {
         storage: RocksDB,
         _dir: TempDir,
-        backend_counters: BackendIoCounters,
     },
     #[cfg(feature = "slatedb")]
     SlateDB {
         storage: SlateDB,
         _dir: TempDir,
-        backend_counters: BackendIoCounters,
     },
 }
 
@@ -108,26 +51,14 @@ impl StorageProfile {
                 let dir = TempDir::new().expect("create rocksdb bench tempdir");
                 let storage = RocksDB::open(dir.path().join("bench.rocksdb"))
                     .expect("open rocksdb bench storage");
-                ProfileStorage::RocksDB {
-                    storage,
-                    _dir: dir,
-                    backend_counters: BackendIoCounters::Unavailable,
-                }
+                ProfileStorage::RocksDB { storage, _dir: dir }
             }
             #[cfg(feature = "slatedb")]
             Self::SlateDB => {
                 let dir = TempDir::new().expect("create slatedb bench tempdir");
-                let counters = SlateDBIoCounters::default();
-                let storage = SlateDB::open_with_io_counters(
-                    dir.path().join("bench.slatedb"),
-                    counters.clone(),
-                )
-                .expect("open slatedb bench storage");
-                ProfileStorage::SlateDB {
-                    storage,
-                    _dir: dir,
-                    backend_counters: BackendIoCounters::SlateDB(counters),
-                }
+                let storage =
+                    SlateDB::open(dir.path().join("bench.slatedb")).expect("open slatedb storage");
+                ProfileStorage::SlateDB { storage, _dir: dir }
             }
             #[cfg(feature = "slatedb")]
             Self::SlateDBRemoteObjectStore => {
@@ -154,19 +85,13 @@ impl StorageProfile {
                 ));
                 let dir = TempDir::new().expect("create remote SlateDB bench tempdir");
                 let db_path = format!("tracked-state-crud-{}", ulid::Ulid::new());
-                let counters = SlateDBIoCounters::default();
-                let storage = SlateDB::open_object_store_with_options_and_io_counters(
+                let storage = SlateDB::open_object_store_with_options(
                     db_path,
                     object_store,
                     lix_storage_slatedb::SlateDBObjectStoreOptions::default(),
-                    counters.clone(),
                 )
                 .expect("open remote-path SlateDB object store");
-                ProfileStorage::SlateDB {
-                    storage,
-                    _dir: dir,
-                    backend_counters: BackendIoCounters::SlateDB(counters),
-                }
+                ProfileStorage::SlateDB { storage, _dir: dir }
             }
         }
     }

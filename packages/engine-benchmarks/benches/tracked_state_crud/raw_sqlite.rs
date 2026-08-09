@@ -14,9 +14,6 @@ pub(crate) struct RawSqliteFixture {
     _dir: TempDir,
 }
 
-pub(crate) const DURABILITY_MODE: &str =
-    "sqlite-wal+synchronous-full+wal-checkpoint-full+temp-store-memory";
-
 pub(crate) fn empty_fixture(rows: &[WorkloadRow]) -> RawSqliteFixture {
     empty_fixture_with_read_many_pk_count(rows, crate::READ_MANY_PK_COUNT)
 }
@@ -76,40 +73,6 @@ pub(crate) fn seeded_fixture_with_read_many_pk_count(
 }
 
 impl RawSqliteFixture {
-    pub(crate) fn flush_settle(&self) {
-        self.connection
-            .execute_batch("PRAGMA wal_checkpoint(FULL);")
-            .expect("settle SQLite WAL before cold reopen");
-    }
-
-    pub(crate) fn settled_disk_bytes(&self) -> u64 {
-        directory_bytes(self._dir.path())
-    }
-
-    pub(crate) fn cold_reopen_public_result(self) -> ExecuteResult {
-        let RawSqliteFixture {
-            connection,
-            rows,
-            _dir: dir,
-            ..
-        } = self;
-        let path = dir.path().join("raw.sqlite");
-        drop(connection);
-        let mut connection = Connection::open(path).expect("cold reopen SQLite comparator fixture");
-        connection.set_prepared_statement_cache_capacity(32);
-        let mut statement = connection
-            .prepare("SELECT path, value FROM json_pointer ORDER BY path")
-            .expect("prepare cold-reopen SQLite public-result read");
-        let query = statement
-            .query([])
-            .expect("query cold-reopen SQLite public-result rows");
-        let result = Self::public_result_from_query(query, rows.len());
-        drop(statement);
-        drop(connection);
-        drop(dir);
-        result
-    }
-
     pub(crate) fn insert_all(&mut self) -> usize {
         let transaction = self
             .connection
@@ -431,21 +394,4 @@ fn literal_update_sql(row: &WorkloadRow) -> String {
         sql_string(row.updated_value_json.as_str()),
         sql_string(row.path.as_str())
     )
-}
-
-fn directory_bytes(path: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| {
-            let path = entry.path();
-            if path.is_dir() {
-                directory_bytes(&path)
-            } else {
-                entry.metadata().map_or(0, |metadata| metadata.len())
-            }
-        })
-        .sum()
 }
