@@ -17,8 +17,9 @@ use super::state::{
     HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
 };
 use super::tree::{
-    ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
+    ImmutableObjectSet, OrderedTreeMutation, OrderedTreeReadCache, apply_ordered_mutations,
+    lookup_on_read, lookup_on_read_with_cache, scan_bounded_page_on_read, scan_page_on_read,
+    validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -89,6 +90,7 @@ pub(super) struct AuthenticatedMemberClosure<'a, R: ?Sized> {
     commit: CommitObjectV1,
     members: Vec<CommitMemberV1>,
     catalog_identity: tokio::sync::OnceCell<()>,
+    tree_cache: tokio::sync::Mutex<OrderedTreeReadCache>,
 }
 
 impl<'a, R: StorageAdapterRead + ?Sized> AuthenticatedMemberClosure<'a, R> {
@@ -180,6 +182,7 @@ where
         commit: commit.clone(),
         members: load_commit_members(read, commit).await?,
         catalog_identity: tokio::sync::OnceCell::const_new(),
+        tree_cache: tokio::sync::Mutex::new(OrderedTreeReadCache::default()),
     })
 }
 
@@ -2402,13 +2405,25 @@ where
         if !matches!(change, ChangeObjectV1::Semantic { .. }) {
             return Err(corruption("commit member edge names a RefChange object"));
         }
-        let value = lookup_on_read(
-            change_catalog_root,
-            "change",
-            change.change_id().as_bytes(),
-            read,
-        )
-        .await?
+        let value = if let Some(context) = context {
+            let mut tree_cache = context.tree_cache.lock().await;
+            lookup_on_read_with_cache(
+                change_catalog_root,
+                "change",
+                change.change_id().as_bytes(),
+                read,
+                &mut tree_cache,
+            )
+            .await?
+        } else {
+            lookup_on_read(
+                change_catalog_root,
+                "change",
+                change.change_id().as_bytes(),
+                read,
+            )
+            .await?
+        }
         .ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
         validate_member_catalog_owner(
