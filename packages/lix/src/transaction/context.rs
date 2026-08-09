@@ -2377,11 +2377,8 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = self.opening_read();
-        let base = self
-            .live_state
-            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
-        overlay_scan_batch(&base, &staged, request).await
+        let forktree = self.forktree_read_facade();
+        overlay_scan_batch(&forktree, &staged, request).await
     }
 
     async fn visible_materialization(
@@ -2658,15 +2655,8 @@ where
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let base = self
-            .live_state
-            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
-        overlay_load_exact_batch(&base, &staged, request).await
+        let forktree = self.forktree_read_facade();
+        overlay_load_exact_batch(&forktree, &staged, request).await
     }
 
     /// Drops `format-only` upserts that are semantically identical to the
@@ -8386,6 +8376,35 @@ mod transaction_validation_reader_tests {
         assert!(predecessor.contains("reader.load_exact_batch(&request)"));
         assert!(!predecessor.contains("LiveStateStoreReader"));
         assert!(!predecessor.contains("transaction_reader("));
+    }
+
+    #[test]
+    fn staged_transaction_materialization_uses_the_same_forktree_owner() {
+        let source = include_str!("context.rs");
+        let scan_start = source
+            .find("async fn scan_visible_live_state_batch")
+            .expect("staged scan helper");
+        let scan_end = source[scan_start..]
+            .find("async fn visible_materialization")
+            .map(|offset| scan_start + offset)
+            .expect("staged scan helper end");
+        let scan = &source[scan_start..scan_end];
+        assert!(scan.contains("let forktree = self.forktree_read_facade()"));
+        assert!(scan.contains("overlay_scan_batch(&forktree"));
+        assert!(!scan.contains("transaction_reader("));
+
+        let exact_start = source
+            .find("async fn load_visible_exact_live_state_batch")
+            .expect("staged exact helper");
+        let exact_end = source[exact_start..]
+            .find("/// Drops `format-only`")
+            .map(|offset| exact_start + offset)
+            .expect("staged exact helper end");
+        let exact = &source[exact_start..exact_end];
+        assert!(exact.contains("let forktree = self.forktree_read_facade()"));
+        assert!(exact.contains("overlay_load_exact_batch(&forktree"));
+        assert!(!exact.contains("transaction_reader("));
+        assert!(!exact.contains("begin_read("));
     }
 }
 

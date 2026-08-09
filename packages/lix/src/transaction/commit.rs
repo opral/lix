@@ -1243,7 +1243,12 @@ fn classify_publication_intent(
             .get(commit_id)
             .copied()
             .unwrap_or_default();
-        if tracked_rows == 0 && !has_selected {
+        if tracked_rows == 0 {
+            if *has_selected {
+                return Err(writer_error(
+                    "selected historical members require the ForkTree history lowering slice",
+                ));
+            }
             return Err(writer_error(
                 "ref-only commit intent requires the ForkTree history lowering slice",
             ));
