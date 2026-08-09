@@ -1380,7 +1380,7 @@ fn decode_validated_change_record(
     decode_change_record(id, change)
 }
 
-async fn validate_commit_catalog_identity<R>(
+pub(super) async fn validate_commit_catalog_identity<R>(
     read: &R,
     commit_catalog_root: ObjectId,
     commit_object_id: ObjectId,
