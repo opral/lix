@@ -388,6 +388,80 @@ async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
 }
 
 #[tokio::test]
+async fn bound_historical_facade_preserves_branch_identity_across_reopen_and_corruption() {
+    let mut seed = build_seed();
+    let chunk = BlobChunkV1 {
+        bytes: Bytes::from_static(b"bound facade payload"),
+    };
+    let (chunk_id, chunk_bytes) = chunk.encode().expect("bound facade object");
+    seed.objects
+        .insert(chunk_id, chunk_bytes)
+        .expect("bound facade object seed");
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open branch-bound retained view");
+    let pack_id = view.hot_pack_object_id();
+    let slot = crate::json_store::JsonSlot::ForkTreeObject(*chunk_id.as_bytes());
+    let facade = ForkTreeReadFacade::from_view(view);
+    assert_eq!(
+        facade
+            .load_json_slot(&slot)
+            .await
+            .expect("load object through bound historical facade"),
+        Some("bound facade payload".to_owned())
+    );
+
+    let other_branch = uuid::Uuid::from_bytes(raw_id(0xb7)).to_string();
+    assert!(
+        facade.branch(&other_branch).await.is_err(),
+        "a retained historical facade must not cross into an unrelated branch"
+    );
+    drop(facade);
+
+    let reopened_read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("reopen retained read"),
+    );
+    let reopened = ForkTreeReadFacade::from_read_on_branch(
+        reopened_read,
+        &uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string(),
+    )
+    .await
+    .expect("reopen branch-bound historical facade");
+    assert_eq!(
+        reopened
+            .load_json_slot(&slot)
+            .await
+            .expect("load after reopen"),
+        Some("bound facade payload".to_owned())
+    );
+
+    let corrupt_read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("open corruption read"),
+    );
+    assert!(
+        ForkTreeReadFacade::from_read_on_branch(
+            CorruptPackRead {
+                inner: corrupt_read,
+                pack_id,
+            },
+            &uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string(),
+        )
+        .await
+        .is_err(),
+        "a corrupted branch-bound pack must fail closed before facade use"
+    );
+}
+
+#[tokio::test]
 async fn zero_pack_raw_control_rejects_packable_history_objects() {
     let seed = build_seed();
     let storage = Memory::new();
