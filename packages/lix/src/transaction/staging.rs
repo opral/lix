@@ -27,6 +27,7 @@ use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
 use crate::gc::CheckpointPublication;
 #[cfg(test)]
+#[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 #[cfg(test)]
 use crate::live_state::MaterializedLiveStateRow;

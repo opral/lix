@@ -14,8 +14,9 @@ use crate::plugin::{
     load_plugin_registry_at_commit,
 };
 use crate::storage_adapter::Storage;
-use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateKey};
-use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateMergeConflict};
+use crate::tracked_state::{
+    MaterializedTrackedStateRow, TrackedStateDiffIdentity, TrackedStateMergeConflict,
+};
 use crate::transaction::types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
 };

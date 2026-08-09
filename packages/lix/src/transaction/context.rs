@@ -54,8 +54,6 @@ use crate::gc::{
     CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef,
     load_checkpoint_publication_state,
 };
-#[cfg(test)]
-use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
     CertifiedCurrentStatePredecessor, LiveStateContext, LiveStateExactBatchRequest,
     LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
@@ -6456,7 +6454,7 @@ where
 
     async fn validate_prepared_writes_by_branch(
         &mut self,
-        read: &(impl StorageAdapterRead + ?Sized),
+        _read: &(impl StorageAdapterRead + ?Sized),
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
         let validation_live_state = self.validation_live_state_reader();
@@ -8170,9 +8168,7 @@ where
         Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
     }
 
-    fn authenticated_blob_reader(
-        &self,
-    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+    fn authenticated_blob_reader(&self) -> Result<Arc<dyn AuthenticatedBlobReader>, LixError> {
         Ok(Arc::new(crate::forktree::blob_reader_on_read(
             self.read_store.clone(),
             &self.active_branch_id,
@@ -9481,9 +9477,7 @@ where
         None
     }
 
-    fn authenticated_blob_reader(
-        &self,
-    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+    fn authenticated_blob_reader(&self) -> Result<Arc<dyn AuthenticatedBlobReader>, LixError> {
         Ok(Arc::new(crate::forktree::blob_reader_on_read(
             self.opening_read(),
             &self.active_branch_id,
@@ -10196,7 +10190,7 @@ fn append_plugin_change_rows(
 fn append_certified_entity_changes(
     changes: &mut WasmHostEntityChanges,
     batches: &[WasmCertifiedEntityBatch],
-    schemas: &crate::plugin::SchemaAllowlist,
+    schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     for batch in batches {
         changes

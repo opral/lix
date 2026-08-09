@@ -38,7 +38,6 @@ pub use crate::storage::{
     Storage, StorageError, StorageRead, StorageSpace, StoredValue as StorageValue, ValueSemantics,
     WriteOptions as StorageWriteOptions,
 };
-pub(crate) use crate::storage::{PutBatch, PutEntry};
 
 pub use context::StorageAdapter;
 pub(crate) use point::exact_get_many;
@@ -50,5 +49,4 @@ pub use stats::{
 };
 #[cfg(any(test, feature = "storage-benches"))]
 pub use write_set::StorageWriteSetArenaStats;
-pub(crate) use write_set::{DeferredFinalPutPage, DeferredFinalPutSource};
 pub use write_set::{StorageWriteSet, StorageWriteSetError};

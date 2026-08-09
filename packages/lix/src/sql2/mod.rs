@@ -38,10 +38,7 @@ pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
     statement_has_durable_runtime_function,
 };
-pub(crate) use catalog::{
-    EntityColumnType, EntitySurfaceSpec, PublicCatalog, derive_entity_surface_spec_from_schema,
-    entity_visible_fields,
-};
+pub(crate) use catalog::PublicCatalog;
 pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, SqlChangelogQuerySource,
     SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
@@ -50,7 +47,6 @@ pub(crate) use context::{
 pub(crate) use entity_batch::{
     CanonicalEntitySnapshotProjection, CurrentEntitySnapshotReader, EntitySnapshotReader,
 };
-pub(crate) use entity_projection::EntityProjectionDecoder;
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]
 pub(crate) use exec::{
@@ -76,11 +72,7 @@ pub(crate) use exec::{
     WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,
     execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
     execute_write_logical_plan_with_mode_and_trace_result,
-    execute_write_logical_plan_with_mode_result, take_certified_entity_insert_batch_executions,
-    take_certified_entity_insert_parameter_batch_executions,
-    take_certified_generation_identity_replacements,
-    take_certified_replacement_parameter_batch_executions,
-    take_certified_single_path_value_replacements, take_entity_update_parameter_batch_executions,
+    execute_write_logical_plan_with_mode_result,
 };
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,

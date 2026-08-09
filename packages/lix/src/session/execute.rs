@@ -13,8 +13,8 @@ use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch}
 use crate::sql2;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
-    StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadDurability,
+    StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
@@ -36,7 +36,7 @@ use tracing::Instrument as _;
 use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
-use super::transaction::{SessionTransaction, transaction_state_error};
+use super::transaction::SessionTransaction;
 use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;

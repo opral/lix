@@ -17,11 +17,11 @@ pub(crate) use reader::load_exact_batch_via_scan_for_test;
 pub(crate) use reader::{LiveStateReadDomain, LiveStateReader};
 #[allow(unused_imports)]
 pub(crate) use types::{
-    Bound, CertifiedCurrentStatePredecessor, CurrentStateDeltaRef, LiveStateExactBatchRequest,
-    LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection, LiveStateRowFilter,
-    LiveStateRowIdentityRef, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
+    Bound, CertifiedCurrentStatePredecessor, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentityRef,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
     MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef, PackedHeadValue, ScanConstraint, ScanField, ScanOperator,
+    MaterializedLiveStateRowRef, ScanConstraint, ScanField, ScanOperator,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{

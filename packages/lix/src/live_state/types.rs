@@ -11,28 +11,8 @@ use bytes::Bytes;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonSlotRef;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
-
-/// Neutral current-state mutation input shared by initialization and the
-/// transaction writer.  This belongs to the live-state owner rather than the
-/// deleted tracked-head module so the writer does not retain a dependency on
-/// the superseded physical reader.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CurrentStateDeltaRef<'a> {
-    pub(crate) schema_key: &'a str,
-    pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: &'a EntityPk,
-    pub(crate) change_id: Option<ChangeId>,
-    pub(crate) commit_id: Option<CommitId>,
-    pub(crate) untracked: bool,
-    pub(crate) deleted: bool,
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) updated_at: LixTimestamp,
-    pub(crate) snapshot: JsonSlotRef<'a>,
-    pub(crate) metadata: JsonSlotRef<'a>,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) enum CertifiedCurrentStatePredecessor {
@@ -338,6 +318,7 @@ impl MaterializedLiveStateBatch {
             .map_or_else(|| self.branch_ids[index].0 as usize, |_| 0)
     }
 
+    #[cfg(test)]
     pub(crate) fn filter(
         &self,
         mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
@@ -687,6 +668,7 @@ impl MaterializedLiveStateExactBatch {
             .map(|ordinal| self.batch.row(ordinal as usize))
     }
 
+    #[cfg(test)]
     pub(crate) fn filter(
         &self,
         mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
@@ -1201,63 +1183,6 @@ impl MaterializedLiveStateBatchBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push_materialized(
-        &mut self,
-        entity_pk: EntityPk,
-        schema_key: String,
-        file_id: Option<String>,
-        snapshot_content: Option<SharedStr>,
-        metadata: Option<SharedStr>,
-        deleted: bool,
-        created_at: LixTimestamp,
-        updated_at: LixTimestamp,
-        global: bool,
-        change_id: Option<ChangeId>,
-        commit_id: Option<CommitId>,
-        untracked: bool,
-        branch_id: &str,
-    ) -> usize {
-        let ordinal = self.len();
-        if self.singleton_capacity {
-            self.push_owned(MaterializedLiveStateRow {
-                entity_pk,
-                schema_key,
-                file_id,
-                snapshot_content,
-                metadata,
-                deleted,
-                created_at,
-                updated_at,
-                global,
-                change_id,
-                commit_id,
-                untracked,
-                branch_id: Arc::from(branch_id),
-            });
-            return ordinal;
-        }
-        let schema_key = SchemaKeyId(self.intern_owned(schema_key));
-        let file_id = file_id.map(|file_id| FileIdId::from_ordinal(self.intern_owned(file_id)));
-        let branch_id = BranchIdId(self.intern_ref(branch_id));
-        self.push_columns(
-            schema_key,
-            file_id,
-            branch_id,
-            entity_pk,
-            snapshot_content,
-            metadata,
-            deleted,
-            created_at,
-            updated_at,
-            global,
-            change_id,
-            commit_id,
-            untracked,
-        );
-        ordinal
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_materialized_ref(
         &mut self,
         entity_pk: &EntityPk,
@@ -1390,6 +1315,7 @@ impl MaterializedLiveStateBatchBuilder {
         self.durable_predecessor.push(None);
     }
 
+    #[cfg(test)]
     pub(crate) fn set_snapshot_content(&mut self, row: usize, value: SharedStr) {
         if let Some(singleton) = self.singleton.as_mut() {
             assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
@@ -1399,6 +1325,7 @@ impl MaterializedLiveStateBatchBuilder {
         self.snapshot_content[row] = Some(value);
     }
 
+    #[cfg(test)]
     pub(crate) fn set_metadata(&mut self, row: usize, value: SharedStr) {
         if let Some(singleton) = self.singleton.as_mut() {
             assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
@@ -1560,6 +1487,7 @@ pub(crate) struct LiveStateScanRequest {
 }
 
 /// Point lookup request for one visible live-state row.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LiveStateRowRequest {
     pub(crate) schema_key: String,
@@ -1595,6 +1523,7 @@ pub(crate) struct LiveStateExactBatchRequest {
 }
 
 impl LiveStateExactBatchRequest {
+    #[cfg(test)]
     pub(crate) fn row_scan_request(&self, row: &LiveStateExactRowRequest) -> LiveStateScanRequest {
         LiveStateScanRequest {
             filter: LiveStateFilter {

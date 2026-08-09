@@ -604,7 +604,7 @@ impl CommitGraphLiveStateReader {
             request.filter.entity_pks.is_empty()
                 || request.filter.entity_pks.contains(&row.entity_pk)
         });
-        rows.retain(|row| {
+        rows.retain(|_row| {
             request
                 .filter
                 .file_ids
