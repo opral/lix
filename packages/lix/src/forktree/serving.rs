@@ -26,6 +26,57 @@ const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
 const CATALOG_SCAN_PAGE_ROWS: usize = 1024;
 
+/// Loads a commit's complete authenticated member closure. Small commits keep
+/// the original inline representation; larger commits resolve the immutable
+/// CommitMemberPageV1 chain while checking commit identity, contiguous
+/// ordinals, cycles, and duplicate Change object identities.
+pub(crate) async fn load_commit_members<R>(
+    read: &R,
+    commit: &CommitObjectV1,
+) -> Result<Vec<CommitMemberV1>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let Some(mut page_id) = commit.member_page_root else {
+        return Ok(commit.members.clone());
+    };
+    if !commit.members.is_empty() {
+        return Err(corruption("paged commit carries an inline member closure"));
+    }
+    let mut members = Vec::new();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(page_id) {
+            return Err(corruption("commit member page chain contains a cycle"));
+        }
+        let bytes = super::view::load_object_bytes(read, page_id).await?;
+        let page = super::model::CommitMemberPageV1::decode(page_id, &bytes)?;
+        if page.commit_id != commit.commit_id
+            || page.start_ordinal
+                != u32::try_from(members.len())
+                    .map_err(|_| corruption("commit member page ordinal exceeds u32"))?
+        {
+            return Err(corruption(
+                "commit member page chain has a mismatched commit or ordinal",
+            ));
+        }
+        members.extend(page.members);
+        match page.next_page_object_id {
+            Some(next) => page_id = next,
+            None => break,
+        }
+    }
+    let mut unique_changes = BTreeSet::new();
+    for member in &members {
+        if !unique_changes.insert(member.change_object_id()) {
+            return Err(corruption(
+                "commit member page chain repeats a change object",
+            ));
+        }
+    }
+    Ok(members)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateSource {
     Global,
@@ -678,8 +729,9 @@ where
         &commit,
     )
     .await?;
-    let mut records = Vec::with_capacity(commit.members.len());
-    for (ordinal, member) in commit.members.iter().copied().enumerate() {
+    let members = load_commit_members(read, &commit).await?;
+    let mut records = Vec::with_capacity(members.len());
+    for (ordinal, member) in members.iter().copied().enumerate() {
         let change_object_id = member.change_object_id();
         let bytes = super::view::load_object_bytes(read, change_object_id).await?;
         let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
@@ -1025,7 +1077,8 @@ where
         ) => {
             let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            if commit.members.get(ordinal as usize)
+            let members = load_commit_members(read, &commit).await?;
+            if members.get(ordinal as usize)
                 != Some(&CommitMemberV1::introduced(entry.change_object_id))
             {
                 return Err(corruption("ChangeCatalog owner/ordinal back-edge is invalid").into());
@@ -1119,7 +1172,8 @@ where
                 &introduction,
             )
             .await?;
-            if introduction.members.get(ordinal as usize)
+            let introduction_members = load_commit_members(read, &introduction).await?;
+            if introduction_members.get(ordinal as usize)
                 != Some(&CommitMemberV1::introduced(member.change_object_id()))
             {
                 return Err(corruption(
@@ -1159,8 +1213,8 @@ where
                     "selected membership source generation is not earlier than its target",
                 ));
             }
-            if source_commit
-                .members
+            let source_members = load_commit_members(read, &source_commit).await?;
+            if source_members
                 .get(source_ordinal as usize)
                 .map(|source| source.change_object_id())
                 != Some(member.change_object_id())
@@ -1186,7 +1240,8 @@ where
         .await?
         .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
     let (source_commit_object_id, _) = source.encode()?;
-    for (source_ordinal, source_member) in source.members.iter().copied().enumerate() {
+    let source_members = load_commit_members(view.storage_read(), &source).await?;
+    for (source_ordinal, source_member) in source_members.iter().copied().enumerate() {
         let change_object_id = source_member.change_object_id();
         let bytes = view.load_object_bytes(change_object_id).await?;
         let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
@@ -1946,7 +2001,8 @@ where
         ) => {
             let bytes = view.load_object_bytes(commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            if commit.members.get(ordinal as usize)
+            let members = load_commit_members(view.storage_read(), &commit).await?;
+            if members.get(ordinal as usize)
                 != Some(&CommitMemberV1::introduced(entry.change_object_id))
             {
                 return Err(corruption(
@@ -1999,7 +2055,8 @@ where
             ));
         }
     }
-    for (ordinal, member) in commit.members.iter().copied().enumerate() {
+    let members = load_commit_members(read, commit).await?;
+    for (ordinal, member) in members.iter().copied().enumerate() {
         let change_object_id = member.change_object_id();
         let bytes = super::view::load_object_bytes(read, change_object_id).await?;
         let change = ChangeObjectV1::decode(change_object_id, &bytes)?;

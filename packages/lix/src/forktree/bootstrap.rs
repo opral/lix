@@ -228,11 +228,12 @@ where
         changes.push((row.change_id, object_id));
     }
 
-    let commit = CommitObjectV1 {
+    let mut commit = CommitObjectV1 {
         commit_id: model_commit,
         generation: 1,
         parent_commit_object_ids: Vec::new(),
         members: semantic_members,
+        member_page_root: None,
         global_state_root: global_state.root.object_id,
         local_state_root: local_state.root.object_id,
         metadata: crate::changelog::encode_forktree_commit_payload(
@@ -247,6 +248,12 @@ where
             },
         )?,
     };
+    let member_pages = commit.prepare_member_pages().map_err(LixError::from)?;
+    for (page_id, page_bytes) in member_pages {
+        objects
+            .insert(page_id, page_bytes)
+            .map_err(LixError::from)?;
+    }
     let (commit_object_id, commit_bytes) = commit.encode().map_err(LixError::from)?;
     objects
         .insert(commit_object_id, commit_bytes)
