@@ -3036,10 +3036,17 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
         super::decode_state_key(&wrong_identity_key).expect("wrong-identity state key");
     assert!(
         reader
-            .load_bytes_for_state_keys(&[wrong_identity])
+            .load_bytes_for_state_keys(std::slice::from_ref(&wrong_identity))
             .await
             .is_err(),
         "a same-BlobId owner with a different declared id must fail before manifest load"
+    );
+    assert!(
+        reader
+            .load_ranges_for_state_keys(&[(wrong_identity, 0..1)])
+            .await
+            .is_err(),
+        "a same-BlobId owner with a different declared id must fail before range selection"
     );
 }
 
