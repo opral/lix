@@ -50,9 +50,23 @@ where
             "checkpoint recovery selector branch does not match its retained view",
         ));
     }
-    let retained_head = CommitId::new(uuid::Uuid::from_bytes(
-        *view.semantic_head_commit().commit_id.as_bytes(),
-    ));
+    let retained_head_object_id = view.branch_snapshot().semantic_head_commit_object_id;
+    let retained_head_bytes = view
+        .load_object_bytes(retained_head_object_id)
+        .await
+        .map_err(LixError::from)?;
+    let retained_head =
+        crate::forktree::CommitObjectV1::decode(retained_head_object_id, &retained_head_bytes)
+            .map_err(LixError::from)?;
+    view.validate_retained_commit(
+        view.repository_root().commit_catalog_root,
+        view.repository_root().change_catalog_root,
+        retained_head_object_id,
+        &retained_head,
+    )
+    .await
+    .map_err(LixError::from)?;
+    let retained_head = CommitId::new(uuid::Uuid::from_bytes(*retained_head.commit_id.as_bytes()));
     if retained_head != checkpoint.recovery_ref.recovered_head_commit_id {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
