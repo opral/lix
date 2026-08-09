@@ -20,7 +20,7 @@ mod view;
 
 pub(crate) use blob::{
     AuthenticatedBlobReader, AuthenticatedBlobRef, PreparedUploadPart, UploadBindingRef,
-    blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
+    blob_reader_on_facade, blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
 };
 pub(crate) use bootstrap::initialize_empty_repository;
 pub(crate) use merkle::{

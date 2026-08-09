@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
@@ -45,6 +46,68 @@ pub(crate) struct CoherentView<R> {
     latest_ref_change: ChangeObjectV1,
     view_id: [u8; 32],
     view_instance_id: u64,
+}
+
+/// Immutable authenticated metadata retained by one operation-owned facade.
+///
+/// The storage read remains outside this value. Rebinding the summary to that
+/// exact read is therefore not a cache lookup or a second authority: it is the
+/// same selector bytes, decoded roots, graph envelope, and view identity that
+/// were authenticated once for this operation.
+#[derive(Clone)]
+struct AuthenticatedViewSummary {
+    branch_id: CanonicalBranchId,
+    raw_global_selector: Bytes,
+    raw_branch_selector: Bytes,
+    global_selector: GlobalSelectorV1,
+    branch_selector: BranchSelectorV1,
+    repository_root: RepositoryRootV1,
+    branch_snapshot: BranchSnapshotV1,
+    semantic_head_commit: CommitObjectV1,
+    latest_ref_change: ChangeObjectV1,
+    view_id: [u8; 32],
+    view_instance_id: u64,
+}
+
+impl AuthenticatedViewSummary {
+    fn from_view<R>(view: &CoherentView<R>) -> Self
+    where
+        R: StorageAdapterRead,
+    {
+        Self {
+            branch_id: view.branch_id,
+            raw_global_selector: view.raw_global_selector.clone(),
+            raw_branch_selector: view.raw_branch_selector.clone(),
+            global_selector: view.global_selector,
+            branch_selector: view.branch_selector,
+            repository_root: view.repository_root,
+            branch_snapshot: view.branch_snapshot,
+            semantic_head_commit: view.semantic_head_commit.clone(),
+            latest_ref_change: view.latest_ref_change.clone(),
+            view_id: view.view_id,
+            view_instance_id: view.view_instance_id,
+        }
+    }
+
+    fn bind<'a, R>(&self, read: &'a R) -> CoherentView<&'a R>
+    where
+        R: StorageAdapterRead,
+    {
+        CoherentView {
+            read,
+            branch_id: self.branch_id,
+            raw_global_selector: self.raw_global_selector.clone(),
+            raw_branch_selector: self.raw_branch_selector.clone(),
+            global_selector: self.global_selector,
+            branch_selector: self.branch_selector,
+            repository_root: self.repository_root,
+            branch_snapshot: self.branch_snapshot,
+            semantic_head_commit: self.semantic_head_commit.clone(),
+            latest_ref_change: self.latest_ref_change.clone(),
+            view_id: self.view_id,
+            view_instance_id: self.view_instance_id,
+        }
+    }
 }
 
 impl<R> CoherentView<R>
@@ -699,6 +762,9 @@ where
 #[derive(Clone)]
 pub(crate) struct ForkTreeReadFacade<R> {
     read: R,
+    retained_views: Arc<
+        Mutex<BTreeMap<CanonicalBranchId, Arc<tokio::sync::OnceCell<AuthenticatedViewSummary>>>>,
+    >,
 }
 
 /// Let snapshot-bound ForkTree serving primitives consume the operation-owned
@@ -750,7 +816,10 @@ where
     R: StorageAdapterRead,
 {
     pub(crate) fn new(read: R) -> Self {
-        Self { read }
+        Self {
+            read,
+            retained_views: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     pub(crate) async fn branch(
@@ -763,10 +832,36 @@ where
                 format!("branch ID must be a UUID: {error}"),
             )
         })?;
-        let view =
-            open_coherent_view_on_read(&self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
-                .await
-                .map_err(crate::LixError::from)?;
+        self.branch_canonical(CanonicalBranchId::from_bytes(*uuid.as_bytes()))
+            .await
+    }
+
+    pub(crate) async fn branch_canonical(
+        &self,
+        branch_id: CanonicalBranchId,
+    ) -> Result<CoherentView<&R>, crate::LixError> {
+        let cell = {
+            let mut retained = self.retained_views.lock().map_err(|_| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "operation-owned ForkTree view registry is poisoned",
+                )
+            })?;
+            Arc::clone(
+                retained
+                    .entry(branch_id)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+        let summary = cell
+            .get_or_try_init(|| async {
+                let view = open_coherent_view_on_read(&self.read, branch_id)
+                    .await
+                    .map_err(crate::LixError::from)?;
+                Ok::<_, crate::LixError>(AuthenticatedViewSummary::from_view(&view))
+            })
+            .await?;
+        let view = summary.bind(&self.read);
         let _view_identity = view.view_id();
         let _resume_identity_validator = CoherentView::<&R>::validate_resume_key;
         let _ = _resume_identity_validator;

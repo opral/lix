@@ -25,6 +25,17 @@ pub(crate) async fn load_mode(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<DeterministicMode, LixError> {
     let rows = load_key_value_rows(read).await?;
+    mode_from_rows(&rows)
+}
+
+pub(crate) async fn load_mode_from_live_state(
+    live_state: &dyn crate::live_state::LiveStateReader,
+) -> Result<DeterministicMode, LixError> {
+    let rows = load_key_value_rows_from_live_state(live_state).await?;
+    mode_from_rows(&rows)
+}
+
+fn mode_from_rows(rows: &[MaterializedLiveStateRow]) -> Result<DeterministicMode, LixError> {
     let Some(row) = rows.iter().find(|row| {
         !row.deleted
             && row
@@ -46,6 +57,19 @@ pub(crate) async fn load_sequence(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<DeterministicSequence, LixError> {
     let rows = load_key_value_rows(read).await?;
+    sequence_from_rows(&rows)
+}
+
+pub(crate) async fn load_sequence_from_live_state(
+    live_state: &dyn crate::live_state::LiveStateReader,
+) -> Result<DeterministicSequence, LixError> {
+    let rows = load_key_value_rows_from_live_state(live_state).await?;
+    sequence_from_rows(&rows)
+}
+
+fn sequence_from_rows(
+    rows: &[MaterializedLiveStateRow],
+) -> Result<DeterministicSequence, LixError> {
     let sequence = rows.iter().find(|row| {
         !row.deleted
             && row
@@ -190,9 +214,14 @@ async fn load_key_value_rows(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
     let forktree = ForkTreeReadFacade::new(read);
-    let rows = crate::live_state::scan_forktree_facade(
-        &forktree,
-        &LiveStateScanRequest {
+    load_key_value_rows_from_live_state(&forktree).await
+}
+
+async fn load_key_value_rows_from_live_state(
+    live_state: &dyn crate::live_state::LiveStateReader,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    let rows = live_state
+        .scan_batch(&LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
                 branch_ids: vec![crate::GLOBAL_BRANCH_ID.to_owned()],
@@ -202,10 +231,9 @@ async fn load_key_value_rows(
                 ..Default::default()
             },
             ..Default::default()
-        },
-    )
-    .await?
-    .into_rows();
+        })
+        .await?
+        .into_rows();
     let mut identities = BTreeSet::new();
     for row in &rows {
         if row.schema_key != KEY_VALUE_SCHEMA_KEY

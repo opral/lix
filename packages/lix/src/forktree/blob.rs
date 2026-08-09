@@ -19,7 +19,7 @@ use super::tree::{
     ImmutableObjectSet, ReceiptTreeEdit, ReceiptTreeRoot, empty_receipt_tree, scan_page_on_read,
     validate_receipt_root_on_read,
 };
-use super::view::{CoherentView, load_object_bytes, load_object_map};
+use super::view::{CoherentView, ForkTreeReadFacade, load_object_bytes, load_object_map};
 
 pub(super) const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const UPLOAD_PART_BYTES: u64 = CANONICAL_BLOB_CHUNK_BYTES as u64 * 16;
@@ -73,7 +73,7 @@ impl AuthenticatedBlobRef {
 /// row. A BlobId is only a semantic field checked after that row's manifest
 /// edge has been authenticated; it is never used as a physical lookup key.
 pub(crate) struct ForkTreeBlobReader<R> {
-    read: R,
+    forktree: ForkTreeReadFacade<R>,
     branch_id: CanonicalBranchId,
 }
 
@@ -110,8 +110,15 @@ where
     }
 }
 
-pub(crate) fn blob_reader_on_read<R>(
+pub(crate) fn blob_reader_on_read<R: StorageAdapterRead>(
     read: R,
+    branch_id: &str,
+) -> Result<ForkTreeBlobReader<R>, crate::LixError> {
+    blob_reader_on_facade(ForkTreeReadFacade::new(read), branch_id)
+}
+
+pub(crate) fn blob_reader_on_facade<R: StorageAdapterRead>(
+    forktree: ForkTreeReadFacade<R>,
     branch_id: &str,
 ) -> Result<ForkTreeBlobReader<R>, crate::LixError> {
     let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
@@ -121,7 +128,7 @@ pub(crate) fn blob_reader_on_read<R>(
         )
     })?;
     Ok(ForkTreeBlobReader {
-        read,
+        forktree,
         branch_id: CanonicalBranchId::from_bytes(*uuid.as_bytes()),
     })
 }
@@ -130,28 +137,26 @@ impl<R> ForkTreeBlobReader<R>
 where
     R: StorageAdapterRead + Clone,
 {
-    async fn bind_state_keys(
+    async fn bind_state_keys<V>(
         &self,
-        view: &CoherentView<R>,
+        view: &CoherentView<V>,
         keys: &[StateKey],
     ) -> Result<Vec<AuthenticatedBlobRef>, crate::LixError>
     where
-        R: Sync,
+        V: StorageAdapterRead + Sync,
     {
-        let mut refs = Vec::with_capacity(keys.len());
-        for key in keys {
-            let reference = view
-                .bind_blob_at_state_key(key)
-                .await?
-                .ok_or_else(|| {
+        view.bind_blobs_at_state_keys(keys)
+            .await?
+            .into_iter()
+            .map(|reference| {
+                reference.ok_or_else(|| {
                     crate::LixError::new(
                         crate::LixError::CODE_STORAGE_ERROR,
                         "selected filesystem BlobRef owner is absent from the authenticated ForkTree view",
                     )
-                })?;
-            refs.push(reference);
-        }
-        Ok(refs)
+                })
+            })
+            .collect()
     }
 
     pub(crate) async fn load_bytes_for_state_keys(
@@ -164,8 +169,7 @@ where
         if keys.is_empty() {
             return Ok(crate::binary_cas::BlobBytesBatch::new(Vec::new()));
         }
-        let view =
-            super::view::open_coherent_view_on_read(self.read.clone(), self.branch_id).await?;
+        let view = self.forktree.branch_canonical(self.branch_id).await?;
         let refs = self.bind_state_keys(&view, keys).await?;
         view.load_blob_bytes_many(&refs).await
     }
@@ -180,8 +184,7 @@ where
         if requests.is_empty() {
             return Ok(crate::binary_cas::BlobRangeBytesBatch::new(Vec::new()));
         }
-        let view =
-            super::view::open_coherent_view_on_read(self.read.clone(), self.branch_id).await?;
+        let view = self.forktree.branch_canonical(self.branch_id).await?;
         let keys = requests
             .iter()
             .map(|(key, _)| key.clone())
@@ -298,24 +301,56 @@ where
     where
         R: Sync,
     {
-        let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
-            schema_key: &key.schema_key,
-            file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
-        });
-        let row = super::serving::state_point(self, &encoded_key, false)
+        let mut refs = self
+            .bind_blobs_at_state_keys(std::slice::from_ref(key))
+            .await?;
+        Ok(refs.pop().flatten())
+    }
+
+    /// Resolves and authenticates every typed BlobRef owner in one ordered-tree
+    /// batch. Slots preserve the caller's StateKey order; manifest loading is
+    /// a separate batched step on this same retained view.
+    pub(crate) async fn bind_blobs_at_state_keys(
+        &self,
+        keys: &[StateKey],
+    ) -> Result<Vec<Option<AuthenticatedBlobRef>>, crate::LixError>
+    where
+        R: Sync,
+    {
+        let encoded_keys = keys
+            .iter()
+            .map(|key| {
+                super::state::encode_state_key(super::state::StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                })
+            })
+            .collect::<Vec<_>>();
+        let rows = super::serving::state_points(self, &encoded_keys, false)
             .await
             .map_err(crate::LixError::from)?;
-        row.map(|row| {
-            bind_state_blob_ref(
-                &row,
-                Some(key),
-                self.branch_id(),
-                self.view_id(),
-                self.view_instance_id(),
+        if rows.len() != keys.len() {
+            return Err(corruption(
+                "authenticated BlobRef point batch returned the wrong slot count",
             )
-        })
-        .transpose()
+            .into());
+        }
+        keys.iter()
+            .zip(rows)
+            .map(|(key, row)| {
+                row.map(|row| {
+                    bind_state_blob_ref(
+                        &row,
+                        Some(key),
+                        self.branch_id(),
+                        self.view_id(),
+                        self.view_instance_id(),
+                    )
+                })
+                .transpose()
+            })
+            .collect()
     }
 
     /// Loads complete payloads without allowing the authenticated row edge to

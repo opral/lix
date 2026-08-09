@@ -23,11 +23,11 @@ use crate::transaction::types::{PreparedStateRowRef, StageJson};
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
+    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ForkTreeReadFacade, ObjectId,
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef, StateKey,
     StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
     encode_state_key, encode_state_value, load_commit, load_commit_summary,
-    open_coherent_view_on_read, select_historical_commit_member, state_point, state_points,
+    select_historical_commit_member, state_point, state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -204,12 +204,12 @@ pub(crate) async fn prepare_forktree_publication_with_parent_heads<R>(
     active_account_id: &str,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
-    read: R,
+    forktree: &ForkTreeReadFacade<R>,
     prepared_writes: PreparedWriteSet,
     pending_publication: Option<PreparedPublication>,
 ) -> Result<PreparedForkTreePlan, LixError>
 where
-    R: StorageAdapterRead + Clone,
+    R: StorageAdapterRead,
 {
     let intent = classify_publication_intent(&prepared_writes, runtime_checkpoint)?;
     let PublicationIntent::Ordinary {
@@ -223,7 +223,7 @@ where
         });
     };
     let branch_id = sole_publication_branch(&prepared_writes, runtime_checkpoint.is_some())?;
-    let view = open_coherent_view_on_read(read, publication_branch_id).await?;
+    let view = forktree.branch_canonical(publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
     if let Some(pending) = pending_publication {
         publication.merge_from(pending)?;

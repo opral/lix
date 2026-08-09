@@ -1270,11 +1270,13 @@ async fn path_copy_catalog_put_and_view_bound_resume_are_bounded() {
 struct CountingStorage {
     inner: Memory,
     begin_reads: Arc<AtomicUsize>,
+    selector_get_many: Arc<AtomicUsize>,
     untracked_get_many: Arc<AtomicUsize>,
 }
 
 struct CountingRead {
     inner: MemoryRead,
+    selector_get_many: Arc<AtomicUsize>,
     untracked_get_many: Arc<AtomicUsize>,
 }
 
@@ -1339,6 +1341,13 @@ impl StorageRead for CountingRead {
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        self.selector_get_many.fetch_add(
+            requests
+                .iter()
+                .filter(|request| request.space == SELECTOR_SPACE)
+                .count(),
+            Ordering::Relaxed,
+        );
         self.untracked_get_many.fetch_add(
             requests
                 .iter()
@@ -1364,6 +1373,7 @@ impl CountingStorage {
         Self {
             inner: Memory::new(),
             begin_reads: Arc::new(AtomicUsize::new(0)),
+            selector_get_many: Arc::new(AtomicUsize::new(0)),
             untracked_get_many: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -1377,6 +1387,7 @@ impl Storage for CountingStorage {
         self.begin_reads.fetch_add(1, Ordering::Relaxed);
         Ok(CountingRead {
             inner: self.inner.begin_read(options).await?,
+            selector_get_many: Arc::clone(&self.selector_get_many),
             untracked_get_many: Arc::clone(&self.untracked_get_many),
         })
     }
@@ -1525,6 +1536,37 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
         .await
         .expect("bounded open does not traverse an unrelated catalog member");
     assert!(load_change(&view, seed.semantic_change_id).await.is_err());
+}
+
+#[tokio::test]
+async fn operation_facade_authenticates_one_branch_view_once_across_clones() {
+    let seed = build_seed();
+    let storage = CountingStorage::new();
+    seed_storage(&storage, &seed).await;
+    let read = SharedStorageAdapterRead::new(StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("one retained operation read"),
+    ));
+    let facade = ForkTreeReadFacade::new(read);
+
+    let first = facade
+        .branch_canonical(seed.branch_id)
+        .await
+        .expect("authenticate branch view");
+    let cloned_facade = facade.clone();
+    let second = cloned_facade
+        .branch_canonical(seed.branch_id)
+        .await
+        .expect("reuse authenticated branch view");
+
+    assert_eq!(storage.begin_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(storage.selector_get_many.load(Ordering::Relaxed), 1);
+    assert_eq!(first.view_id(), second.view_id());
+    assert_eq!(first.view_instance_id(), second.view_instance_id());
+    assert_eq!(first.raw_global_selector(), second.raw_global_selector());
+    assert_eq!(first.raw_branch_selector(), second.raw_branch_selector());
 }
 
 #[tokio::test]

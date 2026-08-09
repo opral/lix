@@ -36,7 +36,6 @@ impl FunctionContext {
     ///
     /// If deterministic mode is absent or disabled, the context uses system
     /// functions. If enabled, it starts from the persisted sequence + 1.
-    #[expect(trivial_casts)]
     pub(crate) async fn prepare(
         read: &(impl StorageAdapterRead + ?Sized),
     ) -> Result<Self, LixError> {
@@ -46,6 +45,13 @@ impl FunctionContext {
         }
 
         let sequence = state::load_sequence(read).await?;
+        Ok(Self::deterministic(mode, sequence))
+    }
+
+    fn deterministic(
+        mode: crate::functions::DeterministicMode,
+        sequence: DeterministicSequence,
+    ) -> Self {
         // Deterministic mode must produce byte-identical state across runs;
         // bookkeeping rows (sequence persistence) take a timestamp derived
         // from the persisted sequence instead of the system clock, without
@@ -54,15 +60,29 @@ impl FunctionContext {
         // ordering assumptions on user-visible timestamps only.
         let bookkeeping_timestamp =
             LixTimestamp::from_unix_millis_utc_lossy(sequence.next_sequence());
-        Ok(Self {
-            functions: FunctionProviderHandle::shared(Box::new(DeterministicFunctionProvider::new(
-                sequence.next_sequence(),
-                mode.timestamp_shuffle,
-            ))
-                as Box<dyn FunctionProvider + Send>),
+        let functions: Box<dyn FunctionProvider + Send> = Box::new(
+            DeterministicFunctionProvider::new(sequence.next_sequence(), mode.timestamp_shuffle),
+        );
+        Self {
+            functions: FunctionProviderHandle::shared(functions),
             bookkeeping_timestamp,
             deterministic_mode_enabled: true,
-        })
+        }
+    }
+
+    /// Prepares functions from an already-retained authenticated ForkTree
+    /// operation view. This avoids opening a second selector view solely for
+    /// deterministic bookkeeping while preserving the same state semantics.
+    pub(crate) async fn prepare_from_live_state(
+        live_state: &dyn crate::live_state::LiveStateReader,
+    ) -> Result<Self, LixError> {
+        let mode = state::load_mode_from_live_state(live_state).await?;
+        if !mode.enabled {
+            return Ok(Self::system_for_function_free_read());
+        }
+
+        let sequence = state::load_sequence_from_live_state(live_state).await?;
+        Ok(Self::deterministic(mode, sequence))
     }
 
     pub(crate) fn deterministic_mode_enabled(&self) -> bool {
