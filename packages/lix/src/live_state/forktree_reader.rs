@@ -9,6 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
@@ -316,6 +318,29 @@ where
     }
     let view = facade.branch(&request.rows[0].branch_id).await?;
     load_exact_view(&view, request).await
+}
+
+/// The ForkTree owner itself satisfies the engine read capability. This keeps
+/// transaction overlays on the caller-owned facade instead of embedding the
+/// superseded `LiveStateStoreReader` as a second current-state owner.
+#[async_trait]
+impl<R> crate::live_state::LiveStateReader for ForkTreeReadFacade<R>
+where
+    R: StorageAdapterRead + 'static,
+{
+    async fn scan_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        scan_facade(self, request).await
+    }
+
+    async fn load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        load_exact_facade(self, request).await
+    }
 }
 
 async fn load_exact_view<R>(
