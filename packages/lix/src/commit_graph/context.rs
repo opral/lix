@@ -304,7 +304,23 @@ impl CommitGraphLiveStateReader {
         } else {
             (BTreeMap::new(), false)
         };
-        let authenticated_heads = self.branch_ref.scan_head_metadata().await?;
+        let requested_branch_ids = if global_commit_surface || request.filter.branch_ids.is_empty()
+        {
+            None
+        } else {
+            let mut unique = Vec::with_capacity(request.filter.branch_ids.len());
+            let mut seen = BTreeSet::new();
+            for branch_id in &request.filter.branch_ids {
+                if seen.insert(branch_id.clone()) {
+                    unique.push(branch_id.clone());
+                }
+            }
+            Some(unique)
+        };
+        let authenticated_heads = match requested_branch_ids.as_deref() {
+            Some(branch_ids) => self.branch_ref.load_head_metadata_batch(branch_ids).await?,
+            None => self.branch_ref.scan_head_metadata().await?,
+        };
         let authenticated_heads_by_branch = authenticated_heads
             .iter()
             .map(|(head, _metadata)| (head.branch_id.clone(), head.clone()))
@@ -333,32 +349,25 @@ impl CommitGraphLiveStateReader {
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            request.filter.branch_ids.clone()
+            requested_branch_ids.expect("explicit branch filters select a requested batch")
         };
         let mut rows = Vec::new();
         for branch_id in branch_ids {
             let head = if global_commit_surface {
-                self.branch_ref
-                    .load_head(&branch_id)
-                    .await?
-                    .ok_or_else(|| {
-                        LixError::branch_not_found(
-                            branch_id.clone(),
-                            "scan ForkTree derived commit surface",
-                            "branch head",
-                        )
-                    })?
+                None
             } else {
-                authenticated_heads_by_branch
-                    .get(&branch_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        LixError::branch_not_found(
-                            branch_id.clone(),
-                            "scan ForkTree derived commit surface",
-                            "branch head",
-                        )
-                    })?
+                Some(
+                    authenticated_heads_by_branch
+                        .get(&branch_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LixError::branch_not_found(
+                                branch_id.clone(),
+                                "scan ForkTree derived commit surface",
+                                "branch head",
+                            )
+                        })?,
+                )
             };
             let mut reachable_by_id = BTreeMap::new();
             if global_commit_surface && retained_nodes_until_gc {
@@ -399,6 +408,7 @@ impl CommitGraphLiveStateReader {
                         .or_insert(ReachableCommitGraphNode { commit, depth: 0 });
                 }
             } else {
+                let head = head.expect("non-global derived surfaces require a selected head");
                 let mut root_ids = BTreeSet::from([head.commit_id]);
                 if let Some(roots) = recovery_roots.get(&branch_id) {
                     root_ids.extend(roots.iter().copied());
@@ -542,9 +552,16 @@ impl CommitGraphLiveStateReader {
         Ok(rows)
     }
 
-    async fn branch_ref_rows(&self) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    async fn branch_ref_rows(
+        &self,
+        requested_branch_ids: Option<&[String]>,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let mut rows = Vec::new();
-        for (head, metadata) in self.branch_ref.scan_head_metadata().await? {
+        let heads = match requested_branch_ids {
+            Some(branch_ids) => self.branch_ref.load_head_metadata_batch(branch_ids).await?,
+            None => self.branch_ref.scan_head_metadata().await?,
+        };
+        for (head, metadata) in heads {
             let entity_pk = EntityPk::uuid_from_canonical(&head.branch_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
@@ -604,7 +621,27 @@ impl CommitGraphLiveStateReader {
         {
             return Ok(Vec::new());
         }
-        let mut rows = self.branch_ref_rows().await?;
+        let requested_branch_ids = if request.filter.entity_pks.is_empty() {
+            None
+        } else {
+            let mut unique = Vec::with_capacity(request.filter.entity_pks.len());
+            let mut seen = BTreeSet::new();
+            for entity_pk in &request.filter.entity_pks {
+                let branch_id = entity_pk.as_single_string_owned().map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("requested branch-ref identity is not a UUID: {error}"),
+                    )
+                })?;
+                if seen.insert(branch_id.clone()) {
+                    unique.push(branch_id);
+                }
+            }
+            Some(unique)
+        };
+        let mut rows = self
+            .branch_ref_rows(requested_branch_ids.as_deref())
+            .await?;
         rows.retain(|row| {
             request.filter.entity_pks.is_empty()
                 || request.filter.entity_pks.contains(&row.entity_pk)
@@ -648,7 +685,8 @@ impl LiveStateReader for CommitGraphLiveStateReader {
                     slots,
                 );
             }
-            let rows = self.branch_ref_rows().await?;
+            let mut requested_branch_ids = Vec::with_capacity(request.rows.len());
+            let mut seen = BTreeSet::new();
             for requested in &request.rows {
                 if requested.branch_id != crate::GLOBAL_BRANCH_ID {
                     return Err(LixError::new(
@@ -656,6 +694,21 @@ impl LiveStateReader for CommitGraphLiveStateReader {
                         "ForkTree branch-ref exact reads require the global branch",
                     ));
                 }
+                let branch_id = requested
+                    .entity_pk
+                    .as_single_string_owned()
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!("requested branch-ref identity is not a UUID: {error}"),
+                        )
+                    })?;
+                if seen.insert(branch_id.clone()) {
+                    requested_branch_ids.push(branch_id);
+                }
+            }
+            let rows = self.branch_ref_rows(Some(&requested_branch_ids)).await?;
+            for requested in &request.rows {
                 let Some(row) = rows.iter().find(|row| row.entity_pk == requested.entity_pk) else {
                     slots.push(None);
                     continue;
@@ -1401,17 +1454,19 @@ pub(crate) fn canonical_commit_change(record: &CommitRecord) -> CommitGraphChang
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::branch::{BranchHead, BranchRefMetadata};
     use crate::common::LixTimestamp;
-    use crate::live_state::{LiveStateFilter, LiveStateRowFilter};
+    use crate::live_state::{LiveStateExactRowRequest, LiveStateFilter, LiveStateRowFilter};
 
     struct CountingBatchBranchRefReader {
         rows: Vec<(BranchHead, BranchRefMetadata)>,
         scan_calls: AtomicUsize,
         load_calls: AtomicUsize,
+        batch_calls: Mutex<Vec<Vec<String>>>,
     }
 
     impl CountingBatchBranchRefReader {
@@ -1433,6 +1488,7 @@ mod tests {
                     .collect(),
                 scan_calls: AtomicUsize::new(0),
                 load_calls: AtomicUsize::new(0),
+                batch_calls: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1453,6 +1509,25 @@ mod tests {
         ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
             self.scan_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.rows.clone())
+        }
+
+        async fn load_head_metadata_batch(
+            &self,
+            branch_ids: &[String],
+        ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
+            self.batch_calls
+                .lock()
+                .expect("batch call log is not poisoned")
+                .push(branch_ids.to_vec());
+            Ok(branch_ids
+                .iter()
+                .filter_map(|branch_id| {
+                    self.rows
+                        .iter()
+                        .find(|(head, _)| &head.branch_id == branch_id)
+                        .cloned()
+                })
+                .collect())
         }
     }
 
@@ -1495,7 +1570,7 @@ mod tests {
 
     #[tokio::test]
     async fn derived_empty_branch_filter_batches_heads_without_point_reload() {
-        for branch_count in [32, 128] {
+        for branch_count in [1, 32, 128] {
             let branch_ref = Arc::new(CountingBatchBranchRefReader::new(branch_count));
             let graph = Arc::new(tokio::sync::Mutex::new(
                 Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
@@ -1525,6 +1600,233 @@ mod tests {
             assert!(rows.is_empty());
             assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 1);
             assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                branch_ref
+                    .batch_calls
+                    .lock()
+                    .expect("batch call log is not poisoned")
+                    .is_empty()
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn derived_explicit_branch_filter_uses_one_requested_metadata_batch() {
+        let branch_ref = Arc::new(CountingBatchBranchRefReader::new(128));
+        let graph = Arc::new(tokio::sync::Mutex::new(
+            Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
+        ));
+        let reader = CommitGraphLiveStateReader::new(
+            "lix_commit_by_branch",
+            graph,
+            branch_ref.clone(),
+            None,
+            false,
+            false,
+        );
+        let requested = vec![
+            branch_ref.rows[5].0.branch_id.clone(),
+            branch_ref.rows[2].0.branch_id.clone(),
+            branch_ref.rows[5].0.branch_id.clone(),
+        ];
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                rows: LiveStateRowFilter::All,
+                schema_keys: vec!["lix_commit_by_branch".to_owned()],
+                branch_ids: requested,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rows = reader
+            .rows_for_request(&request)
+            .await
+            .expect("explicit branch filter should use authenticated requested batch");
+        assert!(rows.is_empty());
+        assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned"),
+            vec![vec![
+                branch_ref.rows[5].0.branch_id.clone(),
+                branch_ref.rows[2].0.branch_id.clone(),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_explicit_missing_branch_fails_closed_after_one_requested_batch() {
+        let branch_ref = Arc::new(CountingBatchBranchRefReader::new(128));
+        let graph = Arc::new(tokio::sync::Mutex::new(
+            Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
+        ));
+        let reader = CommitGraphLiveStateReader::new(
+            "lix_commit_by_branch",
+            graph,
+            branch_ref.clone(),
+            None,
+            false,
+            false,
+        );
+        let requested = vec![
+            branch_ref.rows[5].0.branch_id.clone(),
+            "01930000-0000-7000-8000-ffffffffffff".to_owned(),
+        ];
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                rows: LiveStateRowFilter::All,
+                schema_keys: vec!["lix_commit_by_branch".to_owned()],
+                branch_ids: requested,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = reader
+            .rows_for_request(&request)
+            .await
+            .expect_err("missing requested branch must fail closed");
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+        assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned"),
+            vec![vec![
+                branch_ref.rows[5].0.branch_id.clone(),
+                "01930000-0000-7000-8000-ffffffffffff".to_owned(),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn global_commit_surface_reuses_scanned_heads_without_global_point_reload() {
+        let branch_ref = Arc::new(CountingBatchBranchRefReader::new(128));
+        let graph = Arc::new(tokio::sync::Mutex::new(
+            Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
+        ));
+        let reader = CommitGraphLiveStateReader::new(
+            "lix_commit",
+            graph,
+            branch_ref.clone(),
+            None,
+            true,
+            true,
+        );
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                rows: LiveStateRowFilter::All,
+                schema_keys: vec!["lix_commit".to_owned()],
+                branch_ids: Vec::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rows = reader
+            .rows_for_request(&request)
+            .await
+            .expect("global derived surface should use the scanned authenticated roots");
+        assert!(rows.is_empty());
+        assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_ref_entity_scope_uses_requested_metadata_batch() {
+        let branch_ref = Arc::new(CountingBatchBranchRefReader::new(128));
+        let graph = Arc::new(tokio::sync::Mutex::new(
+            Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
+        ));
+        let reader = CommitGraphLiveStateReader::new(
+            BRANCH_REF_SCHEMA_KEY,
+            graph,
+            branch_ref.clone(),
+            None,
+            false,
+            false,
+        );
+        let branch_id = branch_ref.rows[5].0.branch_id.clone();
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                rows: LiveStateRowFilter::All,
+                schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_owned()],
+                entity_pks: vec![EntityPk::uuid_from_canonical(&branch_id).expect("test UUID")],
+                branch_ids: vec![crate::GLOBAL_BRANCH_ID.to_owned()],
+                untracked: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rows = reader
+            .rows_for_request(&request)
+            .await
+            .expect("branch-ref entity scope should use requested batch");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned"),
+            vec![vec![branch_id]]
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_ref_exact_batch_uses_requested_metadata_batch() {
+        let branch_ref = Arc::new(CountingBatchBranchRefReader::new(128));
+        let graph = Arc::new(tokio::sync::Mutex::new(
+            Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
+        ));
+        let reader = CommitGraphLiveStateReader::new(
+            BRANCH_REF_SCHEMA_KEY,
+            graph,
+            branch_ref.clone(),
+            None,
+            false,
+            false,
+        );
+        let branch_id = branch_ref.rows[5].0.branch_id.clone();
+        let request = LiveStateExactBatchRequest {
+            rows: vec![LiveStateExactRowRequest {
+                schema_key: BRANCH_REF_SCHEMA_KEY.to_owned(),
+                branch_id: crate::GLOBAL_BRANCH_ID.to_owned(),
+                entity_pk: EntityPk::uuid_from_canonical(&branch_id).expect("test UUID"),
+                file_id: None,
+            }],
+            untracked: Some(true),
+            ..Default::default()
+        };
+
+        let result = reader
+            .load_exact_batch(&request)
+            .await
+            .expect("branch-ref exact batch should use requested batch");
+        assert_eq!(result.len(), 1);
+        assert_eq!(branch_ref.scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(branch_ref.load_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *branch_ref
+                .batch_calls
+                .lock()
+                .expect("batch call log is not poisoned"),
+            vec![vec![branch_id]]
+        );
     }
 }
