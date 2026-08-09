@@ -218,6 +218,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_retirement_keeps_catalog_revision_until_identity_is_recreated() {
+        let branch_id = "01920000-0000-7000-8000-0000000000e1";
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let adapter = StorageAdapter::new(storage.clone());
+        let engine = Engine::new(storage).await.expect("engine should open");
+        let session = engine
+            .open_session(&receipt.main_branch_id)
+            .await
+            .expect("main session should open");
+        session
+            .create_branch(CreateBranchOptions {
+                id: Some(branch_id.to_string()),
+                name: "Retired catalog revision branch".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("branch should be created");
+        let created_revision = current_revision(&adapter).await;
+
+        let deleted = session
+            .execute(
+                &format!("DELETE FROM lix_branch WHERE id = '{branch_id}'"),
+                &[],
+            )
+            .await
+            .expect("branch should be retired");
+        assert_eq!(deleted.rows_affected(), 1);
+        assert_eq!(
+            current_revision(&adapter).await,
+            created_revision,
+            "retiring a branch cannot change surviving schema visibility"
+        );
+
+        session
+            .create_branch(CreateBranchOptions {
+                id: Some(branch_id.to_string()),
+                name: "Recreated catalog revision branch".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("branch identity should be recreated");
+        assert_ne!(
+            current_revision(&adapter).await,
+            created_revision,
+            "recreation must fence any cached catalog for the retired identity"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_engine_commit_invalidates_next_open_but_not_open_transaction() {
         let storage = Memory::new();
         let receipt = Engine::initialize(storage.clone())

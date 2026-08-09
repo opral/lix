@@ -2070,6 +2070,15 @@ pub(crate) async fn try_execute_bound_public_write(
     metadata: &ExecuteStatementMetadata,
 ) -> Result<BoundPublicWriteExecution, LixError> {
     match &plan.bound.target {
+        BoundWriteTarget::Branch => {
+            let Some(id) = exact_branch_delete_id(plan, params)? else {
+                return Ok(BoundPublicWriteExecution::Unsupported);
+            };
+            crate::sql2::providers::execute_exact_branch_delete(ctx, id)
+                .await
+                .map(SqlWriteResult::affected)
+                .map(BoundPublicWriteExecution::Executed)
+        }
         BoundWriteTarget::Entity(surface) if bound_public_write_shape_supported(plan) => {
             execute_entity_write(ctx, plan, surface, params)
                 .await
@@ -2093,6 +2102,38 @@ pub(crate) async fn try_execute_bound_public_write(
         }
         _ => Ok(BoundPublicWriteExecution::Unsupported),
     }
+}
+
+fn exact_branch_delete_id(
+    plan: &LogicalWritePlan,
+    params: &[Value],
+) -> Result<Option<String>, LixError> {
+    if plan.bound.op != BoundWriteOp::Delete
+        || !matches!(plan.bound.input, BoundWriteInput::None)
+        || plan.bound.returning.is_some()
+        || plan.bound.conflict.is_some()
+        || !plan.bound.assignments.is_empty()
+    {
+        return Ok(None);
+    }
+    let BoundPredicate::Eq(left, right) = &plan.bound.predicate else {
+        return Ok(None);
+    };
+    let value = match (left, right) {
+        (BoundExpr::Column(column), value) | (value, BoundExpr::Column(column))
+            if column.name == "id" =>
+        {
+            value
+        }
+        _ => return Ok(None),
+    };
+    if !matches!(
+        value,
+        BoundExpr::Literal(BoundLiteral::Text(_)) | BoundExpr::Param(_)
+    ) {
+        return Ok(None);
+    }
+    eval_fast_file_text(value, params, "id").map(Some)
 }
 
 struct FastFileContentUpdateShape {

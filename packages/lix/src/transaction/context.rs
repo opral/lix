@@ -9269,7 +9269,15 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
         .values()
         .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
         .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
-        || !prepared_writes.branch_ref_intents.is_empty()
+        // Retiring a branch removes its descriptor and selector but cannot
+        // change registered-schema visibility for any surviving branch.
+        // Creation/repoint still rotates the revision: creation fences a
+        // cached snapshot if the same branch identity is reused, while a
+        // repoint can expose another commit's registered schemas.
+        || prepared_writes
+            .branch_ref_intents
+            .iter()
+            .any(|intent| intent.create || intent.commit_id.is_some())
 }
 
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
