@@ -1041,6 +1041,51 @@ pub(crate) struct BlobChunkRefV1 {
     pub(crate) declared_len: u64,
 }
 
+/// One canonical authenticated Merkle leaf. The chunk object remains the
+/// payload owner; this node binds its ordinal, length, and content digest into
+/// the range-proof tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlobMerkleLeafV1 {
+    pub(crate) ordinal: u64,
+    pub(crate) chunk_object_id: ObjectId,
+    pub(crate) declared_len: u64,
+    pub(crate) chunk_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobMerkleNodeRefV1 {
+    pub(crate) object_id: ObjectId,
+    pub(crate) height: u32,
+    pub(crate) first_ordinal: u64,
+    pub(crate) leaf_count: u64,
+    pub(crate) logical_bytes: u64,
+}
+
+/// One canonical internal node. Child summaries are encoded along with child
+/// ObjectIds so a proof can validate adjacency and lengths without reading an
+/// unrelated subtree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobMerkleInternalV1 {
+    pub(crate) height: u32,
+    pub(crate) first_ordinal: u64,
+    pub(crate) leaf_count: u64,
+    pub(crate) logical_bytes: u64,
+    pub(crate) left: BlobMerkleNodeRefV1,
+    pub(crate) right: BlobMerkleNodeRefV1,
+}
+
+/// The authenticated layout descriptor consumed by the future publication
+/// owner. `canonical_blob_id` is derived from the canonical Merkle root using
+/// a domain-separated, geometry-bound reduction; `root_object_id` remains the
+/// physical object edge used to prove requested leaves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobMerkleManifestV1 {
+    pub(crate) logical_bytes: u64,
+    pub(crate) leaf_count: u64,
+    pub(crate) root_object_id: ObjectId,
+    pub(crate) canonical_blob_id: BlobId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlobChunkV1 {
     pub(crate) bytes: Bytes,
