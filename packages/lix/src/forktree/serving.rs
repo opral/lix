@@ -2389,6 +2389,7 @@ where
     Ok(edit)
 }
 
+#[cfg(test)]
 pub(crate) async fn retire_commit_catalog_entries<R>(
     root: ObjectId,
     ids: &[CommitId],
@@ -2406,6 +2407,7 @@ where
     edit_catalog(root, "commit", &mutations, read, false).await
 }
 
+#[cfg(test)]
 pub(crate) async fn retire_change_catalog_entries<R>(
     root: ObjectId,
     ids: &[ChangeId],

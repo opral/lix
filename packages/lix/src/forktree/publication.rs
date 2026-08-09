@@ -1091,6 +1091,7 @@ impl PreparedPublication {
         Ok(target_id)
     }
 
+    #[cfg(test)]
     fn release_snapshot_pin(
         &mut self,
         selector: SnapshotSelectorV1,
@@ -1111,6 +1112,7 @@ impl PreparedPublication {
     /// moving the epoch, selector, RepositoryRoot, and catalog roots in one
     /// commit prevents either a dangling back-edge or an early reclamation
     /// window.
+    #[cfg(test)]
     pub(crate) fn release_snapshot_pin_with_catalog_retirement<R>(
         &mut self,
         view: &CoherentView<R>,

@@ -1485,19 +1485,13 @@ impl UploadSelectorV1 {
 pub(crate) enum SnapshotRole {
     Checkpoint = 1,
     Recovery = 2,
-    Undo = 3,
-    Redo = 4,
-    BranchTombstone = 5,
 }
 
 impl SnapshotRole {
-    fn decode(value: u8) -> Result<Self, StorageError> {
+    pub(super) fn decode(value: u8) -> Result<Self, StorageError> {
         match value {
             1 => Ok(Self::Checkpoint),
             2 => Ok(Self::Recovery),
-            3 => Ok(Self::Undo),
-            4 => Ok(Self::Redo),
-            5 => Ok(Self::BranchTombstone),
             _ => Err(corruption(format!(
                 "unknown retained snapshot role {value}"
             ))),
@@ -1508,9 +1502,6 @@ impl SnapshotRole {
         match self {
             Self::Checkpoint => b"checkpoint/",
             Self::Recovery => b"recovery/",
-            Self::Undo => b"undo/",
-            Self::Redo => b"redo/",
-            Self::BranchTombstone => b"branch-tombstone/",
         }
     }
 }
