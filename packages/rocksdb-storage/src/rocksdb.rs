@@ -36,6 +36,43 @@ const BLOB_GC_FORCE_THRESHOLD: f64 = 0.5;
 const MUTABLE_COLUMN_FAMILY: &str = "default";
 const IMMUTABLE_COLUMN_FAMILY: &str = "lix-immutable-v1";
 
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct RocksDBIoCounters {
+    inner: Arc<RocksDBIoCounterValues>,
+}
+
+#[derive(Debug, Default)]
+struct RocksDBIoCounterValues {
+    get_many_calls: AtomicU64,
+    get_many_bytes: AtomicU64,
+    scan_pages: AtomicU64,
+    scan_rows: AtomicU64,
+    scan_bytes: AtomicU64,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RocksDBIoSnapshot {
+    pub get_many_calls: u64,
+    pub get_many_bytes: u64,
+    pub scan_pages: u64,
+    pub scan_rows: u64,
+    pub scan_bytes: u64,
+}
+
+impl RocksDBIoCounters {
+    pub fn snapshot(&self) -> RocksDBIoSnapshot {
+        RocksDBIoSnapshot {
+            get_many_calls: self.inner.get_many_calls.load(Ordering::Relaxed),
+            get_many_bytes: self.inner.get_many_bytes.load(Ordering::Relaxed),
+            scan_pages: self.inner.scan_pages.load(Ordering::Relaxed),
+            scan_rows: self.inner.scan_rows.load(Ordering::Relaxed),
+            scan_bytes: self.inner.scan_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RocksDBFactory {
     temp_dir: TempDir,
@@ -58,12 +95,14 @@ pub struct RocksDB {
 struct RocksDBInner {
     db: DB,
     write_gate: WriteGate,
+    io_counters: Option<RocksDBIoCounters>,
 }
 
 #[allow(missing_debug_implementations)]
 pub struct RocksDBRead<'a> {
     db: &'a DB,
     snapshot: Snapshot<'a>,
+    io_counters: Option<RocksDBIoCounters>,
 }
 
 #[allow(missing_debug_implementations)]
@@ -126,7 +165,19 @@ impl RocksDB {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let path = path.into();
         Ok(Self {
-            inner: open_shared_rocksdb(path.clone())?,
+            inner: open_shared_rocksdb(path.clone(), None)?,
+            path,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_io_counters(
+        path: impl Into<PathBuf>,
+        counters: RocksDBIoCounters,
+    ) -> Result<Self, StorageError> {
+        let path = path.into();
+        Ok(Self {
+            inner: open_shared_rocksdb(path.clone(), Some(counters))?,
             path,
         })
     }
@@ -178,6 +229,7 @@ impl Storage for RocksDB {
             Ok(RocksDBRead {
                 db: &self.inner.db,
                 snapshot: self.inner.db.snapshot(),
+                io_counters: self.inner.io_counters.clone(),
             })
         }
     }
@@ -324,6 +376,12 @@ impl StorageRead for RocksDBRead<'_> {
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
             let key_count = requests.iter().map(|request| request.keys.len()).sum();
+            if let Some(counters) = &self.io_counters {
+                counters
+                    .inner
+                    .get_many_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let mut results = Vec::with_capacity(key_count);
             for request in requests {
                 let cf = column_family(self.db, request.space);
@@ -355,6 +413,14 @@ impl StorageRead for RocksDBRead<'_> {
                                 .into_iter()
                                 .map(|value| {
                                     value.map_err(rocksdb_error).map(|value| {
+                                        if let Some(value) = &value {
+                                            if let Some(counters) = &self.io_counters {
+                                                counters.inner.get_many_bytes.fetch_add(
+                                                    value.len() as u64,
+                                                    Ordering::Relaxed,
+                                                );
+                                            }
+                                        }
                                         value.map(|value| ProjectedValue::FullValue(value.into()))
                                     })
                                 })
@@ -390,6 +456,7 @@ impl StorageRead for RocksDBRead<'_> {
                     bounds,
                     projection: opts.projection,
                     space,
+                    io_counters: self.io_counters.clone(),
                 },
             )
         }
@@ -401,6 +468,7 @@ struct RocksDBScanSource<'a> {
     bounds: EncodedBounds,
     projection: CoreProjection,
     space: StorageSpace,
+    io_counters: Option<RocksDBIoCounters>,
 }
 
 impl StorageScanSource for RocksDBScanSource<'_> {
@@ -409,7 +477,11 @@ impl StorageScanSource for RocksDBScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
         Box::pin(async move {
+            if let Some(counters) = &self.io_counters {
+                counters.inner.scan_pages.fetch_add(1, Ordering::Relaxed);
+            }
             let mut entries = Vec::with_capacity(limit_rows);
+            let mut value_bytes = 0_u64;
             while entries.len() < limit_rows {
                 let Some(encoded_key) = self.iterator.key() else {
                     break;
@@ -432,6 +504,9 @@ impl StorageScanSource for RocksDBScanSource<'_> {
                         })?,
                     )),
                 };
+                if let ProjectedValue::FullValue(value) = &value {
+                    value_bytes = value_bytes.saturating_add(value.len() as u64);
+                }
                 entries.push(ReadEntry { key, value });
                 self.iterator.next();
             }
@@ -440,6 +515,16 @@ impl StorageScanSource for RocksDBScanSource<'_> {
                 .iterator
                 .key()
                 .is_some_and(|key| self.bounds.before_upper(key));
+            if let Some(counters) = &self.io_counters {
+                counters
+                    .inner
+                    .scan_rows
+                    .fetch_add(entries.len() as u64, Ordering::Relaxed);
+                counters
+                    .inner
+                    .scan_bytes
+                    .fetch_add(value_bytes, Ordering::Relaxed);
+            }
             Ok(ScanChunk { entries, has_more })
         })
     }
@@ -661,7 +746,10 @@ fn next_lexicographic_key(key: &Key) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn open_shared_rocksdb(path: PathBuf) -> Result<Arc<RocksDBInner>, StorageError> {
+fn open_shared_rocksdb(
+    path: PathBuf,
+    io_counters: Option<RocksDBIoCounters>,
+) -> Result<Arc<RocksDBInner>, StorageError> {
     let path = registry_key(&path)?;
     let registry = OPEN_DATABASES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut open_databases = registry
@@ -678,6 +766,7 @@ fn open_shared_rocksdb(path: PathBuf) -> Result<Arc<RocksDBInner>, StorageError>
     let inner = Arc::new(RocksDBInner {
         db,
         write_gate: WriteGate::new(),
+        io_counters,
     });
     open_databases.insert(path, Arc::downgrade(&inner));
     Ok(inner)

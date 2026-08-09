@@ -1,7 +1,10 @@
 use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::changelog::CommitId;
-use crate::forktree::{CoherentView, ForkTreeReadFacade};
+use crate::forktree::{
+    CoherentView, ForkTreeReadFacade, HistoricalStateDiffEntry, HistoricalStateRow,
+    historical_state_payloads_differ,
+};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
@@ -55,14 +58,31 @@ where
     S: StorageAdapterRead,
 {
     let view = facade.branch(branch_id).await?;
-    let mut source_diff =
-        load_forktree_diff(&view, commits.base_commit_id, commits.source_commit_id).await?;
+    // Both sides are compared against the same authenticated merge base. Read
+    // and validate that base once through the retained view, then share the
+    // immutable rows between the two side diffs. This is an algorithmic
+    // reduction only: each side still authenticates its own commit, state
+    // rows, and ChangeCatalog payloads before the diff is exposed.
+    let base_rows = view
+        .scan_state_rows_at_commit(commits.base_commit_id)
+        .await?;
+    let mut source_diff = if commits.base_commit_id == commits.source_commit_id {
+        TrackedStateDiff::default()
+    } else {
+        let source_rows = view
+            .scan_state_rows_at_commit(commits.source_commit_id)
+            .await?;
+        load_forktree_diff(&view, base_rows.clone(), source_rows).await?
+    };
     let mut target_diff = if commits.base_commit_id == commits.source_commit_id
         || commits.base_commit_id == commits.target_commit_id
     {
         TrackedStateDiff::default()
     } else {
-        load_forktree_diff(&view, commits.base_commit_id, commits.target_commit_id).await?
+        let target_rows = view
+            .scan_state_rows_at_commit(commits.target_commit_id)
+            .await?;
+        load_forktree_diff(&view, base_rows, target_rows).await?
     };
     exclude_internal_checkpoint_markers(&mut source_diff);
     exclude_internal_checkpoint_markers(&mut target_diff);
@@ -127,15 +147,29 @@ where
 
 async fn load_forktree_diff<S>(
     view: &CoherentView<&S>,
-    base_commit_id: CommitId,
-    side_commit_id: CommitId,
+    before_rows: Vec<HistoricalStateRow>,
+    after_rows: Vec<HistoricalStateRow>,
 ) -> Result<TrackedStateDiff, LixError>
 where
     S: StorageAdapterRead,
 {
-    let entries = view
-        .diff_state_rows_between_commits(base_commit_id, side_commit_id)
-        .await?;
+    let mut by_key = std::collections::BTreeMap::new();
+    for row in before_rows {
+        by_key.entry(row.key.clone()).or_insert((Some(row), None));
+    }
+    for row in after_rows {
+        by_key
+            .entry(row.key.clone())
+            .and_modify(|entry| entry.1 = Some(row.clone()))
+            .or_insert((None, Some(row)));
+    }
+    let entries = by_key
+        .into_values()
+        .filter_map(|(before, after)| {
+            historical_state_payloads_differ(before.as_ref(), after.as_ref())
+                .then_some(HistoricalStateDiffEntry { before, after })
+        })
+        .collect::<Vec<_>>();
     let mut change_ids = BTreeSet::new();
     for entry in &entries {
         if let Some(row) = entry.before.as_ref() {

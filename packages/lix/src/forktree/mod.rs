@@ -45,16 +45,17 @@ pub(crate) use serving::{
     state_point_on_read, state_range,
 };
 pub(crate) use state::{
-    HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
-    UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
-    encode_state_key, encode_state_prefix, encode_state_value, encode_untracked_key,
-    encode_untracked_value,
+    HistoricalStateDiffEntry, HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef,
+    StateValue, StateValueRef, UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef,
+    decode_state_key, decode_state_value, encode_state_key, encode_state_prefix,
+    encode_state_value, encode_untracked_key, encode_untracked_value,
 };
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
 };
 pub(crate) use view::{
-    CoherentView, ForkTreeReadFacade, open_coherent_view, open_coherent_view_on_read,
+    CoherentView, ForkTreeReadFacade, historical_state_payloads_differ, open_coherent_view,
+    open_coherent_view_on_read,
 };
 
 // Stage 1 is deliberately unwired. This zero-runtime compile contract keeps

@@ -602,12 +602,11 @@ where
         super::serving::load_change_records(&self.read, ids).await
     }
 
-    pub(crate) async fn diff_state_rows_between_commits(
+    pub(crate) async fn scan_state_rows_at_commit(
         &self,
-        before: crate::changelog::CommitId,
-        after: crate::changelog::CommitId,
-    ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, true).await
+        commit_id: crate::changelog::CommitId,
+    ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
+        super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
     }
 }
 
@@ -1131,7 +1130,7 @@ where
         .collect())
 }
 
-fn historical_state_payloads_differ(
+pub(crate) fn historical_state_payloads_differ(
     before: Option<&super::state::HistoricalStateRow>,
     after: Option<&super::state::HistoricalStateRow>,
 ) -> bool {
@@ -1660,6 +1659,10 @@ mod tests {
         );
 
         assert!(historical_state_identity_changed(
+            Some(&before),
+            Some(&same_payload_new_change),
+        ));
+        assert!(!historical_state_payloads_differ(
             Some(&before),
             Some(&same_payload_new_change),
         ));
