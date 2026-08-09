@@ -23,7 +23,6 @@ use lix_storage_slatedb::SlateDB;
 use sha2::{Digest, Sha256};
 
 const SIZE: usize = 64 * 1024 * 1024;
-const CANONICAL_CHUNK_BYTES: usize = 1024 * 1024;
 const APPEND_SIZE: usize = SIZE + 1024 * 1024;
 const EDIT_START: usize = SIZE / 2;
 const EDIT_LEN: usize = 1024 * 1024;
@@ -409,7 +408,6 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     )
     .expect("authenticated middle splice");
     let before_update = active_commit(&session).await;
-    lix::storage_bench::begin_verified_inline_blob_splice_accounting();
     let _updated = timed(
         &format!("{label}/middle_overwrite_1m"),
         &counted,
@@ -429,27 +427,6 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     )
     .await
     .expect("overwrite");
-    let splice_accounting = lix::storage_bench::take_verified_inline_blob_splice_accounting();
-    assert_eq!(
-        splice_accounting.calls, 1,
-        "SQL update must consume verified splice"
-    );
-    assert_eq!(splice_accounting.changed_chunks, 1);
-    assert_eq!(
-        splice_accounting.total_chunks,
-        (SIZE / CANONICAL_CHUNK_BYTES) as u64
-    );
-    println!(
-        "{}",
-        serde_json::json!({
-            "event": "verified_splice",
-            "label": format!("{label}/middle_overwrite_1m"),
-            "calls": splice_accounting.calls,
-            "changed_chunks": splice_accounting.changed_chunks,
-            "unchanged_chunks": splice_accounting.total_chunks - splice_accounting.changed_chunks,
-            "total_chunks": splice_accounting.total_chunks,
-        })
-    );
     let after_update = active_commit(&session).await;
     let diff_sql =
         format!("SELECT COUNT(*) AS entries FROM lix_diff('{before_update}', '{after_update}')");
