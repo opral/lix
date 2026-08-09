@@ -692,7 +692,15 @@ where
                 .ok_or_else(|| writer_error("branch creation has no source commit"))?;
             let source_commit = load_commit(view, forktree_commit_id(source_head))
                 .await?
-                .ok_or_else(|| writer_error("branch creation source commit is absent"))?;
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_FOREIGN_KEY,
+                        format!(
+                            "branch ref commit_id '{}' does not reference an existing commit",
+                            source_head
+                        ),
+                    )
+                })?;
             publication
                 .publish_new_branch_selector(
                     view,
@@ -707,12 +715,43 @@ where
             let target_view = open_coherent_view_on_read(view.storage_read(), branch_id).await?;
             let target_commit = match intent.commit_id {
                 Some(commit_id) => Some(
-                    load_commit(&target_view, forktree_commit_id(commit_id))
+                    // The target branch selector can lag the active branch's
+                    // authenticated catalog. Resolve the requested commit
+                    // from the operation view, then use the target view only
+                    // for selector identity/CAS and branch-local state.
+                    load_commit(view, forktree_commit_id(commit_id))
                         .await?
                         .ok_or_else(|| writer_error("branch selector target commit is absent"))?,
                 ),
                 None => None,
             };
+            let requested_object_id = target_commit
+                .as_ref()
+                .map(|commit| commit.encode().map(|(id, _)| id))
+                .transpose()?;
+            let moves_head = requested_object_id.is_some_and(|object_id| {
+                object_id != target_view.branch_snapshot().semantic_head_commit_object_id
+            }) || intent.commit_id.is_none();
+            if moves_head
+                && target_view
+                    .scan_untracked_overlay_rows()
+                    .await?
+                    .into_iter()
+                    .any(|(owner, _, _)| owner == branch_id)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "cannot {} branch '{}' while branch-local untracked state exists",
+                        if intent.commit_id.is_some() {
+                            "repoint"
+                        } else {
+                            "delete"
+                        },
+                        intent.branch_id
+                    ),
+                ));
+            }
             publication
                 .publish_branch_selector_intent(
                     &target_view,

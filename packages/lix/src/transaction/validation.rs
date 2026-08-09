@@ -2593,6 +2593,17 @@ async fn validate_committed_normal_delete_restriction_batches(
             else {
                 continue;
             };
+            // `lix_branch_ref` is the selector-side FK companion of a
+            // `lix_branch_descriptor`. The writable `lix_branch` owner retires
+            // both in one PreparedPublication, so the committed selector row
+            // is intentionally absent from the post-commit image even though
+            // it is not a live-state tombstone in this validation set.
+            if tombstone.schema_key() == BRANCH_DESCRIPTOR_SCHEMA_KEY
+                && row.schema_key() == BRANCH_REF_SCHEMA_KEY
+                && row.entity_pk() == tombstone.entity_pk()
+            {
+                continue;
+            }
             return Err(committed_delete_restriction_error(
                 tombstone,
                 row,

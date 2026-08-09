@@ -506,21 +506,26 @@ impl PreparedPublication {
         };
         let (ref_object_id, ref_bytes) = branch_ref.encode()?;
         let base_repository_root = self.next_repository_root.unwrap_or(view.repository_root());
-        let change_catalog_edit = view
-            .put_change_catalog_entries(
-                base_repository_root.change_catalog_root,
-                &[(
-                    change_id,
-                    ChangeCatalogEntry {
-                        change_object_id: ref_object_id,
-                        owner: ChangeCatalogOwner::BranchRef {
-                            ref_change_object_id: ref_object_id,
-                            branch_id: view.branch_id(),
-                        },
+        // A preceding semantic publication may have produced the catalog root
+        // in this same PreparedPublication. Read those immutable path-copy
+        // nodes through the publication overlay; the retained operation read
+        // alone cannot see staged objects.
+        let overlay = ObjectOverlayRead::new(view.storage_read(), &self.object_puts);
+        let change_catalog_edit = super::serving::put_change_catalog_entries(
+            base_repository_root.change_catalog_root,
+            &[(
+                change_id,
+                ChangeCatalogEntry {
+                    change_object_id: ref_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: ref_object_id,
+                        branch_id: view.branch_id(),
                     },
-                )],
-            )
-            .await?;
+                },
+            )],
+            &overlay,
+        )
+        .await?;
         let branch_snapshot = BranchSnapshotV1 {
             branch_id: view.branch_id(),
             local_state_root: next_commit.local_state_root,
