@@ -643,7 +643,7 @@ where
             let source_head = intent
                 .commit_id
                 .ok_or_else(|| writer_error("branch creation has no source commit"))?;
-            let source_commit = load_commit(view, forktree_commit_id(source_head))
+            let source_commit = load_commit_summary(view, forktree_commit_id(source_head))
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
