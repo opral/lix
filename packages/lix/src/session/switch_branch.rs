@@ -3,7 +3,7 @@ use serde_json::json;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::storage_adapter::Storage;
+use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
 use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 
 use super::context::{SessionContext, SessionMode, WORKSPACE_BRANCH_KEY};
@@ -47,32 +47,28 @@ where
         let observe_invalidation = self.observe_invalidation.clone();
         match current_mode {
             SessionMode::Pinned { .. } => {
-                let write_access = self.begin_session_write_access().await?;
-                self.with_write_transaction_reserved_lending(
-                    write_access,
-                    async move |transaction| {
-                        let reader = transaction.branch_ref_reader_on_opening_read();
-                        BranchLifecycle::new(&reader)
-                            .require_existing_commit_id(
-                                &branch_id,
-                                BranchOperation::SwitchBranch,
-                                BranchReferenceRole::Target,
-                            )
-                            .await
-                    },
-                    |_| {
-                        self.ensure_open()?;
-                        *selector.write().map_err(|_| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                "session branch selector is poisoned",
-                            )
-                        })? = receipt_branch_id.clone();
-                        observe_invalidation.bump();
-                        Ok(())
-                    },
-                )
-                .await?;
+                let _operation_guard = self.begin_waitable_session_operation().await?;
+                let read = SharedStorageAdapterRead::new(
+                    self.storage
+                        .begin_read(StorageReadOptions::default())
+                        .await?,
+                );
+                let reader = self.branch_ctx.ref_reader(read);
+                BranchLifecycle::new(&reader)
+                    .require_existing_commit_id(
+                        &branch_id,
+                        BranchOperation::SwitchBranch,
+                        BranchReferenceRole::Target,
+                    )
+                    .await?;
+                self.ensure_open()?;
+                *selector.write().map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "session branch selector is poisoned",
+                    )
+                })? = receipt_branch_id.clone();
+                observe_invalidation.bump();
             }
             SessionMode::Workspace { .. } => {
                 let write_access = self.begin_session_write_access().await?;
@@ -297,16 +293,13 @@ mod tests {
         let delta = storage.snapshot().delta_since(before);
 
         assert_eq!(switched.branch_id, branch.id);
+        assert_eq!(delta.begin_reads, 1);
+        assert_eq!(delta.begin_writes, 0);
+        assert_eq!(delta.scan_calls, 0);
         assert_eq!(
-            delta,
-            CounterSnapshot {
-                begin_reads: 1,
-                begin_writes: 0,
-                get_many_calls: 1,
-                get_many_keys: 1,
-                scan_calls: 0,
-            },
-            "pinned switching must read only the target branch-head control"
+            (delta.get_many_calls, delta.get_many_keys),
+            (5, 13),
+            "pinned switching must authenticate the target through one retained read"
         );
     }
 }

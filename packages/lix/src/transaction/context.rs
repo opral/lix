@@ -8975,6 +8975,7 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
         .values()
         .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
         .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
+        || !prepared_writes.branch_ref_intents.is_empty()
 }
 
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
