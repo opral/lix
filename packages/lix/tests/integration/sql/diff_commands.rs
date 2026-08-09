@@ -176,7 +176,8 @@ simulation_test!(
              WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
             )
             .await,
-            vec![vec![Value::Json(json!(["b"]))]]
+            Vec::<Vec<Value>>::new(),
+            "working diff compares effective content, so the reverted row is not a semantic change"
         );
         assert_eq!(
             select_rows(
@@ -213,5 +214,164 @@ simulation_test!(
             .expect("head after empty selection should load")
             .expect("head after empty selection should exist");
         assert_eq!(head_after_empty, head_before_empty);
+    }
+);
+
+simulation_test!(
+    historical_diff_preserves_unchanged_global_overlay_counterparts,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let global = sim.wrap_session(
+            engine
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        global
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('overlay-diff-key', 'global-v0', true, false)",
+                &[],
+            )
+            .await
+            .expect("global overlay seed should succeed");
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('overlay-diff-anchor', 'anchor')",
+            &[],
+        )
+        .await
+        .expect("anchor commit should capture the global overlay root");
+        let before = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('overlay-diff-key', 'local-v1')",
+            &[],
+        )
+        .await
+        .expect("local override should succeed");
+        let after = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head after local override should load")
+            .expect("main head after local override should exist");
+
+        let rows = main
+            .execute(
+                &format!(
+                    "SELECT before_change_id, after_change_id \
+                     FROM lix_diff('{before}', '{after}') \
+                     WHERE schema_key = 'lix_key_value' \
+                       AND entity_pk = lix_json('[\"overlay-diff-key\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("local override diff should succeed");
+        assert_eq!(rows.len(), 1, "global counterpart must remain visible");
+        assert!(!matches!(rows.rows()[0].values()[0], Value::Null));
+        assert!(!matches!(rows.rows()[0].values()[1], Value::Null));
+
+        main.execute(
+            "UPDATE lix_key_value SET value = 'local-v2' WHERE key = 'overlay-diff-key'",
+            &[],
+        )
+        .await
+        .expect("local override update should succeed");
+        let updated = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head after local update should load")
+            .expect("main head after local update should exist");
+        let update_rows = main
+            .execute(
+                &format!(
+                    "SELECT before_change_id, after_change_id \
+                     FROM lix_diff('{after}', '{updated}') \
+                     WHERE schema_key = 'lix_key_value' \
+                       AND entity_pk = lix_json('[\"overlay-diff-key\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("local update diff should succeed");
+        assert_eq!(update_rows.len(), 1);
+        assert!(!matches!(update_rows.rows()[0].values()[0], Value::Null));
+        assert!(!matches!(update_rows.rows()[0].values()[1], Value::Null));
+
+        global
+            .execute(
+                "UPDATE lix_key_value SET value = 'global-v1' \
+                 WHERE key = 'overlay-diff-key'",
+                &[],
+            )
+            .await
+            .expect("global overlay update should succeed");
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('overlay-diff-anchor-2', 'anchor')",
+            &[],
+        )
+        .await
+        .expect("second anchor commit should capture the global change");
+        let hidden = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head after hidden global change should load")
+            .expect("main head after hidden global change should exist");
+        let hidden_rows = main
+            .execute(
+                &format!(
+                    "SELECT before_change_id, after_change_id \
+                     FROM lix_diff('{updated}', '{hidden}') \
+                     WHERE schema_key = 'lix_key_value' \
+                       AND entity_pk = lix_json('[\"overlay-diff-key\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("unchanged local overlay should hide global change");
+        assert!(
+            hidden_rows.is_empty(),
+            "unchanged local content masks global changes: {hidden_rows:?}"
+        );
+
+        main.execute(
+            "DELETE FROM lix_key_value WHERE key = 'overlay-diff-key'",
+            &[],
+        )
+        .await
+        .expect("local override removal should succeed");
+        let removed = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head after local removal should load")
+            .expect("main head after local removal should exist");
+        let removal_rows = main
+            .execute(
+                &format!(
+                    "SELECT before_change_id, after_change_id \
+                     FROM lix_diff('{updated}', '{removed}') \
+                     WHERE schema_key = 'lix_key_value' \
+                       AND entity_pk = lix_json('[\"overlay-diff-key\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("local removal diff should succeed");
+        assert_eq!(removal_rows.len(), 1);
+        assert!(!matches!(removal_rows.rows()[0].values()[0], Value::Null));
+        assert!(!matches!(removal_rows.rows()[0].values()[1], Value::Null));
     }
 );

@@ -25,8 +25,8 @@ use super::object::OBJECT_SPACE;
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_retention_tree,
-    build_state_tree, empty_receipt_tree, insert_receipt_part, lookup, scan_all,
-    validate_branch_snapshot_ref_edge, validate_change_catalog_back_edge,
+    build_state_tree, diff_ordered_tree_on_read, empty_receipt_tree, insert_receipt_part, lookup,
+    scan_all, validate_branch_snapshot_ref_edge, validate_change_catalog_back_edge,
     validate_commit_catalog_back_edge, validate_receipt_tree, validate_upload_progress_tree,
     validate_upload_selector_progress,
 };
@@ -1149,6 +1149,122 @@ async fn historical_missing_state_root_fails_before_empty_result() {
             .await
             .is_err(),
         "missing selected state root must not become an empty historical result"
+    );
+}
+
+#[tokio::test]
+async fn ordered_tree_diff_authenticates_equal_roots_and_shared_children() {
+    let mut rows = (0..128)
+        .map(|index| {
+            state_entry(
+                &format!("row-{index:03}"),
+                StateCellRef::Value("value"),
+                index,
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let before = build_state_tree(&rows).expect("before state tree");
+
+    let mut after_rows = rows.clone();
+    after_rows[127] = state_entry("row-127", StateCellRef::Value("changed"), 0xe0, &[]);
+    after_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let after = build_state_tree(&after_rows).expect("after state tree");
+
+    let missing_storage = Memory::new();
+    let mut missing_writes = StorageWriteSet::new();
+    for (id, bytes) in before.objects.iter() {
+        if id != before.root.object_id {
+            missing_writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+        }
+    }
+    commit_write_set_for_test(missing_writes, &missing_storage).await;
+    let missing_read = StorageAdapterReadScope::new(
+        missing_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("missing equal-root read"),
+    );
+    assert!(
+        diff_ordered_tree_on_read(
+            before.root.object_id,
+            before.root.object_id,
+            "state",
+            &missing_read,
+        )
+        .await
+        .is_err(),
+        "equal missing roots must authenticate before pruning"
+    );
+
+    let corrupt_storage = Memory::new();
+    let mut corrupt_writes = StorageWriteSet::new();
+    for (id, bytes) in before.objects.iter() {
+        if id == before.root.object_id {
+            let mut corrupt = bytes.to_vec();
+            corrupt[0] ^= 0x01;
+            corrupt_writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), corrupt);
+        } else {
+            corrupt_writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+        }
+    }
+    commit_write_set_for_test(corrupt_writes, &corrupt_storage).await;
+    let corrupt_read = StorageAdapterReadScope::new(
+        corrupt_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("corrupt equal-root read"),
+    );
+    assert!(
+        diff_ordered_tree_on_read(
+            before.root.object_id,
+            before.root.object_id,
+            "state",
+            &corrupt_read,
+        )
+        .await
+        .is_err(),
+        "equal corrupt roots must authenticate before pruning"
+    );
+
+    let shared_child_corrupt = super::tree::rewrite_first_internal_child_summary_for_test(
+        after.root.object_id,
+        after.objects.get(after.root.object_id).expect("after root"),
+    )
+    .expect("corrupt equal-child parent reference");
+    let shared_storage = Memory::new();
+    let mut shared_writes = StorageWriteSet::new();
+    for (id, bytes) in before.objects.iter() {
+        shared_writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    for (id, bytes) in after.objects.iter() {
+        if id != after.root.object_id && before.objects.get(id).is_none() {
+            shared_writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+        }
+    }
+    shared_writes.put(
+        OBJECT_SPACE,
+        shared_child_corrupt.0.as_bytes().to_vec(),
+        shared_child_corrupt.1.to_vec(),
+    );
+    commit_write_set_for_test(shared_writes, &shared_storage).await;
+    let shared_read = StorageAdapterReadScope::new(
+        shared_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("corrupt equal-child read"),
+    );
+    assert!(
+        diff_ordered_tree_on_read(
+            before.root.object_id,
+            shared_child_corrupt.0,
+            "state",
+            &shared_read,
+        )
+        .await
+        .is_err(),
+        "equal child with a corrupt parent binding must fail closed"
     );
 }
 
