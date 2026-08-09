@@ -24,6 +24,14 @@ use super::tree::{
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
+/// Authenticated historical diff data produced by one retained read. The
+/// change map is operation-local output from the same root/member validation
+/// as the rows; it is not a durable or cross-view cache.
+pub(crate) struct AuthenticatedHistoricalStateDiff {
+    pub(crate) entries: Vec<HistoricalStateDiffEntry>,
+    pub(crate) changes: BTreeMap<crate::changelog::ChangeId, crate::changelog::ChangeRecord>,
+}
+
 const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
 const CATALOG_SCAN_PAGE_ROWS: usize = 1024;
@@ -740,6 +748,148 @@ where
         let entry = ChangeCatalogEntry::decode(&value)?;
         records
             .push(semantic_change_record(read, repository.change_catalog_root, id, entry).await?);
+    }
+    Ok(records)
+}
+
+/// Loads a changed-record batch while reusing only authenticated data from
+/// this one retained read. The catalog entries, Change envelopes, and
+/// introduction member closures are fetched in batches; every key/object,
+/// owner/ordinal, payload, and JSON-edge check remains identical to the
+/// single-record path.
+async fn load_change_records_for_diff<R>(
+    read: &R,
+    change_catalog_root: ObjectId,
+    ids: &[crate::changelog::ChangeId],
+) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let model_ids = ids
+        .iter()
+        .map(|id| ChangeId::from_bytes(*id.as_uuid().as_bytes()))
+        .collect::<Vec<_>>();
+    let keys = model_ids
+        .iter()
+        .map(|id| id.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let catalog_values = lookup_many_on_read(change_catalog_root, "change", &keys, read).await?;
+    let mut entries = Vec::with_capacity(model_ids.len());
+    let mut change_object_ids = BTreeSet::new();
+    let mut owner_commit_object_ids = BTreeSet::new();
+    for value in catalog_values {
+        let Some(value) = value else {
+            entries.push(None);
+            continue;
+        };
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        change_object_ids.insert(entry.change_object_id);
+        if let ChangeCatalogOwner::CommitMember {
+            commit_object_id, ..
+        } = entry.owner
+        {
+            owner_commit_object_ids.insert(commit_object_id);
+        }
+        entries.push(Some(entry));
+    }
+
+    let change_objects = super::view::load_object_map(read, change_object_ids).await?;
+    let owner_objects = super::view::load_object_map(read, owner_commit_object_ids).await?;
+    let mut owner_members = BTreeMap::new();
+    for (commit_object_id, bytes) in owner_objects {
+        let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+        owner_members.insert(commit_object_id, load_commit_members(read, &commit).await?);
+    }
+
+    let mut records = Vec::with_capacity(entries.len());
+    for (id, entry) in model_ids.into_iter().zip(entries) {
+        let Some(entry) = entry else {
+            records.push(None);
+            continue;
+        };
+        let bytes = change_objects
+            .get(&entry.change_object_id)
+            .ok_or_else(|| corruption("ChangeCatalog change object is absent"))?;
+        let change = ChangeObjectV1::decode(entry.change_object_id, bytes)?;
+        if change.change_id() != id {
+            return Err(corruption("ChangeCatalog key does not match Change object").into());
+        }
+        match (entry.owner, &change) {
+            (
+                ChangeCatalogOwner::CommitMember {
+                    commit_object_id,
+                    ordinal,
+                },
+                ChangeObjectV1::Semantic { .. },
+            ) => {
+                let members = owner_members
+                    .get(&commit_object_id)
+                    .ok_or_else(|| corruption("ChangeCatalog owner Commit object is absent"))?;
+                if members.get(ordinal as usize)
+                    != Some(&CommitMemberV1::introduced(entry.change_object_id))
+                {
+                    return Err(
+                        corruption("ChangeCatalog owner/ordinal back-edge is invalid").into(),
+                    );
+                }
+            }
+            (
+                ChangeCatalogOwner::BranchRef {
+                    ref_change_object_id,
+                    branch_id,
+                },
+                ChangeObjectV1::BranchRef {
+                    branch_id: object_branch,
+                    ..
+                },
+            ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {
+                validate_retained_ref_change(
+                    read,
+                    change_catalog_root,
+                    entry.change_object_id,
+                    &change,
+                )
+                .await?;
+            }
+            _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid").into()),
+        }
+        let (payload, json_payload_object_ids, is_empty_ref_payload) = match change {
+            ChangeObjectV1::Semantic {
+                payload,
+                json_payload_object_ids,
+                ..
+            } => (payload, json_payload_object_ids, false),
+            ChangeObjectV1::BranchRef {
+                payload,
+                json_payload_object_ids,
+                ..
+            } => {
+                let is_empty = payload.is_empty();
+                (payload, json_payload_object_ids, is_empty)
+            }
+        };
+        if is_empty_ref_payload {
+            records.push(None);
+            continue;
+        }
+        let record = crate::changelog::decode_forktree_change_payload(
+            &payload,
+            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*id.as_bytes())),
+        )?;
+        let expected = crate::changelog::forktree_change_json_payload_ids(&record)
+            .into_iter()
+            .map(ObjectId::from_bytes)
+            .collect::<Vec<_>>();
+        if expected != json_payload_object_ids {
+            return Err(corruption(
+                "Change object JSON payload edges do not match its semantic payload",
+            )
+            .into());
+        }
+        records.push(Some(record));
     }
     Ok(records)
 }
@@ -1775,6 +1925,22 @@ pub(crate) async fn diff_state_rows_between_commits<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    Ok(
+        diff_state_rows_between_commits_with_records(read, before, after, include_global)
+            .await?
+            .entries,
+    )
+}
+
+pub(crate) async fn diff_state_rows_between_commits_with_records<R>(
+    read: &R,
+    before: crate::changelog::CommitId,
+    after: crate::changelog::CommitId,
+    include_global: bool,
+) -> Result<AuthenticatedHistoricalStateDiff, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     diff_state_rows_between_commits_impl(read, before, after, include_global, true).await
 }
 
@@ -1791,7 +1957,11 @@ pub(crate) async fn diff_state_rows_for_working_diff<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    diff_state_rows_between_commits_impl(read, before, after, include_global, false).await
+    Ok(
+        diff_state_rows_between_commits_impl(read, before, after, include_global, false)
+            .await?
+            .entries,
+    )
 }
 
 async fn diff_state_rows_between_commits_impl<R>(
@@ -1800,7 +1970,7 @@ async fn diff_state_rows_between_commits_impl<R>(
     after: crate::changelog::CommitId,
     include_global: bool,
     identity_aware: bool,
-) -> Result<Vec<HistoricalStateDiffEntry>, crate::LixError>
+) -> Result<AuthenticatedHistoricalStateDiff, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1920,10 +2090,11 @@ where
             change_ids.insert(row.change_id);
         }
     }
+    let mut authenticated = BTreeMap::new();
     if !change_ids.is_empty() {
         let ids = change_ids.into_iter().collect::<Vec<_>>();
-        let records = load_change_records(read, &ids).await?;
-        let mut authenticated = BTreeMap::new();
+        let change_catalog_root = load_repository_root(read).await?.change_catalog_root;
+        let records = load_change_records_for_diff(read, change_catalog_root, &ids).await?;
         for (id, record) in ids.into_iter().zip(records) {
             let record = record.ok_or_else(|| {
                 corruption("changed historical state row has no authenticated Change")
@@ -1940,7 +2111,7 @@ where
         }
     }
 
-    Ok(rows
+    let entries = rows
         .into_values()
         .filter_map(|(before, after)| {
             let changed = if identity_aware {
@@ -1956,7 +2127,11 @@ where
             (before.is_some() || after.is_some())
                 .then_some(HistoricalStateDiffEntry { before, after })
         })
-        .collect())
+        .collect();
+    Ok(AuthenticatedHistoricalStateDiff {
+        entries,
+        changes: authenticated,
+    })
 }
 
 async fn load_diff_commit<R>(

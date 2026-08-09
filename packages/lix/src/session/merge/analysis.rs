@@ -1,3 +1,5 @@
+use super::conflicts::MergeConflictBatch;
+use super::stats::{MergeStats, stats_from_diff, stats_from_plan};
 use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::changelog::CommitId;
@@ -7,10 +9,6 @@ use crate::tracked_state::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRow, TrackedStateMergePlan, TrackedStatePayloadBatch, plan_merge,
 };
-use std::collections::BTreeSet;
-
-use super::conflicts::MergeConflictBatch;
-use super::stats::{MergeStats, stats_from_diff, stats_from_plan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeOutcome {
@@ -133,44 +131,11 @@ async fn load_forktree_diff<S>(
 where
     S: StorageAdapterRead,
 {
-    let entries = view
-        .diff_state_rows_between_commits(base_commit_id, side_commit_id)
+    let authenticated_diff = view
+        .diff_state_rows_between_commits_with_records(base_commit_id, side_commit_id)
         .await?;
-    let mut change_ids = BTreeSet::new();
-    for entry in &entries {
-        if let Some(row) = entry.before.as_ref() {
-            change_ids.insert(row.change_id);
-        }
-        if let Some(row) = entry.after.as_ref() {
-            change_ids.insert(row.change_id);
-        }
-    }
-    let change_ids = change_ids.into_iter().collect::<Vec<_>>();
-    let records = view.load_change_records(&change_ids).await?;
-    let mut authenticated = std::collections::HashMap::with_capacity(records.len());
-    for (change_id, record) in change_ids.iter().copied().zip(records) {
-        let record = record.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("merge state row references missing change '{change_id}'"),
-            )
-        })?;
-        authenticated.insert(change_id, record);
-    }
-    for entry in &entries {
-        for row in [entry.before.as_ref(), entry.after.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            let record = authenticated.get(&row.change_id).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("merge state row lost change payload '{}", row.change_id),
-                )
-            })?;
-            crate::forktree::validate_historical_state_row(view, row, record).await?;
-        }
-    }
+    let entries = authenticated_diff.entries;
+    let authenticated = authenticated_diff.changes;
     let payloads = authenticated
         .into_iter()
         .map(|(change_id, record)| (change_id, record.snapshot, record.metadata));
