@@ -32,7 +32,6 @@ use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::telemetry::TelemetrySink;
-use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
@@ -134,7 +133,6 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) active_account_id: Arc<str>,
     pub(super) storage: StorageAdapter<StorageImpl>,
     pub(super) live_state: Arc<LiveStateContext>,
-    pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -157,7 +155,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -180,7 +177,6 @@ where
             active_account_id,
             storage,
             live_state,
-            tracked_state,
             branch_ctx,
             catalog_context,
             sql_planning_cache,
@@ -199,7 +195,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -218,7 +213,6 @@ where
             active_account_id,
             storage,
             live_state,
-            tracked_state,
             branch_ctx,
             catalog_context,
             sql_planning_cache,
@@ -237,7 +231,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -254,7 +247,6 @@ where
             active_account_id,
             storage,
             live_state,
-            tracked_state,
             branch_ctx,
             catalog_context,
             sql_planning_cache,
@@ -275,7 +267,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -294,7 +285,6 @@ where
             active_account_id: Arc::from(active_account_id),
             storage,
             live_state,
-            tracked_state,
             branch_ctx,
             catalog_context,
             sql_planning_cache,
@@ -522,7 +512,6 @@ where
             self.active_account_id.to_string(),
             self.storage.clone(),
             Arc::clone(&self.live_state),
-            Arc::clone(&self.tracked_state),
             self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
@@ -695,12 +684,6 @@ where
     #[expect(trivial_casts)]
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
         Arc::new(self.forktree.clone()) as Arc<dyn LiveStateReader>
-    }
-
-    fn entity_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::EntitySnapshotReader>> {
-        Some(Arc::new(crate::sql2::CurrentEntitySnapshotReader::new(
-            self.forktree.clone(),
-        )))
     }
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {

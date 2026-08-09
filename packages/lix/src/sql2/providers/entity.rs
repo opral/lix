@@ -385,7 +385,7 @@ impl EntitySpec {
             // Branch-ref rows are authenticated in the global selector scope;
             // an active SQL branch is only the caller's session context and
             // must not be mistaken for the row's storage domain.
-            request.filter.branch_ids = vec![crate::GLOBAL_BRANCH_ID.to_string()];
+            request.filter.branch_ids = vec![GLOBAL_BRANCH_ID.to_string()];
         }
         apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
@@ -2770,16 +2770,6 @@ mod tests {
 
         fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
             Ok(Vec::new().into())
-        }
-
-        async fn load_bytes_many(
-            &mut self,
-            hashes: &[crate::binary_cas::BlobId],
-        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
-                None;
-                hashes.len()
-            ]))
         }
 
         async fn scan_live_state_batch(

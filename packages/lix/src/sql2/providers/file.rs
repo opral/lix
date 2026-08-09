@@ -927,7 +927,11 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
             "content_identity".to_string(),
         ]
     } else {
-        vec!["path".to_string(), "content".to_string()]
+        vec![
+            "path".to_string(),
+            "content".to_string(),
+            "content_identity".to_string(),
+        ]
     };
     Ok(SqlQueryResult {
         columns,
@@ -2471,6 +2475,7 @@ impl PluginRenderContext {
 #[derive(Debug, Clone)]
 struct BlobRefRecord {
     blob_hash: String,
+    #[cfg(test)]
     inline_data: Option<Vec<u8>>,
     live: LiveStateRowHandle,
     state_key: crate::forktree::StateKey,
@@ -2542,6 +2547,7 @@ fn blob_ref_record_from_live_row(
         key,
         BlobRefRecord {
             blob_hash: snapshot.blob_hash,
+            #[cfg(test)]
             inline_data: None,
             live: handle,
             state_key: crate::forktree::StateKey {
@@ -2667,7 +2673,8 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
         writes
             .into_iter()
             .map(|(path, data, metadata, splice)| {
-                (None, path, FileContent::inline(data), metadata, splice)
+                let content = file_content_from_request_splice(data, splice.as_ref());
+                (None, path, content, metadata, splice)
             })
             .collect(),
         conflict,
@@ -2693,7 +2700,8 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
         writes
             .into_iter()
             .map(|(id, path, data, metadata, splice)| {
-                (id, path, FileContent::inline(data), metadata, splice)
+                let content = file_content_from_request_splice(data, splice.as_ref());
+                (id, path, content, metadata, splice)
             })
             .collect(),
         conflict,
@@ -3052,7 +3060,9 @@ async fn stage_indexed_file_path_writes(
     } else {
         Vec::new()
     };
-    let existing_materializations = load_exact_existing_materializations(ctx, &existing).await?;
+    let (_, existing_materializations) =
+        load_exact_existing_materializations(ctx, existing.iter().map(|entry| entry.as_ref()))
+            .await?;
     let mut staged = LixFileStagedBatch::with_row_capacity(writes.len().saturating_mul(3));
 
     for (write, entry) in writes.into_iter().zip(indexed.existing) {
@@ -3166,62 +3176,98 @@ struct ExistingFileMaterialization {
 
 async fn load_exact_existing_materializations(
     ctx: &mut dyn SqlWriteExecutionContext,
-    entries: &[Arc<FilesystemPathEntry>],
-) -> Result<BTreeMap<FilesystemDescriptorKey, ExistingFileMaterialization>, LixError> {
+    entries: impl IntoIterator<Item = &'_ FilesystemPathEntry>,
+) -> Result<
+    (
+        MaterializedLiveStateBatch,
+        BTreeMap<FilesystemDescriptorKey, ExistingFileMaterialization>,
+    ),
+    LixError,
+> {
+    let entries = entries.into_iter().collect::<Vec<_>>();
     if entries.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok((MaterializedLiveStateBatch::default(), BTreeMap::new()));
     }
     let unique = entries
         .iter()
-        .map(|entry| (entry.key.clone(), Arc::clone(entry)))
+        .map(|entry| (entry.key.clone(), *entry))
         .collect::<BTreeMap<_, _>>();
-    let blob_requests = unique
-        .iter()
-        .map(|(key, entry)| {
-            Ok((
-                key.clone(),
-                LiveStateExactRowRequest {
-                    branch_id: entry.key.branch_id().to_string(),
-                    schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: file_id_entity_pk(entry.id())?,
-                    file_id: Some(entry.id().to_string()),
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let request = LiveStateExactBatchRequest {
-        rows: blob_requests
-            .iter()
-            .map(|(_, request)| request.clone())
-            .collect(),
-        projection: LiveStateProjection::default(),
-        untracked: Some(false),
-        include_tombstones: false,
-    };
-    let rows = ctx.load_exact_live_state_batch(&request).await?;
+
+    let mut exact_batches = Vec::new();
     let mut materializations =
         BTreeMap::<FilesystemDescriptorKey, ExistingFileMaterialization>::new();
-    for (row_index, (key, request)) in blob_requests.into_iter().enumerate() {
-        let Some(row) = rows.row(row_index) else {
-            continue;
-        };
-        let tracking_mismatch = row.untracked() ^ key.is_untracked();
-        if row.branch_id() != key.branch_id() || row.global() != key.global() || tracking_mismatch {
+
+    // Exact requests carry one untracked mode for the whole batch. Keep
+    // tracked and untracked entries in separate aligned batches so neither
+    // scope can shadow the other while still using the same transaction-owned
+    // reader and staged overlay.
+    for untracked in [false, true] {
+        let blob_requests = unique
+            .iter()
+            .filter(|(_, entry)| entry.key.is_untracked() == untracked)
+            .map(|(key, entry)| {
+                Ok((
+                    key.clone(),
+                    LiveStateExactRowRequest {
+                        branch_id: entry.key.branch_id().to_string(),
+                        schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                        entity_pk: file_id_entity_pk(entry.id())?,
+                        file_id: Some(entry.id().to_string()),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        if blob_requests.is_empty() {
             continue;
         }
-        let materialization = materializations.entry(key).or_default();
-        // A malformed old snapshot still proves that a blob row must be
-        // replaced; only the optional CAS-reuse shortcut is lost.
-        materialization.has_blob_ref = true;
-        materialization.blob_hash = row
-            .snapshot_content()
-            .map(|snapshot| snapshot.as_str())
-            .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
-            .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
-            .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
+        let request = LiveStateExactBatchRequest {
+            rows: blob_requests
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect(),
+            projection: LiveStateProjection::default(),
+            untracked: Some(untracked),
+            include_tombstones: false,
+        };
+        let rows = ctx.load_exact_live_state_batch(&request).await?;
+        for (row_index, (key, request)) in blob_requests.into_iter().enumerate() {
+            let Some(row) = rows.row(row_index) else {
+                continue;
+            };
+            let tracking_mismatch = row.untracked() ^ key.is_untracked();
+            if row.branch_id() != key.branch_id()
+                || row.global() != key.global()
+                || tracking_mismatch
+            {
+                continue;
+            }
+            let materialization = materializations.entry(key).or_default();
+            // A malformed old snapshot still proves that a blob row must be
+            // replaced; only the optional CAS-reuse shortcut is lost.
+            materialization.has_blob_ref = true;
+            materialization.blob_hash = row
+                .snapshot_content()
+                .map(|snapshot| snapshot.as_str())
+                .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
+                .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
+                .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
+        }
+        exact_batches.push(rows.into_present_batch());
     }
 
-    Ok(materializations)
+    let exact_rows = if exact_batches.len() == 1 {
+        exact_batches
+            .pop()
+            .expect("one exact request produced one exact batch")
+    } else {
+        MaterializedLiveStateBatch::from_rows(
+            exact_batches
+                .into_iter()
+                .flat_map(|batch| batch.into_rows())
+                .collect(),
+        )
+    };
+    Ok((exact_rows, materializations))
 }
 
 pub(crate) async fn execute_fast_lix_file_content_update_by_id(
@@ -3293,14 +3339,18 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     let target_file_ids = BTreeSet::from([file_id.clone()]);
     let indexed_matches = indexed_file_id_matches(index, &target_file_ids, &FilePathPredicate::All);
 
-    // Blob references are not part of the descriptor index and can change
-    // without a path-index revision.
-    let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
-    blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
-    blob_request.filter.entity_pks = vec![file_id_entity_pk(&file_id)?];
-    let rows = ctx.scan_live_state_batch(&blob_request).await?;
+    // The path index supplies only the descriptor/path projection. BlobRef
+    // ownership is loaded from the same authenticated transaction view so a
+    // stale derived index cannot become a second payload authority.
+    let (rows, _) = load_exact_existing_materializations(
+        ctx,
+        indexed_matches
+            .entries()
+            .filter(|entry| entry.kind == FilesystemPathKind::File),
+    )
+    .await?;
 
-    let prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows_without_indexed_blob_refs(&indexed_matches, rows)?;
 
     let PreparedLixFileRows {
         live_rows,
@@ -3347,12 +3397,13 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
             }
             .append_to(&mut staged.state_rows);
         }
+        let content = file_content_from_request_splice(data.clone(), splice_provenance.as_ref());
         stage_lix_file_content_update_write(
             &mut staged,
             existing.id,
             Some(path),
             Some(existing.name),
-            data.clone(),
+            content,
             context,
             has_blob_ref,
             base_blob_hash,
@@ -3366,6 +3417,16 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
         staged.add_count(1)?;
     }
     stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
+}
+
+fn file_content_from_request_splice(
+    data: crate::Blob,
+    _provenance: Option<&RequestBlobSpliceProvenance>,
+) -> FileContent {
+    // The durable identity is derived only after the retained-view Merkle
+    // proof reaches PreparedPublication. Transport provenance never seeds a
+    // BlobRef/manifest identity.
+    FileContent::inline(data)
 }
 
 struct FastLixFilePathWrite {
@@ -4605,6 +4666,21 @@ fn prepare_indexed_lix_file_rows(
     matches: &FilesystemPathSelection,
     rows: impl Into<MaterializedLiveStateBatch>,
 ) -> Result<PreparedLixFileRows, LixError> {
+    prepare_indexed_lix_file_rows_with_blob_authority(matches, rows, true)
+}
+
+fn prepare_indexed_lix_file_rows_without_indexed_blob_refs(
+    matches: &FilesystemPathSelection,
+    rows: impl Into<MaterializedLiveStateBatch>,
+) -> Result<PreparedLixFileRows, LixError> {
+    prepare_indexed_lix_file_rows_with_blob_authority(matches, rows, false)
+}
+
+fn prepare_indexed_lix_file_rows_with_blob_authority(
+    matches: &FilesystemPathSelection,
+    rows: impl Into<MaterializedLiveStateBatch>,
+    include_indexed_blob_refs: bool,
+) -> Result<PreparedLixFileRows, LixError> {
     let mut live_rows = LiveStateBatchOwners::default();
     let scanned_batch = live_rows.push(rows.into());
     let indexed_batch =
@@ -4635,7 +4711,7 @@ fn prepare_indexed_lix_file_rows(
                 live: live_state_row_handle(indexed_batch, descriptor_row_index),
             },
         );
-        if let Some(blob_ref) = entry.blob_ref_live_row() {
+        if include_indexed_blob_refs && let Some(blob_ref) = entry.blob_ref_live_row() {
             indexed_builder.push_materialized_ref(
                 &blob_ref.entity_pk,
                 &blob_ref.schema_key,
@@ -5217,6 +5293,16 @@ async fn exact_path_data_rows_from_prepared(
                 Value::Text(content_identity),
             ]);
         } else {
+            let content_identity = blob_rows
+                .get(&blob_key)
+                .map(|blob_ref| blob_ref.blob_hash.clone())
+                .or_else(|| {
+                    live_rows
+                        .row(file.live)
+                        .change_id()
+                        .map(|change_id| change_id.to_string())
+                })
+                .unwrap_or_else(|| file.id.clone());
             let data = match blob_bytes.take(&blob_key) {
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
@@ -5227,6 +5313,7 @@ async fn exact_path_data_rows_from_prepared(
             rows.push(vec![
                 Value::Text(path),
                 data.map_or(Value::Null, |data| Value::Blob(data.into())),
+                Value::Text(content_identity),
             ]);
         }
     }
@@ -7045,7 +7132,6 @@ mod tests {
 
     use crate::binary_cas::{
         BlobBytesBatch, BlobDataReader, BlobId, BlobLayout, BlobRangeBytesBatch, BlobWriteReceipt,
-        ChunkHash,
     };
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
@@ -7911,7 +7997,7 @@ mod tests {
                     "01920000-0000-7000-8000-0000000000d2",
                     "01920000-0000-7000-8000-0000000000b1",
                     "01920000-0000-7000-8000-0000000000d2",
-                    &BlobId::from_content(&data).to_hex(),
+                    &BlobId::from_canonical_content(&data).to_hex(),
                     data.len(),
                 ),
             ])
@@ -7962,11 +8048,11 @@ mod tests {
     async fn lower_path_contains_scan_loads_blob_rows_only_for_the_matching_find_files_projection()
     {
         let selected_data = b"selected contents".to_vec();
-        let selected_blob_hash = BlobId::from_content(&selected_data).to_hex();
+        let selected_blob_hash = BlobId::from_canonical_content(&selected_data).to_hex();
         let changelog_data = b"changelog contents".to_vec();
-        let changelog_blob_hash = BlobId::from_content(&changelog_data).to_hex();
+        let changelog_blob_hash = BlobId::from_canonical_content(&changelog_data).to_hex();
         let outside_data = b"outside contents".to_vec();
-        let outside_blob_hash = BlobId::from_content(&outside_data).to_hex();
+        let outside_blob_hash = BlobId::from_canonical_content(&outside_data).to_hex();
         let selected_change_id = ChangeId::for_test_label("selected-search-blob");
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let mut selected_blob = live_blob_ref_row(
@@ -8120,9 +8206,9 @@ mod tests {
     #[tokio::test]
     async fn file_directory_id_scan_uses_indexed_descriptors_and_blob_rows() {
         let data = b"docs contents".to_vec();
-        let blob_hash = BlobId::from_content(&data).to_hex();
+        let blob_hash = BlobId::from_canonical_content(&data).to_hex();
         let other_data = b"other contents".to_vec();
-        let other_blob_hash = BlobId::from_content(&other_data).to_hex();
+        let other_blob_hash = BlobId::from_canonical_content(&other_data).to_hex();
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
@@ -8230,7 +8316,7 @@ mod tests {
         let branch_id = "01920000-0000-7000-8000-0000000000b1";
         let first = b"owner-a".to_vec();
         let second = b"owner-b".to_vec();
-        let claimed_blob_id = BlobId::from_content(&first).to_hex();
+        let claimed_blob_id = BlobId::from_canonical_content(&first).to_hex();
         (
             vec![
                 live_file_row(
@@ -8471,7 +8557,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000122",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000122",
-            &BlobId::from_content(&tracked_data).to_hex(),
+            &BlobId::from_canonical_content(&tracked_data).to_hex(),
             tracked_data.len(),
         );
         tracked_blob.change_id = Some(ChangeId::for_test_label("tracked-blob"));
@@ -8480,7 +8566,7 @@ mod tests {
             // Path-index rows are already projected into the requested branch.
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000112",
-            &BlobId::from_content(&global_data).to_hex(),
+            &BlobId::from_canonical_content(&global_data).to_hex(),
             global_data.len(),
         );
         global_blob.global = true;
@@ -8489,7 +8575,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000132",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000132",
-            &BlobId::from_content(&untracked_data).to_hex(),
+            &BlobId::from_canonical_content(&untracked_data).to_hex(),
             untracked_data.len(),
         );
         untracked_blob.untracked = true;
@@ -8500,7 +8586,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000122",
             "01920000-0000-7000-8000-0000000000b1",
             "different-file-id",
-            &BlobId::from_content(&misplaced_data).to_hex(),
+            &BlobId::from_canonical_content(&misplaced_data).to_hex(),
             misplaced_data.len(),
         );
         misplaced_blob.change_id = Some(ChangeId::for_test_label("misplaced-blob"));
@@ -8601,9 +8687,9 @@ mod tests {
     #[tokio::test]
     async fn file_root_directory_scan_uses_indexed_descriptors_and_root_blob_rows() {
         let root_data = b"root contents".to_vec();
-        let root_blob_hash = BlobId::from_content(&root_data).to_hex();
+        let root_blob_hash = BlobId::from_canonical_content(&root_data).to_hex();
         let nested_data = b"nested contents".to_vec();
-        let nested_blob_hash = BlobId::from_content(&nested_data).to_hex();
+        let nested_blob_hash = BlobId::from_canonical_content(&nested_data).to_hex();
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
@@ -8814,6 +8900,7 @@ mod tests {
         blob_rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<TransactionWrite>,
         scan_requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+        exact_load_requests: Arc<Mutex<Vec<LiveStateExactBatchRequest>>>,
         path_index_requests: Arc<AtomicUsize>,
     }
 
@@ -8836,7 +8923,7 @@ mod tests {
             Self {
                 bytes_by_hash: blobs
                     .into_iter()
-                    .map(|bytes| (BlobId::from_content(&bytes), bytes))
+                    .map(|bytes| (BlobId::from_canonical_content(&bytes), bytes))
                     .collect(),
             }
         }
@@ -8930,10 +9017,6 @@ mod tests {
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(Vec::new().into())
-        }
-
-        async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            BlobDataReader::load_bytes_many(self, hashes).await
         }
 
         async fn scan_live_state_batch(
@@ -9053,10 +9136,6 @@ mod tests {
             Ok(Vec::new().into())
         }
 
-        async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            Ok(BlobBytesBatch::new(vec![None; hashes.len()]))
-        }
-
         async fn scan_live_state_batch(
             &mut self,
             request: &LiveStateScanRequest,
@@ -9074,6 +9153,10 @@ mod tests {
             &mut self,
             request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            self.exact_load_requests
+                .lock()
+                .expect("exact request mutex should not be poisoned")
+                .push(request.clone());
             Ok(
                 crate::live_state::MaterializedLiveStateExactBatch::from_rows(
                     request
@@ -9086,6 +9169,9 @@ mod tests {
                                     row.schema_key == requested.schema_key
                                         && row.entity_pk == requested.entity_pk
                                         && row.file_id == requested.file_id
+                                        && request
+                                            .untracked
+                                            .is_none_or(|untracked| row.untracked == untracked)
                                         && row.branch_id.as_ref() == requested.branch_id.as_str()
                                 })
                                 .cloned()
@@ -9483,8 +9569,9 @@ mod tests {
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
-            archive_blob_hash: BlobId::from_content(format!("archive-{key}").as_bytes()).to_hex(),
-            wasm_blob_hash: BlobId::from_content(wasm).to_hex(),
+            archive_blob_hash: BlobId::from_canonical_content(format!("archive-{key}").as_bytes())
+                .to_hex(),
+            wasm_blob_hash: BlobId::from_canonical_content(wasm).to_hex(),
         })
         .expect("test plugin registry entry should be valid")
     }
@@ -9966,7 +10053,7 @@ mod tests {
         let file_id = "01920000-0000-7000-8000-0000000000e2";
         let branch_id = "01920000-0000-7000-8000-0000000000b1";
         let data = b"indexed contents";
-        let blob_hash = BlobId::from_content(data);
+        let blob_hash = BlobId::from_canonical_content(data);
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_file_row(
@@ -10022,8 +10109,8 @@ mod tests {
     async fn file_path_predicate_filters_before_blob_and_plugin_hydration() {
         let selected_data = b"selected".to_vec();
         let other_data = b"other".to_vec();
-        let selected_hash = BlobId::from_content(&selected_data);
-        let other_hash = BlobId::from_content(&other_data);
+        let selected_hash = BlobId::from_canonical_content(&selected_data);
+        let other_hash = BlobId::from_canonical_content(&other_data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000e2",
@@ -10092,7 +10179,7 @@ mod tests {
     #[test]
     fn file_path_predicate_only_discovers_plugins_for_selected_blobless_files() {
         let blob_data = b"stored".to_vec();
-        let blob_hash = BlobId::from_content(&blob_data);
+        let blob_hash = BlobId::from_canonical_content(&blob_data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-000000000512",
@@ -10161,7 +10248,7 @@ mod tests {
     #[tokio::test]
     async fn file_projection_matches_blob_ref_by_descriptor_file_id() {
         let data = b"shared data".to_vec();
-        let blob_hash = BlobId::from_content(&data).to_hex();
+        let blob_hash = BlobId::from_canonical_content(&data).to_hex();
         let blob_reader =
             Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])) as Arc<dyn BlobDataReader>;
         let batch = super::lix_file_record_batch(
@@ -11829,7 +11916,7 @@ mod tests {
     #[tokio::test]
     async fn file_id_conflict_probe_uses_path_index_and_exact_blob_batch() {
         let data = b"hello".to_vec();
-        let blob_hash = BlobId::from_content(&data);
+        let blob_hash = BlobId::from_canonical_content(&data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -11869,9 +11956,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_file_content_update_uses_path_index_and_target_blob_scan() {
+    async fn fast_file_content_update_uses_path_index_and_exact_blob_read() {
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let scan_requests = Arc::new(Mutex::new(Vec::new()));
+        let exact_load_requests = Arc::new(Mutex::new(Vec::new()));
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_directory_row(
@@ -11894,11 +11982,12 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_data).to_hex(),
+                &BlobId::from_canonical_content(old_data).to_hex(),
                 old_data.len(),
             )],
             writes: Vec::new(),
             scan_requests: Arc::clone(&scan_requests),
+            exact_load_requests: Arc::clone(&exact_load_requests),
             path_index_requests: Arc::clone(&path_index_requests),
         };
 
@@ -11916,14 +12005,21 @@ mod tests {
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         {
             let requests = scan_requests.lock().expect("scan request mutex");
+            assert!(requests.is_empty());
+        }
+        {
+            let requests = exact_load_requests.lock().expect("exact request mutex");
             assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].rows.len(), 1);
+            assert_eq!(requests[0].untracked, Some(false));
+            assert_eq!(requests[0].rows[0].schema_key, super::BLOB_REF_SCHEMA_KEY);
             assert_eq!(
-                requests[0].filter.schema_keys,
-                vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+                requests[0].rows[0].entity_pk,
+                uuid_pk("01920000-0000-7000-8000-0000000000d2")
             );
             assert_eq!(
-                requests[0].filter.entity_pks,
-                vec![uuid_pk("01920000-0000-7000-8000-0000000000d2")]
+                requests[0].rows[0].file_id.as_deref(),
+                Some("01920000-0000-7000-8000-0000000000d2")
             );
         }
 
@@ -11990,7 +12086,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_data).to_hex(),
+                &BlobId::from_canonical_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];
@@ -12032,7 +12128,7 @@ mod tests {
         assert!(file_content[0].had_blob_ref);
         assert_eq!(
             file_content[0].base_blob_hash(),
-            Some(BlobId::from_content(old_data)),
+            Some(BlobId::from_canonical_content(old_data)),
             "the exact indexed blob hash should be retained for optional CAS reuse",
         );
         let descriptor = rows
@@ -12060,7 +12156,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_payload).to_hex(),
+                &BlobId::from_canonical_content(old_payload).to_hex(),
                 old_payload.len(),
             ),
         ];
@@ -12068,14 +12164,10 @@ mod tests {
             rows,
             ..CapturingWriteContext::default()
         };
-        let chunk_hash = ChunkHash::from_content(b"durable media chunk");
         let chunk_count = 4_096;
         let chunk_size = 1024 * 1024;
         let size_bytes = u64::from(chunk_count) * chunk_size;
-        let blob_id = BlobId::from_chunks(
-            size_bytes,
-            (0..chunk_count).map(|_| (chunk_hash, chunk_size)),
-        );
+        let blob_id = BlobId::from_bytes([0x44; 32]);
         let receipt = BlobWriteReceipt {
             hash: blob_id,
             size_bytes,
@@ -12147,7 +12239,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_data).to_hex(),
+                &BlobId::from_canonical_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];
@@ -12330,7 +12422,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000442",
             crate::GLOBAL_BRANCH_ID,
             "01920000-0000-7000-8000-000000000442",
-            &BlobId::from_content(b"global").to_hex(),
+            &BlobId::from_canonical_content(b"global").to_hex(),
             6,
         );
         global_fallback.global = true;
@@ -12345,7 +12437,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000112",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000112",
-            &BlobId::from_content(b"branch").to_hex(),
+            &BlobId::from_canonical_content(b"branch").to_hex(),
             6,
         );
         let mut write_context = CapturingWriteContext {
@@ -12413,7 +12505,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_data).to_hex(),
+                &BlobId::from_canonical_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];

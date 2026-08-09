@@ -130,24 +130,3 @@ pub(crate) fn append_path_value_replacement_snapshot(
         normalized,
     )
 }
-
-pub(crate) fn append_path_value_replacement_snapshot_text(
-    primary_key: &str,
-    replacement_value: Option<&str>,
-    normalized: &mut Vec<u8>,
-) -> Result<(usize, usize), crate::LixError> {
-    bound_public_write::append_path_value_replacement_snapshot_text(
-        primary_key,
-        replacement_value,
-        normalized,
-    )
-}
-
-#[cfg(test)]
-pub(crate) use bound_public_write::{
-    take_certified_entity_insert_batch_executions,
-    take_certified_entity_insert_parameter_batch_executions,
-    take_certified_generation_identity_replacements,
-    take_certified_replacement_parameter_batch_executions,
-    take_certified_single_path_value_replacements, take_entity_update_parameter_batch_executions,
-};

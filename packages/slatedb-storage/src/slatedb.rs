@@ -1665,34 +1665,6 @@ pub struct SlateDBRead {
     publication_view: Option<PublicationView>,
     durability: ReadDurability,
     point_cache: SnapshotPointCache,
-    #[cfg(test)]
-    scan_worker_gate: Option<Arc<ScanTestGate>>,
-    #[cfg(test)]
-    scan_hydration_gate: Option<Arc<ScanTestGate>>,
-}
-
-#[cfg(test)]
-struct ScanTestGate {
-    entered: AtomicBool,
-    entered_notify: Notify,
-    release: Notify,
-}
-
-#[cfg(test)]
-impl ScanTestGate {
-    fn new() -> Self {
-        Self {
-            entered: AtomicBool::new(false),
-            entered_notify: Notify::new(),
-            release: Notify::new(),
-        }
-    }
-
-    async fn wait_until_entered(&self) {
-        while !self.entered.load(Ordering::Acquire) {
-            self.entered_notify.notified().await;
-        }
-    }
 }
 
 #[allow(missing_debug_implementations)]
@@ -1925,11 +1897,6 @@ impl WritePipeline {
         snapshot_sequence: u64,
     ) -> PublicationView {
         self.capture_inner(Some(worker), snapshot_sequence)
-    }
-
-    #[cfg(test)]
-    fn capture(&self, snapshot_sequence: u64) -> PublicationView {
-        self.capture_inner(None, snapshot_sequence)
     }
 
     fn capture_inner(
@@ -2533,10 +2500,6 @@ impl Storage for SlateDB {
                 publication_view,
                 durability: opts.durability,
                 point_cache: self.point_cache.clone(),
-                #[cfg(test)]
-                scan_worker_gate: None,
-                #[cfg(test)]
-                scan_hydration_gate: None,
             })
         }
     }
@@ -2568,20 +2531,6 @@ impl Storage for SlateDB {
             })
         }
     }
-}
-
-#[cfg(test)]
-async fn collect_startup_immutable_garbage(
-    worker: &SlateDBWorker,
-    store: &ImmutableValueStore,
-    cutoff: SystemTime,
-) -> Result<(), StorageError> {
-    let store = store.clone();
-    worker
-        .call_read(move |database| async move {
-            collect_startup_immutable_garbage_from_database(database, &store, cutoff).await
-        })
-        .await
 }
 
 async fn collect_startup_immutable_garbage_from_database(
@@ -2995,10 +2944,6 @@ impl StorageRead for SlateDBRead {
                     space,
                     projection: opts.projection,
                     state: Some(state),
-                    #[cfg(test)]
-                    worker_gate: self.scan_worker_gate.clone(),
-                    #[cfg(test)]
-                    hydration_gate: self.scan_hydration_gate.clone(),
                 },
             )
         }
@@ -3012,10 +2957,6 @@ struct SlateDBScanSource {
     space: StorageSpace,
     projection: CoreProjection,
     state: Option<SlateStreamingScanState>,
-    #[cfg(test)]
-    worker_gate: Option<Arc<ScanTestGate>>,
-    #[cfg(test)]
-    hydration_gate: Option<Arc<ScanTestGate>>,
 }
 
 impl StorageScanSource for SlateDBScanSource {
@@ -3028,27 +2969,13 @@ impl StorageScanSource for SlateDBScanSource {
             let state = self.state.take().ok_or(StorageError::InvalidCursor)?;
             let projection = self.projection;
             let space_id = self.space.id();
-            #[cfg(test)]
-            let worker_gate = self.worker_gate.clone();
             let (state, mut chunk) = self
                 .worker
                 .call_read(move |_db| async move {
-                    #[cfg(test)]
-                    if let Some(gate) = worker_gate {
-                        gate.entered.store(true, Ordering::Release);
-                        gate.entered_notify.notify_waiters();
-                        gate.release.notified().await;
-                    }
                     streaming_scan_page(state, limit_rows, projection, space_id).await
                 })
                 .await?;
             self.state = Some(state);
-            #[cfg(test)]
-            if let Some(gate) = &self.hydration_gate {
-                gate.entered.store(true, Ordering::Release);
-                gate.entered_notify.notify_waiters();
-                gate.release.notified().await;
-            }
             hydrate_immutable_value_scan(
                 &self.immutable_value_store,
                 self.space,

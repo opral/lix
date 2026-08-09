@@ -32,6 +32,9 @@ const UPLOAD_SELECTOR_DOMAIN: &str = "lix forktree upload selector v1";
 const SNAPSHOT_SELECTOR_DOMAIN: &str = "lix forktree snapshot selector v1";
 const GC_SELECTOR_DOMAIN: &str = "lix forktree gc-progress selector v2";
 const UPLOAD_BINDING_DOMAIN: &str = "lix forktree upload binding v1";
+pub(crate) const BLOB_MERKLE_CHUNK_BYTES: u64 = 1_048_576;
+const MERKLE_BLOB_ID_DOMAIN: &str = "lix binary blob canonical merkle identity v1";
+const MERKLE_BLOB_ID_MAGIC: &[u8; 8] = b"LIXBMRK\0";
 
 macro_rules! raw_uuid_id {
     ($name:ident) => {
@@ -1041,6 +1044,39 @@ pub(crate) struct BlobChunkRefV1 {
     pub(crate) declared_len: u64,
 }
 
+/// One canonical authenticated Merkle leaf. The chunk object remains the
+/// payload owner; this node binds its ordinal, length, and content digest into
+/// the range-proof tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlobMerkleLeafV1 {
+    pub(crate) ordinal: u64,
+    pub(crate) chunk_object_id: ObjectId,
+    pub(crate) declared_len: u64,
+    pub(crate) chunk_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobMerkleNodeRefV1 {
+    pub(crate) object_id: ObjectId,
+    pub(crate) height: u32,
+    pub(crate) first_ordinal: u64,
+    pub(crate) leaf_count: u64,
+    pub(crate) logical_bytes: u64,
+}
+
+/// One canonical internal node. Child summaries are encoded along with child
+/// ObjectIds so a proof can validate adjacency and lengths without reading an
+/// unrelated subtree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobMerkleInternalV1 {
+    pub(crate) height: u32,
+    pub(crate) first_ordinal: u64,
+    pub(crate) leaf_count: u64,
+    pub(crate) logical_bytes: u64,
+    pub(crate) left: BlobMerkleNodeRefV1,
+    pub(crate) right: BlobMerkleNodeRefV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlobChunkV1 {
     pub(crate) bytes: Bytes,
@@ -1061,50 +1097,64 @@ impl BlobChunkV1 {
         decoder.finish()?;
         Ok(value)
     }
+
+    pub(crate) fn decode_borrowed<'a>(
+        id: ObjectId,
+        bytes: &'a [u8],
+    ) -> Result<&'a [u8], StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::BlobChunk, bytes)?;
+        let value = decoder.bytes_borrowed("blob chunk bytes")?;
+        decoder.finish()?;
+        Ok(value)
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The sole authenticated blob layout descriptor. The manifest points to the
+/// canonical Merkle root; chunk references and flat whole-content digests are
+/// deliberately not part of this durable authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BlobManifestV1 {
     pub(crate) logical_bytes: u64,
-    pub(crate) ordered_chunks: Vec<BlobChunkRefV1>,
-    /// Integrity-bound copy of the canonical public identity. The selected
-    /// state row remains the sole serving owner; this field is only compared
-    /// with that row before payload access and is never independently keyed.
-    pub(super) canonical_blob_id: BlobId,
-    pub(crate) content_digest: [u8; 32],
+    pub(crate) leaf_count: u64,
+    pub(crate) root_object_id: ObjectId,
+    pub(crate) root_height: u32,
+    pub(crate) chunk_bytes: u64,
+    pub(crate) canonical_blob_id: BlobId,
 }
 
 impl BlobManifestV1 {
-    /// Constructs the sole authenticated upload manifest representation from
-    /// the complete ordered chunk closure. Callers cannot provide a detached
-    /// manifest identity; encoding remains the owner validation boundary.
-    pub(crate) fn from_authenticated_chunks(
+    pub(crate) fn from_merkle_root(
         logical_bytes: u64,
-        ordered_chunks: Vec<BlobChunkRefV1>,
-        canonical_blob_id: BlobId,
-        content_digest: [u8; 32],
+        leaf_count: u64,
+        root_object_id: ObjectId,
+        root_height: u32,
     ) -> Self {
+        let canonical_blob_id = canonical_merkle_blob_id(
+            root_object_id,
+            logical_bytes,
+            leaf_count,
+            root_height,
+            BLOB_MERKLE_CHUNK_BYTES,
+        );
         Self {
             logical_bytes,
-            ordered_chunks,
+            leaf_count,
+            root_object_id,
+            root_height,
+            chunk_bytes: BLOB_MERKLE_CHUNK_BYTES,
             canonical_blob_id,
-            content_digest,
         }
     }
 
     pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
         self.validate()?;
-        let count = u32::try_from(self.ordered_chunks.len())
-            .map_err(|_| corruption("blob manifest has too many chunks"))?;
         encode_object(ObjectDomain::BlobManifest, |encoder| {
             encoder.u64(self.logical_bytes);
-            encoder.u32(count);
-            for chunk in &self.ordered_chunks {
-                encode_id(encoder, chunk.chunk_object_id);
-                encoder.u64(chunk.declared_len);
-            }
+            encoder.u64(self.leaf_count);
+            encoder.u64(self.chunk_bytes);
+            encoder.u32(self.root_height);
+            encode_id(encoder, self.root_object_id);
             encoder.fixed(self.canonical_blob_id.as_bytes());
-            encoder.fixed(&self.content_digest);
             Ok(())
         })
     }
@@ -1112,20 +1162,13 @@ impl BlobManifestV1 {
     pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
         let mut decoder = decode_object(id, ObjectDomain::BlobManifest, bytes)?;
         let logical_bytes = decoder.u64()?;
-        let count = decoder.usize("blob manifest chunk count")?;
-        validate_count(count, decoder.remaining(), 40, "blob manifest chunk count")?;
-        let mut ordered_chunks = Vec::with_capacity(count);
-        for _ in 0..count {
-            ordered_chunks.push(BlobChunkRefV1 {
-                chunk_object_id: decode_id(&mut decoder)?,
-                declared_len: decoder.u64()?,
-            });
-        }
         let value = Self {
             logical_bytes,
-            ordered_chunks,
+            leaf_count: decoder.u64()?,
+            chunk_bytes: decoder.u64()?,
+            root_height: decoder.u32()?,
+            root_object_id: decode_id(&mut decoder)?,
             canonical_blob_id: BlobId::from_bytes(decoder.fixed()?),
-            content_digest: decoder.fixed()?,
         };
         decoder.finish()?;
         value.validate()?;
@@ -1133,32 +1176,46 @@ impl BlobManifestV1 {
     }
 
     fn validate(&self) -> Result<(), StorageError> {
-        if self.ordered_chunks.len() > AUTHENTICATED_EDGE_PAGE_ENTRIES {
-            return Err(corruption(
-                "blob manifest exceeds one authenticated edge page; use a blocked manifest",
-            ));
-        }
-        let mut total = 0_u64;
-        for chunk in &self.ordered_chunks {
-            if chunk.chunk_object_id == ObjectId::ZERO || chunk.declared_len == 0 {
-                return Err(corruption("blob manifest has an invalid chunk reference"));
-            }
-            total = total
-                .checked_add(chunk.declared_len)
-                .ok_or_else(|| corruption("blob manifest chunk lengths overflow u64"))?;
-        }
-        if total != self.logical_bytes {
-            return Err(corruption(
-                "blob manifest chunk lengths do not equal its logical length",
-            ));
-        }
-        if self.logical_bytes == 0 && !self.ordered_chunks.is_empty()
-            || self.logical_bytes != 0 && self.ordered_chunks.is_empty()
+        if self.leaf_count == 0
+            || self.root_object_id == ObjectId::ZERO
+            || self.chunk_bytes != BLOB_MERKLE_CHUNK_BYTES
+            || self.leaf_count != self.logical_bytes.div_ceil(self.chunk_bytes).max(1)
+            || (self.leaf_count == 1) != (self.root_height == 0)
+            || (self.leaf_count > 1 && self.root_height == 0)
         {
-            return Err(corruption("blob manifest empty layout is inconsistent"));
+            return Err(corruption("blob manifest Merkle geometry is invalid"));
+        }
+        if self.canonical_blob_id
+            != canonical_merkle_blob_id(
+                self.root_object_id,
+                self.logical_bytes,
+                self.leaf_count,
+                self.root_height,
+                self.chunk_bytes,
+            )
+        {
+            return Err(corruption(
+                "blob manifest Merkle BlobId is not root-derived",
+            ));
         }
         Ok(())
     }
+}
+
+pub(crate) fn canonical_merkle_blob_id(
+    root_object_id: ObjectId,
+    logical_bytes: u64,
+    leaf_count: u64,
+    root_height: u32,
+    chunk_bytes: u64,
+) -> BlobId {
+    let mut encoder = Encoder::with_prefix(MERKLE_BLOB_ID_MAGIC);
+    encoder.u64(logical_bytes);
+    encoder.u64(leaf_count);
+    encoder.u32(root_height);
+    encoder.u64(chunk_bytes);
+    encode_id(&mut encoder, root_object_id);
+    BlobId::from_bytes(keyed_hash(MERKLE_BLOB_ID_DOMAIN, &encoder.into_vec()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

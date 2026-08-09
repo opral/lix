@@ -79,6 +79,7 @@ impl EntitySurfaceSpec {
     /// In particular, String and Json both use Arrow Utf8. A name/type-only
     /// comparison cannot distinguish scalar string bytes from canonical JSON
     /// text after a registered-schema amendment.
+    #[cfg(test)]
     pub(crate) fn columnar_layout_fingerprint(&self) -> String {
         fn update_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {
             hasher.update(&(bytes.len() as u64).to_be_bytes());
@@ -404,13 +405,6 @@ pub(crate) fn entity_surface_schema(
 
     fields.extend(entity_system_fields(shape));
     Arc::new(Schema::new(fields))
-}
-
-pub(crate) fn entity_visible_fields(spec: &EntitySurfaceSpec) -> Vec<Field> {
-    entity_surface_schema(spec, EntitySurfaceShape::Active).fields()[..spec.columns.len()]
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect()
 }
 
 pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {

@@ -233,30 +233,6 @@ where
     })
 }
 
-/// Appends one self-contained storage value to a caller-owned batch buffer.
-///
-/// The returned range can be retained as a compact descriptor by the storage
-/// write pipeline. On encoding failure the buffer is restored to its original
-/// length.
-pub(crate) fn append<T>(
-    context: &str,
-    bytes: &mut Vec<u8>,
-    value: &T,
-) -> Result<std::ops::Range<usize>, LixError>
-where
-    T: ?Sized + musli::Encode<musli::mode::Binary>,
-{
-    let start = bytes.len();
-    if let Err(error) = musli::storage::to_writer(&mut *bytes, value) {
-        bytes.truncate(start);
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode {context} with musli storage: {error}"),
-        ));
-    }
-    Ok(start..bytes.len())
-}
-
 pub(crate) fn decode<'de, T>(context: &str, mut bytes: &'de [u8]) -> Result<T, LixError>
 where
     T: musli::Decode<'de, musli::mode::Binary, musli::alloc::Global>,

@@ -136,6 +136,7 @@ fn validate_upload_request(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_upload_binding(
     existing_path: &str,
     existing_total_size: u64,
@@ -150,6 +151,7 @@ fn validate_upload_binding(
     Ok(())
 }
 
+#[cfg(test)]
 fn upload_part_count(total_size: u64) -> Result<u32, LixError> {
     if total_size == 0 {
         return Ok(1);
@@ -158,6 +160,7 @@ fn upload_part_count(total_size: u64) -> Result<u32, LixError> {
     u32::try_from(parts).map_err(|_| invalid_upload("upload part count exceeds u32"))
 }
 
+#[cfg(test)]
 fn upload_part_size(total_size: u64, part_number: u32) -> Result<u64, LixError> {
     if total_size == 0 && part_number == 0 {
         return Ok(0);
@@ -166,7 +169,9 @@ fn upload_part_size(total_size: u64, part_number: u32) -> Result<u64, LixError> 
         .checked_mul(FILE_UPLOAD_PART_BYTES as u64)
         .ok_or_else(|| invalid_upload("upload part offset exceeds u64"))?;
     if start >= total_size {
-        return Err(invalid_upload("upload part number exceeds declared size"));
+        return Err(invalid_upload(
+            "upload part is outside the declared file size",
+        ));
     }
     Ok((total_size - start).min(FILE_UPLOAD_PART_BYTES as u64))
 }

@@ -484,16 +484,8 @@ where
         chunk_ref: &super::model::BlobChunkRefV1,
         part_hasher: &mut blake3::Hasher,
         final_hasher: &mut blake3::Hasher,
-        semantic_id_builder: &mut super::blob::CanonicalBlobIdBuilder,
-    ) -> Result<(), StorageError> {
-        super::blob::authenticate_chunk(
-            &self.read,
-            chunk_ref,
-            part_hasher,
-            final_hasher,
-            semantic_id_builder,
-        )
-        .await
+    ) -> Result<[u8; 32], StorageError> {
+        super::blob::authenticate_chunk(&self.read, chunk_ref, part_hasher, final_hasher).await
     }
 
     pub(super) async fn load_blob_bytes_many_on_view(
@@ -506,6 +498,30 @@ where
             self.view_id(),
             self.view_instance_id(),
             refs,
+        )
+        .await
+    }
+
+    pub(super) async fn load_blob_merkle_proof(
+        &self,
+        manifest: super::model::BlobManifestV1,
+        state_key: &super::state::StateKey,
+        leaf_range: std::ops::Range<u64>,
+    ) -> Result<super::merkle::BlobMerkleProofV1, StorageError> {
+        super::merkle::load_blob_merkle_range_proof(&self.read, manifest, state_key, leaf_range)
+            .await
+    }
+
+    pub(super) async fn build_blob_merkle_edit_successor(
+        &self,
+        manifest: super::model::BlobManifestV1,
+        payload: &[u8],
+        offset: usize,
+        delete_len: usize,
+        insert_len: usize,
+    ) -> Result<super::merkle::BlobMerkleTreeBuild, StorageError> {
+        super::merkle::build_blob_merkle_edit_successor(
+            &self.read, manifest, payload, offset, delete_len, insert_len,
         )
         .await
     }
@@ -654,13 +670,6 @@ where
         ids: &[crate::changelog::ChangeId],
     ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError> {
         super::serving::load_change_records(&self.read, ids).await
-    }
-
-    pub(crate) async fn scan_state_rows_at_commit(
-        &self,
-        commit_id: crate::changelog::CommitId,
-    ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
-        super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
     }
 
     pub(crate) async fn diff_state_rows_between_commits(
@@ -838,7 +847,6 @@ where
                     updated_at: value.updated_at,
                     change_id: value.change_id,
                     commit_id: value.commit_id,
-                    blob_manifest_object_ids: value.blob_manifest_object_ids,
                 }
             }));
         }
@@ -1603,7 +1611,6 @@ mod tests {
             snapshot_content: snapshot_content.map(Into::into),
             metadata: None,
             deleted,
-            blob_manifest_object_ids: Vec::new(),
         }
     }
 

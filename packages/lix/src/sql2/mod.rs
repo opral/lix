@@ -38,19 +38,13 @@ pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
     statement_has_durable_runtime_function,
 };
-pub(crate) use catalog::{
-    EntityColumnType, EntitySurfaceSpec, PublicCatalog, derive_entity_surface_spec_from_schema,
-    entity_visible_fields,
-};
+pub(crate) use catalog::PublicCatalog;
 pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, SqlChangelogQuerySource,
     SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
-pub(crate) use entity_batch::{
-    CanonicalEntitySnapshotProjection, CurrentEntitySnapshotReader, EntitySnapshotReader,
-};
-pub(crate) use entity_projection::EntityProjectionDecoder;
+pub(crate) use entity_batch::{CanonicalEntitySnapshotProjection, EntitySnapshotReader};
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]
 pub(crate) use exec::{
@@ -61,35 +55,28 @@ pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
     SqlLogicalPlan, append_path_value_replacement_snapshot,
-    append_path_value_replacement_snapshot_text, create_write_logical_plan_from_template,
-    create_write_plan_template_from_parsed, diff_command_query,
-    execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,
-    execute_transaction_read_statement_from_parsed, execute_write_logical_plan_parameter_batch,
-    execute_write_logical_plan_prepared_dml_batch, execute_write_logical_plan_result_with_metadata,
-    execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
-    prepare_path_value_replacement_program, prepare_path_value_replacement_row,
-    prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
-    write_plan_requires_post_stage_returning_checkpoint,
+    create_write_logical_plan_from_template, create_write_plan_template_from_parsed,
+    diff_command_query, execute_read_statement_in_session_from_parsed,
+    execute_read_statement_in_session_with_result, execute_transaction_read_statement_from_parsed,
+    execute_write_logical_plan_parameter_batch, execute_write_logical_plan_prepared_dml_batch,
+    execute_write_logical_plan_result_with_metadata, execute_write_logical_plan_value_batch,
+    parameter_record_batch, parameter_row, prepare_path_value_replacement_program,
+    prepare_path_value_replacement_row, prepare_read_session, prepare_read_session_at_head,
+    query_result_from_batches, write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
 pub(crate) use exec::{
     WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,
     execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
     execute_write_logical_plan_with_mode_and_trace_result,
-    execute_write_logical_plan_with_mode_result, take_certified_entity_insert_batch_executions,
-    take_certified_entity_insert_parameter_batch_executions,
-    take_certified_generation_identity_replacements,
-    take_certified_replacement_parameter_batch_executions,
-    take_certified_single_path_value_replacements, take_entity_update_parameter_batch_executions,
+    execute_write_logical_plan_with_mode_result,
 };
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
 };
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
-pub(crate) use planning_cache::{
-    CachedReadPlan, CachedUpdateLiteralShape, PhysicalReadPlanCacheKey, SqlPlanningCache,
-};
+pub(crate) use planning_cache::{CachedReadPlan, PhysicalReadPlanCacheKey, SqlPlanningCache};
 pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,

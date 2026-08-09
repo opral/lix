@@ -202,35 +202,11 @@ impl<'a> HistoricalStateRowRef<'a> {
         self.row.snapshot_content.as_ref()
     }
 
-    pub(super) fn metadata(self) -> Option<&'a SharedStr> {
-        self.row.metadata.as_ref()
-    }
-
     pub(super) fn deleted(self) -> bool {
         self.row.deleted
     }
 
-    pub(super) fn created_at(self) -> crate::common::LixTimestamp {
-        self.row.created_at
-    }
-
-    pub(super) fn updated_at(self) -> crate::common::LixTimestamp {
-        self.row.updated_at
-    }
-
-    pub(super) fn change_id(self) -> crate::changelog::ChangeId {
-        self.row.change_id
-    }
-
-    pub(super) fn commit_id(self) -> crate::changelog::CommitId {
-        self.row.commit_id
-    }
-
     pub(super) fn key(self) -> &'a StateKey {
         &self.row.key
-    }
-
-    pub(super) fn blob_manifest_object_ids(self) -> &'a [crate::forktree::ObjectId] {
-        &self.row.blob_manifest_object_ids
     }
 }

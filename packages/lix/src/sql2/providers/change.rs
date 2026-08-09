@@ -8,7 +8,9 @@ use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
-use crate::changelog::{ChangeId, ChangeRecord, CommitId};
+#[cfg(test)]
+use crate::changelog::CommitId;
+use crate::changelog::{ChangeId, ChangeRecord};
 use crate::forktree::ForkTreeReadFacade;
 use crate::serialize_row_metadata;
 
@@ -226,6 +228,7 @@ fn push_unique_change(
     Ok(())
 }
 
+#[cfg(test)]
 fn require_commit_records(
     expected_commit_ids: &[CommitId],
     records: Vec<Option<crate::changelog::CommitRecord>>,

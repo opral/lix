@@ -61,11 +61,6 @@ macro_rules! impl_merge_row_batch {
             }
 
             #[cfg(test)]
-            pub(crate) fn large_buffer_count(&self) -> usize {
-                usize::from(!self.rows.is_empty())
-            }
-
-            #[cfg(test)]
             pub(crate) fn row_capacity(&self) -> usize {
                 self.rows.capacity()
             }
@@ -107,6 +102,13 @@ macro_rules! impl_merge_row_batch {
 impl_merge_row_batch!(TrackedStateMergePickBatch, TrackedStateMergePick);
 impl_merge_row_batch!(TrackedStateMergeConflictBatch, TrackedStateMergeConflict);
 
+#[cfg(test)]
+impl TrackedStateMergeConflictBatch {
+    pub(crate) fn large_buffer_count(&self) -> usize {
+        usize::from(!self.rows.is_empty())
+    }
+}
+
 /// One source-side change selected for the merge result.
 ///
 /// Merge picks describe source-side state that will be selected into
@@ -146,6 +148,7 @@ pub(crate) struct TrackedStateMergeConflict {
 
 /// Change ids whose payloads the merge planner needs for cross-change
 /// equality (live/live after-pairs with differing change ids).
+#[cfg(test)]
 pub(crate) fn merge_payload_fallback_ids(
     target_diff: &TrackedStateDiff,
     source_diff: &TrackedStateDiff,
@@ -174,6 +177,7 @@ pub(crate) fn merge_payload_fallback_ids(
 /// Tree diffs are already identity sorted, so the production path performs
 /// one linear intersection without an index or candidate buffer. Defensive
 /// unsorted callers are normalized once by [`SortedMergeInputs`].
+#[cfg(test)]
 fn sorted_merge_payload_fallback_ids<T, S>(
     target_entries: &[T],
     source_entries: &[S],

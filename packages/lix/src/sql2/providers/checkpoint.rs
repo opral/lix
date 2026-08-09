@@ -203,6 +203,7 @@ fn string_constraint_allows(constraint: &FileIdConstraint, value: &str) -> bool 
     }
 }
 
+#[cfg(test)]
 fn checkpoint_depth_scan_limit(route: &HistoryRoute) -> Option<usize> {
     route
         .max_depth
@@ -216,6 +217,7 @@ fn checkpoint_depth_matches(route: &HistoryRoute, depth: u32) -> bool {
         && route.max_depth.is_none_or(|maximum| depth <= maximum)
 }
 
+#[cfg(test)]
 fn min_optional(left: Option<usize>, right: Option<usize>) -> Option<usize> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),

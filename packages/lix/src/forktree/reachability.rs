@@ -17,6 +17,7 @@ use super::gc_index::{
     MaintenanceEdit, live_contains, live_insert, mark_insert, mark_range_iter, queue_pop,
     queue_push,
 };
+use super::merkle::authenticated_merkle_edges;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberPageV1,
@@ -1109,18 +1110,25 @@ where
         }
         ObjectDomain::BlobManifest => {
             let value = BlobManifestV1::decode(id, bytes)?;
-            validate_chunk_sequence(
-                read,
-                &value.ordered_chunks,
-                value.content_digest,
-                "blob manifest",
-            )
-            .await?;
+            let root_domain = if value.leaf_count == 1 {
+                ObjectDomain::BlobMerkleLeafV1
+            } else {
+                ObjectDomain::BlobMerkleInternalV1
+            };
+            edges.push(typed(value.root_object_id, root_domain));
+        }
+        ObjectDomain::BlobMerkleLeafV1 => {
             edges.extend(
-                value
-                    .ordered_chunks
+                authenticated_merkle_edges(id, bytes)?
                     .into_iter()
-                    .map(|chunk| typed(chunk.chunk_object_id, ObjectDomain::BlobChunk)),
+                    .map(|(id, domain)| typed(id, domain)),
+            );
+        }
+        ObjectDomain::BlobMerkleInternalV1 => {
+            edges.extend(
+                authenticated_merkle_edges(id, bytes)?
+                    .into_iter()
+                    .map(|(id, domain)| typed(id, domain)),
             );
         }
         ObjectDomain::SnapshotTarget => {
@@ -1455,13 +1463,6 @@ fn full_value<'a>(value: &'a ProjectedValue, message: &str) -> Result<&'a Bytes,
     match value {
         ProjectedValue::FullValue(bytes) => Ok(bytes),
         ProjectedValue::KeyOnly => Err(corruption(message)),
-    }
-}
-
-fn unbounded_range() -> KeyRange {
-    KeyRange {
-        lower: Bound::Unbounded,
-        upper: Bound::Unbounded,
     }
 }
 

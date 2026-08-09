@@ -21,73 +21,19 @@ use super::tree::{
 };
 use super::view::{CoherentView, load_object_bytes, load_object_map};
 
-const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+pub(super) const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const UPLOAD_PART_BYTES: u64 = CANONICAL_BLOB_CHUNK_BYTES as u64 * 16;
 const UPLOAD_PART_WINDOW: u64 = 4;
-
-/// Computes the existing public fixed-chunk BlobId while upload completion is
-/// already authenticating payload bytes. Memory is one canonical chunk plus
-/// O(chunk-count) hashes; the result is copied into the manifest only as an
-/// integrity claim checked against the selected state owner.
-#[derive(Default)]
-pub(super) struct CanonicalBlobIdBuilder {
-    total_size: u64,
-    pending: Vec<u8>,
-    chunks: Vec<(crate::binary_cas::ChunkHash, u64)>,
-}
-
-impl CanonicalBlobIdBuilder {
-    fn update(&mut self, mut bytes: &[u8]) -> Result<(), StorageError> {
-        self.total_size = self
-            .total_size
-            .checked_add(
-                u64::try_from(bytes.len())
-                    .map_err(|_| corruption("blob fragment length exceeds u64"))?,
-            )
-            .ok_or_else(|| corruption("blob length overflows u64"))?;
-        while !bytes.is_empty() {
-            let remaining = CANONICAL_BLOB_CHUNK_BYTES - self.pending.len();
-            let take = remaining.min(bytes.len());
-            self.pending.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-            if self.pending.len() == CANONICAL_BLOB_CHUNK_BYTES {
-                self.chunks.push((
-                    crate::binary_cas::ChunkHash::from_content(&self.pending),
-                    CANONICAL_BLOB_CHUNK_BYTES as u64,
-                ));
-                self.pending.clear();
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> crate::binary_cas::BlobId {
-        if self.total_size <= CANONICAL_BLOB_CHUNK_BYTES as u64 {
-            let hash = self
-                .chunks
-                .first()
-                .map(|(hash, _)| *hash)
-                .unwrap_or_else(|| crate::binary_cas::ChunkHash::from_content(&self.pending));
-            return crate::binary_cas::BlobId::from_single_chunk(hash);
-        }
-        if !self.pending.is_empty() {
-            self.chunks.push((
-                crate::binary_cas::ChunkHash::from_content(&self.pending),
-                self.pending.len() as u64,
-            ));
-        }
-        crate::binary_cas::BlobId::from_chunks(self.total_size, self.chunks)
-    }
-}
 
 /// A public blob identity bound to one immutable manifest by an authenticated
 /// state-tree row. Fields stay owner-private so sibling subsystems cannot
 /// construct an object-space capability or substitute a manifest ID.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedBlobRef {
     semantic_id: crate::binary_cas::BlobId,
     expected_size: u64,
     manifest_object_id: ObjectId,
+    state_key: StateKey,
     branch_id: CanonicalBranchId,
     view_id: [u8; 32],
     view_instance_id: u64,
@@ -108,12 +54,16 @@ struct HistoricalBlobRefOwnerValue {
 }
 
 impl AuthenticatedBlobRef {
-    pub(crate) fn semantic_id(self) -> crate::binary_cas::BlobId {
+    pub(crate) fn semantic_id(&self) -> crate::binary_cas::BlobId {
         self.semantic_id
     }
 
-    pub(crate) fn expected_size(self) -> u64 {
+    pub(crate) fn expected_size(&self) -> u64 {
         self.expected_size
+    }
+
+    pub(crate) fn manifest_object_id(&self) -> ObjectId {
+        self.manifest_object_id
     }
 }
 
@@ -307,6 +257,7 @@ fn bind_state_blob_ref(
         semantic_id,
         expected_size: owner.size_bytes,
         manifest_object_id,
+        state_key: key,
         branch_id,
         view_id,
         view_instance_id,
@@ -319,6 +270,7 @@ where
 {
     /// Binds a public blob identity to an immutable manifest edge carried by
     /// a row authenticated on this exact coherent view.
+    #[cfg(test)]
     pub(crate) fn bind_blob(
         &self,
         row: &super::serving::VisibleStateRow,
@@ -412,35 +364,22 @@ where
             reference,
         )?;
     }
-    let mut required_ids = BTreeSet::new();
-    for manifest in manifests.values() {
-        for chunk in &manifest.ordered_chunks {
-            required_ids.insert(chunk.chunk_object_id);
-        }
-    }
-    let chunks = load_required_chunks(read, required_ids).await?;
     let mut entries = Vec::with_capacity(refs.len());
     for reference in refs {
         let manifest = required_manifest(&manifests, reference.manifest_object_id)?;
-        let capacity = usize::try_from(manifest.logical_bytes)
-            .map_err(|_| corruption("blob payload length cannot be represented by this process"))?;
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut digest = blake3::Hasher::new();
-        for chunk_ref in &manifest.ordered_chunks {
-            let chunk = required_chunk(&chunks, chunk_ref.chunk_object_id)?;
-            validate_chunk_len(chunk, chunk_ref)?;
-            digest.update(&chunk.bytes);
-            bytes.extend_from_slice(&chunk.bytes);
-        }
-        if bytes.len() != capacity || digest.finalize().as_bytes() != &manifest.content_digest {
-            return Err(corruption("blob manifest payload length or digest is invalid").into());
-        }
-        if crate::binary_cas::BlobId::from_content(&bytes) != reference.semantic_id {
-            return Err(corruption(
-                "authenticated state blob identity does not match its manifest payload",
-            )
-            .into());
-        }
+        let proof = super::merkle::load_blob_merkle_range_proof(
+            read,
+            *manifest,
+            &reference.state_key,
+            0..manifest.leaf_count,
+        )
+        .await?;
+        let bytes = super::merkle::materialize_blob_merkle_range(
+            &proof,
+            &reference.state_key,
+            *manifest,
+            0..manifest.logical_bytes,
+        )?;
         entries.push(Some(bytes));
     }
     Ok(crate::binary_cas::BlobBytesBatch::new(entries))
@@ -465,59 +404,33 @@ where
         let manifest = required_manifest_by_id(&manifests, reference.manifest_object_id)?;
         validate_manifest_fields(manifest, reference.expected_size, reference.semantic_id)?;
     }
-    let required_ids = manifests
-        .values()
-        .flat_map(|manifest| {
-            manifest
-                .ordered_chunks
-                .iter()
-                .map(|chunk| chunk.chunk_object_id)
-        })
-        .collect::<BTreeSet<_>>();
-    let chunks = load_required_chunks(read, required_ids).await?;
     let mut entries = Vec::with_capacity(refs.len());
     for reference in refs {
         let manifest = required_manifest_by_id(&manifests, reference.manifest_object_id)?;
-        let capacity = usize::try_from(manifest.logical_bytes)
-            .map_err(|_| corruption("blob payload length cannot be represented by this process"))?;
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut digest = blake3::Hasher::new();
-        for chunk_ref in &manifest.ordered_chunks {
-            let chunk = required_chunk(&chunks, chunk_ref.chunk_object_id)?;
-            validate_chunk_len(chunk, chunk_ref)?;
-            digest.update(&chunk.bytes);
-            bytes.extend_from_slice(&chunk.bytes);
-        }
-        if bytes.len() != capacity || digest.finalize().as_bytes() != &manifest.content_digest {
-            return Err(corruption("blob manifest payload length or digest is invalid").into());
-        }
-        if crate::binary_cas::BlobId::from_content(&bytes) != reference.semantic_id {
-            return Err(corruption(
-                "historical state blob identity does not match its manifest payload",
-            )
-            .into());
-        }
+        let proof = super::merkle::load_blob_merkle_range_proof(
+            read,
+            *manifest,
+            &reference.state_key,
+            0..manifest.leaf_count,
+        )
+        .await?;
+        let bytes = super::merkle::materialize_blob_merkle_range(
+            &proof,
+            &reference.state_key,
+            *manifest,
+            0..manifest.logical_bytes,
+        )?;
         entries.push(Some(bytes));
     }
     Ok(crate::binary_cas::BlobBytesBatch::new(entries))
 }
 
-/// Extracts the semantic identity from one authenticated historical BlobRef
-/// owner without turning its BlobId into a physical lookup key.  GC uses this
-/// only after the exact historical state key and manifest edge have passed the
-/// same owner validation as payload reads.
-pub(crate) fn historical_blob_semantic_id(
-    key: &StateKey,
-    value: &super::state::StateValue,
-) -> Result<crate::binary_cas::BlobId, crate::LixError> {
-    Ok(bind_historical_state_blob_ref(key, value)?.semantic_id)
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct HistoricalAuthenticatedBlobRef {
     semantic_id: crate::binary_cas::BlobId,
     expected_size: u64,
     manifest_object_id: ObjectId,
+    state_key: StateKey,
 }
 
 fn bind_historical_state_blob_ref(
@@ -570,6 +483,7 @@ fn bind_historical_state_blob_ref(
         semantic_id: crate::binary_cas::BlobId::from_hex(&owner.blob_hash)?,
         expected_size: owner.size_bytes,
         manifest_object_id,
+        state_key: key.clone(),
     })
 }
 
@@ -593,53 +507,28 @@ where
     )?;
     let refs = requests
         .iter()
-        .map(|(reference, _)| *reference)
+        .map(|(reference, _)| reference.clone())
         .collect::<Vec<_>>();
     let manifests = load_manifests(read, &refs).await?;
-    let mut required_ids = BTreeSet::new();
-    for (reference, requested) in requests {
-        let manifest = required_manifest(&manifests, reference.manifest_object_id)?;
-        validate_manifest_owner(manifest, reference)?;
-        let range = validated_range(requested.clone(), manifest.logical_bytes)?;
-        let mut offset = 0_u64;
-        for chunk in &manifest.ordered_chunks {
-            let end = offset
-                .checked_add(chunk.declared_len)
-                .ok_or_else(|| corruption("blob chunk offsets overflow u64"))?;
-            if offset < range.end && end > range.start {
-                required_ids.insert(chunk.chunk_object_id);
-            }
-            offset = end;
-        }
-    }
-    let chunks = load_required_chunks(read, required_ids).await?;
     let mut entries = Vec::with_capacity(requests.len());
     for (reference, requested) in requests {
         let manifest = required_manifest(&manifests, reference.manifest_object_id)?;
         validate_manifest_owner(manifest, reference)?;
         let range = validated_range(requested.clone(), manifest.logical_bytes)?;
-        let expected_len = usize::try_from(range.end - range.start)
-            .map_err(|_| corruption("blob range length cannot be represented by this process"))?;
-        let mut bytes = Vec::with_capacity(expected_len);
-        let mut offset = 0_u64;
-        for chunk_ref in &manifest.ordered_chunks {
-            let end = offset
-                .checked_add(chunk_ref.declared_len)
-                .ok_or_else(|| corruption("blob chunk offsets overflow u64"))?;
-            if offset < range.end && end > range.start {
-                let chunk = required_chunk(&chunks, chunk_ref.chunk_object_id)?;
-                validate_chunk_len(chunk, chunk_ref)?;
-                let start_in_chunk = usize::try_from(range.start.saturating_sub(offset))
-                    .map_err(|_| corruption("blob range start exceeds usize"))?;
-                let end_in_chunk = usize::try_from(range.end.min(end) - offset)
-                    .map_err(|_| corruption("blob range end exceeds usize"))?;
-                bytes.extend_from_slice(&chunk.bytes[start_in_chunk..end_in_chunk]);
-            }
-            offset = end;
-        }
-        if bytes.len() != expected_len {
-            return Err(corruption("blob range materialization length is invalid").into());
-        }
+        let leaf_range = super::merkle::leaf_range_for_bytes(manifest, range.clone())?;
+        let proof = super::merkle::load_blob_merkle_range_proof(
+            read,
+            *manifest,
+            &reference.state_key,
+            leaf_range,
+        )
+        .await?;
+        let bytes = super::merkle::materialize_blob_merkle_range(
+            &proof,
+            &reference.state_key,
+            *manifest,
+            range.clone(),
+        )?;
         entries.push(Some(crate::binary_cas::BlobRangeBytes {
             bytes,
             total_size: manifest.logical_bytes,
@@ -713,26 +602,6 @@ where
         .map_err(Into::into)
 }
 
-async fn load_required_chunks<R>(
-    read: &R,
-    ids: impl IntoIterator<Item = ObjectId>,
-) -> Result<BTreeMap<ObjectId, BlobChunkV1>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let ids = ids.into_iter().collect::<BTreeSet<_>>();
-    let objects = load_object_map(read, ids.iter().copied()).await?;
-    ids.into_iter()
-        .map(|id| {
-            let bytes = objects
-                .get(&id)
-                .ok_or_else(|| corruption(format!("blob chunk {id} is absent")))?;
-            BlobChunkV1::decode(id, bytes).map(|chunk| (id, chunk))
-        })
-        .collect::<Result<_, _>>()
-        .map_err(Into::into)
-}
-
 fn required_manifest(
     manifests: &BTreeMap<ObjectId, BlobManifestV1>,
     id: ObjectId,
@@ -776,25 +645,6 @@ fn validate_manifest_fields(
     Ok(())
 }
 
-fn required_chunk(
-    chunks: &BTreeMap<ObjectId, BlobChunkV1>,
-    id: ObjectId,
-) -> Result<&BlobChunkV1, crate::LixError> {
-    chunks
-        .get(&id)
-        .ok_or_else(|| corruption(format!("blob chunk {id} is absent")).into())
-}
-
-fn validate_chunk_len(
-    chunk: &BlobChunkV1,
-    reference: &BlobChunkRefV1,
-) -> Result<(), crate::LixError> {
-    if chunk.bytes.len() as u64 != reference.declared_len {
-        return Err(corruption("blob chunk bytes do not match their declared length").into());
-    }
-    Ok(())
-}
-
 fn validated_range(requested: Range<u64>, total: u64) -> Result<Range<u64>, crate::LixError> {
     if requested.start >= requested.end || requested.start >= total {
         return Err(crate::LixError::new(
@@ -825,6 +675,7 @@ pub(crate) struct CompletedUpload {
     pub(super) raw_upload_selector: Bytes,
     pub(super) selector: UploadSelectorV1,
     pub(super) manifest: BlobManifestV1,
+    pub(super) merkle_objects: ImmutableObjectSet,
 }
 
 /// One part publication prepared from one coherent upload view. The caller
@@ -839,6 +690,7 @@ pub(crate) struct PreparedUploadPart {
     pub(crate) selector: UploadSelectorV1,
     pub(crate) raw_selector: Option<Bytes>,
     pub(crate) complete_manifest: Option<BlobManifestV1>,
+    pub(crate) complete_merkle_objects: Option<ImmutableObjectSet>,
     pub(crate) complete_receipt: Option<crate::binary_cas::BlobWriteReceipt>,
     pub(crate) already_present: bool,
 }
@@ -1014,7 +866,7 @@ where
             .checked_add(1)
             .ok_or_else(|| corruption("upload selector generation overflows u64"))?,
     };
-    let complete_manifest = if progress.received_bytes == binding.declared_total_size
+    let complete_build = if progress.received_bytes == binding.declared_total_size
         && progress.contiguous_prefix_bytes == binding.declared_total_size
     {
         Some(
@@ -1030,7 +882,8 @@ where
     } else {
         None
     };
-    let complete_receipt = if let Some(manifest) = &complete_manifest {
+    let complete_receipt = if let Some(build) = &complete_build {
+        let manifest = &build.manifest;
         let (manifest_id, _) = manifest.encode()?;
         Some(crate::binary_cas::BlobWriteReceipt {
             hash: manifest.canonical_blob_id,
@@ -1046,7 +899,7 @@ where
                 }
             } else {
                 crate::binary_cas::BlobLayout::Chunked {
-                    chunk_count: u32::try_from(manifest.ordered_chunks.len())
+                    chunk_count: u32::try_from(manifest.leaf_count)
                         .map_err(|_| corruption("upload manifest has too many chunks"))?,
                 }
             },
@@ -1063,7 +916,8 @@ where
         progress,
         selector,
         raw_selector,
-        complete_manifest,
+        complete_manifest: complete_build.as_ref().map(|build| build.manifest),
+        complete_merkle_objects: complete_build.map(|build| build.objects),
         complete_receipt,
         already_present,
     })
@@ -1075,7 +929,7 @@ async fn build_completed_manifest<R>(
     new_part: &UploadPartV1,
     new_chunks: &[BlobChunkV1],
     total_size: u64,
-) -> Result<BlobManifestV1, StorageError>
+) -> Result<super::merkle::BlobMerkleTreeBuild, StorageError>
 where
     R: StorageAdapterRead,
 {
@@ -1120,9 +974,7 @@ where
     }
     parts.insert(new_part.part_number, new_part.clone());
     let mut next_offset = 0_u64;
-    let mut digest = blake3::Hasher::new();
-    let mut blob_id = CanonicalBlobIdBuilder::default();
-    let mut ordered_chunks = Vec::new();
+    let mut chunk_claims = Vec::new();
     for (_, part) in parts {
         if part.byte_offset != next_offset {
             return Err(corruption("upload parts are not contiguous at completion"));
@@ -1146,9 +998,7 @@ where
                 return Err(corruption("upload chunk length does not match its receipt"));
             }
             part_digest.update(&bytes);
-            digest.update(&bytes);
-            blob_id.update(&bytes)?;
-            ordered_chunks.push(chunk_ref.clone());
+            chunk_claims.push((chunk_ref.clone(), *blake3::hash(&bytes).as_bytes()));
         }
         if part_digest.finalize().as_bytes() != &part.part_digest {
             return Err(corruption("upload part digest does not match its chunks"));
@@ -1162,14 +1012,7 @@ where
             "upload completion size does not match its binding",
         ));
     }
-    let manifest = BlobManifestV1::from_authenticated_chunks(
-        next_offset,
-        ordered_chunks,
-        blob_id.finish(),
-        *digest.finalize().as_bytes(),
-    );
-    let _ = manifest.encode()?;
-    Ok(manifest)
+    super::merkle::build_blob_merkle_tree_from_chunk_claims(next_offset, &chunk_claims)
 }
 
 /// Authenticates an open upload and streams its path-copied ReceiptTree in
@@ -1230,9 +1073,8 @@ where
         contiguous_prefix_bytes: progress.contiguous_prefix_bytes,
     };
     view.validate_receipt_root(receipt_root).await?;
-    let mut ordered_chunks = Vec::new();
+    let mut chunk_claims = Vec::new();
     let mut final_hasher = blake3::Hasher::new();
-    let mut semantic_id_builder = CanonicalBlobIdBuilder::default();
     let mut next_offset = 0_u64;
     let mut part_count = 0_u64;
     let mut start_after: Option<Vec<u8>> = None;
@@ -1272,13 +1114,10 @@ where
             }
             let mut part_hasher = blake3::Hasher::new();
             for chunk_ref in &part.ordered_chunks {
-                view.authenticate_chunk(
-                    chunk_ref,
-                    &mut part_hasher,
-                    &mut final_hasher,
-                    &mut semantic_id_builder,
-                )
-                .await?;
+                let chunk_digest = view
+                    .authenticate_chunk(chunk_ref, &mut part_hasher, &mut final_hasher)
+                    .await?;
+                chunk_claims.push((chunk_ref.clone(), chunk_digest));
             }
             if part_hasher.finalize().as_bytes() != &part.part_digest {
                 return Err(corruption("upload part digest does not match its chunks"));
@@ -1289,7 +1128,6 @@ where
             part_count = part_count
                 .checked_add(1)
                 .ok_or_else(|| corruption("upload completion part count overflows u64"))?;
-            ordered_chunks.extend(part.ordered_chunks);
         }
         start_after = page.last().map(|(key, _)| key.clone());
         if page.len() < super::tree::RECEIPT_TREE_LEAF_ENTRIES {
@@ -1311,18 +1149,14 @@ where
     {
         return Err(corruption("upload final digest does not match its binding"));
     }
-    let manifest = BlobManifestV1 {
-        logical_bytes: next_offset,
-        ordered_chunks,
-        canonical_blob_id: semantic_id_builder.finish(),
-        content_digest,
-    };
-    let _ = manifest.encode()?;
+    let build =
+        super::merkle::build_blob_merkle_tree_from_chunk_claims(next_offset, &chunk_claims)?;
     Ok(CompletedUpload {
         view_id: view.view_id(),
         raw_upload_selector,
         selector,
-        manifest,
+        manifest: build.manifest,
+        merkle_objects: build.objects,
     })
 }
 
@@ -1420,8 +1254,7 @@ pub(super) async fn authenticate_chunk<R>(
     chunk_ref: &BlobChunkRefV1,
     part_hasher: &mut blake3::Hasher,
     final_hasher: &mut blake3::Hasher,
-    semantic_id_builder: &mut CanonicalBlobIdBuilder,
-) -> Result<(), StorageError>
+) -> Result<[u8; 32], StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1434,13 +1267,12 @@ where
     }
     part_hasher.update(&chunk.bytes);
     final_hasher.update(&chunk.bytes);
-    semantic_id_builder.update(&chunk.bytes)?;
-    Ok(())
+    Ok(*blake3::hash(&chunk.bytes).as_bytes())
 }
 
 #[cfg(test)]
-mod canonical_blob_id_tests {
-    use super::{CanonicalBlobIdBuilder, bind_historical_state_blob_ref};
+mod historical_blob_binding_tests {
+    use super::bind_historical_state_blob_ref;
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::forktree::ObjectId;
@@ -1454,7 +1286,7 @@ mod canonical_blob_id_tests {
         }
     }
 
-    fn value(id: &str, cell: StateCell, manifest_count: usize) -> StateValue {
+    fn value(_id: &str, cell: StateCell, manifest_count: usize) -> StateValue {
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         StateValue {
             change_id: crate::changelog::ChangeId::for_test_label("change"),
@@ -1471,22 +1303,9 @@ mod canonical_blob_id_tests {
     }
 
     #[test]
-    fn streaming_identity_matches_complete_multi_chunk_content() {
-        let payload = vec![0x5a; 2 * 1024 * 1024 + 17];
-        let mut builder = CanonicalBlobIdBuilder::default();
-        for fragment in payload.chunks(333_333) {
-            builder.update(fragment).expect("streaming identity update");
-        }
-        assert_eq!(
-            builder.finish(),
-            crate::binary_cas::BlobId::from_content(&payload)
-        );
-    }
-
-    #[test]
     fn historical_blob_binding_rejects_wrong_row_and_non_live_cells() {
         let id = "01920000-0000-7000-8000-0000000000a1";
-        let hash = crate::binary_cas::BlobId::from_content(b"payload").to_hex();
+        let hash = crate::binary_cas::BlobId::from_bytes([0x5a; 32]).to_hex();
         let live = StateCell::Value(
             serde_json::json!({"id": id, "blob_hash": hash, "size_bytes": 7})
                 .to_string()

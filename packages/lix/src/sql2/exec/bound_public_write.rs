@@ -59,36 +59,6 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn take_entity_update_parameter_batch_executions() -> usize {
-    ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
-}
-
-#[cfg(test)]
-pub(crate) fn take_certified_replacement_parameter_batch_executions() -> usize {
-    CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
-}
-
-#[cfg(test)]
-pub(crate) fn take_certified_entity_insert_batch_executions() -> usize {
-    CERTIFIED_ENTITY_INSERT_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
-}
-
-#[cfg(test)]
-pub(crate) fn take_certified_entity_insert_parameter_batch_executions() -> usize {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
-}
-
-#[cfg(test)]
-pub(crate) fn take_certified_generation_identity_replacements() -> usize {
-    CERTIFIED_GENERATION_IDENTITY_REPLACEMENTS.with(|executions| executions.replace(0))
-}
-
-#[cfg(test)]
-pub(crate) fn take_certified_single_path_value_replacements() -> usize {
-    CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| executions.replace(0))
-}
-
-#[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
         BoundWriteTarget::Entity(_) => bound_public_write_shape_supported(plan),
@@ -3066,12 +3036,6 @@ pub(crate) struct PreparedPathValueReplacementRow {
 }
 
 impl PreparedPathValueReplacementProgram {
-    pub(crate) fn parameter_count(&self) -> usize {
-        self.primary_key_param_index
-            .max(self.value_param_index)
-            .saturating_add(1)
-    }
-
     pub(crate) fn primary_key<'a>(&self, params: &'a [Value]) -> Result<&'a str, LixError> {
         let Some(Value::Text(primary_key)) = params.get(self.primary_key_param_index) else {
             return Err(LixError::new(
@@ -3080,36 +3044,6 @@ impl PreparedPathValueReplacementProgram {
             ));
         };
         Ok(primary_key)
-    }
-
-    pub(crate) fn primary_key_text<'a>(
-        &self,
-        params: &'a [impl AsRef<str>],
-    ) -> Result<&'a str, LixError> {
-        params
-            .get(self.primary_key_param_index)
-            .map(AsRef::as_ref)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "prepared path replacement primary key text is missing",
-                )
-            })
-    }
-
-    pub(crate) fn replacement_value_text<'a>(
-        &self,
-        params: &'a [impl AsRef<str>],
-    ) -> Result<&'a str, LixError> {
-        params
-            .get(self.value_param_index)
-            .map(AsRef::as_ref)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "prepared path replacement value text is missing",
-                )
-            })
     }
 }
 
@@ -3284,14 +3218,6 @@ pub(crate) fn append_path_value_replacement_snapshot(
             ));
         }
     };
-    append_path_value_replacement_snapshot_text(primary_key, replacement_value, normalized)
-}
-
-pub(crate) fn append_path_value_replacement_snapshot_text(
-    primary_key: &str,
-    replacement_value: Option<&str>,
-    normalized: &mut Vec<u8>,
-) -> Result<(usize, usize), LixError> {
     let start = normalized.len();
     normalized.extend_from_slice(b"{\"path\":");
     if let Err(error) = append_canonical_json_string(normalized, primary_key) {
