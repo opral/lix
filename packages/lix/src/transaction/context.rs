@@ -7174,6 +7174,7 @@ where
                 commit_id,
                 create,
                 change_id: ChangeId::from(self.functions.call_uuid_v7()),
+                updated_at: self.functions.call_timestamp(),
             })
     }
 

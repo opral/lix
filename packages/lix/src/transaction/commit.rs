@@ -584,6 +584,7 @@ where
     })?;
     let ref_change = ChangeObjectV1::BranchRef {
         change_id: forktree_change_id(change_refs.branch_ref_change_id),
+        updated_at: change_refs.created_at,
         branch_id: publication_branch_id,
         before_semantic_head_commit_object_id: Some(selected_parent_object_id),
         after_semantic_head_commit_object_id: Some(commit_object_id),
@@ -698,7 +699,14 @@ where
                     )
                 })?;
             publication
-                .publish_new_branch_selector(view, branch_id, &source_commit)
+                .publish_new_branch_selector(
+                    view,
+                    branch_id,
+                    &source_commit,
+                    forktree_change_id(intent.change_id),
+                    intent.updated_at,
+                )
+                .await
                 .map_err(LixError::from)?;
         } else {
             let target_view = open_coherent_view_on_read(view.storage_read(), branch_id).await?;
@@ -720,6 +728,7 @@ where
                     &target_view,
                     target_commit,
                     forktree_change_id(intent.change_id),
+                    intent.updated_at,
                 )
                 .await
                 .map_err(LixError::from)?;
@@ -1223,6 +1232,7 @@ where
     })?;
     let branch_ref_change = ChangeObjectV1::BranchRef {
         change_id: forktree_change_id(final_content.draft.branch_ref_change_id),
+        updated_at: final_content.draft.created_at,
         branch_id: view.branch_id(),
         before_semantic_head_commit_object_id: Some(
             view.branch_snapshot().semantic_head_commit_object_id,

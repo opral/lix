@@ -50,6 +50,41 @@ fn raw_id(byte: u8) -> [u8; 16] {
     [byte; 16]
 }
 
+#[test]
+fn branch_ref_timestamp_is_authenticated_and_round_trips() {
+    let first_timestamp = LixTimestamp::expect_parse("first", "2026-05-19T00:00:00.001Z");
+    let second_timestamp = LixTimestamp::expect_parse("second", "2026-05-19T00:00:00.002Z");
+    let branch_ref = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0x11)),
+        updated_at: first_timestamp,
+        branch_id: CanonicalBranchId::from_bytes(raw_id(0x22)),
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(ObjectId::from_bytes([0x33; 32])),
+        previous_ref_change_object_id: None,
+        payload: b"head publication".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (first_id, first_bytes) = branch_ref.encode().expect("first RefChange");
+    let decoded = ChangeObjectV1::decode(first_id, &first_bytes).expect("decode RefChange");
+    let ChangeObjectV1::BranchRef { updated_at, .. } = decoded else {
+        panic!("encoded RefChange decoded as a different change kind");
+    };
+    assert_eq!(updated_at, first_timestamp);
+
+    let second_ref = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0x11)),
+        updated_at: second_timestamp,
+        branch_id: CanonicalBranchId::from_bytes(raw_id(0x22)),
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(ObjectId::from_bytes([0x33; 32])),
+        previous_ref_change_object_id: None,
+        payload: b"head publication".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (second_id, _) = second_ref.encode().expect("second RefChange");
+    assert_ne!(first_id, second_id);
+}
+
 async fn commit_publication_for_test<S>(
     publication: PreparedPublication,
     storage: &S,
@@ -462,6 +497,7 @@ fn build_seed() -> SeedData {
         .expect("commit object");
     let ref_change = ChangeObjectV1::BranchRef {
         change_id: ref_change_id,
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
         branch_id,
         before_semantic_head_commit_object_id: None,
         after_semantic_head_commit_object_id: Some(commit_object_id),
@@ -736,6 +772,7 @@ async fn branch_transition<R: StorageAdapterRead>(
     let (commit_object_id, _) = semantic_commit.encode().expect("next commit");
     let ref_change = ChangeObjectV1::BranchRef {
         change_id: ChangeId::from_bytes(raw_id(identity.wrapping_add(1))),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
         branch_id: view.branch_id(),
         before_semantic_head_commit_object_id: Some(
             view.branch_snapshot().semantic_head_commit_object_id,
@@ -1448,6 +1485,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         .expect("child b object");
     let creation = ChangeObjectV1::BranchRef {
         change_id: ChangeId::from_bytes(raw_id(0x54)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
         branch_id: seed.branch_id,
         before_semantic_head_commit_object_id: None,
         after_semantic_head_commit_object_id: Some(child_a_object_id),
@@ -1594,6 +1632,7 @@ async fn coherent_open_defers_ref_target_authentication_until_visited() {
     let mut seed = build_seed();
     let bad_ref = ChangeObjectV1::BranchRef {
         change_id: ChangeId::from_bytes(raw_id(0x40)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
         branch_id: seed.branch_id,
         before_semantic_head_commit_object_id: Some(seed.semantic_change_object_id),
         after_semantic_head_commit_object_id: Some(seed.commit_object_id),
@@ -1732,6 +1771,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
     let mut bad_ref_history = build_seed();
     let latest = ChangeObjectV1::BranchRef {
         change_id: ChangeId::from_bytes(raw_id(0x33)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
         branch_id: bad_ref_history.branch_id,
         before_semantic_head_commit_object_id: None,
         after_semantic_head_commit_object_id: Some(bad_ref_history.commit_object_id),
@@ -1829,6 +1869,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         .expect("child object");
     let creation = ChangeObjectV1::BranchRef {
         change_id: ChangeId::from_bytes(raw_id(0x43)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
         branch_id: bad_generation.branch_id,
         before_semantic_head_commit_object_id: None,
         after_semantic_head_commit_object_id: Some(child_id),
@@ -3067,6 +3108,7 @@ async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBr
     let disposable_ref_id = ChangeId::from_bytes(raw_id(0x32));
     let disposable_ref = ChangeObjectV1::BranchRef {
         change_id: disposable_ref_id,
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
         branch_id: disposable,
         before_semantic_head_commit_object_id: None,
         after_semantic_head_commit_object_id: Some(seed.commit_object_id),

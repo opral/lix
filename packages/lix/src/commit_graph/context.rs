@@ -514,19 +514,16 @@ impl CommitGraphLiveStateReader {
                 "id": head.branch_id,
                 "commit_id": head.commit_id.to_string(),
             });
-            let change_id = self.branch_ref.load_head_change_id(&head.branch_id).await?;
-            let updated_at = change_id
-                .map(|id| {
-                    // BranchRef has no wall-clock field. This stable display
-                    // discriminator keeps the public timestamp non-null and
-                    // change-sensitive; it is never used as chronology.
-                    let digest = blake3::hash(id.as_uuid().as_bytes());
-                    let millis = (u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap())
-                        % 1_000_000_000)
-                        + 1;
-                    LixTimestamp::from_unix_millis_utc_lossy(millis as i64)
-                })
-                .unwrap_or_else(|| LixTimestamp::from_unix_millis_utc_lossy(0));
+            let metadata = self
+                .branch_ref
+                .load_head_metadata(&head.branch_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "branch selector has no authenticated RefChange metadata",
+                    )
+                })?;
             rows.push(MaterializedLiveStateRow {
                 entity_pk,
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
@@ -544,9 +541,9 @@ impl CommitGraphLiveStateReader {
                 metadata: None,
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-                updated_at,
+                updated_at: metadata.updated_at,
                 global: true,
-                change_id,
+                change_id: Some(metadata.change_id),
                 commit_id: Some(head.commit_id),
                 untracked: true,
                 branch_id: Arc::from(crate::GLOBAL_BRANCH_ID),

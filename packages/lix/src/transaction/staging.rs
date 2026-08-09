@@ -847,6 +847,7 @@ pub(crate) struct BranchRefPublicationIntent {
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) create: bool,
     pub(crate) change_id: ChangeId,
+    pub(crate) updated_at: LixTimestamp,
 }
 
 #[derive(Clone)]
@@ -6288,6 +6289,7 @@ mod tests {
                 commit_id: Some(CommitId::for_test_label("commit-a")),
                 create: false,
                 change_id: ChangeId::for_test_label("change-a"),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
             })
             .expect("first selector intent");
         let checkpoint = staged.checkpoint().expect("selector checkpoint");
@@ -6297,6 +6299,7 @@ mod tests {
                 commit_id: None,
                 create: false,
                 change_id: ChangeId::for_test_label("change-b"),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
             })
             .expect("second selector intent");
         staged.restore(checkpoint).expect("selector rollback");

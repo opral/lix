@@ -394,26 +394,68 @@ impl PreparedPublication {
     /// authenticated through the caller's retained view; its state roots are
     /// copied into the new branch snapshot and the selector is fenced with an
     /// absent-key CAS, so creation cannot overwrite an existing branch.
-    pub(crate) fn publish_new_branch_selector(
+    pub(crate) async fn publish_new_branch_selector<R>(
         &mut self,
-        view: &CoherentView<impl StorageAdapterRead>,
+        view: &CoherentView<R>,
         branch_id: super::model::CanonicalBranchId,
         source_commit: &super::model::CommitObjectV1,
-    ) -> Result<ObjectId, StorageError> {
+        change_id: super::model::ChangeId,
+        updated_at: crate::common::LixTimestamp,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead,
+    {
         if branch_id == view.branch_id() {
             return Err(corruption(
                 "branch creation selector targets the selected branch",
             ));
         }
         let (source_commit_object_id, _) = source_commit.encode()?;
+        let branch_ref = ChangeObjectV1::BranchRef {
+            change_id,
+            updated_at,
+            branch_id,
+            before_semantic_head_commit_object_id: None,
+            after_semantic_head_commit_object_id: Some(source_commit_object_id),
+            previous_ref_change_object_id: None,
+            payload: Vec::new(),
+            json_payload_object_ids: Vec::new(),
+        };
+        let (ref_object_id, ref_bytes) = branch_ref.encode()?;
+        let base_repository_root = self.next_repository_root.unwrap_or(view.repository_root());
+        let overlay = ObjectOverlayRead::new(view.storage_read(), &self.object_puts);
+        let change_catalog_edit = super::serving::put_change_catalog_entries(
+            base_repository_root.change_catalog_root,
+            &[(
+                change_id,
+                ChangeCatalogEntry {
+                    change_object_id: ref_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: ref_object_id,
+                        branch_id,
+                    },
+                },
+            )],
+            &overlay,
+        )
+        .await?;
+        let next_change_catalog_root = change_catalog_edit.root;
         let branch_snapshot = BranchSnapshotV1 {
             branch_id,
             local_state_root: source_commit.local_state_root,
             semantic_head_commit_object_id: source_commit_object_id,
-            latest_ref_change_object_id: None,
+            latest_ref_change_object_id: Some(ref_object_id),
             historical_global_state_root: source_commit.global_state_root,
         };
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
+        self.stage_encoded_object(ref_object_id, ref_bytes)?;
+        self.stage_catalog_edit(change_catalog_edit)?;
+        self.stage_repository_root(RepositoryRootV1 {
+            global_state_root: base_repository_root.global_state_root,
+            commit_catalog_root: base_repository_root.commit_catalog_root,
+            change_catalog_root: next_change_catalog_root,
+            retention_policy_root: base_repository_root.retention_policy_root,
+        })?;
         self.put_branch_selector(
             BranchSelectorV1 {
                 branch_id,
@@ -434,6 +476,7 @@ impl PreparedPublication {
         view: &CoherentView<R>,
         next_commit: Option<CommitObjectV1>,
         change_id: super::model::ChangeId,
+        updated_at: crate::common::LixTimestamp,
     ) -> Result<(), StorageError>
     where
         R: StorageAdapterRead,
@@ -450,6 +493,7 @@ impl PreparedPublication {
         }
         let branch_ref = ChangeObjectV1::BranchRef {
             change_id,
+            updated_at,
             branch_id: view.branch_id(),
             before_semantic_head_commit_object_id: Some(
                 view.branch_snapshot().semantic_head_commit_object_id,

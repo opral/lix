@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::LixError;
-use crate::branch::{BranchHead, BranchRefReader};
+use crate::branch::{BranchHead, BranchRefMetadata, BranchRefReader};
 
 /// Statement-scoped binding for a caller-provided prepared branch head.
 ///
@@ -48,6 +48,13 @@ impl BranchRefReader for PreparedBranchRefReader {
         branch_id: &str,
     ) -> Result<Option<crate::changelog::ChangeId>, LixError> {
         self.inner.load_head_change_id(branch_id).await
+    }
+
+    async fn load_head_metadata(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<BranchRefMetadata>, LixError> {
+        self.inner.load_head_metadata(branch_id).await
     }
 }
 

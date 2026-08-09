@@ -259,8 +259,20 @@ where
     objects
         .insert(commit_object_id, commit_bytes)
         .map_err(LixError::from)?;
-    let global_ref = branch_ref_change(&mut functions, global_branch, commit_object_id, None)?;
-    let main_ref = branch_ref_change(&mut functions, main_branch_id, commit_object_id, None)?;
+    let global_ref = branch_ref_change(
+        &mut functions,
+        global_branch,
+        commit_object_id,
+        None,
+        timestamp,
+    )?;
+    let main_ref = branch_ref_change(
+        &mut functions,
+        main_branch_id,
+        commit_object_id,
+        None,
+        timestamp,
+    )?;
     let global_ref_id = global_ref.0;
     let global_ref_object_id = global_ref.1;
     let main_ref_object_id = main_ref.1;
@@ -459,11 +471,13 @@ fn branch_ref_change(
     branch_id: CanonicalBranchId,
     commit_object_id: ObjectId,
     previous_ref: Option<ObjectId>,
+    updated_at: crate::common::LixTimestamp,
 ) -> Result<(super::model::ChangeId, ObjectId, Bytes), LixError> {
     let change_uuid = functions.call_uuid_v7();
     let change_id = super::model::ChangeId::from_bytes(*change_uuid.as_bytes());
     let change = ChangeObjectV1::BranchRef {
         change_id,
+        updated_at,
         branch_id,
         before_semantic_head_commit_object_id: None,
         after_semantic_head_commit_object_id: Some(commit_object_id),
