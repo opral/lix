@@ -35,7 +35,7 @@ use crate::changelog::{
     materialize_known_change_payloads,
 };
 use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_row};
-use crate::commit_graph::{CommitGraphContext, CommitGraphLiveStateReader, CommitGraphStoreReader};
+use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader, ReachableCommitGraphNode};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
@@ -6387,38 +6387,11 @@ where
     ) -> TransactionValidationLiveStateReader<SharedStorageAdapterRead<StorageImpl::Read<'static>>>
     {
         let read = self.opening_read();
-        let graph = Arc::new(tokio::sync::Mutex::new(Box::new(
-            CommitGraphContext::new().reader(read.clone()),
-        )
-            as Box<dyn crate::commit_graph::CommitGraphReader>));
-        let branch_ref: Arc<dyn BranchRefReader> =
-            Arc::new(self.branch_ctx.ref_reader(read.clone()));
         TransactionValidationLiveStateReader {
             forktree: ForkTreeReadFacade::new(read.clone()),
-            commit: CommitGraphLiveStateReader::new(
-                "lix_commit",
-                Arc::clone(&graph),
-                Arc::clone(&branch_ref),
-                None,
-                false,
-                false,
-            ),
-            commit_edge: CommitGraphLiveStateReader::new(
-                "lix_commit_edge",
-                Arc::clone(&graph),
-                Arc::clone(&branch_ref),
-                None,
-                false,
-                false,
-            ),
-            branch_ref: CommitGraphLiveStateReader::new(
-                BRANCH_REF_SCHEMA_KEY,
-                graph,
-                branch_ref,
-                None,
-                false,
-                false,
-            ),
+            graph: Arc::new(tokio::sync::Mutex::new(
+                CommitGraphContext::new().reader(ForkTreeReadFacade::new(read)),
+            )),
         }
     }
 
@@ -8153,31 +8126,271 @@ async fn load_transaction_blob_bytes(
     Ok(BlobBytesBatch::new(entries))
 }
 
-struct TransactionValidationLiveStateReader<R: StorageAdapterRead> {
+struct TransactionValidationLiveStateReader<R: StorageAdapterRead + Clone> {
     forktree: ForkTreeReadFacade<R>,
-    commit: CommitGraphLiveStateReader,
-    commit_edge: CommitGraphLiveStateReader,
-    branch_ref: CommitGraphLiveStateReader,
+    graph: Arc<tokio::sync::Mutex<CommitGraphStoreReader<ForkTreeReadFacade<R>>>>,
 }
 
-fn derived_validation_reader<'a>(
-    request: &LiveStateScanRequest,
-    commit: &'a CommitGraphLiveStateReader,
-    commit_edge: &'a CommitGraphLiveStateReader,
-    branch_ref: &'a CommitGraphLiveStateReader,
-) -> Option<&'a CommitGraphLiveStateReader> {
-    match request.filter.schema_keys.as_slice() {
-        [schema_key] if schema_key == "lix_commit" => Some(commit),
-        [schema_key] if schema_key == "lix_commit_edge" => Some(commit_edge),
-        [schema_key] if schema_key == BRANCH_REF_SCHEMA_KEY => Some(branch_ref),
-        _ => None,
+impl<R> TransactionValidationLiveStateReader<R>
+where
+    R: StorageAdapterRead + Clone + 'static,
+{
+    async fn scan_derived_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let [schema_key] = request.filter.schema_keys.as_slice() else {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "validation request must select exactly one derived schema",
+            ));
+        };
+        if !matches!(
+            schema_key.as_str(),
+            "lix_commit" | "lix_commit_edge" | BRANCH_REF_SCHEMA_KEY
+        ) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "validation request contains an unsupported derived schema",
+            ));
+        }
+
+        if schema_key == BRANCH_REF_SCHEMA_KEY {
+            if !matches!(
+                request.filter.rows,
+                crate::live_state::LiveStateRowFilter::All
+            ) || request.filter.untracked == Some(false)
+                || (!request.filter.branch_ids.is_empty()
+                    && !request
+                        .filter
+                        .branch_ids
+                        .iter()
+                        .any(|branch_id| branch_id == GLOBAL_BRANCH_ID))
+            {
+                return Ok(Vec::new());
+            }
+            let mut rows = Vec::new();
+            for (branch_id, commit_id) in crate::forktree::scan_branch_heads(&self.forktree).await?
+            {
+                let entity_pk = EntityPk::uuid_from_canonical(&branch_id).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("authenticated branch ID is not a UUID: {error}"),
+                    )
+                })?;
+                let metadata =
+                    crate::forktree::load_branch_ref_metadata(&self.forktree, &branch_id).await?;
+                let snapshot = serde_json::json!({
+                    "id": branch_id,
+                    "commit_id": commit_id.to_string(),
+                });
+                rows.push(MaterializedLiveStateRow {
+                    entity_pk,
+                    schema_key: schema_key.clone(),
+                    file_id: None,
+                    snapshot_content: Some(
+                        serde_json::to_string(&snapshot)
+                            .map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_STORAGE_ERROR,
+                                    format!("branch-ref snapshot serialization failed: {error}"),
+                                )
+                            })?
+                            .into(),
+                    ),
+                    metadata: None,
+                    deleted: false,
+                    created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                    updated_at: metadata.updated_at,
+                    global: true,
+                    change_id: Some(metadata.change_id),
+                    commit_id: Some(commit_id),
+                    untracked: true,
+                    branch_id: Arc::from(GLOBAL_BRANCH_ID),
+                });
+            }
+            rows.retain(|row| {
+                request.filter.entity_pks.is_empty()
+                    || request.filter.entity_pks.contains(&row.entity_pk)
+            });
+            rows.retain(|_| {
+                request
+                    .filter
+                    .file_ids
+                    .iter()
+                    .all(|file_id| file_id.matches(None))
+            });
+            rows.sort_by(|left, right| left.entity_pk.cmp(&right.entity_pk));
+            if let Some(limit) = request.limit {
+                rows.truncate(limit);
+            }
+            return Ok(rows);
+        }
+
+        if !matches!(
+            request.filter.rows,
+            crate::live_state::LiveStateRowFilter::All
+        ) {
+            return Ok(Vec::new());
+        }
+        let branch_ids = if request.filter.branch_ids.is_empty() {
+            crate::forktree::scan_branch_heads(&self.forktree)
+                .await?
+                .into_iter()
+                .map(|(branch_id, _)| branch_id)
+                .collect::<Vec<_>>()
+        } else {
+            request.filter.branch_ids.clone()
+        };
+        let mut heads = Vec::with_capacity(branch_ids.len());
+        for branch_id in branch_ids {
+            let head = crate::forktree::load_branch_head(&self.forktree, &branch_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::branch_not_found(
+                        branch_id.clone(),
+                        "scan ForkTree derived commit surface",
+                        "branch head",
+                    )
+                })?;
+            heads.push((branch_id, head));
+        }
+
+        let mut rows = Vec::new();
+        let mut graph = self.graph.lock().await;
+        for (branch_id, head) in heads {
+            let mut roots = BTreeSet::from([head]);
+            if schema_key == "lix_commit" {
+                for entity_pk in &request.filter.entity_pks {
+                    let Ok(commit_text) = entity_pk.as_single_string_owned() else {
+                        continue;
+                    };
+                    if let Ok(commit_id) = CommitId::parse_lix(&commit_text, "requested commit") {
+                        roots.insert(commit_id);
+                    }
+                }
+            }
+            let mut reachable_by_id = BTreeMap::<CommitId, ReachableCommitGraphNode>::new();
+            for root in roots {
+                for reachable in graph.reachable_nodes(&root).await?.iter() {
+                    reachable_by_id
+                        .entry(reachable.commit.commit_id)
+                        .or_insert_with(|| reachable.clone());
+                }
+            }
+            for reachable in reachable_by_id.into_values() {
+                let commit = reachable.commit;
+                if schema_key == "lix_commit" {
+                    let snapshot =
+                        crate::changelog::commit_row_snapshot_json(&commit.commit_id.to_string())?;
+                    let entity_pk = EntityPk::uuid_from_canonical(&commit.commit_id.to_string())
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                format!("authenticated commit ID is not a UUID: {error}"),
+                            )
+                        })?;
+                    rows.push(MaterializedLiveStateRow {
+                        entity_pk,
+                        schema_key: schema_key.clone(),
+                        file_id: None,
+                        snapshot_content: Some(snapshot.into()),
+                        metadata: None,
+                        deleted: false,
+                        created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                        updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                        global: branch_id == GLOBAL_BRANCH_ID,
+                        change_id: None,
+                        commit_id: Some(commit.commit_id),
+                        untracked: false,
+                        branch_id: Arc::from(branch_id.as_str()),
+                    });
+                } else {
+                    for (parent_order, parent_id) in commit.parent_commit_ids.iter().enumerate() {
+                        let parent_order = i64::try_from(parent_order).map_err(|_| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                "authenticated commit parent order exceeds SQL integer range",
+                            )
+                        })?;
+                        let snapshot = serde_json::json!({
+                            "parent_id": parent_id.to_string(),
+                            "child_id": commit.commit_id.to_string(),
+                            "parent_order": parent_order,
+                        });
+                        let entity_pk = EntityPk::from_json_values(
+                            &[
+                                serde_json::Value::String(commit.commit_id.to_string()),
+                                serde_json::Value::Number(parent_order.into()),
+                            ],
+                            &[
+                                crate::entity_pk::EntityPkComponentType::Uuid,
+                                crate::entity_pk::EntityPkComponentType::Integer,
+                            ],
+                        )
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                format!("authenticated commit edge identity is invalid: {error}"),
+                            )
+                        })?;
+                        rows.push(MaterializedLiveStateRow {
+                            entity_pk,
+                            schema_key: schema_key.clone(),
+                            file_id: None,
+                            snapshot_content: Some(
+                                serde_json::to_string(&snapshot)
+                                    .map_err(|error| {
+                                        LixError::new(
+                                            LixError::CODE_STORAGE_ERROR,
+                                            format!(
+                                                "commit edge snapshot serialization failed: {error}"
+                                            ),
+                                        )
+                                    })?
+                                    .into(),
+                            ),
+                            metadata: None,
+                            deleted: false,
+                            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                            global: branch_id == GLOBAL_BRANCH_ID,
+                            change_id: None,
+                            commit_id: Some(commit.commit_id),
+                            untracked: false,
+                            branch_id: Arc::from(branch_id.as_str()),
+                        });
+                    }
+                }
+            }
+        }
+        rows.retain(|row| {
+            request.filter.entity_pks.is_empty()
+                || request.filter.entity_pks.contains(&row.entity_pk)
+        });
+        rows.retain(|_| {
+            request
+                .filter
+                .file_ids
+                .iter()
+                .all(|file_id| file_id.matches(None))
+        });
+        rows.sort_by(|left, right| {
+            left.branch_id
+                .cmp(&right.branch_id)
+                .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+        });
+        if let Some(limit) = request.limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
     }
 }
 
 #[async_trait]
 impl<R> LiveStateReader for TransactionValidationLiveStateReader<R>
 where
-    R: StorageAdapterRead + 'static,
+    R: StorageAdapterRead + Clone + 'static,
 {
     async fn scan_batch(
         &self,
@@ -8202,19 +8415,7 @@ where
             let mut derived_request = request.clone();
             derived_request.filter.schema_keys = vec![schema_key];
             derived_request.limit = None;
-            let reader = derived_validation_reader(
-                &derived_request,
-                &self.commit,
-                &self.commit_edge,
-                &self.branch_ref,
-            )
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    "validation request contains an unsupported derived schema",
-                )
-            })?;
-            rows.extend(reader.scan_batch(&derived_request).await?.into_rows());
+            rows.extend(self.scan_derived_rows(&derived_request).await?);
         }
         rows.sort_by(|left, right| {
             left.schema_key
@@ -8309,19 +8510,7 @@ where
                 projection: derived_request.projection.clone(),
                 limit: None,
             };
-            let reader = derived_validation_reader(
-                &scan_request,
-                &self.commit,
-                &self.commit_edge,
-                &self.branch_ref,
-            )
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    "validation exact request contains an unsupported derived schema",
-                )
-            })?;
-            let rows = reader.scan_batch(&scan_request).await?.into_rows();
+            let rows = self.scan_derived_rows(&scan_request).await?;
             for (position, requested) in positions.into_iter().zip(derived_request.rows) {
                 output[position] = rows
                     .iter()
@@ -8450,6 +8639,26 @@ mod transaction_validation_reader_tests {
         assert!(!source.contains(&format!("{}: LiveStateStoreReader", "current")));
         assert!(!source.contains(concat!("self.", "current.scan_batch")));
         assert!(!source.contains(concat!("self.", "current.load_exact_batch")));
+    }
+
+    #[test]
+    fn validation_reader_uses_only_the_operation_forktree_capability() {
+        let source = include_str!("context.rs");
+        let start = source
+            .find("struct TransactionValidationLiveStateReader")
+            .expect("validation reader definition");
+        let end = source[start..]
+            .find("fn validation_schema_partition")
+            .map(|offset| start + offset)
+            .expect("validation reader end");
+        let reader = &source[start..end];
+        assert!(reader.contains("forktree: ForkTreeReadFacade"));
+        assert!(reader.contains("CommitGraphStoreReader<ForkTreeReadFacade"));
+        assert!(reader.contains("scan_derived_rows"));
+        assert!(!reader.contains("CommitGraphLiveStateReader"));
+        assert!(!reader.contains("derived_validation_reader"));
+        assert!(!reader.contains("branch_ctx.ref_reader"));
+        assert!(!reader.contains("LiveStateStoreReader"));
     }
 
     #[test]

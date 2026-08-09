@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -6,7 +7,7 @@ use bytes::Bytes;
 use crate::entity_pk::EntityPk;
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
-    ReadOptions, ScanOrder, Storage, StorageError,
+    ReadOptions, ScanCursor, ScanOrder, Storage, StorageError,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
@@ -300,6 +301,33 @@ where
 #[derive(Clone)]
 pub(crate) struct ForkTreeReadFacade<R> {
     read: R,
+}
+
+/// Let snapshot-bound ForkTree serving primitives consume the operation-owned
+/// facade without exposing or reacquiring its underlying read handle.
+impl<R> StorageAdapterRead for ForkTreeReadFacade<R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.read.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<crate::storage::GetManyResult, StorageError>> + Send {
+        self.read.get_many(requests)
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.read.begin_scan(space, range, opts)
+    }
 }
 
 /// ForkTree-owned first-parent checkpoint chronology. The state marker is
