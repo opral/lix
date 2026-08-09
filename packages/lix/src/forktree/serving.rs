@@ -77,6 +77,94 @@ where
     Ok(members)
 }
 
+/// A retained-read-local authenticated member closure.  The read identity and
+/// the exact Commit object identity are part of the context so a caller cannot
+/// accidentally reuse a closure for another commit or another read view.
+pub(super) struct AuthenticatedMemberClosure<'a, R: ?Sized> {
+    read: &'a R,
+    commit_object_id: ObjectId,
+    commit_id: CommitId,
+    generation: u64,
+    members: Vec<CommitMemberV1>,
+}
+
+impl<'a, R: ?Sized> AuthenticatedMemberClosure<'a, R> {
+    pub(super) fn members_for(
+        &self,
+        read: &R,
+        commit_object_id: ObjectId,
+        commit_id: CommitId,
+        generation: u64,
+    ) -> Result<Option<&[CommitMemberV1]>, StorageError> {
+        if self.commit_object_id != commit_object_id {
+            return Ok(None);
+        }
+        if !std::ptr::eq(self.read, read)
+            || self.commit_id != commit_id
+            || self.generation != generation
+        {
+            return Err(corruption(
+                "authenticated member closure is bound to another read or commit",
+            ));
+        }
+        Ok(Some(&self.members))
+    }
+}
+
+pub(super) async fn load_authenticated_member_closure<'a, R>(
+    read: &'a R,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<AuthenticatedMemberClosure<'a, R>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    Ok(AuthenticatedMemberClosure {
+        read,
+        commit_object_id,
+        commit_id: commit.commit_id,
+        generation: commit.generation,
+        members: load_commit_members(read, commit).await?,
+    })
+}
+
+fn validate_member_at_ordinal(
+    members: &[CommitMemberV1],
+    ordinal: u32,
+    expected: CommitMemberV1,
+    error: &'static str,
+) -> Result<(), StorageError> {
+    if members.get(ordinal as usize) != Some(&expected) {
+        return Err(corruption(error));
+    }
+    Ok(())
+}
+
+async fn validate_member_at_ordinal_with_context<R>(
+    read: &R,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+    ordinal: u32,
+    expected: CommitMemberV1,
+    context: Option<&AuthenticatedMemberClosure<'_, R>>,
+    error: &'static str,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(members) = context
+        .map(|context| {
+            context.members_for(read, commit_object_id, commit.commit_id, commit.generation)
+        })
+        .transpose()?
+        .flatten()
+    {
+        return validate_member_at_ordinal(members, ordinal, expected, error);
+    }
+    let members = load_commit_members(read, commit).await?;
+    validate_member_at_ordinal(&members, ordinal, expected, error)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateSource {
     Global,
@@ -741,15 +829,17 @@ where
     if commit.commit_id != commit_id {
         return Err(corruption("CommitCatalog key does not match Commit object").into());
     }
-    validate_retained_commit(
+    let closure = load_authenticated_member_closure(read, commit_object_id, &commit).await?;
+    validate_retained_commit_with_context(
         read,
         repository.commit_catalog_root,
         repository.change_catalog_root,
         commit_object_id,
         &commit,
+        Some(&closure),
     )
     .await?;
-    let members = load_commit_members(read, &commit).await?;
+    let members = &closure.members;
     let mut records = Vec::with_capacity(members.len());
     for (ordinal, member) in members.iter().copied().enumerate() {
         let change_object_id = member.change_object_id();
@@ -773,6 +863,7 @@ where
             ordinal,
             member,
             entry,
+            Some(&closure),
         )
         .await?;
         let source_commit_id = match member.source() {
@@ -1196,6 +1287,7 @@ pub(super) async fn validate_member_catalog_owner<R>(
     target_ordinal: usize,
     member: CommitMemberV1,
     entry: ChangeCatalogEntry,
+    context: Option<&AuthenticatedMemberClosure<'_, R>>,
 ) -> Result<(), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
@@ -1219,14 +1311,16 @@ where
                 &introduction,
             )
             .await?;
-            let introduction_members = load_commit_members(read, &introduction).await?;
-            if introduction_members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(member.change_object_id()))
-            {
-                return Err(corruption(
-                    "ChangeCatalog canonical introduction owner/ordinal is invalid",
-                ));
-            }
+            validate_member_at_ordinal_with_context(
+                read,
+                commit_object_id,
+                &introduction,
+                ordinal,
+                CommitMemberV1::introduced(member.change_object_id()),
+                context,
+                "ChangeCatalog canonical introduction owner/ordinal is invalid",
+            )
+            .await?;
             (commit_object_id, ordinal)
         }
         ChangeCatalogOwner::BranchRef { .. } => {
@@ -1260,16 +1354,16 @@ where
                     "selected membership source generation is not earlier than its target",
                 ));
             }
-            let source_members = load_commit_members(read, &source_commit).await?;
-            if source_members
-                .get(source_ordinal as usize)
-                .map(|source| source.change_object_id())
-                != Some(member.change_object_id())
-            {
-                return Err(corruption(
-                    "selected membership source commit/ordinal back-edge is invalid",
-                ));
-            }
+            validate_member_at_ordinal_with_context(
+                read,
+                source_commit_object_id,
+                &source_commit,
+                source_ordinal,
+                CommitMemberV1::introduced(member.change_object_id()),
+                context,
+                "selected membership source commit/ordinal back-edge is invalid",
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1287,7 +1381,10 @@ where
         .await?
         .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
     let (source_commit_object_id, _) = source.encode()?;
-    let source_members = load_commit_members(view.storage_read(), &source).await?;
+    let closure =
+        load_authenticated_member_closure(view.storage_read(), source_commit_object_id, &source)
+            .await?;
+    let source_members = &closure.members;
     for (source_ordinal, source_member) in source_members.iter().copied().enumerate() {
         let change_object_id = source_member.change_object_id();
         let bytes = view.load_object_bytes(change_object_id).await?;
@@ -1312,6 +1409,7 @@ where
             source_ordinal,
             source_member,
             entry,
+            Some(&closure),
         )
         .await?;
         return Ok((
@@ -1910,7 +2008,7 @@ where
         return Ok(None);
     };
     let entry = ChangeCatalogEntry::decode(&value)?;
-    validate_change_entry(view, id, entry).await.map(Some)
+    validate_change_entry(view, id, entry, None).await.map(Some)
 }
 
 pub(crate) async fn page_commits<R>(
@@ -1993,7 +2091,7 @@ where
                 .map_err(|_| corruption("ChangeCatalog key is not a raw UUID"))?,
         );
         let entry = ChangeCatalogEntry::decode(value)?;
-        entries.push((id, validate_change_entry(view, id, entry).await?));
+        entries.push((id, validate_change_entry(view, id, entry, None).await?));
     }
     Ok(CatalogPage {
         resume_token: (rows.len() == page_size)
@@ -2028,6 +2126,7 @@ async fn validate_change_entry<R>(
     view: &CoherentView<R>,
     id: ChangeId,
     entry: ChangeCatalogEntry,
+    context: Option<&AuthenticatedMemberClosure<'_, R>>,
 ) -> Result<ChangeObjectV1, StorageError>
 where
     R: StorageAdapterRead,
@@ -2049,14 +2148,16 @@ where
         ) => {
             let bytes = view.load_object_bytes(commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            let members = load_commit_members(view.storage_read(), &commit).await?;
-            if members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(entry.change_object_id))
-            {
-                return Err(corruption(
-                    "ChangeCatalog commit owner does not point back at its ordinal member",
-                ));
-            }
+            validate_member_at_ordinal_with_context(
+                view.storage_read(),
+                commit_object_id,
+                &commit,
+                ordinal,
+                CommitMemberV1::introduced(entry.change_object_id),
+                context,
+                "ChangeCatalog commit owner does not point back at its ordinal member",
+            )
+            .await?;
         }
         (
             ChangeCatalogOwner::BranchRef {
@@ -2094,6 +2195,29 @@ pub(super) async fn validate_retained_commit<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let closure = load_authenticated_member_closure(read, commit_object_id, commit).await?;
+    validate_retained_commit_with_context(
+        read,
+        commit_catalog_root,
+        change_catalog_root,
+        commit_object_id,
+        commit,
+        Some(&closure),
+    )
+    .await
+}
+
+async fn validate_retained_commit_with_context<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+    context: Option<&AuthenticatedMemberClosure<'_, R>>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     for parent_id in &commit.parent_commit_object_ids {
         let bytes = super::view::load_object_bytes(read, *parent_id).await?;
         let parent = CommitObjectV1::decode(*parent_id, &bytes)?;
@@ -2103,7 +2227,15 @@ where
             ));
         }
     }
-    let members = load_commit_members(read, commit).await?;
+    let members = if let Some(context) = context {
+        context
+            .members_for(read, commit_object_id, commit.commit_id, commit.generation)?
+            .ok_or_else(|| corruption("authenticated member closure names another commit"))?
+    } else {
+        return Err(corruption(
+            "retained commit validation requires an authenticated member closure",
+        ));
+    };
     for (ordinal, member) in members.iter().copied().enumerate() {
         let change_object_id = member.change_object_id();
         let bytes = super::view::load_object_bytes(read, change_object_id).await?;
@@ -2128,6 +2260,7 @@ where
             ordinal,
             member,
             entry,
+            context,
         )
         .await?;
     }
