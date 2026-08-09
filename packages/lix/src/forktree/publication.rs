@@ -82,8 +82,12 @@ pub(crate) struct PreparedPublication {
 }
 
 fn sha256_lower_hex(bytes: &[u8]) -> String {
+    lower_hex(&Sha256::digest(bytes))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    Sha256::digest(bytes)
+    bytes
         .iter()
         .flat_map(|byte| {
             [
@@ -691,41 +695,43 @@ impl PreparedPublication {
             .await
             .map_err(|error| StorageError::Corruption(error.to_string()))?
             .ok_or_else(|| corruption("request blob splice base owner is absent"))?;
-        let base = view
-            .load_blob_bytes_many(std::slice::from_ref(&reference))
-            .await
-            .map_err(|error| StorageError::Corruption(error.to_string()))?
-            .into_vec()
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| corruption("request blob splice base payload is absent"))?;
-        if sha256_lower_hex(&base) != provenance.base_sha256() {
-            return Err(corruption(
-                "request blob splice base digest is not bound to its authenticated StateKey",
-            ));
-        }
+        let base_len = usize::try_from(reference.expected_size())
+            .map_err(|_| corruption("request blob splice base length is invalid"))?;
         let prefix = provenance.prefix_bytes();
         let suffix = provenance.suffix_bytes();
-        if prefix > base.len()
-            || suffix > base.len().saturating_sub(prefix)
+        if prefix > base_len
+            || suffix > base_len.saturating_sub(prefix)
             || prefix
                 .checked_add(suffix)
-                .is_none_or(|bound| bound >= base.len())
+                .is_none_or(|bound| bound >= base_len)
         {
             return Err(corruption("request blob splice bounds are invalid"));
         }
-        let replacement_len = base.len() - prefix - suffix;
+        let replacement_len = base_len - prefix - suffix;
         let insert = provenance.insert();
-        if insert.len() != replacement_len || payload.len() != base.len() {
+        if insert.len() != replacement_len || payload.len() != base_len {
             return Err(corruption(
                 "request blob splice is not a same-length fixed-width replacement",
             ));
         }
+        let base_sha256 = view
+            .authenticate_blob_for_splice(
+                &reference,
+                payload.bytes(),
+                prefix,
+                replacement_len,
+                suffix,
+            )
+            .await
+            .map_err(|error| StorageError::Corruption(error.to_string()))?;
+        if lower_hex(&base_sha256) != provenance.base_sha256() {
+            return Err(corruption(
+                "request blob splice base digest is not bound to its authenticated StateKey",
+            ));
+        }
         let insert_end = prefix + insert.len();
-        if payload.bytes().get(..prefix) != base.get(..prefix)
-            || payload.bytes().get(prefix..insert_end) != Some(insert)
-            || payload.bytes().get(insert_end..) != base.get(base.len() - suffix..)
+        if payload.bytes().get(prefix..insert_end) != Some(insert)
+            || insert_end != base_len - suffix
         {
             return Err(corruption(
                 "request blob splice bytes do not match its authenticated base",

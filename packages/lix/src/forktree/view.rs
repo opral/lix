@@ -357,6 +357,28 @@ where
         .await
     }
 
+    pub(crate) async fn authenticate_blob_for_splice(
+        &self,
+        reference: &super::blob::AuthenticatedBlobRef,
+        successor_bytes: &[u8],
+        prefix_len: usize,
+        replacement_len: usize,
+        suffix_len: usize,
+    ) -> Result<[u8; 32], crate::LixError> {
+        super::blob::authenticate_blob_for_splice_on_read(
+            &self.read,
+            self.branch_id(),
+            self.view_id(),
+            self.view_instance_id(),
+            reference,
+            successor_bytes,
+            prefix_len,
+            replacement_len,
+            suffix_len,
+        )
+        .await
+    }
+
     pub(super) async fn load_blob_ranges_many_on_view(
         &self,
         requests: &[(super::blob::AuthenticatedBlobRef, std::ops::Range<u64>)],
