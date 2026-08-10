@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::storage::{
-    BufferRange, CommitResult, EncodedMutationBatch, Key, KeyRange, PutBatch, PutEntry, Storage,
-    StorageError, StorageWrite, StoredValue, WriteOptions,
+    BufferRange, CommitResult, EncodedMutationBatch, EncodedPut, Key, KeyRange, PutBatch, PutEntry,
+    Storage, StorageError, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
@@ -285,14 +285,32 @@ impl StorageWriteSet {
         if batch.is_empty() {
             return;
         }
-        let staged_puts = batch.put_count() as u64;
-        let staged_deletes = batch.delete_count() as u64;
-        let written_bytes = batch
-            .puts()
-            .iter()
-            .map(|put| put.value.len() as u64)
-            .sum::<u64>();
-        self.group_mut(space).stage_encoded_batch(batch);
+        let (key_bytes, value_bytes, puts, deletes) = batch.into_parts();
+        let staged_deletes = deletes.len() as u64;
+        let (staged_puts, written_bytes) = {
+            let group = self.group_mut(space);
+            let mut retained_puts = Vec::with_capacity(puts.len());
+            for put in puts {
+                let key = slice_bytes(&key_bytes, ArenaRange::new(0, put.key));
+                let value = slice_bytes(&value_bytes, ArenaRange::new(0, put.value));
+                let already_staged = group.puts.iter().any(|staged| {
+                    group.key_bytes(staged.key) == key && group.value_bytes(staged.value) == value
+                });
+                if !already_staged {
+                    retained_puts.push(put);
+                }
+            }
+
+            let staged_puts = retained_puts.len() as u64;
+            let written_bytes = retained_puts
+                .iter()
+                .map(|put| put.value.len() as u64)
+                .sum::<u64>();
+            if staged_puts != 0 || !deletes.is_empty() {
+                group.stage_encoded_parts(key_bytes, value_bytes, retained_puts, deletes);
+            }
+            (staged_puts, written_bytes)
+        };
         self.stats.staged_puts += staged_puts;
         self.stats.staged_deletes += staged_deletes;
         self.stats.written_bytes += written_bytes;
@@ -775,8 +793,13 @@ impl StorageWriteGroup {
         self.deletes.push(key);
     }
 
-    fn stage_encoded_batch(&mut self, batch: EncodedMutationBatch) {
-        let (key_bytes, value_bytes, puts, deletes) = batch.into_parts();
+    fn stage_encoded_parts(
+        &mut self,
+        key_bytes: Bytes,
+        value_bytes: Bytes,
+        puts: Vec<EncodedPut>,
+        deletes: Vec<BufferRange>,
+    ) {
         self.puts.reserve(puts.len());
         self.deletes.reserve(deletes.len());
         let key_buffer_index = self.key_arena.import(key_bytes);
@@ -1264,6 +1287,38 @@ mod tests {
         );
         let (_, deletes) = backend.deletes.pop().expect("one delete batch");
         assert_eq!(deletes[0].0.as_ptr(), key_probe.as_ptr().wrapping_add(1));
+    }
+
+    #[test]
+    fn encoded_batch_coalesces_only_identical_prior_puts() {
+        fn batch(value: &'static [u8]) -> EncodedMutationBatch {
+            EncodedMutationBatch::try_new(
+                Bytes::from_static(b"key"),
+                Bytes::from_static(value),
+                vec![EncodedPut {
+                    key: BufferRange::new(0, 3),
+                    value: BufferRange::new(0, value.len()),
+                }],
+                Vec::new(),
+            )
+            .expect("encoded put should be valid")
+        }
+
+        let mut writes = StorageWriteSet::new();
+        writes.stage_encoded_batch(space(), batch(b"value"));
+        writes.stage_encoded_batch(space(), batch(b"value"));
+        assert_eq!(writes.arena_stats().put_descriptors, 1);
+        assert_eq!(writes.stats().staged_puts, 1);
+        assert!(writes.validate().is_ok());
+
+        let mut conflicting = StorageWriteSet::new();
+        conflicting.stage_encoded_batch(space(), batch(b"first"));
+        conflicting.stage_encoded_batch(space(), batch(b"other"));
+        assert_eq!(conflicting.arena_stats().put_descriptors, 2);
+        assert!(matches!(
+            conflicting.validate(),
+            Err(StorageWriteSetError::DuplicateMutation { .. })
+        ));
     }
 
     #[tokio::test]
