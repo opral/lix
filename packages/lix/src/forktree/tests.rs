@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
+use crate::LixError;
 use crate::changelog::ChangeRecord;
 use crate::commit_graph::CommitGraphStoreReader;
 use crate::common::LixTimestamp;
@@ -802,6 +803,84 @@ fn replace_selected_history_graph(
     seed.global_selector.selector_generation += 1;
     seed.branch_selector.branch_snapshot_object_id = snapshot_id;
     seed.branch_selector.selector_generation += 1;
+}
+
+fn insert_graph_commit(
+    seed: &mut SeedData,
+    byte: u8,
+    generation: u64,
+    parent_commit_object_ids: Vec<ObjectId>,
+) -> (CommitId, ObjectId) {
+    let commit_id = CommitId::from_bytes(raw_id(byte));
+    let commit = CommitObjectV1 {
+        commit_id,
+        generation,
+        parent_commit_object_ids,
+        members: Vec::new(),
+        member_page_object_ids: Vec::new(),
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        metadata: format!("graph-{byte:02x}").into_bytes(),
+    };
+    let (object_id, bytes) = commit.encode().expect("graph commit");
+    seed.objects
+        .insert(object_id, bytes)
+        .expect("graph commit object");
+    (commit_id, object_id)
+}
+
+fn install_graph_head(
+    seed: &mut SeedData,
+    commits: &[(CommitId, ObjectId)],
+    head_object_id: ObjectId,
+    ref_byte: u8,
+) {
+    let ref_change = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(ref_byte)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(i64::from(ref_byte)),
+        branch_id: seed.branch_id,
+        before_semantic_head_commit_object_id: Some(seed.commit_object_id),
+        after_semantic_head_commit_object_id: Some(head_object_id),
+        previous_ref_change_object_id: Some(seed.ref_change_object_id),
+        payload: b"graph-head".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (ref_object_id, ref_bytes) = ref_change.encode().expect("graph ref");
+    seed.objects
+        .insert(ref_object_id, ref_bytes)
+        .expect("graph ref object");
+
+    let mut commit_entries = vec![(
+        seed.commit_id,
+        CommitCatalogEntry {
+            commit_object_id: seed.commit_object_id,
+        },
+    )];
+    commit_entries.extend(commits.iter().map(|(commit_id, object_id)| {
+        (
+            *commit_id,
+            CommitCatalogEntry {
+                commit_object_id: *object_id,
+            },
+        )
+    }));
+    let mut change_entries = seed_member_catalog_entries(seed, seed.commit_object_id);
+    change_entries.push((
+        ref_change.change_id(),
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_object_id,
+                branch_id: seed.branch_id,
+            },
+        },
+    ));
+    replace_selected_history_graph(
+        seed,
+        &commit_entries,
+        &change_entries,
+        head_object_id,
+        ref_object_id,
+    );
 }
 
 async fn seed_storage<S>(storage: &S, seed: &SeedData)
@@ -2518,6 +2597,210 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         load_commit_member_records(&read, public_commit_id(0x51))
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn commit_graph_diamond_records_nearest_depth_once() {
+    let mut seed = build_seed();
+    let (root_catalog_id, root_object_id) = insert_graph_commit(&mut seed, 0x60, 1, Vec::new());
+    let root_id = public_commit_id(0x60);
+    let (left_catalog_id, left_object_id) =
+        insert_graph_commit(&mut seed, 0x61, 2, vec![root_object_id]);
+    let left_id = public_commit_id(0x61);
+    let (right_catalog_id, right_object_id) =
+        insert_graph_commit(&mut seed, 0x62, 2, vec![root_object_id]);
+    let right_id = public_commit_id(0x62);
+    let (head_catalog_id, head_object_id) =
+        insert_graph_commit(&mut seed, 0x63, 3, vec![left_object_id, right_object_id]);
+    let head_id = public_commit_id(0x63);
+    install_graph_head(
+        &mut seed,
+        &[
+            (root_catalog_id, root_object_id),
+            (left_catalog_id, left_object_id),
+            (right_catalog_id, right_object_id),
+            (head_catalog_id, head_object_id),
+        ],
+        head_object_id,
+        0x64,
+    );
+
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("one retained graph read"),
+    );
+    let mut graph = CommitGraphStoreReader::new(read);
+    let reachable = graph
+        .reachable_nodes(&head_id)
+        .await
+        .expect("diamond graph should be reachable");
+
+    assert_eq!(
+        reachable
+            .iter()
+            .map(|node| (node.commit.commit_id, node.depth))
+            .collect::<Vec<_>>(),
+        vec![(head_id, 0), (left_id, 1), (right_id, 1), (root_id, 2),],
+        "DAG traversal must retain each node once at its nearest authenticated depth"
+    );
+}
+
+#[tokio::test]
+async fn commit_graph_criss_cross_rejects_ambiguous_merge_base() {
+    let mut seed = build_seed();
+    let (left_root_catalog_id, left_root_object_id) =
+        insert_graph_commit(&mut seed, 0x70, 1, Vec::new());
+    let left_root_id = public_commit_id(0x70);
+    let (right_root_catalog_id, right_root_object_id) =
+        insert_graph_commit(&mut seed, 0x71, 1, Vec::new());
+    let right_root_id = public_commit_id(0x71);
+    let (left_tip_catalog_id, left_tip_object_id) =
+        insert_graph_commit(&mut seed, 0x72, 2, vec![left_root_object_id]);
+    let (right_tip_catalog_id, right_tip_object_id) =
+        insert_graph_commit(&mut seed, 0x73, 2, vec![right_root_object_id]);
+    let (left_head_catalog_id, left_head_object_id) = insert_graph_commit(
+        &mut seed,
+        0x74,
+        3,
+        vec![left_tip_object_id, right_root_object_id],
+    );
+    let left_head_id = public_commit_id(0x74);
+    let (right_head_catalog_id, right_head_object_id) = insert_graph_commit(
+        &mut seed,
+        0x75,
+        3,
+        vec![right_tip_object_id, left_root_object_id],
+    );
+    let right_head_id = public_commit_id(0x75);
+    install_graph_head(
+        &mut seed,
+        &[
+            (left_root_catalog_id, left_root_object_id),
+            (right_root_catalog_id, right_root_object_id),
+            (left_tip_catalog_id, left_tip_object_id),
+            (right_tip_catalog_id, right_tip_object_id),
+            (left_head_catalog_id, left_head_object_id),
+            (right_head_catalog_id, right_head_object_id),
+        ],
+        left_head_object_id,
+        0x76,
+    );
+
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("one retained graph read"),
+    );
+    let mut graph = CommitGraphStoreReader::new(read);
+    let ancestors = graph
+        .best_common_ancestors(&left_head_id, &right_head_id)
+        .await
+        .expect("criss-cross graph should enumerate common ancestors");
+    assert_eq!(
+        ancestors
+            .iter()
+            .map(|node| node.commit_id)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([left_root_id, right_root_id]),
+        "both equally good criss-cross bases must remain visible"
+    );
+    let error = graph
+        .merge_base(&left_head_id, &right_head_id)
+        .await
+        .expect_err("a three-way merge must reject an ambiguous base");
+    assert_eq!(error.code, LixError::CODE_AMBIGUOUS_MERGE_BASE);
+}
+
+#[tokio::test]
+async fn commit_graph_cycle_and_generation_edges_fail_closed() {
+    let mut seed = build_seed();
+    let (first_catalog_id, first_object_id) = insert_graph_commit(&mut seed, 0x80, 2, Vec::new());
+    let first_id = public_commit_id(0x80);
+    let (second_catalog_id, second_object_id) =
+        insert_graph_commit(&mut seed, 0x81, 1, vec![first_object_id]);
+    let first_commit = CommitObjectV1 {
+        commit_id: first_catalog_id,
+        generation: 2,
+        parent_commit_object_ids: vec![second_object_id],
+        members: Vec::new(),
+        member_page_object_ids: Vec::new(),
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        metadata: b"cycle-first".to_vec(),
+    };
+    let (first_object_id, first_bytes) = first_commit.encode().expect("cycle first");
+    seed.objects
+        .insert(first_object_id, first_bytes)
+        .expect("replace cycle first");
+    install_graph_head(
+        &mut seed,
+        &[
+            (first_catalog_id, first_object_id),
+            (second_catalog_id, second_object_id),
+        ],
+        first_object_id,
+        0x82,
+    );
+
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("one retained graph read"),
+    );
+    let mut graph = CommitGraphStoreReader::new(read);
+    let error = graph
+        .reachable_nodes(&first_id)
+        .await
+        .expect_err("cycle must fail closed before a result is published");
+    assert!(
+        error.to_string().contains("cycle")
+            || error.to_string().contains("lower generation")
+            || error.to_string().contains("multiple Commit objects"),
+        "cycle/generation rejection must identify the authenticated graph defect: {error}"
+    );
+
+    let mut bad_generation = build_seed();
+    let (parent_catalog_id, parent_object_id) =
+        insert_graph_commit(&mut bad_generation, 0x83, 4, Vec::new());
+    let (child_catalog_id, child_object_id) =
+        insert_graph_commit(&mut bad_generation, 0x84, 4, vec![parent_object_id]);
+    let child_id = public_commit_id(0x84);
+    install_graph_head(
+        &mut bad_generation,
+        &[
+            (parent_catalog_id, parent_object_id),
+            (child_catalog_id, child_object_id),
+        ],
+        child_object_id,
+        0x85,
+    );
+    let storage = Memory::new();
+    seed_storage(&storage, &bad_generation).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("one retained graph read"),
+    );
+    let mut graph = CommitGraphStoreReader::new(read);
+    let error = graph
+        .load_node(&child_id)
+        .await
+        .expect_err("equal parent/child generation must fail closed");
+    assert!(
+        error.to_string().contains("generation"),
+        "generation edge must fail closed with a structural error: {error}"
     );
 }
 

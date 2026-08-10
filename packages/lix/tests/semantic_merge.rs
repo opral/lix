@@ -44,6 +44,14 @@ async fn plugin_resolved_rows_are_included_in_semantic_merge_change_stats() {
     assert_eq!(preview.change_stats.added, 0);
     assert_eq!(preview.change_stats.modified, 1);
     assert_eq!(preview.change_stats.removed, 0);
+    assert_ne!(
+        preview.base_commit_id, preview.target_head_commit_id,
+        "plugin resolution must retain a distinct authenticated merge base"
+    );
+    assert_ne!(
+        preview.target_head_commit_id, preview.source_head_commit_id,
+        "plugin resolution must compare the two branch heads"
+    );
 
     let receipt = lix
         .merge_branch(MergeBranchOptions {
@@ -52,6 +60,19 @@ async fn plugin_resolved_rows_are_included_in_semantic_merge_change_stats() {
         .await
         .unwrap();
     assert_eq!(receipt.change_stats, preview.change_stats);
+    assert_eq!(receipt.base_commit_id, preview.base_commit_id);
+    assert_eq!(
+        receipt.target_head_before_commit_id,
+        preview.target_head_commit_id
+    );
+    assert_eq!(
+        receipt.source_head_before_commit_id,
+        preview.source_head_commit_id
+    );
+    assert_eq!(
+        receipt.created_merge_commit_id.as_deref(),
+        Some(receipt.target_head_after_commit_id.as_str())
+    );
     assert_eq!(
         read_file(&lix, "/semantic-merge.csv").await,
         b"very quick,sleepy dog\n"
