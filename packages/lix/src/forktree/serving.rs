@@ -2191,6 +2191,7 @@ pub(super) struct StaleMemberAuthCache {
     commits: BTreeMap<ObjectId, CommitObjectV1>,
     members: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), (CommitMemberV1, u32)>,
     pages: BTreeMap<(ObjectId, ObjectId), super::model::CommitChangePageV2>,
+    change_catalog_entries: BTreeMap<ChangeId, ChangeCatalogEntry>,
 }
 
 impl StaleMemberAuthCache {
@@ -2200,6 +2201,7 @@ impl StaleMemberAuthCache {
             commits: BTreeMap::new(),
             members: BTreeMap::new(),
             pages: BTreeMap::new(),
+            change_catalog_entries: BTreeMap::new(),
         }
     }
 
@@ -2585,15 +2587,23 @@ where
         if !visited.insert((owner, ordinal as u32)) {
             return Err(corruption("selected member source ownership is cyclic"));
         }
-        let value = lookup_on_read(
-            change_catalog_root,
-            "change",
-            current.change_id().as_bytes(),
-            read,
-        )
-        .await?
-        .ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?;
-        let entry = ChangeCatalogEntry::decode(&value)?;
+        let entry = if let Some(entry) = cache.change_catalog_entries.get(&current.change_id()) {
+            entry.clone()
+        } else {
+            let value = lookup_on_read(
+                change_catalog_root,
+                "change",
+                current.change_id().as_bytes(),
+                read,
+            )
+            .await?
+            .ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?;
+            let entry = ChangeCatalogEntry::decode(&value)?;
+            cache
+                .change_catalog_entries
+                .insert(current.change_id(), entry.clone());
+            entry
+        };
         validate_member_catalog_owner_with_stale_cache(
             read,
             binding_id,
@@ -3353,9 +3363,41 @@ where
         decoded_pages.insert(id, super::model::CommitChangePageV2::decode(id, &bytes)?);
     }
 
-    let mut output = Vec::with_capacity(selected.len());
     let mut summary_cache = StaleCommitSummaryCache::new(binding_id);
     let mut stale_member_cache = StaleMemberAuthCache::new(binding_id);
+    let change_ids = selected
+        .iter()
+        .zip(&refs)
+        .filter_map(|(row, value_ref)| {
+            let (Some(_), Some(value_ref)) = (row, value_ref) else {
+                return None;
+            };
+            let page = decoded_pages.get(&value_ref.page_object_id)?;
+            page.members
+                .get(value_ref.page_ordinal as usize)
+                .map(CommitMemberV1::change_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let change_keys = change_ids
+        .iter()
+        .map(|change_id| change_id.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let change_entries =
+        lookup_many_on_read(repository.change_catalog_root, "change", &change_keys, read).await?;
+    if change_entries.len() != change_ids.len() {
+        return Err(corruption(
+            "batched stale ChangeCatalog lookup returned the wrong number of values",
+        ));
+    }
+    for (change_id, value) in change_ids.into_iter().zip(change_entries) {
+        let value =
+            value.ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?;
+        stale_member_cache
+            .change_catalog_entries
+            .insert(change_id, ChangeCatalogEntry::decode(&value)?);
+    }
+
+    let mut output = Vec::with_capacity(selected.len());
     for (row, value_ref) in selected.iter().zip(refs) {
         let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
             output.push(None);
