@@ -3145,8 +3145,7 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
 
     let replacement_bounds =
         super::encode_state_entity_prefix_bounds("app.row", &EntityPk::empty());
-    let (_, replacement_value) =
-        state_entry("a", StateCellRef::Value("replacement-a"), 0x22, &[]);
+    let (_, replacement_value) = state_entry("a", StateCellRef::Value("replacement-a"), 0x22, &[]);
     let replacement = view
         .replace_state_tree_range(
             view.branch_snapshot().local_state_root,

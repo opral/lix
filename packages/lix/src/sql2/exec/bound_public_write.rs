@@ -1446,6 +1446,68 @@ async fn try_execute_direct_path_value_replacement_batch(
             candidate_index += 1;
         }
     }
+    let uniform_created_at = if replaces_complete_collection
+        && candidates.len() == replacement_entity_pks.len()
+        && candidates.len() == unique_row_count
+        && candidates.iter().all(|candidate| {
+            !candidate.untracked()
+                && !candidate.global()
+                && candidate.file_id().is_none()
+                && candidate.metadata().is_none()
+        }) {
+        candidates
+            .iter()
+            .next()
+            .map(NativeStateRow::created_at)
+            .filter(|created_at| {
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.created_at() == *created_at)
+            })
+    } else {
+        None
+    };
+    if let Some(created_at) = uniform_created_at {
+        let mut identity_arena = Vec::new();
+        let mut identity_offsets = Vec::with_capacity(replacement_entity_pks.len());
+        for entity_pk in &replacement_entity_pks {
+            let identity = entity_pk.as_single_string()?;
+            let start = identity_arena.len();
+            identity_arena.extend_from_slice(identity.as_bytes());
+            identity_offsets.push((start, identity_arena.len()));
+        }
+        let journal = TypedMutationJournalBatch::new(
+            schema_plan_id,
+            spec.schema_key.as_str().into(),
+            active_branch_id.clone().into(),
+            identity_arena,
+            identity_offsets,
+            normalized,
+            snapshot_offsets,
+            ordered_identity_digest.ok_or_else(|| {
+                LixError::unknown("complete replacement has no ordered identity digest")
+            })?,
+        )?
+        .with_authenticated_uniform_created_at(created_at);
+        ctx.stage_typed_mutation_journal_replace(journal)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.entity_update_value_batch.stage_root_transition_journal",
+                row_count
+            ))
+            .await?;
+        #[cfg(feature = "storage-benches")]
+        if record_value_certificate {
+            crate::storage_bench::record_certified_entity_update_value_batch_hit(row_count);
+        }
+        return Ok(Some(
+            affected_by_statement
+                .unwrap_or_else(|| vec![1; row_count])
+                .into_iter()
+                .map(SqlWriteResult::affected)
+                .collect(),
+        ));
+    }
     if !replacement_entity_pks.is_empty() {
         let normalized_len = normalized.len();
         let snapshots =

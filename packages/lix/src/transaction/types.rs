@@ -505,6 +505,10 @@ pub(crate) struct TypedMutationJournalBatch {
     pub(crate) snapshot_arena: Vec<u8>,
     pub(crate) snapshot_offsets: Vec<(usize, usize)>,
     pub(crate) expected_ordered_identity_digest: [u8; 32],
+    /// Authenticated lifecycle shared by every row in a complete replacement.
+    /// This is supplied only after an exact retained-view scan proved that the
+    /// requested identity set is the complete current collection.
+    pub(crate) authenticated_uniform_created_at: Option<LixTimestamp>,
 }
 
 impl TypedMutationJournalBatch {
@@ -534,7 +538,16 @@ impl TypedMutationJournalBatch {
             snapshot_arena,
             snapshot_offsets,
             expected_ordered_identity_digest,
+            authenticated_uniform_created_at: None,
         })
+    }
+
+    pub(crate) fn with_authenticated_uniform_created_at(
+        mut self,
+        created_at: LixTimestamp,
+    ) -> Self {
+        self.authenticated_uniform_created_at = Some(created_at);
+        self
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -3536,6 +3549,13 @@ impl PreparedStateBatch {
         }
         for slot in &mut self.slots {
             slot.commit_id = Some(commit_id);
+        }
+    }
+
+    pub(crate) fn set_created_at_all(&mut self, created_at: LixTimestamp) {
+        self.expand_dense_certified_parameter();
+        for slot in &mut self.slots {
+            slot.created_at = created_at;
         }
     }
 

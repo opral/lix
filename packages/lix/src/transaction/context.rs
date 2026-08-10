@@ -8707,21 +8707,25 @@ where
                 "typed mutation journals require a stable schema and direct transaction origin",
             ));
         }
-        if opening_parent_complete_lifecycle_created_at(
-            &self.opening_read(),
-            self.opening_active_branch_head,
-            rows.schema_key.as_str(),
-            u64::try_from(row_count).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "typed mutation journal row count exceeds u64",
+        let authenticated_created_at = match rows.authenticated_uniform_created_at {
+            Some(created_at) => Some(created_at),
+            None => {
+                opening_parent_complete_lifecycle_created_at(
+                    &self.opening_read(),
+                    self.opening_active_branch_head,
+                    rows.schema_key.as_str(),
+                    u64::try_from(row_count).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "typed mutation journal row count exceeds u64",
+                        )
+                    })?,
+                    rows.expected_ordered_identity_digest,
                 )
-            })?,
-            rows.expected_ordered_identity_digest,
-        )
-        .await?
-        .is_none()
-        {
+                .await?
+            }
+        };
+        if authenticated_created_at.is_none() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "typed mutation journal lacks complete parent lifecycle authority",
@@ -8766,6 +8770,9 @@ where
                         "typed mutation journal lost its complete replacement scope",
                     ));
                 }
+                self.staged_writes.set_ordered_mutation_overlay_created_at(
+                    authenticated_created_at.expect("authenticated lifecycle is present"),
+                )?;
             }
             ImmutableMutationChunkStage::RequiresGeneric(_) => {
                 return Err(LixError::new(

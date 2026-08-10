@@ -1057,6 +1057,120 @@ struct SemanticChangeReadCache {
     closures: BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
 }
 
+fn packed_change_address(id: ChangeId) -> Option<(ChangeId, u32)> {
+    let mut base = *id.as_bytes();
+    let ordinal = u32::from_be_bytes(base[12..].try_into().expect("four-byte suffix"));
+    if ordinal == 0 {
+        return None;
+    }
+    base[12..].fill(0);
+    Some((ChangeId::from_bytes(base), ordinal))
+}
+
+async fn packed_change_catalog_entry<R>(
+    read: &R,
+    change_catalog_root: ObjectId,
+    id: ChangeId,
+) -> Result<Option<ChangeCatalogEntry>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let Some((base, ordinal)) = packed_change_address(id) else {
+        return Ok(None);
+    };
+    let Some(value) = lookup_on_read(change_catalog_root, "change", base.as_bytes(), read).await?
+    else {
+        return Ok(None);
+    };
+    let marker = ChangeCatalogEntry::decode(&value)?;
+    let ChangeCatalogOwner::PackedCommit {
+        commit_object_id,
+        member_count,
+    } = marker.owner
+    else {
+        return Ok(None);
+    };
+    if ordinal > member_count {
+        return Ok(None);
+    }
+    Ok(Some(ChangeCatalogEntry {
+        owner: ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal: ordinal - 1,
+        },
+    }))
+}
+
+async fn lookup_change_catalog_entries<R>(
+    read: &R,
+    change_catalog_root: ObjectId,
+    ids: &[ChangeId],
+) -> Result<Vec<Option<ChangeCatalogEntry>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let keys = ids
+        .iter()
+        .map(|id| id.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let direct = lookup_many_on_read(change_catalog_root, "change", &keys, read).await?;
+    let mut marker_keys = BTreeSet::<ChangeId>::new();
+    for (id, value) in ids.iter().zip(&direct) {
+        if value.is_none()
+            && let Some((base, _)) = packed_change_address(*id)
+        {
+            marker_keys.insert(base);
+        }
+    }
+    let marker_ids = marker_keys.into_iter().collect::<Vec<_>>();
+    let marker_values = if marker_ids.is_empty() {
+        Vec::new()
+    } else {
+        let keys = marker_ids
+            .iter()
+            .map(|id| id.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        lookup_many_on_read(change_catalog_root, "change", &keys, read).await?
+    };
+    let mut marker_entries = BTreeMap::new();
+    for (id, value) in marker_ids.into_iter().zip(marker_values) {
+        if let Some(value) = value {
+            marker_entries.insert(id, ChangeCatalogEntry::decode(&value)?);
+        }
+    }
+    ids.iter()
+        .zip(direct)
+        .map(|(id, value)| {
+            if let Some(value) = value {
+                let entry = ChangeCatalogEntry::decode(&value)?;
+                return Ok(
+                    (!matches!(entry.owner, ChangeCatalogOwner::PackedCommit { .. }))
+                        .then_some(entry),
+                );
+            }
+            let Some((base, ordinal)) = packed_change_address(*id) else {
+                return Ok(None);
+            };
+            let Some(marker) = marker_entries.get(&base) else {
+                return Ok(None);
+            };
+            let ChangeCatalogOwner::PackedCommit {
+                commit_object_id,
+                member_count,
+            } = marker.owner
+            else {
+                return Ok(None);
+            };
+            Ok((ordinal <= member_count).then_some(ChangeCatalogEntry {
+                owner: ChangeCatalogOwner::CommitMember {
+                    commit_object_id,
+                    ordinal: ordinal - 1,
+                },
+            }))
+        })
+        .collect()
+}
+
 pub(crate) async fn load_change_records<R>(
     read: &R,
     ids: &[crate::changelog::ChangeId],
@@ -1068,20 +1182,19 @@ where
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let keys = ids
+    let model_ids = ids
         .iter()
-        .map(|id| id.as_uuid().as_bytes().to_vec())
+        .map(|id| ChangeId::from_bytes(*id.as_uuid().as_bytes()))
         .collect::<Vec<_>>();
-    let values = lookup_many_on_read(repository.change_catalog_root, "change", &keys, read).await?;
+    let entries =
+        lookup_change_catalog_entries(read, repository.change_catalog_root, &model_ids).await?;
     let mut records = Vec::with_capacity(ids.len());
     let mut cache = SemanticChangeReadCache::default();
-    for (id, value) in ids.iter().zip(values) {
-        let id = ChangeId::from_bytes(*id.as_uuid().as_bytes());
-        let Some(value) = value else {
+    for (id, entry) in model_ids.into_iter().zip(entries) {
+        let Some(entry) = entry else {
             records.push(None);
             continue;
         };
-        let entry = ChangeCatalogEntry::decode(&value)?;
         records.push(
             semantic_change_record_cached(
                 read,
@@ -1166,18 +1279,16 @@ where
     )
     .await?;
     let members = load_commit_members(read, &commit).await?;
+    let member_ids = members
+        .iter()
+        .map(CommitMemberV1::change_id)
+        .collect::<Vec<_>>();
+    let catalog_entries =
+        lookup_change_catalog_entries(read, repository.change_catalog_root, &member_ids).await?;
     let mut records = Vec::with_capacity(members.len());
-    for (ordinal, member) in members.iter().enumerate() {
+    for (ordinal, (member, entry)) in members.iter().zip(catalog_entries).enumerate() {
         let change_id = member.change_id();
-        let value = lookup_on_read(
-            repository.change_catalog_root,
-            "change",
-            change_id.as_bytes(),
-            read,
-        )
-        .await?
-        .ok_or_else(|| corruption("Commit member has no ChangeCatalog owner"))?;
-        let entry = ChangeCatalogEntry::decode(&value)?;
+        let entry = entry.ok_or_else(|| corruption("Commit member has no ChangeCatalog owner"))?;
         validate_member_catalog_owner(
             read,
             repository.commit_catalog_root,
@@ -1342,30 +1453,160 @@ where
         return Ok(Vec::new());
     }
     let repository = load_repository_root(read).await?;
-    let start_after = start_after.map(|id| id.as_uuid().as_bytes().to_vec());
-    let rows = scan_page_on_read(
-        repository.change_catalog_root,
-        "change",
-        start_after.as_deref(),
-        limit.min(CATALOG_SCAN_PAGE_ROWS),
+    let public_start = start_after.map(|id| ChangeId::from_bytes(*id.as_uuid().as_bytes()));
+    let mut cursor = public_start.map(|id| id.as_bytes().to_vec());
+    let mut records = Vec::with_capacity(limit);
+    let mut cache = SemanticChangeReadCache::default();
+
+    // A page token may point inside one packed commit. Resume that marker
+    // before advancing the physical catalog cursor beyond its base key.
+    if let Some(start) = public_start
+        && let Some((base, ordinal)) = packed_change_address(start)
+        && let Some(value) = lookup_on_read(
+            repository.change_catalog_root,
+            "change",
+            base.as_bytes(),
+            read,
+        )
+        .await?
+    {
+        let marker = ChangeCatalogEntry::decode(&value)?;
+        append_packed_change_records(
+            read,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            base,
+            marker,
+            ordinal,
+            limit,
+            &mut records,
+            &mut cache,
+        )
+        .await?;
+        if records.len() == limit {
+            return Ok(records);
+        }
+        cursor = Some(base.as_bytes().to_vec());
+    }
+
+    while records.len() < limit {
+        let rows = scan_page_on_read(
+            repository.change_catalog_root,
+            "change",
+            cursor.as_deref(),
+            CATALOG_SCAN_PAGE_ROWS,
+            read,
+        )
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let row_count = rows.len();
+        for (key, value) in rows {
+            cursor = Some(key.clone());
+            let id = ChangeId::from_bytes(
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| corruption("ChangeCatalog key is not a raw UUID"))?,
+            );
+            let entry = ChangeCatalogEntry::decode(&value)?;
+            if matches!(entry.owner, ChangeCatalogOwner::PackedCommit { .. }) {
+                append_packed_change_records(
+                    read,
+                    repository.commit_catalog_root,
+                    repository.change_catalog_root,
+                    id,
+                    entry,
+                    0,
+                    limit,
+                    &mut records,
+                    &mut cache,
+                )
+                .await?;
+            } else if let Some(record) =
+                semantic_change_record(read, repository.change_catalog_root, id, entry).await?
+            {
+                records.push(record);
+            }
+            if records.len() == limit {
+                break;
+            }
+        }
+        if row_count < CATALOG_SCAN_PAGE_ROWS {
+            break;
+        }
+    }
+    Ok(records)
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn append_packed_change_records<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    base: ChangeId,
+    marker: ChangeCatalogEntry,
+    start_ordinal: u32,
+    limit: usize,
+    records: &mut Vec<crate::changelog::ChangeRecord>,
+    cache: &mut SemanticChangeReadCache,
+) -> Result<(), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let ChangeCatalogOwner::PackedCommit {
+        commit_object_id,
+        member_count,
+    } = marker.owner
+    else {
+        return Ok(());
+    };
+    let (commit, members) = load_authenticated_commit_member_closure(
         read,
+        commit_catalog_root,
+        commit_object_id,
+        &mut cache.closures,
     )
     .await?;
-    let mut records = Vec::with_capacity(rows.len());
-    for (key, value) in rows {
-        let id = ChangeId::from_bytes(
-            key.as_slice()
-                .try_into()
-                .map_err(|_| corruption("ChangeCatalog key is not a raw UUID"))?,
-        );
-        let entry = ChangeCatalogEntry::decode(&value)?;
-        if let Some(record) =
-            semantic_change_record(read, repository.change_catalog_root, id, entry).await?
+    if commit.commit_id.as_bytes() != base.as_bytes()
+        || usize::try_from(member_count).ok() != Some(members.len())
+    {
+        return Err(corruption("packed ChangeCatalog marker disagrees with its commit").into());
+    }
+    for ordinal in start_ordinal.saturating_add(1)..=member_count {
+        if records.len() == limit {
+            break;
+        }
+        let mut bytes = *base.as_bytes();
+        bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
+        let id = ChangeId::from_bytes(bytes);
+        let ordinal_index = ordinal - 1;
+        let member = members
+            .get(ordinal_index as usize)
+            .ok_or_else(|| corruption("packed commit ordinal is absent"))?;
+        if member.change_id() != id || member.source().is_some() {
+            return Err(corruption("packed commit ordinal identity is invalid").into());
+        }
+        let entry = ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::CommitMember {
+                commit_object_id,
+                ordinal: ordinal_index,
+            },
+        };
+        if let Some(record) = semantic_change_record_cached(
+            read,
+            commit_catalog_root,
+            change_catalog_root,
+            id,
+            entry,
+            cache,
+        )
+        .await?
         {
             records.push(record);
         }
     }
-    Ok(records)
+    Ok(())
 }
 
 pub(crate) async fn load_repository_root<R>(read: &R) -> Result<RepositoryRootV1, crate::LixError>
@@ -1634,6 +1875,9 @@ where
                 .await?;
             change
         }
+        ChangeCatalogOwner::PackedCommit { .. } => {
+            return Err(corruption("packed commit marker is not a semantic ChangeId").into());
+        }
     };
     decode_semantic_change_record(id, change)
 }
@@ -1727,6 +1971,9 @@ where
             validate_retained_ref_change(read, change_catalog_root, ref_change_object_id, &change)
                 .await?;
             change
+        }
+        ChangeCatalogOwner::PackedCommit { .. } => {
+            return Err(corruption("packed commit marker is not a semantic ChangeId").into());
         }
     };
     decode_semantic_change_record(id, change)
@@ -1878,6 +2125,9 @@ where
             return Err(corruption(
                 "semantic commit member resolves to a branch-ref catalog owner",
             ));
+        }
+        ChangeCatalogOwner::PackedCommit { .. } => {
+            return Err(corruption("semantic member resolved to a packed marker"));
         }
     };
     match member.source() {
@@ -2061,9 +2311,13 @@ where
             current.change_id().as_bytes(),
             read,
         )
-        .await?
-        .ok_or_else(|| corruption("historical member has no ChangeCatalog owner"))?;
-        let catalog_entry = ChangeCatalogEntry::decode(&catalog_value)?;
+        .await?;
+        let catalog_entry = match catalog_value {
+            Some(value) => ChangeCatalogEntry::decode(&value)?,
+            None => packed_change_catalog_entry(read, change_catalog_root, current.change_id())
+                .await?
+                .ok_or_else(|| corruption("historical member has no ChangeCatalog owner"))?,
+        };
         validate_member_catalog_owner_with_commit_cache(
             read,
             commit_catalog_root,
@@ -2159,6 +2413,9 @@ where
             return Err(corruption(
                 "semantic commit member resolves to a branch-ref catalog owner",
             ));
+        }
+        ChangeCatalogOwner::PackedCommit { .. } => {
+            return Err(corruption("semantic member resolved to a packed marker"));
         }
     };
     match member.source() {
@@ -2530,6 +2787,9 @@ where
                 "semantic commit member resolves to a branch-ref catalog owner",
             ));
         }
+        ChangeCatalogOwner::PackedCommit { .. } => {
+            return Err(corruption("semantic member resolved to a packed marker"));
+        }
     };
     match member.source() {
         None => {
@@ -2603,9 +2863,13 @@ where
             current.change_id().as_bytes(),
             read,
         )
-        .await?
-        .ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?;
-        let entry = ChangeCatalogEntry::decode(&value)?;
+        .await?;
+        let entry = match value {
+            Some(value) => ChangeCatalogEntry::decode(&value)?,
+            None => packed_change_catalog_entry(read, change_catalog_root, current.change_id())
+                .await?
+                .ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?,
+        };
         validate_member_catalog_owner_with_stale_cache(
             read,
             binding_id,
@@ -3801,9 +4065,13 @@ where
         member.change_id().as_bytes(),
         read,
     )
-    .await?
-    .ok_or_else(|| corruption("historical state member has no ChangeCatalog owner"))?;
-    let entry = ChangeCatalogEntry::decode(&value)?;
+    .await?;
+    let entry = match value {
+        Some(value) => ChangeCatalogEntry::decode(&value)?,
+        None => packed_change_catalog_entry(read, auth.change_catalog_root, member.change_id())
+            .await?
+            .ok_or_else(|| corruption("historical state member has no ChangeCatalog owner"))?,
+    };
     if target_commit_object_id != auth.endpoint_commit_object_id {
         if let Some(endpoint_member) = endpoint_members
             .iter()
@@ -3837,6 +4105,9 @@ where
             )),
             ChangeCatalogOwner::BranchRef { .. } => Err(corruption(
                 "historical semantic state member has a branch-ref ChangeCatalog owner",
+            )),
+            ChangeCatalogOwner::PackedCommit { .. } => Err(corruption(
+                "historical semantic state member resolved to a packed marker",
             )),
         },
         CommitMemberV1::Selected { .. } => {
@@ -4853,12 +5124,12 @@ where
     validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, commit).await?;
     let members: Arc<[CommitMemberV1]> = load_commit_members(read, commit).await?.into();
     let mut closures = BTreeMap::from([(commit_object_id, (commit.clone(), Arc::clone(&members)))]);
-    let change_keys = members
+    let change_ids = members
         .iter()
-        .map(|member| member.change_id().as_bytes().to_vec())
+        .map(CommitMemberV1::change_id)
         .collect::<Vec<_>>();
     let catalog_values =
-        lookup_many_on_read(change_catalog_root, "change", &change_keys, read).await?;
+        lookup_change_catalog_entries(read, change_catalog_root, &change_ids).await?;
     if catalog_values.len() != members.len() {
         return Err(corruption(
             "batched retained ChangeCatalog lookup returned the wrong number of values",
@@ -4877,9 +5148,8 @@ where
                 "resolved retained Change disagrees with its commit member",
             ));
         }
-        let value =
+        let entry =
             value.ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
-        let entry = ChangeCatalogEntry::decode(&value)?;
         validate_member_catalog_owner_with_commit_cache(
             read,
             commit_catalog_root,

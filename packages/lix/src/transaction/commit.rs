@@ -186,12 +186,18 @@ pub(crate) async fn prepare_forktree_publication_with_parent_heads<R>(
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
     read: R,
-    prepared_writes: PreparedWriteSet,
+    mut prepared_writes: PreparedWriteSet,
     pending_publication: Option<PreparedPublication>,
 ) -> Result<PreparedForkTreePlan, LixError>
 where
     R: StorageAdapterRead + Clone,
 {
+    // Keep certified complete replacements columnar through SQL and
+    // transaction staging. The current commit encoder still consumes the
+    // neutral prepared-row view; this single terminal lowering avoids the
+    // former overlay/index/replay path and is the bridge to direct
+    // root-transition page encoding.
+    prepared_writes.lower_certified_ordered_mutation_journals()?;
     let intent = classify_publication_intent(&prepared_writes, runtime_checkpoint)?;
     if publication_owner_branch_ids(&prepared_writes, runtime_checkpoint.is_some()).len() > 1 {
         return Box::pin(prepare_batched_forktree_publication(
@@ -456,6 +462,7 @@ where
     } else {
         view.branch_snapshot().local_state_root
     };
+    let root_transition = complete_replacement_bounds.is_some();
     let state_edit = if let (Some((lower, upper)), Some(entries)) =
         (complete_replacement_bounds, replacement_entries)
     {
@@ -617,13 +624,47 @@ where
             ));
         }
     }
-    let change_catalog_edit = publication
+    // A complete collection replacement is already authenticated twice: its
+    // state leaves point at the exact commit-member pages and the semantic
+    // commit authenticates both those pages and the resulting state root.
+    // Persisting another ChangeCatalog leaf for every member merely rebuilds
+    // a second N-row ownership index during the mutation. Store one packed
+    // commit marker plus the independently-addressable branch-ref change;
+    // the authenticated member closure remains the canonical root-to-root
+    // history owner.
+    let persisted_change_entries = if root_transition {
+        let mut entries = change_entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry.owner, ChangeCatalogOwner::BranchRef { .. }))
+            .copied()
+            .collect::<Vec<_>>();
+        entries.push((
+            ForkTreeChangeId::from_bytes(*semantic_commit.commit_id.as_bytes()),
+            ChangeCatalogEntry {
+                owner: ChangeCatalogOwner::PackedCommit {
+                    commit_object_id,
+                    member_count: u32::try_from(semantic_commit.members.len())
+                        .map_err(|_| writer_error("packed commit member count exceeds u32"))?,
+                },
+            },
+        ));
+        entries.sort_unstable_by_key(|(id, _)| *id);
+        entries
+    } else {
+        change_entries.clone()
+    };
+    let mut change_catalog_edit = publication
         .put_change_catalog_entries(
             &view,
             current_repository_root.change_catalog_root,
-            &change_entries,
+            &persisted_change_entries,
         )
         .await?;
+    if root_transition {
+        // Publication validates the exact commit/member ownership map before
+        // writing. These ephemeral entries are not a durable second index.
+        change_catalog_edit.change_entries.extend(change_entries);
+    }
     let repository_root = RepositoryRootV1 {
         global_state_root: if global {
             state_edit.root

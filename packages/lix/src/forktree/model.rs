@@ -1313,6 +1313,13 @@ pub(crate) enum ChangeCatalogOwner {
         ref_change_object_id: ObjectId,
         branch_id: CanonicalBranchId,
     },
+    /// One catalog owner for a commit whose introduced semantic changes use
+    /// the commit's reserved low-32-bit ordinal address space. The Commit
+    /// object and its authenticated change pages remain the payload owner.
+    PackedCommit {
+        commit_object_id: ObjectId,
+        member_count: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1346,6 +1353,17 @@ impl ChangeCatalogEntry {
                 encode_id(&mut encoder, ref_change_object_id);
                 encoder.fixed(branch_id.as_bytes());
             }
+            ChangeCatalogOwner::PackedCommit {
+                commit_object_id,
+                member_count,
+            } => {
+                if commit_object_id == ObjectId::ZERO || member_count == 0 {
+                    return Err(corruption("packed change owner is empty"));
+                }
+                encoder.u8(2);
+                encode_id(&mut encoder, commit_object_id);
+                encoder.u32(member_count);
+            }
         }
         Ok(encoder.into_vec())
     }
@@ -1360,6 +1378,10 @@ impl ChangeCatalogEntry {
             1 => ChangeCatalogOwner::BranchRef {
                 ref_change_object_id: decode_id(&mut decoder)?,
                 branch_id: CanonicalBranchId::from_bytes(decoder.fixed()?),
+            },
+            2 => ChangeCatalogOwner::PackedCommit {
+                commit_object_id: decode_id(&mut decoder)?,
+                member_count: decoder.u32()?,
             },
             tag => return Err(corruption(format!("unknown change owner tag {tag}"))),
         };
@@ -2663,7 +2685,7 @@ pub(super) fn gc_progress_selector_key() -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitChangePageV2, CommitId};
+    use super::{ChangeCatalogEntry, ChangeCatalogOwner, CommitChangePageV2, CommitId, ObjectId};
 
     #[test]
     fn empty_commit_change_pages_are_a_valid_empty_closure() {
@@ -2671,5 +2693,20 @@ mod tests {
             .expect("empty commit page closure should be encodable");
         assert!(pages.member_locations.is_empty());
         assert!(pages.objects.is_empty());
+    }
+
+    #[test]
+    fn packed_commit_catalog_owner_round_trips() {
+        let entry = ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::PackedCommit {
+                commit_object_id: ObjectId::from_bytes([0x24; 32]),
+                member_count: 257,
+            },
+        };
+        let encoded = entry.encode().expect("encode packed commit owner");
+        assert_eq!(
+            ChangeCatalogEntry::decode(&encoded).expect("decode packed commit owner"),
+            entry
+        );
     }
 }
