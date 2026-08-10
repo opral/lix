@@ -3351,11 +3351,13 @@ pub(crate) async fn prepare_path_value_replacement_row(
 ) -> Result<Option<PreparedPathValueReplacementRow>, LixError> {
     let primary_key = program.primary_key(params)?;
     let entity_pk = EntityPk::single(primary_key.to_owned());
+    let branch_id = ctx.active_branch_id().to_owned();
     let candidates = scan_native_entity_ranges(
         ctx,
         program.schema_key.as_str(),
         vec![entity_pk.clone()],
         false,
+        std::slice::from_ref(&branch_id),
     )
     .await?;
     if candidates.is_empty() {
@@ -4175,6 +4177,12 @@ async fn scan_entity_conflict_candidates(
         spec.schema_key.as_str(),
         entity_pks.into_iter().collect(),
         false,
+        &insert_rows
+            .iter()
+            .map(|row| row.branch_id.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
     )
     .await?;
     candidates.rows.retain(|row| {
@@ -4198,9 +4206,25 @@ async fn scan_entity_candidates(
         bound_entity_pks_from_primary_key_predicate(spec, &plan.bound.predicate, params);
     let mut rows = match entity_pks {
         Some(entity_pks) => {
-            scan_native_entity_ranges(ctx, spec.schema_key.as_str(), entity_pks, false).await?
+            scan_native_entity_ranges(
+                ctx,
+                spec.schema_key.as_str(),
+                entity_pks,
+                false,
+                &scan_branch_ids(&plan.bound.branch_scope)?,
+            )
+            .await?
         }
-        None => scan_native_entity_ranges(ctx, spec.schema_key.as_str(), Vec::new(), false).await?,
+        None => {
+            scan_native_entity_ranges(
+                ctx,
+                spec.schema_key.as_str(),
+                Vec::new(),
+                false,
+                &scan_branch_ids(&plan.bound.branch_scope)?,
+            )
+            .await?
+        }
     };
     rows.rows.retain(|row| row.schema_key == spec.schema_key);
     Ok(rows)
@@ -4214,8 +4238,14 @@ async fn scan_entity_candidates_for_pks(
     metadata_only: bool,
 ) -> Result<NativeStateBatch, LixError> {
     let _ = (scan_branch_ids(&plan.bound.branch_scope)?, metadata_only);
-    let mut rows =
-        scan_native_entity_ranges(ctx, spec.schema_key.as_str(), entity_pks, false).await?;
+    let mut rows = scan_native_entity_ranges(
+        ctx,
+        spec.schema_key.as_str(),
+        entity_pks,
+        false,
+        &scan_branch_ids(&plan.bound.branch_scope)?,
+    )
+    .await?;
     rows.rows.retain(|row| row.schema_key == spec.schema_key);
     Ok(rows)
 }
@@ -4225,53 +4255,61 @@ async fn scan_native_entity_ranges(
     schema_key: &str,
     entity_pks: Vec<EntityPk>,
     include_tombstones: bool,
+    branch_ids: &[String],
 ) -> Result<NativeStateBatch, LixError> {
     let mut rows = Vec::new();
-    if entity_pks.is_empty() {
-        let native = ctx
-            .state_view()
-            .range(None, None, None, include_tombstones)
-            .await
-            .map_err(|error| LixError::unknown(error.to_string()))?;
-        for row in native {
-            let row = NativeStateRow::from_state_row(row, ctx.active_branch_id())?;
-            if row.schema_key == schema_key {
-                rows.push(row);
-            }
-        }
+    let branch_ids = if branch_ids.is_empty() {
+        vec![ctx.active_branch_id().to_owned()]
     } else {
-        for entity_pk in entity_pks {
-            let bounds = crate::forktree::encode_state_entity_prefix_bounds(schema_key, &entity_pk);
+        branch_ids.to_vec()
+    };
+    for branch_id in &branch_ids {
+        if entity_pks.is_empty() {
             let native = ctx
                 .state_view()
-                .range(
-                    Some(bounds.lower.as_slice()),
-                    bounds.upper.as_deref(),
-                    None,
-                    include_tombstones,
-                )
-                .await
-                .map_err(|error| LixError::unknown(error.to_string()))?;
-            rows.extend(
-                native
+                .branch_range(branch_id, None, None, None, include_tombstones)
+                .await?;
+            for row in native {
+                let row = NativeStateRow::from_state_row(row, branch_id)?;
+                if row.schema_key == schema_key {
+                    rows.push(row);
+                }
+            }
+        } else {
+            for entity_pk in &entity_pks {
+                let bounds =
+                    crate::forktree::encode_state_entity_prefix_bounds(schema_key, entity_pk);
+                let native = ctx
+                    .state_view()
+                    .branch_range(
+                        branch_id,
+                        Some(bounds.lower.as_slice()),
+                        bounds.upper.as_deref(),
+                        None,
+                        include_tombstones,
+                    )
+                    .await?;
+                rows.extend(
+                    native
+                        .into_iter()
+                        .map(|row| NativeStateRow::from_state_row(row, branch_id))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let encoded = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key,
+                    file_id: None,
+                    entity_pk,
+                });
+                if let Some(row) = ctx
+                    .state_view()
+                    .untracked_points_for_branch(branch_id, std::slice::from_ref(&encoded), false)
+                    .await?
                     .into_iter()
-                    .map(|row| NativeStateRow::from_state_row(row, ctx.active_branch_id()))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-            let encoded = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                schema_key,
-                file_id: None,
-                entity_pk: &entity_pk,
-            });
-            if let Some(row) = ctx
-                .state_view()
-                .untracked_points(std::slice::from_ref(&encoded), false)
-                .await?
-                .into_iter()
-                .next()
-                .flatten()
-            {
-                rows.push(NativeStateRow::from_untracked(row));
+                    .next()
+                    .flatten()
+                {
+                    rows.push(NativeStateRow::from_untracked(row));
+                }
             }
         }
     }

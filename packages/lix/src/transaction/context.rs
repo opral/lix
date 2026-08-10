@@ -1600,6 +1600,15 @@ where
                 return Err(error);
             }
         };
+        if let Err(error) = validation_state
+            .validate_active_account(&transaction.active_account_id)
+            .await
+        {
+            transaction
+                .discard_pending_plugin_actor_publications()
+                .await;
+            return Err(error);
+        }
         if let Err(error) = validate_prepared_writes_by_branch(
             &validation_state,
             &transaction.active_branch_id,

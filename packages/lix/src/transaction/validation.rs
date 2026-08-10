@@ -949,6 +949,43 @@ where
     validate_foreign_keys(&input, &staged_rows, &all_rows).await?;
     validate_file_ownership(&input, &staged_rows, &all_rows).await?;
     validate_filesystem_namespace(&input, &staged_rows, &all_rows).await?;
+    for row in staged_rows
+        .iter()
+        .copied()
+        .filter(|row| row.schema_key() == "lix_account")
+    {
+        let account_id = row.entity_pk().as_single_string_owned()?;
+        let disables_builtin = row_is_tombstone(row)
+            || prepared_snapshot(row)?
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("status"))
+                .and_then(JsonValue::as_str)
+                == Some("disabled");
+        if disables_builtin
+            && matches!(
+                account_id.as_str(),
+                crate::SYSTEM_ACCOUNT_ID | crate::ANONYMOUS_ACCOUNT_ID
+            )
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "built-in accounts must remain active",
+            ));
+        }
+    }
+    for tombstone in staged_rows
+        .iter()
+        .copied()
+        .filter(|row| row_is_tombstone(*row) && row.schema_key() == "lix_account")
+    {
+        let account_id = tombstone.entity_pk().as_single_string_owned()?;
+        if input.state_view.has_authored_change(&account_id).await? {
+            return Err(LixError::new(
+                "LIX_FOREIGN_KEY_VIOLATION",
+                "cannot delete 'lix_account' row because 'lix_change' rows still reference it",
+            ));
+        }
+    }
     validate_delete_restrictions(&input, &staged_rows, &all_rows).await?;
     validate_insert_identities(&input, &all_rows).await?;
     Ok(())
