@@ -139,6 +139,16 @@ where
         Ok(Self::new(facade.into_branch(branch_id).await?))
     }
 
+    /// Loads authenticated change records through this view's retained read.
+    /// Merge analysis uses this only to bind native state-diff values to their
+    /// immutable change payloads; it never opens a second read.
+    pub(crate) async fn load_change_records(
+        &self,
+        ids: &[crate::changelog::ChangeId],
+    ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+        crate::forktree::load_change_records(self.view.retained_read(), ids).await
+    }
+
     /// Resolves exact keys through the native authenticated ordered-tree
     /// primitive. Result slots preserve request order and duplicates.
     pub(crate) async fn points(
