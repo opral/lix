@@ -1550,6 +1550,144 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
 }
 
 #[tokio::test]
+async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("initial overlay view");
+    let key = encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: Some("file"),
+        entity_pk: &EntityPk::single("b"),
+    });
+    let (masked_rows, _, masked_page_objects) = encode_test_state_entries(
+        0x62,
+        vec![test_state_member(
+            "b",
+            StateCellRef::Value("local-b"),
+            0x62,
+            &[],
+            false,
+        )],
+    );
+    let masked_value = masked_rows
+        .into_iter()
+        .find(|(encoded_key, _)| *encoded_key == key)
+        .map(|(_, value)| value)
+        .expect("masked state value");
+    let mut masked_page_writes = StorageWriteSet::new();
+    for (object_id, bytes) in masked_page_objects {
+        masked_page_writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(masked_page_writes, &storage).await;
+    let state_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![StateTreeMutation::update(key.clone(), masked_value)],
+        view.test_storage_read(),
+    )
+    .await
+    .expect("local mask update");
+    let transition = branch_transition(&view, state_edit, 0x62).await;
+    let masked_commit_id = transition.semantic_commit.commit_id;
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    publication
+        .publish_state_transition(&view, transition)
+        .await
+        .expect("authenticated state transition");
+    drop(view);
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("publish transition");
+
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("diff read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    let before_commit_id =
+        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*seed.commit_id.as_bytes()));
+    let masked_commit_id =
+        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*masked_commit_id.as_bytes()));
+    let mask_diff = facade
+        .diff_branch_state_rows_between_commits(before_commit_id, masked_commit_id)
+        .await
+        .expect("branch-root mask diff");
+    let masked_row = mask_diff
+        .into_iter()
+        .find(|entry| {
+            entry
+                .before
+                .as_ref()
+                .or(entry.after.as_ref())
+                .is_some_and(|row| row.key.entity_pk == EntityPk::single("b"))
+        })
+        .expect("masked global row must remain in the structural diff");
+    assert!(masked_row.before.as_ref().is_some_and(|row| row.deleted));
+    let masked = masked_row.after.expect("masked endpoint");
+    assert!(!masked.global);
+    assert!(!masked.deleted);
+    assert_eq!(masked.snapshot_content.as_deref(), Some("local-b"));
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("view after local mask");
+    let state_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![StateTreeMutation::remove(key)],
+        view.test_storage_read(),
+    )
+    .await
+    .expect("local unmask removal");
+    let transition = branch_transition(&view, state_edit, 0x64).await;
+    let unmasked_commit_id = transition.semantic_commit.commit_id;
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    publication
+        .publish_state_transition(&view, transition)
+        .await
+        .expect("authenticated state transition");
+    drop(view);
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("publish unmask transition");
+
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("unmask diff read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    let unmasked_commit_id =
+        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*unmasked_commit_id.as_bytes()));
+    let unmask_diff = facade
+        .diff_branch_state_rows_between_commits(masked_commit_id, unmasked_commit_id)
+        .await
+        .expect("branch-root unmask diff");
+    let unmasked_row = unmask_diff
+        .into_iter()
+        .find(|entry| {
+            entry
+                .before
+                .as_ref()
+                .or(entry.after.as_ref())
+                .is_some_and(|row| row.key.entity_pk == EntityPk::single("b"))
+        })
+        .expect("unmasked global row must remain in the structural diff");
+    let before = unmasked_row.before.expect("masked before endpoint");
+    assert!(!before.global);
+    assert!(!before.deleted);
+    assert_eq!(before.snapshot_content.as_deref(), Some("local-b"));
+    let after = unmasked_row.after.expect("global fallback endpoint");
+    assert!(after.global);
+    assert!(!after.deleted);
+    assert_eq!(after.snapshot_content.as_deref(), Some("global-b"));
+}
+
+#[tokio::test]
 async fn untracked_range_is_branch_bounded_ordered_and_limited() {
     let seed = build_seed();
     let storage = Memory::new();
@@ -1779,6 +1917,13 @@ async fn historical_missing_state_root_fails_before_empty_result() {
             .await
             .is_err(),
         "missing selected state root must not become an empty historical result"
+    );
+    assert!(
+        facade
+            .diff_branch_state_rows_between_commits(public_commit_id(0x20), public_commit_id(0x20),)
+            .await
+            .is_err(),
+        "branch-root diff must reject a missing authenticated root before equality pruning"
     );
 }
 
