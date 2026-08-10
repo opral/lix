@@ -2120,12 +2120,21 @@ where
                 "parameter batch normalization changed row cardinality",
             ));
         }
+        let outcome = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_buffer_stage"
+        )
+        .in_scope(|| match statement_indices {
+            Some(indices) => self
+                .staged_writes
+                .stage_parameter_batch_insert(write, indices),
+            None => self.staged_writes.stage_write(write),
+        })?;
+        self.refresh_state_view_from_staging(true)?;
         self.pending_file_view_mutations.extend(file_view_mutations);
         self.pending_plugin_actor_publications
             .extend(actor_publications);
-        Ok(TransactionWriteOutcome {
-            count: prepared_transaction_write_row_count(&write) as u64,
-        })
+        Ok(outcome)
     }
 
     fn reject_write_after_collection_replacement(
