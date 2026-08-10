@@ -1167,7 +1167,7 @@ where
                 .await?;
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                     Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                        state_view.clone(),
+                        forktree.clone(),
                     ));
                 let branch_ref: Arc<dyn BranchRefReader> =
                     Arc::new(BranchRefStoreReader::new(read_store.clone()));
@@ -2326,7 +2326,7 @@ where
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
                     > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                        state_view.clone(),
+                        forktree.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(BranchRefStoreReader::new(read_store));
@@ -2341,7 +2341,7 @@ where
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
                     > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                        state_view.clone(),
+                        forktree.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(BranchRefStoreReader::new(read_store));
@@ -2357,7 +2357,7 @@ where
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
                     > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                        state_view.clone(),
+                        forktree.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(BranchRefStoreReader::new(read_store.clone()));
@@ -2469,7 +2469,7 @@ where
         if let Some(data_column_index) = late_file_content_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                    state_view.clone(),
+                    forktree.clone(),
                 ));
             let branch_ref: Arc<dyn BranchRefReader> =
                 Arc::new(BranchRefStoreReader::new(read_store.clone()));
