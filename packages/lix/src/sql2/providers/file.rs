@@ -769,47 +769,65 @@ async fn directory_path_resolvers_from_transaction_state_view<R>(
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let branch_id = branch_binding.ok_or_else(|| {
-        LixError::new(
+    let branch_id = branch_binding
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| state_view.branch_id());
+    directory_path_resolvers_from_transaction_state_view_for_branches(state_view, &[branch_id])
+        .await
+}
+
+async fn directory_path_resolvers_from_transaction_state_view_for_branches<R>(
+    state_view: &TransactionStateView<R>,
+    branch_ids: &[String],
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    if branch_ids.is_empty() {
+        return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
-            "filesystem path resolution requires a branch-bound state view",
-        )
-    })?;
+            "filesystem path resolution requires at least one branch scope",
+        ));
+    }
     let mut rows = Vec::new();
-    for schema_key in filesystem_schema_keys() {
-        let bounds = schema_range_bounds(&schema_key);
-        let tracked = state_view
-            .branch_range(branch_id, Some(&bounds.0), bounds.1.as_deref(), None, true)
-            .await
-            .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
-        rows.extend(FilesystemStateRows::from_view_rows(
-            tracked, branch_id, false,
-        )?);
-        let untracked = state_view
-            .untracked_overlay_branch_range_for_branch(
-                branch_id,
-                Some(&bounds.0),
-                bounds.1.as_deref(),
-                None,
-                true,
-            )
-            .await
-            .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
-        let mut untracked = FilesystemStateRows::from_untracked_view_rows(untracked)?
-            .into_iter()
-            .collect::<Vec<_>>();
-        for row in &mut untracked {
-            if row.global() {
-                row.branch_id = branch_id.to_owned();
+    for branch_id in branch_ids {
+        for schema_key in filesystem_schema_keys() {
+            let bounds = schema_range_bounds(&schema_key);
+            let tracked = state_view
+                .branch_range(branch_id, Some(&bounds.0), bounds.1.as_deref(), None, true)
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+            rows.extend(FilesystemStateRows::from_view_rows(
+                tracked, branch_id, false,
+            )?);
+            let untracked = state_view
+                .untracked_overlay_branch_range_for_branch(
+                    branch_id,
+                    Some(&bounds.0),
+                    bounds.1.as_deref(),
+                    None,
+                    true,
+                )
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+            let mut untracked = FilesystemStateRows::from_untracked_view_rows(untracked)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            for row in &mut untracked {
+                if row.global() {
+                    row.branch_id = branch_id.clone();
+                }
             }
+            rows.extend(untracked);
         }
-        rows.extend(untracked);
     }
     let rows = crate::filesystem::merge_filesystem_state_rows(rows, false);
     let mut resolvers = directory_path_resolvers_from_state_batch(&rows)?;
-    resolvers
-        .entry(filesystem_storage_scope_key(branch_id, false, false, None))
-        .or_default();
+    for branch_id in branch_ids {
+        resolvers
+            .entry(filesystem_storage_scope_key(branch_id, false, false, None))
+            .or_default();
+    }
     Ok(resolvers)
 }
 

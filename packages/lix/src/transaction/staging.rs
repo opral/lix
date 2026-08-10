@@ -2415,6 +2415,7 @@ impl TransactionWriteBuffer {
         };
         let (rows, file_content_writes) = Self::state_rows_from_stage_write(write);
         debug_assert!(file_content_writes.is_empty());
+        self.reject_mixed_staged_retention(&rows)?;
         match self.stage_append_only_if_possible(mode, rows, None)? {
             AppendOnlyStage::Staged => Ok(TransactionWriteOutcome { count }),
             AppendOnlyStage::Fallback(rows) => {
@@ -2468,6 +2469,7 @@ impl TransactionWriteBuffer {
             }
             return Ok(TransactionWriteOutcome { count });
         }
+        self.reject_mixed_staged_retention(&rows)?;
         if file_content_writes.is_empty() {
             match self.stage_append_only_if_possible(mode, rows, statement_indices.as_deref())? {
                 AppendOnlyStage::Staged => return Ok(TransactionWriteOutcome { count }),
@@ -2658,6 +2660,33 @@ impl TransactionWriteBuffer {
                 .extend(file_content_writes);
         }
         Ok(TransactionWriteOutcome { count })
+    }
+
+    /// Rejects a same-transaction identity switch before the append-only
+    /// journal can bypass the indexed mixed-durability check.  The identity
+    /// excludes retention by design; changing only `untracked` for the same
+    /// state owner is a semantic conflict, not a second row.
+    fn reject_mixed_staged_retention(&self, incoming: &PreparedStateBatch) -> Result<(), LixError> {
+        let guard = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let existing = match &*guard {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows,
+        };
+        for row in incoming.iter() {
+            let identity = PreparedStateRowIdentity::from(row);
+            if existing.iter().any(|previous| {
+                PreparedStateRowIdentity::from(previous) == identity
+                    && previous.untracked != row.untracked
+            }) {
+                return Err(mixed_durability_error(row));
+            }
+        }
+        Ok(())
     }
 
     fn state_rows_from_stage_write(
