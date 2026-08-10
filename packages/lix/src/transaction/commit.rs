@@ -17,7 +17,9 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use crate::transaction::staging::{BranchRefPublicationIntent, PreparedWriteSet};
+use crate::transaction::staging::{
+    BranchRefPublicationIntent, HistoricalBlobManifestEdges, PreparedWriteSet,
+};
 use crate::transaction::types::PreparedStateRowRef;
 
 use crate::forktree::{
@@ -210,7 +212,11 @@ where
         } else {
             publication_branch_id
         };
-        let canonical_snapshot = canonical_snapshot_for_row(row, &prepared_blob_manifests)?;
+        let canonical_snapshot = canonical_snapshot_for_row(
+            row,
+            &prepared_blob_manifests,
+            &prepared_writes.historical_blob_manifest_edges,
+        )?;
         if let Some(snapshot) = canonical_snapshot.as_deref() {
             publication.put_untracked_row(
                 untracked_owner,
@@ -224,6 +230,7 @@ where
                     blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
                         row,
                         &prepared_blob_manifests,
+                        &prepared_writes.historical_blob_manifest_edges,
                     )?,
                 },
             )?;
@@ -375,7 +382,11 @@ where
         let change_id = row
             .change_id
             .ok_or_else(|| writer_error("tracked row has no change identity"))?;
-        let canonical_snapshot = canonical_snapshot_for_row(row, &prepared_blob_manifests)?;
+        let canonical_snapshot = canonical_snapshot_for_row(
+            row,
+            &prepared_blob_manifests,
+            &prepared_writes.historical_blob_manifest_edges,
+        )?;
         let snapshot = canonical_snapshot
             .as_deref()
             .map_or(JsonSlot::None, |value| JsonSlot::Inline(value.into()));
@@ -394,8 +405,11 @@ where
             created_at: row.created_at,
             origin_key: row.origin_key.map(ToString::to_string),
         })?;
-        let blob_manifest_object_ids =
-            blob_manifest_object_ids_for_row(row, &prepared_blob_manifests)?;
+        let blob_manifest_object_ids = blob_manifest_object_ids_for_row(
+            row,
+            &prepared_blob_manifests,
+            &prepared_writes.historical_blob_manifest_edges,
+        )?;
         members.push(CommitMemberV1::introduced(
             forktree_change_id(change_id),
             payload,
@@ -916,7 +930,11 @@ where
                     "ordered history repeats one logical state identity",
                 ));
             }
-            let canonical_snapshot = canonical_snapshot_for_row(row, &prepared_blob_manifests)?;
+            let canonical_snapshot = canonical_snapshot_for_row(
+                row,
+                &prepared_blob_manifests,
+                &prepared.historical_blob_manifest_edges,
+            )?;
             let snapshot = canonical_snapshot
                 .as_deref()
                 .map_or(JsonSlot::None, |value| JsonSlot::Inline(value.into()));
@@ -935,8 +953,11 @@ where
                 created_at: row.created_at,
                 origin_key: row.origin_key.map(ToString::to_string),
             })?;
-            let blob_manifest_object_ids =
-                blob_manifest_object_ids_for_row(row, &prepared_blob_manifests)?;
+            let blob_manifest_object_ids = blob_manifest_object_ids_for_row(
+                row,
+                &prepared_blob_manifests,
+                &prepared.historical_blob_manifest_edges,
+            )?;
             members.push(CommitMemberV1::introduced(
                 forktree_change_id(change_id),
                 payload,
@@ -1546,6 +1567,7 @@ where
 fn blob_manifest_object_ids_for_row(
     row: PreparedStateRowRef<'_>,
     manifests: &PreparedBlobManifestMap,
+    historical_edges: &HistoricalBlobManifestEdges,
 ) -> Result<Vec<ObjectId>, LixError> {
     if row.schema_key.as_str() != "lix_binary_blob_ref" {
         return Ok(Vec::new());
@@ -1562,15 +1584,36 @@ fn blob_manifest_object_ids_for_row(
         row.global,
         row.untracked,
     );
-    let manifest = manifests.get(&key).copied().ok_or_else(|| {
-        writer_error("blob-ref state row has no matching prepared ForkTree manifest")
-    })?;
-    Ok(vec![manifest.object_id])
+    if let Some(manifest) = manifests.get(&key).copied() {
+        return Ok(vec![manifest.object_id]);
+    }
+    let state_key = StateKey {
+        schema_key: row.schema_key.to_string(),
+        file_id: Some(file_id.to_string()),
+        entity_pk: row.entity_pk.clone(),
+    };
+    let owner = if row.global {
+        crate::GLOBAL_BRANCH_ID
+    } else {
+        row.branch_id.as_str()
+    };
+    let edge = historical_edges
+        .get(&(owner.to_owned(), state_key))
+        .ok_or_else(|| {
+            writer_error("blob-ref state row has no matching prepared ForkTree manifest")
+        })?;
+    if edge.is_empty() {
+        return Err(writer_error(
+            "historical blob-ref state row has an empty ForkTree manifest edge",
+        ));
+    }
+    Ok(edge.clone())
 }
 
 fn canonical_snapshot_for_row<'a>(
     row: PreparedStateRowRef<'a>,
     manifests: &PreparedBlobManifestMap,
+    historical_edges: &HistoricalBlobManifestEdges,
 ) -> Result<Option<Cow<'a, str>>, LixError> {
     let Some(snapshot) = row.snapshot else {
         return Ok(None);
@@ -1587,9 +1630,29 @@ fn canonical_snapshot_for_row<'a>(
         row.global,
         row.untracked,
     );
-    let manifest = manifests.get(&key).copied().ok_or_else(|| {
-        writer_error("blob-ref state row has no matching prepared ForkTree manifest")
-    })?;
+    let Some(manifest) = manifests.get(&key).copied() else {
+        let state_key = StateKey {
+            schema_key: row.schema_key.to_string(),
+            file_id: Some(file_id.to_string()),
+            entity_pk: row.entity_pk.clone(),
+        };
+        let owner = if row.global {
+            crate::GLOBAL_BRANCH_ID
+        } else {
+            row.branch_id.as_str()
+        };
+        let edge = historical_edges
+            .get(&(owner.to_owned(), state_key))
+            .ok_or_else(|| {
+                writer_error("blob-ref state row has no matching prepared ForkTree manifest")
+            })?;
+        if edge.is_empty() {
+            return Err(writer_error(
+                "historical blob-ref state row has an empty ForkTree manifest edge",
+            ));
+        }
+        return Ok(Some(Cow::Borrowed(snapshot.normalized())));
+    };
     let mut value: serde_json::Value = serde_json::from_str(snapshot.normalized())
         .map_err(|error| writer_error(format!("blob-ref state row JSON is malformed: {error}")))?;
     let object = value
@@ -1774,6 +1837,7 @@ mod intent_tests {
             intermediate_commits: Vec::new(),
             file_content_writes: Vec::new(),
             branch_ref_intents: Vec::new(),
+            historical_blob_manifest_edges: BTreeMap::new(),
         }
     }
 

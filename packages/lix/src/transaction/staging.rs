@@ -21,7 +21,9 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_pk::EntityPk;
-use crate::forktree::{CanonicalBranchId, StateCell, StateKey, StateValue, UntrackedValue};
+use crate::forktree::{
+    CanonicalBranchId, ObjectId, StateCell, StateKey, StateValue, UntrackedValue,
+};
 #[cfg(test)]
 use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
@@ -57,7 +59,13 @@ pub(crate) struct TransactionWriteBuffer {
     intermediate_commits: Mutex<Vec<StagedIntermediateCommit>>,
     file_content_writes: Mutex<Vec<TransactionFileContent>>,
     branch_ref_intents: Mutex<Vec<BranchRefPublicationIntent>>,
+    historical_blob_manifest_edges: Mutex<HistoricalBlobManifestEdges>,
 }
+
+/// Authenticated manifest edges carried by a payload-free historical state
+/// transition. The branch discriminator is part of the key so a global row
+/// cannot be accidentally reused for a branch-local publication.
+pub(crate) type HistoricalBlobManifestEdges = BTreeMap<(String, StateKey), Vec<ObjectId>>;
 
 /// A transaction-local statement checkpoint.
 ///
@@ -75,6 +83,7 @@ pub(crate) struct TransactionWriteBufferCheckpoint {
     intermediate_commits: Vec<StagedIntermediateCommit>,
     file_content_writes: Vec<TransactionFileContent>,
     branch_ref_intents: Vec<BranchRefPublicationIntent>,
+    historical_blob_manifest_edges: HistoricalBlobManifestEdges,
 }
 
 /// One immutable, fixed-shape journal chunk produced by typed SQL mutation
@@ -665,6 +674,7 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) intermediate_commits: Vec<StagedIntermediateCommit>,
     pub(crate) file_content_writes: Vec<TransactionFileContent>,
     pub(crate) branch_ref_intents: Vec<BranchRefPublicationIntent>,
+    pub(crate) historical_blob_manifest_edges: HistoricalBlobManifestEdges,
 }
 
 /// Transaction-local branch selector intent. This is deliberately not a
@@ -1237,6 +1247,18 @@ impl PreparedWriteSet {
         self.state_rows.append(other.state_rows);
         self.file_content_writes
             .append(&mut other.file_content_writes);
+        for (key, edge) in other.historical_blob_manifest_edges {
+            if let Some(previous) = self
+                .historical_blob_manifest_edges
+                .insert(key, edge.clone())
+                && previous != edge
+            {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    "cohort members carry conflicting historical blob manifest edges",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1271,6 +1293,9 @@ impl PreparedWriteSet {
             .retain(|write| !file_ids.contains(&write.file_id));
         self.file_content_writes
             .append(&mut replacement.file_content_writes);
+        for (key, edge) in replacement.historical_blob_manifest_edges {
+            self.historical_blob_manifest_edges.insert(key, edge);
+        }
         for change_refs in self.commit_change_refs_by_branch.values_mut() {
             change_refs.tracked_change_count = self
                 .state_rows
@@ -1374,6 +1399,7 @@ impl TransactionWriteBuffer {
             intermediate_commits: Mutex::new(Vec::new()),
             file_content_writes: Mutex::new(Vec::new()),
             branch_ref_intents: Mutex::new(Vec::new()),
+            historical_blob_manifest_edges: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -2088,6 +2114,13 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged branch selector intents lock",
             )
         })?;
+        let mut historical_blob_manifest_guard =
+            self.historical_blob_manifest_edges.lock().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire transaction staged historical blob manifest lock",
+                )
+            })?;
         let (state_rows, insert_selection) = match std::mem::take(&mut *rows_guard) {
             StagedPreparedRows::AppendOnly {
                 rows,
@@ -2141,6 +2174,7 @@ impl TransactionWriteBuffer {
             intermediate_commits: std::mem::take(&mut *intermediate_guard),
             file_content_writes: std::mem::take(&mut *file_guard),
             branch_ref_intents: std::mem::take(&mut *branch_ref_guard),
+            historical_blob_manifest_edges: std::mem::take(&mut *historical_blob_manifest_guard),
         })
     }
 
@@ -2157,6 +2191,32 @@ impl TransactionWriteBuffer {
                 )
             })?
             .push(intent);
+        Ok(())
+    }
+
+    pub(crate) fn stage_historical_blob_manifest_edges(
+        &self,
+        edges: HistoricalBlobManifestEdges,
+    ) -> Result<(), LixError> {
+        let mut guard = self.historical_blob_manifest_edges.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged historical blob manifest lock",
+            )
+        })?;
+        for (key, edge) in edges {
+            if edge.is_empty() {
+                continue;
+            }
+            if let Some(previous) = guard.insert(key, edge.clone())
+                && previous != edge
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "conflicting authenticated historical blob manifest edges",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2764,6 +2824,13 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged branch selector intents lock",
             )
         })?;
+        let historical_blob_manifest_edges =
+            self.historical_blob_manifest_edges.lock().map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged historical blob manifest lock",
+                )
+            })?;
 
         Ok(TransactionWriteBufferCheckpoint {
             rows: rows.clone(),
@@ -2775,6 +2842,7 @@ impl TransactionWriteBuffer {
             intermediate_commits: intermediate_commits.clone(),
             file_content_writes: file_content_writes.clone(),
             branch_ref_intents: branch_ref_intents.clone(),
+            historical_blob_manifest_edges: historical_blob_manifest_edges.clone(),
         })
     }
 
@@ -2795,6 +2863,7 @@ impl TransactionWriteBuffer {
             intermediate_commits,
             file_content_writes,
             branch_ref_intents,
+            historical_blob_manifest_edges,
         } = checkpoint;
         let mut rows_guard = self.rows.lock().map_err(|_| {
             LixError::new(
@@ -2865,6 +2934,12 @@ impl TransactionWriteBuffer {
         *first_parent_overrides_guard = first_commit_parent_override_by_branch;
         *checkpoint_publications_guard = checkpoint_publications;
         *branch_ref_intents_guard = branch_ref_intents;
+        *self.historical_blob_manifest_edges.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged historical blob manifest lock",
+            )
+        })? = historical_blob_manifest_edges;
         Ok(())
     }
 

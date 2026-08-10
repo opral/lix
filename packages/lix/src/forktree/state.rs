@@ -90,6 +90,10 @@ pub(crate) struct HistoricalStateRow {
     pub(crate) snapshot_content: Option<SharedStr>,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) deleted: bool,
+    /// Authenticated BlobManifest edges carried with the state value. A
+    /// payload-free historical transition must preserve this edge when it
+    /// republishes a prior blob-ref row.
+    pub(crate) blob_manifest_object_ids: Vec<ObjectId>,
 }
 
 /// One semantic change between two authenticated historical ForkTree state

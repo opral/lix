@@ -94,8 +94,9 @@ use crate::transaction::normalization::{
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{
-    BranchRefPublicationIntent, ImmutableMutationChunkStage, ImmutableMutationJournalChunk,
-    PreparedWriteSet, TransactionWriteBuffer, TransactionWriteBufferCheckpoint,
+    BranchRefPublicationIntent, HistoricalBlobManifestEdges, ImmutableMutationChunkStage,
+    ImmutableMutationJournalChunk, PreparedWriteSet, TransactionWriteBuffer,
+    TransactionWriteBufferCheckpoint,
 };
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
@@ -531,6 +532,8 @@ struct TypedStateTransitionTarget {
     change_id: ChangeId,
     snapshot_content: Option<SharedStr>,
     metadata: Option<SharedStr>,
+    global: bool,
+    blob_manifest_object_ids: Vec<crate::forktree::ObjectId>,
 }
 
 /// State which must be restored when `RETURNING` evaluation fails after a
@@ -7151,6 +7154,8 @@ where
                 change_id: row.change_id,
                 snapshot_content: row.snapshot_content.clone(),
                 metadata: row.metadata.clone(),
+                global: row.global,
+                blob_manifest_object_ids: row.blob_manifest_object_ids.clone(),
             });
             if expected_change_id != target.as_ref().map(|target| target.change_id) {
                 transitions.push(TypedStateTransition {
@@ -7176,6 +7181,7 @@ where
         let branch_id = self.active_branch_id.clone();
         let rows_affected = transitions.len() as u64;
         let mut rows = RawWriteBatch::with_capacity(transitions.len());
+        let mut historical_blob_manifest_edges = HistoricalBlobManifestEdges::new();
         for transition in transitions {
             if transition.expected_change_id
                 == transition.target.as_ref().map(|target| target.change_id)
@@ -7185,18 +7191,33 @@ where
                     "typed tracked-state transition contains an unchanged row",
                 ));
             }
-            let (snapshot, metadata) = match transition.target {
-                Some(target) => (
-                    parse_materialized_diff_json(
-                        target.snapshot_content,
-                        "typed state transition target",
-                    )?,
-                    parse_materialized_diff_json(
-                        target.metadata,
-                        "typed state transition target metadata",
-                    )?,
-                ),
-                None => (None, None),
+            let (snapshot, metadata, global) = match transition.target {
+                Some(target) => {
+                    let global = target.global;
+                    if !target.blob_manifest_object_ids.is_empty() {
+                        let owner = if target.global {
+                            GLOBAL_BRANCH_ID
+                        } else {
+                            branch_id.as_str()
+                        };
+                        historical_blob_manifest_edges.insert(
+                            (owner.to_owned(), transition.identity.clone()),
+                            target.blob_manifest_object_ids,
+                        );
+                    }
+                    (
+                        parse_materialized_diff_json(
+                            target.snapshot_content,
+                            "typed state transition target",
+                        )?,
+                        parse_materialized_diff_json(
+                            target.metadata,
+                            "typed state transition target metadata",
+                        )?,
+                        global,
+                    )
+                }
+                None => (None, None, false),
             };
             rows.push(TransactionWriteRow {
                 entity_pk: Some(transition.identity.entity_pk),
@@ -7207,7 +7228,7 @@ where
                 origin: None,
                 created_at: None,
                 updated_at: None,
-                global: false,
+                global,
                 change_id: None,
                 commit_id: None,
                 untracked: false,
@@ -7219,6 +7240,8 @@ where
             rows,
         })
         .await?;
+        self.staged_writes
+            .stage_historical_blob_manifest_edges(historical_blob_manifest_edges)?;
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected,
             commit_id: self
