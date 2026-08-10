@@ -74,6 +74,13 @@ impl FilesystemStateRows {
         self.0.iter()
     }
 
+    /// Stable backing address used by provider tests to prove that the final
+    /// preparation retains this native row batch rather than rebuilding a
+    /// generic materialized batch.
+    pub(crate) fn entity_column_ptr(&self) -> *const FilesystemStateRow {
+        self.0.as_ptr()
+    }
+
     fn extend(&mut self, other: Self) {
         self.0.extend(other.0);
     }
@@ -103,6 +110,21 @@ impl IntoIterator for FilesystemStateRows {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a FilesystemStateRows {
+    type Item = &'a FilesystemStateRow;
+    type IntoIter = std::slice::Iter<'a, FilesystemStateRow>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl From<Vec<FilesystemStateRow>> for FilesystemStateRows {
+    fn from(rows: Vec<FilesystemStateRow>) -> Self {
+        Self::from_rows(rows)
     }
 }
 

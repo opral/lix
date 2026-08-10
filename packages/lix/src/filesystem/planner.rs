@@ -1506,7 +1506,7 @@ where
 {
     let branch_id = branch_binding.ok_or_else(|| {
         LixError::new(
-            LixError::CODE_INVALID_ARGUMENT,
+            LixError::CODE_INVALID_PARAM,
             "filesystem path resolution requires a branch-bound state view",
         )
     })?;
