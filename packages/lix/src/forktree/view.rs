@@ -835,8 +835,9 @@ where
         branch_id: &str,
     ) -> Result<CoherentView<R>, crate::LixError> {
         let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
-            crate::LixError::new(
-                crate::LixError::CODE_INVALID_PARAM,
+            crate::LixError::branch_not_found(
+                branch_id,
+                "open ForkTree branch view",
                 format!("branch ID must be a UUID: {error}"),
             )
         })?;

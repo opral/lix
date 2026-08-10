@@ -1365,6 +1365,12 @@ impl RawWriteBatch {
         self.slots[index].file_id = ordinal;
     }
 
+    pub(crate) fn set_created_at(&mut self, index: usize, created_at: Option<SharedStr>) {
+        self.certified_preparation = None;
+        let ordinal = self.intern_optional_string(created_at);
+        self.slots[index].created_at = ordinal;
+    }
+
     /// Retains rows in source order and compacts the aligned mutable columns.
     ///
     /// Dictionaries remain shared until more than half their slots are dead;

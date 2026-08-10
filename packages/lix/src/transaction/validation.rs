@@ -1024,10 +1024,14 @@ where
         if all_rows.iter().any(|current| {
             !current.deleted && same_insert_identity(PreparedValidationRow::State(row), current)
         }) {
-            return Err(unique_constraint_error(format!(
-                "duplicate insert identity for schema '{}'",
-                row.schema_key
-            )));
+            return Err(unique_constraint_error(
+                crate::transaction::duplicate_insert_identity_message(
+                    row.schema_key,
+                    row.entity_pk,
+                    Some(row.branch_id),
+                    insert.origin.or(row.origin),
+                ),
+            ));
         }
     }
     Ok(())
