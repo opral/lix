@@ -34,7 +34,8 @@ pub(crate) use model::{
 };
 pub(crate) use object::ObjectId;
 pub(crate) use publication::{
-    BranchStateTransition, OrderedBranchHistoryTransition, PreparedPublication, SelectorExpectation,
+    BlobOwnerScope, BranchStateTransition, OrderedBranchHistoryTransition, PreparedPublication,
+    SelectorExpectation,
 };
 pub(crate) use reachability::{GcBudget, GcStepStatus, advance_gc};
 pub(crate) use serving::{

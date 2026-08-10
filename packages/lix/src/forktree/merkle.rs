@@ -89,10 +89,14 @@ pub(super) struct BlobMerkleTreeBuild {
     pub(super) objects: ImmutableObjectSet,
 }
 
-#[derive(Debug)]
-struct AuthenticatedBlobMerkleBase {
+#[derive(Clone, Debug)]
+pub(super) struct AuthenticatedBlobMerkleBase {
     chunk_claims: Vec<(BlobChunkRefV1, [u8; 32])>,
     node_object_ids: BTreeSet<ObjectId>,
+    /// The authenticated node bytes retained for this operation. Chunk
+    /// payloads are intentionally not loaded; leaf claims already bind their
+    /// immutable chunk identities and digests.
+    pub(super) objects: ImmutableObjectSet,
 }
 
 #[derive(Clone, Debug)]
@@ -265,7 +269,7 @@ where
     build_blob_merkle_edit_from_base(manifest, &base, payload, offset, delete_end, insert_end)
 }
 
-fn build_blob_merkle_edit_from_base(
+pub(super) fn build_blob_merkle_edit_from_base(
     manifest: BlobManifestV1,
     base: &AuthenticatedBlobMerkleBase,
     payload: &[u8],
@@ -332,7 +336,7 @@ fn build_blob_merkle_edit_from_base(
     Ok(successor)
 }
 
-async fn load_authenticated_blob_merkle_base<R>(
+pub(super) async fn load_authenticated_blob_merkle_base<R>(
     read: &R,
     manifest: BlobManifestV1,
 ) -> Result<AuthenticatedBlobMerkleBase, StorageError>
@@ -353,6 +357,7 @@ where
     }
     let mut claims_by_ordinal = BTreeMap::new();
     let mut node_object_ids = BTreeSet::new();
+    let mut node_objects = ImmutableObjectSet::default();
     let mut frontier = vec![root];
     while !frontier.is_empty() {
         let ids = frontier
@@ -368,6 +373,7 @@ where
             let bytes = objects
                 .get(&expected.object_id)
                 .ok_or_else(|| corruption("Merkle edit base node is absent"))?;
+            node_objects.insert(expected.object_id, bytes.clone())?;
             let node = decode_node(expected.object_id, bytes)?;
             if node.summary(expected.object_id) != expected {
                 return Err(corruption(
@@ -441,6 +447,92 @@ where
     Ok(AuthenticatedBlobMerkleBase {
         chunk_claims,
         node_object_ids,
+        objects: node_objects,
+    })
+}
+
+/// Builds the authenticated closure ledger from objects produced in the same
+/// PreparedPublication.  These objects have already passed the canonical
+/// encoder and ObjectId checks; decoding the staged closure here preserves the
+/// same edge/order/domain validation used for a retained read without opening
+/// a second authority.
+pub(super) fn authenticated_blob_merkle_base_from_build(
+    build: &BlobMerkleTreeBuild,
+) -> Result<AuthenticatedBlobMerkleBase, StorageError> {
+    fn collect(
+        objects: &ImmutableObjectSet,
+        id: ObjectId,
+        claims: &mut Vec<(BlobChunkRefV1, [u8; 32])>,
+        node_ids: &mut BTreeSet<ObjectId>,
+    ) -> Result<NodeSummary, StorageError> {
+        if !node_ids.insert(id) {
+            return Err(corruption("staged Merkle base contains a node cycle"));
+        }
+        let bytes = objects
+            .get(id)
+            .ok_or_else(|| corruption("staged Merkle base node is absent"))?;
+        let node = decode_node(id, bytes)?;
+        let summary = node.summary(id);
+        match node {
+            DecodedNode::Leaf(leaf) => {
+                if leaf.ordinal != claims.len() as u64 {
+                    return Err(corruption("staged Merkle base leaf order is invalid"));
+                }
+                claims.push((
+                    BlobChunkRefV1 {
+                        chunk_object_id: leaf.chunk_object_id,
+                        declared_len: leaf.declared_len,
+                    },
+                    leaf.chunk_digest,
+                ));
+            }
+            DecodedNode::Internal(internal) => {
+                let left = collect(objects, internal.left.object_id, claims, node_ids)?;
+                let right = collect(objects, internal.right.object_id, claims, node_ids)?;
+                if left.as_ref() != internal.left || right.as_ref() != internal.right {
+                    return Err(corruption(
+                        "staged Merkle base child summary is inconsistent",
+                    ));
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    let mut claims = Vec::new();
+    let mut node_ids = BTreeSet::new();
+    let root = collect(
+        &build.objects,
+        build.manifest.root_object_id,
+        &mut claims,
+        &mut node_ids,
+    )?;
+    if root.height != build.manifest.root_height
+        || root.leaf_count != build.manifest.leaf_count
+        || root.logical_bytes != build.manifest.logical_bytes
+        || canonical_blob_id_from_summary(root) != build.manifest.canonical_blob_id
+    {
+        return Err(corruption(
+            "staged Merkle base manifest identity is inconsistent",
+        ));
+    }
+    for (ordinal, (chunk, _)) in claims.iter().enumerate() {
+        let expected_len = if ordinal + 1 == claims.len() {
+            build.manifest.logical_bytes - ordinal as u64 * CANONICAL_BLOB_CHUNK_BYTES as u64
+        } else {
+            CANONICAL_BLOB_CHUNK_BYTES as u64
+        };
+        if chunk.declared_len != expected_len {
+            return Err(corruption("staged Merkle base chunk geometry is invalid"));
+        }
+    }
+    if claims.len() as u64 != build.manifest.leaf_count {
+        return Err(corruption("staged Merkle base leaf count is inconsistent"));
+    }
+    Ok(AuthenticatedBlobMerkleBase {
+        chunk_claims: claims,
+        node_object_ids: node_ids,
+        objects: build.objects.clone(),
     })
 }
 
@@ -461,7 +553,7 @@ where
     derive_blob_edit_splice_from_base(manifest, &base, payload)
 }
 
-fn derive_blob_edit_splice_from_base(
+pub(super) fn derive_blob_edit_splice_from_base(
     manifest: BlobManifestV1,
     base: &AuthenticatedBlobMerkleBase,
     payload: &[u8],
@@ -1529,6 +1621,7 @@ mod tests {
         AuthenticatedBlobMerkleBase {
             chunk_claims,
             node_object_ids,
+            objects: build.objects.clone(),
         }
     }
 

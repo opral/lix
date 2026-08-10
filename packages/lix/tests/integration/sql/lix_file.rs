@@ -146,6 +146,84 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_transaction_content_splice_reuses_staged_insert_and_update_bases,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let file_id = "73746167-6564-8374-8865-000000000001";
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ('{file_id}', '/staged-splice.txt', CAST('inserted' AS BYTEA))"
+                ),
+                &[],
+            )
+            .await
+            .expect("same-transaction insert should stage");
+        transaction
+            .execute(
+                &format!(
+                    "UPDATE lix_file SET content = CAST('updated' AS BYTEA) \
+                     WHERE id = '{file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("same-transaction insert-to-update should use the staged base");
+        transaction
+            .execute(
+                &format!(
+                    "UPDATE lix_file SET content = CAST('updated-again' AS BYTEA) \
+                     WHERE id = '{file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("same-transaction update-to-update should use the staged successor");
+
+        let staged = transaction
+            .execute(
+                &format!("SELECT content FROM lix_file WHERE id = '{file_id}'"),
+                &[],
+            )
+            .await
+            .expect("staged content should be readable");
+        assert_rows_eq(
+            staged,
+            vec![vec![Value::Blob(b"updated-again".to_vec().into())]],
+        );
+
+        transaction
+            .commit()
+            .await
+            .expect("same-transaction staged splice should commit");
+        let committed = session
+            .execute(
+                &format!("SELECT content FROM lix_file WHERE id = '{file_id}'"),
+                &[],
+            )
+            .await
+            .expect("committed content should be readable");
+        assert_rows_eq(
+            committed,
+            vec![vec![Value::Blob(b"updated-again".to_vec().into())]],
+        );
+    }
+);
+
+simulation_test!(
     file_descriptor_changes_always_carry_their_file_id,
     |sim| async move {
         let engine = sim.boot_engine().await;

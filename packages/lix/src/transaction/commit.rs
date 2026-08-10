@@ -23,7 +23,7 @@ use crate::transaction::staging::{
 use crate::transaction::types::PreparedStateRowRef;
 
 use crate::forktree::{
-    BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
+    BlobOwnerScope, BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
     CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef, StateKey,
@@ -1677,6 +1677,7 @@ where
         if write.is_empty() {
             continue;
         }
+        let owner_scope = blob_owner_scope(write)?;
         let manifest = if let Some(receipt) = write.prepared_cas_receipt() {
             ObjectId::from_bytes(receipt.manifest_object_id)
         } else if let Some(payload) = write.inline_payload() {
@@ -1686,18 +1687,8 @@ where
                         "verified blob splice cannot target an untracked file owner",
                     ));
                 }
-                let file_id = &write.file_id;
-                let state_key = StateKey {
-                    schema_key: "lix_binary_blob_ref".to_owned(),
-                    file_id: Some(file_id.clone()),
-                    entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
-                        writer_error(format!(
-                            "verified blob splice file identity is not a canonical UUID: {error}"
-                        ))
-                    })?,
-                };
                 publication
-                    .stage_verified_inline_blob_splice(view, &state_key, payload, splice)
+                    .stage_verified_inline_blob_splice(view, &owner_scope, payload, splice)
                     .await
                     .map_err(LixError::from)?
             } else if let Some(splice) = write.edit_blob_splice() {
@@ -1706,18 +1697,8 @@ where
                         "verified blob edit cannot target an untracked file owner",
                     ));
                 }
-                let file_id = &write.file_id;
-                let state_key = StateKey {
-                    schema_key: "lix_binary_blob_ref".to_owned(),
-                    file_id: Some(file_id.clone()),
-                    entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
-                        writer_error(format!(
-                            "verified blob edit file identity is not a canonical UUID: {error}"
-                        ))
-                    })?,
-                };
                 publication
-                    .stage_verified_inline_blob_edit(view, &state_key, payload, splice)
+                    .stage_verified_inline_blob_edit(view, &owner_scope, payload, splice)
                     .await
                     .map_err(LixError::from)?
             } else if let Some(provenance) = write.splice_provenance() {
@@ -1726,40 +1707,20 @@ where
                         "verified request blob splice cannot target an untracked file owner",
                     ));
                 }
-                let file_id = &write.file_id;
-                let state_key = StateKey {
-                    schema_key: "lix_binary_blob_ref".to_owned(),
-                    file_id: Some(file_id.clone()),
-                    entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
-                        writer_error(format!(
-                            "verified request blob splice file identity is not a canonical UUID: {error}"
-                        ))
-                    })?,
-                };
                 publication
-                    .stage_verified_request_blob_splice(view, &state_key, payload, provenance)
+                    .stage_verified_request_blob_splice(view, &owner_scope, payload, provenance)
                     .await
                     .map_err(LixError::from)?
             } else if let Some(base_blob_hash) = write.base_blob_hash() {
                 if write.untracked {
                     publication
-                        .stage_inline_blob_payload(payload.bytes())
+                        .stage_inline_blob_payload(owner_scope.clone(), payload.bytes())
                         .map_err(LixError::from)?
                 } else {
-                    let file_id = &write.file_id;
-                    let state_key = StateKey {
-                        schema_key: "lix_binary_blob_ref".to_owned(),
-                        file_id: Some(file_id.clone()),
-                        entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
-                            writer_error(format!(
-                                "authenticated blob edit file identity is not a canonical UUID: {error}"
-                            ))
-                        })?,
-                    };
                     publication
                         .stage_authenticated_inline_blob_edit(
                             view,
-                            &state_key,
+                            &owner_scope,
                             payload,
                             base_blob_hash,
                         )
@@ -1768,7 +1729,7 @@ where
                 }
             } else {
                 publication
-                    .stage_inline_blob_payload(payload.bytes())
+                    .stage_inline_blob_payload(owner_scope.clone(), payload.bytes())
                     .map_err(LixError::from)?
             }
         } else {
@@ -1809,6 +1770,28 @@ where
     }
     validate_final_prepared_blob_manifests(prepared, &manifests)?;
     Ok(manifests)
+}
+
+fn blob_owner_scope(
+    write: &crate::transaction::types::TransactionFileContent,
+) -> Result<BlobOwnerScope, LixError> {
+    let branch_uuid = uuid::Uuid::parse_str(&write.branch_id)
+        .map_err(|error| writer_error(format!("blob owner branch id is not canonical: {error}")))?;
+    let entity_pk = EntityPk::uuid_from_canonical(&write.file_id).map_err(|error| {
+        writer_error(format!(
+            "blob owner file identity is not a canonical UUID: {error}"
+        ))
+    })?;
+    Ok(BlobOwnerScope {
+        state_key: StateKey {
+            schema_key: "lix_binary_blob_ref".to_owned(),
+            file_id: Some(write.file_id.clone()),
+            entity_pk,
+        },
+        branch_id: CanonicalBranchId::from_bytes(*branch_uuid.as_bytes()),
+        global: write.global,
+        untracked: write.untracked,
+    })
 }
 
 fn validate_final_prepared_blob_manifests(

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 
 use crate::RequestBlobSpliceProvenance;
-use crate::binary_cas::{BlobEditSplice, BlobPayload, BlobSameLengthSplice};
+use crate::binary_cas::{BlobEditSplice, BlobId, BlobPayload, BlobSameLengthSplice};
 use crate::storage::{Key, Precondition, StorageError};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
@@ -31,6 +31,27 @@ pub(crate) enum SelectorExpectation {
     Absent,
     Equals(Bytes),
 }
+
+/// Exact owner identity carried from the transaction file write into blob
+/// staging.  The state key alone is not sufficient: global/local and tracked
+/// versus untracked lanes may legitimately share a semantic key while using
+/// different authenticated roots.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BlobOwnerScope {
+    pub(crate) state_key: StateKey,
+    pub(crate) branch_id: super::model::CanonicalBranchId,
+    pub(crate) global: bool,
+    pub(crate) untracked: bool,
+}
+
+#[derive(Clone, Debug)]
+struct StagedBlobBase {
+    manifest_object_id: ObjectId,
+    manifest: BlobManifestV1,
+    base: super::merkle::AuthenticatedBlobMerkleBase,
+}
+
+type StagedBlobBaseKey = (BlobOwnerScope, BlobId);
 
 /// All typed objects required to move one selected branch to a new semantic
 /// commit/state pair. Construction is not authority: `publish_state_transition`
@@ -78,6 +99,7 @@ pub(crate) struct PreparedPublication {
     object_deletes: BTreeSet<ObjectId>,
     untracked_puts: BTreeMap<Bytes, Bytes>,
     untracked_deletes: BTreeSet<Bytes>,
+    staged_blob_bases: BTreeMap<StagedBlobBaseKey, StagedBlobBase>,
 }
 
 impl PreparedPublication {
@@ -163,6 +185,7 @@ impl PreparedPublication {
             object_deletes: BTreeSet::new(),
             untracked_puts: BTreeMap::new(),
             untracked_deletes: BTreeSet::new(),
+            staged_blob_bases: BTreeMap::new(),
         })
     }
 
@@ -190,6 +213,7 @@ impl PreparedPublication {
             object_deletes: BTreeSet::new(),
             untracked_puts: BTreeMap::new(),
             untracked_deletes: BTreeSet::new(),
+            staged_blob_bases: BTreeMap::new(),
         })
     }
 
@@ -288,6 +312,17 @@ impl PreparedPublication {
             self.delete_selector(key, expected)?;
         }
         self.object_puts.extend(other.object_puts)?;
+        for (key, staged) in other.staged_blob_bases {
+            if let Some(existing) = self.staged_blob_bases.get(&key) {
+                if existing.manifest != staged.manifest {
+                    return Err(corruption(
+                        "publications assign conflicting staged blob bases",
+                    ));
+                }
+            } else {
+                self.staged_blob_bases.insert(key, staged);
+            }
+        }
         for (key, value) in other.untracked_puts {
             if self.untracked_deletes.contains(&key) {
                 return Err(corruption(
@@ -662,6 +697,7 @@ impl PreparedPublication {
     /// BlobId-only reader or separate CAS commit is involved.
     pub(crate) fn stage_inline_blob_payload(
         &mut self,
+        scope: BlobOwnerScope,
         bytes: &[u8],
     ) -> Result<ObjectId, StorageError> {
         let chunks = if bytes.is_empty() {
@@ -677,8 +713,38 @@ impl PreparedPublication {
                 .collect::<Vec<_>>()
         };
         let build = super::merkle::build_blob_merkle_tree(&chunks)?;
+        let base = super::merkle::authenticated_blob_merkle_base_from_build(&build)?;
         self.stage_immutable_objects(&build.objects)?;
-        self.stage_blob_manifest(&build.manifest)
+        let manifest_id = self.stage_blob_manifest(&build.manifest)?;
+        self.stage_blob_base(scope, manifest_id, build.manifest.clone(), base)?;
+        Ok(manifest_id)
+    }
+
+    fn stage_blob_base(
+        &mut self,
+        scope: BlobOwnerScope,
+        manifest_object_id: ObjectId,
+        manifest: BlobManifestV1,
+        base: super::merkle::AuthenticatedBlobMerkleBase,
+    ) -> Result<(), StorageError> {
+        let key = (scope, manifest.canonical_blob_id);
+        if let Some(existing) = self.staged_blob_bases.get(&key) {
+            if existing.manifest != manifest {
+                return Err(corruption(
+                    "one blob owner received conflicting staged manifests",
+                ));
+            }
+            return Ok(());
+        }
+        self.staged_blob_bases.insert(
+            key,
+            StagedBlobBase {
+                manifest_object_id,
+                manifest,
+                base,
+            },
+        );
+        Ok(())
     }
 
     /// Publishes an inline successor from an authenticated existing BlobRef
@@ -689,18 +755,54 @@ impl PreparedPublication {
     pub(crate) async fn stage_authenticated_inline_blob_edit<R>(
         &mut self,
         view: &CoherentView<R>,
-        state_key: &StateKey,
+        scope: &BlobOwnerScope,
         payload: &BlobPayload,
-        expected_base: crate::binary_cas::BlobId,
+        expected_base: BlobId,
     ) -> Result<ObjectId, StorageError>
     where
         R: StorageAdapterRead + Sync,
     {
-        let reference = view
-            .bind_blob_at_state_key(state_key)
+        if let Some(staged) = self
+            .staged_blob_bases
+            .get(&(scope.clone(), expected_base))
+            .cloned()
+        {
+            let Some(splice) = super::merkle::derive_blob_edit_splice_from_base(
+                staged.manifest.clone(),
+                &staged.base,
+                payload.bytes(),
+            )?
+            else {
+                if payload.len() as u64 != staged.manifest.logical_bytes {
+                    return Err(corruption(
+                        "staged blob edit has inconsistent unchanged length",
+                    ));
+                }
+                return Ok(staged.manifest_object_id);
+            };
+            return self.stage_verified_inline_blob_edit_from_base(
+                scope,
+                payload,
+                splice,
+                staged.manifest,
+                &staged.base,
+                expected_base,
+            );
+        }
+
+        let reference = if scope.untracked {
+            view.bind_untracked_blob_at_state_key_for_scope(
+                &scope.state_key,
+                scope.branch_id,
+                scope.global,
+            )
             .await
-            .map_err(|error| StorageError::Corruption(error.to_string()))?
-            .ok_or_else(|| corruption("authenticated blob edit base owner is absent"))?;
+        } else {
+            view.bind_blob_at_state_key_for_scope(&scope.state_key, scope.branch_id, scope.global)
+                .await
+        }
+        .map_err(|error| StorageError::Corruption(error.to_string()))?
+        .ok_or_else(|| corruption("authenticated blob edit base owner is absent"))?;
         if reference.semantic_id() != expected_base {
             return Err(corruption(
                 "authenticated blob edit base identity changed before publication",
@@ -716,9 +818,16 @@ impl PreparedPublication {
                 "authenticated blob edit manifest is not bound to its owner",
             ));
         }
-        let Some(splice) =
-            super::merkle::derive_blob_edit_splice(view.retained_read(), manifest, payload.bytes())
-                .await?
+        let base = super::merkle::load_authenticated_blob_merkle_base(
+            view.retained_read(),
+            manifest.clone(),
+        )
+        .await?;
+        let Some(splice) = super::merkle::derive_blob_edit_splice_from_base(
+            manifest.clone(),
+            &base,
+            payload.bytes(),
+        )?
         else {
             if payload.len() as u64 != reference.expected_size() {
                 return Err(corruption(
@@ -727,8 +836,95 @@ impl PreparedPublication {
             }
             return Ok(manifest_object_id);
         };
-        self.stage_verified_inline_blob_edit_bound(view, state_key, payload, splice, reference)
-            .await
+        self.stage_verified_inline_blob_edit_from_base(
+            scope,
+            payload,
+            splice,
+            manifest,
+            &base,
+            expected_base,
+        )
+    }
+
+    fn stage_verified_inline_blob_edit_from_base(
+        &mut self,
+        scope: &BlobOwnerScope,
+        payload: &BlobPayload,
+        splice: BlobEditSplice,
+        manifest: BlobManifestV1,
+        base: &super::merkle::AuthenticatedBlobMerkleBase,
+        expected_base: BlobId,
+    ) -> Result<ObjectId, StorageError> {
+        if manifest.canonical_blob_id != expected_base {
+            return Err(corruption(
+                "verified blob edit base manifest identity is not canonical",
+            ));
+        }
+        let base_len = usize::try_from(manifest.logical_bytes)
+            .map_err(|_| corruption("verified blob edit base length is invalid"))?;
+        let delete_end = splice
+            .offset
+            .checked_add(splice.delete_len)
+            .filter(|end| *end <= base_len)
+            .ok_or_else(|| corruption("verified blob edit delete range is invalid"))?;
+        let expected_len = base_len
+            .checked_sub(splice.delete_len)
+            .and_then(|len| len.checked_add(splice.insert_len))
+            .ok_or_else(|| corruption("verified blob edit successor length overflows"))?;
+        if expected_len != payload.len()
+            || splice.offset.checked_add(splice.insert_len).is_none()
+            || (splice.delete_len == 0 && splice.insert_len == 0)
+        {
+            return Err(corruption(
+                "verified blob edit payload or changed range is invalid",
+            ));
+        }
+        let successor = super::merkle::build_blob_merkle_edit_from_base(
+            manifest,
+            base,
+            payload.bytes(),
+            splice.offset,
+            delete_end,
+            splice.offset + splice.insert_len,
+        )?;
+        let expected_successor_id = payload
+            .hash()
+            .unwrap_or_else(|| BlobId::from_canonical_content(payload.bytes()));
+        if successor.manifest.canonical_blob_id != expected_successor_id
+            || successor.manifest.logical_bytes != payload.len() as u64
+        {
+            return Err(corruption(
+                "verified blob edit hint does not reproduce the requested payload",
+            ));
+        }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_verified_inline_blob_splice(
+            successor
+                .objects
+                .iter()
+                .filter(|(id, bytes)| {
+                    super::object::authenticate_object_domain(*id, bytes)
+                        == Ok(super::object::ObjectDomain::BlobChunk)
+                })
+                .count(),
+            successor.manifest.leaf_count as usize,
+        );
+        self.stage_immutable_objects(&successor.objects)?;
+        let manifest_id = self.stage_blob_manifest(&successor.manifest)?;
+        let mut full_objects = base.objects.clone();
+        full_objects.extend(successor.objects.clone())?;
+        let full_build = super::merkle::BlobMerkleTreeBuild {
+            manifest: successor.manifest.clone(),
+            objects: full_objects.clone(),
+        };
+        let successor_base = super::merkle::authenticated_blob_merkle_base_from_build(&full_build)?;
+        self.stage_blob_base(
+            scope.clone(),
+            manifest_id,
+            successor.manifest,
+            successor_base,
+        )?;
+        Ok(manifest_id)
     }
 
     /// Authenticates a fixed-width successor against the exact BlobRef
@@ -739,20 +935,34 @@ impl PreparedPublication {
     pub(crate) async fn stage_verified_inline_blob_splice<R>(
         &mut self,
         view: &CoherentView<R>,
-        state_key: &StateKey,
+        scope: &BlobOwnerScope,
         payload: &BlobPayload,
         splice: BlobSameLengthSplice,
     ) -> Result<ObjectId, StorageError>
     where
         R: StorageAdapterRead + Sync,
     {
-        let reference = view
-            .bind_blob_at_state_key(state_key)
+        let reference = if scope.untracked {
+            view.bind_untracked_blob_at_state_key_for_scope(
+                &scope.state_key,
+                scope.branch_id,
+                scope.global,
+            )
             .await
-            .map_err(|error| StorageError::Corruption(error.to_string()))?
-            .ok_or_else(|| corruption("verified blob splice base owner is absent"))?;
-        self.stage_verified_inline_blob_splice_bound(view, state_key, payload, splice, reference)
-            .await
+        } else {
+            view.bind_blob_at_state_key_for_scope(&scope.state_key, scope.branch_id, scope.global)
+                .await
+        }
+        .map_err(|error| StorageError::Corruption(error.to_string()))?
+        .ok_or_else(|| corruption("verified blob splice base owner is absent"))?;
+        self.stage_verified_inline_blob_splice_bound(
+            view,
+            &scope.state_key,
+            payload,
+            splice,
+            reference,
+        )
+        .await
     }
 
     /// Re-binds a transaction-verified variable-width edit to the exact
@@ -763,20 +973,34 @@ impl PreparedPublication {
     pub(crate) async fn stage_verified_inline_blob_edit<R>(
         &mut self,
         view: &CoherentView<R>,
-        state_key: &StateKey,
+        scope: &BlobOwnerScope,
         payload: &BlobPayload,
         splice: BlobEditSplice,
     ) -> Result<ObjectId, StorageError>
     where
         R: StorageAdapterRead + Sync,
     {
-        let reference = view
-            .bind_blob_at_state_key(state_key)
+        let reference = if scope.untracked {
+            view.bind_untracked_blob_at_state_key_for_scope(
+                &scope.state_key,
+                scope.branch_id,
+                scope.global,
+            )
             .await
-            .map_err(|error| StorageError::Corruption(error.to_string()))?
-            .ok_or_else(|| corruption("verified blob edit base owner is absent"))?;
-        self.stage_verified_inline_blob_edit_bound(view, state_key, payload, splice, reference)
-            .await
+        } else {
+            view.bind_blob_at_state_key_for_scope(&scope.state_key, scope.branch_id, scope.global)
+                .await
+        }
+        .map_err(|error| StorageError::Corruption(error.to_string()))?
+        .ok_or_else(|| corruption("verified blob edit base owner is absent"))?;
+        self.stage_verified_inline_blob_edit_bound(
+            view,
+            &scope.state_key,
+            payload,
+            splice,
+            reference,
+        )
+        .await
     }
 
     /// Promotes SQL's transport-side splice proof at the publication owner.
@@ -787,18 +1011,26 @@ impl PreparedPublication {
     pub(crate) async fn stage_verified_request_blob_splice<R>(
         &mut self,
         view: &CoherentView<R>,
-        state_key: &StateKey,
+        scope: &BlobOwnerScope,
         payload: &BlobPayload,
         provenance: &RequestBlobSpliceProvenance,
     ) -> Result<ObjectId, StorageError>
     where
         R: StorageAdapterRead + Sync,
     {
-        let reference = view
-            .bind_blob_at_state_key(state_key)
+        let reference = if scope.untracked {
+            view.bind_untracked_blob_at_state_key_for_scope(
+                &scope.state_key,
+                scope.branch_id,
+                scope.global,
+            )
             .await
-            .map_err(|error| StorageError::Corruption(error.to_string()))?
-            .ok_or_else(|| corruption("request blob splice base owner is absent"))?;
+        } else {
+            view.bind_blob_at_state_key_for_scope(&scope.state_key, scope.branch_id, scope.global)
+                .await
+        }
+        .map_err(|error| StorageError::Corruption(error.to_string()))?
+        .ok_or_else(|| corruption("request blob splice base owner is absent"))?;
         if provenance.base_blob_id() != reference.semantic_id() {
             return Err(corruption(
                 "request blob splice base identity does not match its StateKey owner",
@@ -838,7 +1070,11 @@ impl PreparedPublication {
             let splice =
                 BlobSameLengthSplice::new(reference.semantic_id(), prefix, replacement_len);
             self.stage_verified_inline_blob_splice_bound(
-                view, state_key, payload, splice, reference,
+                view,
+                &scope.state_key,
+                payload,
+                splice,
+                reference,
             )
             .await
         } else {
@@ -848,8 +1084,14 @@ impl PreparedPublication {
                 delete_len: replacement_len,
                 insert_len: insert.len(),
             };
-            self.stage_verified_inline_blob_edit_bound(view, state_key, payload, splice, reference)
-                .await
+            self.stage_verified_inline_blob_edit_bound(
+                view,
+                &scope.state_key,
+                payload,
+                splice,
+                reference,
+            )
+            .await
         }
     }
 
