@@ -31,8 +31,6 @@ use datafusion::prelude::SessionContext;
 use futures_util::{FutureExt, future::try_join_all};
 use serde::Deserialize;
 
-#[cfg(test)]
-use crate::binary_cas::BlobDataReader;
 use crate::binary_cas::{BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
@@ -43,13 +41,8 @@ use crate::filesystem::{
     FilesystemPathSelection,
 };
 use crate::functions::FunctionProviderHandle;
-#[cfg(test)]
-use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateBatchBuilder, MaterializedLiveStateRowRef,
-};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
+use crate::storage_adapter::StorageAdapterRead;
 use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
     PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
@@ -88,8 +81,8 @@ use crate::filesystem::{
     FileDescriptorWriteInput, FileDescriptorWriteIntent, FilesystemBlobRefKey,
     FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
     append_blob_ref_tombstone_row, derive_directory_paths,
-    directory_path_resolvers_from_live_state, directory_path_resolvers_from_path_index,
-    directory_path_resolvers_from_state_batch, filesystem_storage_scope_key, plan_file_delete,
+    directory_path_resolvers_from_path_index, directory_path_resolvers_from_state_batch,
+    filesystem_storage_scope_key, plan_file_delete,
     plan_file_descriptor_write, plan_parsed_file_path_update_with_resolvers,
     plan_parsed_file_path_write_with_resolvers,
 };
