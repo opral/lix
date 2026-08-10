@@ -1443,8 +1443,8 @@ where
         &self,
         repository: &RepositoryRootV1,
         commit_id: crate::changelog::CommitId,
-        cache: &mut BTreeMap<crate::changelog::CommitId, (ObjectId, ObjectId)>,
-    ) -> Result<(ObjectId, ObjectId), crate::LixError> {
+        cache: &mut BTreeMap<crate::changelog::CommitId, super::serving::StaleCommitSummary>,
+    ) -> Result<super::serving::StaleCommitSummary, crate::LixError> {
         super::serving::load_historical_commit_state_roots_for_stale(
             &self.read, repository, commit_id, cache,
         )
@@ -1620,25 +1620,32 @@ async fn stale_state_changes_between_commits_on_read<R>(
 where
     R: StorageAdapterRead,
 {
+    let repository = super::serving::load_repository_root(&view.read).await?;
+    let mut summary_cache = BTreeMap::new();
+    let before_roots = view
+        .load_stale_commit_state_roots(&repository, before, &mut summary_cache)
+        .await?;
     if before == after {
         return Ok(StaleStateChanges {
             payload: Vec::new(),
             identities: Vec::new(),
         });
     }
-
-    let repository = super::serving::load_repository_root(&view.read).await?;
-    let mut summary_cache = BTreeMap::new();
-    let before_roots = view
-        .load_stale_commit_state_roots(&repository, before, &mut summary_cache)
-        .await?;
     let after_roots = view
         .load_stale_commit_state_roots(&repository, after, &mut summary_cache)
         .await?;
-    let local_changes =
-        super::tree::diff_roots(Some(before_roots.1), Some(after_roots.1), &view.read).await?;
-    let global_changes =
-        super::tree::diff_roots(Some(before_roots.0), Some(after_roots.0), &view.read).await?;
+    let local_changes = super::tree::diff_roots(
+        Some(before_roots.local_state_root),
+        Some(after_roots.local_state_root),
+        &view.read,
+    )
+    .await?;
+    let global_changes = super::tree::diff_roots(
+        Some(before_roots.global_state_root),
+        Some(after_roots.global_state_root),
+        &view.read,
+    )
+    .await?;
     let keys = merge_sorted_state_keys(local_changes, global_changes);
     if keys.is_empty() {
         return Ok(StaleStateChanges {
@@ -1657,17 +1664,17 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let before_rows = super::serving::state_points_on_read(
-        before_roots.0,
-        Some(before_roots.1),
+    let before_rows = super::serving::state_points_on_read_for_stale(
+        &repository,
+        before_roots,
         &encoded,
         true,
         &view.read,
     )
     .await?;
-    let after_rows = super::serving::state_points_on_read(
-        after_roots.0,
-        Some(after_roots.1),
+    let after_rows = super::serving::state_points_on_read_for_stale(
+        &repository,
+        after_roots,
         &encoded,
         true,
         &view.read,
