@@ -312,11 +312,13 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         .into_iter()
         .next()
         .expect("seed semantic member");
+    let state_key = seed.state_keys[0].clone();
     let repository = view.repository_root();
-    let mut closures = BTreeMap::new();
+    let mut closures = super::serving::StaleMemberAuthCache::default();
     super::serving::resolve_semantic_member_with_stale_auth(
         view.test_storage_read(),
         &member,
+        &state_key,
         seed.commit_object_id,
         commit.generation,
         0,
@@ -327,11 +329,12 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
     .await
     .expect("canonical selected leaf owner");
 
-    let mut wrong_ordinal_closures = BTreeMap::new();
+    let mut wrong_ordinal_closures = super::serving::StaleMemberAuthCache::default();
     assert!(
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
             &member,
+            &state_key,
             seed.commit_object_id,
             commit.generation,
             1,
@@ -345,11 +348,12 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
     );
 
     let empty_change_catalog = build_change_catalog(&[]).expect("empty change catalog");
-    let mut missing_catalog_closures = BTreeMap::new();
+    let mut missing_catalog_closures = super::serving::StaleMemberAuthCache::default();
     assert!(
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
             &member,
+            &state_key,
             seed.commit_object_id,
             commit.generation,
             0,
@@ -368,11 +372,12 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         1,
         LixTimestamp::from_unix_millis_utc_lossy(1),
     );
-    let mut wrong_source_closures = BTreeMap::new();
+    let mut wrong_source_closures = super::serving::StaleMemberAuthCache::default();
     assert!(
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
             &selected,
+            &state_key,
             content_id(0xa1),
             2,
             0,
@@ -385,7 +390,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         "a selected leaf with a substituted source ordinal must fail closed"
     );
 
-    let mut wrong_generation_closures = BTreeMap::new();
+    let mut wrong_generation_closures = super::serving::StaleMemberAuthCache::default();
     assert!(
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
@@ -395,6 +400,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
                 0,
                 LixTimestamp::from_unix_millis_utc_lossy(1),
             ),
+            &state_key,
             content_id(0xa1),
             1,
             0,
