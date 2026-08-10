@@ -1,14 +1,8 @@
 use crate::entity_pk::EntityPk;
-#[cfg(test)]
-use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::MaterializedLiveStateRowRef;
+use crate::state::{StateRow, StateRowSource};
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 /// Validation/storage coordinate for repository facts.
-///
-/// A domain is the complete scope in which a row identity is meaningful:
-/// branch, durability, and file scope. Projection methods on this type are
-/// deliberately named so callers cannot silently erase part of the coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Domain {
     branch_id: String,
@@ -41,27 +35,13 @@ impl Domain {
         Self::any_file(branch_id, untracked)
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_live_row(row: &MaterializedLiveStateRow) -> Self {
-        Self::exact_file(
-            row.branch_id.to_string(),
-            row.untracked,
-            row.file_id.clone(),
-        )
-    }
-
-    pub(crate) fn for_live_row_ref(row: MaterializedLiveStateRowRef<'_>) -> Self {
-        Self::exact_file(
-            row.branch_id(),
-            row.untracked(),
-            row.file_id().map(str::to_owned),
-        )
+    pub(crate) fn for_state_row(row: &StateRow, branch_id: &str, untracked: bool) -> Self {
+        let key = crate::forktree::decode_state_key(&row.key)
+            .expect("authenticated state rows carry canonical keys");
+        Self::exact_file(branch_id, untracked, key.file_id)
     }
 
     pub(crate) fn schema_catalog_domain(&self) -> Self {
-        // Schema definitions are branch + durability scoped. They are not
-        // owned by a data file, so schema catalog lookup deliberately erases
-        // row file scope into `Any`.
         Self::schema_catalog(self.branch_id.clone(), self.untracked)
     }
 
@@ -114,21 +94,28 @@ impl Domain {
         }
     }
 
-    pub(crate) fn contains_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
-        row.branch_id() == self.branch_id
-            && row.untracked() == self.untracked
-            && self.contains_canonical_ref(row)
+    pub(crate) fn contains_state_row(
+        &self,
+        row: &StateRow,
+        branch_id: &str,
+        untracked: bool,
+    ) -> bool {
+        branch_id == self.branch_id
+            && untracked == self.untracked
+            && self.contains_canonical_state_row(row, branch_id)
     }
 
-    /// Matches branch and file scope while accepting whichever durability
-    /// member won canonical tracked/untracked overlay.
-    pub(crate) fn contains_canonical_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
-        row.branch_id() == self.branch_id
-            && committed_row_ref_is_exact_branch_scoped(row, &self.branch_id)
-            && match &self.file_scope {
-                DomainFileScope::Any => true,
-                DomainFileScope::Exact(file_id) => row.file_id() == file_id.as_deref(),
-            }
+    pub(crate) fn contains_canonical_state_row(&self, row: &StateRow, branch_id: &str) -> bool {
+        if branch_id != self.branch_id || !state_row_is_exact_branch_scoped(row, branch_id) {
+            return false;
+        }
+        let Ok(key) = crate::forktree::decode_state_key(&row.key) else {
+            return false;
+        };
+        match &self.file_scope {
+            DomainFileScope::Any => true,
+            DomainFileScope::Exact(file_id) => key.file_id.as_deref() == file_id.as_deref(),
+        }
     }
 
     fn reachable_target_domains(&self) -> Vec<Self> {
@@ -211,12 +198,13 @@ impl DomainRowIdentity {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_live_row(row: &MaterializedLiveStateRow) -> Self {
+    pub(crate) fn from_state_row(row: &StateRow, branch_id: &str, untracked: bool) -> Self {
+        let key = crate::forktree::decode_state_key(&row.key)
+            .expect("authenticated state rows carry canonical keys");
         Self::new(
-            Domain::for_live_row(row),
-            row.schema_key.clone(),
-            row.entity_pk.clone(),
+            Domain::for_state_row(row, branch_id, untracked),
+            key.schema_key,
+            key.entity_pk,
         )
     }
 
@@ -287,11 +275,9 @@ impl DomainSchemaIdentity {
     }
 }
 
-pub(crate) fn committed_row_ref_is_exact_branch_scoped(
-    row: MaterializedLiveStateRowRef<'_>,
-    branch_id: &str,
-) -> bool {
-    row.branch_id() == branch_id && row.global() == (row.branch_id() == GLOBAL_BRANCH_ID)
+pub(crate) fn state_row_is_exact_branch_scoped(row: &StateRow, branch_id: &str) -> bool {
+    branch_id == GLOBAL_BRANCH_ID && row.source == StateRowSource::Global
+        || branch_id != GLOBAL_BRANCH_ID && row.source == StateRowSource::Branch
 }
 
 fn nullable_filter_from_option(value: Option<&String>) -> NullableKeyFilter<String> {

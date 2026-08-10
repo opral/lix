@@ -181,7 +181,7 @@ where
     ///
     /// This is the public engine-level form of the typed `branch_ref` context:
     /// callers should not need to know that branch heads are represented as
-    /// untracked `lix_branch_ref` rows in live_state.
+    /// untracked `lix_branch_ref` rows in the authenticated ForkTree state.
     pub async fn load_branch_head_commit_id(
         &self,
         branch_id: &str,
