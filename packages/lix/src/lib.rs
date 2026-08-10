@@ -56,7 +56,6 @@ pub(crate) mod gc;
 mod handle;
 pub(crate) mod init;
 pub(crate) mod json_store;
-pub(crate) mod live_state;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
 pub(crate) mod plugin;
@@ -70,6 +69,7 @@ pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
 mod sql_profile;
 mod sql_telemetry;
+pub(crate) mod state;
 pub mod storage;
 #[cfg(feature = "storage-benches")]
 pub mod storage_adapter;

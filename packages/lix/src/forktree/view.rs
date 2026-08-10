@@ -795,6 +795,25 @@ where
         Self { read }
     }
 
+    /// Consumes this operation-owned facade into one retained authenticated
+    /// branch view. The read handle is moved, not reacquired, so the state
+    /// boundary can retain selector/root identity for every later point or
+    /// range operation.
+    pub(crate) async fn into_branch(
+        self,
+        branch_id: &str,
+    ) -> Result<CoherentView<R>, crate::LixError> {
+        let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+            crate::LixError::new(
+                crate::LixError::CODE_INVALID_PARAM,
+                format!("branch ID must be a UUID: {error}"),
+            )
+        })?;
+        open_coherent_view_on_read(self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
+            .await
+            .map_err(crate::LixError::from)
+    }
+
     pub(crate) async fn branch(
         &self,
         branch_id: &str,
