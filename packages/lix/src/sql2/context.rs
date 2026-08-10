@@ -400,6 +400,14 @@ where
         unsafe { self.ptr.0.as_ref().active_branch_id().to_string() }
     }
 
+    pub(crate) fn visible_schema_keys(&self) -> Result<Vec<String>, LixError> {
+        unsafe { self.ptr.0.as_ref().list_visible_schemas()? }
+            .iter()
+            .map(crate::schema::schema_key_from_definition)
+            .map(|result| result.map(|key| key.schema_key))
+            .collect()
+    }
+
     pub(crate) fn active_account_id(&self) -> String {
         unsafe { self.ptr.0.as_ref().active_account_id().to_string() }
     }

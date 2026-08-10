@@ -980,6 +980,7 @@ where
                     snapshot_content,
                     metadata: value.metadata,
                     deleted,
+                    blob_manifest_object_ids: value.blob_manifest_object_ids,
                     created_at: value.created_at,
                     updated_at: value.updated_at,
                     change_id: value.change_id,
@@ -1746,6 +1747,7 @@ mod tests {
             snapshot_content: snapshot_content.map(Into::into),
             metadata: None,
             deleted,
+            blob_manifest_object_ids: Vec::new(),
         }
     }
 

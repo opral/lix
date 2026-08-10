@@ -207,6 +207,7 @@ mod tests {
             intermediate_commits: Vec::new(),
             file_content_writes: Vec::new(),
             branch_ref_intents: Vec::new(),
+            historical_blob_manifest_edges: Default::default(),
         };
         let unrelated = StateKey {
             schema_key: "plugin_entity".to_owned(),

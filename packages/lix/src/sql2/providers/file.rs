@@ -68,9 +68,7 @@ use crate::sql2::write_normalization::{
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
-#[cfg(test)]
-use crate::transaction::types::TransactionWriteRow;
-use crate::transaction::types::{RawWriteBatch, TransactionJson};
+use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 use crate::{
     GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
     serialize_row_metadata,
@@ -665,6 +663,35 @@ where
         Ok(FilesystemStateRows::from_rows(
             self.scan_rows(request).await?,
         ))
+    }
+
+    async fn file_owned_rows(
+        &self,
+        branch_id: &str,
+        schema_keys: Vec<String>,
+        file_ids: &[String],
+    ) -> Result<FilesystemStateRows, LixError> {
+        if schema_keys.is_empty() || file_ids.is_empty() {
+            return Ok(FilesystemStateRows::default());
+        }
+        self.scan_file_plan(&FileQueryPlan {
+            filter: FileQueryFilter {
+                schema_keys,
+                branch_ids: vec![branch_id.to_owned()],
+                file_ids: file_ids
+                    .iter()
+                    .cloned()
+                    .map(crate::NullableKeyFilter::Value)
+                    .collect(),
+                untracked: Some(false),
+                include_tombstones: false,
+                ..FileQueryFilter::default()
+            },
+            projection: FileQueryProjection::default(),
+            limit: None,
+            full_surface: false,
+        })
+        .await
     }
 
     async fn load_exact_batch(
@@ -2418,6 +2445,53 @@ where
                     &source_state.blob_ref_keys,
                     plugin_archive_delete_target.as_deref(),
                 )?;
+                let mut staged = staged;
+                let active_branch_id = branch_binding.active_branch_id().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "file delete dependency closure requires one active branch".to_owned(),
+                    )
+                })?;
+                let file_ids = (0..matched_batch.num_rows())
+                    .map(|row_index| required_string_value(&matched_batch, row_index, "id"))
+                    .collect::<Result<BTreeSet<_>>>()?;
+                if !file_ids.is_empty() {
+                    let dependency_rows =
+                        FileStateView::Transaction(write_ctx.state_view().clone())
+                            .file_owned_rows(
+                                active_branch_id,
+                                write_ctx
+                                    .visible_schema_keys()
+                                    .map_err(lix_error_to_datafusion_error)?,
+                                &file_ids.iter().cloned().collect::<Vec<_>>(),
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    for row in dependency_rows {
+                        if row.deleted
+                            || row.global
+                            || row.untracked
+                            || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                            || row.schema_key == BLOB_REF_SCHEMA_KEY
+                        {
+                            continue;
+                        }
+                        staged.state_rows.push(TransactionWriteRow {
+                            entity_pk: Some(row.entity_pk),
+                            schema_key: row.schema_key.into(),
+                            file_id: row.file_id.map(Into::into),
+                            snapshot: None,
+                            metadata: None,
+                            origin: None,
+                            created_at: None,
+                            updated_at: None,
+                            global: false,
+                            change_id: None,
+                            commit_id: None,
+                            untracked: false,
+                            branch_id: row.branch_id.into(),
+                        });
+                    }
+                }
                 let count = staged.count;
 
                 if count > 0 {
