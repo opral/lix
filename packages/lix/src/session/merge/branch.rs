@@ -8,10 +8,12 @@ use tracing::Instrument as _;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::entity_pk::EntityPk;
-use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, StateKey};
+use crate::forktree::{
+    AuthenticatedHistoricalStateView, ForkTreeReadFacade, HistoricalStateRow, StateKey,
+};
 use crate::plugin::{
     ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
-    load_plugin_registry_at_commit,
+    load_plugin_registry_on_historical_view,
 };
 use crate::storage_adapter::Storage;
 use crate::transaction::types::{
@@ -180,8 +182,13 @@ where
                 )
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_analysis"))
                 .await?;
+                let historical = if analysis.conflict_batch().is_some() {
+                    Some(MergeHistoricalState::open(&facade, &analysis).await?)
+                } else {
+                    None
+                };
                 let derived_blob_files = async {
-                    derived_plugin_blob_conflicts(&facade, &analysis).await
+                    derived_plugin_blob_conflicts(historical.as_ref(), &analysis).await
                 }
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_derived_blob_detection"))
                 .await?;
@@ -192,7 +199,12 @@ where
                 let plugin_resolution_stats = if analysis.outcome == MergeOutcome::MergeCommitted {
                     let plugin_conflict_groups = async {
                         plugin_merge_conflict_groups(
-                            &facade,
+                            historical.as_ref().ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "plugin conflict analysis omitted historical commit views",
+                                )
+                            })?,
                             &analysis,
                             &derived_blob_files,
                             &resolvable_plugin_conflicts,
@@ -210,7 +222,16 @@ where
                     .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_conflict_resolve"))
                     .await?;
                     async {
-                        plugin_resolution_change_stats(&facade, &analysis, &resolved_plugin_rows).await
+                        plugin_resolution_change_stats(
+                            &historical.as_ref().ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "plugin resolution omitted historical commit views",
+                                )
+                            })?.target,
+                            &resolved_plugin_rows,
+                        )
+                        .await
                     }
                     .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_resolution_stats"))
                     .await?
@@ -298,8 +319,13 @@ where
                 "lix.perf.merge_analysis"
             ))
             .await?;
+            let historical = if analysis.conflict_batch().is_some() {
+                Some(MergeHistoricalState::open(&facade, &analysis).await?)
+            } else {
+                None
+            };
             let derived_blob_files =
-                async { derived_plugin_blob_conflicts(&facade, &analysis).await }
+                async { derived_plugin_blob_conflicts(historical.as_ref(), &analysis).await }
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
                         "lix.perf.merge_derived_blob_detection"
@@ -376,7 +402,12 @@ where
 
             let plugin_conflict_groups = async {
                 plugin_merge_conflict_groups(
-                    &facade,
+                    historical.as_ref().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "plugin conflict analysis omitted historical commit views",
+                        )
+                    })?,
                     &analysis,
                     &derived_blob_files,
                     &resolvable_plugin_conflicts,
@@ -401,7 +432,19 @@ where
             .await?;
 
             let plugin_resolution_stats = async {
-                plugin_resolution_change_stats(&facade, &analysis, &resolved_plugin_rows).await
+                plugin_resolution_change_stats(
+                    &historical
+                        .as_ref()
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin resolution omitted historical commit views",
+                            )
+                        })?
+                        .target,
+                    &resolved_plugin_rows,
+                )
+                .await
             }
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
@@ -411,7 +454,15 @@ where
 
             let semantic_rows = async {
                 materialized_plugin_merge_rows(
-                    &facade,
+                    &historical
+                        .as_ref()
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin materialization omitted historical commit views",
+                            )
+                        })?
+                        .source,
                     &analysis,
                     &derived_blob_files,
                     &semantic_branch_id,
@@ -502,6 +553,37 @@ struct DerivedPluginConflictIndex {
     files: BTreeMap<String, DerivedPluginFileConflict>,
 }
 
+struct MergeHistoricalState<'a, R: ?Sized> {
+    base: AuthenticatedHistoricalStateView<'a, R>,
+    target: AuthenticatedHistoricalStateView<'a, R>,
+    source: AuthenticatedHistoricalStateView<'a, R>,
+}
+
+impl<'a, R> MergeHistoricalState<'a, R>
+where
+    R: crate::storage_adapter::StorageAdapterRead,
+{
+    async fn open(
+        facade: &'a ForkTreeReadFacade<R>,
+        analysis: &super::analysis::MergeAnalysis,
+    ) -> Result<Self, LixError> {
+        let base = facade
+            .historical_state_view(&analysis.commits.base_commit_id.to_string())
+            .await?;
+        let target = facade
+            .historical_state_view(&analysis.commits.target_commit_id.to_string())
+            .await?;
+        let source = facade
+            .historical_state_view(&analysis.commits.source_commit_id.to_string())
+            .await?;
+        Ok(Self {
+            base,
+            target,
+            source,
+        })
+    }
+}
+
 impl DerivedPluginConflictIndex {
     fn context(&self, file_id: &str) -> Option<&DerivedPluginFileConflict> {
         self.files.get(file_id)
@@ -524,7 +606,7 @@ impl DerivedPluginConflictIndex {
 }
 
 async fn derived_plugin_blob_conflicts<R>(
-    facade: &ForkTreeReadFacade<R>,
+    historical: Option<&MergeHistoricalState<'_, R>>,
     analysis: &super::analysis::MergeAnalysis,
 ) -> Result<DerivedPluginConflictIndex, LixError>
 where
@@ -542,6 +624,12 @@ where
     let Some(conflicts) = analysis.conflict_batch() else {
         return Ok(DerivedPluginConflictIndex::default());
     };
+    let historical = historical.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "plugin conflict analysis omitted historical commit views",
+        )
+    })?;
     let mut conflict_indices_by_file = BTreeMap::<String, Vec<usize>>::new();
     for (index, conflict) in conflicts.iter().enumerate() {
         let Some(file_id) = conflict.file_id() else {
@@ -568,15 +656,9 @@ where
             entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
         })
         .collect::<Vec<_>>();
-    let base_rows = facade
-        .load_state_rows_at_commit(&analysis.commits.base_commit_id.to_string(), &owner_keys)
-        .await?;
-    let target_rows = facade
-        .load_state_rows_at_commit(&analysis.commits.target_commit_id.to_string(), &owner_keys)
-        .await?;
-    let source_rows = facade
-        .load_state_rows_at_commit(&analysis.commits.source_commit_id.to_string(), &owner_keys)
-        .await?;
+    let base_rows = historical.base.load_state_rows(&owner_keys).await?;
+    let target_rows = historical.target.load_state_rows(&owner_keys).await?;
+    let source_rows = historical.source.load_state_rows(&owner_keys).await?;
     let mut common_owners = BTreeMap::new();
     for (index, file_id) in file_ids.into_iter().enumerate() {
         let Some(owner) = common_live_plugin_owner_ref(
@@ -604,16 +686,22 @@ where
     // file-lifecycle and generation conflicts have first-class values.
     let candidate_file_ids = common_owners.keys().cloned().collect::<BTreeSet<_>>();
     let common_descriptors =
-        historical_conflict_file_descriptors(facade, analysis, &candidate_file_ids).await?;
-    let base_registry =
-        load_plugin_registry_at_commit(facade, &analysis.commits.base_commit_id.to_string())
-            .await?;
-    let target_registry =
-        load_plugin_registry_at_commit(facade, &analysis.commits.target_commit_id.to_string())
-            .await?;
-    let source_registry =
-        load_plugin_registry_at_commit(facade, &analysis.commits.source_commit_id.to_string())
-            .await?;
+        historical_conflict_file_descriptors(historical, &candidate_file_ids).await?;
+    let base_registry = load_plugin_registry_on_historical_view(
+        &historical.base,
+        &analysis.commits.base_commit_id.to_string(),
+    )
+    .await?;
+    let target_registry = load_plugin_registry_on_historical_view(
+        &historical.target,
+        &analysis.commits.target_commit_id.to_string(),
+    )
+    .await?;
+    let source_registry = load_plugin_registry_on_historical_view(
+        &historical.source,
+        &analysis.commits.source_commit_id.to_string(),
+    )
+    .await?;
 
     let mut derived = BTreeMap::new();
     let mut derived_owners = BTreeMap::new();
@@ -835,7 +923,7 @@ fn resolvable_plugin_conflict_keys(
 }
 
 async fn plugin_merge_conflict_groups<R>(
-    facade: &ForkTreeReadFacade<R>,
+    historical: &MergeHistoricalState<'_, R>,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &DerivedPluginConflictIndex,
     resolvable_plugin_conflicts: &ResolvablePluginConflicts,
@@ -863,15 +951,9 @@ where
             entity_pk: conflict.identity.entity_pk().clone(),
         })
         .collect::<Vec<_>>();
-    let base_rows = facade
-        .load_state_rows_at_commit(&analysis.commits.base_commit_id.to_string(), &keys)
-        .await?;
-    let target_rows = facade
-        .load_state_rows_at_commit(&analysis.commits.target_commit_id.to_string(), &keys)
-        .await?;
-    let source_rows = facade
-        .load_state_rows_at_commit(&analysis.commits.source_commit_id.to_string(), &keys)
-        .await?;
+    let base_rows = historical.base.load_state_rows(&keys).await?;
+    let target_rows = historical.target.load_state_rows(&keys).await?;
+    let source_rows = historical.source.load_state_rows(&keys).await?;
     if base_rows.iter().any(Option::is_none) {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
@@ -959,8 +1041,7 @@ struct HistoricalDirectoryDescriptor {
 /// divergent renames remain ordinary merge conflicts and missing/corrupt
 /// descriptor metadata simply leaves the optional descriptor fields empty.
 async fn historical_conflict_file_descriptors<R>(
-    facade: &ForkTreeReadFacade<R>,
-    analysis: &super::analysis::MergeAnalysis,
+    historical: &MergeHistoricalState<'_, R>,
     file_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, Option<String>>, LixError>
 where
@@ -984,18 +1065,9 @@ where
             })
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    let base_commit_id = analysis.commits.base_commit_id.to_string();
-    let target_commit_id = analysis.commits.target_commit_id.to_string();
-    let source_commit_id = analysis.commits.source_commit_id.to_string();
-    let base_rows = facade
-        .load_state_rows_at_commit(&base_commit_id, &keys)
-        .await?;
-    let target_rows = facade
-        .load_state_rows_at_commit(&target_commit_id, &keys)
-        .await?;
-    let source_rows = facade
-        .load_state_rows_at_commit(&source_commit_id, &keys)
-        .await?;
+    let base_rows = historical.base.load_state_rows(&keys).await?;
+    let target_rows = historical.target.load_state_rows(&keys).await?;
+    let source_rows = historical.source.load_state_rows(&keys).await?;
 
     let mut descriptors = BTreeMap::new();
     for (index, file_id) in file_ids.iter().cloned().enumerate() {
@@ -1013,27 +1085,12 @@ where
         // renamed. Resolve all three full paths at their own historical roots
         // and only expose a path to the plugin when it is genuinely common.
         // A path-sensitive resolver must never receive a stale base path.
-        let base_path = historical_file_path(
-            facade,
-            &base_commit_id,
-            scope_file_id.as_deref(),
-            &descriptor,
-        )
-        .await?;
-        let target_path = historical_file_path(
-            facade,
-            &target_commit_id,
-            scope_file_id.as_deref(),
-            &descriptor,
-        )
-        .await?;
-        let source_path = historical_file_path(
-            facade,
-            &source_commit_id,
-            scope_file_id.as_deref(),
-            &descriptor,
-        )
-        .await?;
+        let base_path =
+            historical_file_path(&historical.base, scope_file_id.as_deref(), &descriptor).await?;
+        let target_path =
+            historical_file_path(&historical.target, scope_file_id.as_deref(), &descriptor).await?;
+        let source_path =
+            historical_file_path(&historical.source, scope_file_id.as_deref(), &descriptor).await?;
         let Some(path) = common_historical_path(base_path, target_path, source_path) else {
             descriptors.insert(file_id, None);
             continue;
@@ -1074,8 +1131,7 @@ fn common_historical_path(
 }
 
 async fn historical_file_path<R>(
-    facade: &ForkTreeReadFacade<R>,
-    commit_id: &str,
+    historical: &AuthenticatedHistoricalStateView<'_, R>,
     scope_file_id: Option<&str>,
     descriptor: &HistoricalFileDescriptor,
 ) -> Result<Option<String>, LixError>
@@ -1099,8 +1155,8 @@ where
                 )
             })?,
         };
-        let Some(row) = facade
-            .load_state_rows_at_commit(commit_id, std::slice::from_ref(&key))
+        let Some(row) = historical
+            .load_state_rows(std::slice::from_ref(&key))
             .await?
             .into_iter()
             .next()
@@ -1536,7 +1592,7 @@ fn push_transaction_row_from_tracked_row_ref(
 }
 
 async fn materialized_plugin_merge_rows<R>(
-    facade: &ForkTreeReadFacade<R>,
+    source: &AuthenticatedHistoricalStateView<'_, R>,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &DerivedPluginConflictIndex,
     target_branch_id: &SharedStr,
@@ -1588,9 +1644,7 @@ where
         return Ok(resolved_plugin_rows);
     }
 
-    let materialized_rows = facade
-        .load_state_rows_at_commit(&analysis.commits.source_commit_id.to_string(), &keys)
-        .await?;
+    let materialized_rows = source.load_state_rows(&keys).await?;
     let mut rows =
         RawWriteBatch::with_capacity(materialized_rows.len() + resolved_plugin_rows.len());
     for (slot, key) in keys.into_iter().enumerate() {
@@ -1611,8 +1665,7 @@ where
 }
 
 async fn plugin_resolution_change_stats<R>(
-    facade: &ForkTreeReadFacade<R>,
-    analysis: &super::analysis::MergeAnalysis,
+    target: &AuthenticatedHistoricalStateView<'_, R>,
     resolved_rows: &RawWriteBatch,
 ) -> Result<MergeChangeStats, LixError>
 where
@@ -1639,9 +1692,7 @@ where
             })
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    let target_rows = facade
-        .load_state_rows_at_commit(&analysis.commits.target_commit_id.to_string(), &keys)
-        .await?;
+    let target_rows = target.load_state_rows(&keys).await?;
     let mut stats = MergeChangeStats::default();
     for (index, resolved) in resolved_rows.iter().enumerate() {
         let target = target_rows[index].as_ref().filter(|row| !row.deleted);

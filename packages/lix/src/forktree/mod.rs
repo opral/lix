@@ -56,8 +56,8 @@ pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
 };
 pub(crate) use view::{
-    CoherentView, ForkTreeReadFacade, SELECTOR_SPACE, load_object_bytes, open_coherent_view,
-    open_coherent_view_on_read,
+    AuthenticatedHistoricalStateView, CoherentView, ForkTreeReadFacade, SELECTOR_SPACE,
+    load_object_bytes, open_coherent_view, open_coherent_view_on_read,
 };
 
 #[cfg(test)]

@@ -46,7 +46,7 @@ pub(crate) use manifest::{
 pub(crate) use registry::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
     PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
-    load_plugin_registry_at_commit,
+    load_plugin_registry_on_historical_view,
 };
 #[cfg(test)]
 pub(crate) use storage::plugin_storage_archive_path;
