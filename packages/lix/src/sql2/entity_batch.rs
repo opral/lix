@@ -244,9 +244,7 @@ where
         }
         rows.extend(merge_range_slots(branch_rows, Vec::new(), true, None));
     }
-    let global_id =
-        uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID).expect("GLOBAL_BRANCH_ID must be a UUID");
-    let mut global_keys = std::collections::BTreeSet::new();
+    let mut public_identities = std::collections::BTreeSet::new();
     rows.sort_by(|left, right| {
         slot_sort_key(left)
             .cmp(&slot_sort_key(right))
@@ -255,13 +253,8 @@ where
     let mut visible = Vec::with_capacity(rows.len());
     for slot in rows {
         let key = slot_sort_key(&slot);
-        let is_global = match &slot {
-            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
-                row.source == crate::state::StateRowSource::Global
-            }
-            EntityStateSlot::Untracked(row) => row.owner.as_bytes() == global_id.as_bytes(),
-        };
-        if is_global && !global_keys.insert(key) {
+        let public_branch_id = slot_branch_sort_key(&slot);
+        if !public_identities.insert((public_branch_id, key)) {
             continue;
         }
         if request.filter.include_tombstones
