@@ -606,7 +606,7 @@ where
         )?;
         entries.push(Some(bytes));
     }
-    Ok(crate::binary_cas::BlobBytesBatch::new(entries))
+    Ok(crate::binary_cas::BlobBytesBatch::from_shared(entries))
 }
 
 /// Loads historical file payloads from exact ForkTree state keys. The state
@@ -646,7 +646,7 @@ where
         )?;
         entries.push(Some(bytes));
     }
-    Ok(crate::binary_cas::BlobBytesBatch::new(entries))
+    Ok(crate::binary_cas::BlobBytesBatch::from_shared(entries))
 }
 
 #[derive(Clone)]
