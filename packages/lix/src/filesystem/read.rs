@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+use super::FilesystemStateRows;
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
 use super::{DirectoryPathRecord, derive_directory_paths};
-use super::{FilesystemStateRow, FilesystemStateRows};
 use crate::LixError;
 use crate::common::compose_file_path;
 
@@ -305,10 +305,11 @@ fn filesystem_conflict_error(message: String) -> LixError {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemStateRow, FilesystemStateRows};
+    use super::FilesystemStateRows;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
+    use crate::filesystem::FilesystemStateRow;
 
     use super::{
         BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,

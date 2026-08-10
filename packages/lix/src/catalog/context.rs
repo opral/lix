@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use blake3::Hasher;
 use serde_json::Value as JsonValue;
 
+use crate::LixError;
 use crate::catalog::revision::CatalogRevision;
 use crate::catalog::snapshot::{
     CatalogFingerprint, fingerprint_schema_facts, hash_fingerprint_part,
@@ -11,8 +12,7 @@ use crate::catalog::snapshot::{
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::schema::schema_key_from_definition;
-use crate::state::{ForkTreeStateView, StateRow};
-use crate::{LixError, NullableKeyFilter};
+use crate::state::{ForkTreeStateView, StateRow, UntrackedStateRow};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
@@ -101,7 +101,10 @@ impl CatalogContext {
         let catalog_rows = CatalogRows {
             domains: catalog_rows
                 .into_iter()
-                .map(|(domain, rows)| CatalogDomainRows { domain, rows })
+                .map(|(domain, rows)| CatalogDomainRows {
+                    domain,
+                    rows: rows.into_iter().map(catalog_row_from_state).collect(),
+                })
                 .collect(),
         };
         self.compiled_catalog_for_rows(&catalog_rows)
@@ -114,7 +117,7 @@ impl CatalogContext {
         let mut hasher = Hasher::new();
         for (schema_domain, row) in catalog_rows.iter() {
             hash_fingerprint_part(&mut hasher, &schema_domain.fingerprint_component());
-            let snapshot_content = state_snapshot_content(row).ok_or_else(|| {
+            let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
                     "catalog row is missing its authenticated snapshot content",
@@ -183,7 +186,7 @@ struct CatalogRows {
 }
 
 impl CatalogRows {
-    fn iter(&self) -> impl Iterator<Item = (&Domain, &StateRow)> {
+    fn iter(&self) -> impl Iterator<Item = (&Domain, &CatalogRow)> {
         self.domains.iter().flat_map(|domain_rows| {
             domain_rows.rows.iter().filter_map(move |row| {
                 row_belongs_to_schema_catalog_domain(row, &domain_rows.domain)
@@ -195,7 +198,39 @@ impl CatalogRows {
 
 struct CatalogDomainRows {
     domain: Domain,
-    rows: Vec<StateRow>,
+    rows: Vec<CatalogRow>,
+}
+
+struct CatalogRow {
+    key: crate::forktree::StateKey,
+    snapshot_content: Option<crate::common::SharedStr>,
+    untracked: bool,
+}
+
+fn catalog_row_from_state(row: StateRow) -> CatalogRow {
+    let key = crate::forktree::decode_state_key(&row.key)
+        .expect("authenticated state view must return canonical state keys");
+    let snapshot_content = match row.value.cell {
+        crate::forktree::StateCell::Value(value) => Some(value),
+        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
+    };
+    CatalogRow {
+        key,
+        snapshot_content,
+        untracked: false,
+    }
+}
+
+fn catalog_row_from_untracked(row: UntrackedStateRow) -> CatalogRow {
+    let snapshot_content = match row.value.cell {
+        crate::forktree::StateCell::Value(value) => Some(value),
+        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
+    };
+    CatalogRow {
+        key: row.key,
+        snapshot_content,
+        untracked: true,
+    }
 }
 
 async fn scan_catalog_rows<R>(
@@ -214,7 +249,21 @@ where
                 "untracked schema catalogs require the TransactionStateView untracked seam",
             ));
         }
-        let rows = state.range(None, None, None, false).await?;
+        let rows = if schema_domain.untracked() {
+            state
+                .untracked_overlay_rows()
+                .await?
+                .into_iter()
+                .map(catalog_row_from_untracked)
+                .collect()
+        } else {
+            state
+                .range(None, None, None, false)
+                .await?
+                .into_iter()
+                .map(catalog_row_from_state)
+                .collect()
+        };
         catalog_rows.push(CatalogDomainRows {
             domain: schema_domain,
             rows,
@@ -241,30 +290,26 @@ fn facts_from_catalog_rows(catalog_rows: &CatalogRows) -> Result<Vec<SchemaCatal
     Ok(facts)
 }
 
-fn row_belongs_to_schema_catalog_domain(row: &StateRow, domain: &Domain) -> bool {
-    let Ok(key) = crate::forktree::decode_state_key(&row.key) else {
-        return false;
-    };
-    key.schema_key == REGISTERED_SCHEMA_KEY
-        && key.file_id.is_none()
-        && matches!(&row.value.cell, crate::forktree::StateCell::Value(_))
-        && !domain.untracked()
+fn row_belongs_to_schema_catalog_domain(row: &CatalogRow, domain: &Domain) -> bool {
+    row.key.schema_key == REGISTERED_SCHEMA_KEY
+        && row.key.file_id.is_none()
+        && row.snapshot_content.is_some()
+        && row.untracked == domain.untracked()
 }
 
 fn decode_registered_schema_row(
-    row: &StateRow,
+    row: &CatalogRow,
 ) -> Result<Option<(crate::schema::SchemaKey, JsonValue)>, LixError> {
-    let key = crate::forktree::decode_state_key(&row.key)?;
-    if key.schema_key != REGISTERED_SCHEMA_KEY {
+    if row.key.schema_key != REGISTERED_SCHEMA_KEY {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
                 "expected lix_registered_schema row, got schema_key={}",
-                key.schema_key
+                row.key.schema_key
             ),
         ));
     }
-    let crate::forktree::StateCell::Value(snapshot_content) = &row.value.cell else {
+    let Some(snapshot_content) = row.snapshot_content.as_ref() else {
         return Ok(None);
     };
     let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|err| {
@@ -281,11 +326,4 @@ fn decode_registered_schema_row(
     })?;
     let key = schema_key_from_definition(&schema)?;
     Ok(Some((key, schema)))
-}
-
-fn state_snapshot_content(row: &StateRow) -> Option<&str> {
-    match &row.value.cell {
-        crate::forktree::StateCell::Value(value) => Some(value.as_str()),
-        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
-    }
 }

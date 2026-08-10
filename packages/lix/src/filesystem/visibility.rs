@@ -5,11 +5,11 @@ use serde::Deserialize;
 use crate::LixError;
 use crate::state::ForkTreeStateView;
 
+use super::FilesystemStateRows;
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
-use super::{FilesystemStateRow, FilesystemStateRows};
 
 /// Execution-visible filesystem metadata decoded from a concrete state view.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -125,6 +125,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
+    use crate::filesystem::FilesystemStateRow;
 
     fn row(
         schema_key: &str,
