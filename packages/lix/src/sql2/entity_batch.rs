@@ -1,332 +1,502 @@
-//! Terminal SQL projections over the canonical live-state scan.
+//! Native entity request decoding and terminal projections.
 //!
-//! The entity capability does not own a storage/index read. It asks the
-//! operation-owned `LiveStateReader::scan_batch` for the visible rows once and
-//! projects that authenticated batch into snapshot bytes or primary keys.
+//! Entity providers consume concrete authenticated ForkTree state views.  The
+//! module keeps `StateRow` and the native untracked row as the only row shapes
+//! before Arrow/DataFusion takes ownership.
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::LixError;
-use crate::entity_pk::EntityPk;
-use crate::live_state::{LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest};
+use crate::entity_pk::{EntityPk, EntityPkComponents};
+use crate::forktree::{StateCell, StateKeyRef, decode_state_key, encode_state_key};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView, UntrackedStateRow};
+use crate::storage_adapter::StorageAdapterRead;
 
-/// Optional private capability supplied by a SQL execution context.
-///
-/// The production implementation is only a terminal projection: it performs
-/// one canonical `LiveStateReader::scan_batch` and returns no storage handle,
-/// alternate visibility result, or legacy DTO. `None` remains available for
-/// contexts that do not provide this capability.
-#[async_trait]
-pub(crate) trait EntitySnapshotReader: Send + Sync {
-    async fn scan_entity_snapshots(
-        &self,
-        request: LiveStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EntityScanRequest {
+    pub(crate) filter: EntityScanFilter,
+    pub(crate) projection: EntityProjection,
+    pub(crate) limit: Option<usize>,
+}
 
-    /// Returns primary keys from the same committed direct-scan proof as raw
-    /// snapshots. Providers use this only when every projected SQL field is
-    /// an exact primary-key component, avoiding a redundant JSON decode while
-    /// leaving all relational operators to DataFusion.
-    async fn scan_entity_primary_keys(
-        &self,
-        _request: LiveStateScanRequest,
-    ) -> Result<Option<Vec<EntityPk>>, LixError> {
-        Ok(None)
-    }
-
-    async fn load_exact_entity_snapshots(
-        &self,
-        _request: LiveStateExactBatchRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        Ok(None)
-    }
-
-    async fn load_exact_entity_primary_keys(
-        &self,
-        _request: LiveStateExactBatchRequest,
-    ) -> Result<Option<Vec<EntityPk>>, LixError> {
-        Ok(None)
+impl Default for EntityScanRequest {
+    fn default() -> Self {
+        Self {
+            filter: EntityScanFilter::default(),
+            projection: EntityProjection::default(),
+            limit: None,
+        }
     }
 }
 
-/// Terminal projection over an already operation-owned live-state reader.
-/// This adapter only projects the authenticated batch; it does not acquire a
-/// storage read, expose a store, or provide a second visibility authority.
-pub(crate) struct CanonicalEntitySnapshotProjection {
-    live_state: Arc<dyn LiveStateReader>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EntityScanFilter {
+    pub(crate) schema_keys: Vec<String>,
+    pub(crate) branch_ids: Vec<String>,
+    pub(crate) file_ids: Vec<crate::NullableKeyFilter<String>>,
+    pub(crate) entity_pks: Vec<EntityPk>,
+    pub(crate) untracked: Option<bool>,
+    pub(crate) include_tombstones: bool,
+    pub(crate) constraints: Vec<()>,
+    pub(crate) rows: EntityRowSelection,
 }
 
-impl CanonicalEntitySnapshotProjection {
-    pub(crate) fn new(live_state: Arc<dyn LiveStateReader>) -> Self {
-        Self { live_state }
-    }
-}
-
-#[async_trait]
-impl EntitySnapshotReader for CanonicalEntitySnapshotProjection {
-    async fn scan_entity_snapshots(
-        &self,
-        request: LiveStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        validate_terminal_projection_request(&request)?;
-        Ok(Some(
-            canonical_snapshot_projection(self.live_state.as_ref(), &request).await?,
-        ))
-    }
-
-    async fn scan_entity_primary_keys(
-        &self,
-        request: LiveStateScanRequest,
-    ) -> Result<Option<Vec<EntityPk>>, LixError> {
-        validate_terminal_projection_request(&request)?;
-        Ok(Some(
-            canonical_primary_key_projection(self.live_state.as_ref(), &request).await?,
-        ))
-    }
-
-    async fn load_exact_entity_snapshots(
-        &self,
-        request: LiveStateExactBatchRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        validate_exact_terminal_projection_request(&request)?;
-        Ok(Some(
-            canonical_exact_snapshot_projection(self.live_state.as_ref(), &request).await?,
-        ))
-    }
-
-    async fn load_exact_entity_primary_keys(
-        &self,
-        request: LiveStateExactBatchRequest,
-    ) -> Result<Option<Vec<EntityPk>>, LixError> {
-        validate_exact_terminal_projection_request(&request)?;
-        Ok(Some(
-            canonical_exact_primary_key_projection(self.live_state.as_ref(), &request).await?,
-        ))
+impl Default for EntityScanFilter {
+    fn default() -> Self {
+        Self {
+            schema_keys: Vec::new(),
+            branch_ids: Vec::new(),
+            file_ids: Vec::new(),
+            entity_pks: Vec::new(),
+            untracked: None,
+            include_tombstones: false,
+            constraints: Vec::new(),
+            rows: EntityRowSelection::All,
+        }
     }
 }
 
-fn validate_terminal_projection_request(request: &LiveStateScanRequest) -> Result<(), LixError> {
-    if request.filter.include_tombstones {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EntityRowSelection {
+    All,
+    None,
+}
+
+impl Default for EntityRowSelection {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EntityProjection {
+    pub(crate) columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EntityExactBatchRequest {
+    pub(crate) rows: Vec<EntityExactRowRequest>,
+    pub(crate) projection: EntityProjection,
+    pub(crate) untracked: Option<bool>,
+    pub(crate) include_tombstones: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EntityExactRowRequest {
+    pub(crate) schema_key: String,
+    pub(crate) branch_id: String,
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) file_id: Option<String>,
+}
+
+/// A slot preserves exact request order and duplicates.  Missing slots stay
+/// `None`; present slots retain whether they came from tracked or untracked
+/// authenticated state so projection cannot silently change ownership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EntityStateSlot {
+    Tracked(StateRow),
+    Untracked(UntrackedStateRow),
+}
+
+pub(crate) async fn scan_forktree<S>(
+    view: &ForkTreeStateView<S>,
+    request: &EntityScanRequest,
+) -> Result<Vec<StateRow>, LixError>
+where
+    S: StorageAdapterRead + Clone,
+{
+    if matches!(request.filter.rows, EntityRowSelection::None) {
+        return Ok(Vec::new());
+    }
+    let (lower, upper) = schema_bounds(request)?;
+    if request.filter.untracked != Some(false) {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "entity terminal projection does not preserve tombstone rows",
+            "native entity range requires the owner-scoped untracked range seam",
         ));
     }
-    Ok(())
+    view.range(
+        lower.as_deref(),
+        upper.as_deref(),
+        request.limit,
+        request.filter.include_tombstones,
+    )
+    .await
+    .map_err(|e| LixError::new(LixError::CODE_STORAGE_ERROR, e.to_string()))
 }
 
-fn validate_exact_terminal_projection_request(
-    request: &LiveStateExactBatchRequest,
-) -> Result<(), LixError> {
-    if request.include_tombstones {
+pub(crate) async fn scan_transaction<S>(
+    view: &TransactionStateView<S>,
+    request: &EntityScanRequest,
+) -> Result<Vec<StateRow>, LixError>
+where
+    S: StorageAdapterRead + Clone,
+{
+    if matches!(request.filter.rows, EntityRowSelection::None) {
+        return Ok(Vec::new());
+    }
+    let (lower, upper) = schema_bounds(request)?;
+    if request.filter.untracked != Some(false) {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "entity terminal projection does not preserve tombstone rows",
+            "native transaction range requires the owner-scoped untracked range seam",
         ));
     }
-    Ok(())
+    view.range(
+        lower.as_deref(),
+        upper.as_deref(),
+        request.limit,
+        request.filter.include_tombstones,
+    )
+    .await
+    .map_err(|e| LixError::new(LixError::CODE_STORAGE_ERROR, e.to_string()))
 }
 
-async fn canonical_snapshot_projection<R>(
-    reader: &R,
-    request: &LiveStateScanRequest,
-) -> Result<Vec<Option<Bytes>>, LixError>
+pub(crate) async fn exact_forktree<S>(
+    view: &ForkTreeStateView<S>,
+    request: &EntityExactBatchRequest,
+) -> Result<Vec<Option<EntityStateSlot>>, LixError>
 where
-    R: LiveStateReader + ?Sized,
+    S: StorageAdapterRead + Clone,
 {
-    Ok(reader
-        .scan_batch(request)
-        .await?
-        .into_identity_ordered_snapshots())
+    exact_forktree_inner(view, request).await
 }
 
-async fn canonical_primary_key_projection<R>(
-    reader: &R,
-    request: &LiveStateScanRequest,
-) -> Result<Vec<EntityPk>, LixError>
+async fn exact_forktree_inner<S>(
+    view: &ForkTreeStateView<S>,
+    request: &EntityExactBatchRequest,
+) -> Result<Vec<Option<EntityStateSlot>>, LixError>
 where
-    R: LiveStateReader + ?Sized,
+    S: StorageAdapterRead + Clone,
 {
-    Ok(reader
-        .scan_batch(request)
-        .await?
-        .into_identity_ordered_primary_keys())
+    let keys = request
+        .rows
+        .iter()
+        .map(|row| {
+            encode_state_key(StateKeyRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                entity_pk: &row.entity_pk,
+            })
+        })
+        .collect::<Vec<_>>();
+    let tracked = if request.untracked == Some(true) {
+        vec![None; keys.len()]
+    } else {
+        view.points(&keys, true)
+            .await
+            .map_err(|e| LixError::new(LixError::CODE_STORAGE_ERROR, e.to_string()))?
+    };
+    let untracked = if request.untracked == Some(false) {
+        vec![None; keys.len()]
+    } else {
+        view.untracked_points(&keys).await?
+    };
+    merge_exact_slots(request, keys, tracked, untracked)
 }
 
-async fn canonical_exact_snapshot_projection<R>(
-    reader: &R,
-    request: &LiveStateExactBatchRequest,
-) -> Result<Vec<Option<Bytes>>, LixError>
+pub(crate) async fn exact_transaction<S>(
+    view: &TransactionStateView<S>,
+    request: &EntityExactBatchRequest,
+) -> Result<Vec<Option<EntityStateSlot>>, LixError>
 where
-    R: LiveStateReader + ?Sized,
+    S: StorageAdapterRead + Clone,
 {
-    Ok(reader
-        .load_exact_batch(request)
-        .await?
-        .into_present_batch()
-        .into_identity_ordered_snapshots())
+    let keys = request
+        .rows
+        .iter()
+        .map(|row| {
+            encode_state_key(StateKeyRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                entity_pk: &row.entity_pk,
+            })
+        })
+        .collect::<Vec<_>>();
+    let tracked = if request.untracked == Some(true) {
+        vec![None; keys.len()]
+    } else {
+        view.points(&keys, true)
+            .await
+            .map_err(|e| LixError::new(LixError::CODE_STORAGE_ERROR, e.to_string()))?
+    };
+    let untracked = if request.untracked == Some(false) {
+        vec![None; keys.len()]
+    } else {
+        view.untracked_points(&keys, request.include_tombstones)
+            .await?
+    };
+    merge_exact_slots(request, keys, tracked, untracked)
 }
 
-async fn canonical_exact_primary_key_projection<R>(
-    reader: &R,
-    request: &LiveStateExactBatchRequest,
-) -> Result<Vec<EntityPk>, LixError>
-where
-    R: LiveStateReader + ?Sized,
-{
-    Ok(reader
-        .load_exact_batch(request)
-        .await?
-        .into_present_batch()
-        .into_identity_ordered_primary_keys())
+fn merge_exact_slots(
+    request: &EntityExactBatchRequest,
+    keys: Vec<Vec<u8>>,
+    tracked: Vec<Option<StateRow>>,
+    untracked: Vec<Option<UntrackedStateRow>>,
+) -> Result<Vec<Option<EntityStateSlot>>, LixError> {
+    if tracked.len() != keys.len() || untracked.len() != keys.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "native entity exact lookup returned the wrong slot count",
+        ));
+    }
+    let mut output = Vec::with_capacity(keys.len());
+    for (((requested, key), tracked), untracked) in
+        request.rows.iter().zip(keys).zip(tracked).zip(untracked)
+    {
+        let slot = if let Some(row) = untracked {
+            if row.key.schema_key != requested.schema_key
+                || row.key.entity_pk != requested.entity_pk
+                || row.key.file_id != requested.file_id
+            {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "native untracked entity row identity mismatch",
+                ));
+            }
+            if !request.include_tombstones && row.value.cell.deleted() {
+                None
+            } else {
+                Some(EntityStateSlot::Untracked(row))
+            }
+        } else if let Some(row) = tracked {
+            let decoded = decode_state_key(&row.key)?;
+            if decoded.schema_key != requested.schema_key
+                || decoded.entity_pk != requested.entity_pk
+                || decoded.file_id != requested.file_id
+            {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "native tracked entity row identity mismatch",
+                ));
+            }
+            if !request.include_tombstones && row.value.cell.deleted() {
+                None
+            } else {
+                Some(EntityStateSlot::Tracked(row))
+            }
+        } else {
+            None
+        };
+        output.push(slot);
+    }
+    Ok(output)
+}
+
+pub(crate) fn schema_bounds(
+    request: &EntityScanRequest,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), LixError> {
+    let schema = request.filter.schema_keys.first().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "entity scan has no schema key",
+        )
+    })?;
+    if request.filter.schema_keys.iter().any(|key| key != schema) {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "one native entity scan cannot mix schema keys",
+        ));
+    }
+    if request
+        .filter
+        .branch_ids
+        .windows(2)
+        .any(|ids| ids[0] != ids[1])
+    {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "one native entity scan cannot mix branch selectors",
+        ));
+    }
+    // The native key codec exposes the schema prefix by encoding the empty
+    // PK without the trailing file-id component.  This remains a bounded
+    // ordered-tree range; it is never replaced by a full scan.
+    if !request.filter.entity_pks.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "entity-PK scans use exact native points",
+        ));
+    }
+    let empty_pk = EntityPk {
+        components: EntityPkComponents::Empty,
+    };
+    let lower = crate::forktree::encode_state_entity_prefix(schema, &empty_pk);
+    let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
+    Ok((Some(lower), upper))
+}
+
+pub(crate) fn tracked_slot(row: &EntityStateSlot) -> Option<&StateRow> {
+    match row {
+        EntityStateSlot::Tracked(row) => Some(row),
+        EntityStateSlot::Untracked(_) => None,
+    }
+}
+
+pub(crate) fn slot_snapshot(row: &EntityStateSlot) -> Option<&str> {
+    match row {
+        EntityStateSlot::Tracked(row) => match &row.value.cell {
+            StateCell::Value(value) => Some(value.as_ref()),
+            StateCell::Null | StateCell::Tombstone => None,
+        },
+        EntityStateSlot::Untracked(row) => match &row.value.cell {
+            StateCell::Value(value) => Some(value.as_ref()),
+            StateCell::Null | StateCell::Tombstone => None,
+        },
+    }
+}
+
+pub(crate) fn row_snapshot(row: &StateRow) -> Option<&str> {
+    match &row.value.cell {
+        StateCell::Value(value) => Some(value.as_ref()),
+        StateCell::Null | StateCell::Tombstone => None,
+    }
+}
+
+pub(crate) fn project_snapshot(row: &StateRow) -> Option<Bytes> {
+    row_snapshot(row).map(|value| Bytes::copy_from_slice(value.as_bytes()))
+}
+
+pub(crate) fn project_pk(row: &StateRow) -> Result<EntityPk, LixError> {
+    Ok(decode_state_key(&row.key)?.entity_pk)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::changelog::{ChangeId, CommitId};
-    use crate::common::LixTimestamp;
-    use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateRow};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::common::{LixTimestamp, SharedStr};
+    use crate::forktree::{ChangeId, CommitId, StateCell, StateValue};
+    use crate::state::StateRowSource;
 
-    struct CountingCanonicalReader {
-        rows: MaterializedLiveStateBatch,
-        scans: AtomicUsize,
-        exact_loads: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl LiveStateReader for CountingCanonicalReader {
-        async fn scan_batch(
-            &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            self.scans.fetch_add(1, Ordering::SeqCst);
-            Ok(self.rows.clone())
-        }
-
-        async fn load_exact_batch(
-            &self,
-            _request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            self.exact_loads.fetch_add(1, Ordering::SeqCst);
-            Ok(
-                crate::live_state::MaterializedLiveStateExactBatch::from_rows(
-                    self.rows
-                        .clone()
-                        .into_rows()
-                        .into_iter()
-                        .map(Some)
-                        .collect(),
-                ),
-            )
+    fn row(entity: &str, cell: StateCell) -> StateRow {
+        let entity_pk = EntityPk::single(entity);
+        StateRow {
+            key: encode_state_key(StateKeyRef {
+                schema_key: "app.message",
+                file_id: None,
+                entity_pk: &entity_pk,
+            }),
+            value: StateValue {
+                change_id: ChangeId::from_bytes([1; 16]),
+                commit_id: CommitId::from_bytes([2; 16]),
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                cell,
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source: StateRowSource::Branch,
         }
     }
 
-    fn mixed_retention_rows() -> MaterializedLiveStateBatch {
-        MaterializedLiveStateBatch::from_rows(vec![
-            row("b", "tracked", false),
-            row("a", "untracked", true),
-        ])
-    }
-
-    fn row(entity_pk: &str, value: &str, untracked: bool) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: EntityPk::single(entity_pk),
-            schema_key: "entity".to_string(),
-            file_id: None,
-            snapshot_content: Some(format!(r#"{{"value":"{value}"}}"#).into()),
-            metadata: None,
-            deleted: false,
-            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
-            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00Z"),
-            global: false,
-            change_id: Some(ChangeId::for_test_label("change")),
-            commit_id: Some(CommitId::for_test_label("commit")),
-            untracked,
-            branch_id: "branch".into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_projections_use_one_canonical_scan_for_mixed_retention() {
-        let reader = CountingCanonicalReader {
-            rows: mixed_retention_rows(),
-            scans: AtomicUsize::new(0),
-            exact_loads: AtomicUsize::new(0),
-        };
-        let snapshots = canonical_snapshot_projection(&reader, &LiveStateScanRequest::default())
-            .await
-            .expect("canonical snapshot projection should succeed");
-        assert_eq!(reader.scans.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            snapshots,
-            vec![
-                Some(Bytes::from(r#"{"value":"untracked"}"#)),
-                Some(Bytes::from(r#"{"value":"tracked"}"#)),
-            ]
-        );
-
-        let reader = CountingCanonicalReader {
-            rows: mixed_retention_rows(),
-            scans: AtomicUsize::new(0),
-            exact_loads: AtomicUsize::new(0),
-        };
-        let primary_keys =
-            canonical_primary_key_projection(&reader, &LiveStateScanRequest::default())
-                .await
-                .expect("canonical primary-key projection should succeed");
-        assert_eq!(reader.scans.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            primary_keys,
-            vec![EntityPk::single("a"), EntityPk::single("b")]
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_exact_projection_never_scans() {
-        let reader = CountingCanonicalReader {
-            rows: mixed_retention_rows(),
-            scans: AtomicUsize::new(0),
-            exact_loads: AtomicUsize::new(0),
-        };
-        let request = LiveStateExactBatchRequest {
-            rows: vec![
-                crate::live_state::LiveStateExactRowRequest {
-                    schema_key: "entity".into(),
-                    branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
-                    entity_pk: EntityPk::single("a"),
+    fn request(entities: &[&str], include_tombstones: bool) -> EntityExactBatchRequest {
+        EntityExactBatchRequest {
+            rows: entities
+                .iter()
+                .map(|entity| EntityExactRowRequest {
+                    schema_key: "app.message".to_string(),
+                    branch_id: "branch-a".to_string(),
+                    entity_pk: EntityPk::single(*entity),
                     file_id: None,
-                },
-                crate::live_state::LiveStateExactRowRequest {
-                    schema_key: "entity".into(),
-                    branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
-                    entity_pk: EntityPk::single("b"),
-                    file_id: None,
-                },
-            ],
-            ..Default::default()
-        };
-        let snapshots = canonical_exact_snapshot_projection(&reader, &request)
-            .await
-            .expect("exact projection should succeed");
-        assert_eq!(snapshots.len(), 2);
-        assert_eq!(reader.scans.load(Ordering::SeqCst), 0);
-        assert_eq!(reader.exact_loads.load(Ordering::SeqCst), 1);
+                })
+                .collect(),
+            projection: EntityProjection::default(),
+            untracked: Some(false),
+            include_tombstones,
+        }
     }
 
     #[test]
-    fn terminal_projection_rejects_tombstones_before_acquisition() {
-        let request = LiveStateScanRequest {
-            filter: crate::live_state::LiveStateFilter {
-                include_tombstones: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(validate_terminal_projection_request(&request).is_err());
+    fn exact_merge_preserves_order_duplicates_and_missing_slots() {
+        let request = request(&["a", "a", "missing"], false);
+        let rows = vec![
+            Some(row("a", StateCell::Value(SharedStr::from("{}")))),
+            Some(row("a", StateCell::Value(SharedStr::from("{}")))),
+            None,
+        ];
+        let keys = request
+            .rows
+            .iter()
+            .map(|row| {
+                encode_state_key(StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                })
+            })
+            .collect();
+        let slots = merge_exact_slots(&request, keys, rows, vec![None, None, None])
+            .expect("native exact merge");
+        assert_eq!(slots.len(), 3);
+        assert!(slots[0].is_some());
+        assert!(slots[1].is_some());
+        assert!(slots[2].is_none());
+    }
+
+    #[test]
+    fn exact_merge_hides_tombstone_until_requested() {
+        let hidden = request(&["gone"], false);
+        let keys = hidden
+            .rows
+            .iter()
+            .map(|row| {
+                encode_state_key(StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                })
+            })
+            .collect();
+        let tombstone = Some(row("gone", StateCell::Tombstone));
+        let hidden_slots = merge_exact_slots(&hidden, keys, vec![tombstone.clone()], vec![None])
+            .expect("tombstone visibility");
+        assert!(hidden_slots[0].is_none());
+
+        let visible = request(&["gone"], true);
+        let keys = visible
+            .rows
+            .iter()
+            .map(|row| {
+                encode_state_key(StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                })
+            })
+            .collect();
+        let visible_slots = merge_exact_slots(&visible, keys, vec![tombstone], vec![None])
+            .expect("tombstone projection");
+        assert!(matches!(
+            visible_slots[0],
+            Some(EntityStateSlot::Tracked(_))
+        ));
+    }
+
+    #[test]
+    fn exact_merge_rejects_authenticated_identity_substitution() {
+        let request = request(&["expected"], false);
+        let keys = request
+            .rows
+            .iter()
+            .map(|row| {
+                encode_state_key(StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                })
+            })
+            .collect();
+        let result = merge_exact_slots(
+            &request,
+            keys,
+            vec![Some(row(
+                "different",
+                StateCell::Value(SharedStr::from("{}")),
+            ))],
+            vec![None],
+        );
+        assert!(result.is_err());
     }
 }
