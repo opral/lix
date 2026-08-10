@@ -18,7 +18,7 @@ use tracing::Instrument as _;
 use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanFingerprint};
 use crate::common::{RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::live_state::MaterializedLiveStateBatch;
+use crate::state::StateRow;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
@@ -1277,28 +1277,42 @@ impl WasmEntitySource for VecEntitySource {
     }
 }
 
-/// Page-lazy complete-entity source backed by the engine's columnar live-state
+/// Page-lazy complete-entity source backed by authenticated state rows
 /// batch. This keeps shared snapshot buffers in their storage-native owner and
 /// constructs generic Wasm entities only for the page currently crossing the
 /// component boundary.
 #[derive(Debug)]
-pub(crate) struct LiveBatchEntitySource {
-    rows: MaterializedLiveStateBatch,
+pub(crate) struct StateRowEntitySource {
+    rows: Vec<StateRow>,
     ordinals: VecDeque<u32>,
     pending: Option<WasmHostEntity>,
     state: VecSourceState,
 }
 
-impl LiveBatchEntitySource {
+impl StateRowEntitySource {
     pub(crate) fn new(
-        rows: MaterializedLiveStateBatch,
+        rows: Vec<StateRow>,
         ordinals: Vec<u32>,
         limits: WasmTransitionLimits,
     ) -> Result<Self, LixError> {
         for pair in ordinals.windows(2) {
-            let left = rows.row(pair[0] as usize);
-            let right = rows.row(pair[1] as usize);
-            if left.schema_key() == right.schema_key() && left.entity_pk() == right.entity_pk() {
+            let left = rows.get(pair[0] as usize).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "state row ordinal is out of bounds",
+                )
+            })?;
+            let right = rows.get(pair[1] as usize).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "state row ordinal is out of bounds",
+                )
+            })?;
+            let left_key = crate::forktree::decode_state_key(&left.key)?;
+            let right_key = crate::forktree::decode_state_key(&right.key)?;
+            if left_key.schema_key == right_key.schema_key
+                && left_key.entity_pk == right_key.entity_pk
+            {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "durable component entity hydration returned duplicate keys",
@@ -1326,25 +1340,27 @@ impl LiveBatchEntitySource {
                 "plugin state selection references a row outside its batch owner",
             )
         })?;
-        let snapshot = row.snapshot_content().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "plugin state selection references a tombstoned row",
-            )
-        })?;
+        let snapshot = match &row.value.cell {
+            crate::forktree::StateCell::Value(value) => value,
+            crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin state selection references a tombstoned row",
+                ));
+            }
+        };
+        let key = crate::forktree::decode_state_key(&row.key)?;
+        let snapshot = snapshot.as_str();
         host_entity_with_lazy_snapshot(
-            WasmEntityKey::from_owned_parts(
-                row.schema_key().to_owned(),
-                row.entity_pk().clone().into_parts(),
-            ),
-            snapshot.clone().into_bytes(),
+            WasmEntityKey::from_owned_parts(key.schema_key, key.entity_pk.into_parts()),
+            snapshot.as_bytes().to_vec(),
             self.state.limits,
         )
         .map(Some)
     }
 }
 
-impl WasmEntitySource for LiveBatchEntitySource {
+impl WasmEntitySource for StateRowEntitySource {
     fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError> {
         if self.state.reached_eof {
             return Ok(None);

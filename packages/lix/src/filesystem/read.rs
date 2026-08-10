@@ -7,6 +7,7 @@ use super::keys::{
 };
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
 use super::{DirectoryPathRecord, derive_directory_paths};
+use super::{FilesystemStateRow, FilesystemStateRows};
 use crate::LixError;
 use crate::common::compose_file_path;
 
@@ -16,24 +17,22 @@ pub(crate) struct FilesystemIndex {
 }
 
 impl FilesystemIndex {
-    pub(crate) fn from_live_batch(
-        rows: &crate::live_state::MaterializedLiveStateBatch,
-    ) -> Result<Self, LixError> {
+    pub(crate) fn from_state_rows(rows: &FilesystemStateRows) -> Result<Self, LixError> {
         let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectorySnapshot>::new();
         let mut file_rows = Vec::<(FileSnapshot, RowScope)>::new();
         let mut blob_hashes_by_key = BTreeMap::<FilesystemBlobRefKey, String>::new();
 
         for row in rows.iter() {
             let scope = RowScope {
-                branch_id: row.branch_id().to_string(),
-                global: row.global(),
-                untracked: row.untracked(),
-                file_id: row.file_id().map(str::to_owned),
+                branch_id: row.branch_id.clone(),
+                global: row.global,
+                untracked: row.untracked,
+                file_id: row.file_id.clone(),
             };
-            let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
+            let Some(snapshot_content) = row.snapshot_content.as_deref() else {
                 continue;
             };
-            match row.schema_key() {
+            match row.schema_key.as_str() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
                     let snapshot: DirectorySnapshot = serde_json::from_str(snapshot_content)
                         .map_err(|error| {
@@ -42,7 +41,7 @@ impl FilesystemIndex {
                             ))
                         })?;
                     directory_rows.insert(
-                        FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone()),
+                        FilesystemDescriptorKey::from_state_row(row, snapshot.id.clone()),
                         snapshot,
                     );
                 }
@@ -74,7 +73,7 @@ impl FilesystemIndex {
                         )
                     })?;
                     blob_hashes_by_key.insert(
-                        FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id),
+                        FilesystemBlobRefKey::from_state_row(row, snapshot.id),
                         snapshot.blob_hash,
                     );
                 }
@@ -306,10 +305,10 @@ fn filesystem_conflict_error(message: String) -> LixError {
 
 #[cfg(test)]
 mod tests {
+    use super::{FilesystemStateRow, FilesystemStateRows};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
-    use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateRow};
 
     use super::{
         BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -318,7 +317,7 @@ mod tests {
     use super::{FilesystemEntry, FilesystemFileEntry, RowScope};
 
     #[test]
-    fn from_live_rows_rejects_file_directory_namespace_conflicts() {
+    fn from_state_rows_rejects_file_directory_namespace_conflicts() {
         let error = filesystem_index_from_rows(vec![
             directory_row(
                 "dir-foo",
@@ -362,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn from_live_rows_attaches_blob_refs_by_storage_scope() {
+    fn from_state_rows_attaches_blob_refs_by_storage_scope() {
         let index = filesystem_index_from_rows(vec![
             file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -386,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn from_live_rows_resolves_directories_by_branch_scope() {
+    fn from_state_rows_resolves_directories_by_branch_scope() {
         let index = filesystem_index_from_rows(vec![
             directory_row(
                 "dir-shared",
@@ -420,10 +419,10 @@ mod tests {
     }
 
     fn filesystem_index_from_rows(
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<FilesystemStateRow>,
     ) -> Result<FilesystemIndex, crate::LixError> {
-        let rows = MaterializedLiveStateBatch::from_rows(rows);
-        FilesystemIndex::from_live_batch(&rows)
+        let rows = FilesystemStateRows::from_rows(rows);
+        FilesystemIndex::from_state_rows(&rows)
     }
 
     fn file_entry_at<'a>(
@@ -435,11 +434,11 @@ mod tests {
             .find_map(|(entry_path, file)| (entry_path == path).then_some(file))
     }
 
-    fn directory_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
+    fn directory_row(entity_pk: &str, snapshot_content: &str) -> FilesystemStateRow {
         live_row(entity_pk, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, snapshot_content)
     }
 
-    fn file_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
+    fn file_row(entity_pk: &str, snapshot_content: &str) -> FilesystemStateRow {
         live_row_with_scope(
             entity_pk,
             FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -450,11 +449,7 @@ mod tests {
         )
     }
 
-    fn live_row(
-        entity_pk: &str,
-        schema_key: &str,
-        snapshot_content: &str,
-    ) -> MaterializedLiveStateRow {
+    fn live_row(entity_pk: &str, schema_key: &str, snapshot_content: &str) -> FilesystemStateRow {
         live_row_with_scope(
             entity_pk,
             schema_key,
@@ -472,8 +467,8 @@ mod tests {
         branch_id: &str,
         untracked: bool,
         file_id: Option<String>,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> FilesystemStateRow {
+        FilesystemStateRow {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: schema_key.to_string(),
             file_id,

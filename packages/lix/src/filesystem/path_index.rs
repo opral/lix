@@ -13,11 +13,7 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::forktree::ForkTreeReadFacade;
-use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateRow,
-};
+use crate::state::{ForkTreeStateView, StateRow};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
@@ -26,6 +22,7 @@ use super::keys::{
 };
 use super::persistent_map::PersistentMap;
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey};
+use super::{FilesystemStateRow, FilesystemStateRows};
 
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -53,7 +50,7 @@ pub(crate) struct FilesystemPathEntry {
     updated_at: String,
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
-    blob_ref: Option<MaterializedLiveStateRow>,
+    blob_ref: Option<FilesystemStateRow>,
 }
 
 impl FilesystemPathEntry {
@@ -61,7 +58,7 @@ impl FilesystemPathEntry {
         self.key.descriptor_id()
     }
 
-    pub(crate) fn live_row(&self) -> MaterializedLiveStateRow {
+    pub(crate) fn state_row(&self) -> FilesystemStateRow {
         let snapshot_content = match self.kind {
             FilesystemPathKind::File => serde_json::json!({
                 "id": self.id(),
@@ -74,7 +71,7 @@ impl FilesystemPathEntry {
                 "name": &self.name,
             }),
         };
-        MaterializedLiveStateRow {
+        FilesystemStateRow {
             entity_pk: EntityPk::uuid_from_canonical(self.id())
                 .expect("filesystem descriptor IDs are validated canonical UUIDs"),
             schema_key: match self.kind {
@@ -128,7 +125,7 @@ impl FilesystemPathEntry {
         self.commit_id
     }
 
-    pub(crate) fn blob_ref_live_row(&self) -> Option<&MaterializedLiveStateRow> {
+    pub(crate) fn blob_ref_state_row(&self) -> Option<&FilesystemStateRow> {
         self.blob_ref.as_ref()
     }
 
@@ -269,10 +266,10 @@ impl Default for FilesystemPathIndex {
 }
 
 impl FilesystemPathIndex {
-    pub(crate) fn from_live_batch(rows: &MaterializedLiveStateBatch) -> Result<Self, LixError> {
+    pub(crate) fn from_state_rows(rows: &FilesystemStateRows) -> Result<Self, LixError> {
         let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectoryRecord>::new();
         let mut file_rows = Vec::<(FilesystemDescriptorKey, FileRecord)>::new();
-        let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, MaterializedLiveStateRow>::new();
+        let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, FilesystemStateRow>::new();
 
         for row in rows.iter() {
             if row.schema_key() != BLOB_REF_SCHEMA_KEY || row.deleted() {
@@ -295,7 +292,7 @@ impl FilesystemPathIndex {
                     LixError::unknown("lix_binary_blob_ref snapshot is missing string id")
                 })?;
             blob_rows.insert(
-                FilesystemBlobRefKey::from_live_row_ref(row, id.to_string()),
+                FilesystemBlobRefKey::from_state_row_ref(row, id.to_string()),
                 row.to_owned(),
             );
         }
@@ -313,7 +310,7 @@ impl FilesystemPathIndex {
                                 "invalid lix_directory_descriptor snapshot JSON: {error}"
                             ))
                         })?;
-                    let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
+                    let key = FilesystemDescriptorKey::from_state_row_ref(row, snapshot.id.clone());
                     directory_rows.insert(
                         key.clone(),
                         DirectoryRecord {
@@ -534,7 +531,7 @@ impl FilesystemPathIndex {
     pub(crate) fn apply_committed_rows(
         &self,
         request: &FilesystemPathIndexRequest,
-        rows: &[MaterializedLiveStateRow],
+        rows: &[FilesystemStateRow],
         generation: Option<&[u8]>,
     ) -> Result<Self, LixError> {
         let mut next = self.clone();
@@ -560,10 +557,7 @@ impl FilesystemPathIndex {
         Ok(next)
     }
 
-    fn apply_committed_blob_ref_row(
-        &mut self,
-        row: &MaterializedLiveStateRow,
-    ) -> Result<(), LixError> {
+    fn apply_committed_blob_ref_row(&mut self, row: &FilesystemStateRow) -> Result<(), LixError> {
         let descriptor_id = row
             .snapshot_content
             .as_deref()
@@ -575,7 +569,7 @@ impl FilesystemPathIndex {
                     .map(str::to_string)
             })
             .unwrap_or(row.entity_pk.as_single_string_owned()?);
-        let blob_ref_key = FilesystemBlobRefKey::from_live_row(row, descriptor_id.clone());
+        let blob_ref_key = FilesystemBlobRefKey::from_state_row(row, descriptor_id.clone());
         let entry = self
             .entries_by_descriptor_id
             .values_equal_by(descriptor_id.as_str(), |key| key.id.as_str())
@@ -596,7 +590,7 @@ impl FilesystemPathIndex {
         Ok(())
     }
 
-    fn apply_committed_row(&mut self, row: &MaterializedLiveStateRow) -> Result<(), LixError> {
+    fn apply_committed_row(&mut self, row: &FilesystemStateRow) -> Result<(), LixError> {
         let kind = match row.schema_key.as_str() {
             FILE_DESCRIPTOR_SCHEMA_KEY => FilesystemPathKind::File,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => FilesystemPathKind::Directory,
@@ -638,7 +632,7 @@ impl FilesystemPathIndex {
         let key = if kind == FilesystemPathKind::File {
             FilesystemDescriptorKey::from_file_descriptor_live_row(row, descriptor_id)
         } else {
-            FilesystemDescriptorKey::from_live_row(row, descriptor_id)
+            FilesystemDescriptorKey::from_state_row(row, descriptor_id)
         };
         let identity = FilesystemPathEntryIdentity {
             kind,
@@ -692,7 +686,7 @@ impl FilesystemPathIndex {
 
     fn entry_from_row(
         &self,
-        row: &MaterializedLiveStateRow,
+        row: &FilesystemStateRow,
         key: FilesystemDescriptorKey,
         kind: FilesystemPathKind,
     ) -> Result<FilesystemPathEntry, LixError> {
@@ -875,8 +869,8 @@ impl FilesystemPathIndex {
 
 fn for_each_committed_row_projection(
     request: &FilesystemPathIndexRequest,
-    row: &MaterializedLiveStateRow,
-    mut apply: impl FnMut(&MaterializedLiveStateRow) -> Result<(), LixError>,
+    row: &FilesystemStateRow,
+    mut apply: impl FnMut(&FilesystemStateRow) -> Result<(), LixError>,
 ) -> Result<(), LixError> {
     if row.global && !request.branch_ids.is_empty() {
         for branch_id in &request.branch_ids {
@@ -960,28 +954,6 @@ impl FilesystemPathIndexRequest {
         self.include_blob_refs = enabled;
         self
     }
-
-    pub(crate) fn live_state_request(&self) -> LiveStateScanRequest {
-        LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: if self.include_blob_refs {
-                    vec![
-                        BLOB_REF_SCHEMA_KEY.to_string(),
-                        DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                    ]
-                } else {
-                    vec![
-                        DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                    ]
-                },
-                branch_ids: self.branch_ids.clone(),
-                ..LiveStateFilter::default()
-            },
-            ..LiveStateScanRequest::default()
-        }
-    }
 }
 
 #[async_trait]
@@ -992,20 +964,16 @@ pub(crate) trait FilesystemPathIndexReader: Send + Sync {
     ) -> Result<Arc<FilesystemPathIndex>, LixError>;
 }
 
-pub(crate) struct UncachedFilesystemPathIndexReader {
-    live_state: Arc<dyn LiveStateReader>,
-}
-
 /// Operation-owned filesystem index reader. The index is derived from the
 /// caller's retained ForkTree capability; it never opens a second facade or
 /// reaches the underlying storage read directly.
 pub(crate) struct ForkTreeFilesystemPathIndexReader<R> {
-    forktree: ForkTreeReadFacade<R>,
+    state: ForkTreeStateView<R>,
 }
 
 impl<R> ForkTreeFilesystemPathIndexReader<R> {
-    pub(crate) fn new(forktree: ForkTreeReadFacade<R>) -> Self {
-        Self { forktree }
+    pub(crate) fn new(state: ForkTreeStateView<R>) -> Self {
+        Self { state }
     }
 }
 
@@ -1018,37 +986,37 @@ where
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        build_path_index(&self.forktree, request).await
+        build_path_index(&self.state, request).await
     }
 }
 
-impl UncachedFilesystemPathIndexReader {
-    pub(crate) fn new(live_state: Arc<dyn LiveStateReader>) -> Self {
-        Self { live_state }
-    }
-}
-
-#[async_trait]
-impl FilesystemPathIndexReader for UncachedFilesystemPathIndexReader {
-    async fn path_index(
-        &self,
-        request: &FilesystemPathIndexRequest,
-    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        build_path_index(self.live_state.as_ref(), request).await
-    }
-}
-
-pub(crate) async fn build_path_index(
-    live_state: &dyn LiveStateReader,
+pub(crate) async fn build_path_index<R>(
+    state: &ForkTreeStateView<R>,
     request: &FilesystemPathIndexRequest,
-) -> Result<Arc<FilesystemPathIndex>, LixError> {
-    let rows = live_state.scan_batch(&request.live_state_request()).await?;
+) -> Result<Arc<FilesystemPathIndex>, LixError>
+where
+    R: StorageAdapterRead,
+{
+    let branch_id = request.branch_ids.first().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_ARGUMENT,
+            "filesystem path index requires one operation-owned branch state view",
+        )
+    })?;
+    if request.branch_ids.len() != 1 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_ARGUMENT,
+            "filesystem path index cannot acquire multiple branch views in one operation",
+        ));
+    }
+    let rows = state.range(None, None, None, true).await?;
+    let rows = FilesystemStateRows::from_view_rows(rows, branch_id, false)?;
     #[cfg(test)]
     {
         FULL_REBUILD_BUILDS.fetch_add(1, Ordering::SeqCst);
         FULL_REBUILD_DESCRIPTOR_ROWS.fetch_add(rows.len(), Ordering::SeqCst);
     }
-    Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
+    Ok(Arc::new(FilesystemPathIndex::from_state_rows(&rows)?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1164,7 +1132,7 @@ impl FilesystemPathIndexCache {
     /// statement in the same transaction.
     pub(crate) fn advance_revisions(
         &self,
-        rows: &[MaterializedLiveStateRow],
+        rows: &[FilesystemStateRow],
         next_revision_for: impl Fn(&[u8]) -> Option<Vec<u8>>,
     ) {
         let invalidates_delta = rows.iter().any(|row| row.global || row.untracked);
@@ -1297,98 +1265,11 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
-    use crate::live_state::MaterializedLiveStateBatchBuilder;
 
     fn path_index_from_rows(
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<FilesystemStateRow>,
     ) -> Result<FilesystemPathIndex, LixError> {
-        FilesystemPathIndex::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
-    }
-
-    #[derive(Clone)]
-    struct BatchOnlyLiveStateReader {
-        rows: MaterializedLiveStateBatch,
-        scan_calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl LiveStateReader for BatchOnlyLiveStateReader {
-        async fn scan_batch(
-            &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            self.scan_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.rows.clone())
-        }
-
-        async fn load_exact_batch(
-            &self,
-            _request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            unreachable!("path-index construction only scans live state")
-        }
-    }
-
-    #[tokio::test]
-    async fn batch_only_path_index_build_preserves_paths_scopes_and_blob_refs() {
-        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000a1";
-        const DIRECTORY_ID: &str = "01920000-0000-7000-8000-0000000000d3";
-        const FILE_ID: &str = "01920000-0000-7000-8000-0000000000f4";
-        let mut file = file_row(FILE_ID, Some(DIRECTORY_ID), "a.md", BRANCH_ID, false);
-        file.metadata = Some(crate::common::SharedStr::from_static(
-            r#"{"source":"batch"}"#,
-        ));
-        let rows = vec![
-            blob_row(FILE_ID, "hash-from-batch", BRANCH_ID),
-            file,
-            directory_row(DIRECTORY_ID, None, "docs", BRANCH_ID, false),
-        ];
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(rows.len());
-        for row in rows {
-            builder.push_owned(row);
-        }
-        let batch = builder.finish();
-
-        let direct = FilesystemPathIndex::from_live_batch(&batch)
-            .expect("direct batch path index should build");
-        let scan_calls = Arc::new(AtomicUsize::new(0));
-        let reader = BatchOnlyLiveStateReader {
-            rows: batch,
-            scan_calls: Arc::clone(&scan_calls),
-        };
-        let built = build_path_index(
-            &reader,
-            &FilesystemPathIndexRequest::new(vec![BRANCH_ID.to_owned()]),
-        )
-        .await
-        .expect("production batch path index should build");
-
-        assert_eq!(scan_calls.load(Ordering::SeqCst), 1);
-        for index in [&direct, built.as_ref()] {
-            assert_eq!(
-                index
-                    .entries()
-                    .iter()
-                    .map(|entry| entry.path.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["/docs", "/docs/a.md"]
-            );
-            let file = index
-                .exact_entries("/docs/a.md")
-                .pop()
-                .expect("batch file should be indexed");
-            assert_eq!(file.kind, FilesystemPathKind::File);
-            assert_eq!(file.key.branch_id(), BRANCH_ID);
-            assert!(!file.key.global());
-            assert_eq!(file.metadata(), Some(r#"{"source":"batch"}"#));
-            assert_eq!(
-                file.blob_ref_live_row()
-                    .and_then(|row| row.snapshot_content.as_deref()),
-                Some(
-                    r#"{"blob_hash":"hash-from-batch","id":"01920000-0000-7000-8000-0000000000f4","size_bytes":7}"#
-                )
-            );
-        }
+        FilesystemPathIndex::from_state_rows(&FilesystemStateRows::from_rows(rows))
     }
 
     #[test]
@@ -1535,7 +1416,7 @@ mod tests {
         let prior_entry = &prior.exact_entries("/a.md")[0];
         assert_eq!(
             prior_entry
-                .blob_ref_live_row()
+                .blob_ref_state_row()
                 .and_then(|row| row.snapshot_content.as_deref()),
             Some(r#"{"blob_hash":"hash-before","id":"file-a","size_bytes":7}"#)
         );
@@ -1549,13 +1430,13 @@ mod tests {
             .expect("blob-ref delta should apply");
         assert_eq!(
             next.exact_entries("/a.md")[0]
-                .blob_ref_live_row()
+                .blob_ref_state_row()
                 .and_then(|row| row.snapshot_content.as_deref()),
             Some(r#"{"blob_hash":"hash-after","id":"file-a","size_bytes":7}"#)
         );
         assert_eq!(
             prior_entry
-                .blob_ref_live_row()
+                .blob_ref_state_row()
                 .and_then(|row| row.snapshot_content.as_deref()),
             Some(r#"{"blob_hash":"hash-before","id":"file-a","size_bytes":7}"#)
         );
@@ -1568,7 +1449,7 @@ mod tests {
             .expect("blob-ref tombstone should apply");
         assert!(
             deleted.exact_entries("/a.md")[0]
-                .blob_ref_live_row()
+                .blob_ref_state_row()
                 .is_none()
         );
     }
@@ -1593,7 +1474,7 @@ mod tests {
         let entries = next.exact_entries("/global.md");
         assert_eq!(entries.len(), 1);
         let blob_ref = entries[0]
-            .blob_ref_live_row()
+            .blob_ref_state_row()
             .expect("projected file should retain its updated blob ref");
         assert_eq!(blob_ref.branch_id.as_ref(), "branch-a");
         assert_eq!(
@@ -1837,7 +1718,7 @@ mod tests {
         name: &str,
         branch_id: &str,
         global: bool,
-    ) -> MaterializedLiveStateRow {
+    ) -> FilesystemStateRow {
         live_row(
             id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -1853,7 +1734,7 @@ mod tests {
         name: &str,
         branch_id: &str,
         global: bool,
-    ) -> MaterializedLiveStateRow {
+    ) -> FilesystemStateRow {
         live_row(
             id,
             FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -1863,7 +1744,7 @@ mod tests {
         )
     }
 
-    fn blob_row(id: &str, blob_hash: &str, branch_id: &str) -> MaterializedLiveStateRow {
+    fn blob_row(id: &str, blob_hash: &str, branch_id: &str) -> FilesystemStateRow {
         let mut row = live_row(
             id,
             BLOB_REF_SCHEMA_KEY,
@@ -1886,8 +1767,8 @@ mod tests {
         snapshot_content: String,
         branch_id: &str,
         global: bool,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> FilesystemStateRow {
+        FilesystemStateRow {
             entity_pk: EntityPk::single(id),
             schema_key: schema_key.to_string(),
             file_id: None,

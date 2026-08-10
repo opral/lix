@@ -15,7 +15,7 @@ use crate::binary_cas::BlobId;
 use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{MaterializedLiveStateExactBatch, MaterializedLiveStateRow};
+use crate::state::StateRow;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::{
     WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
@@ -246,7 +246,7 @@ pub(crate) fn materialize_keyless_creates(
 pub(crate) fn require_existing_id_authorities(
     plugin: &PluginRegistryEntry,
     keys: &[WasmEntityKey],
-    rows: &MaterializedLiveStateExactBatch,
+    rows: &[Option<StateRow>],
     file_id: &str,
     branch_id: &str,
 ) -> Result<(), LixError> {
@@ -257,17 +257,19 @@ pub(crate) fn require_existing_id_authorities(
         ));
     }
     for (slot, key) in keys.iter().enumerate() {
-        let valid = rows.row(slot).is_some_and(|row| {
-            !row.deleted()
-                && row.snapshot_content().is_some()
-                && key.schema_key == row.schema_key()
+        let valid = rows.get(slot).and_then(Option::as_ref).is_some_and(|row| {
+            let Ok(state_key) = crate::forktree::decode_state_key(&row.key) else {
+                return false;
+            };
+            !row.value.cell.deleted()
+                && state_snapshot_content(row).is_some()
+                && key.schema_key == state_key.schema_key
                 && key.entity_pk.len() == 1
                 && EntityPk::uuid_from_canonical(&key.entity_pk[0])
-                    .is_ok_and(|entity_pk| row.entity_pk() == &entity_pk)
-                && row.file_id() == Some(file_id)
-                && row.branch_id() == branch_id
-                && !row.global()
-                && !row.untracked()
+                    .is_ok_and(|entity_pk| state_key.entity_pk == entity_pk)
+                && state_key.file_id.as_deref() == Some(file_id)
+                && branch_id != crate::GLOBAL_BRANCH_ID
+                && matches!(row.source, crate::state::StateRowSource::Branch)
         });
         if !valid {
             return Err(LixError::new(
@@ -297,7 +299,7 @@ struct ReservationValue {
 /// same-proof replay without another write, and rejects a truncated-context
 /// collision before semantic rows enter the transaction buffer.
 pub(crate) fn reserve_create_row(
-    existing: Option<&MaterializedLiveStateRow>,
+    existing: Option<&StateRow>,
     bound: BoundCreateContext,
     file_id: &str,
     branch_id: &str,
@@ -332,7 +334,7 @@ pub(crate) fn reserve_create_row(
 /// rejecting it here prevents guest-local allocator errors from obscuring the
 /// public constraint violation.
 pub(crate) fn validate_create_reservation(
-    existing: Option<&MaterializedLiveStateRow>,
+    existing: Option<&StateRow>,
     bound: BoundCreateContext,
     file_id: &str,
     branch_id: &str,
@@ -342,9 +344,7 @@ pub(crate) fn validate_create_reservation(
     };
     let key = bound.reservation_key();
     validate_reservation_identity(row, &key, file_id, branch_id)?;
-    let snapshot = row
-        .snapshot_content
-        .as_deref()
+    let snapshot = state_snapshot_content(row)
         .ok_or_else(|| invalid_id(format!("create reservation '{key}' has no snapshot")))?;
     let snapshot: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
         invalid_id(format!(
@@ -441,24 +441,34 @@ fn reservation_row(
 }
 
 fn validate_reservation_identity(
-    row: &MaterializedLiveStateRow,
+    row: &StateRow,
     key: &str,
     file_id: &str,
     branch_id: &str,
 ) -> Result<(), LixError> {
-    if row.schema_key != KEY_VALUE_SCHEMA_KEY
-        || row.entity_pk.as_single_string().ok() != Some(key)
-        || row.file_id.as_deref() != Some(file_id)
-        || row.branch_id.as_ref() != branch_id
-        || row.global
-        || row.untracked
-        || row.deleted
+    let state_key = crate::forktree::decode_state_key(&row.key).map_err(|_| {
+        invalid_id(format!(
+            "create reservation '{key}' has an invalid state key"
+        ))
+    })?;
+    if state_key.schema_key != KEY_VALUE_SCHEMA_KEY
+        || state_key.entity_pk.as_single_string().ok() != Some(key)
+        || state_key.file_id.as_deref() != Some(file_id)
+        || !matches!(row.source, crate::state::StateRowSource::Branch)
+        || row.value.cell.deleted()
     {
         return Err(invalid_id(format!(
             "create reservation '{key}' has invalid tracked file scope"
         )));
     }
     Ok(())
+}
+
+fn state_snapshot_content(row: &StateRow) -> Option<&str> {
+    match &row.value.cell {
+        crate::forktree::StateCell::Value(value) => Some(value.as_str()),
+        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -582,25 +592,11 @@ mod tests {
         }
     }
 
-    fn row_for(bound: BoundCreateContext) -> MaterializedLiveStateRow {
+    fn row_for(bound: BoundCreateContext) -> StateRow {
         let write = reserve_create_row(None, bound, "01920000-0000-7000-8000-0000000000a2", "main")
             .expect("reserve")
             .expect("new row");
-        MaterializedLiveStateRow {
-            entity_pk: write.entity_pk.expect("pk"),
-            schema_key: write.schema_key.into(),
-            file_id: write.file_id.map(Into::into),
-            snapshot_content: write.snapshot.map(|snapshot| snapshot.normalized().into()),
-            metadata: None,
-            deleted: false,
-            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-            updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-            global: false,
-            change_id: None,
-            commit_id: None,
-            untracked: false,
-            branch_id: "main".into(),
-        }
+        state_row_from_write(write)
     }
 
     #[test]
@@ -659,26 +655,29 @@ mod tests {
             .component(1)
             .expect("generated UUID");
         let key = WasmEntityKey::from_owned_parts("csv_row", vec![id.clone()]);
-        let row = MaterializedLiveStateRow {
-            entity_pk: EntityPk::uuid_from_canonical(&id).expect("typed UUID primary key"),
-            schema_key: "csv_row".into(),
-            file_id: Some("01920000-0000-7000-8000-0000000000a2".into()),
-            snapshot_content: Some("{}".into()),
-            metadata: None,
-            deleted: false,
-            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-            updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-            global: false,
-            change_id: None,
-            commit_id: None,
-            untracked: false,
-            branch_id: "main".into(),
+        let row = StateRow {
+            key: crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                schema_key: "csv_row",
+                file_id: Some("01920000-0000-7000-8000-0000000000a2"),
+                entity_pk: &EntityPk::uuid_from_canonical(&id).expect("typed UUID primary key"),
+            }),
+            value: crate::forktree::StateValue {
+                change_id: crate::changelog::ChangeId::for_test_label("change"),
+                commit_id: crate::changelog::CommitId::for_test_label("commit"),
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                cell: crate::forktree::StateCell::Value("{}".into()),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source: crate::state::StateRowSource::Branch,
         };
 
         require_existing_id_authorities(
             &plugin(),
             &[key],
-            &MaterializedLiveStateExactBatch::from_rows(vec![Some(row)]),
+            &[Some(row)],
             "01920000-0000-7000-8000-0000000000a2",
             "main",
         )
@@ -754,6 +753,33 @@ mod tests {
         .expect_err("preflight must reject a reused seed before entering the guest");
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert!(error.message.contains("different operation proof"));
+    }
+
+    fn state_row_from_write(write: TransactionWriteRow) -> StateRow {
+        let entity_pk = write.entity_pk.expect("reservation entity key");
+        let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+            schema_key: &write.schema_key,
+            file_id: write.file_id.as_deref(),
+            entity_pk: &entity_pk,
+        });
+        let snapshot = write.snapshot.map(|snapshot| snapshot.normalized().into());
+        StateRow {
+            key,
+            value: crate::forktree::StateValue {
+                change_id: crate::changelog::ChangeId::for_test_label("change"),
+                commit_id: crate::changelog::CommitId::for_test_label("commit"),
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                cell: snapshot.map_or(
+                    crate::forktree::StateCell::Tombstone,
+                    crate::forktree::StateCell::Value,
+                ),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source: crate::state::StateRowSource::Branch,
+        }
     }
 
     #[test]

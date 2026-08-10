@@ -12,7 +12,6 @@ mod create_context;
 mod incremental;
 mod install;
 mod manifest;
-mod materializer;
 mod registry;
 mod storage;
 
@@ -30,7 +29,7 @@ pub(crate) use create_context::{
     validate_create_changes, validate_create_reservation,
 };
 pub(crate) use incremental::{
-    ArcByteSource, FileBytesSha256, LiveBatchEntitySource, SchemaAllowlist,
+    ArcByteSource, FileBytesSha256, SchemaAllowlist, StateRowEntitySource,
     ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
     VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
     canonicalize_snapshot, certify_dense_fresh_file, drain_conflict_transition_resolutions,
@@ -43,7 +42,6 @@ pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_arch
 pub(crate) use manifest::{
     PluginContentMatcher, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
 };
-pub(crate) use materializer::plugin_state_live_state_projection;
 pub(crate) use registry::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
     PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,

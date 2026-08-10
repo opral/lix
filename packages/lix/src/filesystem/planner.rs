@@ -12,16 +12,13 @@ use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef,
-};
+use crate::state::{ForkTreeStateView, StateRow};
 
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 use super::visibility::VisibleFilesystem;
-use super::{DirectoryPathRecord, derive_directory_paths};
+use super::{DirectoryPathRecord, FilesystemStateRow, FilesystemStateRows, derive_directory_paths};
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteRow;
 use crate::transaction::types::{
@@ -99,8 +96,8 @@ impl FilesystemDescriptorKey {
         }
     }
 
-    pub(crate) fn from_live_row(
-        row: &MaterializedLiveStateRow,
+    pub(crate) fn from_state_row(
+        row: &FilesystemStateRow,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -112,8 +109,8 @@ impl FilesystemDescriptorKey {
         }
     }
 
-    pub(crate) fn from_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+    pub(crate) fn from_state_row_ref(
+        row: &FilesystemStateRow,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -125,8 +122,8 @@ impl FilesystemDescriptorKey {
         }
     }
 
-    pub(crate) fn from_file_descriptor_live_row(
-        row: &MaterializedLiveStateRow,
+    pub(crate) fn from_file_descriptor_state_row(
+        row: &FilesystemStateRow,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -138,8 +135,8 @@ impl FilesystemDescriptorKey {
         }
     }
 
-    pub(crate) fn from_file_descriptor_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+    pub(crate) fn from_file_descriptor_state_row_ref(
+        row: &FilesystemStateRow,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -228,18 +225,18 @@ impl FilesystemBlobRefKey {
         })
     }
 
-    pub(crate) fn from_live_row(
-        row: &MaterializedLiveStateRow,
-        blob_ref_id: impl Into<String>,
-    ) -> Self {
-        Self(FilesystemDescriptorKey::from_live_row(row, blob_ref_id))
+    pub(crate) fn from_state_row(row: &FilesystemStateRow, blob_ref_id: impl Into<String>) -> Self {
+        Self(FilesystemDescriptorKey::from_state_row(row, blob_ref_id))
     }
 
-    pub(crate) fn from_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+    pub(crate) fn from_state_row_ref(
+        row: &FilesystemStateRow,
         blob_ref_id: impl Into<String>,
     ) -> Self {
-        Self(FilesystemDescriptorKey::from_live_row_ref(row, blob_ref_id))
+        Self(FilesystemDescriptorKey::from_state_row_ref(
+            row,
+            blob_ref_id,
+        ))
     }
 }
 
@@ -1422,7 +1419,7 @@ pub(crate) fn plan_recursive_directory_delete(
 }
 
 pub(crate) fn directory_path_resolvers_from_state_batch(
-    rows: &crate::live_state::MaterializedLiveStateBatch,
+    rows: &FilesystemStateRows,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
@@ -1500,30 +1497,24 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
     Ok(resolvers)
 }
 
-pub(crate) async fn directory_path_resolvers_from_live_state(
-    live_state: Arc<dyn LiveStateReader>,
+pub(crate) async fn directory_path_resolvers_from_state_view<R>(
+    state: &ForkTreeStateView<R>,
     branch_binding: Option<&str>,
-) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
-    let rows = live_state
-        .scan_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![
-                    DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                    FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                ],
-                branch_ids: branch_binding
-                    .map(|branch_id| vec![branch_id.to_string()])
-                    .unwrap_or_default(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .await?;
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError>
+where
+    R: crate::storage_adapter::StorageAdapterRead,
+{
+    let branch_id = branch_binding.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_ARGUMENT,
+            "filesystem path resolution requires a branch-bound state view",
+        )
+    })?;
+    let rows = state.range(None, None, None, true).await?;
+    let rows = FilesystemStateRows::from_view_rows(rows, branch_id, false)?;
     let mut resolvers = directory_path_resolvers_from_state_batch(&rows)?;
-    if let Some(branch_id) = branch_binding {
-        let key = filesystem_storage_scope_key(branch_id, false, false, None);
-        resolvers.entry(key).or_default();
-    }
+    let key = filesystem_storage_scope_key(branch_id, false, false, None);
+    resolvers.entry(key).or_default();
     Ok(resolvers)
 }
 
@@ -1743,11 +1734,9 @@ mod tests {
         plan_file_descriptor_write,
     };
     use crate::common::LixPath;
+    use crate::entity_pk::EntityPk;
     use crate::filesystem::VisibleFilesystem;
-    use crate::{
-        entity_pk::EntityPk,
-        live_state::{MaterializedLiveStateBatch, MaterializedLiveStateRow},
-    };
+    use crate::filesystem::{FilesystemStateRow, FilesystemStateRows};
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
@@ -2630,7 +2619,7 @@ mod tests {
 
     #[test]
     fn directory_path_resolvers_from_state_batch_derives_nested_paths() {
-        let rows = MaterializedLiveStateBatch::from_rows(vec![
+        let rows = FilesystemStateRows::from_rows(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2665,7 +2654,7 @@ mod tests {
 
     #[test]
     fn directory_path_resolvers_from_state_batch_handles_parent_cycles() {
-        let rows = MaterializedLiveStateBatch::from_rows(vec![
+        let rows = FilesystemStateRows::from_rows(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000a3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2721,7 +2710,7 @@ mod tests {
             ),
         ];
 
-        let rows = MaterializedLiveStateBatch::from_rows(rows);
+        let rows = FilesystemStateRows::from_rows(rows);
         let resolvers = super::directory_path_resolvers_from_state_batch(&rows)
             .expect("scoped rows should seed distinct resolvers");
 
@@ -2969,7 +2958,7 @@ mod tests {
         entity_pk: &str,
         branch_id: &str,
         snapshot_content: &str,
-    ) -> MaterializedLiveStateRow {
+    ) -> FilesystemStateRow {
         live_directory_row_with_scope(entity_pk, branch_id, false, false, None, snapshot_content)
     }
 
@@ -2980,8 +2969,8 @@ mod tests {
         untracked: bool,
         file_id: Option<String>,
         snapshot_content: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> FilesystemStateRow {
+        FilesystemStateRow {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id,
