@@ -7490,12 +7490,7 @@ where
                     format!("working diff '{diff_id}' has no target row"),
                 )
             })?;
-            let created_at =
-                if entry.before.as_ref().is_none_or(|before| before.deleted) && !target.deleted {
-                    target.updated_at
-                } else {
-                    target.created_at
-                };
+            let created_at = target.created_at;
             if requested.contains(&diff_id) {
                 matched.insert(diff_id);
                 selected_source_membership_exact &=

@@ -203,16 +203,13 @@ fn push_selected_change(
     selected_changes: &mut StagedCommitChangeBatchBuilder,
     key: &StateKey,
     value: &crate::forktree::StateValue,
-    kind: CheckpointChangeKind,
+    _kind: CheckpointChangeKind,
 ) -> bool {
-    // A changelog change durably stores one timestamp, which rebuild uses for
-    // both timestamps when the entity is absent from the parent checkpoint.
-    // Canonicalize newly added rows to that representation so checkpoint roots
-    // remain content-equivalent after their compacted auto-commits are swept.
-    let created_at = match kind {
-        CheckpointChangeKind::Added => value.updated_at,
-        CheckpointChangeKind::Modified | CheckpointChangeKind::Removed => value.created_at,
-    };
+    // The authenticated Change payload owns the row's creation identity. A
+    // newly added row may have a later update timestamp, but replacing
+    // `created_at` with it would make selected-history metadata disagree with
+    // the source Change and disable exact source membership certification.
+    let created_at = value.created_at;
     let source_membership_exact = created_at == value.created_at;
     let deleted = value.cell == StateCell::Tombstone;
     let source_commit_id = value.commit_id;
@@ -238,7 +235,7 @@ mod tests {
     use crate::forktree::{StateCell, StateValue};
 
     #[test]
-    fn canonicalized_added_timestamp_declines_source_membership_certificate() {
+    fn added_timestamp_preserves_source_membership_certificate() {
         let created_at = LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z");
         let updated_at = LixTimestamp::expect_parse("updated_at", "2026-01-02T00:00:00Z");
         let key = StateKey {
@@ -265,10 +262,10 @@ mod tests {
             selected.finish()
         };
 
-        assert!(!selected.source_membership_certified());
+        assert!(selected.source_membership_certified());
         assert_eq!(
             selected.iter().next().expect("one selected row").created_at,
-            updated_at
+            created_at
         );
     }
 }
