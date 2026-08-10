@@ -983,8 +983,8 @@ where
     Ok(())
 }
 
-/// Compatibility name retained only as the concrete transaction hook name;
-/// all inputs and behavior are native and no legacy reader is involved.
+/// Validates the prepared write cohorts against the transaction-owned native
+/// state view before ForkTree publication.
 pub(crate) async fn validate_prepared_writes_by_branch<R>(
     state_view: &TransactionStateView<R>,
     active_branch_id: &str,
