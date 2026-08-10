@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::catalog::{CatalogContext, CatalogSnapshot, TransactionCatalog};
 use crate::domain::Domain;
-use crate::state::ForkTreeStateView;
+use crate::state::TransactionStateView;
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Transaction-local schema owner backed by the operation's authenticated
@@ -26,7 +26,7 @@ impl TransactionSchemaResolver {
 
     async fn load_catalog_for_domain<R>(
         &mut self,
-        state: &ForkTreeStateView<R>,
+        state: &TransactionStateView<R>,
         domain: &Domain,
     ) -> Result<(), LixError>
     where
@@ -40,7 +40,7 @@ impl TransactionSchemaResolver {
         crate::storage_bench::record_transaction_schema_catalog_load();
         let catalog = self
             .context
-            .compiled_catalog_for_domain(state, &domain)
+            .compiled_catalog_for_transaction_state(state, &domain)
             .await?;
         self.catalogs_by_domain
             .insert(domain, TransactionCatalog::Shared(catalog));
@@ -49,7 +49,7 @@ impl TransactionSchemaResolver {
 
     pub(crate) async fn catalog_for_row_normalization<R>(
         &mut self,
-        state: &ForkTreeStateView<R>,
+        state: &TransactionStateView<R>,
         domain: &Domain,
     ) -> Result<&mut TransactionCatalog, LixError>
     where
@@ -64,7 +64,7 @@ impl TransactionSchemaResolver {
 
     pub(crate) async fn catalog_for_validation<R>(
         &mut self,
-        state: &ForkTreeStateView<R>,
+        state: &TransactionStateView<R>,
         domain: &Domain,
     ) -> Result<&CatalogSnapshot, LixError>
     where

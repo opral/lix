@@ -1352,11 +1352,13 @@ where
                 &active_branch_id,
             )
             .await?;
+            let opening_transaction_state_view =
+                TransactionStateView::new(opening_state_view.clone(), Vec::new())?;
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let catalog_revision = load_catalog_revision(&read).await?;
                 let sql_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
-                        &opening_state_view,
+                        &opening_transaction_state_view,
                         &Domain::schema_catalog(active_branch_id.clone(), true),
                         catalog_revision.as_ref(),
                     )
@@ -1367,7 +1369,7 @@ where
                 // first write never falls back to a catalog scan.
                 let tracked_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
-                        &opening_state_view,
+                        &opening_transaction_state_view,
                         &Domain::schema_catalog(active_branch_id.clone(), false),
                         catalog_revision.as_ref(),
                     )
@@ -1393,7 +1395,7 @@ where
                 opening_selector_fence,
                 opening_active_branch_head,
                 opening_global_branch_head,
-                opening_state_view,
+                opening_transaction_state_view,
                 runtime_boundary_result,
             ))
         }
@@ -1426,7 +1428,7 @@ where
             tracked_schema_catalog,
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
-        let state_view = TransactionStateView::new(opening_state_view, Vec::new())?;
+        let state_view = opening_state_view;
         Ok((
             OpenTransaction {
                 transaction: Self {
@@ -2354,13 +2356,11 @@ where
             let timestamp = self.functions.call_timestamp();
             return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
         }
-        let state_view =
-            Self::open_state_view(self.opening_read(), self.active_branch_id.clone()).await?;
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&state_view, &domain)
+                .catalog_for_row_normalization(&self.state_view, &domain)
                 .await?;
             let mut scalar_facts = PreparedScalarBatch::with_capacity(rows.len());
             for index in 0..rows.len() {
@@ -2429,7 +2429,7 @@ where
             let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&state_view, &domain)
+                .catalog_for_row_normalization(&self.state_view, &domain)
                 .await?;
             for &index in &row_indices {
                 let row = rows.row(index);
