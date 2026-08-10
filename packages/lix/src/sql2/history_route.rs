@@ -11,7 +11,7 @@ use crate::LixError;
 use crate::changelog::{ChangeId, ChangeRecord, CommitId};
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
-use crate::forktree::encode_state_entity_prefix_bounds;
+use crate::forktree::{StateKey, encode_state_entity_prefix_bounds};
 
 use super::SqlChangelogQuerySource;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
@@ -209,6 +209,60 @@ impl HistoryRoute {
         }
         true
     }
+}
+
+fn certified_state_keys(
+    request: &CommitGraphChangeHistoryRequest,
+    entries: &[crate::commit_graph::CommitGraphChangeHistoryEntry],
+    observed_commit_id: CommitId,
+) -> Option<Vec<StateKey>> {
+    if request.schema_keys.is_empty() || request.file_ids.is_empty() {
+        return None;
+    }
+    let schema_keys = request
+        .schema_keys
+        .iter()
+        .filter(|schema_key| schema_key.as_str() != "lix_commit")
+        .collect::<Vec<_>>();
+    if schema_keys.is_empty() {
+        return Some(Vec::new());
+    }
+    let entries = entries
+        .iter()
+        .filter(|entry| entry.observed_commit_id == observed_commit_id)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Some(Vec::new());
+    }
+    let entity_pks = if request.entity_pks.is_empty() {
+        entries
+            .iter()
+            .filter(|entry| {
+                schema_keys
+                    .iter()
+                    .any(|key| *key == &entry.change.schema_key)
+            })
+            .map(|entry| entry.change.entity_pk.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        request.entity_pks.clone()
+    };
+    Some(
+        schema_keys
+            .into_iter()
+            .flat_map(|schema_key| {
+                entity_pks.iter().flat_map(move |entity_pk| {
+                    request.file_ids.iter().map(move |file_id| StateKey {
+                        schema_key: schema_key.clone(),
+                        file_id: Some(file_id.clone()),
+                        entity_pk: entity_pk.clone(),
+                    })
+                })
+            })
+            .collect(),
+    )
 }
 
 fn certified_state_ranges(
@@ -649,29 +703,40 @@ where
                     format!("certified commit '{certified_commit_id}' is not reachable"),
                 ));
             }
-            let certified_ranges = certified_state_ranges(&request, &entries, certified_commit_id);
-            let certified_rows = match certified_ranges.as_deref() {
-                None => {
+            let certified_rows =
+                if let Some(keys) = certified_state_keys(&request, &entries, certified_commit_id) {
                     forktree_reader
-                        .scan_state_rows_at_commit(certified_commit_id)
+                        .load_state_rows_at_commit(&certified_commit_id.to_string(), &keys)
                         .await?
-                }
-                Some(ranges) => {
-                    let mut rows = Vec::new();
-                    for (lower, upper) in ranges {
-                        rows.extend(
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                } else {
+                    let certified_ranges =
+                        certified_state_ranges(&request, &entries, certified_commit_id);
+                    match certified_ranges.as_deref() {
+                        None => {
                             forktree_reader
-                                .scan_state_rows_at_commit_range(
-                                    certified_commit_id,
-                                    lower,
-                                    upper.as_deref(),
-                                )
-                                .await?,
-                        );
+                                .scan_state_rows_at_commit(certified_commit_id)
+                                .await?
+                        }
+                        Some(ranges) => {
+                            let mut rows = Vec::new();
+                            for (lower, upper) in ranges {
+                                rows.extend(
+                                    forktree_reader
+                                        .scan_state_rows_at_commit_range(
+                                            certified_commit_id,
+                                            lower,
+                                            upper.as_deref(),
+                                        )
+                                        .await?,
+                                );
+                            }
+                            rows
+                        }
                     }
-                    rows
-                }
-            };
+                };
             for row in certified_rows {
                 let (row_depth, row_commit_created_at, account_id) = if let Some(source) =
                     member_sources_by_change.get(&row.change_id)
