@@ -7,7 +7,7 @@
 
 #![allow(clippy::needless_borrow, clippy::unnecessary_wraps)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
@@ -153,6 +153,131 @@ impl NativeValidationRows {
 
     fn extend(&mut self, other: Self) {
         self.rows.extend(other.rows);
+    }
+}
+
+type PropertyGroupKey = Vec<Vec<String>>;
+type PropertyValueKey = (String, PropertyGroupKey, Vec<String>);
+type InsertIdentityKey = (String, bool, Option<String>, String, EntityPk);
+
+/// One-pass indexes over the authenticated committed rows used by validation.
+/// The old implementation re-scanned every committed row for every staged row
+/// and every constraint.  These indexes preserve the same row set and filters,
+/// but make the committed-side work O(N + K) per validation cohort rather than
+/// O(N * K), where N is visible state and K is the changed set.
+struct NativeValidationIndex {
+    rows: NativeValidationRows,
+    property_values: BTreeMap<PropertyValueKey, Vec<usize>>,
+    file_owners: BTreeMap<String, Vec<usize>>,
+    insert_identities: BTreeMap<InsertIdentityKey, Vec<usize>>,
+}
+
+impl NativeValidationIndex {
+    fn build(rows: NativeValidationRows, catalog: &CatalogSnapshot) -> Result<Self, LixError> {
+        let mut property_groups = BTreeMap::<String, BTreeSet<PropertyGroupKey>>::new();
+        for plan in catalog.plans() {
+            for unique in &plan.uniques {
+                property_groups
+                    .entry(plan.key.schema_key.clone())
+                    .or_default()
+                    .insert(unique.clone());
+            }
+            for foreign_key in &plan.foreign_keys {
+                property_groups
+                    .entry(foreign_key.referenced_schema.schema_key.clone())
+                    .or_default()
+                    .insert(foreign_key.referenced_properties.clone());
+            }
+        }
+
+        let mut property_values = BTreeMap::<PropertyValueKey, Vec<usize>>::new();
+        let mut file_owners = BTreeMap::<String, Vec<usize>>::new();
+        let mut insert_identities = BTreeMap::<InsertIdentityKey, Vec<usize>>::new();
+        for (index, row) in rows.rows.iter().enumerate() {
+            if row.deleted {
+                continue;
+            }
+            insert_identities
+                .entry((
+                    row.branch_id.clone(),
+                    row.global,
+                    row.file_id().map(str::to_owned),
+                    row.schema_key().to_owned(),
+                    row.entity_pk().clone(),
+                ))
+                .or_default()
+                .push(index);
+
+            if row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY {
+                if let Some(file_id) = row.file_id() {
+                    file_owners
+                        .entry(file_id.to_owned())
+                        .or_default()
+                        .push(index);
+                } else if let Ok(file_id) = row.entity_pk().as_single_string() {
+                    file_owners
+                        .entry(file_id.to_owned())
+                        .or_default()
+                        .push(index);
+                }
+            }
+
+            let Some(groups) = property_groups.get(row.schema_key()) else {
+                continue;
+            };
+            let Some(snapshot) = row.snapshot_json()? else {
+                continue;
+            };
+            for group in groups {
+                if let Some(value) = pointer_group_value(&snapshot, group) {
+                    property_values
+                        .entry((row.schema_key().to_owned(), group.clone(), value))
+                        .or_default()
+                        .push(index);
+                }
+            }
+        }
+
+        Ok(Self {
+            rows,
+            property_values,
+            file_owners,
+            insert_identities,
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &NativeValidationRow> {
+        self.rows.iter()
+    }
+
+    fn row(&self, index: usize) -> &NativeValidationRow {
+        &self.rows.rows[index]
+    }
+
+    fn property_candidates(
+        &self,
+        schema_key: &str,
+        properties: &PropertyGroupKey,
+        value: &[String],
+    ) -> &[usize] {
+        self.property_values
+            .get(&(schema_key.to_owned(), properties.clone(), value.to_vec()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn file_owner_candidates(&self, file_id: &str) -> &[usize] {
+        self.file_owners
+            .get(file_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn insert_identity_candidates(&self, key: &InsertIdentityKey) -> &[usize] {
+        self.insert_identities
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 
@@ -423,7 +548,7 @@ fn row_is_tombstone(row: PreparedValidationRow<'_>) -> bool {
 async fn validate_unique_constraints<R>(
     input: &TransactionValidationInput<'_, R>,
     staged_rows: &[PreparedValidationRow<'_>],
-    all_rows: &NativeValidationRows,
+    all_rows: &NativeValidationIndex,
 ) -> Result<(), LixError>
 where
     R: StorageAdapterRead,
@@ -446,7 +571,8 @@ where
             let Some(value) = pointer_group_value(&snapshot, pointers) else {
                 continue;
             };
-            for other in all_rows.iter() {
+            for &other_index in all_rows.property_candidates(row.schema_key(), pointers, &value) {
+                let other = all_rows.row(other_index);
                 if same_identity(row, other)
                     || other.deleted
                     || other.schema_key() != row.schema_key()
@@ -501,7 +627,7 @@ where
 async fn validate_foreign_keys<R>(
     input: &TransactionValidationInput<'_, R>,
     staged_rows: &[PreparedValidationRow<'_>],
-    all_rows: &NativeValidationRows,
+    all_rows: &NativeValidationIndex,
 ) -> Result<(), LixError>
 where
     R: StorageAdapterRead,
@@ -524,13 +650,14 @@ where
             };
             let target_schema = foreign_key.referenced_schema.schema_key.as_str();
             let found = all_rows
+                .property_candidates(
+                    target_schema,
+                    &foreign_key.referenced_properties,
+                    &local_value,
+                )
                 .iter()
-                .filter(|target| !target.deleted && target.schema_key() == target_schema)
-                .any(|target| {
-                    target.snapshot_json().ok().flatten().and_then(|value| {
-                        pointer_group_value(&value, &foreign_key.referenced_properties)
-                    }) == Some(local_value.clone())
-                })
+                .map(|&target_index| all_rows.row(target_index))
+                .any(|target| !target.deleted && target.schema_key() == target_schema)
                 || staged_rows.iter().copied().any(|target| {
                     !row_is_tombstone(target)
                         && target.schema_key() == target_schema
@@ -553,7 +680,7 @@ where
 async fn validate_file_ownership<R>(
     input: &TransactionValidationInput<'_, R>,
     staged_rows: &[PreparedValidationRow<'_>],
-    all_rows: &NativeValidationRows,
+    all_rows: &NativeValidationIndex,
 ) -> Result<(), LixError>
 where
     R: StorageAdapterRead,
@@ -569,19 +696,20 @@ where
         let Some(file_id) = row.file_id() else {
             continue;
         };
-        let present = all_rows.iter().any(|candidate| {
-            !candidate.deleted
-                && candidate.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
-                && ((candidate.file_id().is_none()
-                    && candidate.entity_pk().as_single_string().ok() == Some(file_id))
-                    || candidate.file_id() == Some(file_id))
-        }) || staged_rows.iter().copied().any(|candidate| {
-            !row_is_tombstone(candidate)
-                && candidate.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
-                && ((candidate.file_id().is_none()
-                    && candidate.entity_pk().as_single_string().ok() == Some(file_id))
-                    || candidate.file_id() == Some(file_id))
-        });
+        let present = all_rows
+            .file_owner_candidates(file_id)
+            .iter()
+            .map(|&candidate_index| all_rows.row(candidate_index))
+            .any(|candidate| {
+                !candidate.deleted && candidate.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
+            })
+            || staged_rows.iter().copied().any(|candidate| {
+                !row_is_tombstone(candidate)
+                    && candidate.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
+                    && ((candidate.file_id().is_none()
+                        && candidate.entity_pk().as_single_string().ok() == Some(file_id))
+                        || candidate.file_id() == Some(file_id))
+            });
         if !present {
             return Err(LixError::new(
                 LixError::CODE_FILE_NOT_FOUND,
@@ -676,7 +804,7 @@ fn prepared_descriptor_namespace_parts(
 async fn validate_filesystem_namespace<R>(
     input: &TransactionValidationInput<'_, R>,
     staged_rows: &[PreparedValidationRow<'_>],
-    all_rows: &NativeValidationRows,
+    all_rows: &NativeValidationIndex,
 ) -> Result<(), LixError>
 where
     R: StorageAdapterRead,
@@ -747,7 +875,7 @@ where
 async fn validate_delete_restrictions<R>(
     input: &TransactionValidationInput<'_, R>,
     staged_rows: &[PreparedValidationRow<'_>],
-    all_rows: &NativeValidationRows,
+    all_rows: &NativeValidationIndex,
 ) -> Result<(), LixError>
 where
     R: StorageAdapterRead,
@@ -952,10 +1080,11 @@ where
             .await?,
         );
     }
-    validate_unique_constraints(&input, &staged_rows, &all_rows).await?;
-    validate_foreign_keys(&input, &staged_rows, &all_rows).await?;
-    validate_file_ownership(&input, &staged_rows, &all_rows).await?;
-    validate_filesystem_namespace(&input, &staged_rows, &all_rows).await?;
+    let validation_index = NativeValidationIndex::build(all_rows, input.schema_catalog)?;
+    validate_unique_constraints(&input, &staged_rows, &validation_index).await?;
+    validate_foreign_keys(&input, &staged_rows, &validation_index).await?;
+    validate_file_ownership(&input, &staged_rows, &validation_index).await?;
+    validate_filesystem_namespace(&input, &staged_rows, &validation_index).await?;
     for row in staged_rows
         .iter()
         .copied()
@@ -993,14 +1122,14 @@ where
             ));
         }
     }
-    validate_delete_restrictions(&input, &staged_rows, &all_rows).await?;
-    validate_insert_identities(&input, &all_rows).await?;
+    validate_delete_restrictions(&input, &staged_rows, &validation_index).await?;
+    validate_insert_identities(&input, &validation_index).await?;
     Ok(())
 }
 
 async fn validate_insert_identities<R>(
     input: &TransactionValidationInput<'_, R>,
-    all_rows: &NativeValidationRows,
+    all_rows: &NativeValidationIndex,
 ) -> Result<(), LixError>
 where
     R: StorageAdapterRead,
@@ -1021,9 +1150,21 @@ where
                 format!("duplicate insert identity for schema '{}'", row.schema_key),
             ));
         }
-        if all_rows.iter().any(|current| {
-            !current.deleted && same_insert_identity(PreparedValidationRow::State(row), current)
-        }) {
+        let key = (
+            row.branch_id.to_string(),
+            row.global,
+            row.file_id.map(ToString::to_string),
+            row.schema_key.to_string(),
+            row.entity_pk.clone(),
+        );
+        if all_rows
+            .insert_identity_candidates(&key)
+            .iter()
+            .map(|&current_index| all_rows.row(current_index))
+            .any(|current| {
+                !current.deleted && same_insert_identity(PreparedValidationRow::State(row), current)
+            })
+        {
             return Err(unique_constraint_error(
                 crate::transaction::duplicate_insert_identity_message(
                     row.schema_key,
@@ -1120,5 +1261,55 @@ mod tests {
         );
         let error = descriptor_namespace_parts(&row).expect_err("invalid name must fail");
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+    }
+
+    #[test]
+    fn validation_index_candidate_count_stays_bounded_by_changed_values() {
+        let schema = serde_json::json!({
+            "x-lix-key": "validation_scale",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/slug"]],
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "slug": {"type": "string"}
+            },
+            "required": ["id", "slug"],
+            "additionalProperties": false
+        });
+        let catalog =
+            CatalogSnapshot::from_visible_schemas(&[schema]).expect("test schema must compile");
+        let mut rows = NativeValidationRows::default();
+        for index in 0..4096 {
+            rows.rows.push(native_row(
+                "validation_scale",
+                &format!(r#"{{"id":"{index}","slug":"slug-{index}"}}"#),
+            ));
+        }
+
+        let row_count = rows.rows.len();
+        let validation_index =
+            NativeValidationIndex::build(rows, &catalog).expect("test rows must index");
+        let unique_group = vec![vec!["slug".to_owned()]];
+        let candidate_count = validation_index
+            .property_candidates(
+                "validation_scale",
+                &unique_group,
+                &["\"slug-2048\"".to_owned()],
+            )
+            .len();
+
+        assert_eq!(row_count, 4096);
+        assert_eq!(candidate_count, 1);
+        assert_eq!(
+            validation_index
+                .property_candidates(
+                    "validation_scale",
+                    &unique_group,
+                    &["\"missing\"".to_owned()],
+                )
+                .len(),
+            0
+        );
     }
 }
