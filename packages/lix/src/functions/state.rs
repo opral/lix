@@ -1,8 +1,6 @@
 use crate::LixError;
-use crate::NullableKeyFilter;
-use crate::forktree::ForkTreeReadFacade;
 use crate::functions::{DeterministicMode, DeterministicSequence};
-use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
+use crate::state::StateRow;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use bytes::Bytes;
 use serde_json::Value as JsonValue;
@@ -26,10 +24,10 @@ pub(crate) async fn load_mode(
 ) -> Result<DeterministicMode, LixError> {
     let rows = load_key_value_rows(read).await?;
     let Some(row) = rows.iter().find(|row| {
-        !row.deleted
-            && row
-                .entity_pk
-                .as_single_string()
+        !row.value.cell.deleted()
+            && crate::forktree::decode_state_key(&row.key)
+                .ok()
+                .and_then(|key| key.entity_pk.as_single_string().ok())
                 .is_ok_and(|key| key == DETERMINISTIC_MODE_KEY)
     }) else {
         return Ok(DeterministicMode::disabled());
@@ -47,10 +45,10 @@ pub(crate) async fn load_sequence(
 ) -> Result<DeterministicSequence, LixError> {
     let rows = load_key_value_rows(read).await?;
     let sequence = rows.iter().find(|row| {
-        !row.deleted
-            && row
-                .entity_pk
-                .as_single_string()
+        !row.value.cell.deleted()
+            && crate::forktree::decode_state_key(&row.key)
+                .ok()
+                .and_then(|key| key.entity_pk.as_single_string().ok())
                 .is_ok_and(|key| key == DETERMINISTIC_SEQUENCE_KEY)
     });
     if let Some(row) = sequence {
@@ -58,14 +56,15 @@ pub(crate) async fn load_sequence(
     }
 
     let initialized = rows.iter().find(|row| {
-        row.entity_pk
-            .as_single_string()
+        crate::forktree::decode_state_key(&row.key)
+            .ok()
+            .and_then(|key| key.entity_pk.as_single_string().ok())
             .is_ok_and(|key| key == DETERMINISTIC_SEQUENCE_INITIALIZED_KEY)
     });
     let Some(initialized) = initialized else {
         return Ok(DeterministicSequence::uninitialized());
     };
-    if initialized.deleted {
+    if initialized.value.cell.deleted() {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
             "deterministic sequence initialization marker was deleted",
@@ -188,24 +187,13 @@ async fn untracked_precondition(
 
 async fn load_key_value_rows(
     read: &(impl StorageAdapterRead + ?Sized),
-) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    let forktree = ForkTreeReadFacade::new(read);
-    let rows = crate::live_state::scan_forktree_facade(
-        &forktree,
-        &LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
-                branch_ids: vec![crate::GLOBAL_BRANCH_ID.to_owned()],
-                file_ids: vec![NullableKeyFilter::Null],
-                untracked: Some(true),
-                include_tombstones: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .await?
-    .into_rows();
+) -> Result<Vec<StateRow>, LixError> {
+    let _ = read;
+    return Err(LixError::new(
+        LixError::CODE_STORAGE_ERROR,
+        "untracked deterministic state requires the shared ForkTreeStateView untracked seam",
+    ));
+    /*
     let mut identities = BTreeSet::new();
     for row in &rows {
         if row.schema_key != KEY_VALUE_SCHEMA_KEY
@@ -277,10 +265,20 @@ async fn load_key_value_rows(
         }
     }
     Ok(rows)
+    */
 }
 
-fn key_value_payload(row: &MaterializedLiveStateRow, key: &str) -> Result<JsonValue, LixError> {
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+fn key_value_payload(row: &StateRow, key: &str) -> Result<JsonValue, LixError> {
+    let snapshot_content = match &row.value.cell {
+        crate::forktree::StateCell::Value(value) => value.as_str(),
+        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("deterministic key-value row '{key}' is missing snapshot_content"),
+            ));
+        }
+    };
+    let snapshot_content = Some(snapshot_content).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("deterministic key-value row '{key}' is missing snapshot_content"),

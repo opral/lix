@@ -18,7 +18,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::binary_cas::BlobId;
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
-use crate::live_state::MaterializedLiveStateRow;
+use crate::state::StateRow;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError};
@@ -353,15 +353,15 @@ impl PluginRegistry {
         Self::from_optional_value(Some(value))
     }
 
-    pub(crate) fn from_optional_live_state_row(
-        row: Option<&MaterializedLiveStateRow>,
+    pub(crate) fn from_optional_state_row(
+        row: Option<&StateRow>,
         branch_id: &str,
     ) -> Result<Self, LixError> {
         let Some(row) = row else {
             return Ok(Self::empty());
         };
-        validate_live_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id)?;
-        if row.deleted || row.snapshot_content.is_none() {
+        validate_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id)?;
+        if row.value.cell.deleted() || state_snapshot_content(row).is_none() {
             return Ok(Self::empty());
         }
         let snapshot = parse_snapshot_content(row, "plugin registry")?;
@@ -557,15 +557,16 @@ impl PluginFileOwner {
         }))
     }
 
-    pub(crate) fn from_live_state_row(
-        row: &MaterializedLiveStateRow,
+    pub(crate) fn from_state_row(
+        row: &StateRow,
         branch_id: &str,
     ) -> Result<Option<Self>, LixError> {
-        let file_id = row.file_id.as_deref().ok_or_else(|| {
+        let key = crate::forktree::decode_state_key(&row.key)?;
+        let file_id = key.file_id.as_deref().ok_or_else(|| {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
-        validate_live_state_identity(row, PLUGIN_OWNER_KEY, Some(file_id), branch_id)?;
-        if row.deleted || row.snapshot_content.is_none() {
+        validate_state_identity(row, PLUGIN_OWNER_KEY, Some(file_id), branch_id)?;
+        if row.value.cell.deleted() || state_snapshot_content(row).is_none() {
             return Ok(None);
         }
         let snapshot = parse_snapshot_content(row, "plugin owner")?;
@@ -1086,19 +1087,23 @@ fn tracked_key_value_write_row(
     })
 }
 
-fn validate_live_state_identity(
-    row: &MaterializedLiveStateRow,
+fn validate_state_identity(
+    row: &StateRow,
     key: &str,
     expected_file_id: Option<&str>,
     branch_id: &str,
 ) -> Result<(), LixError> {
     validate_branch_local_scope(branch_id)?;
-    if row.schema_key != KEY_VALUE_SCHEMA_KEY
-        || row.entity_pk.as_single_string().ok() != Some(key)
-        || row.file_id.as_deref() != expected_file_id
-        || row.global
-        || row.untracked
-        || row.branch_id.as_ref() != branch_id
+    let state_key = crate::forktree::decode_state_key(&row.key)?;
+    if state_key.schema_key != KEY_VALUE_SCHEMA_KEY
+        || state_key.entity_pk.as_single_string().ok() != Some(key)
+        || state_key.file_id.as_deref() != expected_file_id
+        || branch_id.is_empty()
+        || !matches!(
+            (expected_file_id, row.source),
+            (Some(_), crate::state::StateRowSource::Branch)
+                | (None, crate::state::StateRowSource::Global)
+        )
     {
         return Err(invalid_registry(format!(
             "reserved plugin row '{key}' has invalid tracked branch-local storage identity"
@@ -1116,15 +1121,18 @@ fn validate_branch_local_scope(branch_id: &str) -> Result<(), LixError> {
     Ok(())
 }
 
-fn parse_snapshot_content(
-    row: &MaterializedLiveStateRow,
-    kind: &str,
-) -> Result<JsonValue, LixError> {
-    let raw = row.snapshot_content.as_deref().ok_or_else(|| {
-        invalid_registry(format!("{kind} live-state row is missing snapshot_content"))
-    })?;
+fn parse_snapshot_content(row: &StateRow, kind: &str) -> Result<JsonValue, LixError> {
+    let raw = state_snapshot_content(row)
+        .ok_or_else(|| invalid_registry(format!("{kind} state row is missing snapshot content")))?;
     serde_json::from_str(raw)
         .map_err(|error| invalid_registry(format!("{kind} snapshot is invalid JSON: {error}")))
+}
+
+fn state_snapshot_content(row: &StateRow) -> Option<&str> {
+    match &row.value.cell {
+        crate::forktree::StateCell::Value(value) => Some(value.as_str()),
+        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
+    }
 }
 
 fn glob_specificity_rank(glob: &str) -> (u8, i32) {
