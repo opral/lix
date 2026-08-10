@@ -5,19 +5,20 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion::common::{DataFusionError, Result, ScalarValue, not_impl_err};
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, not_impl_err};
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 
 use crate::branch::BranchRefReader;
+use crate::changelog::CommitRecord;
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
-use crate::forktree::decode_state_key;
+use crate::forktree::{StateCell, StateKeyRef, StateValue, decode_state_key, encode_state_key};
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
@@ -34,9 +35,7 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
-#[cfg(test)]
-use crate::state::StateRow;
-use crate::state::{ForkTreeStateView, StateRowSource};
+use crate::state::{ForkTreeStateView, StateRow, StateRowSource};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter, parse_row_metadata_value};
 
 use crate::sql2::{SqlChangelogQuerySource, SqlWriteContext, WriteAccess};
@@ -49,8 +48,8 @@ use super::entity_history::register_entity_history_surface;
 use datafusion::physical_plan::ExecutionPlan;
 
 use super::spec::{
-    DmlReturning, InsertApply, PlannedDml, PlannedScan, TableSpec, projected_schema,
-    register_spec_table, row_source, scan_row_source, take_record_batch_rows,
+    DmlReturning, InsertApply, PlannedDml, PlannedScan, TableSpec, finish_scan_batch,
+    projected_schema, register_spec_table, row_source, scan_row_source, take_record_batch_rows,
 };
 use super::values::{
     optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
@@ -79,28 +78,54 @@ where
         match &surface.kind {
             PublicSurfaceKind::EntityBase { schema_key } if include_write_surfaces => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
-                register_spec_table(
-                    ctx,
-                    &surface.name,
-                    Arc::new(EntitySpec::active(
+                let provider = if matches!(schema_key.as_str(), "lix_commit" | "lix_commit_edge") {
+                    let commit_graph = commit_graph.as_ref().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "commit projection is missing its retained ForkTree graph",
+                        )
+                    })?;
+                    EntitySpec::active_commit(
+                        spec,
+                        Arc::clone(&branch_ref),
+                        Arc::clone(commit_graph),
+                    )
+                } else {
+                    EntitySpec::active(
                         spec,
                         state_view.clone(),
                         Arc::clone(&branch_ref),
                         active_branch_id.to_string(),
-                    )),
+                    )
+                };
+                register_spec_table(
+                    ctx,
+                    &surface.name,
+                    Arc::new(provider),
                     WriteAccess::read_only(),
                 )?;
             }
             PublicSurfaceKind::EntityByBranch { schema_key } if include_write_surfaces => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
+                let provider = if matches!(schema_key.as_str(), "lix_commit" | "lix_commit_edge") {
+                    let commit_graph = commit_graph.as_ref().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "commit projection is missing its retained ForkTree graph",
+                        )
+                    })?;
+                    EntitySpec::by_branch_commit(
+                        spec,
+                        Arc::clone(&branch_ref),
+                        Arc::clone(commit_graph),
+                    )
+                } else {
+                    EntitySpec::by_branch(spec, state_view.clone(), Arc::clone(&branch_ref))
+                };
                 register_spec_table(
                     ctx,
                     &surface.name,
-                    Arc::new(EntitySpec::by_branch(
-                        spec,
-                        state_view.clone(),
-                        Arc::clone(&branch_ref),
-                    )),
+                    Arc::new(provider),
                     WriteAccess::read_only(),
                 )?;
             }
@@ -214,6 +239,7 @@ where
     branch_ref: Arc<dyn BranchRefReader>,
     schema: SchemaRef,
     branch_binding: BranchBinding,
+    commit_graph: Option<super::SharedCommitGraph>,
 }
 
 impl<R> EntitySpec<R>
@@ -234,6 +260,7 @@ where
             write_ctx: None,
             branch_ref,
             branch_binding: BranchBinding::active(active_branch_id),
+            commit_graph: None,
         }
     }
 
@@ -251,6 +278,7 @@ where
             write_ctx: Some(write_ctx),
             branch_ref,
             branch_binding: BranchBinding::active(active_branch_id),
+            commit_graph: None,
         }
     }
 
@@ -267,6 +295,7 @@ where
             write_ctx: None,
             branch_ref,
             branch_binding: BranchBinding::explicit(),
+            commit_graph: None,
         }
     }
 
@@ -283,6 +312,41 @@ where
             write_ctx: Some(write_ctx),
             branch_ref,
             branch_binding: BranchBinding::explicit(),
+            commit_graph: None,
+        }
+    }
+
+    fn active_commit(
+        spec: Arc<EntitySurfaceSpec>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        commit_graph: super::SharedCommitGraph,
+    ) -> Self {
+        Self {
+            surface_name: spec.schema_key.clone(),
+            schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            spec,
+            state_view: None,
+            write_ctx: None,
+            branch_ref,
+            branch_binding: BranchBinding::active(crate::GLOBAL_BRANCH_ID.to_string()),
+            commit_graph: Some(commit_graph),
+        }
+    }
+
+    fn by_branch_commit(
+        spec: Arc<EntitySurfaceSpec>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        commit_graph: super::SharedCommitGraph,
+    ) -> Self {
+        Self {
+            surface_name: format!("{}_by_branch", spec.schema_key),
+            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
+            spec,
+            state_view: None,
+            write_ctx: None,
+            branch_ref,
+            branch_binding: BranchBinding::explicit(),
+            commit_graph: Some(commit_graph),
         }
     }
 
@@ -316,6 +380,218 @@ where
                 "entity provider has no retained native state view",
             ))
         }
+    }
+
+    async fn commit_slots(&self) -> Result<Vec<EntityStateSlot>, LixError> {
+        let commit_graph = self.commit_graph.as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "commit projection has no retained ForkTree graph",
+            )
+        })?;
+        // The commit surfaces expose the authenticated logical topology, not
+        // every object that happens to remain physically present while GC is
+        // asynchronous. Branch selectors and snapshot selectors are the
+        // roots; walking those roots also keeps expired intervals hidden once
+        // their selectors are retired, without introducing a second retention
+        // or reachability authority.
+        let mut root_ids = self
+            .branch_ref
+            .scan_heads()
+            .await?
+            .into_iter()
+            .map(|head| head.commit_id)
+            .collect::<BTreeSet<_>>();
+        {
+            let mut graph = commit_graph.lock().await;
+            root_ids.extend(
+                graph
+                    .snapshot_roots()
+                    .await?
+                    .into_iter()
+                    .map(|(_, commit_id)| commit_id),
+            );
+        }
+        let (nodes, records) = {
+            let mut graph = commit_graph.lock().await;
+            let mut nodes = BTreeMap::new();
+            for root_id in root_ids {
+                for reachable in graph.reachable_nodes(&root_id).await?.iter() {
+                    nodes
+                        .entry(reachable.commit.commit_id)
+                        .or_insert_with(|| reachable.commit.clone());
+                }
+            }
+            let nodes = nodes.into_values().collect::<Vec<_>>();
+            let records = graph
+                .load_commit_records(&nodes.iter().map(|node| node.commit_id).collect::<Vec<_>>())
+                .await?;
+            (nodes, records)
+        };
+
+        if nodes.len() != records.len() {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "ForkTree commit projection returned an incomplete commit-record batch",
+            ));
+        }
+
+        let mut commits = Vec::with_capacity(nodes.len());
+        for (node, record) in nodes.into_iter().zip(records) {
+            let record = record.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "ForkTree commit projection is missing commit '{}'",
+                        node.commit_id
+                    ),
+                )
+            })?;
+            if record.commit_id != node.commit_id
+                || record.generation != node.generation
+                || record.parent_commit_ids != node.parent_commit_ids
+            {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "ForkTree commit projection has inconsistent topology for '{}'",
+                        node.commit_id
+                    ),
+                ));
+            }
+            commits.push(record);
+        }
+        commits.sort_by_key(|record| record.commit_id);
+
+        let by_branch = matches!(self.branch_binding, BranchBinding::Explicit);
+        let branch_ids = if by_branch {
+            let mut branch_ids = self
+                .branch_ref
+                .scan_heads()
+                .await?
+                .into_iter()
+                .map(|head| head.branch_id)
+                .collect::<Vec<_>>();
+            branch_ids.sort();
+            branch_ids.dedup();
+            branch_ids
+        } else {
+            Vec::new()
+        };
+
+        let mut slots = Vec::new();
+        for record in &commits {
+            let commit_snapshot =
+                crate::changelog::commit_row_snapshot_json(&record.commit_id.to_string())?;
+            if self.spec.schema_key == "lix_commit" {
+                let entity_pk = EntityPk::uuid_from_canonical(&record.commit_id.to_string())
+                    .map_err(|error| {
+                        LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string())
+                    })?;
+                let row = commit_projection_row(
+                    &self.spec.schema_key,
+                    entity_pk,
+                    commit_snapshot,
+                    record,
+                )?;
+                if by_branch {
+                    for branch_id in &branch_ids {
+                        slots.push(EntityStateSlot::TrackedAt {
+                            row: row.clone(),
+                            branch_id: branch_id.clone(),
+                        });
+                    }
+                } else {
+                    slots.push(EntityStateSlot::Tracked(row));
+                }
+                continue;
+            }
+
+            for (parent_order, parent_id) in record.parent_commit_ids.iter().enumerate() {
+                let snapshot = serde_json::json!({
+                    "parent_id": parent_id.to_string(),
+                    "child_id": record.commit_id.to_string(),
+                    "parent_order": parent_order as i64,
+                });
+                let entity_pk = EntityPk::from_primary_key_plan(
+                    &snapshot,
+                    &self.spec.primary_key_paths,
+                    &self.spec.primary_key_component_types,
+                )
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+                let row = commit_projection_row(
+                    &self.spec.schema_key,
+                    entity_pk,
+                    serde_json::to_string(&snapshot).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!("commit edge snapshot serialization failed: {error}"),
+                        )
+                    })?,
+                    record,
+                )?;
+                if by_branch {
+                    for branch_id in &branch_ids {
+                        slots.push(EntityStateSlot::TrackedAt {
+                            row: row.clone(),
+                            branch_id: branch_id.clone(),
+                        });
+                    }
+                } else {
+                    slots.push(EntityStateSlot::Tracked(row));
+                }
+            }
+        }
+        Ok(slots)
+    }
+
+    async fn plan_commit_scan(
+        &self,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        props: &ExecutionProps,
+    ) -> Result<PlannedScan> {
+        let source_schema = Arc::clone(&self.schema);
+        let output_schema = projected_schema(&source_schema, projection);
+        let df_schema = DFSchema::try_from(Arc::clone(&source_schema))?;
+        let physical_filters = filters
+            .iter()
+            .map(|filter| create_physical_expr(filter, &df_schema, props))
+            .collect::<Result<Vec<_>>>()?;
+        let projection = projection.cloned();
+        let table_name = self.surface_name.clone();
+        let provider = self.clone();
+        Ok(PlannedScan {
+            schema: Arc::clone(&output_schema),
+            ordering: None,
+            source: scan_row_source(
+                Arc::clone(&output_schema),
+                (provider, source_schema, physical_filters, projection, limit),
+                move |(provider, source_schema, physical_filters, projection, limit)| {
+                    let table_name = table_name.clone();
+                    async move {
+                        let slots = provider
+                            .commit_slots()
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                        let batch = entity_record_batch_from_slots(
+                            &provider.spec,
+                            source_schema,
+                            &slots,
+                            None,
+                        )?;
+                        finish_scan_batch(
+                            batch,
+                            &physical_filters,
+                            projection.as_deref(),
+                            limit,
+                            &table_name,
+                        )
+                    }
+                },
+            ),
+        })
     }
 
     /// Plan-time scan derivation shared by `plan_scan` and the unit tests:
@@ -586,6 +862,33 @@ struct EntityReturningKey {
     file_id: Option<String>,
 }
 
+fn commit_projection_row(
+    schema_key: &str,
+    entity_pk: EntityPk,
+    snapshot: String,
+    record: &CommitRecord,
+) -> Result<StateRow, LixError> {
+    let key = encode_state_key(StateKeyRef {
+        schema_key,
+        file_id: None,
+        entity_pk: &entity_pk,
+    });
+    Ok(StateRow {
+        key,
+        value: StateValue {
+            change_id: record.change_id,
+            commit_id: record.commit_id,
+            created_at: record.created_at,
+            updated_at: record.created_at,
+            cell: StateCell::Value(crate::common::SharedStr::from(snapshot)),
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        },
+        source: StateRowSource::Global,
+    })
+}
+
 #[async_trait]
 impl<R> TableSpec<R> for EntitySpec<R>
 where
@@ -600,6 +903,9 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
+        if self.commit_graph.is_some() {
+            return TableProviderFilterPushDown::Exact;
+        }
         let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
         let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
         if ExactBranchIdFilterAnalyzer.supports(filter)
@@ -623,8 +929,13 @@ where
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-        _props: &ExecutionProps,
+        props: &ExecutionProps,
     ) -> Result<PlannedScan> {
+        if self.commit_graph.is_some() {
+            return self
+                .plan_commit_scan(projection, filters, limit, props)
+                .await;
+        }
         let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
         let spec = Arc::clone(&self.spec);
