@@ -105,8 +105,9 @@ pub(crate) trait SqlExecutionContext: Sync {
     /// Loads reusable public-surface metadata for this read snapshot.
     ///
     /// The default keeps lightweight test/read contexts simple. Session
-    /// contexts override it with their revision-keyed catalog cache; providers
-    /// themselves remain scoped to the current storage snapshot.
+    /// contexts override it with their authenticated row-fingerprint catalog
+    /// cache; providers themselves remain scoped to the current storage
+    /// snapshot.
     async fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
         Ok(Arc::new(PublicCatalog::from_visible_schemas(
             &self.load_visible_schemas().await?,

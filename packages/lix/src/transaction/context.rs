@@ -26,10 +26,7 @@ use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchLifecycle, BranchOperation, BranchRefReader, BranchRefStoreReader,
     BranchReferenceRole,
 };
-use crate::catalog::{
-    CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId, load_catalog_revision,
-    stage_catalog_revision,
-};
+use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId};
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, CommitId, load_change_records,
     materialize_known_change_payloads,
@@ -1397,23 +1394,20 @@ where
             let opening_transaction_state_view =
                 TransactionStateView::new(opening_state_view.clone(), Vec::new())?;
             let (sql_schema_catalog, tracked_schema_catalog) = {
-                let catalog_revision = load_catalog_revision(&read).await?;
                 let sql_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_open(
+                    .compiled_catalog_for_transaction_state(
                         &opening_transaction_state_view,
                         &Domain::schema_catalog(active_branch_id.clone(), true),
-                        catalog_revision.as_ref(),
                     )
                     .await?;
                 // SQL planning needs the untracked-visible catalog, while
                 // normal tracked mutations normalize against the tracked
-                // catalog. Pin both under the same revision at open so the
-                // first write never falls back to a catalog scan.
+                // catalog. Both are compiled from authenticated rows in the
+                // opening ForkTree view and cached by their content fingerprint.
                 let tracked_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_open(
+                    .compiled_catalog_for_transaction_state(
                         &opening_transaction_state_view,
                         &Domain::schema_catalog(active_branch_id.clone(), false),
-                        catalog_revision.as_ref(),
                     )
                     .await?;
                 (sql_schema_catalog, tracked_schema_catalog)
@@ -1547,7 +1541,6 @@ where
         transaction
             .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
             .await;
-        let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         if let Err(error) = check_commit_boundary(commit_boundary.as_ref()) {
             transaction
@@ -1669,9 +1662,6 @@ where
         // prepare/commit boundary.
         let (mut writes, materialization_preconditions) =
             prepared_forktree_plan.into_storage_plan()?;
-        if catalog_revision_changed {
-            stage_catalog_revision(&mut writes);
-        }
         let mut write_options = StorageWriteOptions::default();
         write_options.await_durable = transaction.await_durable_commit;
         write_options
@@ -8350,28 +8340,6 @@ fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestam
             "invalid {column} timestamp for prepared state row: {error}"
         ))
     })
-}
-
-fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
-    prepared_writes.state_rows.iter().any(|row| {
-        matches!(
-            row.schema_key.as_str(),
-            REGISTERED_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
-        )
-    }) || prepared_writes
-        .commit_change_refs_by_branch
-        .values()
-        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
-        .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
-        // Retiring a branch removes its descriptor and selector but cannot
-        // change registered-schema visibility for any surviving branch.
-        // Creation/repoint still rotates the revision: creation fences a
-        // cached snapshot if the same branch identity is reused, while a
-        // repoint can expose another commit's registered schemas.
-        || prepared_writes
-            .branch_ref_intents
-            .iter()
-            .any(|intent| intent.create || intent.commit_id.is_some())
 }
 
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {

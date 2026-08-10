@@ -5,7 +5,6 @@ use blake3::Hasher;
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::catalog::revision::CatalogRevision;
 use crate::catalog::snapshot::{
     CatalogFingerprint, fingerprint_schema_facts, hash_fingerprint_part,
 };
@@ -21,69 +20,17 @@ const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
 pub(crate) struct CatalogContext {
     compiled_catalogs: Mutex<HashMap<CatalogFingerprint, Arc<CatalogSnapshot>>>,
     compiled_catalogs_by_rows: Mutex<HashMap<CatalogRowsFingerprint, Arc<CatalogSnapshot>>>,
-    transaction_opening_catalogs:
-        Mutex<HashMap<TransactionOpeningCatalogKey, Arc<CatalogSnapshot>>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CatalogRowsFingerprint(String);
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct TransactionOpeningCatalogKey {
-    domain: Domain,
-    revision: CatalogRevision,
-}
 
 impl CatalogContext {
     pub(crate) fn new() -> Self {
         Self {
             compiled_catalogs: Mutex::new(HashMap::new()),
             compiled_catalogs_by_rows: Mutex::new(HashMap::new()),
-            transaction_opening_catalogs: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub(crate) async fn compiled_catalog_for_transaction_open<R>(
-        &self,
-        state: &TransactionStateView<R>,
-        domain: &Domain,
-        revision: Option<&CatalogRevision>,
-    ) -> Result<Arc<CatalogSnapshot>, LixError>
-    where
-        R: crate::storage_adapter::StorageAdapterRead,
-    {
-        let Some(revision) = revision else {
-            return self
-                .compiled_catalog_for_transaction_state(state, domain)
-                .await;
-        };
-        let key = TransactionOpeningCatalogKey {
-            domain: domain.clone(),
-            revision: revision.clone(),
-        };
-        if let Some(snapshot) = self
-            .transaction_opening_catalogs
-            .lock()
-            .expect("transaction opening catalog cache lock should not be poisoned")
-            .get(&key)
-        {
-            return Ok(Arc::clone(snapshot));
-        }
-
-        let snapshot = self
-            .compiled_catalog_for_transaction_state(state, domain)
-            .await?;
-        let mut cache = self
-            .transaction_opening_catalogs
-            .lock()
-            .expect("transaction opening catalog cache lock should not be poisoned");
-        if cache.len() >= COMPILED_CATALOG_CACHE_LIMIT {
-            if let Some(evicted) = cache.keys().find(|entry| **entry != key).cloned() {
-                cache.remove(&evicted);
-            }
-        }
-        cache.insert(key, Arc::clone(&snapshot));
-        Ok(snapshot)
     }
 
     pub(crate) async fn compiled_catalog_for_transaction_state<R>(

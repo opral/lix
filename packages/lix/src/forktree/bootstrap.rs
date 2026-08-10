@@ -443,7 +443,6 @@ where
         blob_manifest_object_ids: &[],
     })?;
     writes.put(UNTRACKED_ROW_SPACE, workspace_key, workspace_value);
-    crate::catalog::stage_catalog_revision(&mut writes);
     crate::init::stage_repository_protocol(&mut writes);
     #[cfg(test)]
     tests::inject_selector_before_bootstrap_commit(
