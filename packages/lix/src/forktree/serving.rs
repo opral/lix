@@ -2724,17 +2724,12 @@ where
         )
         .await
         .map_err(|error| corruption(error.to_string()))?;
-        if !commit_is_ancestor_on_read(
-            repository,
-            &summary,
-            page_commit_id,
-            &mut summary_cache,
-            read,
-        )
-        .await?
+        if !page_summary
+            .member_page_object_ids
+            .contains(&value_ref.page_object_id)
         {
             return Err(corruption(
-                "stale state value page is owned by an unreachable commit",
+                "stale state value page is not owned by its authenticated commit",
             ));
         }
         let page_ordinal = value_ref.page_ordinal as usize;
@@ -3167,7 +3162,7 @@ pub(crate) struct StaleCommitSummary {
     pub(crate) generation: u64,
     pub(crate) global_state_root: ObjectId,
     pub(crate) local_state_root: ObjectId,
-    pub(crate) parent_commit_ids: Vec<CommitId>,
+    pub(crate) member_page_object_ids: Vec<ObjectId>,
 }
 
 /// Authenticates only the commit envelope and root/topology summary required
@@ -3203,8 +3198,7 @@ where
         &commit,
     )
     .await?;
-    let topology =
-        validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit).await?;
+    validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit).await?;
     validate_root_on_read(commit.global_state_root, "state", read).await?;
     validate_root_on_read(commit.local_state_root, "state", read).await?;
     let summary = StaleCommitSummary {
@@ -3213,56 +3207,13 @@ where
         generation: commit.generation,
         global_state_root: commit.global_state_root,
         local_state_root: commit.local_state_root,
-        parent_commit_ids: topology
-            .parent_commit_ids
-            .into_iter()
-            .map(|parent_id| CommitId::from_bytes(*parent_id.as_uuid().as_bytes()))
-            .collect(),
+        member_page_object_ids: commit.member_page_object_ids.clone(),
     };
     cache.insert(commit_id, summary);
     Ok(cache
         .get(&commit_id)
         .expect("stale summary was just inserted")
         .clone())
-}
-
-async fn commit_is_ancestor_on_read<R>(
-    repository: &RepositoryRootV1,
-    descendant: &StaleCommitSummary,
-    ancestor: CommitId,
-    cache: &mut BTreeMap<crate::changelog::CommitId, StaleCommitSummary>,
-    read: &R,
-) -> Result<bool, StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let mut pending = vec![descendant.clone()];
-    let mut visited = BTreeSet::new();
-    while let Some(current) = pending.pop() {
-        if !visited.insert(current.commit_id) {
-            continue;
-        }
-        if current.commit_id == ancestor {
-            return Ok(true);
-        }
-        for parent_id in current.parent_commit_ids {
-            let parent = load_historical_commit_state_roots_for_stale(
-                read,
-                repository,
-                crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*parent_id.as_bytes())),
-                cache,
-            )
-            .await
-            .map_err(|error| corruption(error.to_string()))?;
-            if parent.generation >= current.generation {
-                return Err(corruption(
-                    "stale commit ancestry has a non-decreasing generation",
-                ));
-            }
-            pending.push(parent);
-        }
-    }
-    Ok(false)
 }
 
 fn historical_state_rows_from_range(
