@@ -176,6 +176,12 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         ))
     }
 
+    #[cfg(test)]
+    fn record_file_exact_batch(&mut self, _request: &crate::sql2::providers::FileExactBatchPlan) {}
+
+    #[cfg(test)]
+    fn record_file_scan(&mut self) {}
+
     /// Resolves an unpublished inline file payload from this transaction's
     /// write buffer. The caller supplies the authenticated BlobId from the
     /// current state row; implementations must return bytes only when that
@@ -416,6 +422,33 @@ where
         &self,
     ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
         unsafe { self.ptr.0.as_ref().authenticated_blob_reader() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_file_exact_batch(
+        &self,
+        request: &crate::sql2::providers::FileExactBatchPlan,
+    ) {
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .expect("SQL write context pointer should be valid")
+                .record_file_exact_batch(request);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_file_scan(&self) {
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .expect("SQL write context pointer should be valid")
+                .record_file_scan();
+        }
     }
 
     pub(crate) fn load_staged_file_bytes_for_owner(

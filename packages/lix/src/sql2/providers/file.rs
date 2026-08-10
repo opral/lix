@@ -163,7 +163,7 @@ struct FileExactKeyPlan {
 }
 
 #[derive(Clone, Debug, Default)]
-struct FileExactBatchPlan {
+pub(crate) struct FileExactBatchPlan {
     rows: Vec<FileExactKeyPlan>,
     projection: FileQueryProjection,
     untracked: Option<bool>,
@@ -1360,6 +1360,10 @@ where
                         // Exact DML must still validate a targeted blob ref
                         // when its descriptor is missing from the path index.
                         FileIdConstraint::Ids(file_ids) => {
+                            #[cfg(test)]
+                            write_ctx.record_file_exact_batch(&file_exact_batch_plan(
+                                &request, file_ids,
+                            ));
                             scan_exact_file_blob_batch(state_view.clone(), &request, file_ids).await
                         }
                         FileIdConstraint::All | FileIdConstraint::None => {
@@ -1375,6 +1379,8 @@ where
                             .then(|| indexed_matches.clone()),
                     )
                 } else {
+                    #[cfg(test)]
+                    write_ctx.record_file_scan();
                     let rows =
                         scan_lix_file_native_batch(state_view.clone(), &request, &target_file_ids)
                             .await
@@ -2868,6 +2874,8 @@ where
             // correlated blob refs solely for those files.
             let rows = match &target_file_ids {
                 FileIdConstraint::Ids(file_ids) => {
+                    #[cfg(test)]
+                    write_ctx.record_file_exact_batch(&file_exact_batch_plan(&request, file_ids));
                     scan_exact_file_blob_batch(state_view.clone(), &request, file_ids).await
                 }
                 FileIdConstraint::All | FileIdConstraint::None => {
@@ -2983,6 +2991,8 @@ where
         // read, especially for path-based upserts.
         let rows = match &target_file_ids {
             FileIdConstraint::Ids(file_ids) => {
+                #[cfg(test)]
+                write_ctx.record_file_exact_batch(&file_exact_batch_plan(&request, file_ids));
                 scan_exact_file_blob_batch(state_view.clone(), &request, file_ids).await
             }
             FileIdConstraint::All | FileIdConstraint::None => {
@@ -3694,6 +3704,8 @@ where
         .map(Some);
     }
 
+    #[cfg(test)]
+    ctx.record_file_scan();
     let live_rows = FileStateView::Transaction(ctx.state_view().clone())
         .scan_file_plan(&FileQueryPlan {
             filter: FileQueryFilter {
@@ -4173,6 +4185,8 @@ where
             untracked: Some(untracked),
             include_tombstones: false,
         };
+        #[cfg(test)]
+        ctx.record_file_exact_batch(&request);
         let rows = FileStateView::Transaction(ctx.state_view().clone())
             .load_exact_batch(&request)
             .await?;
@@ -7381,6 +7395,32 @@ where
     ))
 }
 
+#[cfg(test)]
+fn file_exact_batch_plan(
+    request: &FileQueryPlan,
+    file_ids: &BTreeSet<String>,
+) -> FileExactBatchPlan {
+    FileExactBatchPlan {
+        rows: request
+            .filter
+            .branch_ids
+            .iter()
+            .flat_map(|branch_id| {
+                file_ids.iter().map(move |file_id| FileExactKeyPlan {
+                    branch_id: branch_id.clone(),
+                    schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                    entity_pk: file_id_entity_pk(file_id)
+                        .expect("test file IDs should encode as entity PKs"),
+                    file_id: Some(file_id.clone()),
+                })
+            })
+            .collect(),
+        projection: request.projection.clone(),
+        untracked: request.filter.untracked,
+        include_tombstones: request.filter.include_tombstones,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum FileIdConstraint {
     All,
@@ -8368,17 +8408,24 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use crate::binary_cas::{
-        BlobBytesBatch, BlobDataReader, BlobId, BlobLayout, BlobRangeBytesBatch, BlobWriteReceipt,
+        BlobBytesBatch, BlobDataReader, BlobId, BlobLayout, BlobRangeBytes, BlobRangeBytesBatch,
+        BlobWriteReceipt,
     };
     use crate::branch::{BranchHead, BranchRefReader};
-    use crate::changelog::{ChangeId, CommitId};
+    use crate::changelog::{ChangeId, ChangeRecord, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{
         FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemPathIndex,
         FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemRowContext,
     };
-    use crate::forktree::{AuthenticatedBlobReader, ForkTreeReadFacade, StateKey, UntrackedValue};
+    use crate::forktree::{
+        AuthenticatedBlobReader, BranchStateTransition, ChangeCatalogEntry, ChangeCatalogOwner,
+        ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitObjectV1, ForkTreeReadFacade,
+        PreparedPublication, RepositoryRootV1, StateKey, StateMutationAudit, StateTreeMutation,
+        StateValueRef, UntrackedValue, encode_state_key, encode_state_value,
+    };
     use crate::functions::FunctionProviderHandle;
+    use crate::json_store::JsonSlot;
     use crate::plugin::{
         PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentMatcher, PluginFileOwner,
         PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
@@ -8389,7 +8436,10 @@ mod tests {
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::state::{ForkTreeStateView, StagedUntrackedStateRow, TransactionStateView};
     use crate::storage::{Memory, MemoryRead};
-    use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageReadOptions};
+    use crate::storage_adapter::{
+        SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
+        StorageWriteSet,
+    };
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
@@ -8431,33 +8481,336 @@ mod tests {
         test_transaction_state_view_for_branch(GLOBAL_BRANCH_ID, &[])
     }
 
+    fn test_global_state_member(
+        row: &FilesystemStateRow,
+    ) -> (Vec<u8>, crate::forktree::CommitMemberV1) {
+        let change_id = row
+            .change_id
+            .expect("global native fixture row should have a ChangeId");
+        let fork_change_id = crate::forktree::ChangeId::from_bytes(*change_id.as_uuid().as_bytes());
+        let snapshot = if row.deleted {
+            JsonSlot::None
+        } else if let Some(snapshot) = &row.snapshot_content {
+            JsonSlot::Inline(snapshot.to_string().into_boxed_str())
+        } else {
+            JsonSlot::Inline("null".into())
+        };
+        let metadata = row
+            .metadata
+            .as_ref()
+            .map(|metadata| JsonSlot::Inline(metadata.to_string().into_boxed_str()))
+            .unwrap_or(JsonSlot::None);
+        let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: "native-file-fixture".to_owned(),
+            schema_key: row.schema_key.clone(),
+            entity_pk: row.entity_pk.clone(),
+            file_id: row.file_id.clone(),
+            snapshot,
+            metadata,
+            created_at: row.created_at,
+            origin_key: None,
+        })
+        .expect("global native fixture change payload");
+        let key = encode_state_key(crate::forktree::StateKeyRef {
+            schema_key: &row.schema_key,
+            file_id: row.file_id.as_deref(),
+            entity_pk: &row.entity_pk,
+        });
+        (
+            key,
+            crate::forktree::CommitMemberV1::introduced(
+                fork_change_id,
+                payload,
+                true,
+                row.updated_at,
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn publish_global_fixture_rows(
+        initial_view: &crate::forktree::CoherentView<TestRead>,
+        backend: &Memory,
+        rows: &[FilesystemStateRow],
+    ) {
+        let mut entries = rows
+            .iter()
+            .filter(|row| row.global && !row.untracked)
+            .map(test_global_state_member)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return;
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let commit_id = crate::forktree::CommitId::from_bytes([0x6a; 16]);
+        let members = entries
+            .iter()
+            .map(|(_, member)| member.clone())
+            .collect::<Vec<_>>();
+        let pages = CommitChangePageV2::encode_pages(commit_id, &members)
+            .expect("global native fixture member pages");
+        let mutations = entries
+            .iter()
+            .zip(&pages.member_locations)
+            .map(|((key, _), location)| {
+                StateTreeMutation::insert_bound(
+                    key.clone(),
+                    encode_state_value(StateValueRef {
+                        page_object_id: location.page_object_id,
+                        page_ordinal: location.page_ordinal,
+                    })
+                    .expect("global native fixture state value"),
+                    StateMutationAudit {
+                        commit_id: *commit_id.as_bytes(),
+                        tombstone: false,
+                        blob_manifest_object_ids: Vec::new(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let state_edit = initial_view
+            .edit_state_tree(initial_view.repository_root().global_state_root, mutations)
+            .now_or_never()
+            .expect("global native fixture state edit should not yield")
+            .expect("global native fixture state edit");
+        let parent_id = initial_view
+            .branch_snapshot()
+            .semantic_head_commit_object_id;
+        let parent_bytes = initial_view
+            .load_object_bytes(parent_id)
+            .now_or_never()
+            .expect("global native fixture parent read should not yield")
+            .expect("global native fixture parent commit");
+        let parent = CommitObjectV1::decode(parent_id, &parent_bytes)
+            .expect("global native fixture parent commit should authenticate");
+        let semantic_commit = CommitObjectV1 {
+            commit_id,
+            generation: parent.generation.saturating_add(1),
+            parent_commit_object_ids: vec![parent_id],
+            members,
+            member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
+            global_state_root: state_edit.root,
+            local_state_root: initial_view.branch_snapshot().local_state_root,
+            metadata: b"native-file-fixture-global".to_vec(),
+        };
+        let (commit_object_id, _) = semantic_commit
+            .encode()
+            .expect("global native fixture commit should encode");
+        let commit_catalog_edit = initial_view
+            .put_commit_catalog_entries(
+                initial_view.repository_root().commit_catalog_root,
+                &[(commit_id, CommitCatalogEntry { commit_object_id })],
+            )
+            .now_or_never()
+            .expect("global native fixture commit catalog should not yield")
+            .expect("global native fixture commit catalog");
+        let ref_change_id = crate::forktree::ChangeId::from_bytes([0x6b; 16]);
+        let branch_ref = ChangeObjectV1::BranchRef {
+            change_id: ref_change_id,
+            updated_at: LixTimestamp::expect_parse(
+                "native fixture global timestamp",
+                "2026-04-23T00:00:01Z",
+            ),
+            branch_id: initial_view.branch_id(),
+            before_semantic_head_commit_object_id: Some(parent_id),
+            after_semantic_head_commit_object_id: Some(commit_object_id),
+            previous_ref_change_object_id: initial_view
+                .branch_snapshot()
+                .latest_ref_change_object_id,
+            payload: b"native-file-fixture-global".to_vec(),
+            json_payload_object_ids: Vec::new(),
+        };
+        let (ref_object_id, _) = branch_ref
+            .encode()
+            .expect("global native fixture branch ref should encode");
+        let mut change_entries = semantic_commit
+            .members
+            .iter()
+            .enumerate()
+            .map(|(ordinal, member)| {
+                (
+                    member.change_id(),
+                    ChangeCatalogEntry {
+                        owner: ChangeCatalogOwner::CommitMember {
+                            commit_object_id,
+                            ordinal: u32::try_from(ordinal)
+                                .expect("global native fixture member ordinal"),
+                        },
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        change_entries.push((
+            ref_change_id,
+            ChangeCatalogEntry {
+                owner: ChangeCatalogOwner::BranchRef {
+                    ref_change_object_id: ref_object_id,
+                    branch_id: initial_view.branch_id(),
+                },
+            },
+        ));
+        change_entries.sort_by_key(|(id, _)| *id.as_bytes());
+        let change_catalog_edit = initial_view
+            .put_change_catalog_entries(
+                initial_view.repository_root().change_catalog_root,
+                &change_entries,
+            )
+            .now_or_never()
+            .expect("global native fixture change catalog should not yield")
+            .expect("global native fixture change catalog");
+        let global_state_root = state_edit.root;
+        let commit_catalog_root = commit_catalog_edit.root;
+        let change_catalog_root = change_catalog_edit.root;
+        let branch_snapshot = crate::forktree::BranchSnapshotV1 {
+            branch_id: initial_view.branch_id(),
+            local_state_root: initial_view.branch_snapshot().local_state_root,
+            semantic_head_commit_object_id: commit_object_id,
+            latest_ref_change_object_id: Some(ref_object_id),
+            historical_global_state_root: state_edit.root,
+        };
+        let transition = BranchStateTransition {
+            state_edit,
+            commit_catalog_edit,
+            change_catalog_edit,
+            semantic_commit,
+            changes: vec![branch_ref],
+            branch_snapshot,
+            repository_root: RepositoryRootV1 {
+                global_state_root,
+                commit_catalog_root,
+                change_catalog_root,
+            },
+        };
+        let mut publication = PreparedPublication::from_branch_view(initial_view)
+            .expect("global native fixture publication should bind the source view");
+        publication
+            .publish_state_transition(initial_view, transition)
+            .now_or_never()
+            .expect("global native fixture publication should not yield")
+            .expect("global native fixture publication");
+        let (writes, preconditions) = publication
+            .into_storage_plan()
+            .expect("global native fixture publication should lower");
+        StorageWriteSet::commit(
+            writes,
+            backend,
+            StorageWriteOptions {
+                preconditions,
+                ..StorageWriteOptions::default()
+            },
+        )
+        .now_or_never()
+        .expect("global native fixture publication should not yield")
+        .expect("global native fixture publication should commit");
+    }
+
     fn test_transaction_state_view_for_branch(
         branch_id: &str,
         rows: &[FilesystemStateRow],
     ) -> TransactionStateView<SharedStorageAdapterRead<MemoryRead>> {
-        let storage = Memory::new();
-        let receipt = crate::integration::Engine::initialize(storage.clone())
+        let backend = Memory::new();
+        let receipt = crate::integration::Engine::initialize(backend.clone())
             .now_or_never()
             .expect("in-memory repository initialization should complete")
             .expect("in-memory repository initialization should succeed");
-        let storage = StorageAdapter::new(storage);
+        let storage = StorageAdapter::new(backend.clone());
+        let global_rows = rows
+            .iter()
+            .filter(|row| row.global && !row.untracked)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !global_rows.is_empty() {
+            let initial_read = storage
+                .begin_read(StorageReadOptions::default())
+                .now_or_never()
+                .expect("initial global fixture read should complete without yielding")
+                .expect("initial global fixture read should open");
+            let initial_view = ForkTreeReadFacade::new(SharedStorageAdapterRead::new(initial_read))
+                .into_branch(&receipt.main_branch_id)
+                .now_or_never()
+                .expect("initial global fixture branch view should complete without yielding")
+                .expect("initial global fixture branch view should open");
+            publish_global_fixture_rows(&initial_view, &backend, &global_rows);
+        }
+        if branch_id != GLOBAL_BRANCH_ID {
+            let initial_read = storage
+                .begin_read(StorageReadOptions::default())
+                .now_or_never()
+                .expect("initial in-memory read should complete without yielding")
+                .expect("initial in-memory read should open");
+            let initial_view = ForkTreeReadFacade::new(SharedStorageAdapterRead::new(initial_read))
+                .into_branch(&receipt.main_branch_id)
+                .now_or_never()
+                .expect("initial ForkTree branch view should complete without yielding")
+                .expect("initialized main branch view should open");
+            let branch_uuid = uuid::Uuid::parse_str(branch_id)
+                .expect("native fixture branch ID should be a canonical UUID");
+            let branch = crate::forktree::CanonicalBranchId::from_bytes(*branch_uuid.as_bytes());
+            let source_commit_object_id = initial_view
+                .branch_snapshot()
+                .semantic_head_commit_object_id;
+            let source_commit_bytes = initial_view
+                .load_object_bytes(source_commit_object_id)
+                .now_or_never()
+                .expect("native fixture source commit should complete without yielding")
+                .expect("native fixture source commit should be present");
+            let source_commit = crate::forktree::CommitObjectV1::decode(
+                source_commit_object_id,
+                &source_commit_bytes,
+            )
+            .expect("native fixture source commit should authenticate");
+            let mut publication = PreparedPublication::from_branch_view(&initial_view)
+                .expect("native fixture publication should bind the source view");
+            publication
+                .publish_new_branch_selector(
+                    &initial_view,
+                    branch,
+                    &source_commit,
+                    crate::forktree::ChangeId::from_bytes([0x5b; 16]),
+                    LixTimestamp::expect_parse("fixture branch timestamp", "2026-04-23T00:00:00Z"),
+                )
+                .now_or_never()
+                .expect("native fixture selector publication should complete without yielding")
+                .expect("native fixture selector publication should succeed");
+            let (writes, preconditions) = publication
+                .into_storage_plan()
+                .expect("native fixture publication should lower");
+            StorageWriteSet::commit(
+                writes,
+                &backend,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .now_or_never()
+            .expect("native fixture selector write should complete without yielding")
+            .expect("native fixture selector write should succeed");
+        }
         let read = storage
             .begin_read(StorageReadOptions::default())
             .now_or_never()
             .expect("in-memory read should complete without yielding")
             .expect("in-memory read should open");
         let read = SharedStorageAdapterRead::new(read);
+        let committed_branch_id = if branch_id == GLOBAL_BRANCH_ID {
+            GLOBAL_BRANCH_ID
+        } else {
+            branch_id
+        };
         let committed =
-            ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), &receipt.main_branch_id)
+            ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), committed_branch_id)
                 .now_or_never()
                 .expect("ForkTree branch view should complete without yielding")
                 .expect("initialized main branch view should open");
         let mut selected = BTreeMap::<Vec<u8>, crate::state::StateRow>::new();
         let mut staged_untracked = Vec::new();
-        for row in rows
-            .iter()
-            .filter(|row| row.branch_id == branch_id || row.branch_id == GLOBAL_BRANCH_ID)
-        {
+        for row in rows.iter().filter(|row| {
+            (row.branch_id == branch_id && !row.global)
+                || (row.branch_id == GLOBAL_BRANCH_ID && row.untracked)
+        }) {
             let native = super::test_filesystem_row_to_state_row(row)
                 .expect("native filesystem fixture should be encodable");
             if row.untracked {
@@ -8504,6 +8857,10 @@ mod tests {
         if branches.is_empty() {
             branches.insert(GLOBAL_BRANCH_ID.to_string());
         }
+        // Some native fixtures intentionally contain no rows (for example an
+        // empty plugin registry) but still query the explicit active branch.
+        // Keep that branch addressable without introducing synthetic state.
+        branches.insert("01920000-0000-7000-8000-0000000000b1".to_string());
         branches
             .into_iter()
             .map(|branch_id| {
@@ -10250,6 +10607,20 @@ mod tests {
         }
     }
 
+    impl CapturingWriteContext {
+        fn with_rows(rows: Vec<FilesystemStateRow>) -> Self {
+            let state_view = test_transaction_state_view_for_branch(
+                "01920000-0000-7000-8000-0000000000b1",
+                &rows,
+            );
+            Self {
+                state_view,
+                rows,
+                ..Self::default()
+            }
+        }
+    }
+
     struct IndexedFileContentUpdateWriteContext {
         state_view: TransactionStateView<TestRead>,
         index: Arc<FilesystemPathIndex>,
@@ -10274,6 +10645,78 @@ mod tests {
         requested: Arc<Mutex<Vec<Vec<StateKey>>>>,
     }
 
+    /// Test-only authenticated owner for native write-context fixtures.
+    ///
+    /// The fixture mirrors the production contract: a payload request is
+    /// authorized by the exact BlobRef StateKey first, and the semantic
+    /// BlobId is only used to validate the fixture's in-memory bytes. It does
+    /// not provide a hash-only or fallback read path.
+    struct FixtureAuthenticatedBlobReader {
+        blob_ids_by_key: BTreeMap<StateKey, BlobId>,
+        bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
+    }
+
+    impl FixtureAuthenticatedBlobReader {
+        fn from_rows(
+            rows: &[FilesystemStateRow],
+            bytes_by_hash: &BTreeMap<BlobId, Vec<u8>>,
+        ) -> Result<Self, LixError> {
+            let mut blob_ids_by_key = BTreeMap::new();
+            for row in rows {
+                if row.schema_key != super::BLOB_REF_SCHEMA_KEY || row.deleted {
+                    continue;
+                }
+                let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+                    continue;
+                };
+                let snapshot: super::BlobRefSnapshot = serde_json::from_str(snapshot_content)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!("invalid fixture BlobRef snapshot: {error}"),
+                        )
+                    })?;
+                let blob_id = BlobId::from_hex(&snapshot.blob_hash)?;
+                let state_key = StateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                };
+                if let Some(previous) = blob_ids_by_key.insert(state_key, blob_id)
+                    && previous != blob_id
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "fixture contains conflicting BlobRef owners for one StateKey",
+                    ));
+                }
+            }
+            Ok(Self {
+                blob_ids_by_key,
+                bytes_by_hash: bytes_by_hash.clone(),
+            })
+        }
+
+        fn bytes_for_key(&self, key: &StateKey) -> Result<Option<Vec<u8>>, LixError> {
+            let Some(blob_id) = self.blob_ids_by_key.get(key) else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "fixture BlobRef owner is absent for the requested StateKey",
+                ));
+            };
+            let Some(bytes) = self.bytes_by_hash.get(blob_id) else {
+                return Ok(None);
+            };
+            if !bytes.is_empty() && BlobId::from_canonical_content(bytes) != *blob_id {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "fixture BlobRef bytes do not match the authenticated BlobId",
+                ));
+            }
+            Ok(Some(bytes.clone()))
+        }
+    }
+
     impl StaticBlobReader {
         fn from_blobs(blobs: impl IntoIterator<Item = Vec<u8>>) -> Self {
             Self {
@@ -10294,6 +10737,54 @@ mod tests {
                     .map(|hash| self.blob_bytes_by_hash.get(hash).cloned())
                     .collect(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl AuthenticatedBlobReader for FixtureAuthenticatedBlobReader {
+        async fn load_bytes_for_rows(&self, rows: &[StateKey]) -> Result<BlobBytesBatch, LixError> {
+            Ok(BlobBytesBatch::new(
+                rows.iter()
+                    .map(|key| self.bytes_for_key(key))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+
+        async fn load_ranges_for_rows(
+            &self,
+            requests: &[(StateKey, std::ops::Range<u64>)],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            let mut entries = Vec::with_capacity(requests.len());
+            for (key, range) in requests {
+                let Some(bytes) = self.bytes_for_key(key)? else {
+                    entries.push(None);
+                    continue;
+                };
+                let start = usize::try_from(range.start).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "fixture BlobRef range start overflows usize",
+                    )
+                })?;
+                let end = usize::try_from(range.end).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "fixture BlobRef range end overflows usize",
+                    )
+                })?;
+                if start > end || end > bytes.len() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "fixture BlobRef range is outside the authenticated payload",
+                    ));
+                }
+                entries.push(Some(BlobRangeBytes {
+                    bytes: bytes[start..end].to_vec(),
+                    total_size: bytes.len() as u64,
+                    range: range.clone(),
+                }));
+            }
+            Ok(BlobRangeBytesBatch::new(entries))
         }
     }
 
@@ -10369,6 +10860,23 @@ mod tests {
             &self.state_view
         }
 
+        fn authenticated_blob_reader(
+            &self,
+        ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+            Ok(Arc::new(FixtureAuthenticatedBlobReader::from_rows(
+                &self.rows,
+                &self.blob_bytes_by_hash,
+            )?))
+        }
+
+        fn record_file_exact_batch(&mut self, request: &FileExactBatchPlan) {
+            self.exact_load_requests.push(request.clone());
+        }
+
+        fn record_file_scan(&mut self) {
+            self.scan_count += 1;
+        }
+
         fn active_branch_id(&self) -> &str {
             "01920000-0000-7000-8000-0000000000b1"
         }
@@ -10435,6 +10943,29 @@ mod tests {
 
         fn state_view(&self) -> &TransactionStateView<Self::ReadStore> {
             &self.state_view
+        }
+
+        fn authenticated_blob_reader(
+            &self,
+        ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+            Ok(Arc::new(FixtureAuthenticatedBlobReader::from_rows(
+                &self.blob_rows,
+                &BTreeMap::new(),
+            )?))
+        }
+
+        fn record_file_exact_batch(&mut self, request: &FileExactBatchPlan) {
+            self.exact_load_requests
+                .lock()
+                .expect("exact request mutex should not be poisoned")
+                .push(request.clone());
+        }
+
+        fn record_file_scan(&mut self) {
+            self.scan_requests
+                .lock()
+                .expect("scan request mutex should not be poisoned")
+                .push(FileQueryPlan::default());
         }
 
         fn active_branch_id(&self) -> &str {
@@ -12776,10 +13307,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_delete_reuses_single_candidate_scan() {
-        let mut write_context = CapturingWriteContext {
-            rows: file_dml_rows(),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(file_dml_rows());
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -12825,10 +13353,7 @@ mod tests {
                 7,
             ),
         ]);
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -12864,10 +13389,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_update_reuses_source_rows_for_blob_and_path_state() {
-        let mut write_context = CapturingWriteContext {
-            rows: file_dml_rows(),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(file_dml_rows());
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -12905,10 +13427,7 @@ mod tests {
             "01920000-0000-7000-8000-0000000000b1",
             r#"{"id":"01920000-0000-7000-8000-000000000482","directory_id":null,"name":"other.md"}"#,
         ));
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -12941,10 +13460,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_content_update_reuses_source_blob_ref_keys() {
-        let mut write_context = CapturingWriteContext {
-            rows: file_dml_rows(),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(file_dml_rows());
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -12983,10 +13499,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_upsert_attribute_update_uses_exact_id_blob_lookup() {
-        let mut write_context = CapturingWriteContext {
-            rows: file_dml_rows(),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(file_dml_rows());
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let assignments = vec![
@@ -13030,11 +13543,8 @@ mod tests {
                 data.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            blob_bytes_by_hash: BTreeMap::from([(blob_hash, data)]),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
+        write_context.blob_bytes_by_hash = BTreeMap::from([(blob_hash, data)]);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
 
@@ -13075,16 +13585,20 @@ mod tests {
             .expect("filesystem path index should build"),
         );
         let old_data = b"old";
+        let blob_rows = vec![live_blob_ref_row(
+            "01920000-0000-7000-8000-0000000000d2",
+            "01920000-0000-7000-8000-0000000000b1",
+            "01920000-0000-7000-8000-0000000000d2",
+            &BlobId::from_canonical_content(old_data).to_hex(),
+            old_data.len(),
+        )];
         let mut write_context = IndexedFileContentUpdateWriteContext {
-            state_view: test_transaction_state_view(),
-            index,
-            blob_rows: vec![live_blob_ref_row(
-                "01920000-0000-7000-8000-0000000000d2",
+            state_view: test_transaction_state_view_for_branch(
                 "01920000-0000-7000-8000-0000000000b1",
-                "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_canonical_content(old_data).to_hex(),
-                old_data.len(),
-            )],
+                &blob_rows,
+            ),
+            index,
+            blob_rows,
             writes: Vec::new(),
             scan_requests: Arc::clone(&scan_requests),
             exact_load_requests: Arc::clone(&exact_load_requests),
@@ -13190,10 +13704,7 @@ mod tests {
                 old_data.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
@@ -13260,10 +13771,7 @@ mod tests {
                 old_payload.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
         let chunk_count = 4_096;
         let chunk_size = 1024 * 1024;
         let size_bytes = u64::from(chunk_count) * chunk_size;
@@ -13343,10 +13851,7 @@ mod tests {
                 old_data.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
@@ -13487,15 +13992,11 @@ mod tests {
 
     #[tokio::test]
     async fn fast_file_path_upsert_preserves_root_directory_namespace_collision() {
-        let mut write_context = CapturingWriteContext {
-            rows: vec![live_directory_row(
-                "01920000-0000-7000-8000-0000000000d3",
-                "01920000-0000-7000-8000-0000000000b1",
-                r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
-            )],
-            ..CapturingWriteContext::default()
-        };
-
+        let mut write_context = CapturingWriteContext::with_rows(vec![live_directory_row(
+            "01920000-0000-7000-8000-0000000000d3",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
+        )]);
         let error = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![("/docs".to_string(), b"file".to_vec().into(), None, None)],
@@ -13540,15 +14041,12 @@ mod tests {
             &BlobId::from_canonical_content(b"branch").to_hex(),
             6,
         );
-        let mut write_context = CapturingWriteContext {
-            rows: vec![
-                local_descriptor,
-                global_fallback,
-                global_descriptor,
-                branch_override,
-            ],
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(vec![
+            local_descriptor,
+            global_fallback,
+            global_descriptor,
+            branch_override,
+        ]);
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
@@ -13609,10 +14107,7 @@ mod tests {
                 old_data.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
@@ -13656,11 +14151,7 @@ mod tests {
             r#"{"id":"01920000-0000-7000-8000-000000000132","directory_id":null,"name":"shared.md"}"#,
         );
         untracked.untracked = true;
-        let mut write_context = CapturingWriteContext {
-            rows: vec![tracked, untracked],
-            ..CapturingWriteContext::default()
-        };
-
+        let mut write_context = CapturingWriteContext::with_rows(vec![tracked, untracked]);
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![("/shared.md".to_string(), b"new".to_vec().into(), None, None)],
@@ -13702,14 +14193,11 @@ mod tests {
     #[tokio::test]
     async fn file_insert_sink_stages_file_content_writes() {
         let batch = data_insert_batch();
-        let mut write_context = CapturingWriteContext {
-            rows: vec![live_directory_row(
-                "01920000-0000-7000-8000-0000000000d3",
-                "01920000-0000-7000-8000-0000000000b1",
-                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
-            )],
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(vec![live_directory_row(
+            "01920000-0000-7000-8000-0000000000d3",
+            "01920000-0000-7000-8000-0000000000b1",
+            "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
+        )]);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink =
             LixFileInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit(), true);
@@ -13757,21 +14245,18 @@ mod tests {
     #[tokio::test]
     async fn file_insert_sink_seeds_path_resolver_from_state_view() {
         let batch = path_data_insert_batch();
-        let mut write_context = CapturingWriteContext {
-            rows: vec![
-                live_directory_row(
-                    "01920000-0000-7000-8000-0000000000d3",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
-                ),
-                live_directory_row(
-                    "01920000-0000-7000-8000-000000000313",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
-                ),
-            ],
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(vec![
+            live_directory_row(
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
+            ),
+            live_directory_row(
+                "01920000-0000-7000-8000-000000000313",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
+            ),
+        ]);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink =
             LixFileInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit(), true);

@@ -23,6 +23,10 @@ mod entity;
 mod entity_history;
 mod file;
 mod file_history;
+
+#[cfg(test)]
+pub(crate) use file::FileExactBatchPlan;
+
 mod filesystem_history_path;
 mod filesystem_working_diff;
 mod history_table_function;
