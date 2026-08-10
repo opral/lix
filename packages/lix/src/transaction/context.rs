@@ -7319,8 +7319,6 @@ where
             };
             plans.push((diff_id, identity, expected, target));
         }
-        let state_view =
-            Self::open_state_view(self.opening_read(), self.active_branch_id.clone()).await?;
         let state_keys = plans
             .iter()
             .map(|(_, (schema_key, entity_pk, file_id), _, _)| {
@@ -7331,7 +7329,8 @@ where
                 })
             })
             .collect::<Vec<_>>();
-        let current = state_view
+        let current_tracked = self
+            .state_view
             .points(&state_keys, true)
             .await
             .map_err(|error| {
@@ -7340,17 +7339,25 @@ where
                     format!("diff command state lookup failed: {error}"),
                 )
             })?;
+        let current_untracked = self.state_view.untracked_points(&state_keys, true).await?;
         let mut target_change_ids = Vec::new();
         let mut rows = RawWriteBatch::with_capacity(plans.len());
-        for ((diff_id, (schema_key, entity_pk, file_id), expected, target), current) in
-            plans.into_iter().zip(current)
+        for (
+            (diff_id, (schema_key, entity_pk, file_id), expected, target),
+            (current_tracked, current_untracked),
+        ) in plans
+            .into_iter()
+            .zip(current_tracked.into_iter().zip(current_untracked))
         {
-            let current_matches = match expected {
-                Some(expected) => current
+            let current_matches = match (current_untracked.as_ref(), expected) {
+                // Untracked state is the visible value but has no committed
+                // change identity, so it can never satisfy a tracked side.
+                (Some(_), Some(_)) => false,
+                (Some(row), None) => row.value.cell == StateCell::Tombstone,
+                (None, Some(expected)) => current_tracked
                     .as_ref()
-                    .map(|row| row.value.change_id == expected)
-                    .unwrap_or(false),
-                None => current
+                    .is_some_and(|row| row.value.change_id == expected),
+                (None, None) => current_tracked
                     .as_ref()
                     .is_none_or(|row| row.value.cell == StateCell::Tombstone),
             };

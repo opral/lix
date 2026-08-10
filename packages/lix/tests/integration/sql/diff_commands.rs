@@ -215,3 +215,142 @@ simulation_test!(
         assert_eq!(head_after_empty, head_before_empty);
     }
 );
+
+simulation_test!(
+    diff_commands_reject_staged_state_that_moved_the_selected_identity,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        let initial_head = sim.initial_commit_id().to_string();
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('apply-guard', 'published')",
+                &[],
+            )
+            .await
+            .expect("apply source should publish");
+        let apply_source_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("apply source head should load")
+            .expect("apply source head should exist")
+            .to_string();
+        session
+            .execute("DELETE FROM lix_key_value WHERE key = 'apply-guard'", &[])
+            .await
+            .expect("apply target should return to absence");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('revert-guard', 'before')",
+                &[],
+            )
+            .await
+            .expect("revert predecessor should publish");
+        let revert_before_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("revert predecessor head should load")
+            .expect("revert predecessor head should exist")
+            .to_string();
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'revert-guard'",
+                &[],
+            )
+            .await
+            .expect("revert endpoint should publish");
+        let revert_after_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("revert endpoint head should load")
+            .expect("revert endpoint head should exist")
+            .to_string();
+
+        let mut apply_transaction = session
+            .begin_transaction()
+            .await
+            .expect("apply transaction should begin");
+        apply_transaction
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('apply-guard', 'staged')",
+                &[],
+            )
+            .await
+            .expect("apply transaction should stage its current value");
+        let apply_error = apply_transaction
+            .execute(
+                "INSERT INTO lix_apply (diff_id) \
+                 SELECT diff_id FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"apply-guard\"]')",
+                &[Value::Text(initial_head), Value::Text(apply_source_head)],
+            )
+            .await
+            .expect_err("apply must validate against the staged current value");
+        assert_eq!(apply_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        let apply_visible = apply_transaction
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'apply-guard'",
+                &[],
+            )
+            .await
+            .expect("failed apply must retain the staged value");
+        assert_eq!(
+            apply_visible.rows()[0].get::<Value>("value").unwrap(),
+            Value::Json(json!("staged"))
+        );
+        apply_transaction
+            .rollback()
+            .await
+            .expect("apply transaction should roll back");
+
+        let mut revert_transaction = session
+            .begin_transaction()
+            .await
+            .expect("revert transaction should begin");
+        revert_transaction
+            .execute(
+                "UPDATE lix_key_value SET value = 'staged' WHERE key = 'revert-guard'",
+                &[],
+            )
+            .await
+            .expect("revert transaction should stage its current value");
+        let revert_error = revert_transaction
+            .execute(
+                "INSERT INTO lix_revert (diff_id) \
+                 SELECT diff_id FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"revert-guard\"]')",
+                &[
+                    Value::Text(revert_before_head),
+                    Value::Text(revert_after_head),
+                ],
+            )
+            .await
+            .expect_err("revert must validate against the staged current value");
+        assert_eq!(revert_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        let revert_visible = revert_transaction
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'revert-guard'",
+                &[],
+            )
+            .await
+            .expect("failed revert must retain the staged value");
+        assert_eq!(
+            revert_visible.rows()[0].get::<Value>("value").unwrap(),
+            Value::Json(json!("staged"))
+        );
+        revert_transaction
+            .rollback()
+            .await
+            .expect("revert transaction should roll back");
+    }
+);
