@@ -2599,6 +2599,7 @@ mod tests {
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::datatypes::Schema;
     use datafusion::common::{Column, ScalarValue};
+    use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     use serde_json::json;
 
@@ -2957,7 +2958,7 @@ mod tests {
         let spec = entity_insert_spec_with_primary_key();
         let filters = vec![
             eq_filter("id", "entity-a"),
-            Expr::InList(datafusion::logical_expr::expr::InList::new(
+            Expr::InList(InList::new(
                 Box::new(column("id")),
                 vec![string_literal("entity-b"), string_literal("entity-a")],
                 false,
@@ -2977,7 +2978,7 @@ mod tests {
                 .expect("named file filter analyzes"),
             Some(vec![Some("file-a".to_string())])
         );
-        let multi = Expr::InList(datafusion::logical_expr::expr::InList::new(
+        let multi = Expr::InList(InList::new(
             Box::new(column("lixcol_file_id")),
             vec![string_literal("file-a"), string_literal("file-b")],
             false,
