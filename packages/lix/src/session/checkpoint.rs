@@ -228,3 +228,47 @@ fn push_selected_change(
     );
     source_membership_exact
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
+    use crate::forktree::{StateCell, StateValue};
+
+    #[test]
+    fn canonicalized_added_timestamp_declines_source_membership_certificate() {
+        let created_at = LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z");
+        let updated_at = LixTimestamp::expect_parse("updated_at", "2026-01-02T00:00:00Z");
+        let key = StateKey {
+            schema_key: "test_schema".to_owned(),
+            file_id: None,
+            entity_pk: EntityPk::single("entity"),
+        };
+        let value = StateValue {
+            change_id: ChangeId::for_test_label("checkpoint-canonicalized-change"),
+            commit_id: CommitId::for_test_label("checkpoint-canonicalized-commit"),
+            created_at,
+            updated_at,
+            cell: StateCell::Value("{\"value\":\"payload\"}".into()),
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        };
+        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(1);
+        let source_membership_exact =
+            push_selected_change(&mut selected, &key, &value, CheckpointChangeKind::Added);
+        let selected = if source_membership_exact {
+            selected.finish_source_certified()
+        } else {
+            selected.finish()
+        };
+
+        assert!(!selected.source_membership_certified());
+        assert_eq!(
+            selected.iter().next().expect("one selected row").created_at,
+            updated_at
+        );
+    }
+}

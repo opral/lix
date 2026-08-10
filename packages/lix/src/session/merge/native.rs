@@ -321,3 +321,539 @@ fn row_payload_eq(
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity_pk::EntityPk;
+
+    fn key(entity: &str) -> StateKey {
+        StateKey {
+            schema_key: "test_schema".to_owned(),
+            file_id: None,
+            entity_pk: EntityPk::single(entity),
+        }
+    }
+
+    fn timestamp() -> LixTimestamp {
+        LixTimestamp::from_unix_millis_utc_lossy(0)
+    }
+
+    fn row(change: &str, deleted: bool) -> MergeRow {
+        MergeRow {
+            deleted,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            change_id: ChangeId::for_test_label(change),
+            commit_id: CommitId::for_test_label(&format!("{change}-commit")),
+        }
+    }
+
+    fn entry(
+        entity: &str,
+        kind: MergeDiffKind,
+        before: Option<MergeRow>,
+        after: Option<MergeRow>,
+    ) -> MergeDiffEntry {
+        MergeDiffEntry {
+            identity: key(entity),
+            kind,
+            before,
+            after,
+        }
+    }
+
+    fn diff(entries: Vec<MergeDiffEntry>) -> MergeDiff {
+        MergeDiff::from_entries_with_payloads(entries, MergePayloadBatch::default())
+    }
+
+    fn diff_with_payloads(
+        entries: Vec<MergeDiffEntry>,
+        payloads: impl IntoIterator<Item = (ChangeId, JsonSlot, JsonSlot)>,
+    ) -> MergeDiff {
+        MergeDiff::from_entries_with_payloads(
+            entries,
+            MergePayloadBatch::from_payloads(payloads).expect("payload batch should be unique"),
+        )
+    }
+
+    fn pick_entities(plan: &MergePlan, source: &MergeDiff) -> Vec<String> {
+        plan.picks
+            .iter()
+            .map(|pick| {
+                pick.identity(source)
+                    .entity_pk
+                    .as_single_string_owned()
+                    .expect("single-string entity key")
+            })
+            .collect()
+    }
+
+    fn conflict_entities(plan: &MergePlan) -> Vec<String> {
+        plan.conflicts
+            .iter()
+            .map(|conflict| {
+                conflict
+                    .identity
+                    .entity_pk
+                    .as_single_string_owned()
+                    .expect("single-string entity key")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn source_add_applies() {
+        let source = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Added,
+            None,
+            Some(row("source", false)),
+        )]);
+        let plan = plan_merge(&MergeDiff::default(), &source).expect("merge should plan");
+
+        assert_eq!(pick_entities(&plan, &source), vec!["entity-a"]);
+        assert_eq!(plan.picks[0].change_id, ChangeId::for_test_label("source"));
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn source_modify_applies() {
+        let source = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Modified,
+            Some(row("base", false)),
+            Some(row("source", false)),
+        )]);
+        let plan = plan_merge(&MergeDiff::default(), &source).expect("merge should plan");
+
+        assert_eq!(pick_entities(&plan, &source), vec!["entity-a"]);
+        assert_eq!(
+            plan.picks[0].selected_row(&source).change_id,
+            ChangeId::for_test_label("source")
+        );
+        assert!(!plan.picks[0].selected_row(&source).deleted);
+    }
+
+    #[test]
+    fn source_delete_applies_tombstone() {
+        let source = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Removed,
+            Some(row("base", false)),
+            Some(row("source-delete", true)),
+        )]);
+        let plan = plan_merge(&MergeDiff::default(), &source).expect("merge should plan");
+
+        assert_eq!(pick_entities(&plan, &source), vec!["entity-a"]);
+        assert!(plan.picks[0].selected_row(&source).deleted);
+        assert_eq!(
+            plan.picks[0].change_id,
+            ChangeId::for_test_label("source-delete")
+        );
+    }
+
+    #[test]
+    fn target_only_change_is_noop() {
+        let target = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Modified,
+            Some(row("base", false)),
+            Some(row("target", false)),
+        )]);
+        let plan = plan_merge(&target, &MergeDiff::default()).expect("merge should plan");
+
+        assert!(plan.picks.is_empty());
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn both_sides_same_final_value_is_convergent_noop() {
+        let target_change = ChangeId::for_test_label("target");
+        let source_change = ChangeId::for_test_label("source");
+        let same_snapshot = JsonSlot::from_json("{\"value\":\"same\"}");
+        let target = diff_with_payloads(
+            vec![entry(
+                "entity-a",
+                MergeDiffKind::Modified,
+                Some(row("base", false)),
+                Some(row("target", false)),
+            )],
+            [(target_change, same_snapshot.clone(), JsonSlot::None)],
+        );
+        let source = diff_with_payloads(
+            vec![entry(
+                "entity-a",
+                MergeDiffKind::Modified,
+                Some(row("base", false)),
+                Some(row("source", false)),
+            )],
+            [(source_change, same_snapshot, JsonSlot::None)],
+        );
+
+        let plan = plan_merge(&target, &source).expect("merge should plan");
+        assert!(plan.picks.is_empty());
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn both_sides_delete_is_convergent_noop() {
+        let target = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Removed,
+            Some(row("base", false)),
+            Some(row("target-delete", true)),
+        )]);
+        let source = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Removed,
+            Some(row("base", false)),
+            Some(row("source-delete", true)),
+        )]);
+
+        let plan = plan_merge(&target, &source).expect("merge should plan");
+        assert!(plan.picks.is_empty());
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn different_modifications_conflict() {
+        let target = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Modified,
+            Some(row("base", false)),
+            Some(row("target", false)),
+        )]);
+        let source = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Modified,
+            Some(row("base", false)),
+            Some(row("source", false)),
+        )]);
+
+        let plan = plan_merge(&target, &source).expect("merge should plan");
+        assert!(plan.picks.is_empty());
+        assert_eq!(conflict_entities(&plan), vec!["entity-a"]);
+    }
+
+    #[test]
+    fn delete_modify_conflicts() {
+        let target = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Removed,
+            Some(row("base", false)),
+            Some(row("target-delete", true)),
+        )]);
+        let source = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Modified,
+            Some(row("base", false)),
+            Some(row("source", false)),
+        )]);
+
+        let plan = plan_merge(&target, &source).expect("merge should plan");
+        assert_eq!(conflict_entities(&plan), vec!["entity-a"]);
+    }
+
+    #[test]
+    fn modify_delete_conflicts() {
+        let target = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Modified,
+            Some(row("base", false)),
+            Some(row("target", false)),
+        )]);
+        let source = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Removed,
+            Some(row("base", false)),
+            Some(row("source-delete", true)),
+        )]);
+
+        let plan = plan_merge(&target, &source).expect("merge should plan");
+        assert_eq!(conflict_entities(&plan), vec!["entity-a"]);
+    }
+
+    #[test]
+    fn source_removal_without_tombstone_errors() {
+        let source = diff(vec![entry(
+            "entity-a",
+            MergeDiffKind::Removed,
+            Some(row("base", false)),
+            None,
+        )]);
+        let error = plan_merge(&MergeDiff::default(), &source)
+            .expect_err("a source removal without a tombstone must fail");
+
+        assert!(error.message.contains("without a tombstone row"));
+    }
+
+    #[test]
+    fn pick_and_conflict_order_is_deterministic_by_identity() {
+        let target = diff(vec![entry(
+            "entity-b",
+            MergeDiffKind::Modified,
+            Some(row("base", false)),
+            Some(row("target", false)),
+        )]);
+        let source = diff(vec![
+            entry(
+                "entity-a",
+                MergeDiffKind::Added,
+                None,
+                Some(row("source-a", false)),
+            ),
+            entry(
+                "entity-b",
+                MergeDiffKind::Modified,
+                Some(row("base", false)),
+                Some(row("source-b", false)),
+            ),
+            entry(
+                "entity-c",
+                MergeDiffKind::Added,
+                None,
+                Some(row("source-c", false)),
+            ),
+        ]);
+
+        let plan = plan_merge(&target, &source).expect("ordered merge should plan");
+        assert_eq!(pick_entities(&plan, &source), vec!["entity-a", "entity-c"]);
+        assert_eq!(conflict_entities(&plan), vec!["entity-b"]);
+    }
+
+    #[test]
+    fn large_sorted_merge_consumes_native_order_without_sorting_fallback() {
+        const ROW_COUNT: usize = 10_000;
+        let source = diff(
+            (0..ROW_COUNT)
+                .map(|index| {
+                    let entity = format!("entity-{index:05}");
+                    entry(
+                        &entity,
+                        MergeDiffKind::Added,
+                        None,
+                        Some(row(&format!("source-{index:05}"), false)),
+                    )
+                })
+                .collect(),
+        );
+        let plan = plan_merge(&MergeDiff::default(), &source)
+            .expect("identity-sorted native merge should plan");
+
+        assert_eq!(plan.picks.len(), ROW_COUNT);
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(
+            pick_entities(&plan, &source).first().unwrap(),
+            "entity-00000"
+        );
+        assert_eq!(
+            pick_entities(&plan, &source).last().unwrap(),
+            "entity-09999"
+        );
+    }
+
+    #[test]
+    fn sparse_early_pick_does_not_require_payload_materialization_for_convergent_rows() {
+        const CONVERGENT_ROW_COUNT: usize = 10_000;
+        let target = diff(
+            (0..CONVERGENT_ROW_COUNT)
+                .map(|index| {
+                    let entity = format!("entity-{index:05}");
+                    entry(
+                        &entity,
+                        MergeDiffKind::Modified,
+                        Some(row(&format!("base-{index:05}"), false)),
+                        Some(row(&format!("target-{index:05}"), false)),
+                    )
+                })
+                .collect(),
+        );
+        let source = diff(vec![
+            entry(
+                "entity-00000",
+                MergeDiffKind::Modified,
+                Some(row("base-00000", false)),
+                Some(row("target-00000", false)),
+            ),
+            entry(
+                "entity-10000",
+                MergeDiffKind::Added,
+                None,
+                Some(row("source-10000", false)),
+            ),
+        ]);
+
+        let plan = plan_merge(&target, &source).expect("sparse native merge should plan");
+        assert_eq!(pick_entities(&plan, &source), vec!["entity-10000"]);
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn large_conflict_merge_preserves_each_identity_and_side() {
+        const ROW_COUNT: usize = 10_000;
+        let target = diff(
+            (0..ROW_COUNT)
+                .map(|index| {
+                    let entity = format!("entity-{index:05}");
+                    entry(
+                        &entity,
+                        MergeDiffKind::Modified,
+                        Some(row(&format!("base-{index:05}"), false)),
+                        Some(row(&format!("target-{index:05}"), false)),
+                    )
+                })
+                .collect(),
+        );
+        let source = diff(
+            (0..ROW_COUNT)
+                .map(|index| {
+                    let entity = format!("entity-{index:05}");
+                    entry(
+                        &entity,
+                        MergeDiffKind::Modified,
+                        Some(row(&format!("base-{index:05}"), false)),
+                        Some(row(&format!("source-{index:05}"), false)),
+                    )
+                })
+                .collect(),
+        );
+
+        let plan = plan_merge(&target, &source).expect("large conflict merge should plan");
+        assert!(plan.picks.is_empty());
+        assert_eq!(plan.conflicts.len(), ROW_COUNT);
+        assert_eq!(conflict_entities(&plan).first().unwrap(), "entity-00000");
+        assert_eq!(conflict_entities(&plan).last().unwrap(), "entity-09999");
+        assert!(plan.conflicts.iter().all(|conflict| {
+            conflict.target.after.is_some() && conflict.source.after.is_some()
+        }));
+    }
+
+    #[test]
+    fn live_payload_comparison_only_reads_intersecting_changed_identity() {
+        let same = JsonSlot::from_json("{\"same\":true}");
+        let target = diff_with_payloads(
+            vec![entry(
+                "entity-a",
+                MergeDiffKind::Modified,
+                Some(row("base-a", false)),
+                Some(row("target-a", false)),
+            )],
+            [(
+                ChangeId::for_test_label("target-a"),
+                same.clone(),
+                JsonSlot::None,
+            )],
+        );
+        let source = diff_with_payloads(
+            vec![entry(
+                "entity-a",
+                MergeDiffKind::Modified,
+                Some(row("base-a", false)),
+                Some(row("source-a", false)),
+            )],
+            [(ChangeId::for_test_label("source-a"), same, JsonSlot::None)],
+        );
+
+        let plan = plan_merge(&target, &source).expect("payload comparison should plan");
+        assert!(plan.picks.is_empty());
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn unsorted_native_merge_is_rejected_instead_of_sorting_a_second_authority() {
+        let source = diff(vec![
+            entry(
+                "entity-b",
+                MergeDiffKind::Added,
+                None,
+                Some(row("b", false)),
+            ),
+            entry(
+                "entity-a",
+                MergeDiffKind::Added,
+                None,
+                Some(row("a", false)),
+            ),
+        ]);
+        let error = plan_merge(&MergeDiff::default(), &source)
+            .expect_err("native merge requires the ordered StateDiffEntry contract");
+
+        assert!(error.message.contains("canonical StateKey order"));
+    }
+
+    #[test]
+    fn unsorted_non_adjacent_duplicate_identity_is_rejected() {
+        let duplicate = entry(
+            "entity-a",
+            MergeDiffKind::Added,
+            None,
+            Some(row("a", false)),
+        );
+        let source = diff(vec![
+            duplicate.clone(),
+            entry(
+                "entity-b",
+                MergeDiffKind::Added,
+                None,
+                Some(row("b", false)),
+            ),
+            duplicate,
+        ]);
+        let error = plan_merge(&MergeDiff::default(), &source)
+            .expect_err("duplicate source identity must be rejected");
+
+        assert!(error.message.contains("canonical StateKey order"));
+    }
+
+    #[test]
+    fn adjacent_duplicate_identity_is_rejected() {
+        let source = diff(vec![
+            entry(
+                "entity-a",
+                MergeDiffKind::Added,
+                None,
+                Some(row("a1", false)),
+            ),
+            entry(
+                "entity-a",
+                MergeDiffKind::Added,
+                None,
+                Some(row("a2", false)),
+            ),
+        ]);
+        let error = plan_merge(&MergeDiff::default(), &source)
+            .expect_err("duplicate source identity must be rejected");
+
+        assert!(error.message.contains("duplicate diff entry"));
+    }
+
+    #[test]
+    fn merge_payload_batch_rejects_duplicate_change_ids() {
+        let change_id = ChangeId::for_test_label("duplicate");
+        let error = MergePayloadBatch::from_payloads([
+            (change_id, JsonSlot::None, JsonSlot::None),
+            (change_id, JsonSlot::None, JsonSlot::None),
+        ])
+        .expect_err("duplicate payload identities must fail closed");
+
+        assert!(error.message.contains("duplicate change id"));
+    }
+
+    #[test]
+    fn native_tombstone_endpoint_is_removed_and_not_a_pick_without_after_row() {
+        let source = MergeDiff {
+            entries: vec![entry(
+                "entity-a",
+                MergeDiffKind::Removed,
+                Some(row("base", false)),
+                None,
+            )],
+            payloads: MergePayloadBatch::default(),
+        };
+        let error = plan_merge(&MergeDiff::default(), &source)
+            .expect_err("a missing authenticated tombstone endpoint must fail closed");
+
+        assert!(error.message.contains("without a tombstone row"));
+    }
+}
