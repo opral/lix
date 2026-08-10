@@ -553,6 +553,14 @@ fn prepared_row_domain(row: PreparedValidationRow<'_>) -> Domain {
     )
 }
 
+fn prepared_row_sibling_domain(row: PreparedValidationRow<'_>) -> Domain {
+    Domain::exact_file(
+        row.branch_id().to_owned(),
+        !row.untracked(),
+        row.file_id().map(str::to_owned),
+    )
+}
+
 fn prepared_row_is_global(row: PreparedValidationRow<'_>) -> bool {
     match row {
         PreparedValidationRow::State(row) => row.global,
@@ -1196,7 +1204,7 @@ where
                 format!("duplicate insert identity for schema '{}'", row.schema_key),
             ));
         }
-        let Some(current) = exact_visible_row(
+        let current = exact_visible_row(
             input.state_view,
             input.active_branch_id,
             &prepared_row_domain(PreparedValidationRow::State(insert.row)),
@@ -1204,13 +1212,20 @@ where
             row.entity_pk,
             true,
         )
-        .await?
-        else {
-            continue;
-        };
-        if !current.deleted
-            && same_insert_identity(PreparedValidationRow::State(insert.row), &current)
-        {
+        .await?;
+        let sibling = exact_visible_row(
+            input.state_view,
+            input.active_branch_id,
+            &prepared_row_sibling_domain(PreparedValidationRow::State(insert.row)),
+            row.schema_key,
+            row.entity_pk,
+            true,
+        )
+        .await?;
+        if [current, sibling].into_iter().flatten().any(|current| {
+            !current.deleted
+                && same_insert_identity(PreparedValidationRow::State(insert.row), &current)
+        }) {
             return Err(unique_constraint_error(
                 crate::transaction::duplicate_insert_identity_message(
                     row.schema_key,
