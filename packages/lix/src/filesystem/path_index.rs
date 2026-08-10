@@ -13,7 +13,7 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::state::{ForkTreeStateView, StateRow};
+use crate::state::ForkTreeStateView;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::descriptor_path::{DirectoryPathRecord, derive_directory_paths};

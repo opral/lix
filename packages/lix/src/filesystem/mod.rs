@@ -181,6 +181,7 @@ pub(crate) use self::path_index::{
 };
 pub(crate) use self::persistent_map::{PersistentMap, PersistentMapRangeCursor};
 pub(crate) use self::planner::directory_path_resolvers_from_state_batch;
+#[allow(unused_imports)]
 pub(crate) use self::planner::{
     BlobRefPluginCheckpoint, BlobRefRowInput, DirectoryDescriptorWriteIntent,
     DirectoryPathResolver, FileDeleteInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,

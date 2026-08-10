@@ -12,7 +12,7 @@ use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::state::{ForkTreeStateView, StateRow};
+use crate::state::ForkTreeStateView;
 
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,

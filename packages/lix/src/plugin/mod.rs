@@ -28,6 +28,7 @@ pub(crate) use create_context::{
     require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
     validate_create_changes, validate_create_reservation,
 };
+#[allow(unused_imports)]
 pub(crate) use incremental::{
     ArcByteSource, FileBytesSha256, SchemaAllowlist, StateRowEntitySource,
     ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
