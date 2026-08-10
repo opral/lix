@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableType;
@@ -903,7 +904,7 @@ fn prepare_file_history_rows(
 async fn load_file_history_blob_bytes<S>(
     historical: &ForkTreeReadFacade<S>,
     rows: &[PreparedFileHistoryRow],
-) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError>
+) -> Result<BTreeMap<String, Option<Bytes>>, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -932,7 +933,7 @@ where
     let loaded = historical
         .load_historical_blob_bytes_for_rows(&requests)
         .await?
-        .into_vec();
+        .into_shared_vec();
     if loaded.len() != hashes.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,

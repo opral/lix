@@ -25,6 +25,7 @@ use super::view::load_object_bytes;
 
 const MERKLE_STATE_BINDING_DOMAIN: &str = "lix forktree blob merkle state binding v1";
 const MAX_PROOF_DEPTH: usize = 128;
+const MAX_SHARED_RANGE_RETENTION_FACTOR: u64 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NodeSummary {
@@ -726,6 +727,16 @@ pub(super) fn materialize_blob_merkle_range(
             || start > end
         {
             return Err(corruption("Merkle materialization chunk range is invalid"));
+        }
+        let requested_len = u64::try_from(end - start)
+            .map_err(|_| corruption("Merkle materialization range exceeds u64"))?;
+        let chunk_len = u64::try_from(chunk.len())
+            .map_err(|_| corruption("Merkle chunk length exceeds u64"))?;
+        if requested_len
+            .checked_mul(MAX_SHARED_RANGE_RETENTION_FACTOR)
+            .is_none_or(|bounded_len| bounded_len < chunk_len)
+        {
+            return Ok(Bytes::copy_from_slice(&chunk[start..end]));
         }
         return Ok(chunk_bytes.slice(payload_offset + start..payload_offset + end));
     }
@@ -1588,6 +1599,47 @@ mod tests {
     }
 
     #[test]
+    fn tiny_single_leaf_ranges_do_not_retain_the_full_chunk_object() {
+        let build = build_blob_merkle_tree(&chunks(1)).unwrap();
+        let key = state_key();
+        let proof = prove_blob_merkle_range(&build, &key, 0..1).unwrap();
+        let leaf = decode_leaf(
+            proof.paths[0].leaf_object_id,
+            proof.objects.get(proof.paths[0].leaf_object_id).unwrap(),
+        )
+        .unwrap();
+        let encoded_chunk = proof.objects.get(leaf.chunk_object_id).unwrap();
+        let materialized =
+            materialize_blob_merkle_range(&proof, &key, build.manifest, 0..1).unwrap();
+
+        assert_eq!(materialized.as_ref(), [1].as_slice());
+        let encoded_start = encoded_chunk.as_ptr() as usize;
+        let encoded_end = encoded_start + encoded_chunk.len();
+        let materialized_start = materialized.as_ptr() as usize;
+        assert!(
+            materialized_start < encoded_start
+                || materialized_start >= encoded_end
+                || materialized_start + materialized.len() > encoded_end,
+            "tiny ranges must copy instead of retaining a full authenticated chunk"
+        );
+    }
+
+    #[test]
+    fn multi_leaf_materialization_copies_only_the_requested_cross_chunk_range() {
+        let build = build_blob_merkle_tree(&chunks(2)).unwrap();
+        let key = state_key();
+        let proof = prove_blob_merkle_range(&build, &key, 0..2).unwrap();
+        let chunk_size = CANONICAL_BLOB_CHUNK_BYTES as u64;
+        let start = chunk_size - 3;
+        let end = chunk_size + 4;
+        let materialized =
+            materialize_blob_merkle_range(&proof, &key, build.manifest, start..end).unwrap();
+
+        assert_eq!(materialized.len(), 7);
+        assert_eq!(materialized.as_ref(), [1, 1, 1, 2, 2, 2, 2].as_slice());
+    }
+
+    #[test]
     fn range_proof_authenticates_exact_leaves_and_state() {
         let chunks = chunks(8);
         let build = build_blob_merkle_tree(&chunks).unwrap();
@@ -1601,6 +1653,10 @@ mod tests {
             ..key.clone()
         };
         assert!(verify_blob_merkle_range(&proof, &wrong_key, build.manifest, 3..5).is_err());
+        assert!(
+            materialize_blob_merkle_range(&proof, &wrong_key, build.manifest, 3..5).is_err(),
+            "a wrong StateKey must fail before materialization"
+        );
         assert!(verify_blob_merkle_range(&proof, &key, build.manifest, 2..5).is_err());
     }
 
@@ -1634,10 +1690,12 @@ mod tests {
         proof.paths[0].leaf_object_id = substituted_leaf_id;
         assert_ne!(replacement_id, leaf.chunk_object_id);
         assert!(verify_blob_merkle_range(&proof, &key, build.manifest, 1..2).is_err());
+        assert!(materialize_blob_merkle_range(&proof, &key, build.manifest, 1..2).is_err());
 
         let mut proof = prove_blob_merkle_range(&build, &key, 1..2).unwrap();
         proof.paths[0].steps[0].parent_object_id = ObjectId::ZERO;
         assert!(verify_blob_merkle_range(&proof, &key, build.manifest, 1..2).is_err());
+        assert!(materialize_blob_merkle_range(&proof, &key, build.manifest, 1..2).is_err());
     }
 
     #[test]

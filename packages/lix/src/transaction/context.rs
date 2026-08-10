@@ -2730,7 +2730,7 @@ where
             &[(plugin_materialization_state_key(&actor_key.file_id), hash)],
         )
         .await?
-        .into_vec()
+        .into_blob_vec()
         .into_iter()
         .next()
         .flatten()
@@ -2743,8 +2743,7 @@ where
                     hash.to_hex()
                 ),
             )
-        })?
-        .into();
+        })?;
         let source = StateRowEntitySource::new(rows, entity_ordinals, limits)?;
         let transition = match actor
             .open_entities(
@@ -4887,7 +4886,7 @@ where
                                             )],
                                         )
                                         .await?
-                                        .into_vec()
+                                        .into_blob_vec()
                                         .into_iter()
                                         .next()
                                         .flatten()
@@ -4900,8 +4899,7 @@ where
                                                     hash.to_hex()
                                                 ),
                                             )
-                                        })?
-                                        .into();
+                                        })?;
                                 let built_splices = tracing::debug_span!(
                                     target: "lix_perf",
                                     "lix.perf.plugin_splice_discovery"
@@ -7975,7 +7973,7 @@ where
     if requests.is_empty() {
         return Ok(BlobBytesBatch::new(Vec::new()));
     }
-    let mut entries = vec![None; requests.len()];
+    let mut entries: Vec<Option<crate::Blob>> = vec![None; requests.len()];
     let mut missing = Vec::new();
     for (index, (key, expected)) in requests.iter().enumerate() {
         let staged = key
@@ -7993,7 +7991,7 @@ where
                     "staged plugin payload does not match its authenticated BlobRef identity",
                 ));
             }
-            entries[index] = Some(bytes);
+            entries[index] = Some(bytes.into());
         } else if let Some(file_id) = key.file_id.as_deref()
             && let Some((actual, bytes)) =
                 pending_plugin_wasm_by_owner.get(&(branch_id.to_owned(), file_id.to_owned()))
@@ -8004,7 +8002,7 @@ where
                     "staged plugin payload owner does not match its authenticated BlobRef identity",
                 ));
             }
-            entries[index] = Some(bytes.clone());
+            entries[index] = Some(bytes.clone().into());
         } else {
             missing.push((index, requests[index].0.clone(), *expected));
         }
@@ -8015,7 +8013,7 @@ where
             .iter()
             .map(|(_, key, _)| key.clone())
             .collect::<Vec<_>>();
-        let fetched = reader.load_bytes_for_rows(&keys).await?.into_vec();
+        let fetched = reader.load_bytes_for_rows(&keys).await?.into_blob_vec();
         if fetched.len() != missing.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -8029,7 +8027,7 @@ where
                     "authenticated plugin BlobRef owner has no payload",
                 )
             })?;
-            if BlobId::from_canonical_content(&bytes) != expected {
+            if BlobId::from_canonical_content(bytes.as_ref()) != expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "authenticated plugin BlobRef payload identity does not match the requested owner",
@@ -8038,7 +8036,7 @@ where
             entries[index] = Some(bytes);
         }
     }
-    Ok(BlobBytesBatch::new(entries))
+    Ok(BlobBytesBatch::from_blobs(entries))
 }
 
 /// Runs validation-only derived projections through the caller-owned facade.
@@ -10853,7 +10851,7 @@ where
             &requests,
         )
         .await?
-        .into_vec();
+        .into_blob_vec();
         if materialized_bytes.len() != owners.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -10876,18 +10874,16 @@ where
         let limits = WasmTransitionLimits::default();
 
         for (owner, expected) in owners.iter().zip(materialized_bytes) {
-            let expected: crate::Blob = expected
-                .ok_or_else(|| {
-                    plugin_upgrade_error(
-                        upgrade,
-                        owner.file_id(),
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            "owned component file references a missing materialized blob",
-                        ),
-                    )
-                })?
-                .into();
+            let expected = expected.ok_or_else(|| {
+                plugin_upgrade_error(
+                    upgrade,
+                    owner.file_id(),
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        "owned component file references a missing materialized blob",
+                    ),
+                )
+            })?;
             let path = transaction
                 .plugin_file_path(&upgrade.branch_id, owner.file_id())
                 .await?

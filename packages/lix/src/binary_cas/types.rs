@@ -164,8 +164,14 @@ pub(crate) enum BlobLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum BlobBytesEntry {
+    Owned(Vec<u8>),
+    Shared(bytes::Bytes),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobBytesBatch {
-    entries: Vec<Option<bytes::Bytes>>,
+    entries: Vec<Option<BlobBytesEntry>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +201,7 @@ impl BlobBytesBatch {
         Self {
             entries: entries
                 .into_iter()
-                .map(|entry| entry.map(bytes::Bytes::from))
+                .map(|entry| entry.map(BlobBytesEntry::Owned))
                 .collect(),
         }
     }
@@ -203,18 +209,89 @@ impl BlobBytesBatch {
     /// Retains already shared payload buffers without copying. The caller is
     /// responsible for having authenticated every buffer before construction.
     pub(crate) fn from_shared(entries: Vec<Option<bytes::Bytes>>) -> Self {
-        Self { entries }
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|entry| entry.map(BlobBytesEntry::Shared))
+                .collect(),
+        }
+    }
+
+    /// Retains shared `Blob` payloads without copying. The caller is
+    /// responsible for having authenticated every buffer before construction.
+    pub(crate) fn from_blobs(entries: Vec<Option<crate::Blob>>) -> Self {
+        Self::from_shared(
+            entries
+                .into_iter()
+                .map(|entry| entry.map(crate::Blob::into_bytes))
+                .collect(),
+        )
     }
 
     pub(crate) fn into_vec(self) -> Vec<Option<Vec<u8>>> {
         self.entries
             .into_iter()
-            .map(|entry| entry.map(|bytes| bytes.to_vec()))
+            .map(|entry| {
+                entry.map(|entry| match entry {
+                    BlobBytesEntry::Owned(bytes) => bytes,
+                    BlobBytesEntry::Shared(bytes) => bytes.to_vec(),
+                })
+            })
             .collect()
     }
 
     pub(crate) fn into_shared_vec(self) -> Vec<Option<bytes::Bytes>> {
         self.entries
+            .into_iter()
+            .map(|entry| {
+                entry.map(|entry| match entry {
+                    BlobBytesEntry::Owned(bytes) => bytes.into(),
+                    BlobBytesEntry::Shared(bytes) => bytes,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn into_blob_vec(self) -> Vec<Option<crate::Blob>> {
+        self.entries
+            .into_iter()
+            .map(|entry| {
+                entry.map(|entry| match entry {
+                    BlobBytesEntry::Owned(bytes) => bytes.into(),
+                    BlobBytesEntry::Shared(bytes) => bytes.into(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlobBytesBatch;
+    use bytes::Bytes;
+
+    #[test]
+    fn owned_batches_transfer_vec_storage_without_copying() {
+        let source = vec![0x5a; 32];
+        let source_ptr = source.as_ptr();
+        let returned = BlobBytesBatch::new(vec![Some(source)])
+            .into_vec()
+            .pop()
+            .flatten()
+            .expect("owned entry");
+        assert_eq!(returned.as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn shared_batches_transfer_bytes_storage_into_blob_without_copying() {
+        let source = Bytes::from_static(b"shared authenticated payload");
+        let source_ptr = source.as_ptr();
+        let blob = BlobBytesBatch::from_shared(vec![Some(source)])
+            .into_blob_vec()
+            .pop()
+            .flatten()
+            .expect("shared entry");
+        assert_eq!(blob.as_ref().as_ptr(), source_ptr);
     }
 }
 
