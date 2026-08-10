@@ -1740,6 +1740,32 @@ where
                     .stage_verified_request_blob_splice(view, &state_key, payload, provenance)
                     .await
                     .map_err(LixError::from)?
+            } else if let Some(base_blob_hash) = write.base_blob_hash() {
+                if write.untracked {
+                    publication
+                        .stage_inline_blob_payload(payload.bytes())
+                        .map_err(LixError::from)?
+                } else {
+                    let file_id = &write.file_id;
+                    let state_key = StateKey {
+                        schema_key: "lix_binary_blob_ref".to_owned(),
+                        file_id: Some(file_id.clone()),
+                        entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                            writer_error(format!(
+                                "authenticated blob edit file identity is not a canonical UUID: {error}"
+                            ))
+                        })?,
+                    };
+                    publication
+                        .stage_authenticated_inline_blob_edit(
+                            view,
+                            &state_key,
+                            payload,
+                            base_blob_hash,
+                        )
+                        .await
+                        .map_err(LixError::from)?
+                }
             } else {
                 publication
                     .stage_inline_blob_payload(payload.bytes())

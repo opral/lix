@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 
-use crate::binary_cas::BlobId;
+use crate::binary_cas::{BlobEditSplice, BlobId};
 use crate::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, StorageError,
 };
@@ -17,7 +17,7 @@ use super::model::{
 };
 use super::object::{
     ObjectDomain, ObjectId, authenticate_object_domain, decode_id, decode_object, encode_id,
-    encode_object,
+    encode_object, hash_object_parts,
 };
 use super::state::{StateKey, StateKeyRef, encode_state_key};
 use super::tree::ImmutableObjectSet;
@@ -444,6 +444,92 @@ where
     })
 }
 
+/// Finds a canonical chunk-boundary edit without loading the base payload.
+/// The base claims are authenticated Merkle leaves; the new payload is already
+/// owned by the transaction, so hashing its canonical chunks is the only
+/// content work required. Unchanged complete chunks remain eligible for the
+/// existing authenticated path-copy builder.
+pub(super) async fn derive_blob_edit_splice<R>(
+    read: &R,
+    manifest: BlobManifestV1,
+    payload: &[u8],
+) -> Result<Option<BlobEditSplice>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let base = load_authenticated_blob_merkle_base(read, manifest).await?;
+    derive_blob_edit_splice_from_base(manifest, &base, payload)
+}
+
+fn derive_blob_edit_splice_from_base(
+    manifest: BlobManifestV1,
+    base: &AuthenticatedBlobMerkleBase,
+    payload: &[u8],
+) -> Result<Option<BlobEditSplice>, StorageError> {
+    let new_chunks = if payload.is_empty() {
+        vec![(0_u64, [0_u8; 32])]
+    } else {
+        payload
+            .chunks(CANONICAL_BLOB_CHUNK_BYTES)
+            .map(|chunk| {
+                (
+                    u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+                    *blake3::hash(chunk).as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let claim_matches = |old: &(BlobChunkRefV1, [u8; 32]), new: &(u64, [u8; 32])| {
+        old.0.declared_len == new.0 && old.1 == new.1
+    };
+    let mut prefix = 0_usize;
+    while prefix < base.chunk_claims.len()
+        && prefix < new_chunks.len()
+        && claim_matches(&base.chunk_claims[prefix], &new_chunks[prefix])
+    {
+        prefix += 1;
+    }
+    let mut old_suffix = base.chunk_claims.len();
+    let mut new_suffix = new_chunks.len();
+    while old_suffix > prefix
+        && new_suffix > prefix
+        && claim_matches(
+            &base.chunk_claims[old_suffix - 1],
+            &new_chunks[new_suffix - 1],
+        )
+    {
+        old_suffix -= 1;
+        new_suffix -= 1;
+    }
+    if prefix == base.chunk_claims.len() && prefix == new_chunks.len() {
+        return Ok(None);
+    }
+    let offset = base.chunk_claims[..prefix]
+        .iter()
+        .try_fold(0_usize, |total, (chunk, _)| {
+            total.checked_add(usize::try_from(chunk.declared_len).ok()?)
+        })
+        .ok_or_else(|| corruption("Merkle edit prefix length overflows usize"))?;
+    let delete_len = base.chunk_claims[prefix..old_suffix]
+        .iter()
+        .try_fold(0_usize, |total, (chunk, _)| {
+            total.checked_add(usize::try_from(chunk.declared_len).ok()?)
+        })
+        .ok_or_else(|| corruption("Merkle edit delete length overflows usize"))?;
+    let insert_len = new_chunks[prefix..new_suffix]
+        .iter()
+        .try_fold(0_usize, |total, (length, _)| {
+            total.checked_add(usize::try_from(*length).ok()?)
+        })
+        .ok_or_else(|| corruption("Merkle edit insert length overflows usize"))?;
+    Ok(Some(BlobEditSplice {
+        base_blob_hash: manifest.canonical_blob_id,
+        offset,
+        delete_len,
+        insert_len,
+    }))
+}
+
 async fn load_merkle_objects_many<R>(
     read: &R,
     ids: &[ObjectId],
@@ -490,18 +576,72 @@ where
 /// StateKey-bound manifest root and never looks content up by this value.
 pub(crate) fn canonical_blob_id_for_content(content: &[u8]) -> Result<BlobId, StorageError> {
     let chunks = if content.is_empty() {
-        vec![BlobChunkV1 {
-            bytes: Bytes::new(),
-        }]
+        std::iter::once(&[][..]).collect::<Vec<_>>()
     } else {
         content
             .chunks(CANONICAL_BLOB_CHUNK_BYTES)
-            .map(|chunk| BlobChunkV1 {
-                bytes: Bytes::copy_from_slice(chunk),
-            })
-            .collect()
+            .collect::<Vec<_>>()
     };
-    Ok(build_blob_merkle_tree(&chunks)?.manifest.canonical_blob_id)
+    let mut leaves = Vec::with_capacity(chunks.len());
+    for (ordinal, chunk) in chunks.into_iter().enumerate() {
+        let declared_len = u64::try_from(chunk.len())
+            .map_err(|_| corruption("canonical blob chunk length overflows u64"))?;
+        let encoded_len = u32::try_from(chunk.len())
+            .map_err(|_| corruption("canonical blob chunk length exceeds u32"))?
+            .to_be_bytes();
+        let chunk_object_id =
+            hash_object_parts(ObjectDomain::BlobChunk, [encoded_len.as_slice(), chunk]);
+        let leaf = BlobMerkleLeafV1 {
+            ordinal: u64::try_from(ordinal)
+                .map_err(|_| corruption("canonical blob leaf ordinal overflows u64"))?,
+            chunk_object_id,
+            declared_len,
+            chunk_digest: *blake3::hash(chunk).as_bytes(),
+        };
+        let (leaf_object_id, _) = encode_leaf(&leaf)?;
+        leaves.push(LeafWithId {
+            value: leaf,
+            object_id: leaf_object_id,
+        });
+    }
+    let root = build_blob_merkle_summary(&leaves)?;
+    Ok(canonical_blob_id_from_summary(root))
+}
+
+/// Computes the canonical tree root while retaining only the small leaf and
+/// internal summaries. Unlike the publication builder this deliberately does
+/// not retain chunk or node encodings; the caller uses the result only as a
+/// transient content identity before the authenticated publisher stages the
+/// actual objects.
+fn build_blob_merkle_summary(leaves: &[LeafWithId]) -> Result<NodeSummary, StorageError> {
+    if leaves.is_empty() {
+        return Err(corruption("Merkle layout requires at least one leaf"));
+    }
+    if leaves.len() == 1 {
+        let leaf = &leaves[0].value;
+        return Ok(NodeSummary {
+            object_id: leaves[0].object_id,
+            height: 0,
+            first_ordinal: leaf.ordinal,
+            leaf_count: 1,
+            logical_bytes: leaf.declared_len,
+        });
+    }
+    let split = leaves
+        .len()
+        .checked_next_power_of_two()
+        .ok_or_else(|| corruption("Merkle leaf count cannot be represented"))?
+        / 2;
+    let left = build_blob_merkle_summary(&leaves[..split])?;
+    let right = build_blob_merkle_summary(&leaves[split..])?;
+    let parent = encode_internal(left, right)?;
+    Ok(NodeSummary {
+        object_id: parent.object_id,
+        height: parent.value.height,
+        first_ordinal: parent.value.first_ordinal,
+        leaf_count: parent.value.leaf_count,
+        logical_bytes: parent.value.logical_bytes,
+    })
 }
 
 /// Builds the smallest authenticated Merkle fixture for unit tests.  The
@@ -1414,6 +1554,67 @@ mod tests {
                 authenticate_object_domain(*id, bytes) == Ok(ObjectDomain::BlobChunk)
             })
             .count()
+    }
+
+    #[test]
+    fn canonical_blob_id_without_object_materialization_matches_builder() {
+        for length in [
+            0,
+            1,
+            CANONICAL_BLOB_CHUNK_BYTES - 1,
+            CANONICAL_BLOB_CHUNK_BYTES,
+            CANONICAL_BLOB_CHUNK_BYTES + 1,
+            CANONICAL_BLOB_CHUNK_BYTES * 3 + 17,
+        ] {
+            let content = (0..length)
+                .map(|index| (index as u8).wrapping_mul(37))
+                .collect::<Vec<_>>();
+            let expected = build_blob_merkle_tree(&canonical_chunks(&content))
+                .unwrap()
+                .manifest
+                .canonical_blob_id;
+            assert_eq!(canonical_blob_id_for_content(&content).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn authenticated_edit_geometry_covers_overwrite_append_and_noop() {
+        let base_chunks = chunks(3);
+        let base = build_blob_merkle_tree(&base_chunks).unwrap();
+        let authenticated = authenticated_base(&base);
+        let base_bytes = base_chunks
+            .iter()
+            .flat_map(|chunk| chunk.bytes.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            derive_blob_edit_splice_from_base(base.manifest, &authenticated, &base_bytes),
+            Ok(None),
+        );
+
+        let mut overwritten = base_bytes.clone();
+        overwritten[CANONICAL_BLOB_CHUNK_BYTES..CANONICAL_BLOB_CHUNK_BYTES * 2].fill(0xa5);
+        assert_eq!(
+            derive_blob_edit_splice_from_base(base.manifest, &authenticated, &overwritten),
+            Ok(Some(BlobEditSplice {
+                base_blob_hash: base.manifest.canonical_blob_id,
+                offset: CANONICAL_BLOB_CHUNK_BYTES,
+                delete_len: CANONICAL_BLOB_CHUNK_BYTES,
+                insert_len: CANONICAL_BLOB_CHUNK_BYTES,
+            })),
+        );
+
+        let mut appended = base_bytes;
+        appended.extend(std::iter::repeat_n(0xd6, CANONICAL_BLOB_CHUNK_BYTES));
+        assert_eq!(
+            derive_blob_edit_splice_from_base(base.manifest, &authenticated, &appended),
+            Ok(Some(BlobEditSplice {
+                base_blob_hash: base.manifest.canonical_blob_id,
+                offset: CANONICAL_BLOB_CHUNK_BYTES * 3,
+                delete_len: 0,
+                insert_len: CANONICAL_BLOB_CHUNK_BYTES,
+            })),
+        );
     }
 
     fn state_key() -> StateKey {

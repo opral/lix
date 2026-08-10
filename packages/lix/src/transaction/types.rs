@@ -2099,7 +2099,6 @@ impl TransactionFileContent {
         self.edit_blob_splice
     }
 
-    #[cfg(test)]
     pub(crate) fn base_blob_hash(&self) -> Option<BlobId> {
         self.base_blob_hash
     }
