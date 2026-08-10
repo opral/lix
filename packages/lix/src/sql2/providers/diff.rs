@@ -16,7 +16,7 @@ use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::encode_diff_id;
+use crate::state::encode_diff_id;
 use crate::{LixError, NullableKeyFilter};
 
 use super::checkpoint::filter_conjuncts;
