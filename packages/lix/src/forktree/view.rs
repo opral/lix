@@ -91,7 +91,7 @@ where
         &self.read
     }
 
-    pub(super) fn retained_read(&self) -> &R {
+    pub(crate) fn retained_read(&self) -> &R {
         &self.read
     }
 

@@ -52,12 +52,12 @@ where
     S: StorageAdapterRead,
 {
     let view = facade.branch(branch_id).await?;
-    let base = load_commit_summary(&view, commits.base_commit_id)
+    let base = load_commit_summary(&view, native_commit_id(commits.base_commit_id))
         .await?
         .ok_or_else(|| {
             LixError::commit_not_found(commits.base_commit_id.to_string(), "merge", "base")
         })?;
-    let source = load_commit_summary(&view, commits.source_commit_id)
+    let source = load_commit_summary(&view, native_commit_id(commits.source_commit_id))
         .await?
         .ok_or_else(|| {
             LixError::commit_not_found(commits.source_commit_id.to_string(), "merge", "source")
@@ -68,7 +68,7 @@ where
         None
     } else {
         Some(
-            load_commit_summary(&view, commits.target_commit_id)
+            load_commit_summary(&view, native_commit_id(commits.target_commit_id))
                 .await?
                 .ok_or_else(|| {
                     LixError::commit_not_found(
@@ -146,6 +146,10 @@ where
         stats,
         merge_plan,
     })
+}
+
+fn native_commit_id(value: CommitId) -> crate::forktree::CommitId {
+    crate::forktree::CommitId::from_bytes(*value.as_uuid().as_bytes())
 }
 
 async fn load_forktree_diff<S>(
