@@ -365,8 +365,9 @@ pub(crate) fn project_pk(row: &StateRow) -> Result<EntityPk, LixError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};
-    use crate::forktree::{ChangeId, CommitId, StateCell, StateValue};
+    use crate::forktree::{StateCell, StateValue};
     use crate::state::StateRowSource;
 
     fn row(entity: &str, cell: StateCell) -> StateRow {
@@ -378,8 +379,8 @@ mod tests {
                 entity_pk: &entity_pk,
             }),
             value: StateValue {
-                change_id: ChangeId::from_bytes([1; 16]),
-                commit_id: CommitId::from_bytes([2; 16]),
+                change_id: ChangeId::new(uuid::Uuid::from_bytes([1; 16])),
+                commit_id: CommitId::new(uuid::Uuid::from_bytes([2; 16])),
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
                 cell,

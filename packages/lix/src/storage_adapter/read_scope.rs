@@ -27,7 +27,7 @@ pub trait StorageAdapterRead: Send + Sync {
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send;
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StorageAdapterReadScope<R> {
     read: R,
 }

@@ -100,11 +100,12 @@ pub(crate) enum SqlLogicalPlan {
     Write(SqlWriteLogicalPlan),
 }
 
-pub(crate) fn prepare_path_value_replacement_program<R>(
-    ctx: &dyn crate::sql2::SqlWriteExecutionContext<ReadStore = R>,
+pub(crate) fn prepare_path_value_replacement_program<C, R>(
+    ctx: &C,
     plan: &SqlLogicalPlan,
 ) -> Option<bound_public_write::PreparedPathValueReplacementProgram>
 where
+    C: crate::sql2::SqlWriteExecutionContext<ReadStore = R>,
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let SqlLogicalPlan::Write(write) = plan else {
@@ -113,12 +114,13 @@ where
     bound_public_write::prepare_path_value_replacement_program_from_logical(ctx, &write.plan)
 }
 
-pub(crate) async fn prepare_path_value_replacement_row<R>(
-    ctx: &mut dyn crate::sql2::SqlWriteExecutionContext<ReadStore = R>,
+pub(crate) async fn prepare_path_value_replacement_row<C, R>(
+    ctx: &mut C,
     program: &bound_public_write::PreparedPathValueReplacementProgram,
     params: &[crate::Value],
 ) -> Result<Option<bound_public_write::PreparedPathValueReplacementRow>, crate::LixError>
 where
+    C: crate::sql2::SqlWriteExecutionContext<ReadStore = R>,
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     bound_public_write::prepare_path_value_replacement_row(ctx, program, params).await

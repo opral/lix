@@ -9,7 +9,7 @@ use crate::{NullableKeyFilter, entity_pk::EntityPk};
 pub(super) struct StateFilter {
     pub(super) schema_keys: Vec<String>,
     pub(super) entity_pks: Vec<EntityPk>,
-    pub(super) file_ids: Vec<NullableKeyFilter>,
+    pub(super) file_ids: Vec<NullableKeyFilter<String>>,
     pub(super) include_tombstones: bool,
 }
 

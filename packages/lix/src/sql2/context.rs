@@ -340,9 +340,7 @@ where
             ptr: Arc::new(SqlWriteContextPtr(ptr)),
             gate: Arc::new(Mutex::new(())),
             explicit_insert_columns: None,
-            write_targets: Some(Arc::new(
-                super::providers::WriteTargetRegistry::<R>::default(),
-            )),
+            write_targets: Some(Arc::new(super::providers::WriteTargetRegistry::<R>::new())),
         }
     }
 
