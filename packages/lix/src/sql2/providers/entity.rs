@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,7 +14,9 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchRefReader};
 use crate::changelog::CommitRecord;
@@ -2647,6 +2651,44 @@ fn entity_record_batch_from_slots(
         return RecordBatch::try_new_with_options(schema, vec![], &options)
             .map_err(DataFusionError::from);
     }
+    // Broad tracked scans are the hot public-read path. Decode only the
+    // selected top-level JSON members directly into Arrow builders instead
+    // of materializing one serde_json::Value DOM per row. The native slot
+    // authority and ordering are unchanged; mixed/untracked rows retain the
+    // established parsed path because their owner-specific semantics need the
+    // full snapshot representation.
+    if slots
+        .iter()
+        .all(|slot| !matches!(slot, EntityStateSlot::Untracked(_)))
+    {
+        let decoder = EntityRawProjectionDecoder::new(
+            spec,
+            schema.fields().iter().filter_map(|field| {
+                (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
+            }),
+        )?;
+        let mut visible_columns = decoder.decode_slots(spec, slots)?.into_iter();
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                field.name().strip_prefix("lixcol_").map_or_else(
+                    || {
+                        visible_columns.next().ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "entity projection decoder did not return a visible column"
+                                    .to_string(),
+                            )
+                        })
+                    },
+                    |property_name| {
+                        entity_slot_system_column_array(spec, property_name, slots, branch_id)
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return RecordBatch::try_new(schema, columns).map_err(DataFusionError::from);
+    }
     let snapshots = slots
         .iter()
         .map(|slot| parse_snapshot(slot_snapshot(slot)))
@@ -2657,6 +2699,430 @@ fn entity_record_batch_from_slots(
         .map(|field| entity_slot_column_array(spec, field.name(), slots, &snapshots, branch_id))
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+#[derive(Clone)]
+struct EntityRawProjectionField {
+    name: String,
+    column_type: EntityColumnType,
+}
+
+/// Projection-aware JSON decoding kept at the native entity provider
+/// boundary. This is intentionally not a compatibility module: it consumes
+/// authenticated native slots and emits only the requested Arrow columns.
+struct EntityRawProjectionDecoder {
+    schema_key: String,
+    fields: Vec<EntityRawProjectionField>,
+    slots_by_name: HashMap<String, Vec<usize>>,
+}
+
+impl EntityRawProjectionDecoder {
+    fn new<'a>(
+        spec: &EntitySurfaceSpec,
+        columns: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self> {
+        let mut fields = Vec::new();
+        let mut slots_by_name = HashMap::<String, Vec<usize>>::new();
+        for column_name in columns {
+            let column = spec.visible_column(column_name).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "sql2 entity provider '{}' does not expose column '{}'",
+                    spec.schema_key, column_name
+                ))
+            })?;
+            let index = fields.len();
+            fields.push(EntityRawProjectionField {
+                name: column.name.clone(),
+                column_type: column.column_type,
+            });
+            slots_by_name
+                .entry(column.name.clone())
+                .or_default()
+                .push(index);
+        }
+        Ok(Self {
+            schema_key: spec.schema_key.clone(),
+            fields,
+            slots_by_name,
+        })
+    }
+
+    fn decode_slots(
+        &self,
+        spec: &EntitySurfaceSpec,
+        slots: &[EntityStateSlot],
+    ) -> Result<Vec<ArrayRef>> {
+        let mut sink = EntityRawProjectionSink {
+            columns: self
+                .fields
+                .iter()
+                .map(|field| EntityRawProjectionColumn::new(field.column_type, slots.len()))
+                .collect(),
+            present: vec![false; self.fields.len()],
+        };
+        for slot in slots {
+            self.decode_one(slot_snapshot(slot).map(str::as_bytes), &mut sink)
+                .map_err(lix_error_to_datafusion_error)?;
+            sink.fill_missing_primary_keys(self, spec, slot)
+                .map_err(lix_error_to_datafusion_error)?;
+        }
+        Ok(sink
+            .columns
+            .into_iter()
+            .map(EntityRawProjectionColumn::into_array)
+            .collect())
+    }
+
+    fn decode_one(
+        &self,
+        snapshot: Option<&[u8]>,
+        sink: &mut EntityRawProjectionSink,
+    ) -> Result<(), LixError> {
+        sink.begin_row();
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+        let mut deserializer = serde_json::Deserializer::from_slice(snapshot);
+        let semantic_error = RawEntityProjectionSeed {
+            decoder: self,
+            sink,
+        }
+        .deserialize(&mut deserializer)
+        .map_err(raw_snapshot_decode_error)?;
+        deserializer.end().map_err(raw_snapshot_decode_error)?;
+        semantic_error.map_or(Ok(()), Err)
+    }
+}
+
+struct RawEntityProjectionSeed<'decoder, 'sink> {
+    decoder: &'decoder EntityRawProjectionDecoder,
+    sink: &'sink mut EntityRawProjectionSink,
+}
+
+impl<'de> DeserializeSeed<'de> for RawEntityProjectionSeed<'_, '_> {
+    type Value = Option<LixError>;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(RawEntityProjectionVisitor {
+            decoder: self.decoder,
+            sink: self.sink,
+        })
+    }
+}
+
+struct RawEntityProjectionVisitor<'decoder, 'sink> {
+    decoder: &'decoder EntityRawProjectionDecoder,
+    sink: &'sink mut EntityRawProjectionSink,
+}
+
+impl<'de> Visitor<'de> for RawEntityProjectionVisitor<'_, '_> {
+    type Value = Option<LixError>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON entity snapshot")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let RawEntityProjectionVisitor { decoder, sink } = self;
+        let mut semantic_error = None;
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            let Some(indices) = decoder.slots_by_name.get(key.as_ref()) else {
+                map.next_value::<IgnoredAny>()?;
+                continue;
+            };
+            let raw = map.next_value::<&RawValue>()?;
+            if semantic_error.is_none() {
+                if let Err(error) = sink.project_raw(decoder, indices, raw) {
+                    semantic_error = Some(error);
+                }
+            }
+        }
+        Ok(semantic_error)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+}
+
+struct EntityRawProjectionSink {
+    columns: Vec<EntityRawProjectionColumn>,
+    present: Vec<bool>,
+}
+
+impl EntityRawProjectionSink {
+    fn begin_row(&mut self) {
+        self.present.fill(false);
+        for column in &mut self.columns {
+            column.push_null();
+        }
+    }
+
+    fn project_raw(
+        &mut self,
+        decoder: &EntityRawProjectionDecoder,
+        indices: &[usize],
+        raw: &RawValue,
+    ) -> Result<(), LixError> {
+        for index in indices {
+            self.present[*index] = true;
+            self.columns[*index].replace_last_from_raw(
+                raw,
+                &decoder.fields[*index],
+                &decoder.schema_key,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn fill_missing_primary_keys(
+        &mut self,
+        decoder: &EntityRawProjectionDecoder,
+        spec: &EntitySurfaceSpec,
+        slot: &EntityStateSlot,
+    ) -> Result<(), LixError> {
+        for (index, field) in decoder.fields.iter().enumerate() {
+            if self.present[index] {
+                continue;
+            }
+            let Some(component_index) = spec.primary_key_paths.iter().position(|path| {
+                path.len() == 1 && path.first().is_some_and(|name| name == &field.name)
+            }) else {
+                continue;
+            };
+            let key = slot_state_key(slot)?;
+            let values = key.entity_pk.as_json_array_value()?;
+            let value = values
+                .as_array()
+                .and_then(|values| values.get(component_index));
+            self.columns[index].replace_last_from_json(value, field, &decoder.schema_key)?;
+        }
+        Ok(())
+    }
+}
+
+enum EntityRawProjectionColumn {
+    String(Vec<Option<String>>),
+    Json(Vec<Option<String>>),
+    Integer(Vec<Option<i64>>),
+    Number(Vec<Option<f64>>),
+    Boolean(Vec<Option<bool>>),
+}
+
+impl EntityRawProjectionColumn {
+    fn new(column_type: EntityColumnType, capacity: usize) -> Self {
+        match column_type {
+            EntityColumnType::String => Self::String(Vec::with_capacity(capacity)),
+            EntityColumnType::Json => Self::Json(Vec::with_capacity(capacity)),
+            EntityColumnType::Integer => Self::Integer(Vec::with_capacity(capacity)),
+            EntityColumnType::Number => Self::Number(Vec::with_capacity(capacity)),
+            EntityColumnType::Boolean => Self::Boolean(Vec::with_capacity(capacity)),
+        }
+    }
+
+    fn push_null(&mut self) {
+        match self {
+            Self::String(values) | Self::Json(values) => values.push(None),
+            Self::Integer(values) => values.push(None),
+            Self::Number(values) => values.push(None),
+            Self::Boolean(values) => values.push(None),
+        }
+    }
+
+    fn replace_last_from_raw(
+        &mut self,
+        raw: &RawValue,
+        field: &EntityRawProjectionField,
+        schema_key: &str,
+    ) -> Result<(), LixError> {
+        match self {
+            Self::String(values) if field.column_type == EntityColumnType::String => {
+                *values.last_mut().expect("projection row must start first") =
+                    raw_string_text(raw)?;
+            }
+            Self::Json(values) if field.column_type == EntityColumnType::Json => {
+                *values.last_mut().expect("projection row must start first") = raw_json_text(raw);
+            }
+            Self::Integer(values) if field.column_type == EntityColumnType::Integer => {
+                let value = parse_raw_json_value(raw)?;
+                *values.last_mut().expect("projection row must start first") =
+                    json_bigint_value(Some(&value), schema_key, &field.name)?;
+            }
+            Self::Number(values) if field.column_type == EntityColumnType::Number => {
+                let value = parse_raw_json_value(raw)?;
+                *values.last_mut().expect("projection row must start first") =
+                    json_double_value(Some(&value), schema_key, &field.name)?;
+            }
+            Self::Boolean(values) if field.column_type == EntityColumnType::Boolean => {
+                *values.last_mut().expect("projection row must start first") = raw_bool(raw);
+            }
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "entity snapshot projection produced a value with the wrong SQL type",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_last_from_json(
+        &mut self,
+        value: Option<&JsonValue>,
+        field: &EntityRawProjectionField,
+        schema_key: &str,
+    ) -> Result<(), LixError> {
+        match self {
+            Self::String(values) if field.column_type == EntityColumnType::String => {
+                *values.last_mut().expect("projection row must start first") = match value {
+                    None | Some(JsonValue::Null) => None,
+                    Some(JsonValue::Bool(value)) => Some(value.to_string()),
+                    Some(JsonValue::String(value)) => Some(value.clone()),
+                    Some(value) => Some(serde_json::to_string(value).map_err(|error| {
+                        LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string())
+                    })?),
+                };
+            }
+            Self::Json(values) if field.column_type == EntityColumnType::Json => {
+                *values.last_mut().expect("projection row must start first") = value
+                    .filter(|value| !value.is_null())
+                    .map(|value| serde_json::to_string(value))
+                    .transpose()
+                    .map_err(|error| {
+                        LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string())
+                    })?;
+            }
+            Self::Integer(values) if field.column_type == EntityColumnType::Integer => {
+                *values.last_mut().expect("projection row must start first") =
+                    json_bigint_value(value, schema_key, &field.name)?;
+            }
+            Self::Number(values) if field.column_type == EntityColumnType::Number => {
+                *values.last_mut().expect("projection row must start first") =
+                    json_double_value(value, schema_key, &field.name)?;
+            }
+            Self::Boolean(values) if field.column_type == EntityColumnType::Boolean => {
+                *values.last_mut().expect("projection row must start first") =
+                    value.and_then(JsonValue::as_bool);
+            }
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "entity snapshot projection produced a value with the wrong SQL type",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn into_array(self) -> ArrayRef {
+        match self {
+            Self::String(values) | Self::Json(values) => Arc::new(StringArray::from(values)),
+            Self::Integer(values) => Arc::new(Int64Array::from(values)),
+            Self::Number(values) => Arc::new(Float64Array::from(values)),
+            Self::Boolean(values) => Arc::new(BooleanArray::from(values)),
+        }
+    }
+}
+
+fn parse_raw_json_value(raw: &RawValue) -> Result<JsonValue, LixError> {
+    serde_json::from_str(raw.get()).map_err(raw_snapshot_decode_error)
+}
+
+fn raw_string_text(raw: &RawValue) -> Result<Option<String>, LixError> {
+    if raw.get().trim_start().starts_with('"') {
+        return serde_json::from_str(raw.get())
+            .map(Some)
+            .map_err(raw_snapshot_decode_error);
+    }
+    Ok(Some(
+        serde_json::to_string(&parse_raw_json_value(raw)?)
+            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?,
+    ))
+}
+
+fn raw_json_text(raw: &RawValue) -> Option<String> {
+    (raw.get().trim() != "null").then(|| raw.get().to_string())
+}
+
+fn raw_bool(raw: &RawValue) -> Option<bool> {
+    match raw.get().trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn raw_snapshot_decode_error(error: serde_json::Error) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("sql2 entity provider expected valid snapshot_content JSON: {error}"),
+    )
 }
 
 fn entity_slot_column_array(
