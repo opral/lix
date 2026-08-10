@@ -2472,14 +2472,12 @@ where
                 let mut staged = staged;
                 let mut file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
                 for row_index in 0..matched_batch.num_rows() {
-                    let branch_id = branch_binding
-                        .active_branch_id()
-                        .map(ToOwned::to_owned)
-                        .unwrap_or(required_string_value(
-                            &matched_batch,
-                            row_index,
-                            "lixcol_branch_id",
-                        )?);
+                    let branch_id = match branch_binding.active_branch_id() {
+                        Some(branch_id) => branch_id.to_owned(),
+                        None => {
+                            required_string_value(&matched_batch, row_index, "lixcol_branch_id")?
+                        }
+                    };
                     file_ids_by_branch
                         .entry(branch_id)
                         .or_default()
