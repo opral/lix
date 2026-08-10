@@ -5232,44 +5232,15 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     .map(plugin_storage_archive_file_id)
                     .unwrap_or_else(|| generate_directory_id())
             });
-            let needs_empty_blob_ref = data.is_none() && plugin_key.is_none();
-            let blob_ref_context = context.clone();
             let mut plan = plan_parsed_file_path_write_with_resolvers(
                 path_resolvers,
                 parsed_path,
                 Some(file_id.clone()),
-                Some(
-                    data.map(Into::into)
-                        .unwrap_or_else(|| FileContent::inline(Vec::new())),
-                ),
+                data.map(Into::into),
                 context,
                 generate_directory_id,
             )
             .map_err(lix_error_to_datafusion_error)?;
-            if needs_empty_blob_ref {
-                let filename = path.rsplit('/').next().map(ToOwned::to_owned);
-                stage_lix_file_content_insert_write(
-                    &mut staged,
-                    file_id.clone(),
-                    Some(path.clone()),
-                    filename,
-                    FileContent::inline(Vec::<u8>::new()),
-                    blob_ref_context.clone(),
-                    Some(lix_file_insert_origin(surface_name, &file_id)),
-                )?;
-                BlobRefRowInput {
-                    file_id: file_id.clone(),
-                    blob_hash: BlobId::from_canonical_content(&[]),
-                    size_bytes: 0,
-                    plugin_checkpoint: None,
-                    context: FilesystemRowContext {
-                        file_id: None,
-                        ..blob_ref_context
-                    },
-                }
-                .append_to(&mut plan.rows)
-                .map_err(lix_error_to_datafusion_error)?;
-            }
             attach_lix_file_insert_origin(&mut plan.rows, surface_name, &file_id);
             staged
                 .extend_filesystem_plan(plan)
@@ -5400,7 +5371,7 @@ fn stage_lix_file_content_insert_write(
         context.untracked,
         content,
     );
-    if !file_payload.is_empty() || file_payload.inline_data().is_some() {
+    if !file_payload.is_empty() {
         stage_lix_file_content_blob_ref_write(staged, &file_payload, &context, origin)?;
     }
     staged.file_content_writes.push(file_payload);
@@ -5435,9 +5406,7 @@ fn stage_lix_file_content_update_write(
             append_blob_ref_tombstone_row(&mut staged.state_rows, file_id, context.clone());
             staged.state_rows.set_origin(row_index, origin.clone());
         }
-        if has_blob_ref {
-            staged.file_content_writes.push(file_payload);
-        }
+        staged.file_content_writes.push(file_payload);
         return Ok(());
     }
     stage_lix_file_content_blob_ref_write(staged, &file_payload, &context, origin.clone())?;
@@ -5456,13 +5425,7 @@ fn stage_lix_file_content_blob_ref_write(
         file_id: file_content.file_id.clone(),
         blob_hash: file_content
             .blob_hash()
-            .or_else(|| {
-                file_content
-                    .inline_data()
-                    .filter(|bytes| bytes.is_empty())
-                    .map(|_| BlobId::from_canonical_content(b""))
-            })
-            .expect("inline file payload should have blob hash"),
+            .expect("non-empty payload should have blob hash"),
         size_bytes: file_content.len(),
         plugin_checkpoint: None,
         context: FilesystemRowContext {

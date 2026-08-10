@@ -775,16 +775,7 @@ where
                 .and_then(Option::as_deref);
             validate_file_history_materialization(&prepared_row, bytes)?;
             if needs_data {
-                Some(
-                    bytes
-                        .ok_or_else(|| {
-                            invalid_file_history_state(format!(
-                                "file '{}' blob payload is missing at observed commit '{}'",
-                                prepared_row.id, prepared_row.event.observed_commit_id
-                            ))
-                        })?
-                        .to_vec(),
-                )
+                Some(bytes.unwrap_or_default().to_vec())
             } else {
                 None
             }
@@ -909,13 +900,10 @@ where
     let mut requests = Vec::new();
     let mut hashes = Vec::new();
     for row in rows.iter().filter(|row| row.descriptor().name.is_some()) {
-        let reference = validate_exactly_one_blob_ref(&row.observed_state, &row.event, true)?
-            .ok_or_else(|| {
-                invalid_file_history_state(format!(
-                    "file '{}' at commit '{}' has no authenticated BlobRef",
-                    row.id, row.event.observed_commit_id
-                ))
-            })?;
+        let Some(reference) = validate_exactly_one_blob_ref(&row.observed_state, &row.event, true)?
+        else {
+            continue;
+        };
         let observed = row.observed_state.rows.row(reference.row);
         requests.push((
             observed.observed_commit_id().to_owned(),
@@ -963,10 +951,9 @@ fn invalid_file_history_state(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INVALID_PLUGIN, message)
 }
 
-/// A plugin owner commits a materialization contract alongside semantic
-/// state. Never silently serve an owned historical file from an absent or
-/// opposite representation: that would turn a damaged history root into empty
-/// bytes instead of surfacing the corruption to the caller.
+/// Validate a historical file materialization. A live descriptor without a
+/// BlobRef is the canonical descriptor-only representation of an empty file.
+/// Once a BlobRef exists, its identity, size, and payload remain strict.
 fn validate_file_history_materialization(
     prepared: &PreparedFileHistoryRow,
     payload: Option<&[u8]>,
@@ -988,12 +975,16 @@ fn validate_file_history_materialization(
                 })
         })
         .transpose()?;
-    let blob = validate_exactly_one_blob_ref(state, &prepared.event, true)?.ok_or_else(|| {
-        invalid_file_history_state(format!(
-            "file '{}' at commit '{observed_commit_id}' has no authenticated BlobRef",
-            descriptor.id
-        ))
-    })?;
+    let Some(blob) = validate_exactly_one_blob_ref(state, &prepared.event, true)? else {
+        if payload.is_some_and(|payload| !payload.is_empty()) {
+            return Err(invalid_file_history_state(format!(
+                "descriptor-only file '{}' at commit '{observed_commit_id}' has an unexpected payload",
+                descriptor.id
+            )));
+        }
+        let _ = plugin;
+        return Ok(());
+    };
     let blob_hash = blob.blob_hash.as_deref().ok_or_else(|| {
         invalid_file_history_state(format!(
             "file '{}' at commit '{observed_commit_id}' has no live blob identity",
@@ -1052,12 +1043,6 @@ fn validate_exactly_one_blob_ref<'a>(
         )));
     }
     if refs.is_empty() {
-        if require_live {
-            return Err(invalid_file_history_state(format!(
-                "file '{}' at commit '{}' is missing its authenticated BlobRef",
-                event.file_id, event.observed_commit_id
-            )));
-        }
         return absent_blob_ref();
     }
     let blob = refs[0];
@@ -3209,7 +3194,7 @@ mod tests {
     }
 
     #[test]
-    fn live_file_requires_authenticated_zero_length_blob_ref() {
+    fn live_descriptor_without_blob_ref_materializes_as_empty_file() {
         let file_id = "01920000-0000-7000-8000-0000000000a2";
         let descriptor = descriptor(file_id, Some("empty.txt"), 0);
         let event = file_history_event_from_entry(file_id.to_string(), &descriptor.entry);
@@ -3218,9 +3203,21 @@ mod tests {
             PluginRegistry::empty(),
         ));
         assert!(
-            super::validate_exactly_one_blob_ref(missing.as_ref(), &event, true).is_err(),
-            "a live file without a BlobRef is not an authenticated empty file"
+            super::validate_exactly_one_blob_ref(missing.as_ref(), &event, true)
+                .unwrap()
+                .is_none(),
+            "a descriptor-only live file should not synthesize a BlobRef"
         );
+        let missing_prepared = PreparedFileHistoryRow {
+            id: file_id.to_string(),
+            path: Some("/empty.txt".to_string()),
+            observed_state: Arc::clone(&missing),
+            descriptor_ordinal: 0,
+            blob_hash: None,
+            event: event.clone(),
+        };
+        super::validate_file_history_materialization(&missing_prepared, None)
+            .expect("descriptor-only live file should materialize as empty content");
 
         let empty_hash = BlobId::from_canonical_content(b"");
         let blob = blob_record(file_id, empty_hash, 0);
