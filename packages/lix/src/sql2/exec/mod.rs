@@ -3,6 +3,7 @@ pub(crate) mod datafusion;
 pub(crate) mod write;
 
 use crate::SqlQueryResult;
+use crate::storage_adapter::StorageAdapterRead;
 
 /// Internal write outcome.  DML normally only reports its affected-row count,
 /// while `DELETE … RETURNING` additionally carries the pre-delete result set.
@@ -99,21 +100,27 @@ pub(crate) enum SqlLogicalPlan {
     Write(SqlWriteLogicalPlan),
 }
 
-pub(crate) fn prepare_path_value_replacement_program(
-    ctx: &dyn crate::sql2::SqlWriteExecutionContext,
+pub(crate) fn prepare_path_value_replacement_program<R>(
+    ctx: &dyn crate::sql2::SqlWriteExecutionContext<ReadStore = R>,
     plan: &SqlLogicalPlan,
-) -> Option<bound_public_write::PreparedPathValueReplacementProgram> {
+) -> Option<bound_public_write::PreparedPathValueReplacementProgram>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let SqlLogicalPlan::Write(write) = plan else {
         return None;
     };
     bound_public_write::prepare_path_value_replacement_program_from_logical(ctx, &write.plan)
 }
 
-pub(crate) async fn prepare_path_value_replacement_row(
-    ctx: &mut dyn crate::sql2::SqlWriteExecutionContext,
+pub(crate) async fn prepare_path_value_replacement_row<R>(
+    ctx: &mut dyn crate::sql2::SqlWriteExecutionContext<ReadStore = R>,
     program: &bound_public_write::PreparedPathValueReplacementProgram,
     params: &[crate::Value],
-) -> Result<Option<bound_public_write::PreparedPathValueReplacementRow>, crate::LixError> {
+) -> Result<Option<bound_public_write::PreparedPathValueReplacementRow>, crate::LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     bound_public_write::prepare_path_value_replacement_row(ctx, program, params).await
 }
 

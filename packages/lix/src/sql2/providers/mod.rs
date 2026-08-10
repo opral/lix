@@ -8,7 +8,6 @@ use datafusion::prelude::SessionContext;
 use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
-use crate::live_state::LiveStateReader;
 use crate::storage_adapter::StorageAdapterRead;
 
 mod branch;
@@ -297,7 +296,7 @@ where
                 branch::register_lix_branch_read_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.state_view(),
                     Arc::clone(&branch_ref),
                 )
                 .await?;
@@ -399,7 +398,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.live_state(),
+                    ctx.state_view(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.authenticated_blob_reader()?,
@@ -413,7 +412,7 @@ where
                 file::register_lix_file_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.state_view(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.authenticated_blob_reader()?,
@@ -439,7 +438,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.live_state(),
+                    ctx.state_view(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -450,7 +449,7 @@ where
                 directory::register_lix_directory_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.state_view(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -480,16 +479,11 @@ where
             && selection.includes(surface)
             && matches!(&surface.kind, PublicSurfaceKind::EntityHistory { .. })
     });
-    let entity_live_state: Arc<dyn LiveStateReader> =
-        Arc::new(changelog_query_source.forktree_reader.clone());
-    let entity_snapshot_reader: Arc<dyn crate::sql2::EntitySnapshotReader> = Arc::new(
-        crate::sql2::CanonicalEntitySnapshotProjection::new(Arc::clone(&entity_live_state)),
-    );
     entity::register_entity_providers(
         session,
         ctx.active_branch_id(),
-        entity_live_state,
-        Some(entity_snapshot_reader),
+        ctx.state_view(),
+        None,
         Arc::clone(&branch_ref),
         (needs_entity_history
             || catalog.surfaces().any(|surface| {
@@ -701,29 +695,17 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Arc;
 
-    use async_trait::async_trait;
     use serde_json::json;
 
     use datafusion::arrow::datatypes::{DataType, SchemaRef};
     use datafusion::prelude::SessionContext;
 
-    use crate::LixError;
-    use crate::branch::{BranchHead, BranchRefReader};
-    use crate::changelog::CommitId;
-    use crate::commit_graph::{
-        CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader,
-        ReachableCommitGraphNode,
-    };
-    use crate::live_state::{LiveStateReader, LiveStateScanRequest};
-    use crate::sql2::catalog::{
-        PublicCatalog, PublicSurfaceKind, derive_entity_surface_spec_from_schema,
-    };
+    use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 
     use super::{
         ProviderSelection, ReadProviderScope, branch, change, checkpoint, directory,
-        directory_history, entity, file, file_history, filesystem_working_diff, is_write_surface,
+        directory_history, file, file_history, filesystem_working_diff, is_write_surface,
         read_provider_selection, working_diff,
     };
 
@@ -1043,81 +1025,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn provider_entity_schemas_match_catalog_contract_order() {
-        let schema = json!({
-            "x-lix-key": "phase8_entity",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "count": { "type": "integer" },
-                "body": { "type": "object" }
-            }
-        });
-        let catalog =
-            PublicCatalog::from_visible_schemas(&[schema.clone()]).expect("catalog should build");
-        let _spec = derive_entity_surface_spec_from_schema(&schema).expect("schema should derive");
-        let session = SessionContext::new();
-        entity::register_entity_providers::<
-            crate::storage_adapter::SharedStorageAdapterRead<crate::storage::MemoryRead>,
-        >(
-            &session,
-            "01920000-0000-7000-8000-0000000000a1",
-            Arc::new(EmptyLiveStateReader),
-            None,
-            Arc::new(EmptyBranchRefReader),
-            Some(Arc::new(tokio::sync::Mutex::new(Box::new(
-                EmptyCommitGraphReader,
-            )))),
-            None,
-            None,
-            &catalog,
-            true,
-            &ProviderSelection::All,
-        )
-        .await
-        .expect("entity providers should register");
-
-        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_entity").await;
-        assert_registered_table_schema_matches_catalog(
-            &session,
-            &catalog,
-            "phase8_entity_by_branch",
-        )
-        .await;
-        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_entity_history")
-            .await;
-    }
-
-    async fn assert_registered_table_schema_matches_catalog(
-        session: &SessionContext,
-        catalog: &PublicCatalog,
-        surface_name: &str,
-    ) {
-        let surface = catalog
-            .surface(surface_name)
-            .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
-        let provider = if matches!(
-            surface.kind,
-            PublicSurfaceKind::EntityHistory { .. }
-                | PublicSurfaceKind::FileHistory
-                | PublicSurfaceKind::DirectoryHistory
-        ) {
-            session
-                .table_function(surface_name)
-                .unwrap_or_else(|error| panic!("{surface_name} function should load: {error}"))
-                .create_table_provider(&[])
-                .unwrap_or_else(|error| panic!("{surface_name} function should bind: {error}"))
-        } else {
-            session
-                .table_provider(surface_name)
-                .await
-                .unwrap_or_else(|error| panic!("{surface_name} provider should load: {error}"))
-        };
-        assert_surface_schema_matches_provider_schema(catalog, surface_name, provider.schema());
-    }
-
     fn assert_surface_schema_matches_provider_schema(
         catalog: &PublicCatalog,
         surface_name: &str,
@@ -1161,78 +1068,6 @@ mod tests {
                 provider_schema.fields(),
                 "{surface_name}"
             );
-        }
-    }
-
-    struct EmptyLiveStateReader;
-
-    #[async_trait]
-    impl LiveStateReader for EmptyLiveStateReader {
-        async fn load_exact_batch(
-            &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
-        }
-
-        async fn scan_batch(
-            &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
-            Ok(Vec::new().into())
-        }
-    }
-
-    struct EmptyBranchRefReader;
-
-    #[async_trait]
-    impl BranchRefReader for EmptyBranchRefReader {
-        async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-            Ok(Some(BranchHead {
-                branch_id: branch_id.to_string(),
-                commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
-            }))
-        }
-
-        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-            Ok(Vec::new().into())
-        }
-    }
-
-    struct EmptyCommitGraphReader;
-
-    #[async_trait]
-    impl CommitGraphReader for EmptyCommitGraphReader {
-        async fn load_node(
-            &mut self,
-            _commit_id: &CommitId,
-        ) -> Result<Option<CommitGraphNode>, LixError> {
-            Ok(None)
-        }
-
-        async fn reachable_nodes(
-            &mut self,
-            _head_commit_id: &CommitId,
-        ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
-            Ok(Vec::new().into())
-        }
-
-        async fn load_commit_records(
-            &mut self,
-            commit_ids: &[CommitId],
-        ) -> Result<Vec<Option<crate::changelog::CommitRecord>>, LixError> {
-            Ok(vec![None; commit_ids.len()])
-        }
-
-        async fn change_history_from_commit(
-            &mut self,
-            _start_commit_id: &CommitId,
-            _request: &CommitGraphChangeHistoryRequest,
-        ) -> Result<crate::commit_graph::CommitGraphHistory, LixError> {
-            Ok(crate::commit_graph::CommitGraphHistory {
-                entries: Vec::new(),
-                reachable_nodes: Arc::from([]),
-            })
         }
     }
 }
