@@ -407,25 +407,53 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         "a selected source at the target generation must fail closed"
     );
 
-    let wrong_page_summary = super::serving::StaleCommitSummary {
-        commit_id: CommitId::from_bytes(raw_id(0x21)),
-        commit_object_id: seed.commit_object_id,
-        generation: commit.generation,
-        global_state_root: seed.global_state_root,
-        local_state_root: seed.local_state_root,
-        parent_commit_ids: Vec::new(),
-    };
-    assert!(
-        super::serving::state_points_on_read_for_stale(
-            &repository,
-            wrong_page_summary,
-            &[seed.state_keys[0].clone()],
-            true,
-            view.test_storage_read(),
-        )
+    // A merge may legitimately select a page from a non-ancestor source
+    // commit.  The endpoint's authenticated roots plus the page's catalog
+    // membership are the required proof; serial ancestry is not.
+    let mut non_ancestor = build_seed();
+    let global_state_root = non_ancestor.global_state_root;
+    let local_state_root = non_ancestor.local_state_root;
+    let (non_ancestor_id, non_ancestor_object_id) = insert_graph_commit_with_roots(
+        &mut non_ancestor,
+        0x21,
+        2,
+        Vec::new(),
+        global_state_root,
+        local_state_root,
+    );
+    install_graph_head(
+        &mut non_ancestor,
+        &[(non_ancestor_id, non_ancestor_object_id)],
+        non_ancestor_object_id,
+        0x22,
+    );
+    let non_ancestor_storage = Memory::new();
+    seed_storage(&non_ancestor_storage, &non_ancestor).await;
+    let non_ancestor_view = open_coherent_view(&non_ancestor_storage, non_ancestor.branch_id)
         .await
-        .is_err(),
-        "a state page owned by a different endpoint commit must fail closed"
+        .expect("open non-ancestor root-bound view");
+    let non_ancestor_repository = non_ancestor_view.repository_root();
+    let mut non_ancestor_cache = BTreeMap::new();
+    let non_ancestor_summary = super::serving::load_historical_commit_state_roots_for_stale(
+        non_ancestor_view.test_storage_read(),
+        &non_ancestor_repository,
+        public_commit_id(0x21),
+        &mut non_ancestor_cache,
+    )
+    .await
+    .expect("authenticate non-ancestor endpoint summary");
+    let non_ancestor_rows = super::serving::state_points_on_read_for_stale(
+        &non_ancestor_repository,
+        non_ancestor_summary,
+        &[non_ancestor.state_keys[0].clone()],
+        true,
+        non_ancestor_view.test_storage_read(),
+    )
+    .await
+    .expect("root-bound non-ancestor page is valid");
+    assert!(
+        non_ancestor_rows[0].is_some(),
+        "root-bound non-ancestor page must remain readable without serial ancestry"
     );
 }
 
