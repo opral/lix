@@ -662,17 +662,27 @@ impl PreparedPublication {
     /// BlobId-only reader or separate CAS commit is involved.
     pub(crate) fn stage_inline_blob_payload(
         &mut self,
-        bytes: &[u8],
+        payload: &BlobPayload,
     ) -> Result<ObjectId, StorageError> {
+        // BlobPayload already owns an immutable bytes::Bytes buffer. Keep
+        // each canonical chunk as a slice of that buffer until the object
+        // encoder creates the authenticated durable envelope; the previous
+        // &[u8] API allocated and copied every chunk before encoding it.
+        let bytes = payload.shared_bytes().into_bytes();
         let chunks = if bytes.is_empty() {
             vec![BlobChunkV1 {
                 bytes: Bytes::new(),
             }]
         } else {
-            bytes
-                .chunks(super::blob::CANONICAL_BLOB_CHUNK_BYTES)
-                .map(|chunk| BlobChunkV1 {
-                    bytes: Bytes::copy_from_slice(chunk),
+            (0..bytes
+                .len()
+                .div_ceil(super::blob::CANONICAL_BLOB_CHUNK_BYTES))
+                .map(|ordinal| {
+                    let start = ordinal * super::blob::CANONICAL_BLOB_CHUNK_BYTES;
+                    let end = (start + super::blob::CANONICAL_BLOB_CHUNK_BYTES).min(bytes.len());
+                    BlobChunkV1 {
+                        bytes: bytes.slice(start..end),
+                    }
                 })
                 .collect::<Vec<_>>()
         };

@@ -1742,7 +1742,7 @@ where
                     .map_err(LixError::from)?
             } else {
                 publication
-                    .stage_inline_blob_payload(payload.bytes())
+                    .stage_inline_blob_payload(payload)
                     .map_err(LixError::from)?
             }
         } else {
