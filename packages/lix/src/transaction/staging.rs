@@ -1441,7 +1441,7 @@ impl TransactionWriteBuffer {
         let active_id = CanonicalBranchId::from_bytes(*active_id.as_bytes());
 
         let mut tracked = Vec::<(Vec<u8>, bool, StagedStateRow)>::new();
-        let mut untracked = Vec::<(Vec<u8>, StagedUntrackedStateRow)>::new();
+        let mut untracked = Vec::<(Vec<u8>, CanonicalBranchId, StagedUntrackedStateRow)>::new();
         for row in rows.iter() {
             let is_global = row.global || row.branch_id.as_str() == GLOBAL_BRANCH_ID;
             let is_active = row.branch_id.as_str() == active_branch_id;
@@ -1462,15 +1462,11 @@ impl TransactionWriteBuffer {
                 let owner = if is_global { global_id } else { active_id };
                 let untracked_row =
                     StagedUntrackedStateRow::new(owner, key, untracked_value_from_prepared(row));
-                let owner_key = crate::forktree::encode_untracked_key(
-                    owner,
-                    crate::forktree::StateKeyRef {
-                        schema_key: &untracked_row.key.schema_key,
-                        file_id: untracked_row.key.file_id.as_deref(),
-                        entity_pk: &untracked_row.key.entity_pk,
-                    },
-                );
-                untracked.push((owner_key, untracked_row));
+                // Durable owner prefixes are storage addressing, not
+                // semantic row order. Keep staged mutations ordered by the
+                // canonical logical key so each owner can be merged before
+                // local-over-global precedence is applied.
+                untracked.push((encoded_key, owner, untracked_row));
             } else {
                 let staged_key = encoded_key.clone();
                 tracked.push((
@@ -1501,9 +1497,13 @@ impl TransactionWriteBuffer {
             tracked_rows.push(row);
         }
 
-        untracked.sort_by(|left, right| left.0.cmp(&right.0));
+        untracked.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then(left.1.as_bytes().cmp(right.1.as_bytes()))
+        });
         for pair in untracked.windows(2) {
-            if pair[0].0 == pair[1].0 {
+            if pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "duplicate staged untracked state identity",
@@ -1512,7 +1512,7 @@ impl TransactionWriteBuffer {
         }
         let untracked_rows = untracked
             .into_iter()
-            .map(|(_, row)| row)
+            .map(|(_, _, row)| row)
             .collect::<Vec<_>>();
         Ok((tracked_rows, untracked_rows))
     }
@@ -3652,7 +3652,11 @@ mod staging_semantics_tests {
     #[tokio::test]
     async fn native_staged_untracked_tombstone_preserves_owner_and_masks_slot() {
         let committed = empty_committed_view().await;
-        let owner = crate::forktree::CanonicalBranchId::from_bytes([7; 16]);
+        let owner = crate::forktree::CanonicalBranchId::from_bytes(
+            *uuid::Uuid::parse_str(TEST_GLOBAL)
+                .expect("global branch UUID")
+                .as_bytes(),
+        );
         let key = StateKey {
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -3689,6 +3693,99 @@ mod staging_semantics_tests {
             .expect("tombstone-inclusive untracked point should resolve");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].as_ref().expect("owner retained").owner, owner);
+    }
+
+    #[tokio::test]
+    async fn native_staged_untracked_rows_use_canonical_key_order_across_owners() {
+        let committed = empty_committed_view().await;
+        let low = native_untracked_key("app.order", "a");
+        let high = native_untracked_key("app.order", "b");
+        let low_owner = crate::forktree::CanonicalBranchId::from_bytes([9; 16]);
+        let high_owner = crate::forktree::CanonicalBranchId::from_bytes([1; 16]);
+        let _view = TransactionStateView::new_with_untracked(
+            committed,
+            Vec::new(),
+            vec![
+                StagedUntrackedStateRow::new(
+                    low_owner,
+                    low,
+                    native_untracked_value(StateCell::Value("low".into())),
+                ),
+                StagedUntrackedStateRow::new(
+                    high_owner,
+                    high,
+                    native_untracked_value(StateCell::Value("high".into())),
+                ),
+            ],
+        )
+        .expect("canonical state-key order must not depend on owner prefix");
+    }
+
+    #[tokio::test]
+    async fn native_staged_untracked_exact_and_range_share_tombstone_visibility() {
+        let committed = empty_committed_view().await;
+        let owner = crate::forktree::CanonicalBranchId::from_bytes(
+            *uuid::Uuid::parse_str(TEST_GLOBAL)
+                .expect("global branch UUID")
+                .as_bytes(),
+        );
+        let tombstone = native_untracked_key("app.parity", "a");
+        let visible = native_untracked_key("app.parity", "b");
+        let prefix = encode_state_entity_prefix(
+            "app.parity",
+            &EntityPk {
+                components: crate::entity_pk::EntityPkComponents::Empty,
+            },
+        );
+        let upper = exclusive_prefix_upper_bound(&prefix);
+        let view = TransactionStateView::new_with_untracked(
+            committed,
+            Vec::new(),
+            vec![
+                StagedUntrackedStateRow::new(
+                    owner,
+                    tombstone.clone(),
+                    native_untracked_value(StateCell::Tombstone),
+                ),
+                StagedUntrackedStateRow::new(
+                    owner,
+                    visible.clone(),
+                    native_untracked_value(StateCell::Value("visible".into())),
+                ),
+            ],
+        )
+        .expect("staged parity rows should be canonical");
+        let exact_keys = [
+            encode_state_key(StateKeyRef {
+                schema_key: &tombstone.schema_key,
+                file_id: tombstone.file_id.as_deref(),
+                entity_pk: &tombstone.entity_pk,
+            }),
+            encode_state_key(StateKeyRef {
+                schema_key: &visible.schema_key,
+                file_id: visible.file_id.as_deref(),
+                entity_pk: &visible.entity_pk,
+            }),
+        ];
+        let exact = view
+            .untracked_points(&exact_keys, false)
+            .await
+            .expect("exact staged overlay");
+        assert!(exact[0].is_none());
+        assert!(exact[1].is_some());
+
+        let range = view
+            .untracked_overlay_branch_range_for_branch(
+                TEST_GLOBAL,
+                Some(&prefix),
+                upper.as_deref(),
+                Some(1),
+                false,
+            )
+            .await
+            .expect("range staged overlay");
+        assert_eq!(range.len(), 1);
+        assert_eq!(range[0].key, visible);
     }
 
     #[tokio::test]
