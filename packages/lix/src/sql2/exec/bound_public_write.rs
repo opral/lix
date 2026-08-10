@@ -138,7 +138,15 @@ impl NativeStateRow {
             // keeps this field NULL while retaining the staged commit ID.
             change_id: (!staged).then_some(row.value.change_id),
             commit_id: Some(row.value.commit_id),
-            branch_id: branch_id.to_owned(),
+            // The retained ForkTree view marks physical global rows explicitly.
+            // Preserve that authenticated owner when materializing a native
+            // write candidate; using the active branch here makes an explicit
+            // `lixcol_branch_id = GLOBAL_BRANCH_ID` predicate miss the row.
+            branch_id: if row.source == StateRowSource::Global {
+                crate::GLOBAL_BRANCH_ID.to_owned()
+            } else {
+                branch_id.to_owned()
+            },
             untracked: false,
         })
     }
