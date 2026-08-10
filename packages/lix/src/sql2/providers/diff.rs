@@ -148,39 +148,27 @@ where
                     if route.contradictory {
                         return DIFF_COLS.build(schema, &[]).map_err(diff_batch_error);
                     }
-                    let before = forktree_reader
-                        .scan_state_rows_at_commit(
-                            crate::changelog::CommitId::parse_lix(
-                                &from_commit_id,
-                                "diff from commit",
-                            )
-                            .map_err(lix_error_to_datafusion_error)?,
-                        )
+                    let from_commit_id =
+                        crate::changelog::CommitId::parse_lix(&from_commit_id, "diff from commit")
+                            .map_err(lix_error_to_datafusion_error)?;
+                    let to_commit_id =
+                        crate::changelog::CommitId::parse_lix(&to_commit_id, "diff to commit")
+                            .map_err(lix_error_to_datafusion_error)?;
+                    let changes = forktree_reader
+                        .diff_state_rows_between_commits(from_commit_id, to_commit_id)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
-                    let after = forktree_reader
-                        .scan_state_rows_at_commit(
-                            crate::changelog::CommitId::parse_lix(&to_commit_id, "diff to commit")
-                                .map_err(lix_error_to_datafusion_error)?,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
-                    let mut by_key = std::collections::BTreeMap::new();
-                    for row in before {
-                        if diff_row_matches(&row, &route.filter) {
-                            by_key.entry(row.key.clone()).or_insert((Some(row), None));
+                    let mut rows = Vec::with_capacity(changes.len());
+                    for change in changes {
+                        let before = change
+                            .before
+                            .filter(|row| diff_row_matches(row, &route.filter));
+                        let after = change
+                            .after
+                            .filter(|row| diff_row_matches(row, &route.filter));
+                        if before.is_none() && after.is_none() {
+                            continue;
                         }
-                    }
-                    for row in after {
-                        if diff_row_matches(&row, &route.filter) {
-                            by_key
-                                .entry(row.key.clone())
-                                .and_modify(|entry| entry.1 = Some(row.clone()))
-                                .or_insert((None, Some(row)));
-                        }
-                    }
-                    let mut rows = Vec::with_capacity(by_key.len());
-                    for (_key, (before, after)) in by_key {
                         if before
                             .as_ref()
                             .or(after.as_ref())

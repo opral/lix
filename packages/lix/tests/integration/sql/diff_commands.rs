@@ -278,10 +278,9 @@ simulation_test!(
 
         session
             .execute(
-                r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+                r#"INSERT INTO lix_registered_schema (value, lixcol_global)
                    VALUES (
                      lix_json('{"x-lix-key":"change_id_regression","x-lix-primary-key":["/id"],"type":"object","required":["id","value"],"properties":{"id":{"type":"string"},"value":{"type":"string"}},"additionalProperties":false}'),
-                     false,
                      false
                    )"#,
                 &[],
@@ -374,7 +373,7 @@ simulation_test!(
             &engine,
         );
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
             &[Value::Text(
                 json!({
                     "x-lix-key": "change_id_branch_regression",
