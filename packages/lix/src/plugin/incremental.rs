@@ -1353,7 +1353,7 @@ impl StateRowEntitySource {
         let snapshot = snapshot.as_str();
         host_entity_with_lazy_snapshot(
             WasmEntityKey::from_owned_parts(key.schema_key, key.entity_pk.into_parts()),
-            snapshot.as_bytes().to_vec(),
+            snapshot.as_bytes().to_vec().into(),
             self.state.limits,
         )
         .map(Some)
