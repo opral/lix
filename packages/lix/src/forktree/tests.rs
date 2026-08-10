@@ -825,6 +825,24 @@ fn insert_graph_commit(
     generation: u64,
     parent_commit_object_ids: Vec<ObjectId>,
 ) -> (CommitId, ObjectId) {
+    insert_graph_commit_with_roots(
+        seed,
+        byte,
+        generation,
+        parent_commit_object_ids,
+        seed.global_state_root,
+        seed.local_state_root,
+    )
+}
+
+fn insert_graph_commit_with_roots(
+    seed: &mut SeedData,
+    byte: u8,
+    generation: u64,
+    parent_commit_object_ids: Vec<ObjectId>,
+    global_state_root: ObjectId,
+    local_state_root: ObjectId,
+) -> (CommitId, ObjectId) {
     let commit_id = CommitId::from_bytes(raw_id(byte));
     let commit = CommitObjectV1 {
         commit_id,
@@ -832,8 +850,8 @@ fn insert_graph_commit(
         parent_commit_object_ids,
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
-        global_state_root: seed.global_state_root,
-        local_state_root: seed.local_state_root,
+        global_state_root,
+        local_state_root,
         metadata: format!("graph-{byte:02x}").into_bytes(),
     };
     let (object_id, bytes) = commit.encode().expect("graph commit");
@@ -1779,6 +1797,253 @@ async fn historical_missing_state_root_fails_before_empty_result() {
             .await
             .is_err(),
         "missing selected state root must not become an empty historical result"
+    );
+}
+
+#[tokio::test]
+async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
+    let mut valid = build_seed();
+    let valid_parent_object_id = valid.commit_object_id;
+    let (valid_child_id, valid_child_object_id) =
+        insert_graph_commit(&mut valid, 0x90, 2, vec![valid_parent_object_id]);
+    install_graph_head(
+        &mut valid,
+        &[(valid_child_id, valid_child_object_id)],
+        valid_child_object_id,
+        0x91,
+    );
+    let valid_storage = Memory::new();
+    seed_storage(&valid_storage, &valid).await;
+    let valid_read = StorageAdapterReadScope::new(
+        valid_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("valid summary read"),
+    );
+    let valid_facade = ForkTreeReadFacade::new(valid_read);
+    let valid_repository = RepositoryRootV1::decode(
+        valid.repository_root_id,
+        valid
+            .objects
+            .get(valid.repository_root_id)
+            .expect("valid repository root"),
+    )
+    .expect("valid repository");
+    let mut valid_cache = BTreeMap::new();
+    assert!(
+        valid_facade
+            .load_stale_commit_state_roots(
+                &valid_repository,
+                public_commit_id(0x90),
+                &mut valid_cache,
+            )
+            .await
+            .is_ok(),
+        "a valid catalog/object/root/generation envelope must authenticate"
+    );
+
+    let mut bad_catalog = build_seed();
+    let bad_catalog_parent_object_id = bad_catalog.commit_object_id;
+    let (bad_catalog_child_id, bad_catalog_child_object_id) = insert_graph_commit(
+        &mut bad_catalog,
+        0x92,
+        2,
+        vec![bad_catalog_parent_object_id],
+    );
+    install_graph_head(
+        &mut bad_catalog,
+        &[(bad_catalog_child_id, bad_catalog_child_object_id)],
+        bad_catalog_child_object_id,
+        0x93,
+    );
+    let catalog_changes = seed_member_catalog_entries(&bad_catalog, bad_catalog.commit_object_id);
+    let bad_catalog_commit_id = bad_catalog.commit_id;
+    let bad_catalog_commit_object_id = bad_catalog.commit_object_id;
+    let bad_catalog_orphan_object_id = bad_catalog.orphan_object_id;
+    let bad_catalog_ref_change_object_id = bad_catalog.ref_change_object_id;
+    replace_selected_history_graph(
+        &mut bad_catalog,
+        &[
+            (
+                bad_catalog_commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: bad_catalog_commit_object_id,
+                },
+            ),
+            (
+                bad_catalog_child_id,
+                CommitCatalogEntry {
+                    commit_object_id: bad_catalog_orphan_object_id,
+                },
+            ),
+        ],
+        &catalog_changes,
+        bad_catalog_child_object_id,
+        bad_catalog_ref_change_object_id,
+    );
+    let bad_catalog_storage = Memory::new();
+    seed_storage(&bad_catalog_storage, &bad_catalog).await;
+    let bad_catalog_read = StorageAdapterReadScope::new(
+        bad_catalog_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("bad catalog summary read"),
+    );
+    let bad_catalog_facade = ForkTreeReadFacade::new(bad_catalog_read);
+    let bad_catalog_repository = RepositoryRootV1::decode(
+        bad_catalog.repository_root_id,
+        bad_catalog
+            .objects
+            .get(bad_catalog.repository_root_id)
+            .expect("bad catalog repository root"),
+    )
+    .expect("bad catalog repository");
+    let mut bad_catalog_cache = BTreeMap::new();
+    assert!(
+        bad_catalog_facade
+            .load_stale_commit_state_roots(
+                &bad_catalog_repository,
+                public_commit_id(0x92),
+                &mut bad_catalog_cache,
+            )
+            .await
+            .is_err(),
+        "a catalog entry substituted with a non-Commit object must fail closed"
+    );
+
+    let mut bad_object = build_seed();
+    let bad_object_parent_object_id = bad_object.commit_object_id;
+    let (bad_object_child_id, bad_object_child_object_id) =
+        insert_graph_commit(&mut bad_object, 0x94, 2, vec![bad_object_parent_object_id]);
+    install_graph_head(
+        &mut bad_object,
+        &[(bad_object_child_id, bad_object_child_object_id)],
+        bad_object_child_object_id,
+        0x95,
+    );
+    let bad_object_storage = Memory::new();
+    seed_storage(&bad_object_storage, &bad_object).await;
+    let mut bad_object_write = StorageWriteSet::new();
+    bad_object_write.delete(OBJECT_SPACE, bad_object_child_object_id.as_bytes().to_vec());
+    commit_write_set_for_test(bad_object_write, &bad_object_storage).await;
+    let bad_object_read = StorageAdapterReadScope::new(
+        bad_object_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("bad object summary read"),
+    );
+    let bad_object_facade = ForkTreeReadFacade::new(bad_object_read);
+    let bad_object_repository = RepositoryRootV1::decode(
+        bad_object.repository_root_id,
+        bad_object
+            .objects
+            .get(bad_object.repository_root_id)
+            .expect("bad object repository root"),
+    )
+    .expect("bad object repository");
+    let mut bad_object_cache = BTreeMap::new();
+    assert!(
+        bad_object_facade
+            .load_stale_commit_state_roots(
+                &bad_object_repository,
+                public_commit_id(0x94),
+                &mut bad_object_cache,
+            )
+            .await
+            .is_err(),
+        "a missing Commit object must fail closed before stale classification"
+    );
+
+    let mut bad_root = build_seed();
+    let bad_root_parent_object_id = bad_root.commit_object_id;
+    let bad_root_object_id = bad_root.orphan_object_id;
+    let bad_root_local_state_root = bad_root.local_state_root;
+    let (bad_root_child_id, bad_root_child_object_id) = insert_graph_commit_with_roots(
+        &mut bad_root,
+        0x96,
+        2,
+        vec![bad_root_parent_object_id],
+        bad_root_object_id,
+        bad_root_local_state_root,
+    );
+    install_graph_head(
+        &mut bad_root,
+        &[(bad_root_child_id, bad_root_child_object_id)],
+        bad_root_child_object_id,
+        0x97,
+    );
+    let bad_root_storage = Memory::new();
+    seed_storage(&bad_root_storage, &bad_root).await;
+    let bad_root_read = StorageAdapterReadScope::new(
+        bad_root_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("bad root summary read"),
+    );
+    let bad_root_facade = ForkTreeReadFacade::new(bad_root_read);
+    let bad_root_repository = RepositoryRootV1::decode(
+        bad_root.repository_root_id,
+        bad_root
+            .objects
+            .get(bad_root.repository_root_id)
+            .expect("bad root repository root"),
+    )
+    .expect("bad root repository");
+    let mut bad_root_cache = BTreeMap::new();
+    assert!(
+        bad_root_facade
+            .load_stale_commit_state_roots(
+                &bad_root_repository,
+                public_commit_id(0x96),
+                &mut bad_root_cache,
+            )
+            .await
+            .is_err(),
+        "a wrong-domain state root must fail closed before stale classification"
+    );
+
+    let mut bad_generation = build_seed();
+    let bad_generation_parent_object_id = bad_generation.commit_object_id;
+    let (bad_generation_child_id, bad_generation_child_object_id) = insert_graph_commit(
+        &mut bad_generation,
+        0x98,
+        1,
+        vec![bad_generation_parent_object_id],
+    );
+    install_graph_head(
+        &mut bad_generation,
+        &[(bad_generation_child_id, bad_generation_child_object_id)],
+        bad_generation_child_object_id,
+        0x99,
+    );
+    let bad_generation_storage = Memory::new();
+    seed_storage(&bad_generation_storage, &bad_generation).await;
+    let bad_generation_read = StorageAdapterReadScope::new(
+        bad_generation_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("bad generation summary read"),
+    );
+    let bad_generation_facade = ForkTreeReadFacade::new(bad_generation_read);
+    let bad_generation_repository = RepositoryRootV1::decode(
+        bad_generation.repository_root_id,
+        bad_generation
+            .objects
+            .get(bad_generation.repository_root_id)
+            .expect("bad generation repository root"),
+    )
+    .expect("bad generation repository");
+    let mut bad_generation_cache = BTreeMap::new();
+    assert!(
+        bad_generation_facade
+            .load_stale_commit_state_roots(
+                &bad_generation_repository,
+                public_commit_id(0x98),
+                &mut bad_generation_cache,
+            )
+            .await
+            .is_err(),
+        "a parent with an invalid generation edge must fail closed"
     );
 }
 
