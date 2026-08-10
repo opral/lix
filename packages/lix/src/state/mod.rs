@@ -659,9 +659,19 @@ where
         staged_untracked: Vec<StagedUntrackedStateRow>,
     ) -> Result<Self, LixError> {
         let view = Self::new(committed, staged)?;
+        let encoded_key = |row: &StagedUntrackedStateRow| {
+            crate::forktree::encode_untracked_key(
+                row.owner,
+                crate::forktree::StateKeyRef {
+                    schema_key: &row.key.schema_key,
+                    file_id: row.key.file_id.as_deref(),
+                    entity_pk: &row.key.entity_pk,
+                },
+            )
+        };
         if staged_untracked
             .windows(2)
-            .any(|rows| rows[0].key >= rows[1].key)
+            .any(|rows| encoded_key(&rows[0]) >= encoded_key(&rows[1]))
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -672,6 +682,21 @@ where
             staged_untracked,
             ..view
         })
+    }
+
+    /// Rebinds the same retained committed view to the latest transaction
+    /// buffer snapshot. This is the only mutable part of an explicit
+    /// transaction read: no new storage read or committed-only facade is
+    /// acquired between statements.
+    pub(crate) fn with_staged_rows(
+        &self,
+        staged: Vec<StagedStateRow>,
+        staged_untracked: Vec<StagedUntrackedStateRow>,
+    ) -> Result<Self, LixError>
+    where
+        R: Clone,
+    {
+        Self::new_with_untracked(self.committed.clone(), staged, staged_untracked)
     }
 
     /// Resolves every requested key before applying visibility. A staged
@@ -824,12 +849,23 @@ where
     ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
         let committed = self.committed.untracked_points(state_keys).await?;
         let mut output = Vec::with_capacity(state_keys.len());
+        let active_owner = canonical_branch_id(self.committed.branch_id().as_str())?;
+        let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
         for (key, committed_row) in state_keys.iter().zip(committed) {
             let decoded_key = crate::forktree::decode_state_key(key)?;
             let staged = self
                 .staged_untracked
                 .iter()
-                .find(|row| row.key == decoded_key);
+                .find(|row| row.owner == active_owner && row.key == decoded_key)
+                .or_else(|| {
+                    (active_owner != global_owner)
+                        .then(|| {
+                            self.staged_untracked
+                                .iter()
+                                .find(|row| row.owner == global_owner && row.key == decoded_key)
+                        })
+                        .flatten()
+                });
             let row = staged
                 .map(|row| {
                     if !include_tombstones && row.value.cell.deleted() {
@@ -869,6 +905,71 @@ where
             .into_iter()
             .map(|row| row.filter(|row| include_tombstones || !row.value.cell.deleted()))
             .collect())
+    }
+
+    /// Returns the effective local/global untracked overlay after applying
+    /// staged owners. The returned rows are canonical-key ordered and retain
+    /// their authenticated owner identity for filesystem projections.
+    pub(crate) async fn untracked_overlay_rows(&self) -> Result<Vec<UntrackedStateRow>, LixError> {
+        let committed = self.committed.untracked_overlay_rows().await?;
+        let active_owner = canonical_branch_id(self.committed.branch_id().as_str())?;
+        let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
+        let encode = |owner: CanonicalBranchId, key: &StateKey| {
+            crate::forktree::encode_untracked_key(
+                owner,
+                crate::forktree::StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                },
+            )
+        };
+        let mut rows = committed
+            .into_iter()
+            .filter(|row| row.owner == active_owner || row.owner == global_owner)
+            .map(|row| {
+                (
+                    encode(row.owner, &row.key),
+                    false,
+                    row.owner,
+                    row.key,
+                    row.value,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.staged_untracked
+                .iter()
+                .filter(|row| row.owner == active_owner || row.owner == global_owner)
+                .map(|row| {
+                    (
+                        encode(row.owner, &row.key),
+                        true,
+                        row.owner,
+                        row.key.clone(),
+                        row.value.clone(),
+                    )
+                }),
+        );
+        rows.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+        let mut output = Vec::with_capacity(rows.len());
+        for (encoded, is_staged, owner, key, value) in rows {
+            let same_key = output
+                .last()
+                .is_some_and(|row: &UntrackedStateRow| encode(row.owner, &row.key) == encoded);
+            if same_key {
+                if is_staged {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "duplicate staged untracked state identity",
+                    ));
+                }
+                // The staged row for this exact owner/key was emitted first.
+                continue;
+            }
+            output.push(UntrackedStateRow { owner, key, value });
+        }
+        Ok(output)
     }
 
     /// Resolves one bounded untracked branch range through the retained

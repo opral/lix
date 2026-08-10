@@ -803,6 +803,22 @@ where
         ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), &branch_id).await
     }
 
+    /// Refreshes the native transaction read overlay from the same live write
+    /// buffer that commit will drain. The committed retained view is reused;
+    /// this never opens a statement-local read or a second authority.
+    fn refresh_state_view_from_staging(&mut self, bump_epoch: bool) -> Result<(), LixError> {
+        let (staged, staged_untracked) = self
+            .staged_writes
+            .state_overlay_rows(&self.active_branch_id)?;
+        self.state_view = self.state_view.with_staged_rows(staged, staged_untracked)?;
+        if bump_epoch {
+            self.filesystem_path_index_epoch
+                .fetch_add(1, Ordering::SeqCst);
+            self.filesystem_path_index_cache.clear();
+        }
+        Ok(())
+    }
+
     async fn reconcile_stale_disjoint_writes<S>(
         &mut self,
         read: &S,
@@ -1847,6 +1863,7 @@ where
             trust_filesystem_planner,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
+        self.refresh_state_view_from_staging(false)?;
         self.filesystem_path_index_epoch
             .store(filesystem_path_index_epoch, Ordering::SeqCst);
         // The cache is derived from the discarded post-image. Evict it rather
@@ -1908,7 +1925,9 @@ where
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        Box::pin(self.stage_write_inner(write, None)).await
+        let outcome = Box::pin(self.stage_write_inner(write, None)).await?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     async fn stage_parameter_batch_insert(
@@ -1916,7 +1935,9 @@ where
         write: TransactionWrite,
         statement_indices: Vec<u32>,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        Box::pin(self.stage_write_inner(write, Some(statement_indices))).await
+        let outcome = Box::pin(self.stage_write_inner(write, Some(statement_indices))).await?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     /// Stages the fixed-shape public parameter INSERT proof without routing it
@@ -1973,16 +1994,17 @@ where
                 "certified parameter INSERT preparation changed row cardinality",
             ));
         }
-        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
-            || {
+        let outcome = tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage")
+            .in_scope(|| {
                 self.staged_writes.stage_certified_parameter_batch_insert(
                     PreparedTransactionWrite::Rows {
                         mode: TransactionWriteMode::Insert,
                         rows: prepared,
                     },
                 )
-            },
-        )
+            })?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     /// Stages a certified dense replacement without re-entering plugin,
@@ -2022,15 +2044,16 @@ where
                 "certified parameter replacement preparation changed row cardinality",
             ));
         }
-        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
-            || {
+        let outcome = tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage")
+            .in_scope(|| {
                 self.staged_writes
                     .stage_write(PreparedTransactionWrite::Rows {
                         mode: TransactionWriteMode::Replace,
                         rows: prepared,
                     })
-            },
-        )
+            })?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     async fn stage_write_inner(
@@ -3061,6 +3084,7 @@ where
                     })?;
             }
         }
+        self.refresh_state_view_from_staging(true)?;
         Ok(())
     }
 
@@ -3786,6 +3810,7 @@ where
                 })?;
             checkpoint_commit_id.to_string()
         };
+        self.refresh_state_view_from_staging(true)?;
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected: diff_ids.len() as u64,
             commit_id: Some(checkpoint_commit_id),
@@ -4725,11 +4750,21 @@ where
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        let _ = request;
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "transaction filesystem path-index materialization is not part of the native state boundary",
-        ))
+        let revision = self
+            .filesystem_path_index_epoch
+            .load(Ordering::SeqCst)
+            .to_be_bytes();
+        if let Some(index) = self
+            .filesystem_path_index_cache
+            .get(request, Some(&revision))
+        {
+            return Ok(index);
+        }
+        let index =
+            crate::filesystem::path_index::build_path_index(&self.state_view, request).await?;
+        Ok(self
+            .filesystem_path_index_cache
+            .insert(request, Some(&revision), index))
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
@@ -4785,8 +4820,8 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<bool, LixError> {
-        let _ = (branch_id, scope);
-        Ok(false)
+        self.staged_writes
+            .has_staged_collection_rows(branch_id, scope)
     }
 
     async fn stage_write(
@@ -4890,16 +4925,17 @@ where
                 "certified parameter INSERT preparation changed row cardinality",
             ));
         }
-        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
-            || {
+        let outcome = tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage")
+            .in_scope(|| {
                 self.staged_writes.stage_certified_parameter_batch_insert(
                     PreparedTransactionWrite::Rows {
                         mode: TransactionWriteMode::Insert,
                         rows: prepared,
                     },
                 )
-            },
-        )
+            })?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     async fn stage_parameter_batch_replace(
@@ -4961,15 +4997,16 @@ where
                 "certified replacement preparation changed row cardinality",
             ));
         }
-        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
-            || {
+        let outcome = tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage")
+            .in_scope(|| {
                 self.staged_writes
                     .stage_write(PreparedTransactionWrite::Rows {
                         mode: TransactionWriteMode::Replace,
                         rows: prepared,
                     })
-            },
-        )
+            })?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     async fn stage_typed_mutation_journal_replace(
@@ -5059,6 +5096,7 @@ where
                 ));
             }
         }
+        self.refresh_state_view_from_staging(true)?;
         Ok(TransactionWriteOutcome {
             count: u64::try_from(row_count).expect("typed mutation journal row count fits u64"),
         })

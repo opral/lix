@@ -14,7 +14,7 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::forktree::ForkTreeReadFacade;
-use crate::state::ForkTreeStateView;
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView, UntrackedStateRow};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
@@ -992,7 +992,7 @@ where
 }
 
 #[async_trait]
-trait FilesystemPathIndexSource {
+pub(crate) trait FilesystemPathIndexSource {
     async fn build_path_index(
         &self,
         request: &FilesystemPathIndexRequest,
@@ -1009,6 +1009,24 @@ where
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         build_path_index_from_state(self, request).await
+    }
+}
+
+#[async_trait]
+impl<R> FilesystemPathIndexSource for &TransactionStateView<R>
+where
+    R: StorageAdapterRead + Send + Sync + 'static,
+{
+    async fn build_path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        let tracked_rows = self
+            .range(None, None, None, true)
+            .await
+            .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+        let untracked_rows = (*self).untracked_overlay_rows().await?;
+        build_path_index_from_rows(tracked_rows, untracked_rows, request).await
     }
 }
 
@@ -1079,6 +1097,35 @@ where
         rows.extend(untracked_rows);
     }
     let rows = merge_filesystem_state_rows(rows, true);
+    #[cfg(test)]
+    {
+        FULL_REBUILD_BUILDS.fetch_add(1, Ordering::SeqCst);
+        FULL_REBUILD_DESCRIPTOR_ROWS.fetch_add(rows.len(), Ordering::SeqCst);
+    }
+    Ok(Arc::new(FilesystemPathIndex::from_state_rows(&rows)?))
+}
+
+async fn build_path_index_from_rows(
+    tracked_rows: Vec<StateRow>,
+    untracked_rows: Vec<UntrackedStateRow>,
+    request: &FilesystemPathIndexRequest,
+) -> Result<Arc<FilesystemPathIndex>, LixError> {
+    let branch_id = request.branch_ids.first().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "filesystem path index requires one operation-owned branch state view",
+        )
+    })?;
+    if request.branch_ids.len() != 1 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "transaction filesystem path index requires one branch",
+        ));
+    }
+    let mut rows = FilesystemStateRows::from_view_rows(tracked_rows, branch_id, false)?;
+    rows.extend(FilesystemStateRows::from_untracked_view_rows(
+        untracked_rows,
+    )?);
     #[cfg(test)]
     {
         FULL_REBUILD_BUILDS.fetch_add(1, Ordering::SeqCst);
