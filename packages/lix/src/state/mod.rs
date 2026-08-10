@@ -16,6 +16,16 @@ use crate::forktree::{
 use crate::storage::StorageError;
 use crate::storage_adapter::StorageAdapterRead;
 
+fn canonical_branch_id(branch_id: &str) -> Result<CanonicalBranchId, LixError> {
+    let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("branch ID must be a UUID: {error}"),
+        )
+    })?;
+    Ok(CanonicalBranchId::from_bytes(*uuid.as_bytes()))
+}
+
 /// One logical row returned by a concrete state view.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StateRow {
@@ -139,6 +149,10 @@ where
         Ok(Self::new(facade.into_branch(branch_id).await?))
     }
 
+    pub(crate) fn branch_id_matches(&self, branch_id: &str) -> Result<bool, LixError> {
+        Ok(self.view.branch_id() == canonical_branch_id(branch_id)?)
+    }
+
     /// Resolves exact keys through the native authenticated ordered-tree
     /// primitive. Result slots preserve request order and duplicates.
     pub(crate) async fn points(
@@ -169,6 +183,50 @@ where
             .range(lower, upper, limit, include_tombstones)
             .await
             .map(|rows| rows.into_iter().map(StateRow::from_committed).collect())
+    }
+
+    /// Resolves exact keys from another branch through a borrowed coherent
+    /// view. The branch view reuses this view's retained read; it never
+    /// refreshes the selector or opens a second storage operation.
+    pub(crate) async fn branch_points(
+        &self,
+        branch_id: &str,
+        keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<StateRow>>, LixError> {
+        let branch_id = canonical_branch_id(branch_id)?;
+        self.view
+            .branch_view(branch_id)
+            .await?
+            .points(keys, include_tombstones)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| row.map(StateRow::from_committed))
+                    .collect()
+            })
+            .map_err(LixError::from)
+    }
+
+    /// Resolves one bounded range from another branch through a borrowed
+    /// coherent view. The native ForkTree range remains the only traversal;
+    /// visibility and tombstones are authenticated by that branch view.
+    pub(crate) async fn branch_range(
+        &self,
+        branch_id: &str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<StateRow>, LixError> {
+        let branch_id = canonical_branch_id(branch_id)?;
+        self.view
+            .branch_view(branch_id)
+            .await?
+            .range(lower, upper, limit, include_tombstones)
+            .await
+            .map(|rows| rows.into_iter().map(StateRow::from_committed).collect())
+            .map_err(LixError::from)
     }
 
     /// Resolves exact untracked state keys through the same retained view.
@@ -461,6 +519,42 @@ where
             }
         }
         Ok(output)
+    }
+
+    pub(crate) async fn branch_points(
+        &self,
+        branch_id: &str,
+        keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<StateRow>>, LixError> {
+        if self.committed.branch_id_matches(branch_id)? {
+            return self
+                .points(keys, include_tombstones)
+                .await
+                .map_err(LixError::from);
+        }
+        self.committed
+            .branch_points(branch_id, keys, include_tombstones)
+            .await
+    }
+
+    pub(crate) async fn branch_range(
+        &self,
+        branch_id: &str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<StateRow>, LixError> {
+        if self.committed.branch_id_matches(branch_id)? {
+            return self
+                .range(lower, upper, limit, include_tombstones)
+                .await
+                .map_err(LixError::from);
+        }
+        self.committed
+            .branch_range(branch_id, lower, upper, limit, include_tombstones)
+            .await
     }
 
     /// Resolves untracked exact points with staged rows taking precedence.

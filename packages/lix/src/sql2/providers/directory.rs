@@ -44,7 +44,7 @@ use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
     defaultable_text_insert_value, insert_column_is_omitted,
 };
-use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
+use crate::state::{ForkTreeStateView, StateRow, StateRowSource, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteRow;
@@ -319,6 +319,37 @@ where
                 .collect()),
         }
     }
+
+    async fn branch_range(
+        &self,
+        branch_id: &str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<StateRow>, LixError> {
+        match self {
+            Self::Committed(state) => {
+                state
+                    .branch_range(branch_id, lower, upper, limit, include_tombstones)
+                    .await
+            }
+            Self::Transaction(state) => {
+                state
+                    .branch_range(branch_id, lower, upper, limit, include_tombstones)
+                    .await
+            }
+            #[cfg(test)]
+            Self::Fixture(rows) => Ok(rows
+                .iter()
+                .filter(|row| lower.is_none_or(|bound| row.key.as_slice() >= bound))
+                .filter(|row| upper.is_none_or(|bound| row.key.as_slice() < bound))
+                .filter(|row| include_tombstones || !matches!(row.value.cell, StateCell::Tombstone))
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect()),
+        }
+    }
 }
 
 /// Stable public identity for a directory post-image. By-branch surfaces need
@@ -342,62 +373,85 @@ struct DirectoryScanRequest {
     limit: Option<usize>,
 }
 
+fn resolve_directory_branch_rows(
+    rows: Vec<(String, StateRow)>,
+    limit: Option<usize>,
+) -> Vec<(String, StateRow)> {
+    // A branch view includes the authenticated global overlay. Deduplicate
+    // those repeated global rows while retaining one row per selected branch
+    // for branch-local values. The final limit is applied only after this
+    // visibility/ownership resolution.
+    let mut deduplicated = BTreeMap::new();
+    for (requested_branch_id, row) in rows {
+        let output_branch_id = if row.source == StateRowSource::Global {
+            GLOBAL_BRANCH_ID.to_owned()
+        } else {
+            requested_branch_id
+        };
+        deduplicated.insert(
+            (row.key.clone(), output_branch_id.clone()),
+            (output_branch_id, row),
+        );
+    }
+    let mut rows = deduplicated.into_values().collect::<Vec<_>>();
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
 impl<R> LixDirectorySpec<R>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    async fn load_rows(&self, request: &DirectoryScanRequest) -> Result<Vec<StateRow>> {
-        if request
-            .filter
-            .branch_ids
-            .iter()
-            .any(|branch_id| branch_id != &self.state_branch_id && branch_id != GLOBAL_BRANCH_ID)
-        {
-            return Err(lix_error_to_datafusion_error(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "lix_directory_by_branch requires a concrete ForkTreeStateView for every requested branch",
-            )));
-        }
-
-        let mut rows = Vec::new();
-        if request.filter.entity_pks.is_empty() {
-            let first = EntityPk::uuid_from_canonical("00000000-0000-0000-0000-000000000000")
-                .expect("minimum UUID is canonical");
-            let last = EntityPk::uuid_from_canonical("ffffffff-ffff-ffff-ffff-ffffffffffff")
-                .expect("maximum UUID is canonical");
-            let lower = encode_state_entity_prefix(DIRECTORY_SCHEMA_KEY, &first);
-            let upper = exclusive_prefix_upper_bound(&encode_state_entity_prefix(
-                DIRECTORY_SCHEMA_KEY,
-                &last,
-            ));
-            rows = self
-                .state
-                .range(Some(&lower), upper.as_deref(), request.limit, false)
-                .await
-                .map_err(LixError::from)
-                .map_err(lix_error_to_datafusion_error)?;
+    async fn load_rows(&self, request: &DirectoryScanRequest) -> Result<Vec<(String, StateRow)>> {
+        let branch_ids = if request.filter.branch_ids.is_empty() {
+            vec![self.state_branch_id.clone()]
         } else {
-            for entity_pk in &request.filter.entity_pks {
-                let bounds = encode_state_entity_prefix_bounds(DIRECTORY_SCHEMA_KEY, entity_pk);
-                let remaining = request.limit.map(|limit| limit.saturating_sub(rows.len()));
-                if remaining == Some(0) {
-                    break;
-                }
+            request.filter.branch_ids.clone()
+        };
+        let mut rows = Vec::new();
+        for branch_id in branch_ids {
+            if request.filter.entity_pks.is_empty() {
+                let first = EntityPk::uuid_from_canonical("00000000-0000-0000-0000-000000000000")
+                    .expect("minimum UUID is canonical");
+                let last = EntityPk::uuid_from_canonical("ffffffff-ffff-ffff-ffff-ffffffffffff")
+                    .expect("maximum UUID is canonical");
+                let lower = encode_state_entity_prefix(DIRECTORY_SCHEMA_KEY, &first);
+                let upper = exclusive_prefix_upper_bound(&encode_state_entity_prefix(
+                    DIRECTORY_SCHEMA_KEY,
+                    &last,
+                ));
                 rows.extend(
                     self.state
-                        .range(
-                            Some(&bounds.lower),
-                            bounds.upper.as_deref(),
-                            remaining,
-                            false,
-                        )
+                        .branch_range(&branch_id, Some(&lower), upper.as_deref(), None, false)
                         .await
-                        .map_err(LixError::from)
-                        .map_err(lix_error_to_datafusion_error)?,
+                        .map_err(lix_error_to_datafusion_error)?
+                        .into_iter()
+                        .map(|row| (branch_id.clone(), row)),
                 );
+            } else {
+                for entity_pk in &request.filter.entity_pks {
+                    let bounds = encode_state_entity_prefix_bounds(DIRECTORY_SCHEMA_KEY, entity_pk);
+                    rows.extend(
+                        self.state
+                            .branch_range(
+                                &branch_id,
+                                Some(&bounds.lower),
+                                bounds.upper.as_deref(),
+                                None,
+                                false,
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                            .into_iter()
+                            .map(|row| (branch_id.clone(), row)),
+                    );
+                }
             }
         }
-        Ok(rows)
+
+        Ok(resolve_directory_branch_rows(rows, request.limit))
     }
     async fn indexed_path_matches(
         &self,
@@ -537,9 +591,8 @@ where
                         )
                     } else {
                         let rows = spec.load_rows(&request).await?;
-                        let batch =
-                            lix_directory_record_batch(&table_schema, rows, &spec.state_branch_id)
-                                .map_err(lix_error_to_datafusion_error)?;
+                        let batch = lix_directory_record_batch_with_branch_ids(&table_schema, rows)
+                            .map_err(lix_error_to_datafusion_error)?;
                         (batch.clone(), batch)
                     };
                 *captured.lock().expect("dml source mutex poisoned") = Some(all_directories_batch);
@@ -605,9 +658,8 @@ where
             ..self.clone()
         };
         let rows = transaction_spec.load_rows(&request).await?;
-        let batch =
-            lix_directory_record_batch(&self.schema, rows, &transaction_spec.state_branch_id)
-                .map_err(lix_error_to_datafusion_error)?;
+        let batch = lix_directory_record_batch_with_branch_ids(&self.schema, rows)
+            .map_err(lix_error_to_datafusion_error)?;
         let mut post_rows = BTreeMap::new();
         for row_index in 0..batch.num_rows() {
             let key = self.returning_key_from_batch(&batch, row_index)?;
@@ -760,7 +812,7 @@ where
                         indexed_lix_directory_record_batch(&batch_schema, indexed_matches)
                     } else {
                         let rows = spec.load_rows(&request).await?;
-                        lix_directory_record_batch(&batch_schema, rows, &spec.state_branch_id)
+                        lix_directory_record_batch_with_branch_ids(&batch_schema, rows)
                     }
                     .map_err(|error| {
                         DataFusionError::Execution(format!(
@@ -1319,7 +1371,7 @@ where
             ..self.clone()
         };
         let rows = transaction_spec.load_rows(&request).await?;
-        lix_directory_record_batch(&self.schema, rows, &transaction_spec.state_branch_id)
+        lix_directory_record_batch_with_branch_ids(&self.schema, rows)
             .map_err(lix_error_to_datafusion_error)
     }
 
@@ -2018,15 +2070,28 @@ fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
     )
 }
 
-fn lix_directory_record_batch(
+fn lix_directory_record_batch_with_branch_ids(
     schema: &SchemaRef,
-    rows: Vec<StateRow>,
-    branch_id: &str,
+    rows: Vec<(String, StateRow)>,
 ) -> Result<RecordBatch, LixError> {
-    let rows = FilesystemStateRows::from_view_rows(rows, branch_id, false)?;
+    let mut filesystem_rows = Vec::with_capacity(rows.len());
+    for (branch_id, row) in rows {
+        filesystem_rows
+            .extend(FilesystemStateRows::from_view_rows(vec![row], &branch_id, false)?.into_iter());
+    }
+    lix_directory_record_batch_from_filesystem_rows(
+        schema,
+        FilesystemStateRows::from_rows(filesystem_rows),
+    )
+}
+
+fn lix_directory_record_batch_from_filesystem_rows(
+    schema: &SchemaRef,
+    filesystem_rows: FilesystemStateRows,
+) -> Result<RecordBatch, LixError> {
     let mut directory_rows = Vec::new();
 
-    for row in rows.iter() {
+    for row in &filesystem_rows {
         if row.schema_key() != DIRECTORY_SCHEMA_KEY || row.deleted() {
             continue;
         }
@@ -2491,8 +2556,10 @@ mod tests {
         FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
     };
     use crate::filesystem::{FilesystemStateRow, FilesystemStateRows};
+    use crate::forktree::{StateCell, StateValue};
     use crate::functions::FunctionProviderHandle;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
+    use crate::state::{StateRow, StateRowSource};
     use crate::storage::MemoryRead;
     use crate::storage_adapter::SharedStorageAdapterRead;
     use crate::transaction::types::{
@@ -2504,7 +2571,8 @@ mod tests {
     use super::{
         BranchBinding, DirectoryDescriptorRecord, DirectoryState, LixDirectorySpec,
         UpsertConflictTarget, UpsertSupport, derive_directory_paths,
-        lix_directory_by_branch_schema, lix_directory_insert_origin, lix_directory_record_batch,
+        lix_directory_by_branch_schema, lix_directory_insert_origin,
+        lix_directory_record_batch_from_filesystem_rows,
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers,
     };
@@ -2533,6 +2601,57 @@ mod tests {
 
     fn test_functions() -> FunctionProviderHandle {
         FunctionProviderHandle::system()
+    }
+
+    fn branch_state_row(key: u8, source: StateRowSource) -> StateRow {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(u64::from(key));
+        StateRow {
+            key: vec![key],
+            value: StateValue {
+                change_id: ChangeId::for_test_label(&format!("change-{key}")),
+                commit_id: CommitId::for_test_label(&format!("commit-{key}")),
+                created_at: timestamp,
+                updated_at: timestamp,
+                cell: StateCell::Value(format!("value-{key}").into()),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source,
+        }
+    }
+
+    #[test]
+    fn directory_by_branch_deduplicates_global_overlay_before_limit() {
+        let branch_one = "01920000-0000-7000-8000-0000000000a1";
+        let branch_two = "01920000-0000-7000-8000-0000000000a2";
+        let rows = super::resolve_directory_branch_rows(
+            vec![
+                (
+                    branch_one.to_owned(),
+                    branch_state_row(1, StateRowSource::Global),
+                ),
+                (
+                    branch_two.to_owned(),
+                    branch_state_row(1, StateRowSource::Global),
+                ),
+                (
+                    branch_two.to_owned(),
+                    branch_state_row(2, StateRowSource::Branch),
+                ),
+                (
+                    branch_one.to_owned(),
+                    branch_state_row(2, StateRowSource::Branch),
+                ),
+            ],
+            Some(2),
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, super::GLOBAL_BRANCH_ID);
+        assert_eq!(rows[0].1.key, vec![1]);
+        assert_eq!(rows[1].0, branch_one);
+        assert_eq!(rows[1].1.key, vec![2]);
     }
 
     fn eq_filter(column_name: &str, value: &str) -> Expr {
@@ -2926,8 +3045,11 @@ mod tests {
         ];
 
         let rows = FilesystemStateRows::from_rows(rows);
-        let batch = lix_directory_record_batch(&lix_directory_by_branch_schema(), &rows)
-            .expect("directory batch should build");
+        let batch = lix_directory_record_batch_from_filesystem_rows(
+            &lix_directory_by_branch_schema(),
+            rows,
+        )
+        .expect("directory batch should build");
 
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(
