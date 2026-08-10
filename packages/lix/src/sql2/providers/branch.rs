@@ -31,7 +31,7 @@ use crate::sql2::write_normalization::{
     defaultable_text_insert_value, insert_column_is_omitted,
 };
 use crate::sql2::{SqlWriteContext, WriteAccess};
-use crate::state::{ForkTreeStateView, StateRow, StateRowSource, TransactionStateView};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{
     LogicalPrimaryKey, RawWriteBatch, TransactionWrite, TransactionWriteMode,
@@ -945,7 +945,6 @@ fn parse_descriptor(row: &StateRow, expected_id: &str) -> Result<BranchDescripto
     if key.schema_key != BRANCH_DESCRIPTOR_SCHEMA_KEY
         || key.file_id.is_some()
         || key.entity_pk != expected_pk
-        || matches!(row.source, StateRowSource::Branch)
     {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
