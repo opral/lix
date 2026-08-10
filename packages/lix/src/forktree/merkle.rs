@@ -17,7 +17,7 @@ use super::model::{
 };
 use super::object::{
     ObjectDomain, ObjectId, authenticate_object_domain, decode_id, decode_object, encode_id,
-    encode_object,
+    encode_object, hash_object_parts,
 };
 use super::state::{StateKey, StateKeyRef, encode_state_key};
 use super::tree::ImmutableObjectSet;
@@ -490,19 +490,26 @@ where
 /// before publication; the durable reader still authorizes only the
 /// StateKey-bound manifest root and never looks content up by this value.
 pub(crate) fn canonical_blob_id_for_content(content: &[u8]) -> Result<BlobId, StorageError> {
-    let chunks = if content.is_empty() {
-        vec![BlobChunkV1 {
-            bytes: Bytes::new(),
-        }]
-    } else {
-        content
-            .chunks(CANONICAL_BLOB_CHUNK_BYTES)
-            .map(|chunk| BlobChunkV1 {
-                bytes: Bytes::copy_from_slice(chunk),
-            })
-            .collect()
-    };
-    Ok(build_blob_merkle_tree(&chunks)?.manifest.canonical_blob_id)
+    let logical_bytes = u64::try_from(content.len())
+        .map_err(|_| corruption("canonical blob content exceeds u64 length"))?;
+    let leaf_count = content.len().div_ceil(CANONICAL_BLOB_CHUNK_BYTES).max(1);
+    if leaf_count == 1 {
+        return Ok(canonical_blob_id_from_summary(summary_leaf_for_content(
+            0, content,
+        )?));
+    }
+    let mut leaves = Vec::with_capacity(leaf_count);
+
+    for (ordinal, chunk) in content.chunks(CANONICAL_BLOB_CHUNK_BYTES).enumerate() {
+        let ordinal =
+            u64::try_from(ordinal).map_err(|_| corruption("canonical blob has too many chunks"))?;
+        leaves.push(summary_leaf_for_content(ordinal, chunk)?);
+    }
+
+    let root = build_summary_node(&leaves)?;
+    debug_assert_eq!(root.logical_bytes, logical_bytes);
+    debug_assert_eq!(root.leaf_count, leaf_count as u64);
+    Ok(canonical_blob_id_from_summary(root))
 }
 
 /// Builds the smallest authenticated Merkle fixture for unit tests.  The
@@ -1117,6 +1124,107 @@ fn canonical_blob_id_from_summary(summary: NodeSummary) -> BlobId {
     )
 }
 
+fn summary_leaf_for_content(ordinal: u64, chunk: &[u8]) -> Result<NodeSummary, StorageError> {
+    let chunk_len = u32::try_from(chunk.len())
+        .map_err(|_| corruption("canonical blob chunk exceeds u32 length"))?;
+    let chunk_len_bytes = chunk_len.to_be_bytes();
+    let chunk_object_id = hash_object_parts(ObjectDomain::BlobChunk, &[&chunk_len_bytes, chunk]);
+    let declared_len = u64::try_from(chunk.len())
+        .map_err(|_| corruption("canonical blob chunk exceeds u64 length"))?;
+    let chunk_digest = *blake3::hash(chunk).as_bytes();
+    let ordinal_bytes = ordinal.to_be_bytes();
+    let declared_len_bytes = declared_len.to_be_bytes();
+    let leaf_object_id = hash_object_parts(
+        ObjectDomain::BlobMerkleLeafV1,
+        &[
+            &ordinal_bytes,
+            chunk_object_id.as_bytes(),
+            &declared_len_bytes,
+            &chunk_digest,
+        ],
+    );
+    if leaf_object_id == ObjectId::ZERO {
+        return Err(corruption("canonical blob leaf has a zero object id"));
+    }
+    Ok(NodeSummary {
+        object_id: leaf_object_id,
+        height: 0,
+        first_ordinal: ordinal,
+        leaf_count: 1,
+        logical_bytes: declared_len,
+    })
+}
+
+fn build_summary_node(leaves: &[NodeSummary]) -> Result<NodeSummary, StorageError> {
+    if leaves.is_empty() {
+        return Err(corruption("canonical blob has no Merkle leaves"));
+    }
+    if leaves.len() == 1 {
+        return Ok(leaves[0]);
+    }
+
+    let split = leaves
+        .len()
+        .checked_next_power_of_two()
+        .ok_or_else(|| corruption("Merkle leaf count cannot be represented"))?
+        / 2;
+    let left = build_summary_node(&leaves[..split])?;
+    let right = build_summary_node(&leaves[split..])?;
+    let value = BlobMerkleInternalV1 {
+        height: left.height.max(right.height).saturating_add(1),
+        first_ordinal: left.first_ordinal,
+        leaf_count: left.leaf_count + right.leaf_count,
+        logical_bytes: left.logical_bytes + right.logical_bytes,
+        left: left.as_ref(),
+        right: right.as_ref(),
+    };
+    validate_internal(&value)?;
+
+    let height_bytes = value.height.to_be_bytes();
+    let first_ordinal_bytes = value.first_ordinal.to_be_bytes();
+    let leaf_count_bytes = value.leaf_count.to_be_bytes();
+    let logical_bytes = value.logical_bytes.to_be_bytes();
+    let left_height_bytes = value.left.height.to_be_bytes();
+    let left_first_ordinal_bytes = value.left.first_ordinal.to_be_bytes();
+    let left_leaf_count_bytes = value.left.leaf_count.to_be_bytes();
+    let left_logical_bytes = value.left.logical_bytes.to_be_bytes();
+    let right_height_bytes = value.right.height.to_be_bytes();
+    let right_first_ordinal_bytes = value.right.first_ordinal.to_be_bytes();
+    let right_leaf_count_bytes = value.right.leaf_count.to_be_bytes();
+    let right_logical_bytes = value.right.logical_bytes.to_be_bytes();
+    let object_id = hash_object_parts(
+        ObjectDomain::BlobMerkleInternalV1,
+        &[
+            &height_bytes,
+            &first_ordinal_bytes,
+            &leaf_count_bytes,
+            &logical_bytes,
+            value.left.object_id.as_bytes(),
+            &left_height_bytes,
+            &left_first_ordinal_bytes,
+            &left_leaf_count_bytes,
+            &left_logical_bytes,
+            value.right.object_id.as_bytes(),
+            &right_height_bytes,
+            &right_first_ordinal_bytes,
+            &right_leaf_count_bytes,
+            &right_logical_bytes,
+        ],
+    );
+    if object_id == ObjectId::ZERO {
+        return Err(corruption(
+            "canonical blob internal node has a zero object id",
+        ));
+    }
+    Ok(NodeSummary {
+        object_id,
+        height: value.height,
+        first_ordinal: value.first_ordinal,
+        leaf_count: value.leaf_count,
+        logical_bytes: value.logical_bytes,
+    })
+}
+
 fn build_node(
     leaves: &[LeafWithId],
     objects: &mut ImmutableObjectSet,
@@ -1514,6 +1622,32 @@ mod tests {
                 bytes: Bytes::from(vec![ordinal as u8 + 1; CANONICAL_BLOB_CHUNK_BYTES]),
             })
             .collect()
+    }
+
+    #[test]
+    fn summary_only_canonical_blob_id_matches_full_builder() {
+        for size in [
+            0,
+            1,
+            4 * 1024,
+            CANONICAL_BLOB_CHUNK_BYTES - 1,
+            CANONICAL_BLOB_CHUNK_BYTES,
+            CANONICAL_BLOB_CHUNK_BYTES + 1,
+            3 * CANONICAL_BLOB_CHUNK_BYTES + 123,
+        ] {
+            let content = (0..size)
+                .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+                .collect::<Vec<_>>();
+            let expected = build_blob_merkle_tree(&canonical_chunks(&content))
+                .unwrap()
+                .manifest
+                .canonical_blob_id;
+            assert_eq!(
+                canonical_blob_id_for_content(&content).unwrap(),
+                expected,
+                "summary-only canonical identity diverged at {size} bytes"
+            );
+        }
     }
 
     #[test]
