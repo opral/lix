@@ -16,8 +16,7 @@ use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, ObjectId, StateCell, StateKey, StateSource, StateValue,
     UntrackedValue, VisibleStateRow,
 };
-use crate::storage::StorageError;
-use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::{StorageAdapterRead, StorageError};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 

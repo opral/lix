@@ -73,7 +73,7 @@ impl ExecuteIdempotency {
 pub(crate) const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = StorageSpace::engine_declared(
     0x0007_0005,
     "session.execute_idempotency_receipt.v1",
-    crate::storage::ValueSemantics::Mutable,
+    crate::storage_adapter::ValueSemantics::Mutable,
 );
 
 const RECEIPT_VERSION: u8 = 2;

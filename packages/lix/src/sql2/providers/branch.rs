@@ -32,7 +32,7 @@ use crate::sql2::write_normalization::{
 };
 use crate::sql2::{SqlWriteContext, WriteAccess};
 use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
-use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::{StorageAdapterRead, StorageError};
 use crate::transaction::types::{
     LogicalPrimaryKey, RawWriteBatch, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteRow,
@@ -108,7 +108,7 @@ where
         &self,
         keys: &[Vec<u8>],
         include_tombstones: bool,
-    ) -> Result<Vec<Option<StateRow>>, crate::storage::StorageError> {
+    ) -> Result<Vec<Option<StateRow>>, StorageError> {
         match self {
             Self::Committed(state) => state.points(keys, include_tombstones).await,
             Self::Transaction(state) => state.points(keys, include_tombstones).await,

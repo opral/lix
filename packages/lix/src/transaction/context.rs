@@ -8530,8 +8530,11 @@ where
         {
             return Ok(index);
         }
-        let index =
-            crate::filesystem::path_index::build_path_index(&self.state_view, request).await?;
+        // Keep transaction overlay semantics while entering through the
+        // filesystem owner's public(crate) boundary. The source is still the
+        // transaction state view, so staged rows remain visible; callers do
+        // not reach into the sealed `path_index` implementation module.
+        let index = crate::filesystem::build_path_index(&self.state_view, request).await?;
         Ok(self
             .filesystem_path_index_cache
             .insert(request, Some(&revision), index))

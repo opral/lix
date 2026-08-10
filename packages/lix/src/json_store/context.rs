@@ -25,7 +25,7 @@ pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace =
     StorageSpace::engine_declared(
         0x0002_0002,
         UNTRACKED_JSON_RECLAIM_CANDIDATE_NAMESPACE,
-        crate::storage::ValueSemantics::Mutable,
+        crate::storage_adapter::ValueSemantics::Mutable,
     );
 
 const UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE: &[u8] = b"\x01";

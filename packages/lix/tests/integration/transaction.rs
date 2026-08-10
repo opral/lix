@@ -669,7 +669,10 @@ async fn write_changelog_commit_failure_does_not_commit_storage_write() {
         .await
         .expect("workspace session should open");
 
-    storage.fail_write_namespace("changelog.commit");
+    // Changelog rows are now authenticated ForkTree objects. Inject the
+    // failure at the current immutable publication owner rather than the
+    // deleted legacy changelog space.
+    storage.fail_write_namespace("forktree.object");
     let before = storage.stats();
     let error = session
         .execute(
@@ -1649,7 +1652,7 @@ impl RecordingRead {
 
 fn namespace_space(namespace: &str) -> Option<u32> {
     match namespace {
-        "changelog.commit" => Some(0x0006_0001),
+        "forktree.object" => Some(0x0009_0001),
         "changelog.change" => Some(0x0006_0002),
         _ => None,
     }
