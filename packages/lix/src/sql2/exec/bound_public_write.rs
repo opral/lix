@@ -3172,6 +3172,16 @@ async fn entity_update(
     let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
     for candidate in candidates.iter() {
+        // The workspace selector has one mutable owner: the authenticated
+        // global untracked row. Bootstrap also retains a tracked copy for
+        // branch-local catalog visibility; a plain selector-key UPDATE must
+        // not stage that historical copy into a second branch publication.
+        if spec.schema_key == "lix_key_value"
+            && !candidate.untracked()
+            && candidate.entity_pk() == &EntityPk::single("lix_workspace_branch_id")
+        {
+            continue;
+        }
         let appended = append_entity_update_row(
             &mut write_rows,
             ctx,
