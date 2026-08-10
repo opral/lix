@@ -99,6 +99,7 @@ use crate::transaction::types::{
     TransactionWriteRow, TypedMutationJournalBatch, canonicalize_transaction_json_batch,
     stage_json_from_value,
 };
+use crate::transaction::validation::validate_prepared_writes_by_branch;
 
 use crate::wasm::{
     WasmCertifiedEntityBatch, WasmChangeEffect, WasmConflictResolution, WasmConflictTake,
@@ -954,7 +955,23 @@ where
             "classified stale transaction commit"
         );
         match plan {
-            StaleCommitPlan::Direct | StaleCommitPlan::RevalidateOrdinaryInsert => {}
+            StaleCommitPlan::Direct => {}
+            StaleCommitPlan::RevalidateOrdinaryInsert => {
+                // The concurrent branch head is now the authoritative
+                // validation snapshot.  Reuse the commit-boundary read that
+                // produced the stale classification; do not reopen storage
+                // or silently accept the INSERT race.
+                let committed = self.committed_state_view().await?;
+                let current_state = TransactionStateView::new(committed, Vec::new())?;
+                validate_prepared_writes_by_branch(
+                    &current_state,
+                    &self.active_branch_id,
+                    &self.sql_schema_snapshot,
+                    prepared_writes,
+                    self.trust_filesystem_planner,
+                )
+                .await?;
+            }
             StaleCommitPlan::ReconcilePlugin(plan) => {
                 let file_count = plan.file_ids.len();
                 let semantic_conflict_count = plan.semantic_conflict_indices.len();
@@ -1535,6 +1552,41 @@ where
                 "lix.perf.transaction_reconcile_stale"
             ))
             .await
+        {
+            transaction
+                .discard_pending_plugin_actor_publications()
+                .await;
+            return Err(error);
+        }
+        let validation_state = match transaction.committed_state_view().await {
+            Ok(committed) => match TransactionStateView::new(committed, Vec::new()) {
+                Ok(state) => state,
+                Err(error) => {
+                    transaction
+                        .discard_pending_plugin_actor_publications()
+                        .await;
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_prepared_writes_by_branch(
+            &validation_state,
+            &transaction.active_branch_id,
+            &transaction.sql_schema_snapshot,
+            &prepared_writes,
+            transaction.trust_filesystem_planner,
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_native_validation"
+        ))
+        .await
         {
             transaction
                 .discard_pending_plugin_actor_publications()
