@@ -165,12 +165,12 @@ pub(crate) enum BlobLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobBytesBatch {
-    entries: Vec<Option<Vec<u8>>>,
+    entries: Vec<Option<bytes::Bytes>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobRangeBytes {
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: bytes::Bytes,
     pub(crate) total_size: u64,
     pub(crate) range: Range<u64>,
 }
@@ -192,10 +192,28 @@ impl BlobRangeBytesBatch {
 
 impl BlobBytesBatch {
     pub(crate) fn new(entries: Vec<Option<Vec<u8>>>) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|entry| entry.map(bytes::Bytes::from))
+                .collect(),
+        }
+    }
+
+    /// Retains already shared payload buffers without copying. The caller is
+    /// responsible for having authenticated every buffer before construction.
+    pub(crate) fn from_shared(entries: Vec<Option<bytes::Bytes>>) -> Self {
         Self { entries }
     }
 
     pub(crate) fn into_vec(self) -> Vec<Option<Vec<u8>>> {
+        self.entries
+            .into_iter()
+            .map(|entry| entry.map(|bytes| bytes.to_vec()))
+            .collect()
+    }
+
+    pub(crate) fn into_shared_vec(self) -> Vec<Option<bytes::Bytes>> {
         self.entries
     }
 }
