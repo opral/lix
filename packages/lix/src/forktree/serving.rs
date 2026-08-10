@@ -799,9 +799,8 @@ where
 }
 
 /// Loads one required semantic commit record from the authenticated
-/// CommitCatalog. Unlike the historical compatibility readers, an absent
-/// catalog entry is corruption here; only an authenticated state-key absence
-/// is a valid empty result.
+/// CommitCatalog. An absent catalog entry is corruption here; only an
+/// authenticated state-key absence is a valid empty result.
 pub(crate) async fn load_required_commit_record<R>(
     read: &R,
     id: crate::changelog::CommitId,

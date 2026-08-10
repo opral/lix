@@ -1551,8 +1551,8 @@ where
                 // RETURNING reads the transaction post-image. Keep staged
                 // payload ownership on the same write context while falling
                 // back to the retained authenticated reader for committed
-                // rows; the legacy payload reader cannot see unpublished
-                // BlobRef owners.
+                // rows; committed storage cannot see unpublished BlobRef
+                // owners.
                 use_authenticated_blob_reader: true,
             },
             captured,
