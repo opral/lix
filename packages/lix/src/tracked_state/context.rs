@@ -11,15 +11,6 @@ use crate::tracked_state::{TrackedStateIndexValue, TrackedStateKey};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TrackedStateContext;
-
-impl TrackedStateContext {
-    pub(crate) const fn new() -> Self {
-        Self
-    }
-}
-
 /// Returns file identities whose descriptor tombstone requires dependent
 /// payload rows to be retired. This is semantic transaction planning logic;
 /// it does not read or write a tracked-state physical owner.

@@ -42,9 +42,6 @@ const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 /// The changelog commit plane is a compact serving projection. State/history
 /// payload readers validate physical commit-state authority before decoding
 /// tracked data; metadata topology does not require that physical projection.
-#[derive(Clone)]
-pub(crate) struct CommitGraphContext;
-
 /// Derived commit surfaces must not enter the current-state reader. This
 /// reader is the SQL adapter for the authenticated ForkTree commit topology:
 /// it obtains branch heads and reachable topology from the operation's graph
@@ -612,13 +609,12 @@ impl LiveStateReader for CommitGraphLiveStateReader {
     }
 }
 
-impl CommitGraphContext {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    /// Creates a graph reader over a caller-provided KV store.
-    pub(crate) fn reader<S>(&self, store: S) -> CommitGraphStoreReader<S>
+impl<S> CommitGraphStoreReader<S>
+where
+    S: StorageAdapterRead,
+{
+    /// Creates a graph reader over the caller-owned read capability.
+    pub(crate) fn new(store: S) -> Self
     where
         S: StorageAdapterRead,
     {

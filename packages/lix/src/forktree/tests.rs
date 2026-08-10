@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use bytes::Bytes;
 
 use crate::changelog::ChangeRecord;
-use crate::commit_graph::CommitGraphContext;
+use crate::commit_graph::CommitGraphStoreReader;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonSlot;
@@ -2467,7 +2467,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         grandparent_object_reads: Arc::clone(&grandparent_object_reads),
         member_object_reads: Arc::clone(&member_object_reads),
     };
-    let mut graph = CommitGraphContext::new().reader(read);
+    let mut graph = CommitGraphStoreReader::new(read);
     let sibling_ids = [public_commit_id(0x52), public_commit_id(0x53)];
     let siblings = graph
         .load_nodes(&sibling_ids)

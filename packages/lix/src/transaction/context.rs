@@ -35,7 +35,7 @@ use crate::changelog::{
     materialize_known_change_payloads,
 };
 use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_row};
-use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader, ReachableCommitGraphNode};
+use crate::commit_graph::{CommitGraphStoreReader, ReachableCommitGraphNode};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
@@ -51,11 +51,11 @@ use crate::forktree::{
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_publication_state};
 use crate::live_state::{
-    CertifiedCurrentStatePredecessor, LiveStateContext, LiveStateExactBatchRequest,
-    LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
-    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-    StagedLiveStateRows, is_derived_schema, overlay_load_exact_batch, overlay_scan_batch,
+    CertifiedCurrentStatePredecessor, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+    MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
+    MaterializedLiveStateRow, MaterializedLiveStateRowRef, StagedLiveStateRows, is_derived_schema,
+    overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
@@ -531,7 +531,6 @@ fn record_transaction_path_index_build(descriptor_rows: usize) {
 pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
     active_account_id: String,
-    live_state: Arc<LiveStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     schema_resolver: TransactionSchemaResolver,
@@ -1451,7 +1450,6 @@ where
         mode: &SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
         plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
@@ -1472,8 +1470,7 @@ where
         let read = opening_read.clone();
         let setup_result = async {
             let active_branch_id =
-                resolve_active_branch_id(mode, live_state.as_ref(), branch_ctx.as_ref(), &read)
-                    .await?;
+                resolve_active_branch_id(mode, branch_ctx.as_ref(), &read).await?;
             let runtime_functions = FunctionContext::prepare(&read).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
@@ -1555,7 +1552,6 @@ where
                 transaction: Self {
                     active_branch_id,
                     active_account_id,
-                    live_state,
                     plugin_host,
                     branch_ctx,
                     schema_resolver,
@@ -1802,7 +1798,7 @@ where
         ))
         .await?;
         if rebuild_filesystem_path_index || !filesystem_delta_rows.is_empty() {
-            transaction.live_state.clear_filesystem_path_indexes();
+            transaction.filesystem_path_index_cache.clear();
         }
         for publication in std::mem::take(&mut transaction.pending_plugin_actor_publications) {
             let session_key = publication.session_key().clone();
@@ -7234,7 +7230,7 @@ where
     pub(crate) fn commit_graph_reader_on_opening_read(
         &self,
     ) -> CommitGraphStoreReader<&SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
-        CommitGraphContext::new().reader(&self.opening_read)
+        CommitGraphStoreReader::new(&self.opening_read)
     }
 
     /// Applies a tracked-state transition resolved from two immutable commits.
@@ -8063,7 +8059,7 @@ where
     }
 
     fn commit_graph(&self) -> Box<dyn crate::commit_graph::CommitGraphReader> {
-        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+        Box::new(CommitGraphStoreReader::new(self.read_store.clone()))
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
@@ -8604,7 +8600,7 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let mut graph = CommitGraphContext::new().reader(self);
+        let mut graph = CommitGraphStoreReader::new(self);
         self.scan_validation_rows(&mut graph, request).await
     }
 
@@ -8612,7 +8608,7 @@ where
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        let mut graph = CommitGraphContext::new().reader(self);
+        let mut graph = CommitGraphStoreReader::new(self);
         self.load_exact_validation_rows(&mut graph, request).await
     }
 }
@@ -9293,7 +9289,6 @@ pub(crate) async fn open_transaction<StorageImpl>(
     mode: &SessionMode,
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
-    live_state: Arc<LiveStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -9307,7 +9302,6 @@ where
         mode,
         active_account_id,
         storage,
-        live_state,
         plugin_host,
         branch_ctx,
         catalog_context,
@@ -9323,7 +9317,6 @@ pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
     mode: &SessionMode,
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
-    live_state: Arc<LiveStateContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
@@ -9339,7 +9332,6 @@ where
         mode,
         active_account_id,
         storage,
-        live_state,
         plugin_host,
         branch_ctx,
         catalog_context,
@@ -12121,7 +12113,6 @@ fn require_valid_storage_scope(branch_id: &str, global: bool) -> Result<(), LixE
 
 async fn resolve_active_branch_id(
     mode: &SessionMode,
-    _live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
