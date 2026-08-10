@@ -6,6 +6,10 @@ static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "storage-benches")]
+static TRANSACTION_VALIDATION_ROWS_VISITED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "storage-benches")]
+static TRANSACTION_VALIDATION_ACCOUNTING_ENABLED: AtomicBool = AtomicBool::new(false);
 static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -346,6 +350,25 @@ pub(crate) fn record_transaction_untracked_rows(count: usize) {
 
 pub(crate) fn record_transaction_validation_branch() {
     TRANSACTION_VALIDATION_BRANCHS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "storage-benches")]
+pub fn begin_transaction_validation_accounting() {
+    TRANSACTION_VALIDATION_ROWS_VISITED.store(0, Ordering::Relaxed);
+    TRANSACTION_VALIDATION_ACCOUNTING_ENABLED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) fn record_transaction_validation_row_visited() {
+    if TRANSACTION_VALIDATION_ACCOUNTING_ENABLED.load(Ordering::Relaxed) {
+        TRANSACTION_VALIDATION_ROWS_VISITED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "storage-benches")]
+pub fn take_transaction_validation_rows_visited() -> u64 {
+    TRANSACTION_VALIDATION_ACCOUNTING_ENABLED.store(false, Ordering::Relaxed);
+    TRANSACTION_VALIDATION_ROWS_VISITED.swap(0, Ordering::Relaxed)
 }
 
 pub(crate) fn record_transaction_schema_catalog_load() {

@@ -359,6 +359,8 @@ where
             .await
             .map_err(LixError::from)?
         {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_transaction_validation_row_visited();
             let row = NativeValidationRow::from_tracked(row, active_branch_id)?;
             if domain_matches(domain, &row) {
                 output.rows.push(row);
@@ -1052,6 +1054,24 @@ where
     }
     validate_descriptor_shapes(input.schema_catalog, &staged_rows)?;
     validate_registered_schema_rows(&input, &staged_rows)?;
+    let has_inserts = input.staged_writes.inserts().next().is_some();
+    let needs_committed_state = staged_rows.iter().any(|row| {
+        row.requires_transaction_validation()
+            || row.global()
+            || row.untracked()
+            || row.file_id().is_some()
+            || row_is_tombstone(*row)
+            || matches!(
+                row.schema_key(),
+                FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | "lix_account"
+            )
+    });
+    if !needs_committed_state {
+        if has_inserts {
+            validate_insert_identities_by_point(&input).await?;
+        }
+        return Ok(());
+    }
     let mut schema_keys = BTreeSet::new();
     for row in &staged_rows {
         schema_keys.insert(row.schema_key().to_owned());
@@ -1148,6 +1168,59 @@ where
     }
     validate_delete_restrictions(&input, &staged_rows, &validation_index).await?;
     validate_insert_identities(&input, &validation_index).await?;
+    Ok(())
+}
+
+/// Validate only exact primary-key slots for an unconstrained insert batch.
+/// This retains duplicate detection without materializing a schema-wide
+/// committed validation index.
+async fn validate_insert_identities_by_point<R>(
+    input: &TransactionValidationInput<'_, R>,
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead,
+{
+    let mut seen = BTreeSet::new();
+    for insert in input.staged_writes.inserts() {
+        let row = insert.row;
+        let identity = (
+            row.branch_id.to_string(),
+            row.global,
+            row.file_id.map(ToString::to_string),
+            row.schema_key.to_string(),
+            row.entity_pk.clone(),
+        );
+        if !seen.insert(identity) {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!("duplicate insert identity for schema '{}'", row.schema_key),
+            ));
+        }
+        let Some(current) = exact_visible_row(
+            input.state_view,
+            input.active_branch_id,
+            &prepared_row_domain(PreparedValidationRow::State(insert.row)),
+            row.schema_key,
+            row.entity_pk,
+            true,
+        )
+        .await?
+        else {
+            continue;
+        };
+        if !current.deleted
+            && same_insert_identity(PreparedValidationRow::State(insert.row), &current)
+        {
+            return Err(unique_constraint_error(
+                crate::transaction::duplicate_insert_identity_message(
+                    row.schema_key,
+                    row.entity_pk,
+                    Some(row.branch_id),
+                    insert.origin.or(row.origin),
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
