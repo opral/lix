@@ -666,7 +666,7 @@ where
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-            self.forktree.clone(),
+            self.state_view.clone(),
         ))
     }
 

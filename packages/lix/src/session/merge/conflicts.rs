@@ -167,16 +167,6 @@ mod tests {
         assert!(std::ptr::eq(view.tracked(), &plan.conflicts[0]));
         assert!(identity.shares_key_with(view.identity()));
         assert!(identity.shares_key_with(&view.tracked().target.identity));
-        assert!(
-            identity.shares_key_with(
-                &view
-                    .tracked()
-                    .source
-                    .after
-                    .as_ref()
-                    .expect("source row")
-                    .identity
-            )
-        );
+        assert!(identity.shares_key_with(&view.tracked().source.identity));
     }
 }

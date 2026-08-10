@@ -1167,7 +1167,7 @@ where
                 .await?;
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                     Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                        forktree.clone(),
+                        state_view.clone(),
                     ));
                 let branch_ref: Arc<dyn BranchRefReader> =
                     Arc::new(BranchRefStoreReader::new(read_store.clone()));
@@ -2326,7 +2326,7 @@ where
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
                     > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                        forktree.clone(),
+                        state_view.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(BranchRefStoreReader::new(read_store));
@@ -2341,7 +2341,7 @@ where
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
                     > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                        forktree.clone(),
+                        state_view.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(BranchRefStoreReader::new(read_store));
@@ -2357,7 +2357,7 @@ where
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
                     > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                        forktree.clone(),
+                        state_view.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(BranchRefStoreReader::new(read_store.clone()));
@@ -2447,7 +2447,7 @@ where
             active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
             forktree: forktree.clone(),
-            state_view,
+            state_view: state_view.clone(),
             catalog_context: Arc::clone(&self.catalog_context),
             sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             functions: functions.clone(),
@@ -2469,7 +2469,7 @@ where
         if let Some(data_column_index) = late_file_content_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
-                    forktree.clone(),
+                    state_view.clone(),
                 ));
             let branch_ref: Arc<dyn BranchRefReader> =
                 Arc::new(BranchRefStoreReader::new(read_store.clone()));
@@ -2710,10 +2710,8 @@ fn validate_execute_statement_metadata(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn hydrate_lix_file_content_result(
-    state_view: crate::state::ForkTreeStateView<
-        SharedStorageAdapterRead<impl crate::storage_adapter::StorageRead>,
-    >,
+async fn hydrate_lix_file_content_result<R>(
+    state_view: crate::state::ForkTreeStateView<SharedStorageAdapterRead<R>>,
     active_branch_id: &str,
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
@@ -2722,7 +2720,10 @@ async fn hydrate_lix_file_content_result(
     session_file_views: Option<sql2::SessionFileViews>,
     query: &mut SqlQueryResult,
     data_column_index: usize,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: crate::storage_adapter::StorageRead + 'static,
+{
     let mut paths = BTreeSet::new();
     for row in &query.rows {
         let Some(Value::Text(path)) = row.get(data_column_index) else {

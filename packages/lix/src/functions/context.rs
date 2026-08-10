@@ -5,6 +5,7 @@ use crate::functions::{
     DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
     SystemFunctionProvider, state,
 };
+use crate::state::ForkTreeStateView;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 
 /// Execution-scoped runtime function context.
@@ -40,12 +41,22 @@ impl FunctionContext {
     pub(crate) async fn prepare(
         read: &(impl StorageAdapterRead + ?Sized),
     ) -> Result<Self, LixError> {
-        let mode = state::load_mode(read).await?;
+        let facade = crate::forktree::ForkTreeReadFacade::new(read);
+        let global_state_view =
+            ForkTreeStateView::from_facade(facade, crate::GLOBAL_BRANCH_ID).await?;
+        Self::prepare_from_view(&global_state_view).await
+    }
+
+    async fn prepare_from_view<R>(state_view: &ForkTreeStateView<R>) -> Result<Self, LixError>
+    where
+        R: StorageAdapterRead,
+    {
+        let mode = state::load_mode(state_view).await?;
         if !mode.enabled {
             return Ok(Self::system_for_function_free_read());
         }
 
-        let sequence = state::load_sequence(read).await?;
+        let sequence = state::load_sequence(state_view).await?;
         // Deterministic mode must produce byte-identical state across runs;
         // bookkeeping rows (sequence persistence) take a timestamp derived
         // from the persisted sequence instead of the system clock, without

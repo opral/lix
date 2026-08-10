@@ -68,7 +68,10 @@ where
                         head_commit_id != previous_checkpoint_commit_id;
                     let selected_changes = {
                         let view = historical.branch(&branch_id).await?;
-                        let before = load_commit_summary(&view, previous_checkpoint_commit_id)
+                        let before = load_commit_summary(
+                            &view,
+                            native_commit_id(previous_checkpoint_commit_id),
+                        )
                             .await?
                             .ok_or_else(|| {
                                 LixError::new(
@@ -76,7 +79,7 @@ where
                                     "checkpoint baseline commit is missing",
                                 )
                             })?;
-                        let after = load_commit_summary(&view, head_commit_id)
+                        let after = load_commit_summary(&view, native_commit_id(head_commit_id))
                             .await?
                             .ok_or_else(|| {
                                 LixError::new(
@@ -183,6 +186,10 @@ where
         });
         Ok(outcome.receipt)
     }
+}
+
+fn native_commit_id(value: crate::changelog::CommitId) -> crate::forktree::CommitId {
+    crate::forktree::CommitId::from_bytes(*value.as_uuid().as_bytes())
 }
 
 #[derive(Clone, Copy)]
