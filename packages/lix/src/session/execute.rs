@@ -1160,8 +1160,11 @@ where
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
-                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(forktree.clone());
+                let state_view = crate::state::ForkTreeStateView::from_facade(
+                    forktree.clone(),
+                    &active_branch_id,
+                )
+                .await?;
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                     Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
                         forktree.clone(),
@@ -1179,7 +1182,7 @@ where
                 let file_view_collector = sql2::SessionFileViews::default();
                 let result = sql2::execute_exact_lix_file_batch_read(
                     &active_branch_id,
-                    live_state,
+                    state_view,
                     filesystem_path_index,
                     branch_ref,
                     authenticated_blob_reader,
@@ -2350,8 +2353,7 @@ where
                     .await?
                 }
                 exact_filesystem_read => {
-                    let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                        Arc::new(forktree.clone());
+                    let state_view = state_view.clone();
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
                     > = Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
@@ -2369,7 +2371,7 @@ where
                         ExactFilesystemRead::Point(selector, column) => {
                             sql2::execute_exact_lix_file_read(
                                 &active_branch_id,
-                                live_state,
+                                state_view,
                                 filesystem_path_index,
                                 branch_ref,
                                 Arc::clone(&authenticated_blob_reader),
@@ -2383,7 +2385,7 @@ where
                         ExactFilesystemRead::PathContentBatch(paths) => {
                             sql2::execute_exact_lix_file_batch_read(
                                 &active_branch_id,
-                                live_state,
+                                state_view,
                                 filesystem_path_index,
                                 branch_ref,
                                 authenticated_blob_reader,
@@ -2397,7 +2399,7 @@ where
                         ExactFilesystemRead::IdManifestBatch(file_ids) => {
                             sql2::execute_exact_lix_file_id_manifest_batch_read(
                                 &active_branch_id,
-                                live_state,
+                                state_view,
                                 filesystem_path_index,
                                 branch_ref,
                                 authenticated_blob_reader,
@@ -2425,7 +2427,6 @@ where
                 file_view_mutations,
             ));
         }
-        let live_state: Arc<dyn crate::live_state::LiveStateReader> = Arc::new(forktree.clone());
         let runtime_functions = if has_durable_runtime_function {
             Some(FunctionContext::prepare(&read_store).await?)
         } else {
@@ -2479,8 +2480,8 @@ where
                 )?);
             let mut materialized = query.query.into_sql_query_result()?;
             hydrate_lix_file_content_result(
+                state_view.clone(),
                 &active_branch_id,
-                Arc::clone(&live_state),
                 filesystem_path_index,
                 branch_ref,
                 authenticated_blob_reader,
@@ -2492,7 +2493,6 @@ where
             .await?;
             query.query = sql2::SessionReadResult::Rows(materialized);
         }
-        drop(live_state);
         let file_view_mutations = file_view_collector
             .map(|collector| collector.plugin_file_mutations())
             .unwrap_or_default();
@@ -2711,8 +2711,10 @@ fn validate_execute_statement_metadata(
 
 #[allow(clippy::too_many_arguments)]
 async fn hydrate_lix_file_content_result(
+    state_view: crate::state::ForkTreeStateView<
+        SharedStorageAdapterRead<impl crate::storage_adapter::StorageRead>,
+    >,
     active_branch_id: &str,
-    live_state: Arc<dyn crate::live_state::LiveStateReader>,
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
@@ -2737,7 +2739,7 @@ async fn hydrate_lix_file_content_result(
 
     let hydrated = sql2::execute_exact_lix_file_batch_read(
         active_branch_id,
-        live_state,
+        state_view,
         filesystem_path_index,
         branch_ref,
         authenticated_blob_reader,
