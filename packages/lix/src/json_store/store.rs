@@ -12,7 +12,7 @@ pub(crate) const JSON_NAMESPACE: &str = "json_store.json";
 pub(crate) const JSON_SPACE: StorageSpace = StorageSpace::engine_declared(
     0x0002_0001,
     JSON_NAMESPACE,
-    crate::storage::ValueSemantics::Mutable,
+    crate::storage_adapter::ValueSemantics::Mutable,
 );
 const STORED_JSON_MAGIC: &[u8] = b"lix-json:v1";
 const STORED_JSON_HEADER_LEN: usize = STORED_JSON_MAGIC.len() + 1 + 8;

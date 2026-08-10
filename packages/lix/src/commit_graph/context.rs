@@ -21,8 +21,10 @@ use crate::entity_pk::EntityPk;
 use crate::forktree::{
     SELECTOR_SPACE, SnapshotSelectorV1, SnapshotTargetV1, load_object_bytes, snapshot_selector_key,
 };
-use crate::storage::{BeginScanOptions, CoreProjection, KeyRange, ScanOrder};
-use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::{
+    StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StorageKeyRange,
+    StorageProjectedValue, StorageScanOrder,
+};
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 impl<S> CommitGraphStoreReader<S>
@@ -161,13 +163,13 @@ where
         let mut cursor = read
             .begin_scan(
                 SELECTOR_SPACE,
-                KeyRange {
+                StorageKeyRange {
                     lower: std::ops::Bound::Unbounded,
                     upper: std::ops::Bound::Unbounded,
                 },
-                BeginScanOptions {
-                    projection: CoreProjection::FullValue,
-                    order: ScanOrder::Ascending,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    order: StorageScanOrder::Ascending,
                 },
             )
             .await?;
@@ -185,8 +187,8 @@ where
                     continue;
                 }
                 let bytes = match &entry.value {
-                    crate::storage::ProjectedValue::FullValue(bytes) => bytes,
-                    crate::storage::ProjectedValue::KeyOnly => {
+                    StorageProjectedValue::FullValue(bytes) => bytes,
+                    StorageProjectedValue::KeyOnly => {
                         return Err(LixError::new(
                             LixError::CODE_STORAGE_ERROR,
                             "ForkTree snapshot selector scan returned key-only data",

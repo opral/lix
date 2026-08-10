@@ -45,7 +45,7 @@ use crate::sql2::write_normalization::{
     defaultable_text_insert_value, insert_column_is_omitted,
 };
 use crate::state::{ForkTreeStateView, StateRow, TransactionStateView, UntrackedStateRow};
-use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::{StorageAdapterRead, StorageError};
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteRow;
 use crate::transaction::types::{
@@ -277,7 +277,7 @@ where
         &self,
         keys: &[Vec<u8>],
         include_tombstones: bool,
-    ) -> Result<Vec<Option<StateRow>>, crate::storage::StorageError> {
+    ) -> Result<Vec<Option<StateRow>>, StorageError> {
         match self {
             Self::Committed(state) => state.points(keys, include_tombstones).await,
             Self::Transaction(state) => state.points(keys, include_tombstones).await,
@@ -302,7 +302,7 @@ where
         upper: Option<&[u8]>,
         limit: Option<usize>,
         include_tombstones: bool,
-    ) -> Result<Vec<StateRow>, crate::storage::StorageError> {
+    ) -> Result<Vec<StateRow>, StorageError> {
         match self {
             Self::Committed(state) => state.range(lower, upper, limit, include_tombstones).await,
             Self::Transaction(state) => state.range(lower, upper, limit, include_tombstones).await,

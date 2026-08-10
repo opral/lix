@@ -9,7 +9,7 @@ use crate::storage_adapter::{
 const CATALOG_REVISION_SPACE: StorageSpace = StorageSpace::engine_declared(
     0x0007_0003,
     "catalog.schema_revision",
-    crate::storage::ValueSemantics::Mutable,
+    crate::storage_adapter::ValueSemantics::Mutable,
 );
 const CATALOG_REVISION_KEY: &[u8] = b"global";
 

@@ -892,7 +892,18 @@ where
         let view =
             open_coherent_view_on_read(&self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
                 .await
-                .map_err(crate::LixError::from)?;
+                .map_err(|error| match error {
+                    StorageError::Corruption(message)
+                        if message == "requested branch selector is absent" =>
+                    {
+                        crate::LixError::branch_not_found(
+                            branch_id.to_owned(),
+                            "open ForkTree branch view",
+                            "branch selector",
+                        )
+                    }
+                    error => error.into(),
+                })?;
         let _view_identity = view.view_id();
         Ok(view)
     }
