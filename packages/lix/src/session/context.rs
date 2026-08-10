@@ -25,7 +25,7 @@ use crate::sql2::{
     ChangelogQuerySource, SessionFileViews, SqlChangelogQuerySource, SqlExecutionContext,
     SqlPlanningCache,
 };
-use crate::state::ForkTreeStateView;
+use crate::state::{ForkTreeStateView, TransactionStateView};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
@@ -611,9 +611,10 @@ where
                 "lix.perf.public_read.catalog_revision"
             ))
             .await?;
+        let transaction_state = TransactionStateView::new(self.state_view.clone(), Vec::new())?;
         self.catalog_context
             .compiled_catalog_for_transaction_open(
-                self.state_view(),
+                &transaction_state,
                 &Domain::schema_catalog(self.active_branch_id.to_string(), true),
                 revision.as_ref(),
             )
