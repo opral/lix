@@ -7,6 +7,7 @@
 mod blob;
 mod bootstrap;
 mod codec;
+mod current_pack;
 mod gc_index;
 mod merkle;
 mod model;
@@ -23,6 +24,7 @@ pub(crate) use blob::{
     blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
 };
 pub(crate) use bootstrap::initialize_empty_repository;
+pub(crate) use current_pack::encode_current_state_packs;
 pub(crate) use merkle::canonical_blob_id_for_content;
 pub(crate) use model::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,

@@ -6,8 +6,11 @@ use std::time::{Duration, Instant};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use lix::Value;
 use lix::integration::{Engine, SessionContext};
-use lix::storage::Memory;
+use lix::storage::{Memory, Storage};
 use serde_json::json;
+
+#[cfg(feature = "slatedb")]
+use lix_storage_slatedb::SlateDB;
 
 fn diff_command_benches(c: &mut Criterion) {
     if std::env::var_os("LIX_DIFF_COMMAND_PROFILE").is_some() {
@@ -80,13 +83,31 @@ fn profile() {
         .unwrap_or_else(|| vec![100, 1_000, 10_000]);
     for rows in row_counts {
         for sample in 0..samples {
-            runtime.block_on(profile_sample(rows, sample));
+            match std::env::var("LIX_DIFF_COMMAND_PROFILE_BACKEND").as_deref() {
+                Ok("slatedb") => {
+                    #[cfg(feature = "slatedb")]
+                    {
+                        let directory = tempfile::TempDir::new()
+                            .expect("create SlateDB diff-profile directory");
+                        let storage = SlateDB::open(directory.path().join("diff.slatedb"))
+                            .expect("open SlateDB diff-profile storage");
+                        runtime.block_on(profile_sample(rows, sample, storage));
+                    }
+                    #[cfg(not(feature = "slatedb"))]
+                    panic!("slatedb diff profiling requires the slatedb feature");
+                }
+                Ok(other) => panic!("unknown diff profile backend {other}"),
+                Err(_) => runtime.block_on(profile_sample(rows, sample, Memory::new())),
+            }
         }
     }
 }
 
-async fn profile_sample(rows: usize, sample: usize) {
-    let session = new_session().await;
+async fn profile_sample<S>(rows: usize, sample: usize, storage: S)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let session = new_session_with_storage(storage).await;
     let baseline = active_commit(&session).await;
     execute(&session, &insert_sql(rows)).await;
     let head = active_commit(&session).await;
@@ -179,7 +200,13 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 async fn new_session() -> SessionContext<Memory> {
-    let storage = Memory::new();
+    new_session_with_storage(Memory::new()).await
+}
+
+async fn new_session_with_storage<S>(storage: S) -> SessionContext<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     Engine::initialize(storage.clone())
         .await
         .expect("initialize benchmark storage");
@@ -219,7 +246,10 @@ fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usi
     )
 }
 
-async fn active_commit(session: &SessionContext<Memory>) -> String {
+async fn active_commit<S>(session: &SessionContext<S>) -> String
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     let result = session
         .execute("SELECT lix_active_branch_commit_id()", &[])
         .await
@@ -230,7 +260,10 @@ async fn active_commit(session: &SessionContext<Memory>) -> String {
     commit_id.clone()
 }
 
-async fn execute(session: &SessionContext<Memory>, sql: &str) {
+async fn execute<S>(session: &SessionContext<S>, sql: &str)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     black_box(
         session
             .execute(sql, &[])

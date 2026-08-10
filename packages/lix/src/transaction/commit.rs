@@ -27,11 +27,11 @@ use crate::forktree::{
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CheckpointCursorV1,
     CommitCatalogEntry, CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1,
     CommitObjectV1, HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition,
-    PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCellRef, StateKey,
-    StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
-    encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
-    introduced_checkpoint_marker, load_commit, load_commit_summary, open_coherent_view_on_read,
-    select_historical_commit_members, state_points,
+    PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCell, StateKey,
+    StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValue, StateValueRef,
+    encode_current_state_packs, encode_state_entity_prefix_bounds, encode_state_key,
+    encode_state_value, introduced_checkpoint_marker, load_commit, load_commit_summary,
+    open_coherent_view_on_read, select_historical_commit_members, state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -408,6 +408,22 @@ where
             &prepared_blob_manifests,
             &prepared_writes.historical_blob_manifest_edges,
         )?;
+        let current_value = StateValue {
+            change_id,
+            commit_id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            cell: match canonical_snapshot.as_deref() {
+                None => StateCell::Tombstone,
+                Some("null") => StateCell::Null,
+                Some(value) => StateCell::Value(value.into()),
+            },
+            metadata: row
+                .metadata
+                .map(|value| crate::common::SharedStr::from(value.normalized())),
+            origin_key: row.origin_key.map(ToString::to_string),
+            blob_manifest_object_ids: blob_manifest_object_ids.clone(),
+        };
         members.push(CommitMemberV1::introduced(
             forktree_change_id(change_id),
             payload,
@@ -415,22 +431,36 @@ where
             row.updated_at,
             blob_manifest_object_ids.clone(),
         ));
-        pending_rows.push((row, key, previous, blob_manifest_object_ids));
+        pending_rows.push((row, key, previous, blob_manifest_object_ids, current_value));
     }
     let member_pages = CommitChangePageV2::encode_pages(forktree_commit_id(commit_id), &members)?;
+    let current_packs = encode_current_state_packs(
+        forktree_commit_id(commit_id),
+        global,
+        pending_rows
+            .iter()
+            .zip(&member_pages.member_locations)
+            .filter(|((row, ..), _)| !(global && row.snapshot.is_none()))
+            .map(|((_, key, _, _, value), location)| (key.clone(), value.clone(), *location))
+            .collect(),
+    )?;
     let mut state_mutations = Vec::with_capacity(pending_rows.len());
     let mut replacement_entries = complete_replacement_bounds
         .as_ref()
         .map(|_| Vec::with_capacity(pending_rows.len()));
-    for ((row, key, previous, blob_manifest_object_ids), location) in
+    for ((row, key, previous, blob_manifest_object_ids, _), _) in
         pending_rows.into_iter().zip(&member_pages.member_locations)
     {
         let mutation = if global && row.snapshot.is_none() {
             StateTreeMutation::remove(key)
         } else {
+            let location = current_packs
+                .locations
+                .get(&key)
+                .ok_or_else(|| writer_error("current-state pack omitted a published row"))?;
             let encoded = encode_state_value(StateValueRef {
-                page_object_id: location.page_object_id,
-                page_ordinal: location.page_ordinal,
+                pack_object_id: location.pack_object_id,
+                pack_ordinal: location.pack_ordinal,
             })?;
             let audit = StateMutationAudit {
                 commit_id: *commit_id.as_uuid().as_bytes(),
@@ -463,7 +493,7 @@ where
         view.branch_snapshot().local_state_root
     };
     let root_transition = complete_replacement_bounds.is_some();
-    let state_edit = if let (Some((lower, upper)), Some(entries)) =
+    let mut state_edit = if let (Some((lower, upper)), Some(entries)) =
         (complete_replacement_bounds, replacement_entries)
     {
         view.replace_state_tree_range(state_base, lower, upper, entries)
@@ -471,6 +501,7 @@ where
     } else {
         view.edit_state_tree(state_base, state_mutations).await?
     };
+    state_edit.stage_objects(current_packs.objects)?;
 
     let expected_parent = commit_parent_heads
         .get(&branch_id)
@@ -910,6 +941,7 @@ struct OrderedCommitContent {
     mutations: Vec<StateTreeMutation>,
     members: Vec<CommitMemberV1>,
     member_page_object_ids: Vec<ObjectId>,
+    current_pack_objects: Vec<(ObjectId, bytes::Bytes)>,
     max_selected_source_generation: Option<u64>,
 }
 
@@ -922,6 +954,7 @@ enum PendingStateMutation {
         existed: bool,
         tombstone: bool,
         blob_manifest_object_ids: Vec<ObjectId>,
+        value: StateValue,
     },
 }
 
@@ -1183,7 +1216,23 @@ where
                     key,
                     existed,
                     tombstone: row.snapshot.is_none(),
-                    blob_manifest_object_ids,
+                    blob_manifest_object_ids: blob_manifest_object_ids.clone(),
+                    value: StateValue {
+                        change_id,
+                        commit_id: draft.commit_id,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        cell: match canonical_snapshot.as_deref() {
+                            None => StateCell::Tombstone,
+                            Some("null") => StateCell::Null,
+                            Some(value) => StateCell::Value(value.into()),
+                        },
+                        metadata: row
+                            .metadata
+                            .map(|value| crate::common::SharedStr::from(value.normalized())),
+                        origin_key: row.origin_key.map(ToString::to_string),
+                        blob_manifest_object_ids: blob_manifest_object_ids.clone(),
+                    },
                 }
             };
             pending_mutations.push(mutation);
@@ -1277,6 +1326,16 @@ where
                         existed,
                         tombstone: selected.deleted,
                         blob_manifest_object_ids: source_value.blob_manifest_object_ids.clone(),
+                        value: StateValue {
+                            change_id: selected.change_id,
+                            commit_id: draft.commit_id,
+                            created_at: selected.created_at,
+                            updated_at: selected.updated_at,
+                            cell: source_value.cell.clone(),
+                            metadata: source_value.metadata.clone(),
+                            origin_key: source_value.origin_key.clone(),
+                            blob_manifest_object_ids: source_value.blob_manifest_object_ids.clone(),
+                        },
                     }
                 };
                 pending_mutations.push(mutation);
@@ -1294,10 +1353,24 @@ where
                 "ordered history state mutations differ from commit membership",
             ));
         }
+        let current_packs = encode_current_state_packs(
+            forktree_commit_id(draft.commit_id),
+            state_domain.unwrap_or(false),
+            pending_mutations
+                .iter()
+                .zip(&member_pages.member_locations)
+                .filter_map(|(pending, location)| match pending {
+                    PendingStateMutation::Remove { .. } => None,
+                    PendingStateMutation::Put { key, value, .. } => {
+                        Some((key.clone(), value.clone(), *location))
+                    }
+                })
+                .collect(),
+        )?;
         let mutations = pending_mutations
             .into_iter()
             .zip(&member_pages.member_locations)
-            .map(|(pending, location)| {
+            .map(|(pending, _history_location)| {
                 Ok(match pending {
                     PendingStateMutation::Remove { key } => StateTreeMutation::remove(key),
                     PendingStateMutation::Put {
@@ -1305,10 +1378,14 @@ where
                         existed,
                         tombstone,
                         blob_manifest_object_ids,
+                        value: _,
                     } => {
+                        let location = current_packs.locations.get(&key).ok_or_else(|| {
+                            writer_error("current-state pack omitted an ordered-history row")
+                        })?;
                         let encoded = encode_state_value(StateValueRef {
-                            page_object_id: location.page_object_id,
-                            page_ordinal: location.page_ordinal,
+                            pack_object_id: location.pack_object_id,
+                            pack_ordinal: location.pack_ordinal,
                         })?;
                         let audit = StateMutationAudit {
                             commit_id: *draft.commit_id.as_uuid().as_bytes(),
@@ -1329,6 +1406,7 @@ where
             mutations,
             members,
             member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
+            current_pack_objects: current_packs.objects,
             max_selected_source_generation,
         });
     }
@@ -1347,7 +1425,7 @@ where
     for content in &mut contents {
         sort_state_mutations(&mut content.mutations)?;
     }
-    let state_edits = view
+    let mut state_edits = view
         .edit_state_tree_sequence(
             state_base,
             contents
@@ -1356,6 +1434,9 @@ where
                 .collect(),
         )
         .await?;
+    for (edit, content) in state_edits.iter_mut().zip(&mut contents) {
+        edit.stage_objects(std::mem::take(&mut content.current_pack_objects))?;
+    }
 
     let mut staged_commits = BTreeMap::<CommitId, (ObjectId, CommitObjectV1)>::new();
     let mut semantic_commits = Vec::with_capacity(contents.len());

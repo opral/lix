@@ -316,6 +316,16 @@ impl StateTreeEdit {
     pub(crate) fn copied_nodes(&self) -> usize {
         self.copied_nodes
     }
+
+    pub(crate) fn stage_objects(
+        &mut self,
+        objects: impl IntoIterator<Item = (ObjectId, bytes::Bytes)>,
+    ) -> Result<(), StorageError> {
+        for (id, bytes) in objects {
+            self.objects.insert(id, bytes)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -2684,33 +2694,46 @@ where
         let Some(encoded) = lookup_on_read(root, "state", state_key, read).await? else {
             continue;
         };
-        let value_ref = decode_state_value_storage(&encoded)?;
-        let page_bytes = super::view::load_object_bytes(read, value_ref.page_object_id).await?;
-        let page = super::model::CommitChangePageV2::decode(value_ref.page_object_id, &page_bytes)?;
+        let source = if expected_global {
+            StateSource::Global
+        } else {
+            StateSource::Branch
+        };
+        let pack_row = load_current_pack_rows(read, &[Some((state_key.to_vec(), encoded, source))])
+            .await?
+            .pop()
+            .flatten()
+            .map(|(row, _)| row)
+            .ok_or_else(|| corruption("authenticated source state pack row is absent"))?;
+        let page_bytes =
+            super::view::load_object_bytes(read, pack_row.history_page_object_id).await?;
+        let page =
+            super::model::CommitChangePageV2::decode(pack_row.history_page_object_id, &page_bytes)?;
         if page.commit_id != commit.commit_id
             || !commit
                 .member_page_object_ids
-                .contains(&value_ref.page_object_id)
+                .contains(&pack_row.history_page_object_id)
         {
             return Err(corruption(
                 "authenticated source state page is not owned by its Commit",
             ));
         }
-        cache
-            .pages
-            .insert((commit_object_id, value_ref.page_object_id), page.clone());
+        cache.pages.insert(
+            (commit_object_id, pack_row.history_page_object_id),
+            page.clone(),
+        );
         validate_stale_page_position(
             read,
             binding_id,
             commit_object_id,
             commit.commit_id,
             &commit.member_page_object_ids,
-            value_ref.page_object_id,
+            pack_row.history_page_object_id,
             &page,
             cache,
         )
         .await?;
-        let page_ordinal = usize::try_from(value_ref.page_ordinal)
+        let page_ordinal = usize::try_from(pack_row.history_page_ordinal)
             .map_err(|_| corruption("authenticated source page ordinal overflows usize"))?;
         let member = page
             .members
@@ -2731,7 +2754,7 @@ where
         }
         let member_ordinal = page
             .start_ordinal
-            .checked_add(value_ref.page_ordinal)
+            .checked_add(pack_row.history_page_ordinal)
             .ok_or_else(|| corruption("authenticated source member ordinal overflows u32"))?;
         cache
             .members
@@ -2794,7 +2817,7 @@ where
     struct PendingLookup {
         request: StaleMemberLookup,
         commit: CommitObjectV1,
-        value_ref: super::state::StateValueRef,
+        pack_row: ResolvedCurrentPackRow,
         expected_global: bool,
     }
 
@@ -2838,6 +2861,8 @@ where
             .into_iter()
             .zip(global)
             .collect::<BTreeMap<_, _>>();
+        let mut selected_rows = Vec::with_capacity(commit_requests.len());
+        let mut pending_requests = Vec::with_capacity(commit_requests.len());
         for (slot, (request, local)) in commit_requests.into_iter().zip(local).enumerate() {
             let (encoded, expected_global) = match local {
                 Some(encoded) => (encoded, false),
@@ -2850,10 +2875,28 @@ where
                     true,
                 ),
             };
+            selected_rows.push(Some((
+                request.state_key.clone(),
+                encoded,
+                if expected_global {
+                    StateSource::Global
+                } else {
+                    StateSource::Branch
+                },
+            )));
+            pending_requests.push((request, expected_global));
+        }
+        let resolved_rows = load_current_pack_rows(read, &selected_rows).await?;
+        for ((request, expected_global), resolved) in
+            pending_requests.into_iter().zip(resolved_rows)
+        {
+            let (pack_row, _) = resolved.ok_or_else(|| {
+                corruption("authenticated source current-state pack row is absent")
+            })?;
             pending.push(PendingLookup {
                 request,
                 commit: commit.clone(),
-                value_ref: decode_state_value_storage(&encoded)?,
+                pack_row,
                 expected_global,
             });
         }
@@ -2865,7 +2908,7 @@ where
             .commit
             .member_page_object_ids
             .iter()
-            .position(|id| *id == lookup.value_ref.page_object_id)
+            .position(|id| *id == lookup.pack_row.history_page_object_id)
             .ok_or_else(|| {
                 corruption("authenticated source state page is not owned by its Commit")
             })?;
@@ -2923,7 +2966,7 @@ where
             .pages
             .get(&(
                 lookup.request.commit_object_id,
-                lookup.value_ref.page_object_id,
+                lookup.pack_row.history_page_object_id,
             ))
             .cloned()
             .ok_or_else(|| corruption("authenticated source state page is absent"))?;
@@ -2933,12 +2976,12 @@ where
             lookup.request.commit_object_id,
             lookup.commit.commit_id,
             &lookup.commit.member_page_object_ids,
-            lookup.value_ref.page_object_id,
+            lookup.pack_row.history_page_object_id,
             &page,
             cache,
         )
         .await?;
-        let page_ordinal = usize::try_from(lookup.value_ref.page_ordinal)
+        let page_ordinal = usize::try_from(lookup.pack_row.history_page_ordinal)
             .map_err(|_| corruption("authenticated source page ordinal overflows usize"))?;
         let member = page
             .members
@@ -2959,7 +3002,7 @@ where
         }
         let member_ordinal = page
             .start_ordinal
-            .checked_add(lookup.value_ref.page_ordinal)
+            .checked_add(lookup.pack_row.history_page_ordinal)
             .ok_or_else(|| corruption("authenticated source member ordinal overflows u32"))?;
         cache
             .members
@@ -3922,17 +3965,10 @@ where
         })
         .collect::<Vec<_>>();
 
-    let mut refs = Vec::with_capacity(selected.len());
+    let pack_rows = load_current_pack_rows(read, &selected).await?;
     let mut page_ids = BTreeSet::new();
-    for row in &selected {
-        let value_ref = row
-            .as_ref()
-            .map(|(_, encoded, _)| decode_state_value_storage(encoded))
-            .transpose()?;
-        if let Some(value_ref) = value_ref {
-            page_ids.insert(value_ref.page_object_id);
-        }
-        refs.push(value_ref);
+    for row in pack_rows.iter().flatten() {
+        page_ids.insert(row.0.history_page_object_id);
     }
     let pages = super::view::load_object_map(read, page_ids).await?;
     let mut decoded_pages = BTreeMap::new();
@@ -3944,14 +3980,14 @@ where
     let mut stale_member_cache = StaleMemberAuthCache::new(binding_id);
     let change_ids = selected
         .iter()
-        .zip(&refs)
-        .filter_map(|(row, value_ref)| {
-            let (Some(_), Some(value_ref)) = (row, value_ref) else {
+        .zip(&pack_rows)
+        .filter_map(|(row, pack_row)| {
+            let (Some(_), Some((pack_row, _))) = (row, pack_row) else {
                 return None;
             };
-            let page = decoded_pages.get(&value_ref.page_object_id)?;
+            let page = decoded_pages.get(&pack_row.history_page_object_id)?;
             page.members
-                .get(value_ref.page_ordinal as usize)
+                .get(pack_row.history_page_ordinal as usize)
                 .map(CommitMemberV1::change_id)
         })
         .collect::<BTreeSet<_>>();
@@ -3977,12 +4013,12 @@ where
     // authority, but all of its source StateKey and page-prefix reads are now
     // satisfied by this retained-read cache rather than repeated per row.
     let mut proof_seeds = Vec::new();
-    for (row, value_ref) in selected.iter().zip(&refs) {
-        let (Some((encoded_key, _, _)), Some(value_ref)) = (row, value_ref) else {
+    for (row, pack_row) in selected.iter().zip(&pack_rows) {
+        let (Some((encoded_key, _, _)), Some((pack_row, _))) = (row, pack_row) else {
             continue;
         };
         let page = decoded_pages
-            .get(&value_ref.page_object_id)
+            .get(&pack_row.history_page_object_id)
             .ok_or_else(|| corruption("state value page is absent"))?;
         let page_changelog_id =
             crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*page.commit_id.as_bytes()));
@@ -3997,7 +4033,7 @@ where
         .map_err(|error| corruption(error.to_string()))?;
         if !page_summary
             .member_page_object_ids
-            .contains(&value_ref.page_object_id)
+            .contains(&pack_row.history_page_object_id)
         {
             return Err(corruption(
                 "stale state value page is not owned by its authenticated commit",
@@ -4009,14 +4045,14 @@ where
             page_summary.commit_object_id,
             page_summary.commit_id,
             &page_summary.member_page_object_ids,
-            value_ref.page_object_id,
+            pack_row.history_page_object_id,
             page,
             &mut stale_member_cache,
         )
         .await?;
         let member = page
             .members
-            .get(value_ref.page_ordinal as usize)
+            .get(pack_row.history_page_ordinal as usize)
             .cloned()
             .ok_or_else(|| corruption("state value page ordinal is absent"))?;
         proof_seeds.push((member, encoded_key.clone()));
@@ -4031,13 +4067,19 @@ where
     .await?;
 
     let mut output = Vec::with_capacity(selected.len());
-    for (row, value_ref) in selected.iter().zip(refs) {
-        let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
+    for (row, pack_row) in selected.iter().zip(pack_rows) {
+        let (Some((encoded_key, _, source)), Some((pack_row, pack_source))) = (row, pack_row)
+        else {
             output.push(None);
             continue;
         };
+        if *source != pack_source {
+            return Err(corruption(
+                "current-state pack source slot changed during stale resolution",
+            ));
+        }
         let page = decoded_pages
-            .get(&value_ref.page_object_id)
+            .get(&pack_row.history_page_object_id)
             .ok_or_else(|| corruption("state value page is absent"))?;
         let page_commit_id = page.commit_id;
         let page_changelog_id =
@@ -4053,7 +4095,7 @@ where
         .map_err(|error| corruption(error.to_string()))?;
         if !page_summary
             .member_page_object_ids
-            .contains(&value_ref.page_object_id)
+            .contains(&pack_row.history_page_object_id)
         {
             return Err(corruption(
                 "stale state value page is not owned by its authenticated commit",
@@ -4065,12 +4107,12 @@ where
             page_summary.commit_object_id,
             page_summary.commit_id,
             &page_summary.member_page_object_ids,
-            value_ref.page_object_id,
+            pack_row.history_page_object_id,
             page,
             &mut stale_member_cache,
         )
         .await?;
-        let page_ordinal = value_ref.page_ordinal as usize;
+        let page_ordinal = pack_row.history_page_ordinal as usize;
         let member = page
             .members
             .get(page_ordinal)
@@ -4133,21 +4175,24 @@ where
                 return Err(corruption("state value page contains out-of-page metadata"));
             }
         };
-        output.push(Some((
-            StateValue {
-                change_id: public_change_id,
-                commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-                    *page.commit_id.as_bytes(),
-                )),
-                created_at,
-                updated_at: resolved.updated_at,
-                cell,
-                metadata: metadata.map(Into::into),
-                origin_key: record.origin_key,
-                blob_manifest_object_ids: resolved.blob_manifest_object_ids,
-            },
-            *source,
-        )));
+        let historical_value = StateValue {
+            change_id: public_change_id,
+            commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+                *page.commit_id.as_bytes(),
+            )),
+            created_at,
+            updated_at: resolved.updated_at,
+            cell,
+            metadata: metadata.map(Into::into),
+            origin_key: record.origin_key,
+            blob_manifest_object_ids: resolved.blob_manifest_object_ids,
+        };
+        if historical_value != pack_row.value {
+            return Err(corruption(
+                "current-state pack value differs from its stale-authenticated history member",
+            ));
+        }
+        output.push(Some((pack_row.value, *source)));
     }
 
     output
@@ -4162,6 +4207,78 @@ where
         })
         .collect()
 }
+#[derive(Clone, Debug)]
+struct ResolvedCurrentPackRow {
+    value: StateValue,
+    history_page_object_id: ObjectId,
+    history_page_ordinal: u32,
+}
+
+async fn load_current_pack_rows<R>(
+    read: &R,
+    selected: &[Option<(Vec<u8>, Vec<u8>, StateSource)>],
+) -> Result<Vec<Option<(ResolvedCurrentPackRow, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut refs = Vec::with_capacity(selected.len());
+    let mut pack_ids = BTreeSet::new();
+    for row in selected {
+        let value_ref = row
+            .as_ref()
+            .map(|(_, encoded, _)| decode_state_value_storage(encoded))
+            .transpose()?;
+        if let Some(value_ref) = value_ref {
+            pack_ids.insert(value_ref.pack_object_id);
+        }
+        refs.push(value_ref);
+    }
+    let encoded_packs = super::view::load_object_map(read, pack_ids).await?;
+    let mut packs = BTreeMap::new();
+    for (id, bytes) in encoded_packs {
+        packs.insert(
+            id,
+            super::current_pack::CurrentStatePackV1::decode(id, &bytes)?,
+        );
+    }
+
+    let mut output = Vec::with_capacity(selected.len());
+    for (row, value_ref) in selected.iter().zip(refs) {
+        let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
+            output.push(None);
+            continue;
+        };
+        let pack = packs
+            .get(&value_ref.pack_object_id)
+            .ok_or_else(|| corruption("current-state pack is absent"))?;
+        if pack.global != (*source == StateSource::Global) {
+            return Err(corruption(
+                "current-state pack domain differs from its selected state root",
+            ));
+        }
+        let pack_ordinal = usize::try_from(value_ref.pack_ordinal)
+            .map_err(|_| corruption("current-state pack ordinal exceeds usize"))?;
+        let pack_row = pack
+            .rows
+            .get(pack_ordinal)
+            .ok_or_else(|| corruption("current-state pack ordinal is absent"))?;
+        if pack_row.encoded_key != *encoded_key {
+            return Err(corruption(
+                "current-state pack row identity differs from its state key",
+            ));
+        }
+        output.push(Some((
+            ResolvedCurrentPackRow {
+                value: pack_row.value.clone(),
+                history_page_object_id: pack_row.history_page_object_id,
+                history_page_ordinal: pack_row.history_page_ordinal,
+            },
+            *source,
+        )));
+    }
+    Ok(output)
+}
+
 async fn resolve_state_values_on_read<R>(
     read: &R,
     selected: &[Option<(Vec<u8>, Vec<u8>, StateSource)>],
@@ -4170,17 +4287,16 @@ async fn resolve_state_values_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let mut refs = Vec::with_capacity(selected.len());
+    let pack_rows = load_current_pack_rows(read, selected).await?;
+    if historical_auth.is_none() {
+        return Ok(pack_rows
+            .into_iter()
+            .map(|row| row.map(|(row, source)| (row.value, source)))
+            .collect());
+    }
     let mut page_ids = BTreeSet::new();
-    for row in selected {
-        let value_ref = row
-            .as_ref()
-            .map(|(_, encoded, _)| decode_state_value_storage(encoded))
-            .transpose()?;
-        if let Some(value_ref) = value_ref {
-            page_ids.insert(value_ref.page_object_id);
-        }
-        refs.push(value_ref);
+    for row in pack_rows.iter().flatten() {
+        page_ids.insert(row.0.history_page_object_id);
     }
     let pages = super::view::load_object_map(read, page_ids).await?;
     let mut decoded_pages = BTreeMap::new();
@@ -4189,7 +4305,6 @@ where
     }
 
     let mut output = Vec::with_capacity(selected.len());
-    let mut member_closures = BTreeMap::new();
     let mut authenticated_member_closures = BTreeMap::new();
     let mut page_commit_cache = BTreeMap::new();
     let (endpoint_commit, endpoint_members) = if let Some(auth) = historical_auth {
@@ -4204,26 +4319,32 @@ where
     } else {
         (None, None)
     };
-    for (row, value_ref) in selected.iter().zip(refs) {
-        let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
+    for (row, pack_row) in selected.iter().zip(pack_rows) {
+        let (Some((encoded_key, _, source)), Some((pack_row, pack_source))) = (row, pack_row)
+        else {
             output.push(None);
             continue;
         };
+        if *source != pack_source {
+            return Err(corruption(
+                "current-state pack source slot changed during resolution",
+            ));
+        }
         let page = decoded_pages
-            .get(&value_ref.page_object_id)
+            .get(&pack_row.history_page_object_id)
             .ok_or_else(|| corruption("state value page is absent"))?;
         let member = page
             .members
-            .get(value_ref.page_ordinal as usize)
+            .get(pack_row.history_page_ordinal as usize)
             .ok_or_else(|| corruption("state value page ordinal is absent"))?;
         let historical_binding = if let Some(auth) = historical_auth {
             Some(
                 validate_historical_state_page_member(
                     read,
                     auth,
-                    value_ref.page_object_id,
+                    pack_row.history_page_object_id,
                     page,
-                    value_ref.page_ordinal,
+                    pack_row.history_page_ordinal,
                     member,
                     encoded_key,
                     *source,
@@ -4248,7 +4369,7 @@ where
             )
             .await?
         } else {
-            resolve_semantic_member_with_cache(read, member, &mut member_closures).await?
+            unreachable!("ordinary current-state reads return before historical resolution")
         };
         let expected_global = *source == StateSource::Global;
         if resolved.global != expected_global {
@@ -4291,21 +4412,24 @@ where
                 return Err(corruption("state value page contains out-of-page metadata"));
             }
         };
-        output.push(Some((
-            StateValue {
-                change_id: public_change_id,
-                commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-                    *page.commit_id.as_bytes(),
-                )),
-                created_at,
-                updated_at: resolved.updated_at,
-                cell,
-                metadata: metadata.map(Into::into),
-                origin_key: record.origin_key,
-                blob_manifest_object_ids: resolved.blob_manifest_object_ids,
-            },
-            *source,
-        )));
+        let historical_value = StateValue {
+            change_id: public_change_id,
+            commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+                *page.commit_id.as_bytes(),
+            )),
+            created_at,
+            updated_at: resolved.updated_at,
+            cell,
+            metadata: metadata.map(Into::into),
+            origin_key: record.origin_key,
+            blob_manifest_object_ids: resolved.blob_manifest_object_ids,
+        };
+        if historical_value != pack_row.value {
+            return Err(corruption(
+                "current-state pack value differs from its authenticated history member",
+            ));
+        }
+        output.push(Some((pack_row.value, *source)));
     }
     Ok(output)
 }
@@ -4448,9 +4572,17 @@ where
                 .ok_or_else(|| {
                     corruption("historical state member is absent from endpoint state root")
                 })?;
-            let endpoint_ref = decode_state_value_storage(&endpoint_value)?;
-            if endpoint_ref.page_object_id != page_object_id
-                || endpoint_ref.page_ordinal != page_ordinal
+            let endpoint_pack_row = load_current_pack_rows(
+                read,
+                &[Some((encoded_key.to_vec(), endpoint_value, source))],
+            )
+            .await?
+            .pop()
+            .flatten()
+            .map(|(row, _)| row)
+            .ok_or_else(|| corruption("historical endpoint current-state pack row is absent"))?;
+            if endpoint_pack_row.history_page_object_id != page_object_id
+                || endpoint_pack_row.history_page_ordinal != page_ordinal
             {
                 return Err(corruption(
                     "historical state page member is not bound to endpoint state root",

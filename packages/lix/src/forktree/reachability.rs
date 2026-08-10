@@ -915,6 +915,10 @@ where
                 }
             }
         }
+        ObjectDomain::CurrentStatePackV1 => {
+            let pack = super::current_pack::CurrentStatePackV1::decode(id, bytes)?;
+            edges.extend(pack.object_edges().map(|(id, domain)| typed(id, domain)));
+        }
         ObjectDomain::BranchRefChange => {
             let change = ChangeObjectV1::decode(id, bytes)?;
             let change_catalog_root = repository_change_catalog(read, repository_root_id).await?;

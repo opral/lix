@@ -43,11 +43,12 @@ use super::{
     PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
     ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
     SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
-    StateMutationAudit, StateSource, StateTreeMutation, StateValueRef, UploadBindingRef,
-    UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, advance_gc, edit_state_tree,
-    encode_state_key, encode_state_value, load_commit, load_commit_member_records,
-    load_commit_summary, open_coherent_view, prepare_upload_completion, prepare_upload_part,
-    put_change_catalog_entries, put_commit_catalog_entries, state_point, state_points, state_range,
+    StateMutationAudit, StateSource, StateTreeMutation, StateValue, StateValueRef,
+    UploadBindingRef, UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow,
+    advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_commit,
+    load_commit_member_records, load_commit_summary, open_coherent_view, prepare_upload_completion,
+    prepare_upload_part, put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    state_points, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -1167,6 +1168,7 @@ fn encode_test_state_entries(
     Vec<(Vec<u8>, Vec<u8>)>,
     Vec<CommitMemberV1>,
     Vec<(ObjectId, Bytes)>,
+    Vec<(ObjectId, Bytes)>,
 ) {
     let members = entries
         .iter()
@@ -1175,21 +1177,90 @@ fn encode_test_state_entries(
     let pages =
         CommitChangePageV2::encode_pages(CommitId::from_bytes(raw_id(commit_byte)), &members)
             .expect("test change pages");
+    let pack_rows = entries
+        .iter()
+        .zip(&pages.member_locations)
+        .map(|((key, member), location)| {
+            let (payload, global, updated_at, manifests) = member
+                .introduced_payload()
+                .expect("test state entry is introduced");
+            let change_id = crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+                *member.change_id().as_bytes(),
+            ));
+            let record = crate::changelog::decode_forktree_change_payload(payload, change_id)
+                .expect("test state payload");
+            let cell = match record.snapshot {
+                JsonSlot::None => StateCell::Tombstone,
+                JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
+                JsonSlot::Inline(value) => StateCell::Value(value.into()),
+                JsonSlot::ForkTreeObject(_) => panic!("test state payload must be inline"),
+            };
+            let metadata = match record.metadata {
+                JsonSlot::None => None,
+                JsonSlot::Inline(value) => Some(value.into()),
+                JsonSlot::ForkTreeObject(_) => panic!("test state metadata must be inline"),
+            };
+            (
+                key.clone(),
+                StateValue {
+                    change_id,
+                    commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(raw_id(
+                        commit_byte,
+                    ))),
+                    created_at: record.created_at,
+                    updated_at,
+                    cell,
+                    metadata,
+                    origin_key: record.origin_key,
+                    blob_manifest_object_ids: manifests.to_vec(),
+                },
+                *location,
+                global,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut pack_locations = BTreeMap::new();
+    let mut pack_objects = Vec::new();
+    for global in [true, false] {
+        let packs = super::current_pack::encode_current_state_packs(
+            CommitId::from_bytes(raw_id(commit_byte)),
+            global,
+            pack_rows
+                .iter()
+                .filter(|row| row.3 == global)
+                .map(|(key, value, location, _)| (key.clone(), value.clone(), *location))
+                .collect(),
+        )
+        .expect("test current-state packs");
+        pack_locations.extend(
+            packs
+                .locations
+                .into_iter()
+                .map(|(key, location)| ((global, key), location)),
+        );
+        pack_objects.extend(packs.objects);
+    }
     let rows = entries
         .into_iter()
-        .zip(&pages.member_locations)
-        .map(|((key, _), location)| {
+        .map(|(key, member)| {
+            let global = member
+                .introduced_payload()
+                .expect("test state entry is introduced")
+                .1;
+            let location = pack_locations
+                .get(&(global, key.clone()))
+                .expect("test pack location");
             (
                 key,
                 encode_state_value(StateValueRef {
-                    page_object_id: location.page_object_id,
-                    page_ordinal: location.page_ordinal,
+                    pack_object_id: location.pack_object_id,
+                    pack_ordinal: location.pack_ordinal,
                 })
                 .expect("state value"),
             )
         })
         .collect();
-    (rows, members, pages.objects)
+    (rows, members, pages.objects, pack_objects)
 }
 
 fn state_entry(
@@ -1205,8 +1276,8 @@ fn state_entry(
         entity_pk: &entity_pk,
     });
     let value = encode_state_value(StateValueRef {
-        page_object_id: content_id(commit_byte),
-        page_ordinal: 0,
+        pack_object_id: content_id(commit_byte),
+        pack_ordinal: 0,
     })
     .expect("state value");
     (key, value)
@@ -1239,7 +1310,7 @@ fn build_seed() -> SeedData {
     let ref_change_id = ChangeId::from_bytes(raw_id(0x31));
     let mut objects = ImmutableObjectSet::default();
 
-    let (all_rows, members, member_page_objects) = encode_test_state_entries(
+    let (all_rows, members, member_page_objects, current_pack_objects) = encode_test_state_entries(
         0x20,
         vec![
             test_state_member("a", StateCellRef::Value("global-a"), 0x20, &[], true),
@@ -1254,6 +1325,9 @@ fn build_seed() -> SeedData {
     let semantic_change_object_id = member_page_objects[0].0;
     for (id, bytes) in member_page_objects {
         objects.insert(id, bytes).expect("commit change page");
+    }
+    for (id, bytes) in current_pack_objects {
+        objects.insert(id, bytes).expect("current-state pack");
     }
     let mut global_rows = all_rows[..3].to_vec();
     global_rows.sort_by(|left, right| left.0.cmp(&right.0));
@@ -2460,8 +2534,8 @@ fn diff_state_rows(values: &[(usize, u8)]) -> Vec<(Vec<u8>, Vec<u8>)> {
                 entity_pk: &entity_pk,
             });
             let value = encode_state_value(StateValueRef {
-                page_object_id: content_id(value.saturating_add(1)),
-                page_ordinal: *index as u32,
+                pack_object_id: content_id(value.saturating_add(1)),
+                pack_ordinal: *index as u32,
             })
             .expect("state diff value");
             (key, value)
@@ -2789,15 +2863,15 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
     assert!(RepositoryRootV1::decode(seed.repository_root_id, &corrupted).is_err());
     assert!(BranchSnapshotV1::decode(seed.repository_root_id, encoded).is_err());
 
-    let page_object_id = content_id(7);
+    let pack_object_id = content_id(7);
     let encoded = encode_state_value(StateValueRef {
-        page_object_id,
-        page_ordinal: 3,
+        pack_object_id,
+        pack_ordinal: 3,
     })
     .expect("typed state");
     let decoded = super::decode_state_value(&encoded).expect("typed state");
-    assert_eq!(decoded.page_object_id, page_object_id);
-    assert_eq!(decoded.page_ordinal, 3);
+    assert_eq!(decoded.pack_object_id, pack_object_id);
+    assert_eq!(decoded.pack_ordinal, 3);
     let (key, _) = state_entry("typed-key", StateCellRef::Null, 7, &[]);
     let decoded_key: StateKey = super::decode_state_key(&key).expect("typed key");
     assert_eq!(decoded_key.schema_key, "app.row");
@@ -3190,23 +3264,24 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
         file_id: Some("file"),
         entity_pk: &EntityPk::single("b"),
     });
-    let (masked_rows, masked_members, masked_page_objects) = encode_test_state_entries(
-        0x62,
-        vec![test_state_member(
-            "b",
-            StateCellRef::Value("local-b"),
+    let (masked_rows, masked_members, masked_page_objects, masked_pack_objects) =
+        encode_test_state_entries(
             0x62,
-            &[],
-            false,
-        )],
-    );
+            vec![test_state_member(
+                "b",
+                StateCellRef::Value("local-b"),
+                0x62,
+                &[],
+                false,
+            )],
+        );
     let masked_value = masked_rows
         .into_iter()
         .find(|(encoded_key, _)| *encoded_key == key)
         .map(|(_, value)| value)
         .expect("masked state value");
     let mut masked_page_writes = StorageWriteSet::new();
-    for (object_id, bytes) in masked_page_objects {
+    for (object_id, bytes) in masked_page_objects.into_iter().chain(masked_pack_objects) {
         masked_page_writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
     }
     commit_write_set_for_test(masked_page_writes, &storage).await;
@@ -6469,7 +6544,7 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
             transplanted_manifest_id,
         ),
     ];
-    let (rows, members, _) = encode_test_state_entries(0x70, test_entries);
+    let (rows, members, _, pack_objects) = encode_test_state_entries(0x70, test_entries);
     let [
         wrong_owner_row,
         selected_row,
@@ -6497,7 +6572,7 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
             },
         )
     };
-    let state_edit = edit_state_tree(
+    let mut state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![
             bound_insert(wrong_owner_row, &members[0]),
@@ -6510,6 +6585,9 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     )
     .await
     .expect("state edit");
+    state_edit
+        .stage_objects(pack_objects)
+        .expect("stage completion current-state packs");
     let transition = branch_transition_with_members(&view, state_edit, 0x70, members).await;
     let mut publish = PreparedPublication::from_branch_view(&view).expect("completion publication");
     publish
@@ -6722,7 +6800,7 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
             valid_manifest_id,
         ),
     ];
-    let (rows, members, _) = encode_test_state_entries(0x70, entries);
+    let (rows, members, _, pack_objects) = encode_test_state_entries(0x70, entries);
     let valid_key = rows[1].0.clone();
     let wrong_identity_key = rows[2].0.clone();
     let mut mutations = rows
@@ -6759,13 +6837,16 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
         };
         left_key.cmp(right_key)
     });
-    let state_edit = edit_state_tree(
+    let mut state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         mutations,
         view.test_storage_read(),
     )
     .await
     .expect("duplicate-owner state edit");
+    state_edit
+        .stage_objects(pack_objects)
+        .expect("stage duplicate-owner current-state packs");
     let transition = branch_transition_with_members(&view, state_edit, 0x70, members).await;
     let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
     publication
@@ -7030,9 +7111,9 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
         &[manifest_id],
         false,
     );
-    let (rows, members, _) = encode_test_state_entries(0x80, vec![entry]);
+    let (rows, members, _, pack_objects) = encode_test_state_entries(0x80, vec![entry]);
     let (key, value) = rows.into_iter().next().expect("state row");
-    let state_edit = edit_state_tree(
+    let mut state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![StateTreeMutation::insert_bound(
             key,
@@ -7047,6 +7128,9 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     )
     .await
     .expect("state edit");
+    state_edit
+        .stage_objects(pack_objects)
+        .expect("stage retained current-state pack");
     let semantic_change_ids = members
         .iter()
         .map(CommitMemberV1::change_id)
@@ -7731,7 +7815,7 @@ fn build_three_page_stale_fixture() -> ThreePageStaleFixture {
             )
         })
         .collect::<Vec<_>>();
-    let (rows, members, page_objects) = encode_test_state_entries(0xc1, entries);
+    let (rows, members, page_objects, pack_objects) = encode_test_state_entries(0xc1, entries);
     let page_ids = page_objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     assert_eq!(
         page_ids.len(),
@@ -7740,6 +7824,11 @@ fn build_three_page_stale_fixture() -> ThreePageStaleFixture {
     );
     for (id, bytes) in page_objects {
         seed.objects.insert(id, bytes).expect("stale page object");
+    }
+    for (id, bytes) in pack_objects {
+        seed.objects
+            .insert(id, bytes)
+            .expect("stale current-state pack");
     }
     let selected_row = rows[512].clone();
     let selected_key = selected_row.0.clone();

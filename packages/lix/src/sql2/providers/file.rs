@@ -8345,8 +8345,9 @@ mod tests {
     use crate::forktree::{
         AuthenticatedBlobReader, BranchStateTransition, ChangeCatalogEntry, ChangeCatalogOwner,
         ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitObjectV1, ForkTreeReadFacade,
-        PreparedPublication, RepositoryRootV1, StateKey, StateMutationAudit, StateTreeMutation,
-        StateValueRef, encode_state_key, encode_state_value,
+        PreparedPublication, RepositoryRootV1, StateCell, StateKey, StateMutationAudit,
+        StateTreeMutation, StateValue, StateValueRef, encode_current_state_packs, encode_state_key,
+        encode_state_value,
     };
     use crate::functions::FunctionProviderHandle;
     use crate::json_store::JsonSlot;
@@ -8475,15 +8476,63 @@ mod tests {
             .collect::<Vec<_>>();
         let pages = CommitChangePageV2::encode_pages(commit_id, &members)
             .expect("global native fixture member pages");
+        let packs = encode_current_state_packs(
+            commit_id,
+            true,
+            entries
+                .iter()
+                .zip(&pages.member_locations)
+                .map(|((key, member), location)| {
+                    let (payload, _, updated_at, manifests) = member
+                        .introduced_payload()
+                        .expect("global fixture member is introduced");
+                    let change_id =
+                        ChangeId::new(uuid::Uuid::from_bytes(*member.change_id().as_bytes()));
+                    let record =
+                        crate::changelog::decode_forktree_change_payload(payload, change_id)
+                            .expect("global fixture payload");
+                    let cell = match record.snapshot {
+                        JsonSlot::None => StateCell::Tombstone,
+                        JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
+                        JsonSlot::Inline(value) => StateCell::Value(value.into()),
+                        JsonSlot::ForkTreeObject(_) => {
+                            panic!("global fixture payload must be inline")
+                        }
+                    };
+                    let metadata = match record.metadata {
+                        JsonSlot::None => None,
+                        JsonSlot::Inline(value) => Some(value.into()),
+                        JsonSlot::ForkTreeObject(_) => {
+                            panic!("global fixture metadata must be inline")
+                        }
+                    };
+                    (
+                        key.clone(),
+                        StateValue {
+                            change_id,
+                            commit_id: CommitId::new(uuid::Uuid::from_bytes(*commit_id.as_bytes())),
+                            created_at: record.created_at,
+                            updated_at,
+                            cell,
+                            metadata,
+                            origin_key: record.origin_key,
+                            blob_manifest_object_ids: manifests.to_vec(),
+                        },
+                        *location,
+                    )
+                })
+                .collect(),
+        )
+        .expect("global native fixture current-state packs");
         let mutations = entries
             .iter()
-            .zip(&pages.member_locations)
-            .map(|((key, _), location)| {
+            .map(|(key, _)| {
+                let location = packs.locations.get(key).expect("global fixture pack row");
                 StateTreeMutation::insert_bound(
                     key.clone(),
                     encode_state_value(StateValueRef {
-                        page_object_id: location.page_object_id,
-                        page_ordinal: location.page_ordinal,
+                        pack_object_id: location.pack_object_id,
+                        pack_ordinal: location.pack_ordinal,
                     })
                     .expect("global native fixture state value"),
                     StateMutationAudit {
@@ -8494,11 +8543,14 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let state_edit = initial_view
+        let mut state_edit = initial_view
             .edit_state_tree(initial_view.repository_root().global_state_root, mutations)
             .now_or_never()
             .expect("global native fixture state edit should not yield")
             .expect("global native fixture state edit");
+        state_edit
+            .stage_objects(packs.objects)
+            .expect("global native fixture pack staging");
         let parent_id = initial_view
             .branch_snapshot()
             .semantic_head_commit_object_id;

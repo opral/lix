@@ -25,13 +25,16 @@ use crate::storage_adapter::{
     PointReadPlan, Storage, StorageAdapter, StorageGetOptions, StorageWriteOptions, StorageWriteSet,
 };
 
+use super::encode_current_state_packs;
 use super::model::{
     BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
     ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1,
     CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::state::{StateKeyRef, StateValueRef, encode_state_key, encode_state_value};
+use super::state::{
+    StateCell, StateKeyRef, StateValue, StateValueRef, encode_state_key, encode_state_value,
+};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_state_tree,
 };
@@ -215,28 +218,99 @@ where
 
     let member_pages = CommitChangePageV2::encode_pages(model_commit, &semantic_members)
         .map_err(LixError::from)?;
+    let values_for =
+        |global: bool,
+         locations: &[super::model::StatePageLocation]|
+         -> Result<Vec<(Vec<u8>, StateValue, super::model::StatePageLocation)>, LixError> {
+            rows.iter()
+                .zip(locations)
+                .map(|(row, location)| {
+                    let change_id = if global {
+                        row.change_id
+                    } else {
+                        row.local_change_id
+                    };
+                    let cell = match &row.snapshot {
+                        JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
+                        JsonSlot::Inline(value) => StateCell::Value(value.clone().into()),
+                        JsonSlot::None => StateCell::Tombstone,
+                        JsonSlot::ForkTreeObject(_) => {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "bootstrap current state contains an out-of-pack JSON reference",
+                            ));
+                        }
+                    };
+                    Ok((
+                        row.key.clone(),
+                        StateValue {
+                            change_id,
+                            commit_id: initial_commit,
+                            created_at: timestamp,
+                            updated_at: timestamp,
+                            cell,
+                            metadata: match &row.metadata {
+                                JsonSlot::None => None,
+                                JsonSlot::Inline(value) => Some(value.clone().into()),
+                                JsonSlot::ForkTreeObject(_) => {
+                                    return Err(LixError::new(
+                                        LixError::CODE_INTERNAL_ERROR,
+                                        "bootstrap metadata contains an out-of-pack JSON reference",
+                                    ));
+                                }
+                            },
+                            origin_key: None,
+                            blob_manifest_object_ids: Vec::new(),
+                        },
+                        *location,
+                    ))
+                })
+                .collect()
+        };
+    let global_packs = encode_current_state_packs(
+        model_commit,
+        true,
+        values_for(true, &member_pages.member_locations[..rows.len()])?,
+    )
+    .map_err(LixError::from)?;
+    let local_packs = encode_current_state_packs(
+        model_commit,
+        false,
+        values_for(false, &member_pages.member_locations[rows.len()..])?,
+    )
+    .map_err(LixError::from)?;
     let global_entries = rows
         .iter()
-        .zip(&member_pages.member_locations[..rows.len()])
-        .map(|(row, location)| {
+        .map(|row| {
+            let location = global_packs.locations.get(&row.key).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "bootstrap global pack omitted a row",
+                )
+            })?;
             Ok((
                 row.key.clone(),
                 encode_state_value(StateValueRef {
-                    page_object_id: location.page_object_id,
-                    page_ordinal: location.page_ordinal,
+                    pack_object_id: location.pack_object_id,
+                    pack_ordinal: location.pack_ordinal,
                 })?,
             ))
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let local_entries = rows
         .iter()
-        .zip(&member_pages.member_locations[rows.len()..])
-        .map(|(row, location)| {
+        .map(|row| {
+            let location = local_packs.locations.get(&row.key).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "bootstrap local pack omitted a row",
+                )
+            })?;
             Ok((
                 row.key.clone(),
                 encode_state_value(StateValueRef {
-                    page_object_id: location.page_object_id,
-                    page_ordinal: location.page_ordinal,
+                    pack_object_id: location.pack_object_id,
+                    pack_ordinal: location.pack_ordinal,
                 })?,
             ))
         })
@@ -258,6 +332,11 @@ where
     for (page_id, page_bytes) in &member_pages.objects {
         objects
             .insert(*page_id, page_bytes.clone())
+            .map_err(LixError::from)?;
+    }
+    for (pack_id, pack_bytes) in global_packs.objects.into_iter().chain(local_packs.objects) {
+        objects
+            .insert(pack_id, pack_bytes)
             .map_err(LixError::from)?;
     }
 
