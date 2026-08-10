@@ -11,7 +11,7 @@ use crate::LixError;
 use crate::branch::{
     BranchLifecycle, BranchOperation, BranchRefReader, BranchRefStoreReader, BranchReferenceRole,
 };
-use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
+use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot};
 use crate::commit_graph::{CommitGraphReader, CommitGraphStoreReader};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
@@ -605,18 +605,11 @@ where
     }
 
     async fn compiled_sql_catalog(&self) -> Result<Arc<CatalogSnapshot>, LixError> {
-        let revision = load_catalog_revision(&self.read_store)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.public_read.catalog_revision"
-            ))
-            .await?;
         let transaction_state = TransactionStateView::new(self.state_view.clone(), Vec::new())?;
         self.catalog_context
-            .compiled_catalog_for_transaction_open(
+            .compiled_catalog_for_transaction_state(
                 &transaction_state,
                 &Domain::schema_catalog(self.active_branch_id.to_string(), true),
-                revision.as_ref(),
             )
             .await
     }
