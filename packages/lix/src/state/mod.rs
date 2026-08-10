@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::forktree::{
-    CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKey, StateSource, StateValue,
+    CanonicalBranchId, ForkTreeReadFacade, ObjectId, StateCell, StateKey, StateSource, StateValue,
     UntrackedValue, VisibleStateRow,
 };
 use crate::storage::StorageError;
@@ -31,6 +31,31 @@ pub(crate) struct UntrackedStateRow {
     pub(crate) owner: CanonicalBranchId,
     pub(crate) key: StateKey,
     pub(crate) value: UntrackedValue,
+}
+
+/// Authenticated global/local state roots for one historical view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StateRoots {
+    pub(crate) global: ObjectId,
+    pub(crate) local: Option<ObjectId>,
+}
+
+/// One native state value selected at a diff endpoint, retaining its source
+/// root provenance and the complete authenticated value identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StateDiffValue {
+    pub(crate) value: StateValue,
+    pub(crate) source: StateSource,
+}
+
+/// Ordered native diff entry between two explicit authenticated root pairs.
+/// The key order is inherited from the ordered-tree diff and is never rebuilt
+/// through a map or sorted after the fact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StateDiffEntry {
+    pub(crate) key: StateKey,
+    pub(crate) before: Option<StateDiffValue>,
+    pub(crate) after: Option<StateDiffValue>,
 }
 
 impl StateRow {
@@ -191,6 +216,92 @@ where
             .map(|(key, value)| UntrackedStateRow { owner, key, value })
             .collect())
     }
+
+    /// Diffs two explicit authenticated root pairs through this retained
+    /// ForkTree view. Equal roots short-circuit before any tree descent;
+    /// changed keys are merged from the two intrinsically ordered native
+    /// root diffs and resolved at both endpoints with local-over-global
+    /// precedence.
+    pub(crate) async fn diff_roots(
+        &self,
+        before: StateRoots,
+        after: StateRoots,
+    ) -> Result<Vec<StateDiffEntry>, LixError> {
+        if before == after {
+            return Ok(Vec::new());
+        }
+
+        let local_changes =
+            crate::forktree::diff_roots(before.local, after.local, self.view.retained_read())
+                .await?;
+        let global_changes = crate::forktree::diff_roots(
+            Some(before.global),
+            Some(after.global),
+            self.view.retained_read(),
+        )
+        .await?;
+        let keys = merge_sorted_state_keys(local_changes, global_changes);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encoded = keys
+            .iter()
+            .map(|key| {
+                crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                })
+            })
+            .collect::<Vec<_>>();
+        let before_rows = crate::forktree::state_points_on_read(
+            before.global,
+            before.local,
+            &encoded,
+            true,
+            self.view.retained_read(),
+        )
+        .await?;
+        let after_rows = crate::forktree::state_points_on_read(
+            after.global,
+            after.local,
+            &encoded,
+            true,
+            self.view.retained_read(),
+        )
+        .await?;
+        let mut output = Vec::new();
+        for ((key, before), after) in keys.into_iter().zip(before_rows).zip(after_rows) {
+            let before = before.map(|(value, source)| StateDiffValue { value, source });
+            let after = after.map(|(value, source)| StateDiffValue { value, source });
+            if before != after {
+                output.push(StateDiffEntry { key, before, after });
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn merge_sorted_state_keys(left: Vec<StateKey>, right: Vec<StateKey>) -> Vec<StateKey> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut merged = Vec::new();
+    loop {
+        match (left.peek(), right.peek()) {
+            (None, None) => break,
+            (Some(_), None) => merged.push(left.next().expect("peeked left key")),
+            (None, Some(_)) => merged.push(right.next().expect("peeked right key")),
+            (Some(left_key), Some(right_key)) => match left_key.cmp(right_key) {
+                Ordering::Less => merged.push(left.next().expect("peeked left key")),
+                Ordering::Greater => merged.push(right.next().expect("peeked right key")),
+                Ordering::Equal => {
+                    merged.push(left.next().expect("peeked left key"));
+                    right.next();
+                }
+            },
+        }
+    }
+    merged
 }
 
 /// One transaction's committed retained view plus an ordered staged overlay.

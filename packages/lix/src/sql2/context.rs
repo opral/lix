@@ -57,6 +57,12 @@ pub(crate) struct ChangelogQuerySource<S> {
 pub(crate) trait SqlExecutionContext: Sync {
     type ReadStore: StorageAdapterRead + Clone + Send + Sync + 'static;
 
+    /// The concrete authenticated committed-state owner for this SQL read.
+    /// Providers receive this retained view directly; they do not acquire a
+    /// replacement reader or lower through a request-shaped compatibility
+    /// surface.
+    fn state_view(&self) -> &crate::state::ForkTreeStateView<Self::ReadStore>;
+
     fn active_branch_id(&self) -> &str;
     fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
         super::session::new_sql_session_context()
@@ -123,6 +129,13 @@ pub(crate) trait SqlExecutionContext: Sync {
 /// authority without adding another translation layer.
 #[async_trait]
 pub(crate) trait SqlWriteExecutionContext: Send {
+    type ReadStore: StorageAdapterRead + Clone + Send + Sync + 'static;
+
+    /// The concrete transaction state owner for this SQL write.  The
+    /// associated storage type is part of the boundary so DataFusion cannot
+    /// erase the retained ForkTree read behind an untyped adapter.
+    fn state_view(&self) -> &crate::state::TransactionStateView<Self::ReadStore>;
+
     fn active_branch_id(&self) -> &str;
     fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
         super::session::new_sql_session_context()
@@ -285,28 +298,42 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 }
 
 #[derive(Clone)]
-pub(crate) struct SqlWriteContext {
-    ptr: Arc<SqlWriteContextPtr>,
+pub(crate) struct SqlWriteContext<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    ptr: Arc<SqlWriteContextPtr<R>>,
     gate: Arc<Mutex<()>>,
     explicit_insert_columns: Option<Arc<BTreeSet<String>>>,
     write_targets: Option<Arc<super::providers::WriteTargetRegistry>>,
 }
 
-struct SqlWriteContextPtr(NonNull<dyn SqlWriteExecutionContext>);
+struct SqlWriteContextPtr<R>(NonNull<dyn SqlWriteExecutionContext<ReadStore = R>>)
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static;
 
 // DataFusion stores providers as owned Send + Sync trait objects. This context
 // is only constructed for one write execution and never outlives the borrowed
 // transaction context that owns it.
-unsafe impl Send for SqlWriteContextPtr {}
-unsafe impl Sync for SqlWriteContextPtr {}
+unsafe impl<R> Send for SqlWriteContextPtr<R> where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static
+{
+}
+unsafe impl<R> Sync for SqlWriteContextPtr<R> where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static
+{
+}
 
-impl SqlWriteContext {
-    pub(crate) fn new(ctx: &mut dyn SqlWriteExecutionContext) -> Self {
+impl<R> SqlWriteContext<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new(ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>) -> Self {
         let ptr = NonNull::from(ctx);
         let ptr = unsafe {
             std::mem::transmute::<
-                NonNull<dyn SqlWriteExecutionContext + '_>,
-                NonNull<dyn SqlWriteExecutionContext + 'static>,
+                NonNull<dyn SqlWriteExecutionContext<ReadStore = R> + '_>,
+                NonNull<dyn SqlWriteExecutionContext<ReadStore = R> + 'static>,
             >(ptr)
         };
         Self {
@@ -315,6 +342,10 @@ impl SqlWriteContext {
             explicit_insert_columns: None,
             write_targets: Some(Arc::new(super::providers::WriteTargetRegistry::default())),
         }
+    }
+
+    pub(crate) fn state_view(&self) -> &crate::state::TransactionStateView<R> {
+        unsafe { self.ptr.0.as_ref().state_view() }
     }
 
     pub(crate) fn with_explicit_insert_columns(
@@ -457,21 +488,27 @@ impl SqlWriteContext {
 }
 
 #[derive(Clone)]
-pub(crate) enum WriteAccess {
+pub(crate) enum WriteAccess<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     ReadOnly,
-    Write { ctx: SqlWriteContext },
+    Write { ctx: SqlWriteContext<R> },
 }
 
-impl WriteAccess {
+impl<R> WriteAccess<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     pub(crate) fn read_only() -> Self {
         Self::ReadOnly
     }
 
-    pub(crate) fn write(ctx: SqlWriteContext) -> Self {
+    pub(crate) fn write(ctx: SqlWriteContext<R>) -> Self {
         Self::Write { ctx }
     }
 
-    pub(crate) fn into_write_context(self) -> Option<SqlWriteContext> {
+    pub(crate) fn into_write_context(self) -> Option<SqlWriteContext<R>> {
         match self {
             Self::ReadOnly => None,
             Self::Write { ctx } => Some(ctx),
@@ -480,7 +517,10 @@ impl WriteAccess {
 }
 
 #[async_trait]
-impl FilesystemPathIndexReader for SqlWriteContext {
+impl<R> FilesystemPathIndexReader for SqlWriteContext<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     async fn path_index(
         &self,
         request: &FilesystemPathIndexRequest,
@@ -490,7 +530,10 @@ impl FilesystemPathIndexReader for SqlWriteContext {
 }
 
 #[async_trait]
-impl BranchRefReader for SqlWriteContext {
+impl<R> BranchRefReader for SqlWriteContext<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         Ok(SqlWriteContext::load_branch_head(self, branch_id)
             .await?
