@@ -1387,16 +1387,11 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        let repository = super::serving::load_repository_root(&self.read).await?;
-        Ok(stale_state_changes_between_commits_on_read(
-            &self.read,
-            &repository,
-            before,
-            after,
-            true,
+        Ok(
+            stale_state_changes_between_commits_on_read(self, before, after, true)
+                .await?
+                .payload,
         )
-        .await?
-        .payload)
     }
 
     /// Diffs only the branch-local state domain for checkpoint and working
@@ -1407,16 +1402,11 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        let repository = super::serving::load_repository_root(&self.read).await?;
-        Ok(stale_state_changes_between_commits_on_read(
-            &self.read,
-            &repository,
-            before,
-            after,
-            false,
+        Ok(
+            stale_state_changes_between_commits_on_read(self, before, after, false)
+                .await?
+                .payload,
         )
-        .await?
-        .payload)
     }
 
     /// Returns authenticated state-write identity changes separately from
@@ -1428,16 +1418,11 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateIdentityChange>, crate::LixError> {
-        let repository = super::serving::load_repository_root(&self.read).await?;
-        Ok(stale_state_changes_between_commits_on_read(
-            &self.read,
-            &repository,
-            before,
-            after,
-            true,
+        Ok(
+            stale_state_changes_between_commits_on_read(self, before, after, true)
+                .await?
+                .identities,
         )
-        .await?
-        .identities)
     }
 
     /// Returns payload and write-identity changes from one authenticated root
@@ -1449,9 +1434,21 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<StaleStateChanges, crate::LixError> {
-        let repository = super::serving::load_repository_root(&self.read).await?;
-        stale_state_changes_between_commits_on_read(&self.read, &repository, before, after, true)
-            .await
+        stale_state_changes_between_commits_on_read(self, before, after, true).await
+    }
+
+    /// Loads the authenticated commit summary used by stale reconciliation.
+    /// The cache is scoped by the caller to this exact retained view/read.
+    pub(crate) async fn load_stale_commit_state_roots(
+        &self,
+        repository: &RepositoryRootV1,
+        commit_id: crate::changelog::CommitId,
+        cache: &mut BTreeMap<crate::changelog::CommitId, (ObjectId, ObjectId)>,
+    ) -> Result<(ObjectId, ObjectId), crate::LixError> {
+        super::serving::load_historical_commit_state_roots_for_stale(
+            &self.read, repository, commit_id, cache,
+        )
+        .await
     }
 
     /// Resolves one required semantic commit record from the authenticated
@@ -1615,14 +1612,13 @@ pub(crate) struct StaleStateChanges {
 }
 
 async fn stale_state_changes_between_commits_on_read<R>(
-    read: &R,
-    repository: &super::model::RepositoryRootV1,
+    view: &ForkTreeReadFacade<R>,
     before: crate::changelog::CommitId,
     after: crate::changelog::CommitId,
     include_global: bool,
 ) -> Result<StaleStateChanges, crate::LixError>
 where
-    R: StorageAdapterRead + ?Sized,
+    R: StorageAdapterRead,
 {
     if before == after {
         return Ok(StaleStateChanges {
@@ -1631,17 +1627,18 @@ where
         });
     }
 
-    let before_roots = super::serving::load_historical_commit_state_roots_from_repository(
-        read, repository, before,
-    )
-    .await?;
-    let after_roots =
-        super::serving::load_historical_commit_state_roots_from_repository(read, repository, after)
-            .await?;
+    let repository = super::serving::load_repository_root(&view.read).await?;
+    let mut summary_cache = BTreeMap::new();
+    let before_roots = view
+        .load_stale_commit_state_roots(&repository, before, &mut summary_cache)
+        .await?;
+    let after_roots = view
+        .load_stale_commit_state_roots(&repository, after, &mut summary_cache)
+        .await?;
     let local_changes =
-        super::tree::diff_roots(Some(before_roots.1), Some(after_roots.1), read).await?;
+        super::tree::diff_roots(Some(before_roots.1), Some(after_roots.1), &view.read).await?;
     let global_changes =
-        super::tree::diff_roots(Some(before_roots.0), Some(after_roots.0), read).await?;
+        super::tree::diff_roots(Some(before_roots.0), Some(after_roots.0), &view.read).await?;
     let keys = merge_sorted_state_keys(local_changes, global_changes);
     if keys.is_empty() {
         return Ok(StaleStateChanges {
@@ -1665,7 +1662,7 @@ where
         Some(before_roots.1),
         &encoded,
         true,
-        read,
+        &view.read,
     )
     .await?;
     let after_rows = super::serving::state_points_on_read(
@@ -1673,7 +1670,7 @@ where
         Some(after_roots.1),
         &encoded,
         true,
-        read,
+        &view.read,
     )
     .await?;
 
