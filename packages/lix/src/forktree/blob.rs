@@ -143,6 +143,7 @@ where
             let reference = view
                 .bind_blob_at_state_key(key)
                 .await?
+                .or(view.bind_untracked_blob_at_state_key(key).await?)
                 .ok_or_else(|| {
                     crate::LixError::new(
                         crate::LixError::CODE_STORAGE_ERROR,
@@ -205,6 +206,26 @@ fn bind_state_blob_ref(
     view_instance_id: u64,
 ) -> Result<AuthenticatedBlobRef, crate::LixError> {
     let key = super::state::decode_state_key(&row.encoded_key)?;
+    bind_state_blob_ref_parts(
+        key,
+        &row.value.cell,
+        &row.value.blob_manifest_object_ids,
+        expected_key,
+        branch_id,
+        view_id,
+        view_instance_id,
+    )
+}
+
+fn bind_state_blob_ref_parts(
+    key: StateKey,
+    cell: &StateCell,
+    manifest_object_ids: &[ObjectId],
+    expected_key: Option<&StateKey>,
+    branch_id: CanonicalBranchId,
+    view_id: [u8; 32],
+    view_instance_id: u64,
+) -> Result<AuthenticatedBlobRef, crate::LixError> {
     if let Some(expected_key) = expected_key {
         if &key != expected_key {
             return Err(corruption(
@@ -225,7 +246,7 @@ fn bind_state_blob_ref(
     if key.entity_pk != expected_entity_pk {
         return Err(corruption("blob-reference key identity is inconsistent").into());
     }
-    let value = match &row.value.cell {
+    let value = match cell {
         StateCell::Value(value) => value,
         StateCell::Null | StateCell::Tombstone => {
             return Err(corruption("blob-reference owner has no live semantic value").into());
@@ -242,14 +263,12 @@ fn bind_state_blob_ref(
         );
     }
     let semantic_id = crate::binary_cas::BlobId::from_hex(&owner.blob_hash)?;
-    if row.value.blob_manifest_object_ids.len() != 1 {
+    if manifest_object_ids.len() != 1 {
         return Err(
             corruption("blob-reference owner must contain exactly one manifest edge").into(),
         );
     }
-    let manifest_object_id = row
-        .value
-        .blob_manifest_object_ids
+    let manifest_object_id = manifest_object_ids
         .first()
         .copied()
         .ok_or_else(|| corruption("blob-reference owner manifest edge is absent"))?;
@@ -316,6 +335,43 @@ where
             )
         })
         .transpose()
+    }
+
+    /// Re-resolves an untracked filesystem BlobRef through the same
+    /// authenticated coherent view. Untracked rows have no committed ChangeId
+    /// or CommitId, but their semantic value and manifest edge are still
+    /// authenticated by the untracked owner tree.
+    pub(crate) async fn bind_untracked_blob_at_state_key(
+        &self,
+        key: &StateKey,
+    ) -> Result<Option<AuthenticatedBlobRef>, crate::LixError>
+    where
+        R: Sync,
+    {
+        let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        });
+        let Some((_, selected_key, value)) = self
+            .load_untracked_overlay_points(&[encoded_key])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        bind_state_blob_ref_parts(
+            selected_key,
+            &value.cell,
+            &value.blob_manifest_object_ids,
+            Some(key),
+            self.branch_id(),
+            self.view_id(),
+            self.view_instance_id(),
+        )
+        .map(Some)
     }
 
     /// Loads complete payloads without allowing the authenticated row edge to

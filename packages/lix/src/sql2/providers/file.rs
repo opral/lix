@@ -6617,15 +6617,16 @@ where
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
                 let expected = BlobId::from_hex(&row.blob_hash)?;
-                let staged = live_rows
-                    .row(row.live)
+                let live = live_rows.row(row.live);
+                let staged_owner = if live.global() {
+                    GLOBAL_BRANCH_ID
+                } else {
+                    live.branch_id()
+                };
+                let staged = live
                     .file_id()
                     .map(|file_id| {
-                        write_ctx.load_staged_file_bytes_for_owner(
-                            live_rows.row(row.live).branch_id(),
-                            file_id,
-                            expected,
-                        )
+                        write_ctx.load_staged_file_bytes_for_owner(staged_owner, file_id, expected)
                     })
                     .transpose()?
                     .flatten();

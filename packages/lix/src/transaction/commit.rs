@@ -1586,13 +1586,13 @@ where
             write.global,
             write.untracked,
         );
-        if let Some(previous) = manifests.insert(key.clone(), prepared_manifest)
-            && previous.object_id != manifest
-        {
-            return Err(writer_error(
-                "one file scope has conflicting ForkTree manifest identities",
-            ));
-        }
+        // File content writes are ordered within one transaction.  A staged
+        // INSERT followed by UPDATE for the same owner intentionally carries
+        // two manifests here, while the coalesced state row retains only the
+        // final BlobRef.  Keep the last authenticated manifest for that
+        // owner; rejecting the earlier superseded payload would make
+        // write-your-own-writes fail before publication.
+        manifests.insert(key, prepared_manifest);
     }
     Ok(manifests)
 }
