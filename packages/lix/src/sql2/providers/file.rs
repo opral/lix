@@ -4496,11 +4496,18 @@ where
 
 fn file_content_from_request_splice(
     data: crate::Blob,
-    _provenance: Option<&RequestBlobSpliceProvenance>,
+    provenance: Option<&RequestBlobSpliceProvenance>,
 ) -> FileContent {
-    // The durable identity is derived only after the retained-view Merkle
-    // proof reaches PreparedPublication. Transport provenance never seeds a
-    // BlobRef/manifest identity.
+    if let Some(provenance) = provenance.filter(|provenance| provenance.matches_result(&data)) {
+        // The request boundary already authenticated these exact immutable
+        // result bytes and computed their canonical Merkle identity. Reuse
+        // that proof locally; publication still validates the resulting
+        // manifest and StateKey binding before persisting any BlobRef.
+        return FileContent::inline_with_blob_id(data, provenance.result_blob_id());
+    }
+    // Without an exact validated provenance match, retain the ordinary
+    // canonical identity derivation. Transport metadata is never an
+    // independent BlobRef/manifest authority.
     FileContent::inline(data)
 }
 

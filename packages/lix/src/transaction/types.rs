@@ -1804,6 +1804,10 @@ impl FileContent {
         Self::Inline(BlobPayload::from_bytes(data))
     }
 
+    pub(crate) fn inline_with_blob_id(data: impl Into<crate::Blob>, blob_id: BlobId) -> Self {
+        Self::Inline(BlobPayload::from_bytes_with_hash(data, blob_id))
+    }
+
     pub(crate) fn blob_id(&self) -> Option<BlobId> {
         match self {
             Self::Inline(payload) => payload.hash(),
