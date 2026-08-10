@@ -7,6 +7,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::LixError;
+use crate::binary_cas::BlobId;
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
@@ -173,6 +174,20 @@ pub(crate) trait SqlWriteExecutionContext: Send {
             LixError::CODE_UNSUPPORTED_SQL,
             "authenticated ForkTree blob reader is unavailable for this SQL write context",
         ))
+    }
+
+    /// Resolves an unpublished inline file payload from this transaction's
+    /// write buffer. The caller supplies the authenticated BlobId from the
+    /// current state row; implementations must return bytes only when that
+    /// identity matches. Committed payloads remain the responsibility of the
+    /// retained ForkTree blob reader.
+    fn load_staged_file_bytes_for_owner(
+        &self,
+        _branch_id: &str,
+        _file_id: &str,
+        _expected: BlobId,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        Ok(None)
     }
 
     async fn filesystem_path_index(
@@ -401,6 +416,20 @@ where
         &self,
     ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
         unsafe { self.ptr.0.as_ref().authenticated_blob_reader() }
+    }
+
+    pub(crate) fn load_staged_file_bytes_for_owner(
+        &self,
+        branch_id: &str,
+        file_id: &str,
+        expected: BlobId,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        unsafe {
+            self.ptr
+                .0
+                .as_ref()
+                .load_staged_file_bytes_for_owner(branch_id, file_id, expected)
+        }
     }
 
     pub(crate) async fn load_branch_head(
