@@ -20,7 +20,6 @@ use crate::storage_adapter::StorageAdapterRead;
 struct AuthenticatedMemberSource {
     source_commit_id: CommitId,
     owner_depth: u32,
-    record: ChangeRecord,
 }
 
 async fn authenticated_history_metadata<R>(
@@ -552,6 +551,8 @@ where
         // provenance closure; do not treat an arbitrary state-row commit ID as
         // reachable merely because it is present in a state root.
         let mut member_sources_by_change = BTreeMap::<ChangeId, AuthenticatedMemberSource>::new();
+        let mut member_records_by_owner_change =
+            BTreeMap::<(CommitId, ChangeId), ChangeRecord>::new();
         for owner_commit_id in &certified_commit_ids {
             let owner_depth = reachable_by_id
                 .get(owner_commit_id)
@@ -575,8 +576,19 @@ where
                 })?;
             for (source_commit_id, record) in members {
                 let change_id = record.change_id;
+                if member_records_by_owner_change
+                    .insert((*owner_commit_id, change_id), record)
+                    .is_some()
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "authenticated commit '{owner_commit_id}' repeats Change '{change_id}'"
+                        ),
+                    ));
+                }
                 if let Some(previous) = member_sources_by_change.get(&change_id) {
-                    if previous.source_commit_id != source_commit_id || previous.record != record {
+                    if previous.source_commit_id != source_commit_id {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
                             format!(
@@ -590,7 +602,6 @@ where
                         AuthenticatedMemberSource {
                             source_commit_id,
                             owner_depth,
-                            record,
                         },
                     );
                 }
@@ -665,8 +676,18 @@ where
                 let (row_depth, row_commit_created_at, account_id) = if let Some(source) =
                     member_sources_by_change.get(&row.change_id)
                 {
-                    validate_authenticated_member_row(&forktree_reader, &row, &source.record)
-                        .await?;
+                    let owner_record = member_records_by_owner_change
+                        .get(&(row.commit_id, row.change_id))
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "certified historical row Change '{}' has no authenticated owner projection",
+                                    row.change_id
+                                ),
+                            )
+                        })?;
+                    validate_authenticated_member_row(&forktree_reader, &row, owner_record).await?;
                     if let Some((depth, created_at, account_id)) =
                         reachable_by_id.get(&row.commit_id)
                     {

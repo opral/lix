@@ -77,7 +77,8 @@ struct ResolvedSemanticMember {
     change_id: ChangeId,
     payload: Vec<u8>,
     global: bool,
-    updated_at: crate::common::LixTimestamp,
+    updated_at: LixTimestamp,
+    selected_created_at: Option<LixTimestamp>,
     blob_manifest_object_ids: Vec<ObjectId>,
 }
 
@@ -91,6 +92,7 @@ where
     let expected_change_id = member.change_id();
     let mut current = member.clone();
     let mut visited = BTreeSet::new();
+    let mut selected_created_at = None;
     loop {
         match current {
             CommitMemberV1::Introduced {
@@ -110,6 +112,7 @@ where
                     payload,
                     global,
                     updated_at,
+                    selected_created_at,
                     blob_manifest_object_ids,
                 });
             }
@@ -117,6 +120,7 @@ where
                 change_id,
                 source_commit_object_id,
                 source_ordinal,
+                created_at,
             } => {
                 if change_id != expected_change_id
                     || !visited.insert((source_commit_object_id, source_ordinal))
@@ -125,6 +129,7 @@ where
                         "selected member source is cyclic or changes its ChangeId",
                     ));
                 }
+                selected_created_at.get_or_insert(created_at);
                 let bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
                 let source = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
                 current = load_commit_members(read, &source)
@@ -145,9 +150,21 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let resolved = resolve_semantic_member(read, member).await?;
+    let payload = if let Some(created_at) = resolved.selected_created_at {
+        let public_change_id =
+            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
+        let mut record =
+            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
+                .map_err(|error| corruption(error.to_string()))?;
+        record.created_at = created_at;
+        crate::changelog::encode_forktree_change_payload(&record)
+            .map_err(|error| corruption(error.to_string()))?
+    } else {
+        resolved.payload
+    };
     Ok(ChangeObjectV1::Semantic {
         change_id: resolved.change_id,
-        payload: resolved.payload,
+        payload,
         json_payload_object_ids: Vec::new(),
     })
 }
@@ -1167,9 +1184,15 @@ where
                 source.commit_id
             }
         };
-        let record = semantic_change_record(read, repository.change_catalog_root, change_id, entry)
-            .await?
-            .ok_or_else(|| corruption("Commit member has no semantic Change payload"))?;
+        let ChangeObjectV1::Semantic { payload, .. } =
+            semantic_change_for_member(read, member).await?
+        else {
+            return Err(corruption("Commit member has no semantic Change payload").into());
+        };
+        let record = crate::changelog::decode_forktree_change_payload(
+            &payload,
+            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
+        )?;
         records.push((
             crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*source_commit_id.as_bytes())),
             record,
@@ -1712,6 +1735,19 @@ where
                 source_commit_object_id,
                 u32::try_from(source_ordinal)
                     .map_err(|_| corruption("selected source ordinal exceeds u32"))?,
+                crate::changelog::decode_forktree_change_payload(
+                    match &change {
+                        ChangeObjectV1::Semantic { payload, .. } => payload,
+                        ChangeObjectV1::BranchRef { .. } => {
+                            return Err(corruption(
+                                "selected semantic member resolved to a branch-ref change",
+                            ));
+                        }
+                    },
+                    crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
+                )
+                .map_err(|error| corruption(error.to_string()))?
+                .created_at,
             ),
             source,
             change,
@@ -1918,6 +1954,7 @@ where
         let record =
             crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
                 .map_err(|error| corruption(error.to_string()))?;
+        let created_at = resolved.selected_created_at.unwrap_or(record.created_at);
         if encode_state_key(super::state::StateKeyRef {
             schema_key: &record.schema_key,
             file_id: record.file_id.as_deref(),
@@ -1955,7 +1992,7 @@ where
                 commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
                     *page.commit_id.as_bytes(),
                 )),
-                created_at: record.created_at,
+                created_at,
                 updated_at: resolved.updated_at,
                 cell,
                 metadata: metadata.map(Into::into),

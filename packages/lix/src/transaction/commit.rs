@@ -29,7 +29,7 @@ use crate::forktree::{
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef, StateKey,
     StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
     UntrackedValueRef, encode_state_key, encode_state_value, load_commit, load_commit_summary,
-    open_coherent_view_on_read, select_historical_commit_member, state_point, state_points,
+    open_coherent_view_on_read, select_historical_commit_member, state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -879,6 +879,21 @@ where
         return Err(writer_error("ordered history repeats one staged CommitId"));
     }
 
+    // Ordered checkpoint history starts at the authenticated parent of its
+    // first draft, not necessarily at the currently selected branch head.
+    // Partial checkpoints deliberately publish an intermediate checkpoint
+    // from the previous checkpoint and then replay the unselected changes.
+    let sequence_parent_id = drafts
+        .first()
+        .and_then(|draft| draft.parent_commit_ids.first())
+        .copied()
+        .ok_or_else(|| writer_error("ordered history first draft has no parent"))?;
+    let sequence_parent = load_commit(view, forktree_commit_id(sequence_parent_id))
+        .await?
+        .ok_or_else(|| writer_error("ordered history first parent is absent"))?;
+    let sequence_global_root = sequence_parent.global_state_root;
+    let sequence_local_root = sequence_parent.local_state_root;
+
     let mut state_domain = prepared
         .state_rows
         .iter()
@@ -1001,10 +1016,11 @@ where
 
             let existed = match touched_presence.get(&key) {
                 Some(existed) => *existed,
-                None => state_point(view, &key, true)
+                None => view
+                    .state_point_at_roots(sequence_global_root, sequence_local_root, &key, true)
                     .await?
                     .as_ref()
-                    .is_some_and(|value| row.global || value.source == StateSource::Branch),
+                    .is_some_and(|(_, source)| row.global || *source == StateSource::Branch),
             };
             let mutation = if row.global && row.snapshot.is_none() {
                 touched_presence.insert(key.clone(), false);
@@ -1059,7 +1075,6 @@ where
                 if record.schema_key != selected.schema_key()
                     || record.file_id.as_deref() != selected.file_id()
                     || record.entity_pk != *selected.entity_pk()
-                    || record.created_at != selected.created_at
                     || record.snapshot.is_none() != selected.deleted
                 {
                     return Err(writer_error(
@@ -1076,14 +1091,32 @@ where
                     .await?
                     .ok_or_else(|| writer_error("selected history source state row is absent"))?;
                 let selected_global = source_domain == StateSource::Global;
+                let sequence_value = view
+                    .state_point_at_roots(
+                        sequence_global_root,
+                        sequence_local_root,
+                        &identity,
+                        true,
+                    )
+                    .await?;
+                let sequence_semantically_absent = sequence_value
+                    .as_ref()
+                    .is_none_or(|(value, _)| value.cell.deleted());
+                let source_membership_exact = record.created_at == selected.created_at
+                    && source_value.created_at == selected.created_at;
+                let canonical_checkpoint_add = !batch.source_membership_certified()
+                    && sequence_semantically_absent
+                    && !selected.deleted
+                    && selected.created_at == source_value.updated_at;
                 if state_domain
                     .replace(selected_global)
                     .is_some_and(|domain| domain != selected_global)
                     || source_value.change_id != selected.change_id
                     || source_value.commit_id != selected.source_commit_id
                     || source_value.cell.deleted() != selected.deleted
-                    || source_value.created_at != selected.created_at
                     || source_value.updated_at != selected.updated_at
+                    || (batch.source_membership_certified() && !source_membership_exact)
+                    || (!source_membership_exact && !canonical_checkpoint_add)
                 {
                     return Err(writer_error(
                         "selected history source state authority is inconsistent",
@@ -1091,12 +1124,9 @@ where
                 }
                 let existed = match touched_presence.get(&identity) {
                     Some(existed) => *existed,
-                    None => state_point(view, &identity, true)
-                        .await?
-                        .as_ref()
-                        .is_some_and(|value| {
-                            selected_global || value.source == StateSource::Branch
-                        }),
+                    None => sequence_value.as_ref().is_some_and(|(_, source)| {
+                        selected_global || *source == StateSource::Branch
+                    }),
                 };
                 let mutation = if selected_global && selected.deleted {
                     touched_presence.insert(identity.clone(), false);
@@ -1111,7 +1141,11 @@ where
                     }
                 };
                 pending_mutations.push(mutation);
-                members.push(member);
+                members.push(
+                    member
+                        .with_selected_created_at(selected.created_at)
+                        .map_err(LixError::from)?,
+                );
             }
         }
         let member_pages =
@@ -1162,9 +1196,9 @@ where
 
     let global = state_domain.unwrap_or(false);
     let state_base = if global {
-        view.repository_root().global_state_root
+        sequence_global_root
     } else {
-        view.branch_snapshot().local_state_root
+        sequence_local_root
     };
     for content in &mut contents {
         sort_state_mutations(&mut content.mutations)?;
@@ -1206,10 +1240,10 @@ where
         let global_state_root = if global {
             state_edit.root
         } else {
-            view.repository_root().global_state_root
+            sequence_global_root
         };
         let local_state_root = if global {
-            view.branch_snapshot().local_state_root
+            sequence_local_root
         } else {
             state_edit.root
         };
