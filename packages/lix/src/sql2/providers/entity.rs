@@ -2759,10 +2759,10 @@ impl EntityRawProjectionDecoder {
                 .map(|field| EntityRawProjectionColumn::new(field.column_type, slots.len()))
                 .collect(),
             present: vec![false; self.fields.len()],
+            errors: vec![None; self.fields.len()],
         };
         for slot in slots {
-            self.decode_one(slot_snapshot(slot).map(str::as_bytes), &mut sink)
-                .map_err(lix_error_to_datafusion_error)?;
+            self.decode_one(slot_snapshot(slot).map(str::as_bytes), &mut sink)?;
             sink.fill_missing_primary_keys(self, spec, slot)
                 .map_err(lix_error_to_datafusion_error)?;
         }
@@ -2777,7 +2777,7 @@ impl EntityRawProjectionDecoder {
         &self,
         snapshot: Option<&[u8]>,
         sink: &mut EntityRawProjectionSink,
-    ) -> Result<(), LixError> {
+    ) -> Result<()> {
         sink.begin_row();
         let Some(snapshot) = snapshot else {
             return Ok(());
@@ -2788,9 +2788,11 @@ impl EntityRawProjectionDecoder {
             sink,
         }
         .deserialize(&mut deserializer)
-        .map_err(raw_snapshot_decode_error)?;
-        deserializer.end().map_err(raw_snapshot_decode_error)?;
-        semantic_error.map_or(Ok(()), Err)
+        .map_err(raw_snapshot_decode_datafusion_error)?;
+        deserializer
+            .end()
+            .map_err(raw_snapshot_decode_datafusion_error)?;
+        semantic_error.map_or(Ok(()), |error| Err(lix_error_to_datafusion_error(error)))
     }
 }
 
@@ -2830,20 +2832,15 @@ impl<'de> Visitor<'de> for RawEntityProjectionVisitor<'_, '_> {
         A: MapAccess<'de>,
     {
         let RawEntityProjectionVisitor { decoder, sink } = self;
-        let mut semantic_error = None;
         while let Some(key) = map.next_key::<Cow<'de, str>>()? {
             let Some(indices) = decoder.slots_by_name.get(key.as_ref()) else {
                 map.next_value::<IgnoredAny>()?;
                 continue;
             };
             let raw = map.next_value::<&RawValue>()?;
-            if semantic_error.is_none() {
-                if let Err(error) = sink.project_raw(decoder, indices, raw) {
-                    semantic_error = Some(error);
-                }
-            }
+            sink.project_raw(decoder, indices, raw);
         }
-        Ok(semantic_error)
+        Ok(sink.final_error())
     }
 
     fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
@@ -2914,11 +2911,13 @@ impl<'de> Visitor<'de> for RawEntityProjectionVisitor<'_, '_> {
 struct EntityRawProjectionSink {
     columns: Vec<EntityRawProjectionColumn>,
     present: Vec<bool>,
+    errors: Vec<Option<LixError>>,
 }
 
 impl EntityRawProjectionSink {
     fn begin_row(&mut self) {
         self.present.fill(false);
+        self.errors.fill(None);
         for column in &mut self.columns {
             column.push_null();
         }
@@ -2929,16 +2928,17 @@ impl EntityRawProjectionSink {
         decoder: &EntityRawProjectionDecoder,
         indices: &[usize],
         raw: &RawValue,
-    ) -> Result<(), LixError> {
+    ) {
         for index in indices {
             self.present[*index] = true;
-            self.columns[*index].replace_last_from_raw(
-                raw,
-                &decoder.fields[*index],
-                &decoder.schema_key,
-            )?;
+            self.errors[*index] = self.columns[*index]
+                .replace_last_from_raw(raw, &decoder.fields[*index], &decoder.schema_key)
+                .err();
         }
-        Ok(())
+    }
+
+    fn final_error(&self) -> Option<LixError> {
+        self.errors.iter().find_map(Option::clone)
     }
 
     fn fill_missing_primary_keys(
@@ -3007,7 +3007,7 @@ impl EntityRawProjectionColumn {
                     raw_string_text(raw)?;
             }
             Self::Json(values) if field.column_type == EntityColumnType::Json => {
-                *values.last_mut().expect("projection row must start first") = raw_json_text(raw);
+                *values.last_mut().expect("projection row must start first") = raw_json_text(raw)?;
             }
             Self::Integer(values) if field.column_type == EntityColumnType::Integer => {
                 let value = parse_raw_json_value(raw)?;
@@ -3095,6 +3095,9 @@ fn parse_raw_json_value(raw: &RawValue) -> Result<JsonValue, LixError> {
 }
 
 fn raw_string_text(raw: &RawValue) -> Result<Option<String>, LixError> {
+    if raw.get().trim() == "null" {
+        return Ok(None);
+    }
     if raw.get().trim_start().starts_with('"') {
         return serde_json::from_str(raw.get())
             .map(Some)
@@ -3106,8 +3109,14 @@ fn raw_string_text(raw: &RawValue) -> Result<Option<String>, LixError> {
     ))
 }
 
-fn raw_json_text(raw: &RawValue) -> Option<String> {
-    (raw.get().trim() != "null").then(|| raw.get().to_string())
+fn raw_json_text(raw: &RawValue) -> Result<Option<String>, LixError> {
+    let value = parse_raw_json_value(raw)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|error| LixError::new(LixError::CODE_UNKNOWN, error.to_string()))
 }
 
 fn raw_bool(raw: &RawValue) -> Option<bool> {
@@ -3123,6 +3132,12 @@ fn raw_snapshot_decode_error(error: serde_json::Error) -> LixError {
         LixError::CODE_INTERNAL_ERROR,
         format!("sql2 entity provider expected valid snapshot_content JSON: {error}"),
     )
+}
+
+fn raw_snapshot_decode_datafusion_error(error: serde_json::Error) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "sql2 entity provider expected valid snapshot_content JSON: {error}"
+    ))
 }
 
 fn entity_slot_column_array(
@@ -3720,6 +3735,79 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         )
+    }
+
+    fn projection_matrix_spec() -> Arc<EntitySurfaceSpec> {
+        Arc::new(
+            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "projection_matrix",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "body": { "type": "string" },
+                    "meta": { "type": "object" },
+                    "count": { "type": "integer" },
+                    "ratio": { "type": "number" },
+                    "enabled": { "type": "boolean" }
+                }
+            }))
+            .expect("projection matrix schema should derive"),
+        )
+    }
+
+    fn projection_matrix_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("lixcol_entity_pk", DataType::Utf8, true),
+            Field::new("id", DataType::Utf8, true),
+            Field::new("body", DataType::Utf8, true),
+            Field::new("lixcol_file_id", DataType::Utf8, true),
+            Field::new("meta", DataType::Utf8, true),
+            Field::new("count", DataType::Int64, true),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new("enabled", DataType::Boolean, true),
+            Field::new("body", DataType::Utf8, true),
+        ]))
+    }
+
+    fn entity_record_batch_from_slots_dom(
+        spec: &EntitySurfaceSpec,
+        schema: SchemaRef,
+        slots: &[EntityStateSlot],
+        branch_id: Option<&str>,
+    ) -> Result<RecordBatch> {
+        let snapshots = slots
+            .iter()
+            .map(|slot| parse_snapshot(slot_snapshot(slot)))
+            .collect::<Result<Vec<_>>>()?;
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| entity_slot_column_array(spec, field.name(), slots, &snapshots, branch_id))
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+    }
+
+    fn assert_projection_batches_match(fast: &RecordBatch, dom: &RecordBatch) {
+        assert_eq!(fast.num_rows(), dom.num_rows());
+        assert_eq!(fast.num_columns(), dom.num_columns());
+        for column_index in 0..fast.num_columns() {
+            assert_eq!(
+                format!("{:?}", fast.column(column_index)),
+                format!("{:?}", dom.column(column_index)),
+                "projection column {column_index} diverged"
+            );
+        }
+    }
+
+    fn matrix_row(entity: &str, snapshot: &str, source: StateRowSource) -> EntityStateSlot {
+        EntityStateSlot::Tracked(tracked_row_with_file(
+            source,
+            "projection_matrix",
+            entity,
+            None,
+            StateCell::Value(SharedStr::from(snapshot)),
+        ))
     }
 
     fn string_literal(value: &str) -> Expr {
@@ -4754,6 +4842,183 @@ mod tests {
                 .value(0),
             7
         );
+    }
+
+    #[test]
+    fn native_fast_projection_matches_dom_for_null_duplicates_and_canonical_json() {
+        let spec = projection_matrix_spec();
+        let schema = projection_matrix_schema();
+        let cases = [
+            r#"{"id":"one","body":"hello","meta":{"z":2,"a":1},"count":7,"ratio":1.5,"enabled":true}"#,
+            r#"{"id":"two","body":null,"meta":null,"count":-3,"enabled":false}"#,
+            r#"{"id":"three","meta":{"unicode":"é","number":1.5},"count":0}"#,
+            r#"{"id":"four","body":"\u0068\u0069","meta":{"b":2,"a":[true,null]},"count":42,"enabled":true}"#,
+            r#"{"id":"bounds","count":9223372036854775807,"ratio":-0.0}"#,
+            r#"{"id":"dup","body":"ok","count":"bad","count":7,"meta":{"z":2,"a":1,"a":3}}"#,
+            r#"{"id":"unknown","body":"ok","unknown":1,"unknown":2,"meta":{}}"#,
+            "7",
+            "[1,2,3]",
+            "null",
+        ];
+        let slots = cases
+            .iter()
+            .enumerate()
+            .map(|(index, snapshot)| {
+                matrix_row(&format!("row-{index}"), snapshot, StateRowSource::Branch)
+            })
+            .collect::<Vec<_>>();
+        let fast =
+            entity_record_batch_from_slots(&spec, Arc::clone(&schema), &slots, Some("branch-a"))
+                .expect("fast projection matrix");
+        let dom = entity_record_batch_from_slots_dom(&spec, schema, &slots, Some("branch-a"))
+            .expect("DOM projection matrix");
+        assert_projection_batches_match(&fast, &dom);
+
+        let body = fast
+            .column_by_name("body")
+            .expect("body")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("body string");
+        assert!(body.is_null(1), "explicit JSON null must be SQL NULL");
+        assert!(
+            body.is_null(8),
+            "non-object JSON roots must not become text"
+        );
+        let meta = fast
+            .column_by_name("meta")
+            .expect("meta")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("meta string");
+        assert!(meta.is_null(1), "explicit JSON null must be SQL NULL");
+        let canonical = serde_json::to_string(
+            &serde_json::from_str::<JsonValue>(r#"{"z":2,"a":1,"a":3}"#)
+                .expect("canonical JSON fixture"),
+        )
+        .expect("canonical JSON serialization");
+        assert_eq!(meta.value(5), canonical);
+        assert_eq!(
+            fast.column(5)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count")
+                .value(5),
+            7
+        );
+    }
+
+    #[test]
+    fn native_fast_projection_preserves_error_class_and_final_duplicate_value() {
+        let spec = projection_matrix_spec();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::Int64,
+            true,
+        )]));
+        let final_valid = matrix_row(
+            "valid",
+            r#"{"count":"bad","count":7}"#,
+            StateRowSource::Branch,
+        );
+        let fast = entity_record_batch_from_slots(
+            &spec,
+            Arc::clone(&schema),
+            std::slice::from_ref(&final_valid),
+            Some("branch-a"),
+        )
+        .expect("last duplicate occurrence controls conversion");
+        let dom = entity_record_batch_from_slots_dom(
+            &spec,
+            Arc::clone(&schema),
+            std::slice::from_ref(&final_valid),
+            Some("branch-a"),
+        )
+        .expect("DOM last duplicate occurrence");
+        assert_projection_batches_match(&fast, &dom);
+        assert_eq!(
+            fast.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count")
+                .value(0),
+            7
+        );
+
+        for (snapshot, expected_code) in [
+            (r#"{"count":7,"count":"bad"}"#, LixError::CODE_TYPE_MISMATCH),
+            (r#"{"count":7} trailing"#, LixError::CODE_UNKNOWN),
+            (r#"{"count":7"#, LixError::CODE_UNKNOWN),
+            (r#"{"count":1.5}"#, LixError::CODE_TYPE_MISMATCH),
+            (
+                r#"{"count":9223372036854775808}"#,
+                LixError::CODE_TYPE_MISMATCH,
+            ),
+        ] {
+            let row = matrix_row("invalid", snapshot, StateRowSource::Branch);
+            let fast_error = entity_record_batch_from_slots(
+                &spec,
+                Arc::clone(&schema),
+                std::slice::from_ref(&row),
+                Some("branch-a"),
+            )
+            .expect_err("fast projection must reject invalid input");
+            let dom_error = entity_record_batch_from_slots_dom(
+                &spec,
+                Arc::clone(&schema),
+                std::slice::from_ref(&row),
+                Some("branch-a"),
+            )
+            .expect_err("DOM projection must reject invalid input");
+            assert_eq!(
+                crate::sql2::error::datafusion_error_to_lix_error(fast_error).code,
+                expected_code,
+                "fast and DOM must retain the existing DataFusion/type classification"
+            );
+            assert_eq!(
+                crate::sql2::error::datafusion_error_to_lix_error(dom_error).code,
+                expected_code,
+            );
+        }
+    }
+
+    #[test]
+    fn native_fast_projection_matches_dom_across_lanes_tombstones_and_system_columns() {
+        let spec = projection_matrix_spec();
+        let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByBranch);
+        let slots = vec![
+            matrix_row(
+                "global",
+                r#"{"id":"global","body":"g","meta":{"z":2,"a":1},"count":1,"enabled":true}"#,
+                StateRowSource::Global,
+            ),
+            matrix_row(
+                "local",
+                r#"{"id":"local","body":"l","meta":{"z":3,"a":2},"count":2,"enabled":false}"#,
+                StateRowSource::Branch,
+            ),
+            EntityStateSlot::Tracked(tracked_row_with_file(
+                StateRowSource::Branch,
+                "projection_matrix",
+                "tombstone",
+                Some("file-tombstone"),
+                StateCell::Tombstone,
+            )),
+        ];
+        let fast =
+            entity_record_batch_from_slots(&spec, Arc::clone(&schema), &slots, Some("branch-a"))
+                .expect("fast lane projection");
+        let dom = entity_record_batch_from_slots_dom(&spec, schema, &slots, Some("branch-a"))
+            .expect("DOM lane projection");
+        assert_projection_batches_match(&fast, &dom);
+        assert_eq!(fast.num_rows(), 3);
+        let body = fast
+            .column_by_name("body")
+            .expect("body")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("body string");
+        assert!(body.is_null(2), "tombstones remain null output slots");
     }
 
     #[test]
