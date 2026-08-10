@@ -8467,12 +8467,19 @@ where
             return Ok(Some(generation.live_count));
         }
         let view = ForkTreeStateView::from_facade(self.forktree_read_facade(), branch_id).await?;
-        let rows = view.range(None, None, None, false).await.map_err(|error| {
-            LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                format!("collection state range failed: {error}"),
-            )
-        })?;
+        let bounds = crate::forktree::encode_state_entity_prefix_bounds(
+            scope.schema_key,
+            &EntityPk::empty(),
+        );
+        let rows = view
+            .range(Some(&bounds.lower), bounds.upper.as_deref(), None, false)
+            .await
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("collection state range failed: {error}"),
+                )
+            })?;
         let count = rows
             .into_iter()
             .filter_map(|row| crate::forktree::decode_state_key(&row.key).ok())

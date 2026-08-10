@@ -472,6 +472,7 @@ fn merge_sorted_state_keys(left: Vec<StateKey>, right: Vec<StateKey>) -> Vec<Sta
 pub(crate) struct TransactionStateView<R> {
     committed: ForkTreeStateView<R>,
     staged: Vec<StagedStateRow>,
+    removed_local_ranges: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
 impl<R> TransactionStateView<R>
@@ -550,7 +551,12 @@ where
                 "staged state rows are not strictly ordered",
             ));
         }
-        Ok(Self { committed, staged })
+        let removed_local_ranges = collection_delete_ranges(&staged)?;
+        Ok(Self {
+            committed,
+            staged,
+            removed_local_ranges,
+        })
     }
 
     /// Rebinds the same retained committed view to the latest transaction
@@ -595,7 +601,11 @@ where
             {
                 visible_staged_row(&self.staged[staged_index], include_tombstones)
             } else {
-                committed_row.and_then(|row| visible_committed_row(row, include_tombstones))
+                committed_row.and_then(|row| {
+                    (!self.removes_committed_row(&row))
+                        .then(|| visible_committed_row(row, include_tombstones))
+                        .flatten()
+                })
             };
             sorted_rows.push(row);
         }
@@ -640,7 +650,9 @@ where
                 Ordering::Less => {
                     let row = committed[committed_index].clone();
                     committed_index += 1;
-                    visible_committed_row(row, include_tombstones)
+                    (!self.removes_committed_row(&row))
+                        .then(|| visible_committed_row(row, include_tombstones))
+                        .flatten()
                 }
                 Ordering::Equal => {
                     let row = visible_staged_row(&self.staged[staged_index], include_tombstones);
@@ -666,6 +678,16 @@ where
             }
         }
         Ok(output)
+    }
+
+    fn removes_committed_row(&self, row: &StateRow) -> bool {
+        row.source == StateRowSource::Branch
+            && self.removed_local_ranges.iter().any(|(lower, upper)| {
+                row.key.as_slice() >= lower.as_slice()
+                    && upper
+                        .as_ref()
+                        .is_none_or(|upper| row.key.as_slice() < upper.as_slice())
+            })
     }
 
     pub(crate) async fn branch_points(
@@ -727,6 +749,10 @@ where
             .iter()
             .zip(committed)
             .map(|((lower, upper), committed)| {
+                let committed = committed
+                    .into_iter()
+                    .filter(|row| !self.removes_committed_row(row))
+                    .collect();
                 merge_staged_range(
                     committed,
                     &self.staged,
@@ -737,6 +763,41 @@ where
             })
             .collect())
     }
+}
+
+fn collection_delete_ranges(
+    staged: &[StagedStateRow],
+) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, LixError> {
+    let mut ranges = Vec::new();
+    for row in staged {
+        let key = crate::forktree::decode_state_key(&row.key)?;
+        if key.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+            continue;
+        }
+        let StateCell::Value(snapshot) = &row.value.cell else {
+            continue;
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("collection-generation marker snapshot is malformed: {error}"),
+                )
+            })?;
+        if value.get("live_count").and_then(serde_json::Value::as_u64) != Some(0) {
+            continue;
+        }
+        let (schema_key, file_id) =
+            crate::collection_generation::collection_scope_from_entity_pk(&key.entity_pk)?;
+        if file_id.is_some() {
+            continue;
+        }
+        let bounds =
+            crate::forktree::encode_state_entity_prefix_bounds(&schema_key, &EntityPk::empty());
+        ranges.push((bounds.lower, bounds.upper));
+    }
+    ranges.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(ranges)
 }
 
 fn merge_staged_range(

@@ -2493,14 +2493,14 @@ async fn entity_delete_collection(
         file_id: None,
     };
     let active_branch_id = ctx.active_branch_id().to_string();
-    let global = ctx
-        .load_collection_generation(crate::GLOBAL_BRANCH_ID, scope)
+    let global_count = ctx
+        .load_exact_collection_live_count(crate::GLOBAL_BRANCH_ID, scope)
         .await?;
     // A visible active-branch collection can shadow global rows with the same
     // identity. Per-branch counts cannot recover that union cardinality
     // exactly, so preserve the row-wise route until the projection itself has
     // a certified count.
-    if global.is_some_and(|global| global.live_count != 0) {
+    if global_count.is_some_and(|live_count| live_count != 0) {
         return Ok(None);
     }
     // A generation control only counts committed HOT members. Ordinary staged
@@ -2510,28 +2510,19 @@ async fn entity_delete_collection(
     if ctx.has_staged_collection_rows(&active_branch_id, scope)? {
         return Ok(None);
     }
-    let Some(mut previous) = ctx
-        .load_collection_generation(&active_branch_id, scope)
+    let Some(live_count) = ctx
+        .load_exact_collection_live_count(&active_branch_id, scope)
         .await?
     else {
         return Ok(None);
     };
-    if previous.live_count == crate::collection_generation::DEFERRED_LIVE_COUNT {
-        let Some(live_count) = ctx
-            .load_exact_collection_live_count(&active_branch_id, scope)
-            .await?
-        else {
-            return Ok(None);
-        };
-        previous.live_count = live_count;
-    }
-    if previous.live_count == 0 {
+    if live_count == 0 {
         return Ok(Some(SqlWriteResult::affected(0)));
     }
     let mut rows = RawWriteBatch::with_capacity(1);
     rows.push(collection_delete_stage_row(&active_branch_id, scope));
     stage_rows(ctx, TransactionWriteMode::Replace, rows).await?;
-    Ok(Some(SqlWriteResult::affected(previous.live_count)))
+    Ok(Some(SqlWriteResult::affected(live_count)))
 }
 
 fn plan_references_active_branch_commit_id(plan: &LogicalWritePlan) -> bool {

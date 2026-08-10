@@ -3131,6 +3131,27 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     // Both mutations are lowered through one authenticated batch edit; they
     // may share the same copied leaf and ancestor path.
     assert!(edit.copied_nodes() >= 1);
+
+    let bounds = super::encode_state_entity_prefix_bounds("app.row", &EntityPk::empty());
+    let range_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![StateTreeMutation::remove_range(bounds.lower, bounds.upper)],
+        view.test_storage_read(),
+    )
+    .await
+    .expect("authenticated schema range delete");
+    assert_eq!(range_edit.entry_count(), 0);
+    assert!(range_edit.copied_nodes() >= 1);
+    assert!(
+        edit_state_tree(
+            view.branch_snapshot().local_state_root,
+            vec![StateTreeMutation::remove_range(vec![0xff], None)],
+            view.test_storage_read(),
+        )
+        .await
+        .is_err(),
+        "a malformed state prefix must fail closed"
+    );
 }
 
 #[tokio::test]
@@ -6704,12 +6725,14 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
         let left_key: &[u8] = match left {
             StateTreeMutation::Insert { key, .. }
             | StateTreeMutation::Update { key, .. }
-            | StateTreeMutation::Remove { key } => key,
+            | StateTreeMutation::Remove { key }
+            | StateTreeMutation::RemoveRange { lower: key, .. } => key,
         };
         let right_key: &[u8] = match right {
             StateTreeMutation::Insert { key, .. }
             | StateTreeMutation::Update { key, .. }
-            | StateTreeMutation::Remove { key } => key,
+            | StateTreeMutation::Remove { key }
+            | StateTreeMutation::RemoveRange { lower: key, .. } => key,
         };
         left_key.cmp(right_key)
     });

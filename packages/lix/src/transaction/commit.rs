@@ -29,9 +29,9 @@ use crate::forktree::{
     CommitObjectV1, HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition,
     PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCellRef, StateKey,
     StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
-    encode_state_key, encode_state_value, introduced_checkpoint_marker, load_commit,
-    load_commit_summary, open_coherent_view_on_read, select_historical_commit_members,
-    state_points,
+    encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
+    introduced_checkpoint_marker, load_commit, load_commit_summary, open_coherent_view_on_read,
+    select_historical_commit_members, state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -394,6 +394,9 @@ where
             }
         };
         state_mutations.push(mutation);
+        if let Some((lower, upper)) = collection_delete_range(row)? {
+            state_mutations.push(StateTreeMutation::remove_range(lower, upper));
+        }
     }
     sort_state_mutations(&mut state_mutations)?;
 
@@ -1977,11 +1980,42 @@ fn writer_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
 }
 
+fn collection_delete_range(
+    row: PreparedStateRowRef<'_>,
+) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>, LixError> {
+    if row.schema_key.as_str() != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+        || row.global
+        || row.untracked
+    {
+        return Ok(None);
+    }
+    let Some(snapshot) = row.snapshot else {
+        return Ok(None);
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(snapshot.normalized()).map_err(|error| {
+            writer_error(format!(
+                "collection-generation marker snapshot is malformed: {error}"
+            ))
+        })?;
+    if value.get("live_count").and_then(serde_json::Value::as_u64) != Some(0) {
+        return Ok(None);
+    }
+    let (schema_key, file_id) =
+        crate::collection_generation::collection_scope_from_entity_pk(row.entity_pk)?;
+    if file_id.is_some() {
+        return Ok(None);
+    }
+    let bounds = encode_state_entity_prefix_bounds(&schema_key, &EntityPk::empty());
+    Ok(Some((bounds.lower, bounds.upper)))
+}
+
 fn state_mutation_key(mutation: &StateTreeMutation) -> &[u8] {
     match mutation {
         StateTreeMutation::Insert { key, .. }
         | StateTreeMutation::Update { key, .. }
         | StateTreeMutation::Remove { key } => key.as_slice(),
+        StateTreeMutation::RemoveRange { lower, .. } => lower.as_slice(),
     }
 }
 

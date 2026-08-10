@@ -246,6 +246,12 @@ where
             request.limit,
         ));
     }
+    // One branch is already emitted in canonical key order by the retained
+    // ForkTree range and its global/local overlay. Avoid rebuilding that same
+    // order through the multi-branch heap/dedup machinery.
+    if branch_rows.len() == 1 {
+        return Ok(branch_rows.pop().expect("one branch result"));
+    }
     let mut global_keys = std::collections::BTreeSet::new();
     let mut branch_rows = branch_rows
         .into_iter()

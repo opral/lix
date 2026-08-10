@@ -2633,6 +2633,9 @@ fn entity_record_batch_from_slots(
         return RecordBatch::try_new_with_options(schema, vec![], &options)
             .map_err(DataFusionError::from);
     }
+    if spec.certifies_path_value_replacement {
+        return path_value_record_batch_from_slots(spec, schema, slots, branch_id);
+    }
     let snapshots = slots
         .iter()
         .map(|slot| parse_snapshot(slot_snapshot(slot)))
@@ -2641,6 +2644,156 @@ fn entity_record_batch_from_slots(
         .fields()
         .iter()
         .map(|field| entity_slot_column_array(spec, field.name(), slots, &snapshots, branch_id))
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+/// Borrowed terminal projection for the certified `{path, value}` entity
+/// shape. The canonical ForkTree snapshot remains the only row authority; the
+/// projector validates the complete outer JSON object once and materializes
+/// only requested fields at the Arrow boundary.
+#[derive(Clone, Copy)]
+struct BorrowedPathValueSnapshot<'a> {
+    path: Option<&'a serde_json::value::RawValue>,
+    value: Option<&'a serde_json::value::RawValue>,
+}
+
+impl<'de> serde::Deserialize<'de> for BorrowedPathValueSnapshot<'de> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = BorrowedPathValueSnapshot<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a path/value snapshot object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut path = None;
+                let mut value = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    let raw = map.next_value::<&'de serde_json::value::RawValue>()?;
+                    match key.as_ref() {
+                        // serde_json's DOM semantics are last-key-wins. Keep
+                        // exactly that behavior without constructing the
+                        // complete outer object.
+                        "path" => path = Some(raw),
+                        "value" => value = Some(raw),
+                        _ => {}
+                    }
+                }
+                Ok(BorrowedPathValueSnapshot { path, value })
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+fn parse_borrowed_path_value_snapshot(snapshot: &str) -> Result<BorrowedPathValueSnapshot<'_>> {
+    let mut deserializer = serde_json::Deserializer::from_str(snapshot);
+    let parsed = serde::Deserialize::deserialize(&mut deserializer).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "sql2 entity provider expected valid snapshot_content JSON: {error}"
+        ))
+    })?;
+    deserializer.end().map_err(|error| {
+        DataFusionError::Execution(format!(
+            "sql2 entity provider expected valid snapshot_content JSON: {error}"
+        ))
+    })?;
+    Ok(parsed)
+}
+
+fn path_value_record_batch_from_slots(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    slots: &[EntityStateSlot],
+    branch_id: Option<&str>,
+) -> Result<RecordBatch> {
+    let snapshots = slots
+        .iter()
+        .map(|slot| {
+            slot_snapshot(slot)
+                .map(parse_borrowed_path_value_snapshot)
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if let Some(property_name) = field.name().strip_prefix("lixcol_") {
+                return entity_slot_system_column_array(spec, property_name, slots, branch_id);
+            }
+            let column = spec.visible_column(field.name()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "sql2 entity provider '{}' does not expose column '{}'",
+                    spec.schema_key,
+                    field.name()
+                ))
+            })?;
+            let values = slots
+                .iter()
+                .zip(&snapshots)
+                .map(|(slot, snapshot)| {
+                    let raw = snapshot.and_then(|snapshot| match field.name().as_str() {
+                        "path" => snapshot.path,
+                        "value" => snapshot.value,
+                        _ => None,
+                    });
+                    match raw {
+                        Some(raw) => serde_json::from_str::<JsonValue>(raw.get())
+                            .map(Some)
+                            .map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "sql2 entity provider expected valid snapshot_content JSON: {error}"
+                                ))
+                            }),
+                        None => entity_primary_key_value(spec, field.name(), slot),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let array: ArrayRef = match column.column_type {
+                EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
+                    values
+                        .iter()
+                        .map(|value| {
+                            entity_json_text_value(value.as_ref(), column.column_type)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )),
+                EntityColumnType::Integer => Arc::new(Int64Array::from(
+                    values
+                        .iter()
+                        .map(|value| {
+                            entity_i64_value(value.as_ref(), &spec.schema_key, field.name())
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )),
+                EntityColumnType::Number => Arc::new(Float64Array::from(
+                    values
+                        .iter()
+                        .map(|value| {
+                            entity_f64_value(value.as_ref(), &spec.schema_key, field.name())
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )),
+                EntityColumnType::Boolean => Arc::new(BooleanArray::from_iter(
+                    values
+                        .iter()
+                        .map(|value| value.as_ref().and_then(JsonValue::as_bool)),
+                )),
+            };
+            Ok(array)
+        })
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
@@ -3200,6 +3353,25 @@ mod tests {
         )
     }
 
+    fn path_value_entity_spec() -> Arc<EntitySurfaceSpec> {
+        Arc::new(
+            crate::sql2::catalog::derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "json_pointer",
+                "x-lix-primary-key": ["/path"],
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "value": {
+                        "type": ["null", "string", "number", "integer", "boolean", "object", "array"]
+                    }
+                },
+                "required": ["path", "value"],
+                "additionalProperties": false
+            }))
+            .expect("path/value schema should derive"),
+        )
+    }
+
     fn string_literal(value: &str) -> Expr {
         Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
     }
@@ -3668,6 +3840,91 @@ mod tests {
                 .value(0),
             "branch-a"
         );
+    }
+
+    #[test]
+    fn borrowed_path_value_projection_matches_dom_null_duplicates_and_canonical_json() {
+        let spec = path_value_entity_spec();
+        assert!(spec.certifies_path_value_replacement);
+        let slots = vec![
+            EntityStateSlot::Tracked(tracked_row_with_file(
+                StateRowSource::Branch,
+                "json_pointer",
+                "/null",
+                None,
+                StateCell::Value(SharedStr::from(r#"{"path":"/null","value":null}"#)),
+            )),
+            EntityStateSlot::Tracked(tracked_row_with_file(
+                StateRowSource::Branch,
+                "json_pointer",
+                "/last",
+                None,
+                StateCell::Value(SharedStr::from(
+                    r#"{"path":"bad","value":{"z":0},"path":"/last","value":{"z":2,"a":1}}"#,
+                )),
+            )),
+            EntityStateSlot::Tracked(tracked_row_with_file(
+                StateRowSource::Branch,
+                "json_pointer",
+                "/fallback",
+                None,
+                StateCell::Value(SharedStr::from(r#"{"value":"text"}"#)),
+            )),
+        ];
+        let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
+        let batch = entity_record_batch_from_slots(&spec, schema, &slots, Some("branch-a"))
+            .expect("borrowed path/value projection");
+        let paths = batch
+            .column_by_name("path")
+            .expect("path")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path string");
+        let values = batch
+            .column_by_name("value")
+            .expect("value")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("value JSON text");
+        assert_eq!(paths.value(0), "/null");
+        assert!(values.is_null(0), "explicit JSON null maps to SQL NULL");
+        assert_eq!(paths.value(1), "/last", "last duplicate field wins");
+        assert_eq!(values.value(1), r#"{"a":1,"z":2}"#);
+        assert_eq!(
+            paths.value(2),
+            "/fallback",
+            "missing PK falls back to StateKey"
+        );
+        assert_eq!(values.value(2), r#""text""#);
+    }
+
+    #[test]
+    fn borrowed_path_value_projection_retains_execution_error_for_malformed_or_trailing_json() {
+        let spec = path_value_entity_spec();
+        for snapshot in [
+            r#"{"path":"/bad","value":}"#,
+            r#"{"path":"/bad","value":1} trailing"#,
+            r#"["/bad",1]"#,
+        ] {
+            let slot = EntityStateSlot::Tracked(tracked_row_with_file(
+                StateRowSource::Branch,
+                "json_pointer",
+                "/bad",
+                None,
+                StateCell::Value(SharedStr::from(snapshot)),
+            ));
+            let error = entity_record_batch_from_slots(
+                &spec,
+                entity_surface_schema(&spec, EntitySurfaceShape::Active),
+                &[slot],
+                Some("branch-a"),
+            )
+            .expect_err("malformed snapshot must fail closed");
+            assert!(
+                matches!(error, DataFusionError::Execution(_)),
+                "malformed snapshot error class changed: {error:?}"
+            );
+        }
     }
 
     #[test]
