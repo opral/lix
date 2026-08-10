@@ -226,35 +226,96 @@ pub(crate) fn encode_untracked_branch_range_bounds(
 ) -> Result<CanonicalPrefixBounds, LixError> {
     let prefix = encode_untracked_branch_prefix(branch_id);
     let canonical_bound = |bytes: &[u8], name: &str| -> Result<Vec<u8>, LixError> {
-        let decoded = decode_state_key(bytes)?;
-        let canonical = encode_state_key(StateKeyRef {
-            schema_key: &decoded.schema_key,
-            file_id: decoded.file_id.as_deref(),
-            entity_pk: &decoded.entity_pk,
-        });
-        if canonical != bytes {
-            return Err(state_error(format!("{name} is not canonically encoded")));
+        if let Ok(decoded) = decode_state_key(bytes) {
+            let canonical = encode_state_key(StateKeyRef {
+                schema_key: &decoded.schema_key,
+                file_id: decoded.file_id.as_deref(),
+                entity_pk: &decoded.entity_pk,
+            });
+            if canonical == bytes {
+                return Ok(canonical);
+            }
         }
-        Ok(canonical)
+        canonical_state_entity_prefix(bytes)
+            .map_err(|_| state_error(format!("{name} is not canonically encoded")))
     };
     let lower = lower
         .map(|bytes| canonical_bound(bytes, "untracked lower bound"))
-        .transpose()?
-        .map_or_else(
-            || prefix.clone(),
-            |bytes| [prefix.as_slice(), bytes.as_slice()].concat(),
-        );
+        .transpose()?;
     let upper = upper
-        .map(|bytes| canonical_bound(bytes, "untracked upper bound"))
-        .transpose()?
-        .map_or_else(
-            || exclusive_prefix_upper_bound(&prefix),
-            |bytes| Some([prefix.as_slice(), bytes.as_slice()].concat()),
-        );
+        .map(|bytes| {
+            if lower
+                .as_ref()
+                .and_then(|lower| exclusive_prefix_upper_bound(lower))
+                .as_deref()
+                == Some(bytes)
+            {
+                return Ok::<Vec<u8>, LixError>(bytes.to_vec());
+            }
+            canonical_bound(bytes, "untracked upper bound")
+        })
+        .transpose()?;
+    let lower = lower.map_or_else(
+        || prefix.clone(),
+        |bytes| [prefix.as_slice(), bytes.as_slice()].concat(),
+    );
+    let upper = upper.map_or_else(
+        || exclusive_prefix_upper_bound(&prefix),
+        |bytes| Some([prefix.as_slice(), bytes.as_slice()].concat()),
+    );
     if upper.as_ref().is_some_and(|upper| lower > *upper) {
         return Err(state_error("untracked range bounds are inverted"));
     }
     Ok(CanonicalPrefixBounds { lower, upper })
+}
+
+/// Canonicalizes the state-key prefix emitted by
+/// `encode_state_entity_prefix`.  Prefixes intentionally stop before the
+/// file-id component, and the empty-PK form stops after the codec version;
+/// neither is a complete `StateKey` accepted by `decode_state_key`.
+fn canonical_state_entity_prefix(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
+    let mut offset = 0_usize;
+    let (schema_key, terminator) = read_key_string(bytes, &mut offset, "state schema key")?;
+    if terminator != KEY_PART_FINAL {
+        return Err(state_error("state schema key has an invalid terminator"));
+    }
+    let version = *bytes
+        .get(offset)
+        .ok_or_else(|| state_error("state entity primary key prefix is truncated"))?;
+    offset += 1;
+    if version != ENTITY_PK_CODEC_V1 {
+        return Err(state_error(format!(
+            "state entity primary key has unsupported codec version {version}"
+        )));
+    }
+    if offset == bytes.len() {
+        return Ok(encode_state_entity_prefix(
+            &schema_key,
+            &EntityPk {
+                components: crate::entity_pk::EntityPkComponents::Empty,
+            },
+        ));
+    }
+
+    let mut components = smallvec::SmallVec::new();
+    loop {
+        let (component, terminator) = read_entity_pk_part(bytes, &mut offset)?;
+        components.push(component);
+        if terminator == KEY_PART_FINAL {
+            if offset != bytes.len() {
+                return Err(state_error(
+                    "state entity primary key prefix has trailing bytes",
+                ));
+            }
+            let entity_pk = EntityPk::from_components(components).map_err(|error| {
+                state_error(format!("state entity primary key is invalid: {error}"))
+            })?;
+            return Ok(encode_state_entity_prefix(&schema_key, &entity_pk));
+        }
+        if offset == bytes.len() {
+            return Err(state_error("state entity primary key prefix is truncated"));
+        }
+    }
 }
 
 fn write_entity_pk(output: &mut Vec<u8>, entity_pk: &EntityPk) {
