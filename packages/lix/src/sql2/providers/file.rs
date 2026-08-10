@@ -5236,7 +5236,10 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 path_resolvers,
                 parsed_path,
                 Some(file_id.clone()),
-                data.map(Into::into),
+                Some(
+                    data.map(Into::into)
+                        .unwrap_or_else(|| FileContent::inline(Vec::new())),
+                ),
                 context,
                 generate_directory_id,
             )
@@ -5371,7 +5374,7 @@ fn stage_lix_file_content_insert_write(
         context.untracked,
         content,
     );
-    if !file_payload.is_empty() {
+    if !file_payload.is_empty() || file_payload.inline_data().is_some() {
         stage_lix_file_content_blob_ref_write(staged, &file_payload, &context, origin)?;
     }
     staged.file_content_writes.push(file_payload);
@@ -5406,7 +5409,9 @@ fn stage_lix_file_content_update_write(
             append_blob_ref_tombstone_row(&mut staged.state_rows, file_id, context.clone());
             staged.state_rows.set_origin(row_index, origin.clone());
         }
-        staged.file_content_writes.push(file_payload);
+        if has_blob_ref {
+            staged.file_content_writes.push(file_payload);
+        }
         return Ok(());
     }
     stage_lix_file_content_blob_ref_write(staged, &file_payload, &context, origin.clone())?;
@@ -5425,7 +5430,13 @@ fn stage_lix_file_content_blob_ref_write(
         file_id: file_content.file_id.clone(),
         blob_hash: file_content
             .blob_hash()
-            .expect("non-empty payload should have blob hash"),
+            .or_else(|| {
+                file_content
+                    .inline_data()
+                    .filter(|bytes| bytes.is_empty())
+                    .map(|_| BlobId::from_canonical_content(b""))
+            })
+            .expect("inline file payload should have blob hash"),
         size_bytes: file_content.len(),
         plugin_checkpoint: None,
         context: FilesystemRowContext {
