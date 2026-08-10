@@ -2752,7 +2752,7 @@ where
     .await?;
     let mut data_by_path = BTreeMap::new();
     for mut row in hydrated.rows {
-        let [Value::Text(path), data] = row.as_mut_slice() else {
+        let [Value::Text(path), data, _content_identity] = row.as_mut_slice() else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "late lix_file content hydration returned an invalid row",

@@ -984,6 +984,11 @@ where
     /// payload validation. Write-side staging remains separate because it may
     /// contain unpublished bytes that are not in the opening view.
     authenticated_blob_reader: Option<Arc<dyn crate::forktree::AuthenticatedBlobReader>>,
+    /// The live transaction owner, when this is a write provider. It is
+    /// retained so statement scans observe the current TransactionStateView
+    /// after each staged write or rollback rather than the constructor
+    /// snapshot.
+    write_ctx: Option<SqlWriteContext<R>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
@@ -997,6 +1002,12 @@ enum LixFilePayloadReader {
 }
 
 impl LixFilePayloadReader {
+    fn authenticated_reader(&self) -> &dyn crate::forktree::AuthenticatedBlobReader {
+        match self {
+            Self::Authenticated(reader) => reader.as_ref(),
+        }
+    }
+
     async fn record_batch(
         &self,
         schema: &SchemaRef,
@@ -1158,6 +1169,7 @@ where
                 &authenticated_blob_reader,
             )),
             authenticated_blob_reader: Some(authenticated_blob_reader),
+            write_ctx: None,
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -1187,6 +1199,7 @@ where
                 &authenticated_blob_reader,
             )),
             authenticated_blob_reader: Some(authenticated_blob_reader),
+            write_ctx: Some(write_ctx.clone()),
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -1249,6 +1262,7 @@ where
                 &authenticated_blob_reader,
             )),
             authenticated_blob_reader: Some(authenticated_blob_reader),
+            write_ctx: None,
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -1277,6 +1291,7 @@ where
                 &authenticated_blob_reader,
             )),
             authenticated_blob_reader: Some(authenticated_blob_reader),
+            write_ctx: Some(write_ctx.clone()),
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -1399,9 +1414,10 @@ where
                                 .to_string(),
                         )
                         })?;
-                    lix_file_record_batch_from_prepared_authenticated(
+                    lix_file_record_batch_from_prepared_authenticated_transaction(
                         &table_schema,
                         authenticated_blob_reader.as_ref(),
+                        &write_ctx,
                         plugin_render.clone(),
                         options.needs_data,
                         prepared,
@@ -2032,6 +2048,7 @@ where
             source: scan_row_source(
                 Arc::clone(&projected_schema),
                 (
+                    self.write_ctx.clone(),
                     Arc::new(self.state_view.clone()),
                     self.blob_reader.clone(),
                     self.plugin_host.clone(),
@@ -2050,6 +2067,7 @@ where
                     limit,
                 ),
                 |(
+                    write_ctx,
                     state_view,
                     blob_reader,
                     plugin_host,
@@ -2067,6 +2085,12 @@ where
                     needs_required_blob_rows,
                     limit,
                 )| async move {
+                    let state_view = write_ctx
+                        .as_ref()
+                        .map(|write_ctx| {
+                            Arc::new(FileStateView::Transaction(write_ctx.state_view().clone()))
+                        })
+                        .unwrap_or(state_view);
                     if let Some(indexed_matches) = indexed_matches.as_ref()
                         && !needs_required_blob_rows
                     {
@@ -2152,15 +2176,27 @@ where
                     } else {
                         None
                     };
-                    let batch = blob_reader
-                        .record_batch(&batch_schema, plugin_render, needs_data, prepared)
+                    let batch = if let Some(write_ctx) = write_ctx.as_ref() {
+                        lix_file_record_batch_from_prepared_authenticated_transaction(
+                            &batch_schema,
+                            blob_reader.authenticated_reader(),
+                            write_ctx,
+                            plugin_render,
+                            needs_data,
+                            prepared,
+                        )
                         .await
-                        .map_err(|error| {
-                            DataFusionError::Context(
-                                "sql2 lix_file batch build failed".to_string(),
-                                Box::new(lix_error_to_datafusion_error(error)),
-                            )
-                        })?;
+                    } else {
+                        blob_reader
+                            .record_batch(&batch_schema, plugin_render, needs_data, prepared)
+                            .await
+                    }
+                    .map_err(|error| {
+                        DataFusionError::Context(
+                            "sql2 lix_file batch build failed".to_string(),
+                            Box::new(lix_error_to_datafusion_error(error)),
+                        )
+                    })?;
                     finish_scan_batch(batch, &filters, projection.as_deref(), limit, "lix_file")
                 },
             ),
@@ -2865,9 +2901,10 @@ where
                         .to_string(),
                 )
             })?;
-        lix_file_record_batch_from_prepared_authenticated(
+        lix_file_record_batch_from_prepared_authenticated_transaction(
             &self.schema,
             authenticated_blob_reader.as_ref(),
+            write_ctx,
             plugin_render,
             true,
             prepared,
@@ -6016,6 +6053,51 @@ async fn lix_file_record_batch_from_prepared_authenticated(
     .await
 }
 
+/// Transaction variant of the authenticated file materializer. The state
+/// rows and path selection come from the live TransactionStateView; inline
+/// unpublished bytes are resolved only through that same transaction's write
+/// owner and are accepted only when their canonical BlobId matches the
+/// selected BlobRef row. All other payloads stay on the retained authenticated
+/// ForkTree reader.
+async fn lix_file_record_batch_from_prepared_authenticated_transaction<R>(
+    schema: &SchemaRef,
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
+    write_ctx: &SqlWriteContext<R>,
+    plugin_render: Option<PluginRenderContext>,
+    load_data: bool,
+    prepared: PreparedLixFileRows,
+) -> Result<RecordBatch, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let projected_columns = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    let needs_data = load_data && projected_columns.contains(&"content");
+    let mut blob_bytes = if needs_data {
+        load_authenticated_blob_bytes_for_files_with_staged(
+            authenticated_blob_reader,
+            write_ctx,
+            &prepared.live_rows,
+            &prepared.file_rows,
+            &prepared.blob_rows,
+        )
+        .await?
+    } else {
+        LoadedBlobBytes::default()
+    };
+    lix_file_record_batch_from_prepared_with_blob_bytes(
+        schema,
+        plugin_render,
+        load_data,
+        prepared,
+        &mut blob_bytes,
+    )
+    .await
+}
+
 async fn lix_file_record_batch_from_prepared_with_blob_bytes(
     schema: &SchemaRef,
     plugin_render: Option<PluginRenderContext>,
@@ -6386,6 +6468,74 @@ async fn load_authenticated_blob_bytes_for_files(
             if *remaining == 0 {
                 keys.push(key);
                 rows.push(row.state_key.clone());
+            }
+            *remaining += 1;
+        }
+    }
+    if !keys.is_empty() {
+        let values = authenticated_blob_reader
+            .load_bytes_for_rows(&rows)
+            .await?
+            .into_vec();
+        if values.len() != keys.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "authenticated blob reader returned {} values for {} requested rows",
+                    values.len(),
+                    keys.len()
+                ),
+            ));
+        }
+        bytes_by_key.extend(keys.into_iter().zip(values));
+    }
+    Ok(LoadedBlobBytes {
+        bytes_by_key,
+        remaining_by_key,
+    })
+}
+
+async fn load_authenticated_blob_bytes_for_files_with_staged<R>(
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
+    write_ctx: &SqlWriteContext<R>,
+    live_rows: &StateRowOwners,
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+) -> Result<LoadedBlobBytes, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    if file_rows.is_empty() || blob_rows.is_empty() {
+        return Ok(LoadedBlobBytes::default());
+    }
+    let mut keys = Vec::new();
+    let mut rows = Vec::new();
+    let mut bytes_by_key = BTreeMap::new();
+    let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
+    for file in file_rows.values() {
+        let key = file.blob_ref_key(live_rows);
+        if let Some(row) = blob_rows.get(&key) {
+            let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
+            if *remaining == 0 {
+                let expected = BlobId::from_hex(&row.blob_hash)?;
+                let staged = live_rows
+                    .row(row.live)
+                    .file_id()
+                    .map(|file_id| {
+                        write_ctx.load_staged_file_bytes_for_owner(
+                            live_rows.row(row.live).branch_id(),
+                            file_id,
+                            expected,
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                if let Some(bytes) = staged {
+                    bytes_by_key.insert(key.clone(), Some(bytes));
+                } else {
+                    keys.push(key);
+                    rows.push(row.state_key.clone());
+                }
             }
             *remaining += 1;
         }
