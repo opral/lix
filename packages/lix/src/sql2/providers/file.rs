@@ -49,8 +49,8 @@ use crate::functions::FunctionProviderHandle;
 use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
     PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
-    plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
-    plugin_storage_archive_file_id,
+    is_reservation_key, plugin_archive_delete_origin, plugin_archive_file_id_matches,
+    plugin_key_from_archive_path, plugin_storage_archive_file_id,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -2273,7 +2273,7 @@ where
             indexed_matches,
             LixFileDmlSourceOptions {
                 needs_data,
-                needs_plugin_ownership: false,
+                needs_plugin_ownership: true,
                 capture_path_resolver_rows: false,
                 use_authenticated_blob_reader: false,
             },
@@ -2327,6 +2327,10 @@ where
                                 || row.untracked
                                 || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
                                 || row.schema_key == BLOB_REF_SCHEMA_KEY
+                                || is_plugin_owned_delete_row(
+                                    source_state.plugin_render.as_ref(),
+                                    &row,
+                                )
                             {
                                 continue;
                             }
@@ -2387,6 +2391,38 @@ where
         self.plan_update_with_post_image(write_ctx, assignments, filters, Some(returning))
             .await
     }
+}
+
+fn is_plugin_owned_delete_row(
+    plugin_render: Option<&PluginRenderContext>,
+    row: &FilesystemStateRow,
+) -> bool {
+    let Some(file_id) = row.file_id.as_deref() else {
+        return false;
+    };
+    let key = FilesystemDescriptorKey::from_context(
+        &FilesystemRowContext {
+            branch_id: row.branch_id.clone(),
+            global: row.global,
+            untracked: row.untracked,
+            file_id: None,
+            metadata: None,
+        },
+        file_id,
+    );
+    let Some(owner) = plugin_render.and_then(|render| render.owner_for_file(&key)) else {
+        return false;
+    };
+    if row.schema_key == "lix_key_value" {
+        return row
+            .entity_pk
+            .as_single_string()
+            .is_ok_and(|key| key == PLUGIN_OWNER_KEY || is_reservation_key(key));
+    }
+    owner
+        .schema_keys()
+        .binary_search_by(|schema_key| schema_key.as_str().cmp(&row.schema_key))
+        .is_ok()
 }
 
 impl<R> LixFileSpec<R>
@@ -12548,6 +12584,77 @@ mod tests {
         let row = staged.state_rows.row(0);
         assert_eq!(row.schema_key, "lix_file_descriptor");
         assert_eq!(row.snapshot, None);
+    }
+
+    #[test]
+    fn file_delete_routes_only_exact_scope_plugin_owned_rows_to_reconciliation() {
+        let branch_id = "01920000-0000-7000-8000-0000000000b1";
+        let file_id = "01920000-0000-7000-8000-000000000472";
+        let owner =
+            PluginFileOwner::new(file_id, "plugin_sentinel", vec!["plugin_note".to_string()])
+                .expect("plugin owner fixture should be valid");
+        let file_key = FilesystemDescriptorKey::from_context(
+            &FilesystemRowContext {
+                branch_id: branch_id.to_string(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata: None,
+            },
+            file_id,
+        );
+        let render = super::PluginRenderContext {
+            host: PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            branches: BTreeMap::new(),
+            owners_by_file: BTreeMap::from([(file_key, owner)]),
+            owner_change_ids_by_file: BTreeMap::new(),
+            session_file_views: None,
+        };
+        let plugin_row = FilesystemStateRow {
+            schema_key: "plugin_note".to_string(),
+            file_id: Some(file_id.to_string()),
+            branch_id: branch_id.to_string(),
+            ..live_file_row(
+                "01920000-0000-7000-8000-000000000099",
+                branch_id,
+                r#"{"id":"01920000-0000-7000-8000-000000000099","value":"note"}"#,
+            )
+        };
+
+        assert!(super::is_plugin_owned_delete_row(
+            Some(&render),
+            &plugin_row
+        ));
+
+        for row in [
+            FilesystemStateRow {
+                branch_id: "01920000-0000-7000-8000-0000000000b2".to_string(),
+                ..plugin_row.clone()
+            },
+            FilesystemStateRow {
+                global: true,
+                ..plugin_row.clone()
+            },
+            FilesystemStateRow {
+                schema_key: "ordinary_file_entity".to_string(),
+                ..plugin_row.clone()
+            },
+        ] {
+            assert!(!super::is_plugin_owned_delete_row(Some(&render), &row));
+        }
+
+        let mut reservation = plugin_row.clone();
+        reservation.schema_key = "lix_key_value".to_string();
+        reservation.entity_pk =
+            crate::entity_pk::EntityPk::single("lix_plugin_create_v1:0123456789abcdef01234567");
+        assert!(super::is_plugin_owned_delete_row(
+            Some(&render),
+            &reservation
+        ));
+        assert!(!super::is_plugin_owned_delete_row(None, &reservation));
+
+        reservation.entity_pk = crate::entity_pk::EntityPk::single("ordinary-key");
+        assert!(!super::is_plugin_owned_delete_row(None, &reservation));
     }
 
     #[test]
