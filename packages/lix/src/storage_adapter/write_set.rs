@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::storage::{
@@ -155,6 +155,12 @@ enum MutationIndex {
 }
 
 #[derive(Hash, PartialEq, Eq)]
+struct ContentAddressedRef<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+}
+
+#[derive(Hash, PartialEq, Eq)]
 struct ArenaRemap {
     shared_buffer_base: usize,
 }
@@ -304,6 +310,7 @@ impl StorageWriteSet {
     /// makes their no-duplicate certificate compositional with the ordinary
     /// write-set validator instead of silently bypassing mutations staged by
     /// another domain writer.
+    ///
     /// Retains one contiguous content-addressed batch while coalescing puts
     /// already present in the same storage-space lane.
     ///
@@ -311,6 +318,47 @@ impl StorageWriteSet {
     /// removes descriptors only, so a tracked-state chunk batch is still
     /// represented by exactly one key buffer and one value buffer after
     /// duplicate content is discarded.
+    pub(crate) fn stage_content_addressed_encoded_batch(
+        &mut self,
+        space: StorageSpace,
+        batch: EncodedMutationBatch,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        let (key_bytes, value_bytes, puts, deletes) = batch.into_parts();
+        debug_assert!(
+            deletes.is_empty(),
+            "content-addressed encoded batches contain puts only"
+        );
+        let puts = {
+            let group = self.group_mut(space);
+            let mut existing = HashSet::with_capacity_and_hasher(
+                group.puts.len().saturating_add(puts.len()),
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            );
+            for put in &group.puts {
+                existing.insert(ContentAddressedRef {
+                    key: group.key_bytes(put.key),
+                    value: group.value_bytes(put.value),
+                });
+            }
+            puts.into_iter()
+                .filter(|put| {
+                    existing.insert(ContentAddressedRef {
+                        key: &key_bytes
+                            [put.key.offset()..put.key.offset().saturating_add(put.key.len())],
+                        value: &value_bytes[put.value.offset()
+                            ..put.value.offset().saturating_add(put.value.len())],
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let batch = EncodedMutationBatch::try_new(key_bytes, value_bytes, puts, deletes)
+            .expect("filtered encoded batch retains validated buffer ranges");
+        self.stage_encoded_batch(space, batch);
+    }
+
     pub fn delete<S, K>(&mut self, space: S, key: K)
     where
         S: IntoStorageSpace,
@@ -1264,6 +1312,70 @@ mod tests {
         );
         let (_, deletes) = backend.deletes.pop().expect("one delete batch");
         assert_eq!(deletes[0].0.as_ptr(), key_probe.as_ptr().wrapping_add(1));
+    }
+
+    #[test]
+    fn content_addressed_encoded_batch_coalesces_without_splitting_arenas() {
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from_static(b"aab"),
+            Bytes::from_static(b"AAB"),
+            vec![
+                EncodedPut {
+                    key: BufferRange::new(0, 1),
+                    value: BufferRange::new(0, 1),
+                },
+                EncodedPut {
+                    key: BufferRange::new(1, 1),
+                    value: BufferRange::new(1, 1),
+                },
+                EncodedPut {
+                    key: BufferRange::new(2, 1),
+                    value: BufferRange::new(2, 1),
+                },
+            ],
+            Vec::new(),
+        )
+        .expect("valid content-addressed batch");
+        let mut writes = StorageWriteSet::new();
+        writes.stage_content_addressed_encoded_batch(space(), batch.clone());
+        writes.stage_content_addressed_encoded_batch(space(), batch);
+
+        let arenas = writes.arena_stats();
+        assert_eq!(writes.stats().staged_puts, 2);
+        assert_eq!(arenas.put_descriptors, 2);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.value_shared_buffers, 1);
+        writes
+            .validate()
+            .expect("identical content-addressed descriptors should coalesce");
+
+        let mut conflicting = StorageWriteSet::new();
+        let first = EncodedMutationBatch::try_new(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"first"),
+            vec![EncodedPut {
+                key: BufferRange::new(0, 3),
+                value: BufferRange::new(0, 5),
+            }],
+            Vec::new(),
+        )
+        .expect("valid first batch");
+        let second = EncodedMutationBatch::try_new(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"other"),
+            vec![EncodedPut {
+                key: BufferRange::new(0, 3),
+                value: BufferRange::new(0, 5),
+            }],
+            Vec::new(),
+        )
+        .expect("valid conflicting batch");
+        conflicting.stage_content_addressed_encoded_batch(space(), first);
+        conflicting.stage_content_addressed_encoded_batch(space(), second);
+        assert!(matches!(
+            conflicting.validate(),
+            Err(StorageWriteSetError::DuplicateMutation { .. })
+        ));
     }
 
     #[tokio::test]
