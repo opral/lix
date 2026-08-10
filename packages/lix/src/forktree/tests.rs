@@ -2056,7 +2056,7 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
         file_id: Some("file"),
         entity_pk: &EntityPk::single("b"),
     });
-    let (masked_rows, _, masked_page_objects) = encode_test_state_entries(
+    let (masked_rows, masked_members, masked_page_objects) = encode_test_state_entries(
         0x62,
         vec![test_state_member(
             "b",
@@ -2083,7 +2083,7 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
     )
     .await
     .expect("local mask update");
-    let transition = branch_transition(&view, state_edit, 0x62).await;
+    let transition = branch_transition_with_members(&view, state_edit, 0x62, masked_members).await;
     let masked_commit_id = transition.semantic_commit.commit_id;
     let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
     publication
