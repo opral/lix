@@ -5,7 +5,6 @@ mod catalog;
 mod change_materialization;
 mod context;
 mod dml;
-mod entity_batch;
 mod entity_projection;
 mod error;
 mod exec;
@@ -43,7 +42,6 @@ pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, SqlChangelogQuerySource,
     SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
 };
-pub(crate) use entity_batch::{CanonicalEntitySnapshotProjection, EntitySnapshotReader};
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]
 pub(crate) use exec::{
