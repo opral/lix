@@ -156,7 +156,12 @@ where
                     rows,
                 })
                 .await?;
-            transaction.stage_branch_ref_intent(&branch_id, Some(source_head), true)?;
+            transaction.stage_branch_ref_intent_from_source(
+                &branch_id,
+                Some(source_head),
+                true,
+                Some(transaction.active_branch_id().to_string()),
+            )?;
 
             Ok(CreateBranchReceipt {
                 id: branch_id,

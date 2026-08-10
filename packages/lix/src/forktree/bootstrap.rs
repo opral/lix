@@ -27,10 +27,10 @@ use crate::storage_adapter::{
 
 use super::model::{
     BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
-    ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1,
-    CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId,
-    SnapshotSelectorV1, SnapshotTargetV1, branch_selector_key, global_selector_key,
-    snapshot_selector_key,
+    ChangeObjectV1, CheckpointBaselineSnapshotV1, CommitCatalogEntry, CommitChangePageV2, CommitId,
+    CommitMemberV1, CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, SnapshotRole,
+    SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1, branch_selector_key,
+    global_selector_key, snapshot_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::state::{
@@ -387,9 +387,32 @@ where
         .insert(main_snapshot_id, main_snapshot_bytes)
         .map_err(LixError::from)?;
 
+    let global_baseline_snapshot = CheckpointBaselineSnapshotV1 {
+        branch_id: global_branch,
+        local_state_root: global_state.root.object_id,
+        semantic_head_commit_object_id: commit_object_id,
+        historical_global_state_root: global_state.root.object_id,
+    };
+    let main_baseline_snapshot = CheckpointBaselineSnapshotV1 {
+        branch_id: main_branch_id,
+        local_state_root: local_state.root.object_id,
+        semantic_head_commit_object_id: commit_object_id,
+        historical_global_state_root: global_state.root.object_id,
+    };
+    let (global_baseline_snapshot_id, global_baseline_snapshot_bytes) =
+        global_baseline_snapshot.encode().map_err(LixError::from)?;
+    let (main_baseline_snapshot_id, main_baseline_snapshot_bytes) =
+        main_baseline_snapshot.encode().map_err(LixError::from)?;
+    objects
+        .insert(global_baseline_snapshot_id, global_baseline_snapshot_bytes)
+        .map_err(LixError::from)?;
+    objects
+        .insert(main_baseline_snapshot_id, main_baseline_snapshot_bytes)
+        .map_err(LixError::from)?;
+
     for (branch_id, snapshot_id) in [
-        (global_branch, global_snapshot_id),
-        (main_branch_id, main_snapshot_id),
+        (global_branch, global_baseline_snapshot_id),
+        (main_branch_id, main_baseline_snapshot_id),
     ] {
         let target = SnapshotTargetV1 {
             role: SnapshotRole::CheckpointBaseline,
@@ -423,9 +446,13 @@ where
     );
     let global_branch_selector_storage_key = branch_selector_key(global_branch).to_vec();
     let main_branch_selector_storage_key = branch_selector_key(main_branch_id).to_vec();
-    for (branch_id, snapshot_id) in [
-        (global_branch, global_snapshot_id),
-        (main_branch_id, main_snapshot_id),
+    for (branch_id, snapshot_id, baseline_snapshot_id) in [
+        (
+            global_branch,
+            global_snapshot_id,
+            global_baseline_snapshot_id,
+        ),
+        (main_branch_id, main_snapshot_id, main_baseline_snapshot_id),
     ] {
         writes.put(
             SELECTOR_SPACE,
@@ -448,7 +475,7 @@ where
             role: SnapshotRole::CheckpointBaseline,
             selector_id,
             branch_id,
-            branch_snapshot_object_id: snapshot_id,
+            branch_snapshot_object_id: baseline_snapshot_id,
             semantic_commit_object_id: commit_object_id,
         }
         .encode()

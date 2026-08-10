@@ -20,12 +20,12 @@ use super::gc_index::{
 use super::merkle::authenticated_merkle_edges;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId,
-    CommitObjectV1, GcEdgeCursorV1, GcLiveBranchEntryV1, GcMarkEntryV2, GcPhaseV2,
-    GcProgressSelectorV2, GcProgressV2, GcQueueEntryV1, GlobalSelectorV1, RepositoryRootV1,
-    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
-    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
-    upload_selector_key,
+    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CheckpointBaselineSnapshotV1, CommitCatalogEntry,
+    CommitChangePageV2, CommitId, CommitObjectV1, GcEdgeCursorV1, GcLiveBranchEntryV1,
+    GcMarkEntryV2, GcPhaseV2, GcProgressSelectorV2, GcProgressV2, GcQueueEntryV1, GlobalSelectorV1,
+    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
+    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
+    snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId, authenticate_object_domain};
 use super::publication::PreparedPublication;
@@ -1072,12 +1072,55 @@ where
         }
         ObjectDomain::SnapshotTarget => {
             let value = SnapshotTargetV1::decode(id, bytes)?;
+            let snapshot_bytes = load_object_bytes(read, value.branch_snapshot_object_id).await?;
+            let snapshot_domain = if value.role == super::model::SnapshotRole::CheckpointBaseline {
+                ObjectDomain::CheckpointBaselineSnapshot
+            } else {
+                ObjectDomain::BranchSnapshot
+            };
+            match snapshot_domain {
+                ObjectDomain::CheckpointBaselineSnapshot => {
+                    let snapshot = CheckpointBaselineSnapshotV1::decode(
+                        value.branch_snapshot_object_id,
+                        &snapshot_bytes,
+                    )?;
+                    if snapshot.branch_id != value.branch_id
+                        || snapshot.semantic_head_commit_object_id
+                            != value.semantic_commit_object_id
+                    {
+                        return Err(corruption(
+                            "checkpoint baseline target does not authenticate its snapshot",
+                        ));
+                    }
+                }
+                ObjectDomain::BranchSnapshot => {
+                    let snapshot =
+                        BranchSnapshotV1::decode(value.branch_snapshot_object_id, &snapshot_bytes)?;
+                    if snapshot.branch_id != value.branch_id
+                        || snapshot.semantic_head_commit_object_id
+                            != value.semantic_commit_object_id
+                    {
+                        return Err(corruption(
+                            "snapshot target does not authenticate its branch snapshot",
+                        ));
+                    }
+                }
+                _ => unreachable!(),
+            }
             edges.extend([
-                typed(
-                    value.branch_snapshot_object_id,
-                    ObjectDomain::BranchSnapshot,
-                ),
+                typed(value.branch_snapshot_object_id, snapshot_domain),
                 typed(value.semantic_commit_object_id, ObjectDomain::Commit),
+            ]);
+        }
+        ObjectDomain::CheckpointBaselineSnapshot => {
+            let value = CheckpointBaselineSnapshotV1::decode(id, bytes)?;
+            edges.extend([
+                typed(value.local_state_root, ObjectDomain::OrderedTreeNode),
+                typed(value.semantic_head_commit_object_id, ObjectDomain::Commit),
+                typed(
+                    value.historical_global_state_root,
+                    ObjectDomain::OrderedTreeNode,
+                ),
             ]);
         }
         ObjectDomain::GcMarkPackV2

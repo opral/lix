@@ -37,8 +37,8 @@ use super::view::SELECTOR_SPACE;
 use super::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, CanonicalUploadId,
-    ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView,
-    CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
+    ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CheckpointBaselineSnapshotV1,
+    CoherentView, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
     CommitTopologyReader, ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId,
     PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
     ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
@@ -116,6 +116,33 @@ fn checkpoint_baseline_target_corruption_fails_closed() {
     assert!(
         SnapshotTargetV1::decode(ObjectId::from_bytes(corrupted_id), &bytes).is_err(),
         "substituting a baseline target object ID must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn publisher_rejects_mismatched_checkpoint_baseline_commit() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("view");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("publication");
+    let snapshot = CheckpointBaselineSnapshotV1 {
+        branch_id: seed.branch_id,
+        local_state_root: view.branch_snapshot().local_state_root,
+        semantic_head_commit_object_id: content_id(0x75),
+        historical_global_state_root: view.branch_snapshot().historical_global_state_root,
+    };
+    let result = publication.publish_checkpoint_baseline_pin_for_test(
+        seed.branch_id,
+        snapshot,
+        view.branch_snapshot().semantic_head_commit_object_id,
+        SelectorExpectation::Absent,
+    );
+    assert!(
+        result.is_err(),
+        "mismatched baseline/commit must fail closed"
     );
 }
 
@@ -5172,7 +5199,11 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
         .into_iter()
         .enumerate()
     {
-        let selector_id = SnapshotSelectorId::from_bytes(raw_id(index as u8 + 2));
+        let selector_id = if role == SnapshotRole::CheckpointBaseline {
+            SnapshotSelectorId::from_bytes(*seed.branch_id.as_bytes())
+        } else {
+            SnapshotSelectorId::from_bytes(raw_id(index as u8 + 2))
+        };
         roles
             .publish_current_snapshot_pin(&view, role, selector_id, SelectorExpectation::Absent)
             .expect("role selector");

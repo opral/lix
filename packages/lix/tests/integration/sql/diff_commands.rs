@@ -190,6 +190,24 @@ simulation_test!(
             ]
         );
 
+        let second_checkpointed = session
+            .execute(
+                "INSERT INTO lix_create_checkpoint (diff_id) \
+             SELECT diff_id FROM lix_working_diff \
+             WHERE schema_key = $1 \
+               AND entity_pk = lix_json($2) \
+             RETURNING commit_id",
+                &[
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("[\"b\"]".to_string()),
+                ],
+            )
+            .await
+            .expect("a second partial checkpoint should preserve its own baseline");
+        assert_eq!(second_checkpointed.rows_affected(), 1);
+        assert_eq!(second_checkpointed.columns(), &["commit_id"]);
+        assert_eq!(second_checkpointed.len(), 1);
+
         let head_before_empty = engine
             .load_branch_head_commit_id(sim.main_branch_id())
             .await

@@ -58,6 +58,7 @@ pub(super) enum ObjectDomain {
     BlobMerkleLeafV1 = 18,
     BlobMerkleInternalV1 = 19,
     CommitChangePageV2 = 20,
+    CheckpointBaselineSnapshot = 21,
 }
 
 impl ObjectDomain {
@@ -81,6 +82,7 @@ impl ObjectDomain {
             18 => Ok(Self::BlobMerkleLeafV1),
             19 => Ok(Self::BlobMerkleInternalV1),
             20 => Ok(Self::CommitChangePageV2),
+            21 => Ok(Self::CheckpointBaselineSnapshot),
             _ => Err(corruption(format!("unknown object domain {value}"))),
         }
     }

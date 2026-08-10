@@ -685,6 +685,7 @@ pub(crate) struct BranchRefPublicationIntent {
     pub(crate) branch_id: String,
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) create: bool,
+    pub(crate) source_branch_id: Option<String>,
     pub(crate) change_id: ChangeId,
     pub(crate) updated_at: LixTimestamp,
 }

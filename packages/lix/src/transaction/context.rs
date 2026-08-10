@@ -6987,11 +6987,22 @@ where
         commit_id: Option<CommitId>,
         create: bool,
     ) -> Result<(), LixError> {
+        self.stage_branch_ref_intent_from_source(branch_id, commit_id, create, None)
+    }
+
+    pub(crate) fn stage_branch_ref_intent_from_source(
+        &mut self,
+        branch_id: &str,
+        commit_id: Option<CommitId>,
+        create: bool,
+        source_branch_id: Option<String>,
+    ) -> Result<(), LixError> {
         self.staged_writes
             .stage_branch_ref_intent(BranchRefPublicationIntent {
                 branch_id: branch_id.to_owned(),
                 commit_id,
                 create,
+                source_branch_id,
                 change_id: ChangeId::from(self.functions.call_uuid_v7()),
                 updated_at: self.functions.call_timestamp(),
             })

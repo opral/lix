@@ -16,9 +16,10 @@ use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
     BlobChunkV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry,
-    ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
-    branch_selector_key, global_selector_key, snapshot_selector_key,
+    ChangeId, ChangeObjectV1, CheckpointBaselineSnapshotV1, CommitCatalogEntry, CommitId,
+    CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId,
+    SnapshotSelectorV1, SnapshotTargetV1, branch_selector_key, global_selector_key,
+    snapshot_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 
@@ -1551,9 +1552,15 @@ where
         let canonical_branch = CanonicalBranchId::from_bytes(*branch_uuid.as_bytes());
         let selector_id = SnapshotSelectorId::from_bytes(*canonical_branch.as_bytes());
         let key = snapshot_selector_key(SnapshotRole::CheckpointBaseline, selector_id);
-        let Some(raw_selector) = branch_view.load_selector_value(&key).await? else {
-            return Ok(None);
-        };
+        let raw_selector = branch_view
+            .load_selector_value(&key)
+            .await?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "checkpoint baseline selector is absent",
+                )
+            })?;
         let selector = SnapshotSelectorV1::decode(&raw_selector).map_err(LixError::from)?;
         if selector.role != SnapshotRole::CheckpointBaseline || selector.selector_id != selector_id
         {
@@ -1581,8 +1588,9 @@ where
             .load_object_bytes(target.branch_snapshot_object_id)
             .await
             .map_err(LixError::from)?;
-        let snapshot = BranchSnapshotV1::decode(target.branch_snapshot_object_id, &snapshot_bytes)
-            .map_err(LixError::from)?;
+        let snapshot =
+            CheckpointBaselineSnapshotV1::decode(target.branch_snapshot_object_id, &snapshot_bytes)
+                .map_err(LixError::from)?;
         if snapshot.branch_id != canonical_branch {
             return Err(crate::LixError::new(
                 crate::LixError::CODE_STORAGE_ERROR,

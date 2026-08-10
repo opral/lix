@@ -849,9 +849,11 @@ where
                         ),
                     )
                 })?;
-            let source_branch_id = uuid::Uuid::from_bytes(*view.branch_id().as_bytes()).to_string();
+            let source_branch_id = intent.source_branch_id.as_deref().ok_or_else(|| {
+                writer_error("branch creation has no authenticated source branch")
+            })?;
             let baseline_commit_id = ForkTreeReadFacade::new(view.retained_read().clone())
-                .latest_checkpoint_for_branch(source_head, &source_branch_id)
+                .latest_checkpoint_for_branch(source_head, source_branch_id)
                 .await?
                 .ok_or_else(|| writer_error("branch creation source has no checkpoint baseline"))?;
             let baseline_commit = load_commit(view, forktree_commit_id(baseline_commit_id))
@@ -1654,13 +1656,12 @@ where
         latest_ref_change_object_id: Some(ref_object_id),
         historical_global_state_root: final_global_state_root,
     };
-    let (final_branch_snapshot_object_id, _) = final_branch_snapshot.encode()?;
     for checkpoint in &prepared.checkpoint_publications {
         // Empty checkpoints still advance the authenticated checkpoint
         // baseline.  Otherwise the next empty checkpoint would compare its
         // head with the prior non-empty baseline, incorrectly rotating the
         // recovery selector and eventually dropping the retained interval.
-        let (checkpoint_object_id, _) = staged_commits
+        let (_, checkpoint_commit) = staged_commits
             .get(&checkpoint.checkpoint_commit_id)
             .ok_or_else(|| writer_error("checkpoint baseline commit was not staged"))?;
         let selector_id = SnapshotSelectorId::from_bytes(*view.branch_id().as_bytes());
@@ -1670,14 +1671,9 @@ where
             .await?
             .map(SelectorExpectation::Equals)
             .unwrap_or(SelectorExpectation::Absent);
-        publication.publish_snapshot_pin_to_commit(
-            SnapshotRole::CheckpointBaseline,
-            selector_id,
-            view.branch_id(),
-            final_branch_snapshot_object_id,
-            *checkpoint_object_id,
-            expected,
-        )?;
+        publication
+            .publish_checkpoint_baseline_pin(view, checkpoint_commit, expected)
+            .map_err(LixError::from)?;
     }
     let transition = OrderedBranchHistoryTransition {
         state_edits,

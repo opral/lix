@@ -12,10 +12,10 @@ use super::blob::{AuthenticatedBlobRef, CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeObjectV1, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
-    snapshot_selector_key, upload_selector_key,
+    ChangeCatalogOwner, ChangeObjectV1, CheckpointBaselineSnapshotV1, CommitMemberV1,
+    CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1, branch_selector_key,
+    gc_progress_selector_key, global_selector_key, snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, StateTreeEdit};
@@ -464,6 +464,82 @@ impl PreparedPublication {
         Ok(id)
     }
 
+    fn stage_checkpoint_baseline_snapshot(
+        &mut self,
+        value: CheckpointBaselineSnapshotV1,
+    ) -> Result<ObjectId, StorageError> {
+        let (id, bytes) = value.encode()?;
+        self.stage_encoded_object(id, bytes)?;
+        Ok(id)
+    }
+
+    fn publish_checkpoint_baseline_pin_for_branch(
+        &mut self,
+        branch_id: super::model::CanonicalBranchId,
+        snapshot: CheckpointBaselineSnapshotV1,
+        commit_object_id: ObjectId,
+        expected: SelectorExpectation,
+    ) -> Result<ObjectId, StorageError> {
+        if snapshot.branch_id != branch_id
+            || snapshot.semantic_head_commit_object_id != commit_object_id
+        {
+            return Err(corruption(
+                "checkpoint baseline snapshot does not match its commit and branch",
+            ));
+        }
+        let snapshot_id = self.stage_checkpoint_baseline_snapshot(snapshot)?;
+        self.publish_snapshot_pin_to_commit(
+            super::model::SnapshotRole::CheckpointBaseline,
+            super::model::SnapshotSelectorId::from_bytes(*branch_id.as_bytes()),
+            branch_id,
+            snapshot_id,
+            commit_object_id,
+            expected,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish_checkpoint_baseline_pin_for_test(
+        &mut self,
+        branch_id: super::model::CanonicalBranchId,
+        snapshot: CheckpointBaselineSnapshotV1,
+        commit_object_id: ObjectId,
+        expected: SelectorExpectation,
+    ) -> Result<ObjectId, StorageError> {
+        self.publish_checkpoint_baseline_pin_for_branch(
+            branch_id,
+            snapshot,
+            commit_object_id,
+            expected,
+        )
+    }
+
+    /// Publishes a checkpoint baseline from the authenticated commit being
+    /// staged. The baseline target is constructed only after its snapshot,
+    /// commit identity, branch, and roots agree in this publication owner.
+    pub(crate) fn publish_checkpoint_baseline_pin<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        commit: &CommitObjectV1,
+        expected: SelectorExpectation,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        let (commit_object_id, _) = commit.encode()?;
+        self.publish_checkpoint_baseline_pin_for_branch(
+            view.branch_id(),
+            CheckpointBaselineSnapshotV1 {
+                branch_id: view.branch_id(),
+                local_state_root: commit.local_state_root,
+                semantic_head_commit_object_id: commit_object_id,
+                historical_global_state_root: commit.global_state_root,
+            },
+            commit_object_id,
+            expected,
+        )
+    }
+
     /// Publishes the selector for a newly-created branch into this same
     /// transaction-owned publication. The source commit is already
     /// authenticated through the caller's retained view; its state roots are
@@ -524,14 +600,12 @@ impl PreparedPublication {
         };
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
         let (baseline_commit_object_id, _) = baseline_commit.encode()?;
-        let baseline_snapshot = BranchSnapshotV1 {
+        let baseline_snapshot = CheckpointBaselineSnapshotV1 {
             branch_id,
             local_state_root: baseline_commit.local_state_root,
             semantic_head_commit_object_id: baseline_commit_object_id,
-            latest_ref_change_object_id: None,
             historical_global_state_root: baseline_commit.global_state_root,
         };
-        let baseline_snapshot_id = self.stage_branch_snapshot(baseline_snapshot)?;
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
         self.stage_catalog_edit(change_catalog_edit)?;
         self.stage_repository_root(RepositoryRootV1 {
@@ -547,11 +621,9 @@ impl PreparedPublication {
             },
             SelectorExpectation::Absent,
         )?;
-        self.publish_snapshot_pin_to_commit(
-            super::model::SnapshotRole::CheckpointBaseline,
-            super::model::SnapshotSelectorId::from_bytes(*branch_id.as_bytes()),
+        self.publish_checkpoint_baseline_pin_for_branch(
             branch_id,
-            baseline_snapshot_id,
+            baseline_snapshot,
             baseline_commit_object_id,
             SelectorExpectation::Absent,
         )?;
@@ -1133,7 +1205,7 @@ impl PreparedPublication {
 
     /// Pins the exact selected branch snapshot/head under any retained-root
     /// role without letting a caller supply an unrelated object edge.
-    pub(crate) fn publish_snapshot_pin_to_commit(
+    fn publish_snapshot_pin_to_commit(
         &mut self,
         role: super::model::SnapshotRole,
         selector_id: super::model::SnapshotSelectorId,
@@ -1142,6 +1214,28 @@ impl PreparedPublication {
         semantic_commit_object_id: ObjectId,
         expected: SelectorExpectation,
     ) -> Result<ObjectId, StorageError> {
+        if role == super::model::SnapshotRole::CheckpointBaseline {
+            if selector_id != super::model::SnapshotSelectorId::from_bytes(*branch_id.as_bytes()) {
+                return Err(corruption(
+                    "checkpoint baseline selector does not match its branch",
+                ));
+            }
+            let raw_snapshot =
+                self.object_puts
+                    .get(branch_snapshot_object_id)
+                    .ok_or_else(|| {
+                        corruption("checkpoint baseline snapshot was not staged by the publisher")
+                    })?;
+            let snapshot =
+                CheckpointBaselineSnapshotV1::decode(branch_snapshot_object_id, raw_snapshot)?;
+            if snapshot.branch_id != branch_id
+                || snapshot.semantic_head_commit_object_id != semantic_commit_object_id
+            {
+                return Err(corruption(
+                    "checkpoint baseline target does not authenticate its snapshot and commit",
+                ));
+            }
+        }
         let selector_generation = match &expected {
             SelectorExpectation::Absent => 1,
             SelectorExpectation::Equals(raw_selector) => {
@@ -1187,6 +1281,30 @@ impl PreparedPublication {
     where
         R: StorageAdapterRead,
     {
+        if role == super::model::SnapshotRole::CheckpointBaseline {
+            if selector_id
+                != super::model::SnapshotSelectorId::from_bytes(*view.branch_id().as_bytes())
+            {
+                return Err(corruption(
+                    "checkpoint baseline selector does not match its branch",
+                ));
+            }
+            return self.publish_checkpoint_baseline_pin_for_branch(
+                view.branch_id(),
+                CheckpointBaselineSnapshotV1 {
+                    branch_id: view.branch_id(),
+                    local_state_root: view.branch_snapshot().local_state_root,
+                    semantic_head_commit_object_id: view
+                        .branch_snapshot()
+                        .semantic_head_commit_object_id,
+                    historical_global_state_root: view
+                        .branch_snapshot()
+                        .historical_global_state_root,
+                },
+                view.branch_snapshot().semantic_head_commit_object_id,
+                expected,
+            );
+        }
         self.publish_snapshot_pin_to_commit(
             role,
             selector_id,

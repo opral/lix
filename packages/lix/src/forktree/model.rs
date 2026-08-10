@@ -132,6 +132,58 @@ pub(crate) struct BranchSnapshotV1 {
     pub(crate) historical_global_state_root: ObjectId,
 }
 
+/// Authenticated snapshot payload used only by a checkpoint-baseline target.
+/// Unlike the moving branch snapshot, it deliberately has no RefChange edge:
+/// the checkpoint commit itself is the retained semantic baseline, while the
+/// ordinary branch selector remains the sole owner of the moving RefChange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointBaselineSnapshotV1 {
+    pub(crate) branch_id: CanonicalBranchId,
+    pub(crate) local_state_root: ObjectId,
+    pub(crate) semantic_head_commit_object_id: ObjectId,
+    pub(crate) historical_global_state_root: ObjectId,
+}
+
+impl CheckpointBaselineSnapshotV1 {
+    pub(crate) fn encode(self) -> Result<(ObjectId, Bytes), StorageError> {
+        validate_nonzero_ids(
+            "checkpoint baseline snapshot",
+            &[
+                self.local_state_root,
+                self.semantic_head_commit_object_id,
+                self.historical_global_state_root,
+            ],
+        )?;
+        encode_object(ObjectDomain::CheckpointBaselineSnapshot, |encoder| {
+            encoder.fixed(self.branch_id.as_bytes());
+            encode_id(encoder, self.local_state_root);
+            encode_id(encoder, self.semantic_head_commit_object_id);
+            encode_id(encoder, self.historical_global_state_root);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::CheckpointBaselineSnapshot, bytes)?;
+        let value = Self {
+            branch_id: CanonicalBranchId::from_bytes(decoder.fixed()?),
+            local_state_root: decode_id(&mut decoder)?,
+            semantic_head_commit_object_id: decode_id(&mut decoder)?,
+            historical_global_state_root: decode_id(&mut decoder)?,
+        };
+        decoder.finish()?;
+        validate_nonzero_ids(
+            "checkpoint baseline snapshot",
+            &[
+                value.local_state_root,
+                value.semantic_head_commit_object_id,
+                value.historical_global_state_root,
+            ],
+        )?;
+        Ok(value)
+    }
+}
+
 impl BranchSnapshotV1 {
     pub(crate) fn encode(self) -> Result<(ObjectId, Bytes), StorageError> {
         validate_nonzero_ids(
