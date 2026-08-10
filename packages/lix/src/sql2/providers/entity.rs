@@ -386,7 +386,7 @@ fn derived_surface_reader(
         )
     })?;
     let derived_live_state: Arc<dyn LiveStateReader> =
-        Arc::new(crate::commit_graph::CommitGraphLiveStateReader::new(
+        Arc::new(crate::commit_graph::CommitGraphDerivedSurfaceReader::new(
             schema_key,
             Arc::clone(commit_graph),
             Arc::clone(branch_ref),

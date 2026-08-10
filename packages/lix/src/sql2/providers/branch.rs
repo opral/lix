@@ -587,9 +587,7 @@ impl UpsertSupport for BranchSpec {
         // Build fresh readers rather than reuse the session's cached branch
         // ref: a conflict update may have just staged a new branch head.
         let live_state: Arc<dyn LiveStateReader> = Arc::new(write_ctx.clone());
-        let branch_ref: Arc<dyn BranchRefReader> = Arc::new(
-            crate::sql2::WriteContextBranchRefReader::new(write_ctx.clone()),
-        );
+        let branch_ref: Arc<dyn BranchRefReader> = Arc::new(write_ctx.clone());
         let rows = load_branch_rows(live_state, branch_ref, BranchHeadReadStrategy::Point)
             .await
             .map_err(lix_error_to_datafusion_error)?;

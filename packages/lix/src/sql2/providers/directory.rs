@@ -2529,9 +2529,7 @@ mod tests {
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
         let live_state = Arc::new(write_ctx.clone());
-        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
-            write_ctx.clone(),
-        ));
+        let branch_ref = Arc::new(write_ctx.clone());
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let spec = match branch_binding {
             BranchBinding::Active { .. } => LixDirectorySpec::active_branch(
@@ -2560,9 +2558,7 @@ mod tests {
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
         let live_state = Arc::new(write_ctx.clone());
-        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
-            write_ctx.clone(),
-        ));
+        let branch_ref = Arc::new(write_ctx.clone());
         let spec = LixDirectorySpec::active_branch(
             write_ctx.active_branch_id(),
             live_state,
@@ -3635,9 +3631,7 @@ mod tests {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let live_state = Arc::new(write_ctx.clone());
-        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
-            write_ctx.clone(),
-        ));
+        let branch_ref = Arc::new(write_ctx.clone());
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let provider = SpecTableProvider::new(Arc::new(LixDirectorySpec::active_branch(
             write_ctx.active_branch_id(),

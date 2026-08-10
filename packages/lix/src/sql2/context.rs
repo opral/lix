@@ -563,22 +563,10 @@ impl FilesystemPathIndexReader for SqlWriteContext {
     }
 }
 
-pub(crate) struct WriteContextBranchRefReader {
-    ctx: SqlWriteContext,
-}
-
-impl WriteContextBranchRefReader {
-    pub(crate) fn new(ctx: SqlWriteContext) -> Self {
-        Self { ctx }
-    }
-}
-
 #[async_trait]
-impl BranchRefReader for WriteContextBranchRefReader {
+impl BranchRefReader for SqlWriteContext {
     async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-        Ok(self
-            .ctx
-            .load_branch_head(branch_id)
+        Ok(SqlWriteContext::load_branch_head(self, branch_id)
             .await?
             .map(|commit_id| BranchHead {
                 branch_id: branch_id.to_string(),

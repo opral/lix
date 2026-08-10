@@ -7146,7 +7146,7 @@ mod tests {
     };
     use crate::sql2::dml::InsertSink;
     use crate::sql2::providers::upsert::UpsertConflictTarget;
-    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext, WriteContextBranchRefReader};
+    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
@@ -9504,7 +9504,7 @@ mod tests {
     }
 
     fn file_dml_spec(write_ctx: SqlWriteContext) -> LixFileSpec {
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(write_ctx.clone());
         LixFileSpec::active_branch_with_write(
             write_ctx,
             branch_ref,

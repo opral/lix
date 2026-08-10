@@ -42,7 +42,6 @@ pub(crate) use catalog::PublicCatalog;
 pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, SqlChangelogQuerySource,
     SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextBranchRefReader,
 };
 pub(crate) use entity_batch::{CanonicalEntitySnapshotProjection, EntitySnapshotReader};
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;

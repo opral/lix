@@ -8755,7 +8755,7 @@ mod transaction_validation_reader_tests {
         assert!(projection.contains("&'a self"));
         assert!(projection.contains("CommitGraphStoreReader<&'a ForkTreeReadFacade"));
         assert!(projection.contains("scan_validation_derived_rows"));
-        assert!(!projection.contains("CommitGraphLiveStateReader"));
+        assert!(!projection.contains("CommitGraphDerivedSurfaceReader"));
         assert!(!projection.contains("derived_validation_reader"));
         assert!(!projection.contains("branch_ctx.ref_reader"));
         assert!(!projection.contains("LiveStateStoreReader"));
@@ -8870,7 +8870,7 @@ mod transaction_validation_reader_tests {
         assert!(resolver.contains("ForkTreeReadFacade<impl StorageAdapterRead + 'static>"));
         assert!(resolver.contains("forktree\n        .collection_generation("));
         assert!(!resolver.contains("transaction_reader("));
-        assert!(!resolver.contains("LiveStateContext"));
+        assert!(!resolver.contains(concat!("LiveState", "Context")));
 
         let loader_start = source
             .rfind("async fn load_collection_generation(")
