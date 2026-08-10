@@ -953,3 +953,59 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn native_row(schema_key: &str, snapshot: &str) -> NativeValidationRow {
+        NativeValidationRow {
+            key: StateKey {
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+                entity_pk: EntityPk::single("id"),
+            },
+            branch_id: "branch".to_owned(),
+            global: false,
+            untracked: false,
+            snapshot: Some(SharedStr::from(snapshot)),
+            metadata: None,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn unique_pointer_groups_are_canonical_and_null_is_absent() {
+        let snapshot = serde_json::json!({"id": "a", "optional": null});
+        assert_eq!(
+            pointer_group_value(&snapshot, &[vec!["id".to_owned()]]),
+            Some(vec!["\"a\"".to_owned()])
+        );
+        assert_eq!(
+            pointer_group_value(&snapshot, &[vec!["optional".to_owned()]]),
+            None
+        );
+    }
+
+    #[test]
+    fn filesystem_descriptor_namespace_decodes_directory_parent_and_name() {
+        let row = native_row(
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+            r#"{"id":"child","parent_id":"parent","name":"entry"}"#,
+        );
+        assert_eq!(
+            descriptor_namespace_parts(&row).expect("valid descriptor"),
+            Some((Some("parent".to_owned()), "entry".to_owned()))
+        );
+    }
+
+    #[test]
+    fn filesystem_descriptor_namespace_rejects_non_string_name() {
+        let row = native_row(
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            r#"{"id":"file","directory_id":null,"name":7}"#,
+        );
+        let error = descriptor_namespace_parts(&row).expect_err("invalid name must fail");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+    }
+}
