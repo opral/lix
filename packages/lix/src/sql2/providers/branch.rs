@@ -23,7 +23,9 @@ use crate::branch::{
 };
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
-use crate::forktree::{StateCell, StateKeyRef, decode_state_key, encode_state_key};
+use crate::forktree::{
+    StateCell, StateKeyRef, decode_state_key, encode_state_entity_prefix_bounds, encode_state_key,
+};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::write_normalization::{
@@ -209,6 +211,7 @@ where
             .saturating_mul(2);
         let mut rows = RawWriteBatch::with_capacity(row_capacity);
         let mut branch_ref_intents = Vec::new();
+        let mut branch_rows_for_validation = Vec::new();
         let mut count = 0u64;
         for batch in batches {
             let branch_rows = branch_insert_rows_from_batch(&batch, &default_commit_id)?;
@@ -218,6 +221,7 @@ where
                 })?)
                 .ok_or_else(|| DataFusionError::Execution("INSERT row count overflow".into()))?;
             for row in branch_rows {
+                branch_rows_for_validation.push(row.clone());
                 branch_ref_intents.push(push_branch_descriptor_row(
                     &mut rows,
                     row,
@@ -226,6 +230,9 @@ where
                 ));
             }
         }
+
+        reject_branch_identity_conflicts(write_ctx, &branch_rows_for_validation, &BTreeSet::new())
+            .await?;
 
         if !rows.is_empty() {
             write_ctx
@@ -292,6 +299,8 @@ where
                     }
                     post_rows.extend(branch_rows);
                 }
+
+                reject_branch_identity_conflicts(&write_ctx, &post_rows, &BTreeSet::new()).await?;
 
                 if !stage_rows.is_empty() {
                     write_ctx
@@ -382,6 +391,12 @@ where
                     let branch_rows =
                         branch_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
                     reject_protected_branch_updates(&branch_rows)?;
+                    let ignored_ids = branch_rows
+                        .iter()
+                        .map(|row| row.id.clone())
+                        .collect::<BTreeSet<_>>();
+                    reject_branch_identity_conflicts(&write_ctx, &branch_rows, &ignored_ids)
+                        .await?;
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("UPDATE row count overflow".to_string())
                     })?;
@@ -434,6 +449,12 @@ where
                     let branch_rows =
                         branch_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
                     reject_protected_branch_updates(&branch_rows)?;
+                    let ignored_ids = branch_rows
+                        .iter()
+                        .map(|row| row.id.clone())
+                        .collect::<BTreeSet<_>>();
+                    reject_branch_identity_conflicts(&write_ctx, &branch_rows, &ignored_ids)
+                        .await?;
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("UPDATE row count overflow".to_string())
                     })?;
@@ -527,6 +548,7 @@ where
                 )
             })?;
         let branch_rows = branch_insert_rows_from_batch(batch, &default_commit_id)?;
+        reject_branch_identity_conflicts(write_ctx, &branch_rows, &BTreeSet::new()).await?;
         let mut rows = RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
         let mut branch_ref_intents = Vec::new();
         for row in branch_rows {
@@ -689,13 +711,18 @@ where
 
     async fn apply_conflict_update(
         &self,
-        _write_ctx: &SqlWriteContext<R>,
+        write_ctx: &SqlWriteContext<R>,
         augmented: &RecordBatch,
         assignments: &[(String, Arc<dyn PhysicalExpr>)],
     ) -> Result<StagedUpsert> {
         let branch_rows =
             branch_update_rows_from_batch(augmented, assignments, &lix_branch_schema())?;
         reject_protected_branch_updates(&branch_rows)?;
+        let ignored_ids = branch_rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<BTreeSet<_>>();
+        reject_branch_identity_conflicts(write_ctx, &branch_rows, &ignored_ids).await?;
         let mut rows = RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
         let mut branch_ref_intents = Vec::new();
         for row in branch_rows {
@@ -732,6 +759,107 @@ static LIX_BRANCH_COLS: ColumnTable<BranchRow> = ColumnTable {
         ),
     ],
 };
+
+/// Branch descriptors and branch selectors are separate authenticated owners,
+/// but the public `lix_branch` surface still has one relational identity. Do
+/// the bounded descriptor checks before staging the selector intent so SQL
+/// exposes the branch table's unique contracts instead of a later generic
+/// transaction conflict.
+async fn reject_branch_identity_conflicts<R>(
+    write_ctx: &SqlWriteContext<R>,
+    rows: &[BranchRow],
+    ignored_ids: &BTreeSet<String>,
+) -> Result<()>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        if !ids.insert(row.id.as_str()) {
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "unique constraint violation on table 'lix_branch' id '{}'",
+                    row.id
+                ),
+            )));
+        }
+    }
+
+    if !rows.is_empty() {
+        let keys = rows
+            .iter()
+            .map(|row| {
+                let entity_pk = EntityPk::uuid_from_canonical(&row.id).map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "branch id must be a canonical UUID: {error}"
+                    ))
+                })?;
+                Ok(encode_state_key(StateKeyRef {
+                    schema_key: BRANCH_DESCRIPTOR_SCHEMA_KEY,
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let existing = write_ctx
+            .state_view()
+            .points(&keys, false)
+            .await
+            .map_err(|error| lix_error_to_datafusion_error(error.into()))?;
+        for (row, existing) in rows.iter().zip(existing) {
+            if existing.is_some() && !ignored_ids.contains(&row.id) {
+                return Err(lix_error_to_datafusion_error(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "unique constraint violation on table 'lix_branch' id '{}'",
+                        row.id
+                    ),
+                )));
+            }
+        }
+    }
+
+    let empty_pk = EntityPk {
+        components: crate::entity_pk::EntityPkComponents::Empty,
+    };
+    let bounds = encode_state_entity_prefix_bounds(BRANCH_DESCRIPTOR_SCHEMA_KEY, &empty_pk);
+    let existing_rows = write_ctx
+        .state_view()
+        .range(Some(&bounds.lower), bounds.upper.as_deref(), None, false)
+        .await
+        .map_err(|error| lix_error_to_datafusion_error(error.into()))?;
+    let mut existing_names = BTreeMap::<String, String>::new();
+    for row in existing_rows {
+        let key = decode_state_key(&row.key).map_err(lix_error_to_datafusion_error)?;
+        let id = key
+            .entity_pk
+            .as_single_string_owned()
+            .map_err(lix_error_to_datafusion_error)?;
+        let descriptor = parse_descriptor(&row, &id).map_err(lix_error_to_datafusion_error)?;
+        existing_names.insert(descriptor.name, descriptor.id);
+    }
+
+    let mut proposed_names = BTreeMap::<String, String>::new();
+    for row in rows {
+        if let Some(existing_id) = existing_names
+            .get(&row.name)
+            .or_else(|| proposed_names.get(&row.name))
+            && existing_id != &row.id
+            && !ignored_ids.contains(existing_id)
+        {
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "unique constraint violation on table 'lix_branch' property '/name': branch name '{}' already exists",
+                    row.name
+                ),
+            )));
+        }
+        proposed_names.insert(row.name.clone(), row.id.clone());
+    }
+    Ok(())
+}
 
 fn branch_batch_error(error: ColumnTableError) -> DataFusionError {
     match error {

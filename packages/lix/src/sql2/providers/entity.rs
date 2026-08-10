@@ -14,9 +14,10 @@ use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 
-use crate::branch::BranchRefReader;
+use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchRefReader};
 use crate::changelog::CommitRecord;
 use crate::commit_graph::CommitGraphReader;
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{StateCell, StateKeyRef, StateValue, decode_state_key, encode_state_key};
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
@@ -354,6 +355,9 @@ where
         &self,
         request: &EntityScanRequest,
     ) -> Result<Vec<EntityStateSlot>, LixError> {
+        if self.spec.schema_key == BRANCH_REF_SCHEMA_KEY {
+            return self.scan_branch_ref_slots(request).await;
+        }
         if let Some(view) = &self.state_view {
             scan_slots_forktree(view, request).await
         } else if let Some(write_ctx) = &self.write_ctx {
@@ -370,6 +374,9 @@ where
         &self,
         request: &EntityExactBatchRequest,
     ) -> Result<Vec<Option<EntityStateSlot>>, LixError> {
+        if self.spec.schema_key == BRANCH_REF_SCHEMA_KEY {
+            return self.exact_branch_ref_slots(request).await;
+        }
         if let Some(view) = &self.state_view {
             exact_forktree(view, request).await
         } else if let Some(write_ctx) = &self.write_ctx {
@@ -380,6 +387,57 @@ where
                 "entity provider has no retained native state view",
             ))
         }
+    }
+
+    /// Branch refs are selector/control-plane facts, not tracked or untracked
+    /// state rows. Project the authenticated selector + RefChange metadata
+    /// through the native entity surface instead of scanning a state root that
+    /// cannot contain these rows. The synthetic StateRow is only an Arrow
+    /// boundary carrier; its IDs, timestamps, and head are all sourced from
+    /// the same retained BranchRefReader batch.
+    async fn scan_branch_ref_slots(
+        &self,
+        request: &EntityScanRequest,
+    ) -> Result<Vec<EntityStateSlot>, LixError> {
+        let rows = if let Some(ids) = branch_ref_ids_from_request(request) {
+            self.branch_ref.load_head_metadata_batch(&ids).await?
+        } else {
+            self.branch_ref.scan_head_metadata().await?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(head, metadata)| {
+                branch_ref_state_slot(&head.branch_id, head.commit_id, metadata)
+            })
+            .collect())
+    }
+
+    async fn exact_branch_ref_slots(
+        &self,
+        request: &EntityExactBatchRequest,
+    ) -> Result<Vec<Option<EntityStateSlot>>, LixError> {
+        let ids = request
+            .rows
+            .iter()
+            .map(|row| branch_ref_id_from_entity_pk(&row.entity_pk))
+            .collect::<Vec<_>>();
+        let requested_ids = ids.iter().flatten().cloned().collect::<Vec<_>>();
+        let candidates = self
+            .branch_ref
+            .load_head_metadata_batch(&requested_ids)
+            .await?
+            .into_iter()
+            .map(|(head, metadata)| {
+                (
+                    head.branch_id.clone(),
+                    branch_ref_state_slot(&head.branch_id, head.commit_id, metadata),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        Ok(ids
+            .into_iter()
+            .map(|id| id.and_then(|id| candidates.get(&id).cloned()))
+            .collect())
     }
 
     async fn commit_slots(&self) -> Result<Vec<EntityStateSlot>, LixError> {
@@ -889,6 +947,61 @@ fn commit_projection_row(
     })
 }
 
+fn branch_ref_id_from_entity_pk(entity_pk: &EntityPk) -> Option<String> {
+    let id = entity_pk.as_single_string_owned().ok()?;
+    EntityPk::uuid_from_canonical(&id).ok().map(|_| id)
+}
+
+fn branch_ref_ids_from_request(request: &EntityScanRequest) -> Option<Vec<String>> {
+    if request.filter.entity_pks.is_empty() {
+        return None;
+    }
+    Some(
+        request
+            .filter
+            .entity_pks
+            .iter()
+            .filter_map(branch_ref_id_from_entity_pk)
+            .collect(),
+    )
+}
+
+fn branch_ref_state_slot(
+    branch_id: &str,
+    commit_id: crate::changelog::CommitId,
+    metadata: crate::branch::BranchRefMetadata,
+) -> EntityStateSlot {
+    let entity_pk = EntityPk::uuid_from_canonical(branch_id)
+        .expect("authenticated branch ref IDs are canonical UUIDs");
+    let key = encode_state_key(StateKeyRef {
+        schema_key: BRANCH_REF_SCHEMA_KEY,
+        file_id: None,
+        entity_pk: &entity_pk,
+    });
+    let snapshot = serde_json::json!({
+        "id": branch_id,
+        "commit_id": commit_id.to_string(),
+    })
+    .to_string();
+    EntityStateSlot::Tracked(StateRow {
+        key,
+        value: StateValue {
+            change_id: metadata.change_id,
+            commit_id,
+            // RefChange metadata does not expose an original creation time;
+            // the public control row only promises a stable value, so use the
+            // canonical zero timestamp while retaining authenticated updates.
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            updated_at: metadata.updated_at,
+            cell: StateCell::Value(crate::common::SharedStr::from(snapshot)),
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        },
+        source: StateRowSource::Global,
+    })
+}
+
 #[async_trait]
 impl<R> TableSpec<R> for EntitySpec<R>
 where
@@ -931,7 +1044,7 @@ where
         limit: Option<usize>,
         props: &ExecutionProps,
     ) -> Result<PlannedScan> {
-        if self.commit_graph.is_some() {
+        if self.commit_graph.is_some() && self.spec.schema_key != BRANCH_REF_SCHEMA_KEY {
             return self
                 .plan_commit_scan(projection, filters, limit, props)
                 .await;
@@ -2554,7 +2667,7 @@ fn entity_slot_column_array(
     branch_id: Option<&str>,
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
-        return entity_slot_system_column_array(property_name, slots, branch_id);
+        return entity_slot_system_column_array(spec, property_name, slots, branch_id);
     }
     let column_type = spec
         .visible_column(column_name)
@@ -2680,6 +2793,7 @@ fn slot_value(
 }
 
 fn entity_slot_system_column_array(
+    spec: &EntitySurfaceSpec,
     column_name: &str,
     slots: &[EntityStateSlot],
     branch_id: Option<&str>,
@@ -2785,11 +2899,12 @@ fn entity_slot_system_column_array(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(lix_error_to_datafusion_error)?,
         )),
-        "untracked" => Arc::new(BooleanArray::from_iter(
-            slots
-                .iter()
-                .map(|slot| Some(matches!(slot, EntityStateSlot::Untracked(_)))),
-        )),
+        "untracked" => Arc::new(BooleanArray::from_iter(slots.iter().map(|slot| {
+            Some(
+                matches!(slot, EntityStateSlot::Untracked(_))
+                    || spec.schema_key == BRANCH_REF_SCHEMA_KEY,
+            )
+        }))),
         "branch_id" => Arc::new(StringArray::from_iter(branch_ids)),
         _ => {
             return Err(DataFusionError::Execution(format!(
@@ -3207,6 +3322,7 @@ mod tests {
 
     #[test]
     fn exact_state_system_projection_preserves_native_identity_and_owner() {
+        let spec = entity_insert_spec_with_primary_key();
         let tracked = EntityStateSlot::Tracked(tracked_row(
             StateRowSource::Branch,
             "app.message",
@@ -3215,12 +3331,15 @@ mod tests {
         let untracked = untracked_row("app.message", "untracked");
         let slots = vec![tracked, untracked];
 
-        let entity_pk = entity_slot_system_column_array("entity_pk", &slots, Some("branch-a"))
-            .expect("entity pk projection");
-        let untracked_flag = entity_slot_system_column_array("untracked", &slots, Some("branch-a"))
-            .expect("untracked projection");
-        let branch_ids = entity_slot_system_column_array("branch_id", &slots, Some("branch-a"))
-            .expect("branch projection");
+        let entity_pk =
+            entity_slot_system_column_array(spec.as_ref(), "entity_pk", &slots, Some("branch-a"))
+                .expect("entity pk projection");
+        let untracked_flag =
+            entity_slot_system_column_array(spec.as_ref(), "untracked", &slots, Some("branch-a"))
+                .expect("untracked projection");
+        let branch_ids =
+            entity_slot_system_column_array(spec.as_ref(), "branch_id", &slots, Some("branch-a"))
+                .expect("branch projection");
         assert_eq!(entity_pk.len(), 2);
         assert_eq!(untracked_flag.len(), 2);
         assert_eq!(branch_ids.len(), 2);
