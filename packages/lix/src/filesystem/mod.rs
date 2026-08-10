@@ -5,7 +5,6 @@ mod keys;
 pub(crate) mod path_index;
 mod persistent_map;
 mod planner;
-mod read;
 mod visibility;
 
 use crate::LixError;
@@ -285,5 +284,11 @@ pub(crate) use self::planner::{
     plan_parsed_file_path_update_with_resolvers, plan_parsed_file_path_write_with_resolvers,
     plan_recursive_directory_delete,
 };
-pub(crate) use self::read::{FilesystemIndex, filesystem_schema_keys};
+pub(crate) fn filesystem_schema_keys() -> Vec<String> {
+    vec![
+        keys::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+        keys::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+        keys::BLOB_REF_SCHEMA_KEY.to_string(),
+    ]
+}
 pub(crate) use self::visibility::VisibleFilesystem;
