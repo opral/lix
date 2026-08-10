@@ -7,7 +7,9 @@ use lix::{PreparedDmlParameterBatch, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
-const ROW_COUNT: usize = 512;
+// Cross one authenticated 256-entry page boundary without making the debug
+// test future itself dominate the platform test-thread stack.
+const ROW_COUNT: usize = 257;
 const SCHEMA_KEY: &str = "certified_replacement_delete_probe";
 
 #[async_trait]
@@ -38,14 +40,32 @@ impl ReopenStorage for SlateDB {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rocksdb_reopens_after_certified_replacement_delete_checkpoint() {
-    replacement_delete_checkpoint_reopens::<RocksDB>().await;
+#[test]
+fn rocksdb_reopens_after_certified_replacement_delete_checkpoint() {
+    run_reopen_test::<RocksDB>();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn slatedb_reopens_after_certified_replacement_delete_checkpoint() {
-    replacement_delete_checkpoint_reopens::<SlateDB>().await;
+#[test]
+fn slatedb_reopens_after_certified_replacement_delete_checkpoint() {
+    run_reopen_test::<SlateDB>();
+}
+
+fn run_reopen_test<S: ReopenStorage>() {
+    std::thread::Builder::new()
+        .name("certified-replacement-reopen".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("build replacement test runtime")
+                .block_on(replacement_delete_checkpoint_reopens::<S>());
+        })
+        .expect("spawn replacement test thread")
+        .join()
+        .expect("replacement test thread completes");
 }
 
 async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
@@ -106,6 +126,7 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
                 .sum::<u64>(),
             ROW_COUNT as u64
         );
+        assert_schema_history(&lix, ROW_COUNT * 2).await;
 
         assert_eq!(
             lix.execute(&format!("DELETE FROM {SCHEMA_KEY}"), &[])
@@ -130,6 +151,7 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
         .await
         .expect("reopen durable Lix");
     assert_collection_empty(&lix).await;
+    assert_schema_history(&lix, ROW_COUNT * 2).await;
     let checkpoints = lix
         .execute("SELECT COUNT(*) AS count FROM lix_checkpoint", &[])
         .await
@@ -138,6 +160,41 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
     lix.close().await.expect("close reopened durable Lix");
     drop(lix);
     storage.flush().await;
+}
+
+async fn assert_schema_history<S: Storage + Clone + Send + Sync + 'static>(
+    lix: &lix::Lix<S>,
+    minimum: usize,
+) {
+    let rows = lix
+        .execute(
+            "SELECT id FROM lix_change WHERE schema_key = $1 ORDER BY id",
+            &[Value::Text(SCHEMA_KEY.to_string())],
+        )
+        .await
+        .expect("read replacement collection history");
+    assert!(rows.rows().len() >= minimum);
+    let change_id = rows
+        .rows()
+        .last()
+        .map(|row| row.get::<String>("id"))
+        .transpose()
+        .expect("replacement change id is valid")
+        .expect("replacement history has a change id");
+    let exact = lix
+        .execute(
+            "SELECT schema_key FROM lix_change WHERE id = $1",
+            &[Value::Text(change_id)],
+        )
+        .await
+        .expect("read directly addressed replacement change");
+    assert_eq!(exact.rows().len(), 1);
+    assert_eq!(
+        exact.rows()[0]
+            .get::<String>("schema_key")
+            .expect("replacement schema key is valid"),
+        SCHEMA_KEY
+    );
 }
 
 async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix<S>) {

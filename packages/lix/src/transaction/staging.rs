@@ -465,7 +465,7 @@ impl OrderedMutationJournal {
         self.chunks[0].timestamp()
     }
 
-    fn into_prepared(self) -> Result<PreparedStateBatch, LixError> {
+    pub(crate) fn into_prepared(self) -> Result<PreparedStateBatch, LixError> {
         let proof = self.replacement_proof;
         let schema_key = self.schema_key().to_owned();
         let branch_id = self.branch_id().to_owned();
@@ -480,6 +480,28 @@ impl OrderedMutationJournal {
             rows.append(chunk.into_prepared(proof.is_some())?);
         }
         rows.set_commit_id_all(self.commit_id);
+        for index in 0..rows.len() {
+            let ordinal = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation journal change ordinal exceeds u32",
+                    )
+                })?;
+            let change_id =
+                ChangeId::for_commit_ordinal(self.commit_id, ordinal).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation journal commit has no packed change address space",
+                    )
+                })?;
+            rows.set_change_id(index, Some(change_id));
+        }
+        if let Some(created_at) = self.overlay_uniform_created_at {
+            rows.set_created_at_all(created_at);
+        }
         if let Some(proof) = proof {
             if !rows.certify_complete_collection_replacement(
                 &schema_key,
@@ -1090,6 +1112,40 @@ impl<'a> PreparedWriteValidationSet<'a> {
 }
 
 impl PreparedWriteSet {
+    /// Lowers only journals carrying a complete authenticated replacement
+    /// proof. This remains a temporary consumer boundary while ForkTree's
+    /// root-transition publisher consumes the immutable columns directly;
+    /// partial journals still require durable predecessor hydration.
+    pub(crate) fn lower_certified_ordered_mutation_journals(&mut self) -> Result<(), LixError> {
+        let journals = self
+            .commit_change_refs_by_branch
+            .values_mut()
+            .filter_map(|refs| {
+                refs.take_ordered_mutation_journal()
+                    .map(|journal| (refs.commit_id, journal))
+            })
+            .collect::<Vec<_>>();
+        for (_commit_id, journal) in journals {
+            if journal.replacement_proof.is_none() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "partial immutable mutation journal reached complete-root lowering",
+                ));
+            }
+            let rows = Arc::try_unwrap(journal)
+                .unwrap_or_else(|journal| (*journal).clone())
+                .into_prepared()?;
+            let previous_len = self.state_rows.len();
+            let row_count = rows.len();
+            self.state_rows.append(rows);
+            self.insert_selection.resize_rows(previous_len);
+            for _ in 0..row_count {
+                self.insert_selection.push_not_insert();
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn ordered_mutation_journal_descriptors(
         &self,
     ) -> Vec<DrainedMutationJournalDescriptor> {

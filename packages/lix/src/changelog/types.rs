@@ -101,6 +101,21 @@ impl ChangeId {
         &self.uuid
     }
 
+    /// Returns the directly addressable identity of one packed change in a
+    /// commit whose low 32 bits were reserved by
+    /// [`CommitId::with_change_address_space`].
+    pub(crate) fn for_commit_ordinal(commit_id: CommitId, ordinal: u32) -> Option<Self> {
+        if ordinal == 0 {
+            return None;
+        }
+        let mut bytes = *commit_id.as_uuid().as_bytes();
+        if bytes[12..] != [0; 4] {
+            return None;
+        }
+        bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
+        Some(Self::new(Uuid::from_bytes(bytes)))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test_label(value: &str) -> Self {
         Uuid::parse_str(value)

@@ -1150,6 +1150,30 @@ where
                     return Err(corruption("ChangeCatalog owner/back-edge mismatch"));
                 }
             }
+            ChangeCatalogOwner::PackedCommit {
+                commit_object_id,
+                member_count,
+            } => {
+                let bytes = load_object_bytes(read, commit_object_id).await?;
+                let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+                let members = super::serving::load_commit_members(read, &commit).await?;
+                if commit.commit_id.as_bytes() != key.as_bytes()
+                    || usize::try_from(member_count).ok() != Some(members.len())
+                    || members.iter().enumerate().any(|(index, member)| {
+                        let mut expected = *commit.commit_id.as_bytes();
+                        let Some(ordinal) = u32::try_from(index)
+                            .ok()
+                            .and_then(|value| value.checked_add(1))
+                        else {
+                            return true;
+                        };
+                        expected[12..].copy_from_slice(&ordinal.to_be_bytes());
+                        member.change_id().as_bytes() != &expected || member.source().is_some()
+                    })
+                {
+                    return Err(corruption("packed ChangeCatalog owner/back-edge mismatch"));
+                }
+            }
         }
     }
     Ok(())

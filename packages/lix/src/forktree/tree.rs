@@ -269,6 +269,11 @@ pub(super) fn ordered_tree_edges(
                                 object_ids
                                     .push((ref_change_object_id, ObjectDomain::BranchRefChange));
                             }
+                            ChangeCatalogOwner::PackedCommit {
+                                commit_object_id, ..
+                            } => {
+                                object_ids.push((commit_object_id, ObjectDomain::CommitV2));
+                            }
                         }
                         change_entries.push((key, value));
                     }
@@ -1980,6 +1985,11 @@ pub(super) fn validate_change_catalog_back_edge(
                 return Err(corruption("RefChange has no before or after target"));
             }
             change
+        }
+        ChangeCatalogOwner::PackedCommit { .. } => {
+            return Err(corruption(
+                "packed commit marker has no standalone Change object",
+            ));
         }
     };
     if change.change_id() != key {
