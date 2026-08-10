@@ -243,12 +243,6 @@ where
     let schema_domains = domain.schema_catalog_domains();
     let mut catalog_rows = Vec::with_capacity(schema_domains.len());
     for schema_domain in schema_domains {
-        if schema_domain.untracked() {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                "untracked schema catalogs require the TransactionStateView untracked seam",
-            ));
-        }
         let rows = if schema_domain.untracked() {
             state
                 .untracked_overlay_rows()

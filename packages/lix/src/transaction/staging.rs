@@ -21,12 +21,16 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_pk::EntityPk;
-use crate::forktree::StateKey;
+use crate::forktree::{
+    CanonicalBranchId, StateCell, StateKey, StateKeyRef, StateValue, UntrackedValue,
+    encode_state_key,
+};
 #[cfg(test)]
 use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
 use crate::gc::CheckpointPublication;
 use crate::state::CertifiedStatePredecessor;
+use crate::state::{StagedStateRow, StagedUntrackedStateRow};
 use crate::transaction::types::StagedCommitChangeRefs;
 use crate::transaction::types::{
     CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation,
@@ -1338,6 +1342,115 @@ impl TransactionWriteBuffer {
             file_content_writes: Mutex::new(Vec::new()),
             branch_ref_intents: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Returns the branch-local tracked overlay needed by plugin lifecycle
+    /// reconciliation on the transaction's already-retained read.
+    ///
+    /// This intentionally exposes no reader and performs no committed-state
+    /// lookup. It is the narrow Wave 2 bridge until the live write buffer is
+    /// supplied directly by `TransactionStateView`.
+    pub(crate) fn plugin_state_overlays(
+        &self,
+        branch_id: &str,
+    ) -> Result<(Vec<StagedStateRow>, Vec<StagedUntrackedStateRow>), LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let rows = match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows,
+        };
+        let mut tracked = rows
+            .iter()
+            .filter(|row| !row.global && !row.untracked && row.branch_id.as_str() == branch_id)
+            .map(|row| {
+                let change_id = row.change_id.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "staged tracked plugin row has no change identity",
+                    )
+                })?;
+                let commit_id = row.commit_id.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "staged tracked plugin row has no commit identity",
+                    )
+                })?;
+                Ok(StagedStateRow::new(
+                    encode_state_key(StateKeyRef {
+                        schema_key: row.schema_key.as_str(),
+                        file_id: row.file_id.map(SharedStr::as_str),
+                        entity_pk: row.entity_pk,
+                    }),
+                    StateValue {
+                        change_id,
+                        commit_id,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        cell: row.snapshot.map_or(StateCell::Tombstone, |snapshot| {
+                            StateCell::Value(SharedStr::from(snapshot.normalized().to_owned()))
+                        }),
+                        metadata: row
+                            .metadata
+                            .map(|metadata| SharedStr::from(metadata.normalized().to_owned())),
+                        origin_key: row.origin_key.map(ToString::to_string),
+                        blob_manifest_object_ids: Vec::new(),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        tracked.sort_by(|left, right| left.key.cmp(&right.key));
+        if tracked.windows(2).any(|rows| rows[0].key >= rows[1].key) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "staged plugin state overlay contains duplicate identities",
+            ));
+        }
+        let branch_uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("plugin transaction branch ID is not a UUID: {error}"),
+            )
+        })?;
+        let owner = CanonicalBranchId::from_bytes(*branch_uuid.as_bytes());
+        let mut untracked = rows
+            .iter()
+            .filter(|row| !row.global && row.untracked && row.branch_id.as_str() == branch_id)
+            .map(|row| {
+                StagedUntrackedStateRow::new(
+                    owner,
+                    StateKey {
+                        schema_key: row.schema_key.to_string(),
+                        file_id: row.file_id.map(ToString::to_string),
+                        entity_pk: row.entity_pk.clone(),
+                    },
+                    UntrackedValue {
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        cell: row.snapshot.map_or(StateCell::Tombstone, |snapshot| {
+                            StateCell::Value(SharedStr::from(snapshot.normalized().to_owned()))
+                        }),
+                        metadata: row
+                            .metadata
+                            .map(|metadata| SharedStr::from(metadata.normalized().to_owned())),
+                        origin_key: row.origin_key.map(ToString::to_string),
+                        blob_manifest_object_ids: Vec::new(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        untracked.sort_by(|left, right| left.key.cmp(&right.key));
+        if untracked.windows(2).any(|rows| rows[0].key >= rows[1].key) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "staged untracked plugin state overlay contains duplicate identities",
+            ));
+        }
+        Ok((tracked, untracked))
     }
 
     pub(crate) fn certify_complete_collection_replacement(

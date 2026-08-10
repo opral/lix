@@ -66,7 +66,12 @@ async fn plugin_wasm_owner_survives_memory_snapshot_reopen() {
         .with_storage(storage.clone())
         .await
         .expect("open Memory plugin fixture");
-    install_csv_plugin(&lix).await;
+    insert_file(
+        &lix,
+        "/.lix/plugins/plugin_csv.lixplugin",
+        &csv_plugin_archive(),
+    )
+    .await;
     let owner_rows = lix
         .execute(
             "SELECT path FROM lix_file WHERE path = $1",
@@ -91,7 +96,7 @@ async fn plugin_wasm_owner_survives_memory_snapshot_reopen() {
         1,
         "plugin WASM owner payload must be readable"
     );
-    write_file(&lix, "/memory-reopen.csv", b"quick,dog\n").await;
+    insert_file(&lix, "/memory-reopen.csv", b"quick,dog\n").await;
     assert_eq!(read_file(&lix, "/memory-reopen.csv").await, b"quick,dog\n");
     let snapshot = storage
         .export_snapshot()
@@ -184,6 +189,21 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+        &[
+            Value::Text(path.to_string()),
+            Value::Blob(data.to_vec().into()),
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+async fn insert_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str, data: &[u8])
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text(path.to_string()),
             Value::Blob(data.to_vec().into()),
