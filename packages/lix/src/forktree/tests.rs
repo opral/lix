@@ -1194,6 +1194,30 @@ fn canonical_prefix_bounds_handle_carry_and_reject_invalid_untracked_bounds() {
             .is_err()
     );
     assert!(super::encode_untracked_branch_range_bounds(branch_id, Some(&[0xff]), None).is_err());
+
+    let schema_prefix = super::encode_state_entity_prefix(
+        "app.row",
+        &EntityPk {
+            components: crate::entity_pk::EntityPkComponents::Empty,
+        },
+    );
+    let schema_upper = super::exclusive_prefix_upper_bound(&schema_prefix);
+    let bounded = super::encode_untracked_branch_range_bounds(
+        branch_id,
+        Some(&schema_prefix),
+        schema_upper.as_deref(),
+    )
+    .expect("canonical schema prefix bounds");
+    assert!(bounded.lower.ends_with(&schema_prefix));
+    assert_eq!(
+        bounded
+            .upper
+            .as_deref()
+            .expect("finite schema prefix upper bound")
+            .strip_prefix(&bounded.lower[..bounded.lower.len() - schema_prefix.len()])
+            .expect("branch prefix"),
+        schema_upper.as_deref().expect("schema upper")
+    );
 }
 
 #[tokio::test]
