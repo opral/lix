@@ -6,7 +6,7 @@ use crate::functions::{
     SystemFunctionProvider, state,
 };
 use crate::state::ForkTreeStateView;
-use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
+use crate::storage_adapter::StorageAdapterRead;
 
 /// Execution-scoped runtime function context.
 ///
@@ -83,29 +83,6 @@ impl FunctionContext {
     /// Returns the engine-owned provider used by SQL and transaction staging.
     pub(crate) fn provider(&self) -> FunctionProviderHandle {
         self.functions.clone()
-    }
-
-    /// Persists deterministic sequence progress if this execution used any.
-    ///
-    /// System functions report no sequence state, so this is a no-op when
-    /// deterministic mode is disabled.
-    pub(crate) async fn stage_persist_if_needed(
-        &self,
-        read: &(impl StorageAdapterRead + ?Sized),
-        writes: &mut StorageWriteSet,
-    ) -> Result<Vec<StoragePrecondition>, LixError> {
-        let Some(highest_seen) = self.functions.deterministic_sequence_persist_highest_seen()
-        else {
-            return Ok(Vec::new());
-        };
-        state::stage_sequence(
-            read,
-            writes,
-            DeterministicSequence { highest_seen },
-            self.bookkeeping_timestamp,
-            deterministic_sequence_change_id(highest_seen),
-        )
-        .await
     }
 
     pub(crate) fn deterministic_sequence_checkpoint(

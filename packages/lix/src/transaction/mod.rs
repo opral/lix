@@ -8,6 +8,7 @@ mod stale_commit;
 pub(crate) mod types;
 mod validation;
 
+pub(crate) use commit::prepare_runtime_sequence_publication;
 pub(crate) use commit_coordinator::CommitCoordinator;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;

@@ -13,7 +13,7 @@ use crate::sql2;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadDurability,
-    StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    StorageReadOptions, StorageWriteOptions,
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
@@ -2257,28 +2257,33 @@ where
         runtime_functions: FunctionContext,
         has_runtime_write_access: bool,
     ) -> Result<Option<crate::storage_adapter::StorageWriteSetStats>, LixError> {
-        let mut writes = StorageWriteSet::new();
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let function_preconditions = runtime_functions
-            .stage_persist_if_needed(&read, &mut writes)
-            .await?;
-        if writes.is_empty() {
+        let Some(runtime_checkpoint) = runtime_functions.deterministic_sequence_checkpoint() else {
             return Ok(None);
-        }
+        };
         if !has_runtime_write_access {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "runtime function state changed without reserved write access",
             ));
         }
+        let publication = crate::transaction::prepare_runtime_sequence_publication(
+            self.active_account_id(),
+            runtime_checkpoint,
+            read,
+        )
+        .await?;
+        let (writes, publication_preconditions) = publication.into_storage_plan()?;
         let commit_boundary = self.transaction_commit_boundary();
         let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
         let mut write_options = StorageWriteOptions::default();
-        write_options.preconditions.extend(function_preconditions);
+        write_options
+            .preconditions
+            .extend(publication_preconditions);
         let prepared_commit = self
             .storage
             .prepare_write_set(writes, write_options)

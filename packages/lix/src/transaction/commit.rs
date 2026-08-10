@@ -46,6 +46,39 @@ pub(crate) enum PreparedForkTreePlan {
     Publication(PreparedPublication),
 }
 
+/// Lowers a read execution's deterministic-function checkpoint through the
+/// same authenticated ForkTree publication compiler as ordinary transactions.
+/// The caller still owns the one backend prepare/commit boundary.
+pub(crate) async fn prepare_runtime_sequence_publication<R>(
+    active_account_id: &str,
+    runtime_checkpoint: RuntimeSequenceCheckpoint,
+    read: R,
+) -> Result<PreparedForkTreePlan, LixError>
+where
+    R: StorageAdapterRead + Clone,
+{
+    prepare_forktree_publication_with_parent_heads(
+        active_account_id,
+        &BTreeMap::new(),
+        Some(runtime_checkpoint),
+        read,
+        PreparedWriteSet {
+            state_rows: crate::transaction::types::PreparedStateBatch::new(),
+            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+            branch_ref_intents: Vec::new(),
+            historical_blob_manifest_edges: BTreeMap::new(),
+        },
+        None,
+    )
+    .await
+}
+
 impl PreparedForkTreePlan {
     pub(crate) fn into_storage_plan(
         self,

@@ -1,8 +1,7 @@
 use crate::LixError;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::state::{ForkTreeStateView, UntrackedStateRow};
-use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use bytes::Bytes;
+use crate::storage_adapter::StorageAdapterRead;
 use serde_json::Value as JsonValue;
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
@@ -91,108 +90,6 @@ where
         LixError::CODE_STORAGE_ERROR,
         "deterministic sequence member is missing after initialization",
     ))
-}
-
-/// Persists the highest deterministic sequence value used by an execution.
-///
-/// The row is untracked global `lix_key_value` current state. It never enters
-/// the changelog or commit graph.
-pub(crate) async fn stage_sequence(
-    read: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    sequence: DeterministicSequence,
-    timestamp: crate::common::LixTimestamp,
-    _change_id: crate::changelog::ChangeId,
-) -> Result<Vec<StoragePrecondition>, LixError> {
-    let sequence_key = deterministic_untracked_storage_key(DETERMINISTIC_SEQUENCE_KEY);
-    let snapshot = serde_json::to_string(&serde_json::json!({
-        "key": DETERMINISTIC_SEQUENCE_KEY,
-        "value": sequence.highest_seen,
-    }))
-    .expect("deterministic sequence snapshot is serializable");
-    let value = crate::forktree::encode_untracked_value(crate::forktree::UntrackedValueRef {
-        created_at: timestamp,
-        updated_at: timestamp,
-        cell: crate::forktree::StateCellRef::Value(&snapshot),
-        metadata: None,
-        origin_key: None,
-        blob_manifest_object_ids: &[],
-    })?;
-    let sequence_precondition = untracked_precondition(read, &sequence_key).await?;
-    writes.put(crate::forktree::UNTRACKED_ROW_SPACE, sequence_key, value);
-
-    let marker_key = deterministic_untracked_storage_key(DETERMINISTIC_SEQUENCE_INITIALIZED_KEY);
-    let marker_snapshot = serde_json::to_string(&serde_json::json!({
-        "key": DETERMINISTIC_SEQUENCE_INITIALIZED_KEY,
-        "value": true,
-    }))
-    .expect("deterministic sequence initialization marker is serializable");
-    let marker_value =
-        crate::forktree::encode_untracked_value(crate::forktree::UntrackedValueRef {
-            created_at: timestamp,
-            updated_at: timestamp,
-            cell: crate::forktree::StateCellRef::Value(&marker_snapshot),
-            metadata: None,
-            origin_key: None,
-            blob_manifest_object_ids: &[],
-        })?;
-    let marker_precondition = untracked_precondition(read, &marker_key).await?;
-    writes.put(
-        crate::forktree::UNTRACKED_ROW_SPACE,
-        marker_key,
-        marker_value,
-    );
-    Ok(vec![sequence_precondition, marker_precondition])
-}
-
-fn deterministic_untracked_storage_key(key: &str) -> crate::storage_adapter::StorageKey {
-    let entity_pk = crate::entity_pk::EntityPk::single(key);
-    let encoded = crate::forktree::encode_untracked_key(
-        crate::forktree::CanonicalBranchId::from_bytes(
-            *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
-                .expect("global branch ID is canonical")
-                .as_bytes(),
-        ),
-        crate::forktree::StateKeyRef {
-            schema_key: KEY_VALUE_SCHEMA_KEY,
-            file_id: None,
-            entity_pk: &entity_pk,
-        },
-    );
-    crate::storage_adapter::StorageKey(Bytes::from(encoded))
-}
-
-async fn untracked_precondition(
-    read: &(impl StorageAdapterRead + ?Sized),
-    storage_key: &crate::storage_adapter::StorageKey,
-) -> Result<StoragePrecondition, LixError> {
-    let current = crate::storage_adapter::PointReadPlan::new(
-        crate::forktree::UNTRACKED_ROW_SPACE,
-        std::slice::from_ref(storage_key),
-    )
-    .materialize(read, crate::storage_adapter::StorageGetOptions::default())
-    .await?
-    .value
-    .into_iter()
-    .next()
-    .flatten();
-    match current {
-        Some(crate::storage_adapter::StorageProjectedValue::FullValue(expected)) => {
-            Ok(StoragePrecondition::KeyValueEquals {
-                space: crate::forktree::UNTRACKED_ROW_SPACE,
-                key: storage_key.clone(),
-                expected,
-            })
-        }
-        Some(crate::storage_adapter::StorageProjectedValue::KeyOnly) => Err(LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "deterministic sequence owner read returned key-only data",
-        )),
-        None => Ok(StoragePrecondition::KeyAbsent {
-            space: crate::forktree::UNTRACKED_ROW_SPACE,
-            key: storage_key.clone(),
-        }),
-    }
 }
 
 async fn load_key_value_rows<R>(
