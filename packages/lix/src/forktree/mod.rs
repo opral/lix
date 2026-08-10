@@ -23,10 +23,7 @@ pub(crate) use blob::{
     blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
 };
 pub(crate) use bootstrap::initialize_empty_repository;
-pub(crate) use merkle::{
-    BlobMerkleProofV1, BlobMerkleTreeBuild, build_blob_merkle_tree, canonical_blob_id_for_content,
-    derive_blob_merkle_successor_id, prove_blob_merkle_range, verify_blob_merkle_range,
-};
+pub(crate) use merkle::canonical_blob_id_for_content;
 pub(crate) use model::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BlobMerkleInternalV1,
     BlobMerkleLeafV1, BlobMerkleNodeRefV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId,
