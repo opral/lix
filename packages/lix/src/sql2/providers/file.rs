@@ -2470,50 +2470,60 @@ where
                     plugin_archive_delete_target.as_deref(),
                 )?;
                 let mut staged = staged;
-                let active_branch_id = branch_binding.active_branch_id().ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "file delete dependency closure requires one active branch".to_owned(),
-                    )
-                })?;
-                let file_ids = (0..matched_batch.num_rows())
-                    .map(|row_index| required_string_value(&matched_batch, row_index, "id"))
-                    .collect::<Result<BTreeSet<_>>>()?;
-                if !file_ids.is_empty() {
-                    let dependency_rows =
-                        FileStateView::Transaction(write_ctx.state_view().clone())
+                let mut file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
+                for row_index in 0..matched_batch.num_rows() {
+                    let branch_id = branch_binding
+                        .active_branch_id()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or(required_string_value(
+                            &matched_batch,
+                            row_index,
+                            "lixcol_branch_id",
+                        )?);
+                    file_ids_by_branch
+                        .entry(branch_id)
+                        .or_default()
+                        .insert(required_string_value(&matched_batch, row_index, "id")?);
+                }
+                if !file_ids_by_branch.is_empty() {
+                    let schema_keys = write_ctx
+                        .visible_schema_keys()
+                        .map_err(lix_error_to_datafusion_error)?;
+                    let state_view = FileStateView::Transaction(write_ctx.state_view().clone());
+                    for (branch_id, file_ids) in file_ids_by_branch {
+                        let dependency_rows = state_view
                             .file_owned_rows(
-                                active_branch_id,
-                                write_ctx
-                                    .visible_schema_keys()
-                                    .map_err(lix_error_to_datafusion_error)?,
+                                &branch_id,
+                                schema_keys.clone(),
                                 &file_ids.iter().cloned().collect::<Vec<_>>(),
                             )
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
-                    for row in dependency_rows {
-                        if row.deleted
-                            || row.global
-                            || row.untracked
-                            || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-                            || row.schema_key == BLOB_REF_SCHEMA_KEY
-                        {
-                            continue;
+                        for row in dependency_rows {
+                            if row.deleted
+                                || row.global
+                                || row.untracked
+                                || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                                || row.schema_key == BLOB_REF_SCHEMA_KEY
+                            {
+                                continue;
+                            }
+                            staged.state_rows.push(TransactionWriteRow {
+                                entity_pk: Some(row.entity_pk),
+                                schema_key: row.schema_key.into(),
+                                file_id: row.file_id.map(Into::into),
+                                snapshot: None,
+                                metadata: None,
+                                origin: None,
+                                created_at: None,
+                                updated_at: None,
+                                global: false,
+                                change_id: None,
+                                commit_id: None,
+                                untracked: false,
+                                branch_id: row.branch_id.into(),
+                            });
                         }
-                        staged.state_rows.push(TransactionWriteRow {
-                            entity_pk: Some(row.entity_pk),
-                            schema_key: row.schema_key.into(),
-                            file_id: row.file_id.map(Into::into),
-                            snapshot: None,
-                            metadata: None,
-                            origin: None,
-                            created_at: None,
-                            updated_at: None,
-                            global: false,
-                            change_id: None,
-                            commit_id: None,
-                            untracked: false,
-                            branch_id: row.branch_id.into(),
-                        });
                     }
                 }
                 let count = staged.count;
