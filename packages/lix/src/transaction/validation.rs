@@ -357,12 +357,24 @@ fn constraint_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message)
 }
 
+fn unique_constraint_error(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_UNIQUE, message)
+}
+
+fn foreign_key_constraint_error(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_FOREIGN_KEY, message)
+}
+
 fn same_identity(row: PreparedValidationRow<'_>, current: &NativeValidationRow) -> bool {
     row.schema_key() == current.schema_key()
         && row.entity_pk() == current.entity_pk()
         && row.file_id() == current.file_id()
         && row.untracked() == current.untracked
         && row.branch_id() == current.branch_id
+}
+
+fn same_insert_identity(row: PreparedValidationRow<'_>, current: &NativeValidationRow) -> bool {
+    same_identity(row, current) && prepared_row_is_global(row) == current.global
 }
 
 fn prepared_row_domain(row: PreparedValidationRow<'_>) -> Domain {
@@ -434,7 +446,7 @@ where
                     continue;
                 };
                 if pointer_group_value(&other_snapshot, pointers).as_ref() == Some(&value) {
-                    return Err(constraint_error(format!(
+                    return Err(unique_constraint_error(format!(
                         "unique constraint violation on schema '{}'",
                         row.schema_key()
                     )));
@@ -464,7 +476,7 @@ where
                     continue;
                 };
                 if pointer_group_value(&other_snapshot, pointers).as_ref() == Some(&value) {
-                    return Err(constraint_error(format!(
+                    return Err(unique_constraint_error(format!(
                         "unique constraint violation on schema '{}'",
                         row.schema_key()
                     )));
@@ -516,7 +528,7 @@ where
                         }) == Some(local_value.clone())
                 });
             if !found {
-                return Err(constraint_error(format!(
+                return Err(foreign_key_constraint_error(format!(
                     "foreign key on schema '{}' references a missing '{}' row",
                     row.schema_key(),
                     target_schema
@@ -931,13 +943,13 @@ where
     validate_file_ownership(&input, &staged_rows, &all_rows).await?;
     validate_filesystem_namespace(&input, &staged_rows, &all_rows).await?;
     validate_delete_restrictions(&input, &staged_rows, &all_rows).await?;
-    validate_insert_identities(&input, &staged_rows).await?;
+    validate_insert_identities(&input, &all_rows).await?;
     Ok(())
 }
 
 async fn validate_insert_identities<R>(
     input: &TransactionValidationInput<'_, R>,
-    staged_rows: &[PreparedValidationRow<'_>],
+    all_rows: &NativeValidationRows,
 ) -> Result<(), LixError>
 where
     R: StorageAdapterRead,
@@ -948,18 +960,26 @@ where
         let identity = (
             row.branch_id.to_string(),
             row.untracked,
+            row.global,
             row.file_id.map(ToString::to_string),
             row.schema_key.to_string(),
             row.entity_pk.clone(),
         );
         if !seen.insert(identity) {
             return Err(LixError::new(
-                LixError::CODE_CONSTRAINT_VIOLATION,
+                LixError::CODE_UNIQUE,
                 format!("duplicate insert identity for schema '{}'", row.schema_key),
             ));
         }
+        if all_rows.iter().any(|current| {
+            !current.deleted && same_insert_identity(PreparedValidationRow::State(row), current)
+        }) {
+            return Err(unique_constraint_error(format!(
+                "duplicate insert identity for schema '{}'",
+                row.schema_key
+            )));
+        }
     }
-    let _ = staged_rows;
     Ok(())
 }
 
