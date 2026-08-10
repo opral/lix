@@ -261,7 +261,7 @@ where
             }
             EntityStateSlot::Untracked(row) => row.owner.as_bytes() == global_id.as_bytes(),
         };
-        if is_global && !global_keys.insert(key) {
+        if is_global && !global_keys.insert((slot_branch_sort_key(&slot), key)) {
             continue;
         }
         if request.filter.include_tombstones

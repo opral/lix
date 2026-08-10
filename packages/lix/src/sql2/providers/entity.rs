@@ -3418,8 +3418,8 @@ mod tests {
                 .iter()
                 .filter(|branch_id| **branch_id == GLOBAL_BRANCH_ID)
                 .count(),
-            2,
-            "the global row is emitted once per key, not once per selected branch"
+            3,
+            "each of the three authenticated bootstrap keys is emitted once for the raw global branch, not once per selected branch"
         );
 
         let exact = crate::sql2::entity_batch::exact_forktree(
