@@ -30,12 +30,10 @@ use super::model::{
 use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId, authenticate_object_domain};
 use super::publication::PreparedPublication;
 use super::serving::{validate_retained_commit, validate_retained_ref_change};
-use super::state::{UNTRACKED_ROW_SPACE, decode_untracked_key, decode_untracked_value};
 use super::tree::ordered_tree_edges;
 use super::view::{SELECTOR_SPACE, load_object_bytes};
 
 const SELECTOR_PAGE_ROWS: usize = 256;
-const UNTRACKED_PAGE_ROWS: usize = 1;
 const TRAVERSAL_BATCH_CLAIMS: usize = 128;
 const EDGE_PAGE_ENTRIES: usize = super::model::AUTHENTICATED_EDGE_PAGE_ENTRIES;
 const SWEEP_PAGE_ROWS: usize = 256;
@@ -137,7 +135,6 @@ where
     };
     match progress.phase {
         GcPhaseV2::RootSelectors => advance_selector_roots(storage, snapshot, &mut progress).await,
-        GcPhaseV2::RootUntracked => advance_untracked_roots(storage, snapshot, &mut progress).await,
         GcPhaseV2::Traverse => advance_traversal(storage, snapshot, &mut progress, budget).await,
         GcPhaseV2::Sweep => advance_sweep(storage, snapshot, &mut progress, budget).await,
         GcPhaseV2::Cleanup => advance_cleanup(storage, snapshot, &mut progress, budget).await,
@@ -287,7 +284,6 @@ where
         expected_global_digest: global_digest(&snapshot.raw_global),
         expected_global_epoch: snapshot.global.epoch,
         selector_resume_after: None,
-        untracked_resume_after: None,
         object_resume_after: None,
         maintenance_resume_after: None,
         saw_global_selector: false,
@@ -444,85 +440,11 @@ where
                 "GC selector scan did not observe the global selector",
             ));
         }
-        progress.phase = GcPhaseV2::RootUntracked;
+        progress.phase = GcPhaseV2::Traverse;
         progress.selector_resume_after = None;
     } else if page.entries.is_empty() {
         return Err(corruption(
             "GC selector scan claims more after an empty page",
-        ));
-    }
-    drop(cursor);
-    commit_progress(
-        storage,
-        snapshot,
-        progress.clone(),
-        edit,
-        SweepBatch::default(),
-        false,
-    )
-    .await?;
-    Ok(status(progress))
-}
-
-async fn advance_untracked_roots<S, R>(
-    storage: &S,
-    snapshot: GcSnapshot<R>,
-    progress: &mut GcProgressV2,
-) -> Result<GcStepStatus, StorageError>
-where
-    S: Storage,
-    R: StorageAdapterRead,
-{
-    let mut cursor = snapshot
-        .read
-        .begin_scan(
-            UNTRACKED_ROW_SPACE,
-            restart_range(progress.untracked_resume_after.as_deref()),
-            BeginScanOptions {
-                projection: CoreProjection::FullValue,
-                order: ScanOrder::Ascending,
-            },
-        )
-        .await?;
-    let page = cursor.next_page(UNTRACKED_PAGE_ROWS).await?;
-    let mut edit = MaintenanceEdit::default();
-    for entry in &page.entries {
-        let (branch_id, _) =
-            decode_untracked_key(&entry.key.0).map_err(|error| corruption(error.to_string()))?;
-        let value = decode_untracked_value(full_value(
-            &entry.value,
-            "GC untracked scan returned key-only data",
-        )?)
-        .map_err(|error| corruption(error.to_string()))?;
-        if live_contains(
-            &snapshot.read,
-            &edit,
-            progress.live_branch_index_root,
-            progress.cycle_id,
-            &live_branch_digest(branch_id),
-            branch_id,
-        )
-        .await?
-        {
-            for root in value.blob_manifest_object_ids {
-                enqueue_root(
-                    &snapshot.read,
-                    &mut edit,
-                    progress,
-                    root,
-                    ObjectDomain::BlobManifest,
-                )
-                .await?;
-            }
-        }
-    }
-    progress.untracked_resume_after = page.entries.last().map(|entry| entry.key.0.to_vec());
-    if !page.has_more {
-        progress.phase = GcPhaseV2::Traverse;
-        progress.untracked_resume_after = None;
-    } else if page.entries.is_empty() {
-        return Err(corruption(
-            "GC untracked scan claims more after an empty page",
         ));
     }
     drop(cursor);

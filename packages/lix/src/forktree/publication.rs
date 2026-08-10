@@ -19,10 +19,7 @@ use super::model::{
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, SelectedHistoricalMemberBatch, StateTreeEdit};
-use super::state::{
-    StateKey, StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
-    encode_untracked_value,
-};
+use super::state::StateKey;
 use super::tree::{ImmutableObjectSet, ReceiptTreeEdit};
 use super::view::{CoherentView, SELECTOR_SPACE};
 
@@ -77,8 +74,6 @@ pub(crate) struct PreparedPublication {
     selector_deletes: BTreeSet<Bytes>,
     object_puts: ImmutableObjectSet,
     object_deletes: BTreeSet<ObjectId>,
-    untracked_puts: BTreeMap<Bytes, Bytes>,
-    untracked_deletes: BTreeSet<Bytes>,
 }
 
 impl PreparedPublication {
@@ -162,8 +157,6 @@ impl PreparedPublication {
             selector_deletes: BTreeSet::new(),
             object_puts: ImmutableObjectSet::default(),
             object_deletes: BTreeSet::new(),
-            untracked_puts: BTreeMap::new(),
-            untracked_deletes: BTreeSet::new(),
         })
     }
 
@@ -189,8 +182,6 @@ impl PreparedPublication {
             selector_deletes: BTreeSet::new(),
             object_puts: ImmutableObjectSet::default(),
             object_deletes: BTreeSet::new(),
-            untracked_puts: BTreeMap::new(),
-            untracked_deletes: BTreeSet::new(),
         })
     }
 
@@ -289,30 +280,6 @@ impl PreparedPublication {
             self.delete_selector(key, expected)?;
         }
         self.object_puts.extend(other.object_puts)?;
-        for (key, value) in other.untracked_puts {
-            if self.untracked_deletes.contains(&key) {
-                return Err(corruption(
-                    "publication both puts and deletes one untracked row",
-                ));
-            }
-            match self.untracked_puts.get(&key) {
-                Some(existing) if existing != &value => {
-                    return Err(corruption("publications assign conflicting untracked rows"));
-                }
-                Some(_) => {}
-                None => {
-                    self.untracked_puts.insert(key, value);
-                }
-            }
-        }
-        for key in other.untracked_deletes {
-            if self.untracked_puts.contains_key(&key) {
-                return Err(corruption(
-                    "publication both puts and deletes one untracked row",
-                ));
-            }
-            self.untracked_deletes.insert(key);
-        }
         Ok(())
     }
 
@@ -1799,51 +1766,6 @@ impl PreparedPublication {
         )
     }
 
-    /// Stages one current untracked row under the same global epoch as every
-    /// CAS/root mutation. This prevents an untracked blob reference from
-    /// reviving a payload concurrently with sweep.
-    pub(crate) fn put_untracked_row(
-        &mut self,
-        branch_id: super::model::CanonicalBranchId,
-        key: StateKeyRef<'_>,
-        value: UntrackedValueRef<'_>,
-    ) -> Result<(), StorageError> {
-        let key = Bytes::from(encode_untracked_key(branch_id, key));
-        if self.untracked_deletes.contains(&key) {
-            return Err(corruption(
-                "publication both puts and deletes one untracked row",
-            ));
-        }
-        let value = Bytes::from(
-            encode_untracked_value(value).map_err(|error| corruption(error.to_string()))?,
-        );
-        match self.untracked_puts.get(&key) {
-            Some(existing) if existing != &value => Err(corruption(
-                "publication assigns two values to one untracked row",
-            )),
-            Some(_) => Ok(()),
-            None => {
-                self.untracked_puts.insert(key, value);
-                Ok(())
-            }
-        }
-    }
-
-    pub(crate) fn delete_untracked_row(
-        &mut self,
-        branch_id: super::model::CanonicalBranchId,
-        key: StateKeyRef<'_>,
-    ) -> Result<(), StorageError> {
-        let key = Bytes::from(encode_untracked_key(branch_id, key));
-        if self.untracked_puts.contains_key(&key) {
-            return Err(corruption(
-                "publication both puts and deletes one untracked row",
-            ));
-        }
-        self.untracked_deletes.insert(key);
-        Ok(())
-    }
-
     /// Retires one selected branch and atomically installs owner-produced
     /// catalog pruning under the same epoch. The path-copied catalog edits are
     /// the retirement proof; immutable branch/commit/state objects become
@@ -1918,8 +1840,6 @@ impl PreparedPublication {
                 .saturating_add(self.selector_puts.len())
                 .saturating_add(self.selector_deletes.len())
                 .saturating_add(self.object_deletes.len())
-                .saturating_add(self.untracked_puts.len())
-                .saturating_add(self.untracked_deletes.len())
                 .saturating_add(2),
             3,
         );
@@ -1943,12 +1863,6 @@ impl PreparedPublication {
         }
         for key in self.selector_deletes {
             writes.delete(SELECTOR_SPACE, key.to_vec());
-        }
-        for (key, value) in self.untracked_puts {
-            writes.put(UNTRACKED_ROW_SPACE, key.to_vec(), value.to_vec());
-        }
-        for key in self.untracked_deletes {
-            writes.delete(UNTRACKED_ROW_SPACE, key.to_vec());
         }
         Ok((writes, preconditions))
     }

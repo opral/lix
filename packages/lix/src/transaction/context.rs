@@ -820,10 +820,10 @@ where
     /// buffer that commit will drain. The committed retained view is reused;
     /// this never opens a statement-local read or a second authority.
     fn refresh_state_view_from_staging(&mut self, bump_epoch: bool) -> Result<(), LixError> {
-        let (staged, staged_untracked) = self
+        let staged = self
             .staged_writes
             .state_overlay_rows(&self.active_branch_id)?;
-        self.state_view = self.state_view.with_staged_rows(staged, staged_untracked)?;
+        self.state_view = self.state_view.with_staged_rows(staged)?;
         if bump_epoch {
             self.filesystem_path_index_epoch
                 .fetch_add(1, Ordering::SeqCst);
@@ -6309,14 +6309,6 @@ where
         Ok(prepared_rows)
     }
 
-    async fn open_state_view(
-        read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
-        branch_id: String,
-    ) -> Result<ForkTreeStateView<SharedStorageAdapterRead<StorageImpl::Read<'static>>>, LixError>
-    {
-        ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), &branch_id).await
-    }
-
     /// Convenience helper for programmatic APIs that only stage state rows.
     pub(crate) async fn stage_rows(
         &mut self,
@@ -6352,39 +6344,6 @@ where
     /// Returns the active branch resolved inside this write transaction.
     pub(crate) fn active_branch_id(&self) -> &str {
         &self.active_branch_id
-    }
-
-    /// Reports whether visible untracked state is owned by any requested file.
-    pub(crate) async fn has_untracked_file_scoped_rows(
-        &mut self,
-        file_ids: &[String],
-    ) -> Result<bool, LixError> {
-        if file_ids.is_empty() {
-            return Ok(false);
-        }
-        let rows = Self::open_state_view(self.opening_read(), self.active_branch_id.clone())
-            .await?
-            .untracked_overlay_rows()
-            .await?;
-        Ok(rows.into_iter().any(|row| {
-            uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string() == self.active_branch_id
-                && row
-                    .key
-                    .file_id
-                    .as_deref()
-                    .is_some_and(|file_id| file_ids.iter().any(|candidate| candidate == file_id))
-        }))
-    }
-
-    /// Reports whether the active branch has any visible untracked state.
-    pub(crate) async fn has_untracked_rows(&mut self) -> Result<bool, LixError> {
-        Ok(
-            !Self::open_state_view(self.opening_read(), self.active_branch_id.clone())
-                .await?
-                .untracked_branch_range(None, None, Some(1))
-                .await?
-                .is_empty(),
-        )
     }
 
     /// Stages the protocol replay receipt into this transaction's final
@@ -7336,25 +7295,16 @@ where
                     format!("diff command state lookup failed: {error}"),
                 )
             })?;
-        let current_untracked = self.state_view.untracked_points(&state_keys, true).await?;
         let mut target_change_ids = Vec::new();
         let mut rows = RawWriteBatch::with_capacity(plans.len());
-        for (
-            (diff_id, (schema_key, entity_pk, file_id), expected, target),
-            (current_tracked, current_untracked),
-        ) in plans
-            .into_iter()
-            .zip(current_tracked.into_iter().zip(current_untracked))
+        for ((diff_id, (schema_key, entity_pk, file_id), expected, target), current_tracked) in
+            plans.into_iter().zip(current_tracked)
         {
-            let current_matches = match (current_untracked.as_ref(), expected) {
-                // Untracked state is the visible value but has no committed
-                // change identity, so it can never satisfy a tracked side.
-                (Some(_), Some(_)) => false,
-                (Some(row), None) => row.value.cell == StateCell::Tombstone,
-                (None, Some(expected)) => current_tracked
+            let current_matches = match expected {
+                Some(expected) => current_tracked
                     .as_ref()
                     .is_some_and(|row| row.value.change_id == expected),
-                (None, None) => current_tracked
+                None => current_tracked
                     .as_ref()
                     .is_none_or(|row| row.value.cell == StateCell::Tombstone),
             };

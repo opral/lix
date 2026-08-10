@@ -11,7 +11,7 @@ use crate::catalog::snapshot::{
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::schema::schema_key_from_definition;
-use crate::state::{StateRow, TransactionStateView, UntrackedStateRow};
+use crate::state::{StateRow, TransactionStateView};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
@@ -139,7 +139,6 @@ struct CatalogDomainRows {
 struct CatalogRow {
     key: crate::forktree::StateKey,
     snapshot_content: Option<crate::common::SharedStr>,
-    untracked: bool,
 }
 
 fn catalog_row_from_state(row: StateRow) -> CatalogRow {
@@ -152,19 +151,6 @@ fn catalog_row_from_state(row: StateRow) -> CatalogRow {
     CatalogRow {
         key,
         snapshot_content,
-        untracked: false,
-    }
-}
-
-fn catalog_row_from_untracked(row: UntrackedStateRow) -> CatalogRow {
-    let snapshot_content = match row.value.cell {
-        crate::forktree::StateCell::Value(value) => Some(value),
-        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
-    };
-    CatalogRow {
-        key: row.key,
-        snapshot_content,
-        untracked: true,
     }
 }
 
@@ -178,27 +164,12 @@ where
     let schema_domains = domain.schema_catalog_domains();
     let mut catalog_rows = Vec::with_capacity(schema_domains.len());
     for schema_domain in schema_domains {
-        let rows = if schema_domain.untracked() {
-            state
-                .untracked_overlay_branch_range_for_branch(
-                    schema_domain.branch_id(),
-                    None,
-                    None,
-                    None,
-                    false,
-                )
-                .await?
-                .into_iter()
-                .map(catalog_row_from_untracked)
-                .collect()
-        } else {
-            state
-                .branch_range(schema_domain.branch_id(), None, None, None, false)
-                .await?
-                .into_iter()
-                .map(catalog_row_from_state)
-                .collect()
-        };
+        let rows = state
+            .branch_range(schema_domain.branch_id(), None, None, None, false)
+            .await?
+            .into_iter()
+            .map(catalog_row_from_state)
+            .collect();
         catalog_rows.push(CatalogDomainRows {
             domain: schema_domain,
             rows,
@@ -229,7 +200,6 @@ fn row_belongs_to_schema_catalog_domain(row: &CatalogRow, domain: &Domain) -> bo
     row.key.schema_key == REGISTERED_SCHEMA_KEY
         && row.key.file_id.is_none()
         && row.snapshot_content.is_some()
-        && row.untracked == domain.untracked()
 }
 
 fn decode_registered_schema_row(

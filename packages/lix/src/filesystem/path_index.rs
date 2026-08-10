@@ -95,7 +95,7 @@ impl FilesystemPathEntry {
             global: self.key.global(),
             change_id: self.change_id,
             commit_id: self.commit_id,
-            untracked: self.key.is_untracked(),
+            untracked: false,
             branch_id: self.key.branch_id().into(),
         }
     }
@@ -618,7 +618,6 @@ impl FilesystemPathIndex {
             && same_id.iter().any(|entry| {
                 !entry.key.global()
                     && entry.key.branch_id() == row.branch_id.as_str()
-                    && entry.key.is_untracked() == row.untracked
                     && entry.key.file_id()
                         == if kind == FilesystemPathKind::File {
                             None
@@ -1045,19 +1044,6 @@ where
                 branch_id,
                 false,
             )?);
-
-            let mut untracked_rows = self
-                .untracked_overlay_branch_range_for_branch(branch_id, None, None, None, true)
-                .await?
-                .into_iter()
-                .map(FilesystemStateRow::from_untracked_state_row)
-                .collect::<Result<Vec<_>, _>>()?;
-            for row in &mut untracked_rows {
-                if row.global() {
-                    row.branch_id = branch_id.clone();
-                }
-            }
-            rows.extend(untracked_rows);
         }
 
         let rows = merge_filesystem_state_rows(rows, true);
@@ -1123,18 +1109,6 @@ where
             branch_id,
             false,
         )?);
-        let mut untracked_rows = state
-            .untracked_overlay_branch_range_for_branch(branch_id, None, None, None, true)
-            .await?
-            .into_iter()
-            .map(FilesystemStateRow::from_untracked_state_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        for row in &mut untracked_rows {
-            if row.global() {
-                row.branch_id = branch_id.clone();
-            }
-        }
-        rows.extend(untracked_rows);
     }
     let rows = merge_filesystem_state_rows(rows, true);
     #[cfg(test)]
@@ -1261,7 +1235,7 @@ impl FilesystemPathIndexCache {
         rows: &[FilesystemStateRow],
         next_revision_for: impl Fn(&[u8]) -> Option<Vec<u8>>,
     ) {
-        let invalidates_delta = rows.iter().any(|row| row.global || row.untracked);
+        let invalidates_delta = rows.iter().any(|row| row.global);
         let mut entries = self
             .entries
             .lock()

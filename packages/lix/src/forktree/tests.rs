@@ -43,12 +43,11 @@ use super::{
     PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
     ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
     SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
-    StateMutationAudit, StateSource, StateTreeMutation, StateValueRef, UNTRACKED_ROW_SPACE,
-    UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1, UploadSelectorV1,
-    VisibleStateRow, advance_gc, edit_state_tree, encode_state_key, encode_state_value,
-    load_commit, load_commit_member_records, load_commit_summary, open_coherent_view,
-    prepare_upload_completion, prepare_upload_part, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_points, state_range,
+    StateMutationAudit, StateSource, StateTreeMutation, StateValueRef, UploadBindingRef,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, advance_gc, edit_state_tree,
+    encode_state_key, encode_state_value, load_commit, load_commit_member_records,
+    load_commit_summary, open_coherent_view, prepare_upload_completion, prepare_upload_part,
+    put_change_catalog_entries, put_commit_catalog_entries, state_point, state_points, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -1745,6 +1744,7 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
     assert!(build_state_tree(&[(b"opaque".to_vec(), b"opaque".to_vec())]).is_err());
 }
 
+#[cfg(any())]
 #[test]
 fn canonical_prefix_bounds_handle_carry_and_reject_invalid_untracked_bounds() {
     assert_eq!(
@@ -2181,6 +2181,7 @@ async fn branch_root_diff_resolves_global_fallback_after_local_unmask() {
     assert_eq!(after.snapshot_content.as_deref(), Some("global-b"));
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn untracked_range_is_branch_bounded_ordered_and_limited() {
     let seed = build_seed();
@@ -2852,13 +2853,11 @@ struct CountingStorage {
     inner: Memory,
     begin_reads: Arc<AtomicUsize>,
     object_get_many: Arc<AtomicUsize>,
-    untracked_get_many: Arc<AtomicUsize>,
 }
 
 struct CountingRead {
     inner: MemoryRead,
     object_get_many: Arc<AtomicUsize>,
-    untracked_get_many: Arc<AtomicUsize>,
 }
 
 struct SharedParentCountingRead<R> {
@@ -2929,13 +2928,6 @@ impl StorageRead for CountingRead {
                 .count(),
             Ordering::Relaxed,
         );
-        self.untracked_get_many.fetch_add(
-            requests
-                .iter()
-                .filter(|request| request.space == UNTRACKED_ROW_SPACE)
-                .count(),
-            Ordering::Relaxed,
-        );
         self.inner.get_many(requests)
     }
 
@@ -2955,7 +2947,6 @@ impl CountingStorage {
             inner: Memory::new(),
             begin_reads: Arc::new(AtomicUsize::new(0)),
             object_get_many: Arc::new(AtomicUsize::new(0)),
-            untracked_get_many: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -2969,7 +2960,6 @@ impl Storage for CountingStorage {
         Ok(CountingRead {
             inner: self.inner.begin_read(options).await?,
             object_get_many: Arc::clone(&self.object_get_many),
-            untracked_get_many: Arc::clone(&self.untracked_get_many),
         })
     }
 
@@ -3208,6 +3198,7 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
     );
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
     let seed = build_seed();
@@ -5542,6 +5533,7 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     );
 }
 
+#[cfg(any())]
 async fn publish_untracked_manifest(
     storage: &Memory,
     seed: &SeedData,
@@ -5583,6 +5575,7 @@ async fn publish_untracked_manifest(
     manifest_id
 }
 
+#[cfg(any())]
 async fn delete_untracked(storage: &Memory, seed: &SeedData, primary_key: &str) {
     let view = open_coherent_view(storage, seed.branch_id)
         .await
@@ -5899,6 +5892,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     assert!(!object_present(&storage, upload.chunk_id).await);
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn untracked_and_real_shared_chunk_roots_release_only_at_final_reference() {
     let seed = build_seed();

@@ -31,10 +31,7 @@ use super::model::{
     CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::state::{
-    StateCellRef, StateKeyRef, StateValueRef, UNTRACKED_ROW_SPACE, UntrackedValueRef,
-    encode_state_key, encode_state_value, encode_untracked_key, encode_untracked_value,
-};
+use super::state::{StateKeyRef, StateValueRef, encode_state_key, encode_state_value};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_state_tree,
 };
@@ -425,24 +422,6 @@ where
             .to_vec(),
         );
     }
-    let workspace_key = encode_untracked_key(
-        global_branch,
-        StateKeyRef {
-            schema_key: KEY_VALUE_SCHEMA_KEY,
-            file_id: None,
-            entity_pk: &EntityPk::single(WORKSPACE_BRANCH_KEY),
-        },
-    );
-    let workspace_branch_snapshot = json!({ "value": main_branch.to_string() }).to_string();
-    let workspace_value = encode_untracked_value(UntrackedValueRef {
-        created_at: timestamp,
-        updated_at: timestamp,
-        cell: StateCellRef::Value(&workspace_branch_snapshot),
-        metadata: None,
-        origin_key: None,
-        blob_manifest_object_ids: &[],
-    })?;
-    writes.put(UNTRACKED_ROW_SPACE, workspace_key, workspace_value);
     crate::init::stage_repository_protocol(&mut writes);
     #[cfg(test)]
     tests::inject_selector_before_bootstrap_commit(

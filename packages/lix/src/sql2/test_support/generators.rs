@@ -106,11 +106,6 @@ const TX_SETUP_STAGED_LIX_FILE_ROW: &[&str] = &[
 ];
 
 #[cfg(test)]
-const SETUP_SEED_UNTRACKED_LIX_FILE_ROW: &[&str] = &[
-    "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ('01920000-0000-7000-8000-000000000542', '/diff/untracked.md', CAST('old' AS BYTEA), true)",
-];
-
-#[cfg(test)]
 const LIX_FILE_PROBE: &[DifferentialProbe] = &[DifferentialProbe::LixFileActive {
     paths: &[
         "/diff/insert.md",
@@ -120,7 +115,6 @@ const LIX_FILE_PROBE: &[DifferentialProbe] = &[DifferentialProbe::LixFileActive 
         "/diff/upsert-new.md",
         "/diff/existing.md",
         "/diff/tx.md",
-        "/diff/untracked.md",
         "/diff/multi-a.md",
         "/diff/multi-b.md",
     ],
@@ -366,30 +360,6 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
             expected_execution: ExpectedExecution::Ok,
-        },
-        DifferentialSqlCase {
-            seed: "generated/lix-file/upsert-path-data-rejects-untracked-update".into(),
-            setup_sql: SETUP_SEED_UNTRACKED_LIX_FILE_ROW,
-            transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/untracked.md', CAST('new' AS BYTEA)) ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
-            params: EMPTY_PARAMS,
-            probes: LIX_FILE_PROBE,
-            expectation: DifferentialExpectation::FastRequiredParity,
-            expected_execution: ExpectedExecution::Err {
-                code: "LIX_CONSTRAINT_VIOLATION",
-            },
-        },
-        DifferentialSqlCase {
-            seed: "generated/lix-file/upsert-path-data-rejects-untracked-do-nothing".into(),
-            setup_sql: SETUP_SEED_UNTRACKED_LIX_FILE_ROW,
-            transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/untracked.md', CAST('skip' AS BYTEA)) ON CONFLICT (path) DO NOTHING".into(),
-            params: EMPTY_PARAMS,
-            probes: LIX_FILE_PROBE,
-            expectation: DifferentialExpectation::FastRequiredParity,
-            expected_execution: ExpectedExecution::Err {
-                code: "LIX_CONSTRAINT_VIOLATION",
-            },
         },
         DifferentialSqlCase {
             seed: "generated/lix-file/multi-row-path-data-fast".into(),
