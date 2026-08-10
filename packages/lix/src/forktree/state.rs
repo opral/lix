@@ -33,7 +33,7 @@ pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace = StorageSpace::engine_declar
     crate::storage::ValueSemantics::Mutable,
 );
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct StateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
