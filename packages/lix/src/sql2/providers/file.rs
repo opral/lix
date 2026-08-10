@@ -15,6 +15,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::arrow::array::{
     ArrayRef, BooleanArray, LargeBinaryArray, RecordBatchOptions, StringArray,
 };
@@ -5925,7 +5926,7 @@ struct LixFileRecordBatchRow {
     path: String,
     directory_id: Option<String>,
     name: String,
-    data: Option<Vec<u8>>,
+    data: Option<Bytes>,
     entity_pk: String,
     file_id: Option<String>,
     global: bool,
@@ -5944,7 +5945,7 @@ struct LixFileRecordBatchColumns {
     paths: Vec<Option<String>>,
     directory_ids: Vec<Option<String>>,
     names: Vec<Option<String>>,
-    data_values: Vec<Option<Vec<u8>>>,
+    data_values: Vec<Option<Bytes>>,
     entity_pks: Vec<Option<String>>,
     schema_keys: Vec<Option<String>>,
     file_ids: Vec<Option<String>>,
@@ -6006,7 +6007,7 @@ impl LixFileRecordBatchColumns {
         let data_values: ArrayRef = Arc::new(LargeBinaryArray::from(
             data_values
                 .iter()
-                .map(|value| value.as_deref())
+                .map(|value| value.as_ref().map(|bytes| bytes.as_ref()))
                 .collect::<Vec<_>>(),
         ));
         let entity_pks: ArrayRef = Arc::new(StringArray::from(entity_pks));
@@ -6226,12 +6227,12 @@ async fn lix_file_record_batch_from_prepared_with_blob_bytes(
             match blob_bytes.take(&blob_key) {
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
-                    Some(data) => Some(data),
-                    None => Some(Vec::new()),
+                    Some(data) => Some(data.into()),
+                    None => Some(Bytes::new()),
                 },
             }
         } else {
-            Some(Vec::new())
+            Some(Bytes::new())
         };
         let projected_change_id = blob_rows
             .get(&blob_key)
@@ -6388,8 +6389,8 @@ async fn exact_path_data_rows_from_prepared(
             let data = match blob_bytes.take(&blob_key) {
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
-                    Some(data) => Some(data),
-                    None => Some(Vec::new()),
+                    Some(data) => Some(data.into()),
+                    None => Some(Bytes::new()),
                 },
             };
             rows.push(vec![
@@ -6411,7 +6412,7 @@ fn materialize_vec_range(data: Vec<u8>, requested: Range<u64>) -> Result<BlobRan
     // file from a missing path without materializing an unbounded read first.
     if total_size == 0 && requested.start == 0 {
         return Ok(BlobRangeBytes {
-            bytes: Vec::new(),
+            bytes: Bytes::new(),
             total_size,
             range: 0..0,
         });
@@ -6428,7 +6429,7 @@ fn materialize_vec_range(data: Vec<u8>, requested: Range<u64>) -> Result<BlobRan
     let end = usize::try_from(range.end)
         .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "file range is too large"))?;
     Ok(BlobRangeBytes {
-        bytes: data[start..end].to_vec(),
+        bytes: data[start..end].to_vec().into(),
         total_size,
         range,
     })
@@ -6436,12 +6437,12 @@ fn materialize_vec_range(data: Vec<u8>, requested: Range<u64>) -> Result<BlobRan
 
 #[derive(Default)]
 struct LoadedBlobBytes {
-    bytes_by_key: BTreeMap<FilesystemBlobRefKey, Option<Vec<u8>>>,
+    bytes_by_key: BTreeMap<FilesystemBlobRefKey, Option<Bytes>>,
     remaining_by_key: BTreeMap<FilesystemBlobRefKey, usize>,
 }
 
 impl LoadedBlobBytes {
-    fn take(&mut self, key: &FilesystemBlobRefKey) -> Option<Option<Vec<u8>>> {
+    fn take(&mut self, key: &FilesystemBlobRefKey) -> Option<Option<Bytes>> {
         match self.remaining_by_key.get_mut(key) {
             Some(remaining) if *remaining > 1 => {
                 *remaining -= 1;
@@ -6569,7 +6570,7 @@ async fn load_authenticated_blob_bytes_for_files(
         let values = authenticated_blob_reader
             .load_bytes_for_scoped_rows(&rows)
             .await?
-            .into_vec();
+            .into_shared_vec();
         if values.len() != keys.len() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -6625,7 +6626,7 @@ where
                     .transpose()?
                     .flatten();
                 if let Some(bytes) = staged {
-                    bytes_by_key.insert(key.clone(), Some(bytes));
+                    bytes_by_key.insert(key.clone(), Some(bytes.into()));
                 } else {
                     let live = live_rows.row(row.live);
                     keys.push(key);
@@ -6644,7 +6645,7 @@ where
         let values = authenticated_blob_reader
             .load_bytes_for_scoped_rows(&rows)
             .await?
-            .into_vec();
+            .into_shared_vec();
         if values.len() != keys.len() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -6697,7 +6698,7 @@ async fn load_blob_bytes_for_files(
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
                 if let Some(data) = &row.inline_data {
-                    bytes_by_key.insert(key.clone(), Some(data.clone()));
+                    bytes_by_key.insert(key.clone(), Some(data.clone().into()));
                 } else {
                     keys.push(key);
                     hashes.push(BlobId::from_hex(&row.blob_hash)?);
@@ -6707,7 +6708,10 @@ async fn load_blob_bytes_for_files(
         }
     }
     if !keys.is_empty() {
-        let values = blob_reader.load_bytes_many(&hashes).await?.into_vec();
+        let values = blob_reader
+            .load_bytes_many(&hashes)
+            .await?
+            .into_shared_vec();
         if values.len() != keys.len() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -10950,7 +10954,7 @@ mod tests {
                     ));
                 }
                 entries.push(Some(BlobRangeBytes {
-                    bytes: bytes[start..end].to_vec(),
+                    bytes: bytes[start..end].to_vec().into(),
                     total_size: bytes.len() as u64,
                     range: range.clone(),
                 }));

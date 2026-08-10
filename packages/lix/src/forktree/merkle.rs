@@ -663,10 +663,80 @@ pub(super) fn materialize_blob_merkle_range(
     state_key: &StateKey,
     manifest: BlobManifestV1,
     requested: Range<u64>,
-) -> Result<Vec<u8>, StorageError> {
+) -> Result<Bytes, StorageError> {
     let leaf_range = leaf_range_for_bytes(&manifest, requested.clone())?;
     verify_blob_merkle_range(proof, state_key, manifest, leaf_range)?;
-    let mut output = Vec::with_capacity((requested.end - requested.start) as usize);
+
+    if requested.start == requested.end {
+        return Ok(Bytes::new());
+    }
+
+    // The authenticated object is already a shared `Bytes` buffer. For a
+    // range contained in one leaf, retain a slice of that exact object rather
+    // than copying the payload into an intermediate Vec. The object header
+    // remains part of the authenticated buffer; only the payload subrange is
+    // exposed to the caller.
+    if proof.paths.len() == 1 {
+        let path = &proof.paths[0];
+        let leaf_bytes = proof
+            .objects
+            .get(path.leaf_object_id)
+            .ok_or_else(|| corruption("Merkle materialization leaf is missing"))?;
+        let leaf = decode_leaf(path.leaf_object_id, leaf_bytes)?;
+        let chunk_bytes = proof
+            .objects
+            .get(leaf.chunk_object_id)
+            .ok_or_else(|| corruption("Merkle materialization chunk is missing"))?;
+        let chunk = BlobChunkV1::decode_borrowed(leaf.chunk_object_id, chunk_bytes)?;
+        let chunk_start = leaf
+            .ordinal
+            .checked_mul(u64::from(BLOB_MERKLE_CHUNK_BYTES))
+            .ok_or_else(|| corruption("Merkle chunk offset overflowed"))?;
+        let start = requested
+            .start
+            .checked_sub(chunk_start)
+            .ok_or_else(|| corruption("Merkle materialization starts before its leaf"))?;
+        let end = requested
+            .end
+            .min(
+                chunk_start
+                    .checked_add(leaf.declared_len)
+                    .ok_or_else(|| corruption("Merkle chunk end overflowed"))?,
+            )
+            .checked_sub(chunk_start)
+            .ok_or_else(|| corruption("Merkle materialization ends before its leaf"))?;
+        let start = usize::try_from(start)
+            .map_err(|_| corruption("Merkle materialization start exceeds usize"))?;
+        let end = usize::try_from(end)
+            .map_err(|_| corruption("Merkle materialization end exceeds usize"))?;
+        let payload_start = chunk.as_ptr() as usize;
+        let object_start = chunk_bytes.as_ptr() as usize;
+        let payload_offset = payload_start
+            .checked_sub(object_start)
+            .ok_or_else(|| corruption("Merkle chunk payload is outside its object"))?;
+        let payload_end = payload_offset
+            .checked_add(chunk.len())
+            .ok_or_else(|| corruption("Merkle chunk payload offset overflowed"))?;
+        let object_end = object_start
+            .checked_add(chunk_bytes.len())
+            .ok_or_else(|| corruption("Merkle chunk object address overflowed"))?;
+        if payload_start < object_start
+            || payload_end > object_end
+            || end > chunk.len()
+            || start > end
+        {
+            return Err(corruption("Merkle materialization chunk range is invalid"));
+        }
+        return Ok(chunk_bytes.slice(payload_offset + start..payload_offset + end));
+    }
+
+    // Multi-leaf ranges have no single backing allocation. Allocate exactly
+    // the requested size once and append authenticated leaf slices directly;
+    // this is the sole coalescing copy before the final consumer.
+    let mut output = Vec::with_capacity(
+        usize::try_from(requested.end - requested.start)
+            .map_err(|_| corruption("Merkle materialization range exceeds usize"))?,
+    );
     for path in &proof.paths {
         let leaf = decode_leaf(
             path.leaf_object_id,
@@ -684,13 +754,16 @@ pub(super) fn materialize_blob_merkle_range(
         )?;
         let chunk_start = leaf.ordinal * u64::from(BLOB_MERKLE_CHUNK_BYTES);
         let start = requested.start.saturating_sub(chunk_start) as usize;
-        let end = (requested.end.min(chunk_start + leaf.declared_len) - chunk_start) as usize;
+        let chunk_end = chunk_start
+            .checked_add(leaf.declared_len)
+            .ok_or_else(|| corruption("Merkle chunk end overflowed"))?;
+        let end = (requested.end.min(chunk_end) - chunk_start) as usize;
         output.extend_from_slice(&chunk[start..end]);
     }
     if output.len() as u64 != requested.end - requested.start {
         return Err(corruption("Merkle materialized byte range is incomplete"));
     }
-    Ok(output)
+    Ok(Bytes::from(output))
 }
 
 /// Creates a proof for an exact half-open range of leaf ordinals. The proof
@@ -1456,7 +1529,7 @@ mod tests {
         verify_blob_merkle_range(&proof, &key, build.manifest, 0..1).unwrap();
         assert_eq!(
             materialize_blob_merkle_range(&proof, &key, build.manifest, 0..0).unwrap(),
-            Vec::<u8>::new()
+            Bytes::new()
         );
 
         assert!(
@@ -1483,6 +1556,34 @@ mod tests {
             verify_blob_merkle_range(&substituted_proof, &key, substituted.manifest, 0..1,)
                 .is_err(),
             "a non-empty leaf cannot substitute for the canonical empty root"
+        );
+    }
+
+    #[test]
+    fn single_leaf_materialization_reuses_authenticated_chunk_bytes() {
+        let build = build_blob_merkle_tree(&[BlobChunkV1 {
+            bytes: Bytes::from_static(b"authenticated chunk"),
+        }])
+        .unwrap();
+        let key = state_key();
+        let proof = prove_blob_merkle_range(&build, &key, 0..1).unwrap();
+        let leaf = decode_leaf(
+            proof.paths[0].leaf_object_id,
+            proof.objects.get(proof.paths[0].leaf_object_id).unwrap(),
+        )
+        .unwrap();
+        let encoded_chunk = proof.objects.get(leaf.chunk_object_id).unwrap();
+        let materialized =
+            materialize_blob_merkle_range(&proof, &key, build.manifest, 3..13).unwrap();
+
+        assert_eq!(materialized.as_ref(), b"henticated".as_slice());
+        let encoded_start = encoded_chunk.as_ptr() as usize;
+        let encoded_end = encoded_start + encoded_chunk.len();
+        let materialized_start = materialized.as_ptr() as usize;
+        assert!(
+            materialized_start >= encoded_start
+                && materialized_start + materialized.len() <= encoded_end,
+            "single-leaf reads must retain a slice of the authenticated chunk object"
         );
     }
 
