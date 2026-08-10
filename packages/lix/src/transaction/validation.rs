@@ -370,48 +370,99 @@ where
     Ok(output)
 }
 
-async fn exact_visible_row<R>(
-    state_view: &TransactionStateView<R>,
-    active_branch_id: &str,
+struct ExactVisibleRequest {
+    key: Vec<u8>,
+    untracked: bool,
+    include_tombstones: bool,
+}
+
+fn exact_visible_request(
     domain: &Domain,
     schema_key: &str,
     entity_pk: &EntityPk,
     include_tombstones: bool,
-) -> Result<Option<NativeValidationRow>, LixError>
-where
-    R: StorageAdapterRead,
-{
+) -> Result<ExactVisibleRequest, LixError> {
     let key = encode_state_key(StateKeyRef {
         schema_key,
         file_id: match domain.file_filters().as_slice() {
             [crate::NullableKeyFilter::Value(file_id)] => Some(file_id.as_str()),
             [crate::NullableKeyFilter::Null] => None,
             [] => None,
-            _ => return Ok(None),
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "exact validation lookup requires one file-scope selector",
+                ));
+            }
         },
         entity_pk,
     });
-    if domain.untracked() {
-        let row = state_view
-            .untracked_points(&[key], true)
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .map(NativeValidationRow::from_untracked);
-        Ok(row.filter(|row| include_tombstones || !row.deleted))
+    Ok(ExactVisibleRequest {
+        key,
+        untracked: domain.untracked(),
+        include_tombstones,
+    })
+}
+
+/// Resolves all exact validation targets through the one transaction-owned
+/// retained view. Tracked and untracked requests are each batched once, while
+/// the returned vector remains aligned with the caller's original request
+/// order. No committed-only reader or alternate materialization authority is
+/// introduced here.
+async fn batched_exact_visible_rows<R>(
+    state_view: &TransactionStateView<R>,
+    active_branch_id: &str,
+    requests: Vec<ExactVisibleRequest>,
+) -> Result<Vec<Option<NativeValidationRow>>, LixError>
+where
+    R: StorageAdapterRead,
+{
+    let tracked_keys = requests
+        .iter()
+        .filter(|request| !request.untracked)
+        .map(|request| request.key.clone())
+        .collect::<Vec<_>>();
+    let untracked_keys = requests
+        .iter()
+        .filter(|request| request.untracked)
+        .map(|request| request.key.clone())
+        .collect::<Vec<_>>();
+
+    let tracked_rows = if tracked_keys.is_empty() {
+        Vec::new()
     } else {
-        let row = state_view
-            .points(&[key], true)
+        state_view
+            .points(&tracked_keys, true)
             .await
             .map_err(LixError::from)?
-            .into_iter()
-            .next()
-            .flatten()
-            .map(|row| NativeValidationRow::from_tracked(row, active_branch_id))
-            .transpose()?;
-        Ok(row.filter(|row| include_tombstones || !row.deleted))
+    };
+    let untracked_rows = if untracked_keys.is_empty() {
+        Vec::new()
+    } else {
+        state_view.untracked_points(&untracked_keys, true).await?
+    };
+
+    let mut tracked_rows = tracked_rows.into_iter();
+    let mut untracked_rows = untracked_rows.into_iter();
+    let mut output = Vec::with_capacity(requests.len());
+    for request in requests {
+        let row = if request.untracked {
+            untracked_rows
+                .next()
+                .expect("untracked validation batch slot count matches requests")
+                .map(NativeValidationRow::from_untracked)
+        } else {
+            tracked_rows
+                .next()
+                .expect("tracked validation batch slot count matches requests")
+                .map(|row| NativeValidationRow::from_tracked(row, active_branch_id))
+                .transpose()?
+        };
+        output.push(row.filter(|row| request.include_tombstones || !row.deleted));
     }
+    debug_assert!(tracked_rows.next().is_none());
+    debug_assert!(untracked_rows.next().is_none());
+    Ok(output)
 }
 
 fn prepared_snapshot(row: PreparedValidationRow<'_>) -> Result<Option<JsonValue>, LixError> {
@@ -915,26 +966,35 @@ async fn validate_delete_restrictions<R>(
 where
     R: StorageAdapterRead,
 {
-    for tombstone in staged_rows
+    let tombstones = staged_rows
         .iter()
         .copied()
-        .filter(|row| row_is_tombstone(*row))
-    {
+        .filter(|row| {
+            row_is_tombstone(*row)
+                && input
+                    .schema_catalog
+                    .delete_plan_for_key(row.schema_key())
+                    .has_committed_checks()
+        })
+        .collect::<Vec<_>>();
+    let requests = tombstones
+        .iter()
+        .map(|tombstone| {
+            exact_visible_request(
+                &prepared_row_domain(*tombstone),
+                tombstone.schema_key(),
+                tombstone.entity_pk(),
+                false,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let targets =
+        batched_exact_visible_rows(input.state_view, input.active_branch_id, requests).await?;
+
+    for (tombstone, target) in tombstones.into_iter().zip(targets) {
         let delete_plan = input
             .schema_catalog
             .delete_plan_for_key(tombstone.schema_key());
-        if !delete_plan.has_committed_checks() {
-            continue;
-        }
-        let target = exact_visible_row(
-            input.state_view,
-            input.active_branch_id,
-            &prepared_row_domain(tombstone),
-            tombstone.schema_key(),
-            tombstone.entity_pk(),
-            false,
-        )
-        .await?;
         let Some(target) = target else {
             continue;
         };
@@ -1189,7 +1249,9 @@ where
     R: StorageAdapterRead,
 {
     let mut seen = BTreeSet::new();
-    for insert in input.staged_writes.inserts() {
+    let inserts = input.staged_writes.inserts().collect::<Vec<_>>();
+    let mut requests = Vec::with_capacity(inserts.len() * 2);
+    for insert in &inserts {
         let row = insert.row;
         let identity = (
             row.branch_id.to_string(),
@@ -1204,24 +1266,25 @@ where
                 format!("duplicate insert identity for schema '{}'", row.schema_key),
             ));
         }
-        let current = exact_visible_row(
-            input.state_view,
-            input.active_branch_id,
+        requests.push(exact_visible_request(
             &prepared_row_domain(PreparedValidationRow::State(insert.row)),
             row.schema_key,
             row.entity_pk,
             true,
-        )
-        .await?;
-        let sibling = exact_visible_row(
-            input.state_view,
-            input.active_branch_id,
+        )?);
+        requests.push(exact_visible_request(
             &prepared_row_sibling_domain(PreparedValidationRow::State(insert.row)),
             row.schema_key,
             row.entity_pk,
             true,
-        )
-        .await?;
+        )?);
+    }
+    let rows =
+        batched_exact_visible_rows(input.state_view, input.active_branch_id, requests).await?;
+    for (insert, pair) in inserts.iter().zip(rows.chunks_exact(2)) {
+        let row = insert.row;
+        let current = pair[0].as_ref();
+        let sibling = pair[1].as_ref();
         if [current, sibling].into_iter().flatten().any(|current| {
             !current.deleted
                 && same_insert_identity(PreparedValidationRow::State(insert.row), &current)
