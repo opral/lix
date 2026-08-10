@@ -2871,13 +2871,11 @@ where
             .await?
             {
                 Some(value) => ChangeCatalogEntry::decode(&value)?,
-                None => packed_change_catalog_entry(
-                    read,
-                    change_catalog_root,
-                    current.change_id(),
-                )
-                .await?
-                .ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?,
+                None => packed_change_catalog_entry(read, change_catalog_root, current.change_id())
+                    .await?
+                    .ok_or_else(|| {
+                        corruption("selected stale member has no ChangeCatalog owner")
+                    })?,
             };
             cache
                 .change_catalog_entries

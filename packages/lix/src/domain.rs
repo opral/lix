@@ -129,7 +129,7 @@ impl Domain {
         // untracked state domain no longer exists, so projecting a caller's
         // legacy domain bit into two catalog domains would read the same
         // tracked branch twice and manufacture duplicate schema identities.
-        vec![self.schema_catalog_domain().with_untracked(false)]
+        vec![Self::schema_catalog(self.branch_id.clone(), false)]
     }
 
     pub(crate) fn fk_target_domains(&self) -> Vec<Self> {
