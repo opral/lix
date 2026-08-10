@@ -115,6 +115,16 @@ where
         super::serving::edit_state_tree(root, mutations, &self.read).await
     }
 
+    pub(crate) async fn replace_state_tree_range(
+        &self,
+        root: ObjectId,
+        lower: Vec<u8>,
+        upper: Option<Vec<u8>>,
+        replacement: Vec<(Vec<u8>, Vec<u8>, super::serving::StateMutationAudit)>,
+    ) -> Result<super::serving::StateTreeEdit, StorageError> {
+        super::serving::replace_state_tree_range(root, lower, upper, replacement, &self.read).await
+    }
+
     /// Applies ordered intermediate state edits while retaining the same
     /// authenticated operation read for every path-copy lookup.
     pub(crate) async fn edit_state_tree_sequence(

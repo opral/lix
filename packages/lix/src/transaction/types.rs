@@ -2922,7 +2922,6 @@ impl PreparedStateBatch {
         self.certified_tracked_keys_strictly_ordered
     }
 
-    #[cfg(test)]
     pub(crate) fn complete_collection_replacement_proof(
         &self,
     ) -> Option<CompleteCollectionReplacementProof> {

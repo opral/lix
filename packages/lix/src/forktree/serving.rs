@@ -22,8 +22,8 @@ use super::state::{
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
     apply_ordered_mutations_idempotent_inserts, delete_ordered_range, lookup_many_on_read,
-    lookup_on_read, scan_bounded_page_on_read, scan_page_on_read, scan_ranges_on_read,
-    validate_root_on_read,
+    lookup_on_read, scan_bounded_page_on_read, scan_page_on_read, scan_range_on_read,
+    scan_ranges_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE};
 
@@ -4441,6 +4441,93 @@ where
         wrote_tombstone,
         written_commit_ids,
         objects,
+    })
+}
+
+/// Replaces one complete authenticated state-key range in a single canonical
+/// tree build.
+///
+/// The caller supplies the complete, strictly ordered post-image for the
+/// range.  Entries outside the range retain their existing authenticated
+/// state-page references; entries inside it are never read or materialized.
+/// Consequently a collection replacement is `O(outside + replacement)` and
+/// does not perform one root-to-leaf path copy per row.  The returned root is
+/// the sole state authority and is authenticated by the semantic commit.
+pub(crate) async fn replace_state_tree_range<R>(
+    root: ObjectId,
+    lower: Vec<u8>,
+    upper: Option<Vec<u8>>,
+    replacement: Vec<(Vec<u8>, Vec<u8>, StateMutationAudit)>,
+    read: &R,
+) -> Result<StateTreeEdit, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    super::state::validate_state_entity_prefix(&lower)
+        .map_err(|error| corruption(error.to_string()))?;
+    if upper.as_ref().is_some_and(|upper| lower >= *upper) {
+        return Err(corruption(
+            "state-tree replacement range is empty or reversed",
+        ));
+    }
+    if replacement.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        || replacement.iter().any(|(key, value, _)| {
+            key.as_slice() < lower.as_slice()
+                || upper
+                    .as_deref()
+                    .is_some_and(|upper| key.as_slice() >= upper)
+                || super::state::decode_state_key(key).is_err()
+                || decode_state_value(value).is_err()
+        })
+    {
+        return Err(corruption(
+            "state-tree replacement entries are invalid, unordered, or outside their range",
+        ));
+    }
+
+    let root = validate_root_on_read(root, "state", read).await?;
+    let mut entries =
+        scan_range_on_read(root.object_id, "state", None, Some(&lower), None, read).await?;
+    entries.reserve(replacement.len());
+    entries.extend(
+        replacement
+            .iter()
+            .map(|(key, value, _)| (key.clone(), value.clone())),
+    );
+    if let Some(upper) = upper.as_deref() {
+        entries.extend(
+            scan_range_on_read(root.object_id, "state", Some(upper), None, None, read).await?,
+        );
+    }
+    if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(corruption(
+            "state-tree root replacement produced duplicate or unordered keys",
+        ));
+    }
+    let build = super::tree::build_state_tree(&entries)?;
+    let copied_nodes = build.objects.iter().count();
+    let mut added_blob_roots = BTreeMap::new();
+    let mut written_commit_ids = BTreeSet::new();
+    let mut wrote_tombstone = false;
+    for (_, _, audit) in replacement {
+        wrote_tombstone |= audit.tombstone;
+        written_commit_ids.insert(audit.commit_id);
+        added_blob_roots.extend(
+            audit
+                .blob_manifest_object_ids
+                .into_iter()
+                .map(|object_id| (object_id, ())),
+        );
+    }
+    Ok(StateTreeEdit {
+        base_root: root.object_id,
+        root: build.root.object_id,
+        entry_count: build.root.entry_count,
+        copied_nodes,
+        added_blob_roots,
+        wrote_tombstone,
+        written_commit_ids,
+        objects: build.objects,
     })
 }
 

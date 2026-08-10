@@ -3142,6 +3142,30 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     .expect("authenticated schema range delete");
     assert_eq!(range_edit.entry_count(), 0);
     assert!(range_edit.copied_nodes() >= 1);
+
+    let replacement_bounds =
+        super::encode_state_entity_prefix_bounds("app.row", &EntityPk::empty());
+    let (_, replacement_value) =
+        state_entry("a", StateCellRef::Value("replacement-a"), 0x22, &[]);
+    let replacement = view
+        .replace_state_tree_range(
+            view.branch_snapshot().local_state_root,
+            replacement_bounds.lower,
+            replacement_bounds.upper,
+            vec![(
+                seed.state_keys[0].clone(),
+                replacement_value,
+                StateMutationAudit {
+                    commit_id: raw_id(0x22),
+                    tombstone: false,
+                    blob_manifest_object_ids: Vec::new(),
+                },
+            )],
+        )
+        .await
+        .expect("authenticated complete range replacement");
+    assert_eq!(replacement.entry_count(), 1);
+    assert!(replacement.copied_nodes() >= 1);
     assert!(
         edit_state_tree(
             view.branch_snapshot().local_state_root,
