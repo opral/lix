@@ -1092,12 +1092,16 @@ fn plan_parsed_file_path_write_with_fallback(
             context.untracked,
             content,
         );
-        if !file_payload.is_empty() {
+        if !file_payload.is_empty() || file_payload.inline_data().is_some() {
+            let blob_hash = file_payload.blob_hash().or_else(|| {
+                file_payload
+                    .inline_data()
+                    .filter(|bytes| bytes.is_empty())
+                    .map(|_| BlobId::from_canonical_content(b""))
+            });
             BlobRefRowInput {
                 file_id,
-                blob_hash: file_payload
-                    .blob_hash()
-                    .expect("non-empty payload should have blob hash"),
+                blob_hash: blob_hash.expect("inline file payload should have blob hash"),
                 size_bytes: file_payload.len(),
                 plugin_checkpoint: None,
                 context: FilesystemRowContext {
@@ -1151,12 +1155,16 @@ pub(crate) fn plan_file_descriptor_write(
             input.context.untracked,
             FileContent::inline(data),
         );
-        if !file_payload.is_empty() {
+        if !file_payload.is_empty() || file_payload.inline_data().is_some() {
+            let blob_hash = file_payload.blob_hash().or_else(|| {
+                file_payload
+                    .inline_data()
+                    .filter(|bytes| bytes.is_empty())
+                    .map(|_| BlobId::from_canonical_content(b""))
+            });
             BlobRefRowInput {
                 file_id,
-                blob_hash: file_payload
-                    .blob_hash()
-                    .expect("non-empty payload should have blob hash"),
+                blob_hash: blob_hash.expect("inline file payload should have blob hash"),
                 size_bytes: file_payload.len(),
                 plugin_checkpoint: None,
                 context: FilesystemRowContext {
@@ -1332,10 +1340,13 @@ fn fallback_path_resolver(
     resolvers: &BTreeMap<String, DirectoryPathResolver>,
     context: &FilesystemRowContext,
 ) -> Option<DirectoryPathResolver> {
+    if !context.untracked {
+        return None;
+    }
     let fallback_key = filesystem_storage_scope_key(
         &context.branch_id,
         context.global,
-        !context.untracked,
+        false,
         context.file_id.as_deref(),
     );
     resolvers.get(&fallback_key).cloned()
@@ -2605,7 +2616,7 @@ mod tests {
     }
 
     #[test]
-    fn file_path_write_carries_empty_payload_without_blob_ref() {
+    fn file_path_write_carries_authenticated_empty_blob_ref() {
         let mut resolver =
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
         let plan = plan_parsed_file_path_write(
@@ -2627,11 +2638,20 @@ mod tests {
                 .iter()
                 .any(|row| row.schema_key == "lix_file_descriptor")
         );
-        assert!(
-            !plan
-                .rows
-                .iter()
-                .any(|row| row.schema_key == "lix_binary_blob_ref")
+        let blob = plan
+            .rows
+            .iter()
+            .find(|row| row.schema_key == "lix_binary_blob_ref")
+            .expect("empty file path write should authenticate its empty blob");
+        let snapshot = blob
+            .snapshot
+            .as_ref()
+            .expect("empty blob ref should carry snapshot")
+            .value();
+        assert_eq!(snapshot["size_bytes"], 0);
+        assert_eq!(
+            snapshot["blob_hash"],
+            BlobId::from_canonical_content(b"").to_hex()
         );
     }
 
