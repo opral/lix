@@ -390,6 +390,10 @@ where
                 )
                 .await
             }
+            Self::Transaction(view) if view.branch_id() == branch_id => {
+                view.untracked_overlay_range(lower, upper, limit, include_tombstones)
+                    .await
+            }
             Self::Transaction(view) => {
                 view.untracked_overlay_branch_range_for_branch(
                     branch_id,
@@ -645,6 +649,8 @@ where
                 }),
                 row.schema_key.clone(),
                 row.branch_id.clone(),
+                row.global,
+                row.untracked,
             );
             deduplicated.insert(key, row);
         }
