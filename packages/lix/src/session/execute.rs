@@ -871,11 +871,17 @@ where
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                     let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                     let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+                    let state_view = crate::state::ForkTreeStateView::from_facade(
+                        forktree.clone(),
+                        &active_branch_id,
+                    )
+                    .await?;
                     let ctx = SessionSqlExecutionContext {
                         active_branch_id: &active_branch_id,
                         active_account_id: self.active_account_id(),
                         read_store,
                         forktree,
+                        state_view,
                         catalog_context: Arc::clone(&self.catalog_context),
                         sql_planning_cache: Arc::clone(&self.sql_planning_cache),
                         functions: FunctionProviderHandle::system(),
@@ -1976,11 +1982,17 @@ where
                     acknowledge_file_views.then(sql2::SessionFileViews::default);
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+                let state_view = crate::state::ForkTreeStateView::from_facade(
+                    forktree.clone(),
+                    &active_branch_id,
+                )
+                .await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
                     read_store,
                     forktree,
+                    state_view,
                     catalog_context: Arc::clone(&self.catalog_context),
                     sql_planning_cache: Arc::clone(&self.sql_planning_cache),
                     functions: FunctionProviderHandle::system(),
@@ -2124,11 +2136,17 @@ where
                     ));
                 }
                 let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+                let state_view = crate::state::ForkTreeStateView::from_facade(
+                    forktree.clone(),
+                    &active_branch_id,
+                )
+                .await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
                     read_store,
                     forktree,
+                    state_view,
                     catalog_context: Arc::clone(&self.catalog_context),
                     sql_planning_cache: Arc::clone(&self.sql_planning_cache),
                     functions: FunctionProviderHandle::system(),
@@ -2296,6 +2314,9 @@ where
             ))
             .await?;
         let forktree = crate::forktree::ForkTreeReadFacade::new(read_store.clone());
+        let state_view =
+            crate::state::ForkTreeStateView::from_facade(forktree.clone(), &active_branch_id)
+                .await?;
         if let Some(exact_filesystem_read) = exact_filesystem_read {
             let query = match exact_filesystem_read {
                 ExactFilesystemRead::RootFileListing => {
@@ -2425,6 +2446,7 @@ where
             active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
             forktree: forktree.clone(),
+            state_view,
             catalog_context: Arc::clone(&self.catalog_context),
             sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             functions: functions.clone(),
@@ -3145,21 +3167,6 @@ where
                 self.execute(sql, params).await.map(|result| (result, None))
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn scan_live_state_for_test(
-        &mut self,
-        request: &crate::live_state::LiveStateScanRequest,
-    ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
-        let _operation_guard = self.begin_session_operation()?;
-        let transaction = self.transaction_mut()?;
-        transaction.flush_prepared_mutations_for_read().await?;
-        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_live_state_batch(
-            transaction,
-            request,
-        )
-        .await
     }
 }
 

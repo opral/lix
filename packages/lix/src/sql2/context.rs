@@ -12,13 +12,8 @@ use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
-    UncachedFilesystemPathIndexReader,
 };
 use crate::functions::FunctionProviderHandle;
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateExactBatch,
-};
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{
@@ -83,10 +78,7 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn active_account_id(&self) -> &str {
         crate::ANONYMOUS_ACCOUNT_ID
     }
-    fn live_state(&self) -> Arc<dyn LiveStateReader>;
-    fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
-        Arc::new(UncachedFilesystemPathIndexReader::new(self.live_state()))
-    }
+    fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader>;
     fn functions(&self) -> FunctionProviderHandle;
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
@@ -170,24 +162,15 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         ))
     }
 
-    async fn scan_live_state_batch(
-        &mut self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError>;
-
-    async fn load_exact_live_state_batch(
-        &mut self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError>;
-
     async fn filesystem_path_index(
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        let rows = self
-            .scan_live_state_batch(&request.live_state_request())
-            .await?;
-        Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
+        let _ = request;
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "filesystem path index is unavailable through this write context",
+        ))
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;
@@ -389,38 +372,6 @@ impl SqlWriteContext {
         unsafe { self.ptr.0.as_ref().authenticated_blob_reader() }
     }
 
-    pub(crate) async fn scan_live_state_batch(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .scan_live_state_batch(request)
-                .await
-        }
-    }
-
-    pub(crate) async fn load_exact_live_state_batch(
-        &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .load_exact_live_state_batch(request)
-                .await
-        }
-    }
-
     pub(crate) async fn load_branch_head(
         &self,
         branch_id: &str,
@@ -525,31 +476,6 @@ impl WriteAccess {
             Self::ReadOnly => None,
             Self::Write { ctx } => Some(ctx),
         }
-    }
-}
-
-#[async_trait]
-impl LiveStateReader for SqlWriteContext {
-    async fn scan_batch(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let mut request = request.clone();
-        if request.filter.branch_ids.is_empty() {
-            // Write-side validation requests that do not carry a branch
-            // predicate are scoped to the transaction's active branch. The
-            // operation context still owns the same retained ForkTree read;
-            // this only supplies the missing logical scope.
-            request.filter.branch_ids = vec![self.active_branch_id()];
-        }
-        self.scan_live_state_batch(&request).await
-    }
-
-    async fn load_exact_batch(
-        &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        self.load_exact_live_state_batch(request).await
     }
 }
 

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::branch::BranchRefStoreReader;
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::entity_pk::EntityPk;
+use crate::forktree::{StateCell, StateKeyRef, encode_state_key};
 use crate::init::InitReceipt;
-use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{
@@ -13,13 +14,13 @@ use crate::plugin::{
 };
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
+use crate::state::ForkTreeStateView;
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions};
 use crate::storage_adapter::{Storage, StorageAdapter};
 use crate::telemetry::TelemetrySink;
 use crate::transaction::CommitCoordinator;
 use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
-use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
@@ -299,37 +300,39 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let row = crate::live_state::scan_forktree_facade(
-            &crate::forktree::ForkTreeReadFacade::new(read),
-            &LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec!["lix_account".to_string()],
-                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
-                    entity_pks: vec![account_pk],
-                    file_ids: vec![NullableKeyFilter::Null],
-                    ..Default::default()
-                },
-                limit: Some(1),
-                ..Default::default()
-            },
+        let key = encode_state_key(StateKeyRef {
+            schema_key: "lix_account",
+            file_id: None,
+            entity_pk: &account_pk,
+        });
+        let view = ForkTreeStateView::from_facade(
+            crate::forktree::ForkTreeReadFacade::new(read),
+            GLOBAL_BRANCH_ID,
         )
-        .await?
-        .into_rows()
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ACCOUNT_NOT_FOUND",
-                format!("active account '{account_id}' does not exist"),
-            )
-        })?;
-        let snapshot = row.snapshot_content.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("account '{account_id}' has no snapshot"),
-            )
-        })?;
-        let value: serde_json::Value = serde_json::from_str(&snapshot).map_err(|error| {
+        .await?;
+        let row = view
+            .points(&[key], false)
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ACCOUNT_NOT_FOUND",
+                    format!("active account '{account_id}' does not exist"),
+                )
+            })?;
+        let snapshot = match row.value.cell {
+            StateCell::Value(value) => value,
+            StateCell::Null | StateCell::Tombstone => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("account '{account_id}' has no snapshot"),
+                ));
+            }
+        };
+        let snapshot = snapshot.as_str();
+        let value: serde_json::Value = serde_json::from_str(snapshot).map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("account '{account_id}' has invalid JSON: {error}"),
@@ -358,25 +361,24 @@ where
         // spaces keep their physical IDs across hard layout cuts, so an old
         // group value could otherwise be decoded before we reject it.
         crate::init::RepositoryProtocolStatus::Current => {
-            let initialized = crate::live_state::scan_forktree_facade(
-                &crate::forktree::ForkTreeReadFacade::new(read),
-                &LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec!["lix_key_value".to_string()],
-                        branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
-                        entity_pks: vec![EntityPk::single("lix_id")],
-                        file_ids: vec![NullableKeyFilter::Null],
-                        ..Default::default()
-                    },
-                    limit: Some(1),
-                    ..Default::default()
-                },
+            let entity_pk = EntityPk::single("lix_id");
+            let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                schema_key: "lix_key_value",
+                file_id: None,
+                entity_pk: &entity_pk,
+            });
+            let view = ForkTreeStateView::from_facade(
+                crate::forktree::ForkTreeReadFacade::new(read),
+                GLOBAL_BRANCH_ID,
             )
-            .await?
-            .into_rows()
-            .into_iter()
-            .next()
-            .is_some();
+            .await?;
+            let initialized = view
+                .points(&[key], false)
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .is_some();
             if initialized {
                 Ok(())
             } else {
