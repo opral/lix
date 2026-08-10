@@ -119,6 +119,7 @@ impl NativeStateRow {
 
     fn from_state_row(row: StateRow, branch_id: &str) -> Result<Self, LixError> {
         let key = crate::forktree::decode_state_key(&row.key)?;
+        let staged = row.source == StateRowSource::Staged;
         let snapshot_content = match row.value.cell {
             StateCell::Value(value) => Some(value),
             StateCell::Null | StateCell::Tombstone => None,
@@ -132,7 +133,10 @@ impl NativeStateRow {
             created_at: row.value.created_at,
             updated_at: row.value.updated_at,
             global: row.source == StateRowSource::Global,
-            change_id: Some(row.value.change_id),
+            // Staged change IDs are transaction-internal until publication;
+            // RETURNING exposes the committed audit contract and therefore
+            // keeps this field NULL while retaining the staged commit ID.
+            change_id: (!staged).then_some(row.value.change_id),
             commit_id: Some(row.value.commit_id),
             branch_id: branch_id.to_owned(),
             untracked: false,

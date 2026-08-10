@@ -1521,7 +1521,12 @@ where
                 needs_data,
                 needs_plugin_ownership: false,
                 capture_path_resolver_rows: false,
-                use_authenticated_blob_reader: false,
+                // RETURNING reads the transaction post-image. Keep staged
+                // payload ownership on the same write context while falling
+                // back to the retained authenticated reader for committed
+                // rows; the legacy payload reader cannot see unpublished
+                // BlobRef owners.
+                use_authenticated_blob_reader: true,
             },
             captured,
         );
@@ -7156,6 +7161,17 @@ where
         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
         BLOB_REF_SCHEMA_KEY.to_string(),
     ];
+    // Descriptors use the NULL file-id lane while blob references use the
+    // entity's file id. Keep the bounded exact request aligned with both
+    // authenticated rows so RETURNING can observe the complete post-image.
+    file_request.filter.file_ids = std::iter::once(crate::NullableKeyFilter::Null)
+        .chain(
+            target_file_ids
+                .iter()
+                .cloned()
+                .map(crate::NullableKeyFilter::Value),
+        )
+        .collect();
     file_request.filter.entity_pks = target_file_ids
         .iter()
         .map(|file_id| file_id_entity_pk(file_id))
