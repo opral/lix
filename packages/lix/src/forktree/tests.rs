@@ -294,6 +294,142 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
 }
 
 #[tokio::test]
+async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open stale selected-leaf view");
+    let commit = CommitObjectV1::decode(
+        seed.commit_object_id,
+        seed.objects
+            .get(seed.commit_object_id)
+            .expect("seed commit"),
+    )
+    .expect("decode seed commit");
+    let member = seed_commit_members(&seed)
+        .into_iter()
+        .next()
+        .expect("seed semantic member");
+    let repository = view.repository_root();
+    let mut closures = BTreeMap::new();
+    super::serving::resolve_semantic_member_with_stale_auth(
+        view.test_storage_read(),
+        &member,
+        seed.commit_object_id,
+        commit.generation,
+        0,
+        repository.commit_catalog_root,
+        repository.change_catalog_root,
+        &mut closures,
+    )
+    .await
+    .expect("canonical selected leaf owner");
+
+    let mut wrong_ordinal_closures = BTreeMap::new();
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            &member,
+            seed.commit_object_id,
+            commit.generation,
+            1,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut wrong_ordinal_closures,
+        )
+        .await
+        .is_err(),
+        "a content-valid member at the wrong target ordinal must fail closed"
+    );
+
+    let empty_change_catalog = build_change_catalog(&[]).expect("empty change catalog");
+    let mut missing_catalog_closures = BTreeMap::new();
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            &member,
+            seed.commit_object_id,
+            commit.generation,
+            0,
+            repository.commit_catalog_root,
+            empty_change_catalog.root.object_id,
+            &mut missing_catalog_closures,
+        )
+        .await
+        .is_err(),
+        "a selected leaf without a ChangeCatalog back-edge must fail closed"
+    );
+
+    let selected = CommitMemberV1::selected(
+        member.change_id(),
+        seed.commit_object_id,
+        1,
+        LixTimestamp::from_unix_millis_utc_lossy(1),
+    );
+    let mut wrong_source_closures = BTreeMap::new();
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            &selected,
+            content_id(0xa1),
+            2,
+            0,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut wrong_source_closures,
+        )
+        .await
+        .is_err(),
+        "a selected leaf with a substituted source ordinal must fail closed"
+    );
+
+    let mut wrong_generation_closures = BTreeMap::new();
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            &CommitMemberV1::selected(
+                member.change_id(),
+                seed.commit_object_id,
+                0,
+                LixTimestamp::from_unix_millis_utc_lossy(1),
+            ),
+            content_id(0xa1),
+            1,
+            0,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut wrong_generation_closures,
+        )
+        .await
+        .is_err(),
+        "a selected source at the target generation must fail closed"
+    );
+
+    let wrong_page_summary = super::serving::StaleCommitSummary {
+        commit_id: CommitId::from_bytes(raw_id(0x21)),
+        commit_object_id: seed.commit_object_id,
+        generation: commit.generation,
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        parent_commit_ids: Vec::new(),
+    };
+    assert!(
+        super::serving::state_points_on_read_for_stale(
+            &repository,
+            wrong_page_summary,
+            &[seed.state_keys[0].clone()],
+            true,
+            view.test_storage_read(),
+        )
+        .await
+        .is_err(),
+        "a state page owned by a different endpoint commit must fail closed"
+    );
+}
+
+#[tokio::test]
 async fn commit_summary_defers_unaccessed_member_authentication() {
     let seed = build_seed();
     let storage = Memory::new();
@@ -2044,6 +2180,52 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .await
             .is_err(),
         "a parent with an invalid generation edge must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn stale_equal_commit_authenticates_repository_catalog_commit_and_roots() {
+    let mut missing = build_seed();
+    let missing_commit = missing.commit_object_id;
+    let missing_storage = Memory::new();
+    seed_storage(&missing_storage, &missing).await;
+    let mut missing_write = StorageWriteSet::new();
+    missing_write.delete(OBJECT_SPACE, missing_commit.as_bytes().to_vec());
+    commit_write_set_for_test(missing_write, &missing_storage).await;
+    let missing_read = StorageAdapterReadScope::new(
+        missing_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("missing equal-endpoint read"),
+    );
+    let missing_facade = ForkTreeReadFacade::new(missing_read);
+    assert!(
+        missing_facade
+            .stale_state_changes_between_commits(public_commit_id(0x20), public_commit_id(0x20),)
+            .await
+            .is_err(),
+        "equal endpoints must authenticate the Commit object before returning empty"
+    );
+
+    let corrupt = build_seed();
+    let corrupt_storage = Memory::new();
+    seed_storage(&corrupt_storage, &corrupt).await;
+    let mut corrupt_write = StorageWriteSet::new();
+    corrupt_write.delete(OBJECT_SPACE, corrupt.global_state_root.as_bytes().to_vec());
+    commit_write_set_for_test(corrupt_write, &corrupt_storage).await;
+    let corrupt_read = StorageAdapterReadScope::new(
+        corrupt_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("corrupt equal-endpoint read"),
+    );
+    let corrupt_facade = ForkTreeReadFacade::new(corrupt_read);
+    assert!(
+        corrupt_facade
+            .stale_state_changes_between_commits(public_commit_id(0x20), public_commit_id(0x20),)
+            .await
+            .is_err(),
+        "equal endpoints must authenticate both state roots before returning empty"
     );
 }
 
