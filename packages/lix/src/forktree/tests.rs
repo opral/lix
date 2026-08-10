@@ -6123,3 +6123,128 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     };
     assert!(zero_page_edge.encode().is_err());
 }
+
+#[tokio::test]
+async fn stale_page_prefix_authentication_rejects_earlier_corruption() {
+    let commit_id = CommitId::from_bytes(raw_id(0xb1));
+    let members = (0..513).map(zero_edge_page_member).collect::<Vec<_>>();
+    let pages = CommitChangePageV2::encode_pages(commit_id, &members)
+        .expect("three-page stale proof fixture");
+    let page_ids = pages.objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    assert_eq!(page_ids.len(), 3, "the selected page must have a prefix");
+    let selected_page = CommitChangePageV2::decode(
+        page_ids[2],
+        pages
+            .objects
+            .iter()
+            .find(|(id, _)| *id == page_ids[2])
+            .expect("selected page")
+            .1
+            .as_ref(),
+    )
+    .expect("selected page decodes");
+
+    let canonical_storage = Memory::new();
+    let mut canonical_writes = StorageWriteSet::new();
+    for (id, bytes) in &pages.objects {
+        canonical_writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(canonical_writes, &canonical_storage).await;
+    let canonical_adapter = StorageAdapter::new(canonical_storage);
+    let canonical_read = canonical_adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("canonical stale page read");
+    super::serving::validate_stale_page_position(
+        &canonical_read,
+        content_id(0xbe),
+        commit_id,
+        &page_ids,
+        page_ids[2],
+        &selected_page,
+        &mut super::serving::StaleMemberAuthCache::default(),
+    )
+    .await
+    .expect("canonical page prefix is valid");
+
+    let second_page = CommitChangePageV2::decode(
+        page_ids[1],
+        pages
+            .objects
+            .iter()
+            .find(|(id, _)| *id == page_ids[1])
+            .expect("second page")
+            .1
+            .as_ref(),
+    )
+    .expect("second page decodes");
+    let mut gap_page = second_page.clone();
+    gap_page.start_ordinal = gap_page.start_ordinal.checked_add(1).expect("gap ordinal");
+    let (gap_id, gap_bytes) = gap_page.encode().expect("gap page encodes");
+    let gap_storage = Memory::new();
+    let mut gap_writes = StorageWriteSet::new();
+    for (id, bytes) in &pages.objects {
+        gap_writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    gap_writes.put(OBJECT_SPACE, gap_id.as_bytes().to_vec(), gap_bytes.to_vec());
+    commit_write_set_for_test(gap_writes, &gap_storage).await;
+    let gap_adapter = StorageAdapter::new(gap_storage);
+    let gap_read = gap_adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("gap stale page read");
+    let mut gap_page_ids = page_ids.clone();
+    gap_page_ids[1] = gap_id;
+    assert!(
+        super::serving::validate_stale_page_position(
+            &gap_read,
+            content_id(0xbe),
+            commit_id,
+            &gap_page_ids,
+            page_ids[2],
+            &selected_page,
+            &mut super::serving::StaleMemberAuthCache::default(),
+        )
+        .await
+        .is_err(),
+        "a gap before the immediate predecessor must reject the later selected page"
+    );
+
+    let mut wrong_commit_page = second_page;
+    wrong_commit_page.commit_id = CommitId::from_bytes(raw_id(0xb2));
+    let (wrong_id, wrong_bytes) = wrong_commit_page
+        .encode()
+        .expect("wrong-commit page encodes");
+    let wrong_storage = Memory::new();
+    let mut wrong_writes = StorageWriteSet::new();
+    for (id, bytes) in &pages.objects {
+        wrong_writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    wrong_writes.put(
+        OBJECT_SPACE,
+        wrong_id.as_bytes().to_vec(),
+        wrong_bytes.to_vec(),
+    );
+    commit_write_set_for_test(wrong_writes, &wrong_storage).await;
+    let wrong_adapter = StorageAdapter::new(wrong_storage);
+    let wrong_read = wrong_adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("wrong-commit stale page read");
+    let mut wrong_page_ids = page_ids;
+    wrong_page_ids[1] = wrong_id;
+    assert!(
+        super::serving::validate_stale_page_position(
+            &wrong_read,
+            content_id(0xbe),
+            commit_id,
+            &wrong_page_ids,
+            wrong_page_ids[2],
+            &selected_page,
+            &mut super::serving::StaleMemberAuthCache::default(),
+        )
+        .await
+        .is_err(),
+        "a wrong-commit page in the earlier prefix must reject the later selected page"
+    );
+}
