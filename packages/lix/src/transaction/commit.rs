@@ -1644,16 +1644,7 @@ fn classify_publication_intent(
         };
     }
 
-    let allow_multi_branch_untracked = !has_commit_intent
-        && !prepared.state_rows.is_empty()
-        && prepared.state_rows.iter().all(|row| row.untracked);
-    let allow_multi_branch_publication =
-        publication_owner_branch_ids(prepared, runtime_checkpoint.is_some()).len() > 1;
-    let branch_id = sole_publication_branch(
-        prepared,
-        runtime_checkpoint.is_some(),
-        allow_multi_branch_untracked || allow_multi_branch_publication,
-    )?;
+    let branch_id = sole_publication_branch(prepared, runtime_checkpoint.is_some())?;
     Ok(PublicationIntent::Ordinary {
         branch_id: canonical_branch_id(&branch_id)?,
         semantic_commit: has_commit_intent,
@@ -1982,22 +1973,14 @@ fn canonical_snapshot_for_row<'a>(
 fn sole_publication_branch(
     prepared: &PreparedWriteSet,
     runtime_checkpoint_present: bool,
-    allow_multi_branch_untracked: bool,
 ) -> Result<String, LixError> {
-    let mut branches = publication_owner_branch_ids(prepared, runtime_checkpoint_present);
-    let branch = branches
+    let branches = publication_owner_branch_ids(prepared, runtime_checkpoint_present);
+    branches
         .iter()
         .find(|branch_id| branch_id.as_str() != crate::GLOBAL_BRANCH_ID)
         .cloned()
         .or_else(|| branches.iter().next().cloned())
-        .ok_or_else(|| writer_error("prepared publication has no branch owner"))?;
-    branches.remove(&branch);
-    if !branches.is_empty() && !allow_multi_branch_untracked {
-        return Err(writer_error(
-            "multi-branch transaction requires the batched ForkTree publication slice",
-        ));
-    }
-    Ok(branch.to_string())
+        .ok_or_else(|| writer_error("prepared publication has no branch owner"))
 }
 
 fn publication_owner_branch_ids(

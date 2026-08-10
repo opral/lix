@@ -14507,7 +14507,7 @@ mod tests {
             None,
         )
         .await
-        .expect("ambiguous legacy topology should decline the fast path");
+        .expect("ambiguous cross-scope topology should decline the fast path");
 
         assert_eq!(outcome, None);
         assert_eq!(write_context.path_index_count, 1);

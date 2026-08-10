@@ -1163,7 +1163,7 @@ where
 
     /// Loads the complete authenticated historical state overlay through this
     /// facade's retained read. Callers may project the returned ForkTree-owned
-    /// rows into their public DTOs, but may not acquire a legacy reader for
+    /// rows into their public DTOs, but may not acquire a second state reader for
     /// the same commit.
     pub(crate) async fn scan_state_rows_at_commit(
         &self,
@@ -1184,7 +1184,7 @@ where
     /// Diffs two authenticated historical state roots through this facade's
     /// retained read. The neutral result is the sole source for checkpoint
     /// and working-diff projections; callers may filter and project it but
-    /// may not reopen a legacy state reader for the same interval.
+    /// may not reopen a parallel state reader for the same interval.
     pub(crate) async fn diff_state_rows_between_commits(
         &self,
         before: crate::changelog::CommitId,
