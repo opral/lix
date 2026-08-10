@@ -15,8 +15,11 @@ use crate::LixError;
 use crate::catalog::{CatalogSnapshot, SchemaPlan};
 use crate::common::{SharedStr, json_pointer_get, validate_row_metadata};
 use crate::domain::Domain;
-use crate::entity_pk::EntityPk;
-use crate::forktree::{StateCell, StateKey, StateKeyRef, decode_state_key, encode_state_key};
+use crate::entity_pk::{EntityPk, EntityPkComponents};
+use crate::forktree::{
+    StateCell, StateKey, StateKeyRef, decode_state_key, encode_state_entity_prefix,
+    encode_state_key, exclusive_prefix_upper_bound,
+};
 use crate::state::{StateRow, StateRowSource, TransactionStateView, UntrackedStateRow};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidationSet};
@@ -162,36 +165,40 @@ async fn visible_rows<R>(
     state_view: &TransactionStateView<R>,
     active_branch_id: &str,
     domain: &Domain,
-    schema_keys: &[String],
-    entity_pks: &[EntityPk],
-    include_tombstones: bool,
+    schema_key: &str,
 ) -> Result<NativeValidationRows, LixError>
 where
     R: StorageAdapterRead,
 {
     let mut output = NativeValidationRows::default();
+    let prefix = encode_state_entity_prefix(
+        schema_key,
+        &EntityPk {
+            components: EntityPkComponents::Empty,
+        },
+    );
+    let upper = exclusive_prefix_upper_bound(&prefix);
     if domain.untracked() {
-        for row in state_view.untracked_branch_range(None, None, None).await? {
+        for row in state_view
+            .untracked_branch_range(Some(&prefix), upper.as_deref(), None)
+            .await?
+        {
             let row = NativeValidationRow::from_untracked(row);
-            if domain_matches(domain, &row)
-                && (schema_keys.is_empty() || schema_keys.iter().any(|key| key == row.schema_key()))
-                && (entity_pks.is_empty() || entity_pks.iter().any(|pk| pk == row.entity_pk()))
-                && (include_tombstones || !row.deleted)
-            {
+            if domain_matches(domain, &row) {
                 output.rows.push(row);
             }
         }
     } else {
-        // This is the explicit full validation range.  The native state view
-        // authenticates ordering, branch/global overlay, tombstones, and the
-        // transaction's staged replacement before this filter is applied.
-        for row in state_view.range(None, None, None, true).await? {
+        // Validation is bounded to each affected schema prefix.  The native
+        // state view authenticates ordering, branch/global overlay, tombstones,
+        // and the transaction's staged replacement before this filter runs.
+        for row in state_view
+            .range(Some(&prefix), upper.as_deref(), None, true)
+            .await
+            .map_err(LixError::from)?
+        {
             let row = NativeValidationRow::from_tracked(row, active_branch_id)?;
-            if domain_matches(domain, &row)
-                && (schema_keys.is_empty() || schema_keys.iter().any(|key| key == row.schema_key()))
-                && (entity_pks.is_empty() || entity_pks.iter().any(|pk| pk == row.entity_pk()))
-                && (include_tombstones || !row.deleted)
-            {
+            if domain_matches(domain, &row) {
                 output.rows.push(row);
             }
         }
@@ -867,26 +874,58 @@ where
     }
     validate_descriptor_shapes(input.schema_catalog, &staged_rows)?;
     validate_registered_schema_rows(&input, &staged_rows)?;
-    let mut all_rows = visible_rows(
-        input.state_view,
-        input.active_branch_id,
-        &Domain::any_file(input.active_branch_id, false),
-        &[],
-        &[],
-        true,
-    )
-    .await?;
-    all_rows.extend(
-        visible_rows(
-            input.state_view,
-            input.active_branch_id,
-            &Domain::any_file(input.active_branch_id, true),
-            &[],
-            &[],
-            true,
-        )
-        .await?,
-    );
+    let mut schema_keys = BTreeSet::new();
+    for row in &staged_rows {
+        schema_keys.insert(row.schema_key().to_owned());
+        if let Some((_, plan)) = input.schema_catalog.plan_for_key(row.schema_key()) {
+            schema_keys.extend(
+                plan.foreign_keys
+                    .iter()
+                    .map(|foreign_key| foreign_key.referenced_schema.schema_key.clone()),
+            );
+        }
+        if row_is_tombstone(*row) {
+            schema_keys.extend(
+                input
+                    .schema_catalog
+                    .delete_plan_for_key(row.schema_key())
+                    .foreign_key_references
+                    .iter()
+                    .map(|reference| reference.source_key.schema_key.clone()),
+            );
+        }
+        if row.file_id().is_some() {
+            schema_keys.insert(FILE_DESCRIPTOR_SCHEMA_KEY.to_owned());
+        }
+        if matches!(
+            row.schema_key(),
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY | FILE_DESCRIPTOR_SCHEMA_KEY
+        ) {
+            schema_keys.insert(DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned());
+            schema_keys.insert(FILE_DESCRIPTOR_SCHEMA_KEY.to_owned());
+        }
+    }
+    let mut all_rows = NativeValidationRows::default();
+    for schema_key in schema_keys {
+        all_rows.extend(
+            visible_rows(
+                input.state_view,
+                input.active_branch_id,
+                &Domain::any_file(input.active_branch_id, false),
+                &schema_key,
+            )
+            .await?,
+        );
+        all_rows.extend(
+            visible_rows(
+                input.state_view,
+                input.active_branch_id,
+                &Domain::any_file(input.active_branch_id, true),
+                &schema_key,
+            )
+            .await?,
+        );
+    }
     validate_unique_constraints(&input, &staged_rows, &all_rows).await?;
     validate_foreign_keys(&input, &staged_rows, &all_rows).await?;
     validate_file_ownership(&input, &staged_rows, &all_rows).await?;
