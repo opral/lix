@@ -124,8 +124,7 @@ where
     let changelog_query_source = read_ctx.changelog_query_source();
     providers::register_diff_function(&session, changelog_query_source.clone());
     let write_ctx = SqlWriteContext::new(write_ctx);
-    let write_branch_ref: Arc<dyn BranchRefReader> =
-        Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone()));
+    let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(write_ctx.clone());
     let provider_selection =
         providers::read_provider_selection(&session, std::slice::from_ref(statement));
     providers::register_transaction(
@@ -182,8 +181,7 @@ pub(crate) async fn build_write_session_with_options(
         .with_explicit_insert_columns(options.explicit_insert_columns.clone());
     let write_targets = write_ctx.write_targets()?;
     let active_branch_id = write_ctx.active_branch_id();
-    let branch_ref: Arc<dyn BranchRefReader> =
-        Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone()));
+    let branch_ref: Arc<dyn BranchRefReader> = Arc::new(write_ctx.clone());
     let active_branch_commit_id =
         branch_ref
             .load_head(&active_branch_id)

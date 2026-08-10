@@ -47,7 +47,7 @@ const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 /// it obtains branch heads and reachable topology from the operation's graph
 /// capability, then exposes only terminal row snapshots to the existing entity
 /// projection machinery.
-pub(crate) struct CommitGraphLiveStateReader {
+pub(crate) struct CommitGraphDerivedSurfaceReader {
     schema_key: String,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
     branch_ref: Arc<dyn BranchRefReader>,
@@ -55,7 +55,7 @@ pub(crate) struct CommitGraphLiveStateReader {
     include_retained_nodes: bool,
 }
 
-impl CommitGraphLiveStateReader {
+impl CommitGraphDerivedSurfaceReader {
     pub(crate) fn new(
         schema_key: impl Into<String>,
         commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
@@ -524,7 +524,7 @@ impl CommitGraphLiveStateReader {
 }
 
 #[async_trait::async_trait]
-impl LiveStateReader for CommitGraphLiveStateReader {
+impl LiveStateReader for CommitGraphDerivedSurfaceReader {
     async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
@@ -614,10 +614,7 @@ where
     S: StorageAdapterRead,
 {
     /// Creates a graph reader over the caller-owned read capability.
-    pub(crate) fn new(store: S) -> Self
-    where
-        S: StorageAdapterRead,
-    {
+    pub(crate) fn new(store: S) -> Self {
         CommitGraphStoreReader {
             topology: crate::forktree::CommitTopologyReader::new(store),
             node_cache: HashMap::new(),
@@ -1629,7 +1626,7 @@ mod tests {
                     nodes: Arc::clone(&nodes),
                 });
             let graph = Arc::new(tokio::sync::Mutex::new(graph_reader));
-            let reader = CommitGraphLiveStateReader::new(
+            let reader = CommitGraphDerivedSurfaceReader::new(
                 "lix_commit",
                 graph,
                 branch_ref.clone(),
@@ -1700,7 +1697,7 @@ mod tests {
             nodes: Arc::clone(&nodes),
         });
         let graph = Arc::new(tokio::sync::Mutex::new(graph_reader));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             "lix_commit",
             graph,
             branch_ref.clone(),
@@ -1744,7 +1741,7 @@ mod tests {
             nodes: shared_topology_nodes(130),
         });
         let graph = Arc::new(tokio::sync::Mutex::new(graph_reader));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             "lix_commit",
             graph,
             branch_ref.clone(),
@@ -1782,7 +1779,7 @@ mod tests {
             let graph = Arc::new(tokio::sync::Mutex::new(
                 Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
             ));
-            let reader = CommitGraphLiveStateReader::new(
+            let reader = CommitGraphDerivedSurfaceReader::new(
                 "lix_commit_by_branch",
                 graph,
                 branch_ref.clone(),
@@ -1823,7 +1820,7 @@ mod tests {
         let graph = Arc::new(tokio::sync::Mutex::new(
             Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
         ));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             "lix_commit_by_branch",
             graph,
             branch_ref.clone(),
@@ -1871,7 +1868,7 @@ mod tests {
         let graph = Arc::new(tokio::sync::Mutex::new(
             Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
         ));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             "lix_commit_by_branch",
             graph,
             branch_ref.clone(),
@@ -1918,7 +1915,7 @@ mod tests {
         let graph = Arc::new(tokio::sync::Mutex::new(
             Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
         ));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             "lix_commit",
             graph,
             branch_ref.clone(),
@@ -1958,7 +1955,7 @@ mod tests {
         let graph = Arc::new(tokio::sync::Mutex::new(
             Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
         ));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             BRANCH_REF_SCHEMA_KEY,
             graph,
             branch_ref.clone(),
@@ -2001,7 +1998,7 @@ mod tests {
         let graph = Arc::new(tokio::sync::Mutex::new(
             Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
         ));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             BRANCH_REF_SCHEMA_KEY,
             graph,
             branch_ref.clone(),
@@ -2043,7 +2040,7 @@ mod tests {
         let graph = Arc::new(tokio::sync::Mutex::new(
             Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
         ));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             BRANCH_REF_SCHEMA_KEY,
             graph,
             branch_ref.clone(),
@@ -2083,7 +2080,7 @@ mod tests {
         let graph = Arc::new(tokio::sync::Mutex::new(
             Box::new(EmptyCommitGraphReader) as Box<dyn CommitGraphReader>
         ));
-        let reader = CommitGraphLiveStateReader::new(
+        let reader = CommitGraphDerivedSurfaceReader::new(
             BRANCH_REF_SCHEMA_KEY,
             graph,
             branch_ref.clone(),
