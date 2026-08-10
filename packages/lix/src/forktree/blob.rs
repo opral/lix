@@ -1157,6 +1157,7 @@ async fn build_completed_manifest<R>(
 where
     R: StorageAdapterRead,
 {
+    let new_chunk_bytes = index_new_chunk_bytes(new_chunks)?;
     let mut parts = BTreeMap::<u64, UploadPartV1>::new();
     if let Some(prior_root) = prior_root {
         let mut start_after = None;
@@ -1206,13 +1207,9 @@ where
         let mut part_digest = blake3::Hasher::new();
         for chunk_ref in &part.ordered_chunks {
             let bytes = if part.part_number == new_part.part_number {
-                new_chunks
-                    .iter()
-                    .find_map(|chunk| {
-                        chunk.encode().ok().and_then(|(id, _)| {
-                            (id == chunk_ref.chunk_object_id).then_some(chunk.bytes.clone())
-                        })
-                    })
+                new_chunk_bytes
+                    .get(&chunk_ref.chunk_object_id)
+                    .map(|bytes| (*bytes).clone())
                     .ok_or_else(|| corruption("new upload chunk is absent"))?
             } else {
                 let bytes = view.load_object_bytes(chunk_ref.chunk_object_id).await?;
@@ -1237,6 +1234,17 @@ where
         ));
     }
     super::merkle::build_blob_merkle_tree_from_chunk_claims(next_offset, &chunk_claims)
+}
+
+fn index_new_chunk_bytes<'a>(
+    chunks: &'a [BlobChunkV1],
+) -> Result<BTreeMap<ObjectId, &'a Bytes>, StorageError> {
+    let mut indexed = BTreeMap::new();
+    for chunk in chunks {
+        let (object_id, _) = chunk.encode()?;
+        indexed.entry(object_id).or_insert(&chunk.bytes);
+    }
+    Ok(indexed)
 }
 
 /// Authenticates an open upload and streams its path-copied ReceiptTree in
@@ -1569,5 +1577,32 @@ mod historical_blob_binding_tests {
                 .into(),
         );
         assert!(bind_historical_state_blob_ref(&key(id), &value(id, missing_id, 1)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod upload_chunk_index_tests {
+    use super::{BlobChunkV1, index_new_chunk_bytes};
+    use bytes::Bytes;
+
+    #[test]
+    fn indexes_repeated_authenticated_chunk_identity_without_copying_bytes() {
+        let bytes = Bytes::from(vec![0x5a; 1024]);
+        let chunks = vec![
+            BlobChunkV1 {
+                bytes: bytes.clone(),
+            },
+            BlobChunkV1 {
+                bytes: bytes.clone(),
+            },
+        ];
+        let indexed = index_new_chunk_bytes(&chunks).expect("index chunks");
+        assert_eq!(
+            indexed.len(),
+            1,
+            "same content must share one object identity"
+        );
+        let selected = indexed.values().next().expect("indexed chunk");
+        assert!(std::ptr::eq(selected.as_ref(), bytes.as_ref()));
     }
 }
