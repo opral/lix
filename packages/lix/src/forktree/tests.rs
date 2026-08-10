@@ -248,8 +248,17 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     assert_eq!(source_commit.commit_id, seed.commit_id);
     assert_eq!(source_change.change_id(), seed.semantic_change_id);
     assert_eq!(
+        member.selected_created_at(),
+        Some(LixTimestamp::from_unix_millis_utc_lossy(1))
+    );
+    assert_eq!(
         member.clone(),
-        CommitMemberV1::selected(seed.semantic_change_id, seed.commit_object_id, 0)
+        CommitMemberV1::selected(
+            seed.semantic_change_id,
+            seed.commit_object_id,
+            0,
+            LixTimestamp::from_unix_millis_utc_lossy(1),
+        )
     );
     let entry = ChangeCatalogEntry {
         owner: ChangeCatalogOwner::CommitMember {
@@ -361,7 +370,12 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("open selected history view");
-    let member = CommitMemberV1::selected(seed.semantic_change_id, seed.commit_object_id, 0);
+    let member = CommitMemberV1::selected(
+        seed.semantic_change_id,
+        seed.commit_object_id,
+        0,
+        LixTimestamp::from_unix_millis_utc_lossy(1),
+    );
     let entry = ChangeCatalogEntry {
         owner: ChangeCatalogOwner::CommitMember {
             commit_object_id: seed.commit_object_id,

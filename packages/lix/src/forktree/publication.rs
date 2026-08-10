@@ -1434,10 +1434,24 @@ impl PreparedPublication {
         }
 
         let is_global = state_domain_global;
+        let first_parent_object_id = semantic_commits
+            .first()
+            .and_then(|commit| commit.parent_commit_object_ids.first())
+            .copied()
+            .ok_or_else(|| corruption("ordered history first commit has no parent"))?;
+        let first_parent_bytes = view.load_object_bytes(first_parent_object_id).await?;
+        let first_parent = CommitObjectV1::decode(first_parent_object_id, &first_parent_bytes)?;
+        view.validate_retained_commit(
+            view.repository_root().commit_catalog_root,
+            view.repository_root().change_catalog_root,
+            first_parent_object_id,
+            &first_parent,
+        )
+        .await?;
         let mut expected_state_base = if is_global {
-            view.repository_root().global_state_root
+            first_parent.global_state_root
         } else {
-            view.branch_snapshot().local_state_root
+            first_parent.local_state_root
         };
         let mut seen_commit_ids = BTreeSet::new();
         for (commit, state_edit) in semantic_commits.iter().zip(state_edits.iter()) {
@@ -1457,10 +1471,10 @@ impl PreparedPublication {
             let expected_global_root = if is_global {
                 state_edit.root
             } else {
-                view.repository_root().global_state_root
+                first_parent.global_state_root
             };
             let expected_local_root = if is_global {
-                view.branch_snapshot().local_state_root
+                first_parent.local_state_root
             } else {
                 state_edit.root
             };

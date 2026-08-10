@@ -193,6 +193,10 @@ pub(crate) enum CommitMemberV1 {
         change_id: ChangeId,
         source_commit_object_id: ObjectId,
         source_ordinal: u32,
+        /// Authenticated lifecycle timestamp projected by this selected
+        /// membership. Checkpoint compaction may rebase an identity that was
+        /// absent from its parent while retaining the canonical source member.
+        created_at: LixTimestamp,
     },
 }
 
@@ -217,11 +221,37 @@ impl CommitMemberV1 {
         change_id: ChangeId,
         source_commit_object_id: ObjectId,
         source_ordinal: u32,
+        created_at: LixTimestamp,
     ) -> Self {
         Self::Selected {
             change_id,
             source_commit_object_id,
             source_ordinal,
+            created_at,
+        }
+    }
+
+    pub(crate) fn with_selected_created_at(
+        mut self,
+        created_at: LixTimestamp,
+    ) -> Result<Self, StorageError> {
+        let Self::Selected {
+            created_at: selected_created_at,
+            ..
+        } = &mut self
+        else {
+            return Err(corruption(
+                "cannot project a selected timestamp onto an introduced member",
+            ));
+        };
+        *selected_created_at = created_at;
+        Ok(self)
+    }
+
+    pub(crate) fn selected_created_at(&self) -> Option<LixTimestamp> {
+        match self {
+            Self::Selected { created_at, .. } => Some(*created_at),
+            Self::Introduced { .. } => None,
         }
     }
 
@@ -275,11 +305,13 @@ impl CommitMemberV1 {
                 change_id,
                 source_commit_object_id,
                 source_ordinal,
+                created_at,
             } => {
                 encoder.u8(1);
                 encoder.fixed(change_id.as_bytes());
                 encode_id(encoder, *source_commit_object_id);
                 encoder.u32(*source_ordinal);
+                encoder.u64(created_at.packed());
             }
         }
         Ok(())
@@ -308,6 +340,9 @@ impl CommitMemberV1 {
                 ChangeId::from_bytes(decoder.fixed()?),
                 decode_id(decoder)?,
                 decoder.u32()?,
+                LixTimestamp::from_packed(decoder.u64()?).map_err(|error| {
+                    corruption(format!("selected change created_at is invalid: {error}"))
+                })?,
             ),
             tag => {
                 return Err(corruption(format!(

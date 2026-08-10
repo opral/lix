@@ -4056,7 +4056,6 @@ impl StagedCommitChangeBatch {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn source_membership_certified(&self) -> bool {
         self.source_membership_certified
     }
