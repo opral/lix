@@ -7,9 +7,6 @@ use crate::entity_pk::EntityPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, StateKey};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::{Storage, StorageAdapterRead};
-use crate::tracked_state::{
-    TrackedStateIndexValue, TrackedStateKey, descriptor_dependency_cascade_file_ids,
-};
 use crate::transaction::Transaction;
 use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 use crate::undo_redo::{
@@ -244,7 +241,7 @@ where
     Ok(semantic_state_from_marker(marker, commit_id))
 }
 
-fn semantic_keys(branch_id: &str) -> Result<[TrackedStateKey; 2], LixError> {
+fn semantic_keys(branch_id: &str) -> Result<[StateKey; 2], LixError> {
     let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PARAM,
@@ -252,12 +249,12 @@ fn semantic_keys(branch_id: &str) -> Result<[TrackedStateKey; 2], LixError> {
         )
     })?;
     Ok([
-        TrackedStateKey {
+        StateKey {
             schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
             file_id: None,
             entity_pk: branch_pk.clone(),
         },
-        TrackedStateKey {
+        StateKey {
             schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
             file_id: None,
             entity_pk: branch_pk,
@@ -270,25 +267,18 @@ async fn semantic_state_for_record(
     branch_id: &str,
     commit_id: CommitId,
     record: &crate::commit_graph::CommitGraphNode,
-) -> Result<
-    (
-        SemanticState,
-        Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-    ),
-    LixError,
-> {
+) -> Result<(SemanticState, Vec<HistoricalStateRow>), LixError> {
     if record.parent_commit_ids.len() != 1 {
         return Ok((SemanticState::default(), Vec::new()));
     }
 
     let keys = semantic_keys(branch_id)?;
     let delta_rows = facade.load_commit_delta_rows(commit_id, None).await?;
-    let delta = tracked_delta_from_rows(&delta_rows);
     if delta_rows
         .iter()
         .any(|row| row.key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY && !row.deleted)
     {
-        return Ok((SemanticState::default(), delta));
+        return Ok((SemanticState::default(), delta_rows));
     }
     let operation_marker = delta_rows
         .iter()
@@ -301,7 +291,7 @@ async fn semantic_state_for_record(
                 redo_target: None,
                 redo_next: None,
             },
-            delta,
+            delta_rows,
         ));
     };
     let operation_key = StateKey {
@@ -310,11 +300,11 @@ async fn semantic_state_for_record(
         entity_pk: keys[1].entity_pk.clone(),
     };
     if operation_row.key != operation_key {
-        return Ok((SemanticState::default(), delta));
+        return Ok((SemanticState::default(), delta_rows));
     }
     let marker = parse_marker(operation_row.snapshot_content.as_ref(), commit_id)?;
     let state = semantic_state_from_marker(marker, commit_id);
-    Ok((state, delta))
+    Ok((state, delta_rows))
 }
 
 fn semantic_state_from_marker(marker: UndoRedoMarker, commit_id: CommitId) -> SemanticState {
@@ -332,29 +322,6 @@ fn semantic_state_from_marker(marker: UndoRedoMarker, commit_id: CommitId) -> Se
             redo_next: None,
         },
     }
-}
-
-fn tracked_delta_from_rows(
-    rows: &[HistoricalStateRow],
-) -> Vec<(TrackedStateKey, TrackedStateIndexValue)> {
-    rows.iter()
-        .map(|row| {
-            (
-                TrackedStateKey {
-                    schema_key: row.key.schema_key.clone(),
-                    file_id: row.key.file_id.clone(),
-                    entity_pk: row.key.entity_pk.clone(),
-                },
-                TrackedStateIndexValue {
-                    change_id: row.change_id,
-                    commit_id: row.commit_id,
-                    deleted: row.deleted,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                },
-            )
-        })
-        .collect()
 }
 
 async fn operation_marker_at(
@@ -420,9 +387,8 @@ fn missing_operation_marker(commit_id: CommitId) -> LixError {
 async fn load_commit_delta(
     facade: &ForkTreeReadFacade<impl StorageAdapterRead>,
     commit_id: CommitId,
-) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
-    let rows = facade.load_commit_delta_rows(commit_id, None).await?;
-    Ok(tracked_delta_from_rows(&rows))
+) -> Result<Vec<HistoricalStateRow>, LixError> {
+    facade.load_commit_delta_rows(commit_id, None).await
 }
 
 async fn load_node<S>(
@@ -469,7 +435,7 @@ async fn apply_state_diff<S>(
     desired: CommitId,
     target: CommitId,
     desired_is_target: bool,
-    target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
+    target_delta: &[HistoricalStateRow],
 ) -> Result<crate::sql2::DiffCommandOutcome, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -480,7 +446,7 @@ where
     let keys = if cascade_file_ids.is_empty() {
         target_delta
             .iter()
-            .map(|(key, _)| key.clone())
+            .map(|row| row.key.clone())
             .collect::<Vec<_>>()
     } else {
         let visible_schema_keys = transaction.visible_schema_keys()?;
@@ -504,7 +470,7 @@ where
         })
         .collect::<Vec<_>>();
     transaction
-        .execute_tracked_state_transition_with_facade(facade, current, desired, keys)
+        .execute_state_transition_with_facade(facade, current, desired, keys)
         .await
 }
 
@@ -513,18 +479,18 @@ async fn descriptor_dependency_closure(
     current: CommitId,
     desired: CommitId,
     dependency_commit: CommitId,
-    target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
+    target_delta: &[HistoricalStateRow],
     file_ids: &[String],
     visible_schema_keys: &[String],
-) -> Result<Vec<TrackedStateKey>, LixError> {
+) -> Result<Vec<StateKey>, LixError> {
     let mut keys = target_delta
         .iter()
-        .map(|(key, _)| key.clone())
+        .map(|row| row.key.clone())
         .collect::<BTreeSet<_>>();
     let mut schema_keys = visible_schema_keys.iter().cloned().collect::<BTreeSet<_>>();
     if target_delta
         .iter()
-        .any(|(key, _)| key.schema_key == "lix_registered_schema")
+        .any(|row| row.key.schema_key == "lix_registered_schema")
     {
         for endpoint in [current, desired] {
             for row in facade.scan_state_rows_at_commit(endpoint).await? {
@@ -554,46 +520,68 @@ async fn descriptor_dependency_closure(
         {
             continue;
         }
-        keys.insert(TrackedStateKey {
-            schema_key: row.key.schema_key,
-            file_id: row.key.file_id,
-            entity_pk: row.key.entity_pk,
-        });
+        keys.insert(row.key);
     }
     Ok(keys.into_iter().collect())
 }
 
+fn descriptor_dependency_cascade_file_ids(
+    target_delta: &[HistoricalStateRow],
+) -> Result<Vec<String>, LixError> {
+    let mut file_ids = BTreeSet::new();
+    for row in target_delta {
+        if row.key.schema_key != "lix_file_descriptor" || !row.deleted {
+            continue;
+        }
+        let file_id = row
+            .key
+            .entity_pk
+            .as_single_string_owned()
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("file descriptor tombstone has invalid identity: {error}"),
+                )
+            })?;
+        file_ids.insert(file_id);
+    }
+    Ok(file_ids.into_iter().collect())
+}
+
 async fn reject_untracked_descriptor_cascade<S>(
     transaction: &mut Transaction<S>,
-    target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
+    target_delta: &[HistoricalStateRow],
     desired_is_target: bool,
     target: CommitId,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let removes_descriptor = |value: &TrackedStateIndexValue| {
+    let removes_descriptor = |row: &HistoricalStateRow| {
         if desired_is_target {
-            value.deleted
+            row.deleted
         } else {
-            !value.deleted
+            !row.deleted
         }
     };
     let mut file_ids = Vec::new();
     let mut removes_directory = false;
-    for (key, value) in target_delta {
-        if !removes_descriptor(value) {
+    for row in target_delta {
+        if !removes_descriptor(row) {
             continue;
         }
-        match key.schema_key.as_str() {
-            "lix_file_descriptor" => {
-                file_ids.push(key.entity_pk.as_single_string_owned().map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("undo/redo file descriptor identity is invalid: {error}"),
-                    )
-                })?)
-            }
+        match row.key.schema_key.as_str() {
+            "lix_file_descriptor" => file_ids.push(
+                row.key
+                    .entity_pk
+                    .as_single_string_owned()
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("undo/redo file descriptor identity is invalid: {error}"),
+                        )
+                    })?,
+            ),
             "lix_directory_descriptor" => removes_directory = true,
             _ => {}
         }
@@ -740,11 +728,12 @@ mod tests {
                 let key = load_commit_delta(&facade, head)
                     .await?
                     .into_iter()
-                    .find(|(key, _)| key.schema_key == "lix_key_value")
+                    .find(|row| row.key.schema_key == "lix_key_value")
                     .expect("update delta contains the key-value row")
-                    .0;
+                    .key
+                    .clone();
                 transaction
-                    .execute_tracked_state_transition(head, parent, vec![key.clone(), key])
+                    .execute_state_transition(head, parent, vec![key.clone(), key])
                     .await
             })
             .await
@@ -765,11 +754,12 @@ mod tests {
                 let key = load_commit_delta(&facade, head)
                     .await?
                     .into_iter()
-                    .find(|(key, _)| key.schema_key == "lix_key_value")
+                    .find(|row| row.key.schema_key == "lix_key_value")
                     .expect("update delta contains the key-value row")
-                    .0;
+                    .key
+                    .clone();
                 transaction
-                    .execute_tracked_state_transition(parent, head, vec![key])
+                    .execute_state_transition(parent, head, vec![key])
                     .await
             })
             .await

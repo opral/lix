@@ -38,45 +38,23 @@ pub(crate) enum MergeDiffKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeRow {
-    pub(crate) key: StateKey,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
-    pub(crate) snapshot_content: Option<SharedStr>,
-    pub(crate) metadata: Option<SharedStr>,
 }
 
 impl MergeRow {
-    pub(crate) fn from_state_value(key: StateKey, value: &StateValue) -> Self {
-        let (deleted, snapshot_content) = match &value.cell {
-            StateCell::Tombstone => (true, None),
-            StateCell::Null => (false, None),
-            StateCell::Value(value) => (false, Some(value.clone())),
-        };
+    pub(crate) fn from_state_value(value: &StateValue) -> Self {
+        let deleted = matches!(&value.cell, StateCell::Tombstone);
         Self {
-            key,
             deleted,
             created_at: value.created_at,
             updated_at: value.updated_at,
             change_id: value.change_id,
             commit_id: value.commit_id,
-            snapshot_content,
-            metadata: value.metadata.clone(),
         }
-    }
-
-    pub(crate) fn schema_key(&self) -> &str {
-        &self.key.schema_key
-    }
-
-    pub(crate) fn file_id(&self) -> Option<&str> {
-        self.key.file_id.as_deref()
-    }
-
-    pub(crate) fn entity_pk(&self) -> &crate::entity_pk::EntityPk {
-        &self.key.entity_pk
     }
 }
 
@@ -88,11 +66,11 @@ pub(crate) fn merge_entry_from_native(entry: StateDiffEntry) -> Option<MergeDiff
     let before = entry
         .before
         .as_ref()
-        .map(|value| MergeRow::from_state_value(identity.clone(), &value.value));
+        .map(|value| MergeRow::from_state_value(&value.value));
     let after = entry
         .after
         .as_ref()
-        .map(|value| MergeRow::from_state_value(identity.clone(), &value.value));
+        .map(|value| MergeRow::from_state_value(&value.value));
     let before_live = before.as_ref().is_some_and(|row| !row.deleted);
     let after_live = after.as_ref().is_some_and(|row| !row.deleted);
     let kind = match (before_live, after_live) {
@@ -168,9 +146,21 @@ pub(crate) struct MergePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergePick {
-    pub(crate) identity: StateKey,
+    pub(crate) source_index: usize,
     pub(crate) change_id: ChangeId,
-    pub(crate) selected_row: MergeRow,
+}
+
+impl MergePick {
+    pub(crate) fn identity<'a>(&self, source: &'a MergeDiff) -> &'a StateKey {
+        &source.entries[self.source_index].identity
+    }
+
+    pub(crate) fn selected_row<'a>(&self, source: &'a MergeDiff) -> &'a MergeRow {
+        source.entries[self.source_index]
+            .after
+            .as_ref()
+            .expect("source pick always references a live after row")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,11 +205,7 @@ impl MergeKeyExt for StateKey {
     }
 }
 
-pub(crate) fn plan_merge(
-    target: &MergeDiff,
-    source: &MergeDiff,
-    fallback_payloads: &MergePayloadBatch,
-) -> Result<MergePlan, LixError> {
+pub(crate) fn plan_merge(target: &MergeDiff, source: &MergeDiff) -> Result<MergePlan, LixError> {
     ensure_strictly_sorted(&target.entries)?;
     ensure_strictly_sorted(&source.entries)?;
     let mut plan = MergePlan::default();
@@ -231,17 +217,11 @@ pub(crate) fn plan_merge(
         match target_entry.identity.cmp(&source_entry.identity) {
             Ordering::Less => target_index += 1,
             Ordering::Greater => {
-                plan.picks.push(source_pick(source_entry)?);
+                plan.picks.push(source_pick(source_entry, source_index)?);
                 source_index += 1;
             }
             Ordering::Equal => {
-                if !same_final_state(
-                    target_entry,
-                    source_entry,
-                    target,
-                    source,
-                    fallback_payloads,
-                ) {
+                if !same_final_state(target_entry, source_entry, target, source) {
                     plan.conflicts.push(MergeConflict {
                         identity: target_entry.identity.clone(),
                         target: target_entry.clone(),
@@ -253,8 +233,8 @@ pub(crate) fn plan_merge(
             }
         }
     }
-    for entry in &source.entries[source_index..] {
-        plan.picks.push(source_pick(entry)?);
+    for (index, entry) in source.entries.iter().enumerate().skip(source_index) {
+        plan.picks.push(source_pick(entry, index)?);
     }
     Ok(plan)
 }
@@ -284,7 +264,7 @@ fn ensure_strictly_sorted(entries: &[MergeDiffEntry]) -> Result<(), LixError> {
     Ok(())
 }
 
-fn source_pick(entry: &MergeDiffEntry) -> Result<MergePick, LixError> {
+fn source_pick(entry: &MergeDiffEntry, source_index: usize) -> Result<MergePick, LixError> {
     let Some(row) = entry.after.clone() else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -296,9 +276,8 @@ fn source_pick(entry: &MergeDiffEntry) -> Result<MergePick, LixError> {
         ));
     };
     Ok(MergePick {
-        identity: entry.identity.clone(),
+        source_index,
         change_id: row.change_id,
-        selected_row: row,
     })
 }
 
@@ -307,13 +286,12 @@ fn same_final_state(
     source: &MergeDiffEntry,
     target_diff: &MergeDiff,
     source_diff: &MergeDiff,
-    fallback: &MergePayloadBatch,
 ) -> bool {
     match (target.after.as_ref(), source.after.as_ref()) {
         (None, None) => true,
         (Some(target), Some(source)) if target.deleted && source.deleted => true,
         (Some(target), Some(source)) if !target.deleted && !source.deleted => {
-            row_payload_eq(target, source, target_diff, source_diff, fallback)
+            row_payload_eq(target, source, target_diff, source_diff)
         }
         _ => false,
     }
@@ -324,7 +302,6 @@ fn row_payload_eq(
     right: &MergeRow,
     target: &MergeDiff,
     source: &MergeDiff,
-    fallback: &MergePayloadBatch,
 ) -> bool {
     if left.change_id == right.change_id {
         return true;
@@ -332,13 +309,11 @@ fn row_payload_eq(
     let left = target
         .payloads()
         .get(left.change_id)
-        .or_else(|| source.payloads().get(left.change_id))
-        .or_else(|| fallback.get(left.change_id));
+        .or_else(|| source.payloads().get(left.change_id));
     let right = target
         .payloads()
         .get(right.change_id)
-        .or_else(|| source.payloads().get(right.change_id))
-        .or_else(|| fallback.get(right.change_id));
+        .or_else(|| source.payloads().get(right.change_id));
     match (left, right) {
         (Some((left_snapshot, left_metadata)), Some((right_snapshot, right_metadata))) => {
             left_snapshot == right_snapshot && left_metadata == right_metadata

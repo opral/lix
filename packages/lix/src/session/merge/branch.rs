@@ -443,18 +443,16 @@ where
             .in_scope(|| {
                 let mut selected_changes =
                     StagedCommitChangeBatchBuilder::with_capacity(merge_plan.picks.len());
-                for pick in merge_plan
-                    .picks
-                    .iter()
-                    .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
-                {
+                for pick in merge_plan.picks.iter().filter(|pick| {
+                    !pick_is_derived_plugin_state(pick, &analysis.source_diff, &derived_blob_files)
+                }) {
                     selected_changes.push(
-                        pick.identity.clone(),
-                        pick.selected_row.commit_id,
+                        pick.identity(&analysis.source_diff).clone(),
+                        pick.selected_row(&analysis.source_diff).commit_id,
                         pick.change_id,
-                        pick.selected_row.deleted,
-                        pick.selected_row.created_at,
-                        pick.selected_row.updated_at,
+                        pick.selected_row(&analysis.source_diff).deleted,
+                        pick.selected_row(&analysis.source_diff).created_at,
+                        pick.selected_row(&analysis.source_diff).updated_at,
                     );
                 }
                 transaction.stage_merge_commit(
@@ -715,19 +713,21 @@ fn is_derived_blob_conflict(
 
 fn pick_is_derived_plugin_state(
     pick: &MergePick,
+    source_diff: &super::native::MergeDiff,
     derived_blob_files: &DerivedPluginConflictIndex,
 ) -> bool {
-    let Some(file_id) = pick.selected_row.file_id() else {
+    let identity = pick.identity(source_diff);
+    let Some(file_id) = identity.file_id() else {
         return false;
     };
     let Some(owner) = derived_blob_files.owner(file_id) else {
         return false;
     };
-    matches!(pick.selected_row.schema_key(), BLOB_REF_SCHEMA_KEY)
+    matches!(identity.schema_key(), BLOB_REF_SCHEMA_KEY)
         || owner
             .schema_keys()
             .iter()
-            .any(|schema_key| schema_key == pick.selected_row.schema_key())
+            .any(|schema_key| schema_key == identity.schema_key())
 }
 
 /// One historical triple for a plugin-owned semantic entity. The row identity
@@ -1552,33 +1552,35 @@ where
         .picks
         .iter()
         .filter(|pick| {
-            pick.selected_row.file_id().is_some_and(|file_id| {
-                derived_blob_files.owner(file_id).is_some_and(|owner| {
-                    owner
-                        .schema_keys()
-                        .iter()
-                        .any(|schema_key| schema_key == pick.selected_row.schema_key())
+            pick.identity(&analysis.source_diff)
+                .file_id()
+                .is_some_and(|file_id| {
+                    derived_blob_files.owner(file_id).is_some_and(|owner| {
+                        owner.schema_keys().iter().any(|schema_key| {
+                            schema_key == pick.identity(&analysis.source_diff).schema_key()
+                        })
+                    })
                 })
-            })
         })
         .count();
     let mut keys = Vec::with_capacity(key_count);
     for pick in &merge_plan.picks {
-        let Some(file_id) = pick.selected_row.file_id() else {
+        let identity = pick.identity(&analysis.source_diff);
+        let Some(file_id) = identity.file_id() else {
             continue;
         };
         if !derived_blob_files.owner(file_id).is_some_and(|owner| {
             owner
                 .schema_keys()
                 .iter()
-                .any(|schema_key| schema_key == pick.selected_row.schema_key())
+                .any(|schema_key| schema_key == identity.schema_key())
         }) {
             continue;
         }
         keys.push(StateKey {
-            schema_key: pick.selected_row.schema_key().to_owned(),
-            file_id: pick.selected_row.file_id().map(str::to_owned),
-            entity_pk: pick.selected_row.entity_pk().clone(),
+            schema_key: identity.schema_key().to_owned(),
+            file_id: identity.file_id().map(str::to_owned),
+            entity_pk: identity.entity_pk().clone(),
         });
     }
     debug_assert_eq!(keys.len(), key_count);

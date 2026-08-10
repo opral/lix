@@ -212,13 +212,7 @@ fn push_selected_change(
     let change_id = value.change_id;
     let updated_at = value.updated_at;
     selected_changes.push(
-        crate::tracked_state::TrackedStateDiffIdentity::from_key(
-            crate::tracked_state::TrackedStateKey {
-                schema_key: key.schema_key.clone(),
-                file_id: key.file_id.clone(),
-                entity_pk: key.entity_pk.clone(),
-            },
-        ),
+        key.clone(),
         source_commit_id,
         change_id,
         deleted,
