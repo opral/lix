@@ -25,13 +25,13 @@ use crate::transaction::types::PreparedStateRowRef;
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CheckpointCursorV1,
-    CommitCatalogEntry, CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1,
-    CommitObjectV1, HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition,
-    PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCellRef, StateKey,
-    StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
-    encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
-    introduced_checkpoint_marker, load_commit, load_commit_summary, open_coherent_view_on_read,
-    select_historical_commit_members, state_points,
+    CollectionTransitionRow, CommitCatalogEntry, CommitChangePageV2, CommitId as ForkTreeCommitId,
+    CommitMemberV1, CommitObjectV1, HistoricalMemberSelection, ObjectId,
+    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1,
+    SelectedHistoricalMember, StateKey, StateKeyRef, StateMutationAudit, StateSource,
+    StateTreeMutation, StateValueRef, encode_state_entity_prefix_bounds, encode_state_key,
+    encode_state_value, introduced_checkpoint_marker, load_commit, load_commit_summary,
+    open_coherent_view_on_read, select_historical_commit_members, state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -347,6 +347,8 @@ where
             })
         })
         .collect::<Vec<_>>();
+    let root_transition = complete_replacement_bounds.is_some();
+    let replacement_schema_key = root_transition.then(|| tracked_rows[0].schema_key.to_string());
     let previous_rows = if complete_replacement_bounds.is_some() {
         // The complete-set certificate proves that every ordered identity is
         // the current collection.  Reading every predecessor would recreate
@@ -363,6 +365,12 @@ where
         ));
     }
     let mut members = Vec::with_capacity(tracked_rows.len());
+    let mut prepared_change_ids = Vec::with_capacity(tracked_rows.len());
+    let mut collection_rows = Vec::with_capacity(if root_transition {
+        tracked_rows.len()
+    } else {
+        0
+    });
     let mut pending_rows = Vec::with_capacity(tracked_rows.len());
     for ((row, key), previous) in tracked_rows
         .into_iter()
@@ -380,44 +388,78 @@ where
         let change_id = row
             .change_id
             .ok_or_else(|| writer_error("tracked row has no change identity"))?;
+        prepared_change_ids.push(forktree_change_id(change_id));
         let canonical_snapshot = canonical_snapshot_for_row(
             row,
             &prepared_blob_manifests,
             &prepared_writes.historical_blob_manifest_edges,
         )?;
-        let snapshot = canonical_snapshot
-            .as_deref()
-            .map_or(JsonSlot::None, |value| JsonSlot::Inline(value.into()));
-        let metadata = row.metadata.map_or(JsonSlot::None, |value| {
-            JsonSlot::Inline(value.normalized().into())
-        });
-        let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-            format_version: 2,
-            change_id,
-            account_id: active_account_id.to_string(),
-            schema_key: row.schema_key.to_string(),
-            entity_pk: row.entity_pk.clone(),
-            file_id: row.file_id.map(ToString::to_string),
-            snapshot,
-            metadata,
-            created_at: row.created_at,
-            origin_key: row.origin_key.map(ToString::to_string),
-        })?;
         let blob_manifest_object_ids = blob_manifest_object_ids_for_row(
             row,
             &prepared_blob_manifests,
             &prepared_writes.historical_blob_manifest_edges,
         )?;
-        members.push(CommitMemberV1::introduced(
-            forktree_change_id(change_id),
-            payload,
-            global,
-            row.updated_at,
-            blob_manifest_object_ids.clone(),
-        ));
+        if root_transition {
+            if !blob_manifest_object_ids.is_empty() {
+                return Err(writer_error(
+                    "complete collection transition contains a blob-manifest edge",
+                ));
+            }
+            collection_rows.push(CollectionTransitionRow {
+                state_key: key.clone(),
+                snapshot: canonical_snapshot.as_deref().map(str::to_owned),
+                metadata: row.metadata.map(|value| value.normalized().to_owned()),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                origin_key: row.origin_key.map(ToString::to_string),
+            });
+        } else {
+            let snapshot = canonical_snapshot
+                .as_deref()
+                .map_or(JsonSlot::None, |value| JsonSlot::Inline(value.into()));
+            let metadata = row.metadata.map_or(JsonSlot::None, |value| {
+                JsonSlot::Inline(value.normalized().into())
+            });
+            let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+                format_version: 2,
+                change_id,
+                account_id: active_account_id.to_string(),
+                schema_key: row.schema_key.to_string(),
+                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.map(ToString::to_string),
+                snapshot,
+                metadata,
+                created_at: row.created_at,
+                origin_key: row.origin_key.map(ToString::to_string),
+            })?;
+            members.push(CommitMemberV1::introduced(
+                forktree_change_id(change_id),
+                payload,
+                global,
+                row.updated_at,
+                blob_manifest_object_ids.clone(),
+            ));
+        }
         pending_rows.push((row, key, previous, blob_manifest_object_ids));
     }
-    let member_pages = CommitChangePageV2::encode_pages(forktree_commit_id(commit_id), &members)?;
+    let mut member_pages = if root_transition {
+        CommitChangePageV2::encode_collection_transition_pages(
+            forktree_commit_id(commit_id),
+            active_account_id,
+            replacement_schema_key
+                .as_deref()
+                .expect("complete replacement has a schema identity"),
+            global,
+            &collection_rows,
+        )?
+    } else {
+        CommitChangePageV2::encode_pages(forktree_commit_id(commit_id), &members)?
+    };
+    if member_pages.member_change_ids != prepared_change_ids {
+        return Err(writer_error(
+            "collection transition change identities do not match packed commit ordinals",
+        ));
+    }
     let mut state_mutations = Vec::with_capacity(pending_rows.len());
     let mut replacement_entries = complete_replacement_bounds
         .as_ref()
@@ -462,7 +504,6 @@ where
     } else {
         view.branch_snapshot().local_state_root
     };
-    let root_transition = complete_replacement_bounds.is_some();
     let state_edit = if let (Some((lower, upper)), Some(entries)) =
         (complete_replacement_bounds, replacement_entries)
     {
@@ -510,10 +551,7 @@ where
         .checked_add(1)
         .ok_or_else(|| writer_error("commit generation overflows u64"))?;
 
-    let semantic_change_ids = members
-        .iter()
-        .map(CommitMemberV1::change_id)
-        .collect::<Vec<_>>();
+    let semantic_change_ids = member_pages.member_change_ids.clone();
     let current_repository_root = publication.current_repository_root();
     let global_state_root = if global {
         state_edit.root
@@ -643,7 +681,7 @@ where
             ChangeCatalogEntry {
                 owner: ChangeCatalogOwner::PackedCommit {
                     commit_object_id,
-                    member_count: u32::try_from(semantic_commit.members.len())
+                    member_count: u32::try_from(semantic_change_ids.len())
                         .map_err(|_| writer_error("packed commit member count exceeds u32"))?,
                 },
             },
@@ -674,11 +712,17 @@ where
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
     };
+    let collection_member_pages = if root_transition {
+        std::mem::take(&mut member_pages.objects)
+    } else {
+        Vec::new()
+    };
     let transition = BranchStateTransition {
         state_edit,
         commit_catalog_edit,
         change_catalog_edit,
         semantic_commit,
+        collection_member_pages,
         changes,
         branch_snapshot: BranchSnapshotV1 {
             branch_id: publication_branch_id,

@@ -8606,6 +8606,7 @@ mod tests {
             commit_catalog_edit,
             change_catalog_edit,
             semantic_commit,
+            collection_member_pages: Vec::new(),
             changes: vec![branch_ref],
             branch_snapshot,
             repository_root: RepositoryRootV1 {

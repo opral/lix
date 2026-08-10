@@ -2765,6 +2765,7 @@ async fn branch_transition_with_members<R: StorageAdapterRead>(
         commit_catalog_edit,
         change_catalog_edit,
         semantic_commit,
+        collection_member_pages: Vec::new(),
         changes: vec![ref_change],
         branch_snapshot: BranchSnapshotV1 {
             branch_id: view.branch_id(),

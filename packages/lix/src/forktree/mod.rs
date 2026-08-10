@@ -27,10 +27,10 @@ pub(crate) use merkle::canonical_blob_id_for_content;
 pub(crate) use model::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,
     BranchSnapshotV1, CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner,
-    ChangeId, ChangeObjectV1, CheckpointCursorV1, CommitCatalogEntry, CommitChangePageV2, CommitId,
-    CommitMemberV1, CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, SnapshotRole,
-    SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, snapshot_selector_key,
+    ChangeId, ChangeObjectV1, CheckpointCursorV1, CollectionTransitionRow, CommitCatalogEntry,
+    CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
+    RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1, snapshot_selector_key,
 };
 pub(crate) use object::ObjectId;
 pub(crate) use publication::{

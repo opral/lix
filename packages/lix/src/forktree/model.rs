@@ -21,6 +21,8 @@ pub(crate) const AUTHENTICATED_EDGE_PAGE_ENTRIES: usize = 256;
 const COMMIT_MEMBER_PAGE_EDGE_BUDGET: usize = AUTHENTICATED_EDGE_PAGE_ENTRIES;
 const COMMIT_CHANGE_PAGE_TARGET_BYTES: usize = 64 * 1024;
 const COMMIT_CHANGE_PAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const COMMIT_CHANGE_PAGE_MEMBERS: u8 = 0;
+const COMMIT_CHANGE_PAGE_COLLECTION_TRANSITION: u8 = 1;
 
 const GLOBAL_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTG\0\x01";
 const BRANCH_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTB\0\x01";
@@ -404,10 +406,36 @@ pub(crate) struct CommitChangePageV2 {
     pub(crate) members: Vec<CommitMemberV1>,
 }
 
+/// Compact authenticated input for a complete collection-root transition.
+///
+/// The state key remains the canonical row identity. Common account/schema
+/// facts are encoded once per page; public history reconstructs the ordinary
+/// semantic change payload lazily when the page is read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CollectionTransitionRow {
+    pub(crate) state_key: Vec<u8>,
+    pub(crate) snapshot: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
+    pub(crate) origin_key: Option<String>,
+}
+
+#[derive(Debug)]
+struct DecodedCollectionTransitionPage {
+    commit_id: CommitId,
+    start_ordinal: u32,
+    account_id: String,
+    schema_key: String,
+    global: bool,
+    rows: Vec<CollectionTransitionRow>,
+}
+
 impl CommitChangePageV2 {
     pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
         self.validate()?;
         let mut body = Encoder::default();
+        body.u8(COMMIT_CHANGE_PAGE_MEMBERS);
         body.fixed(self.commit_id.as_bytes());
         body.u32(self.start_ordinal);
         body.u32(
@@ -434,6 +462,28 @@ impl CommitChangePageV2 {
     }
 
     pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let body = Self::decode_page_body(id, bytes)?;
+        let mut body = Decoder::after_prefix(&body, &[])?;
+        match body.u8()? {
+            COMMIT_CHANGE_PAGE_MEMBERS => Self::decode_member_body(body),
+            COMMIT_CHANGE_PAGE_COLLECTION_TRANSITION => {
+                let page = Self::decode_collection_body(body)?;
+                let members = page.into_members()?;
+                let value = Self {
+                    commit_id: members.0,
+                    start_ordinal: members.1,
+                    members: members.2,
+                };
+                value.validate()?;
+                Ok(value)
+            }
+            tag => Err(corruption(format!(
+                "commit change page has invalid layout tag {tag}"
+            ))),
+        }
+    }
+
+    fn decode_page_body(id: ObjectId, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
         let mut decoder = decode_object(id, ObjectDomain::CommitChangePageV2, bytes)?;
         let decoded_len = decoder.usize("commit change page decoded length")?;
         if decoded_len == 0 || decoded_len > COMMIT_CHANGE_PAGE_MAX_BYTES {
@@ -452,7 +502,10 @@ impl CommitChangePageV2 {
                 "commit change page decoded length is inconsistent",
             ));
         }
-        let mut body = Decoder::after_prefix(&body, &[])?;
+        Ok(body)
+    }
+
+    fn decode_member_body(mut body: Decoder<'_>) -> Result<Self, StorageError> {
         let commit_id = CommitId::from_bytes(body.fixed()?);
         let start_ordinal = body.u32()?;
         let count = body.usize("commit member page count")?;
@@ -473,6 +526,159 @@ impl CommitChangePageV2 {
         };
         value.validate()?;
         Ok(value)
+    }
+
+    fn decode_collection_body(
+        mut body: Decoder<'_>,
+    ) -> Result<DecodedCollectionTransitionPage, StorageError> {
+        let commit_id = CommitId::from_bytes(body.fixed()?);
+        let start_ordinal = body.u32()?;
+        let account_id = decode_utf8(&mut body, "collection transition account id")?;
+        let schema_key = decode_utf8(&mut body, "collection transition schema key")?;
+        let global = decode_bool(&mut body, "collection transition global flag")?;
+        if account_id.is_empty() || schema_key.is_empty() {
+            return Err(corruption(
+                "collection transition account and schema identities must not be empty",
+            ));
+        }
+        let count = body.usize("collection transition row count")?;
+        if count == 0 || count > AUTHENTICATED_EDGE_PAGE_ENTRIES || count > body.remaining() / 23 {
+            return Err(corruption(
+                "collection transition row count exceeds its encoded body",
+            ));
+        }
+        let mut rows = Vec::with_capacity(count);
+        let mut previous_key: Option<Vec<u8>> = None;
+        for _ in 0..count {
+            let state_key = body.bytes("collection transition state key")?;
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| previous.as_slice() >= state_key.as_slice())
+            {
+                return Err(corruption(
+                    "collection transition state keys are not strictly ordered",
+                ));
+            }
+            let decoded_key = super::state::decode_state_key(&state_key)
+                .map_err(|error| corruption(error.to_string()))?;
+            if decoded_key.schema_key != schema_key || decoded_key.file_id.is_some() {
+                return Err(corruption(
+                    "collection transition state key disagrees with its page schema",
+                ));
+            }
+            let snapshot = decode_optional_utf8(&mut body, "collection transition snapshot")?;
+            let metadata = decode_optional_utf8(&mut body, "collection transition metadata")?;
+            let created_at = LixTimestamp::from_packed(body.u64()?).map_err(|error| {
+                corruption(format!(
+                    "collection transition created_at is invalid: {error}"
+                ))
+            })?;
+            let updated_at = LixTimestamp::from_packed(body.u64()?).map_err(|error| {
+                corruption(format!(
+                    "collection transition updated_at is invalid: {error}"
+                ))
+            })?;
+            let origin_key = decode_optional_utf8(&mut body, "collection transition origin key")?;
+            previous_key = Some(state_key.clone());
+            rows.push(CollectionTransitionRow {
+                state_key,
+                snapshot,
+                metadata,
+                created_at,
+                updated_at,
+                origin_key,
+            });
+        }
+        body.finish()?;
+        start_ordinal
+            .checked_add(
+                u32::try_from(rows.len())
+                    .map_err(|_| corruption("collection transition ordinal exceeds u32"))?,
+            )
+            .ok_or_else(|| corruption("collection transition ordinal overflows u32"))?;
+        Ok(DecodedCollectionTransitionPage {
+            commit_id,
+            start_ordinal,
+            account_id,
+            schema_key,
+            global,
+            rows,
+        })
+    }
+
+    /// Authenticates a compact collection page without eagerly reconstructing
+    /// N public history payloads during publication.
+    pub(crate) fn collection_member_ids(
+        id: ObjectId,
+        bytes: &[u8],
+    ) -> Result<(CommitId, u32, Vec<ChangeId>), StorageError> {
+        let page_body = Self::decode_page_body(id, bytes)?;
+        let mut body = Decoder::after_prefix(&page_body, &[])?;
+        if body.u8()? != COMMIT_CHANGE_PAGE_COLLECTION_TRANSITION {
+            return Err(corruption(
+                "prebuilt collection transition contains an ordinary member page",
+            ));
+        }
+        let commit_id = CommitId::from_bytes(body.fixed()?);
+        let start_ordinal = body.u32()?;
+        let account_id = decode_utf8_borrowed(&mut body, "collection transition account id")?;
+        let schema_key = decode_utf8_borrowed(&mut body, "collection transition schema key")?;
+        let _global = decode_bool(&mut body, "collection transition global flag")?;
+        if account_id.is_empty() || schema_key.is_empty() {
+            return Err(corruption(
+                "collection transition account and schema identities must not be empty",
+            ));
+        }
+        let count = body.usize("collection transition row count")?;
+        if count == 0 || count > AUTHENTICATED_EDGE_PAGE_ENTRIES || count > body.remaining() / 23 {
+            return Err(corruption(
+                "collection transition row count exceeds its encoded body",
+            ));
+        }
+        let mut change_ids = Vec::with_capacity(count);
+        let mut previous_key: Option<&[u8]> = None;
+        for offset in 0..count {
+            let state_key = body.bytes_borrowed("collection transition state key")?;
+            if previous_key.is_some_and(|previous| previous >= state_key) {
+                return Err(corruption(
+                    "collection transition state keys are not strictly ordered",
+                ));
+            }
+            let decoded_key = super::state::decode_state_key(state_key)
+                .map_err(|error| corruption(error.to_string()))?;
+            if decoded_key.schema_key != schema_key || decoded_key.file_id.is_some() {
+                return Err(corruption(
+                    "collection transition state key disagrees with its page schema",
+                ));
+            }
+            let _snapshot =
+                decode_optional_utf8_borrowed(&mut body, "collection transition snapshot")?;
+            let _metadata =
+                decode_optional_utf8_borrowed(&mut body, "collection transition metadata")?;
+            LixTimestamp::from_packed(body.u64()?).map_err(|error| {
+                corruption(format!(
+                    "collection transition created_at is invalid: {error}"
+                ))
+            })?;
+            LixTimestamp::from_packed(body.u64()?).map_err(|error| {
+                corruption(format!(
+                    "collection transition updated_at is invalid: {error}"
+                ))
+            })?;
+            let _origin_key =
+                decode_optional_utf8_borrowed(&mut body, "collection transition origin key")?;
+            let ordinal = start_ordinal
+                .checked_add(
+                    u32::try_from(offset)
+                        .map_err(|_| corruption("collection transition ordinal exceeds u32"))?,
+                )
+                .and_then(|ordinal| ordinal.checked_add(1))
+                .ok_or_else(|| corruption("collection transition ordinal overflows u32"))?;
+            change_ids.push(packed_change_id(commit_id, ordinal)?);
+            previous_key = Some(state_key);
+        }
+        body.finish()?;
+        Ok((commit_id, start_ordinal, change_ids))
     }
 
     fn validate(&self) -> Result<(), StorageError> {
@@ -522,6 +728,7 @@ impl CommitChangePageV2 {
             return Ok(PreparedCommitChangePages {
                 objects: Vec::new(),
                 member_locations: Vec::new(),
+                member_change_ids: Vec::new(),
             });
         }
         let mut chunks = Vec::<(u32, Vec<CommitMemberV1>)>::new();
@@ -601,6 +808,91 @@ impl CommitChangePageV2 {
         Ok(PreparedCommitChangePages {
             objects: encoded,
             member_locations,
+            member_change_ids: members.iter().map(CommitMemberV1::change_id).collect(),
+        })
+    }
+
+    pub(crate) fn encode_collection_transition_pages(
+        commit_id: CommitId,
+        account_id: &str,
+        schema_key: &str,
+        global: bool,
+        rows: &[CollectionTransitionRow],
+    ) -> Result<PreparedCommitChangePages, StorageError> {
+        if rows.is_empty() || account_id.is_empty() || schema_key.is_empty() {
+            return Err(corruption(
+                "collection transition must contain rows and common identities",
+            ));
+        }
+        let mut objects = Vec::new();
+        let mut member_locations = Vec::with_capacity(rows.len());
+        let mut member_change_ids = Vec::with_capacity(rows.len());
+        let mut start = 0usize;
+        while start < rows.len() {
+            let mut end = start;
+            let mut estimated_bytes = 64usize
+                .checked_add(account_id.len())
+                .and_then(|value| value.checked_add(schema_key.len()))
+                .ok_or_else(|| corruption("collection transition page size overflowed"))?;
+            while end < rows.len() && end - start < AUTHENTICATED_EDGE_PAGE_ENTRIES {
+                let row = &rows[end];
+                let row_bytes = 32usize
+                    .checked_add(row.state_key.len())
+                    .and_then(|value| {
+                        value.checked_add(row.snapshot.as_deref().map_or(0, str::len))
+                    })
+                    .and_then(|value| {
+                        value.checked_add(row.metadata.as_deref().map_or(0, str::len))
+                    })
+                    .and_then(|value| {
+                        value.checked_add(row.origin_key.as_deref().map_or(0, str::len))
+                    })
+                    .ok_or_else(|| corruption("collection transition row size overflowed"))?;
+                if end > start
+                    && estimated_bytes
+                        .checked_add(row_bytes)
+                        .is_none_or(|bytes| bytes > COMMIT_CHANGE_PAGE_TARGET_BYTES)
+                {
+                    break;
+                }
+                estimated_bytes = estimated_bytes
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| corruption("collection transition page size overflowed"))?;
+                end += 1;
+            }
+            let start_ordinal = u32::try_from(start)
+                .map_err(|_| corruption("collection transition ordinal exceeds u32"))?;
+            let page_rows = &rows[start..end];
+            let (id, bytes) = encode_collection_transition_page(
+                commit_id,
+                start_ordinal,
+                account_id,
+                schema_key,
+                global,
+                page_rows,
+            )?;
+            for offset in 0..page_rows.len() {
+                member_locations.push(StatePageLocation {
+                    page_object_id: id,
+                    page_ordinal: u32::try_from(offset)
+                        .expect("collection page row count is bounded below u32"),
+                });
+                let ordinal = u32::try_from(start + offset + 1)
+                    .map_err(|_| corruption("collection transition ordinal exceeds u32"))?;
+                member_change_ids.push(packed_change_id(commit_id, ordinal)?);
+            }
+            objects.push((id, bytes));
+            start = end;
+        }
+        if objects.len() + 2 > AUTHENTICATED_EDGE_PAGE_ENTRIES {
+            return Err(corruption(
+                "collection transition page vector exceeds its edge bound",
+            ));
+        }
+        Ok(PreparedCommitChangePages {
+            objects,
+            member_locations,
+            member_change_ids,
         })
     }
 }
@@ -615,6 +907,192 @@ pub(crate) struct StatePageLocation {
 pub(crate) struct PreparedCommitChangePages {
     pub(crate) objects: Vec<(ObjectId, Bytes)>,
     pub(crate) member_locations: Vec<StatePageLocation>,
+    pub(crate) member_change_ids: Vec<ChangeId>,
+}
+
+impl DecodedCollectionTransitionPage {
+    fn change_ids(&self) -> Result<Vec<ChangeId>, StorageError> {
+        (0..self.rows.len())
+            .map(|offset| {
+                let ordinal = self
+                    .start_ordinal
+                    .checked_add(
+                        u32::try_from(offset)
+                            .map_err(|_| corruption("collection transition ordinal exceeds u32"))?,
+                    )
+                    .and_then(|ordinal| ordinal.checked_add(1))
+                    .ok_or_else(|| corruption("collection transition ordinal overflows u32"))?;
+                packed_change_id(self.commit_id, ordinal)
+            })
+            .collect()
+    }
+
+    fn into_members(self) -> Result<(CommitId, u32, Vec<CommitMemberV1>), StorageError> {
+        let change_ids = self.change_ids()?;
+        let mut members = Vec::with_capacity(self.rows.len());
+        for (row, change_id) in self.rows.into_iter().zip(change_ids) {
+            let key = super::state::decode_state_key(&row.state_key)
+                .map_err(|error| corruption(error.to_string()))?;
+            let payload =
+                crate::changelog::encode_forktree_change_payload(&crate::changelog::ChangeRecord {
+                    format_version: 2,
+                    change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+                        *change_id.as_bytes(),
+                    )),
+                    account_id: self.account_id.clone(),
+                    schema_key: self.schema_key.clone(),
+                    entity_pk: key.entity_pk,
+                    file_id: None,
+                    snapshot: row
+                        .snapshot
+                        .map_or(crate::json_store::JsonSlot::None, |value| {
+                            crate::json_store::JsonSlot::Inline(value.into_boxed_str())
+                        }),
+                    metadata: row
+                        .metadata
+                        .map_or(crate::json_store::JsonSlot::None, |value| {
+                            crate::json_store::JsonSlot::Inline(value.into_boxed_str())
+                        }),
+                    created_at: row.created_at,
+                    origin_key: row.origin_key,
+                })
+                .map_err(|error| corruption(error.to_string()))?;
+            members.push(CommitMemberV1::introduced(
+                change_id,
+                payload,
+                self.global,
+                row.updated_at,
+                Vec::new(),
+            ));
+        }
+        Ok((self.commit_id, self.start_ordinal, members))
+    }
+}
+
+fn packed_change_id(commit_id: CommitId, ordinal: u32) -> Result<ChangeId, StorageError> {
+    let commit_id = crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*commit_id.as_bytes()));
+    let change_id = crate::changelog::ChangeId::for_commit_ordinal(commit_id, ordinal)
+        .ok_or_else(|| corruption("collection commit has no packed change address space"))?;
+    Ok(ChangeId::from_bytes(*change_id.as_uuid().as_bytes()))
+}
+
+fn encode_collection_transition_page(
+    commit_id: CommitId,
+    start_ordinal: u32,
+    account_id: &str,
+    schema_key: &str,
+    global: bool,
+    rows: &[CollectionTransitionRow],
+) -> Result<(ObjectId, Bytes), StorageError> {
+    let mut body = Encoder::default();
+    body.u8(COMMIT_CHANGE_PAGE_COLLECTION_TRANSITION);
+    body.fixed(commit_id.as_bytes());
+    body.u32(start_ordinal);
+    body.bytes(account_id.as_bytes())?;
+    body.bytes(schema_key.as_bytes())?;
+    body.u8(u8::from(global));
+    body.u32(
+        u32::try_from(rows.len())
+            .map_err(|_| corruption("collection transition row count exceeds u32"))?,
+    );
+    let mut previous_key: Option<&[u8]> = None;
+    for row in rows {
+        if previous_key.is_some_and(|previous| previous >= row.state_key.as_slice()) {
+            return Err(corruption(
+                "collection transition state keys are not strictly ordered",
+            ));
+        }
+        let key = super::state::decode_state_key(&row.state_key)
+            .map_err(|error| corruption(error.to_string()))?;
+        if key.schema_key != schema_key || key.file_id.is_some() {
+            return Err(corruption(
+                "collection transition state key disagrees with its page schema",
+            ));
+        }
+        body.bytes(&row.state_key)?;
+        encode_optional_utf8(&mut body, row.snapshot.as_deref())?;
+        encode_optional_utf8(&mut body, row.metadata.as_deref())?;
+        body.u64(row.created_at.packed());
+        body.u64(row.updated_at.packed());
+        encode_optional_utf8(&mut body, row.origin_key.as_deref())?;
+        previous_key = Some(&row.state_key);
+    }
+    let body = body.into_vec();
+    if body.len() > COMMIT_CHANGE_PAGE_MAX_BYTES {
+        return Err(corruption(
+            "collection transition page exceeds its byte bound",
+        ));
+    }
+    let compressed = crate::compression::compress_zstd_level_1(&body).map_err(|error| {
+        corruption(format!(
+            "collection transition page compression failed: {error}"
+        ))
+    })?;
+    encode_object(ObjectDomain::CommitChangePageV2, |encoder| {
+        encoder.u32(
+            u32::try_from(body.len())
+                .map_err(|_| corruption("collection transition decoded length exceeds u32"))?,
+        );
+        encoder.bytes(&compressed)
+    })
+}
+
+fn encode_optional_utf8(encoder: &mut Encoder, value: Option<&str>) -> Result<(), StorageError> {
+    match value {
+        None => encoder.u8(0),
+        Some(value) => {
+            encoder.u8(1);
+            encoder.bytes(value.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_optional_utf8(
+    decoder: &mut Decoder<'_>,
+    label: &str,
+) -> Result<Option<String>, StorageError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => decode_utf8(decoder, label).map(Some),
+        tag => Err(corruption(format!(
+            "{label} has invalid optional tag {tag}"
+        ))),
+    }
+}
+
+fn decode_utf8(decoder: &mut Decoder<'_>, label: &str) -> Result<String, StorageError> {
+    String::from_utf8(decoder.bytes(label)?)
+        .map_err(|_| corruption(format!("{label} is not UTF-8")))
+}
+
+fn decode_optional_utf8_borrowed<'a>(
+    decoder: &mut Decoder<'a>,
+    label: &str,
+) -> Result<Option<&'a str>, StorageError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => decode_utf8_borrowed(decoder, label).map(Some),
+        tag => Err(corruption(format!(
+            "{label} has invalid optional tag {tag}"
+        ))),
+    }
+}
+
+fn decode_utf8_borrowed<'a>(
+    decoder: &mut Decoder<'a>,
+    label: &str,
+) -> Result<&'a str, StorageError> {
+    std::str::from_utf8(decoder.bytes_borrowed(label)?)
+        .map_err(|_| corruption(format!("{label} is not UTF-8")))
+}
+
+fn decode_bool(decoder: &mut Decoder<'_>, label: &str) -> Result<bool, StorageError> {
+    match decoder.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        tag => Err(corruption(format!("{label} has invalid boolean tag {tag}"))),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2685,7 +3163,31 @@ pub(super) fn gc_progress_selector_key() -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChangeCatalogEntry, ChangeCatalogOwner, CommitChangePageV2, CommitId, ObjectId};
+    use super::{
+        ChangeCatalogEntry, ChangeCatalogOwner, CollectionTransitionRow, CommitChangePageV2,
+        CommitId, ObjectId,
+    };
+
+    fn packed_commit() -> CommitId {
+        let mut bytes = [0x42; 16];
+        bytes[12..].fill(0);
+        CommitId::from_bytes(bytes)
+    }
+
+    fn collection_row(key: &str) -> CollectionTransitionRow {
+        CollectionTransitionRow {
+            state_key: super::super::state::encode_state_key(super::super::state::StateKeyRef {
+                schema_key: "app_entity",
+                file_id: None,
+                entity_pk: &crate::entity_pk::EntityPk::single(key),
+            }),
+            snapshot: Some(format!(r#"{{"id":"{key}","value":7}}"#)),
+            metadata: None,
+            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(1_000),
+            updated_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(2_000),
+            origin_key: None,
+        }
+    }
 
     #[test]
     fn empty_commit_change_pages_are_a_valid_empty_closure() {
@@ -2707,6 +3209,77 @@ mod tests {
         assert_eq!(
             ChangeCatalogEntry::decode(&encoded).expect("decode packed commit owner"),
             entry
+        );
+    }
+
+    #[test]
+    fn collection_transition_pages_reconstruct_exact_public_history_lazily() {
+        let rows = [
+            collection_row("a"),
+            collection_row("b"),
+            collection_row("c"),
+        ];
+        let pages = CommitChangePageV2::encode_collection_transition_pages(
+            packed_commit(),
+            "account",
+            "app_entity",
+            false,
+            &rows,
+        )
+        .expect("encode compact collection transition");
+        assert_eq!(pages.objects.len(), 1);
+        assert_eq!(pages.member_locations.len(), rows.len());
+        assert_eq!(pages.member_change_ids.len(), rows.len());
+
+        let (page_id, page_bytes) = &pages.objects[0];
+        let (_, start, authenticated_ids) =
+            CommitChangePageV2::collection_member_ids(*page_id, page_bytes)
+                .expect("authenticate compact page without materialization");
+        assert_eq!(start, 0);
+        assert_eq!(authenticated_ids, pages.member_change_ids);
+
+        let decoded = CommitChangePageV2::decode(*page_id, page_bytes)
+            .expect("materialize compact history page");
+        for (index, member) in decoded.members.iter().enumerate() {
+            let (payload, global, updated_at, manifests) = member
+                .introduced_payload()
+                .expect("compact member is introduced history");
+            assert!(!global);
+            assert!(manifests.is_empty());
+            assert_eq!(updated_at, rows[index].updated_at);
+            let change_id = crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+                *member.change_id().as_bytes(),
+            ));
+            let record = crate::changelog::decode_forktree_change_payload(payload, change_id)
+                .expect("decode reconstructed history payload");
+            assert_eq!(record.account_id, "account");
+            assert_eq!(record.schema_key, "app_entity");
+            assert_eq!(
+                record.entity_pk,
+                crate::entity_pk::EntityPk::single(["a", "b", "c"][index])
+            );
+            assert_eq!(
+                record.snapshot,
+                crate::json_store::JsonSlot::Inline(
+                    rows[index].snapshot.as_deref().expect("snapshot").into(),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn collection_transition_rejects_duplicate_or_unordered_state_keys() {
+        let row = collection_row("a");
+        let rows = [row.clone(), row];
+        assert!(
+            CommitChangePageV2::encode_collection_transition_pages(
+                packed_commit(),
+                "account",
+                "app_entity",
+                false,
+                &rows,
+            )
+            .is_err()
         );
     }
 }
