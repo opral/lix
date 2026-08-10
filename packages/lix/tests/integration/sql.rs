@@ -8,14 +8,6 @@ macro_rules! simulation_test {
     };
     ($name:ident, options = $options:expr, |$sim:ident| $body:expr) => {
         simulation_test!(@single $name, base, Base, $options, |$sim| $body);
-        #[cfg(feature = "all-simulations")]
-        simulation_test!(
-            @single $name,
-            tracked_state_rebuild,
-            TrackedStateRebuild,
-            $options,
-            |$sim| $body
-        );
     };
     (@single $name:ident, $simulation:ident, $mode:ident, $options:expr, |$sim:ident| $body:expr) => {
         paste::paste! {

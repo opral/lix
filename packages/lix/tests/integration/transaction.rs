@@ -596,35 +596,6 @@ async fn existing_workspace_session_writes_to_its_pinned_branch() {
 }
 
 #[tokio::test]
-async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
-    let storage = RecordingStorage::new();
-    let receipt = Engine::initialize(storage.clone())
-        .await
-        .expect("storage should initialize");
-    let engine = Engine::new(storage.clone())
-        .await
-        .expect("initialized storage should create an engine");
-
-    storage.fail_read_namespace("changelog.commit");
-    let before = storage.stats();
-    let error = engine
-        .rebuild_tracked_state_for_branch(&receipt.main_branch_id)
-        .await
-        .expect_err("forced changelog read failure should fail rebuild");
-    assert!(
-        error.message.contains("forced read failure"),
-        "unexpected error: {error:?}"
-    );
-
-    let delta = storage.stats().delta_since(&before);
-    assert_eq!(
-        delta.write_opened, 0,
-        "failed rebuild should not open a storage write"
-    );
-    assert_eq!(delta.write_committed, 0, "failed rebuild must not commit");
-}
-
-#[tokio::test]
 async fn write_changelog_commit_failure_does_not_commit_storage_write() {
     let storage = RecordingStorage::new();
     let _receipt = Engine::initialize(storage.clone())

@@ -271,23 +271,6 @@ where
         self.plugin_host.reset_transition_counters();
     }
 
-    /// Verifies the requested branch's authenticated current ForkTree serving projection.
-    ///
-    /// ForkTree roots are the sole current-state authority. This operation
-    /// intentionally performs no legacy tracked-state rebuild or secondary
-    /// publication; a successful walk proves the branch can serve its state.
-    pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let facade = crate::forktree::ForkTreeReadFacade::new(read);
-        let view = facade.branch(branch_id).await?;
-        let _ = crate::forktree::state_range(&view, None, None, None, true).await?;
-        Ok(())
-    }
-
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
         let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
             LixError::new(
