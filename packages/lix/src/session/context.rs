@@ -51,7 +51,7 @@ pub(crate) async fn load_workspace_branch_id_from_index(
     });
     let view = ForkTreeStateView::from_facade(forktree, GLOBAL_BRANCH_ID).await?;
     let row = view
-        .points(&[key], false)
+        .untracked_points(&[key])
         .await?
         .into_iter()
         .next()

@@ -262,6 +262,7 @@ impl PreparedPublication {
             }
             if !self_changed {
                 self.next_global.repository_root = other.next_global.repository_root;
+                self.next_repository_root = other.next_repository_root;
             }
         }
         for (key, expected) in &other.selector_expectations {

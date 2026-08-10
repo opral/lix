@@ -260,11 +260,11 @@ where
             file_id: row.file_id.map(|value| value.as_str()),
             entity_pk: row.entity_pk,
         };
-        let untracked_owner = canonical_branch_id(if row.global {
-            crate::GLOBAL_BRANCH_ID
+        let untracked_owner = if row.global {
+            canonical_branch_id(crate::GLOBAL_BRANCH_ID)?
         } else {
-            row.branch_id.as_str()
-        })?;
+            publication_branch_id
+        };
         let canonical_snapshot = canonical_snapshot_for_row(
             row,
             &prepared_blob_manifests,
@@ -709,6 +709,12 @@ where
     let branch_ids = publication_owner_branch_ids(&prepared_writes, runtime_checkpoint.is_some())
         .into_iter()
         .collect::<Vec<_>>();
+    let mut branch_ids = branch_ids;
+    branch_ids.sort_by(|left, right| {
+        (left != crate::GLOBAL_BRANCH_ID)
+            .cmp(&(right != crate::GLOBAL_BRANCH_ID))
+            .then_with(|| left.cmp(right))
+    });
     if branch_ids.len() < 2 {
         return Err(writer_error(
             "batched ForkTree publication was requested without multiple owners",
