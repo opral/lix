@@ -644,6 +644,14 @@ impl DirectoryPathResolver {
             if let Some(fallback_entry) = fallback_entry {
                 match fallback_entry {
                     FilesystemNamespaceEntry::Directory(existing_id) => {
+                        if !context.untracked {
+                            return Err(LixError::new(
+                                LixError::CODE_UNIQUE,
+                                format!(
+                                    "cannot insert tracked row for schema 'lix_directory_descriptor' entity_pk \"{existing_id}\": a canonical untracked row already exists; delete it first"
+                                ),
+                            ));
+                        }
                         if is_leaf
                             && let Some(leaf_id) = leaf_id.as_ref()
                             && leaf_id != &existing_id
@@ -795,13 +803,18 @@ impl DirectoryPathResolver {
         name: String,
         directory_id: String,
     ) -> Result<(), LixError> {
+        // Validate the complete parent graph after every newly reserved
+        // descriptor.  A multi-row INSERT can introduce a cycle even when
+        // each row is individually well-formed; validate on a clone so a
+        // rejected reservation cannot leak into the operation's resolver.
+        let mut next = self.clone();
         let key = (parent_id, name);
-        match self.entries_by_parent_and_name.get(&key) {
+        match next.entries_by_parent_and_name.get(&key) {
             Some(FilesystemNamespaceEntry::Directory(existing_id))
                 if existing_id == &directory_id =>
             {
                 let existing_descriptor =
-                    self.directories_by_id
+                    next.directories_by_id
                         .get(&directory_id)
                         .ok_or_else(|| {
                             LixError::new(
@@ -820,11 +833,11 @@ impl DirectoryPathResolver {
                 &key.0, &key.1, existing,
             )),
             None => {
-                match self.directories_by_id.get(&directory_id) {
+                match next.directories_by_id.get(&directory_id) {
                     Some(existing) if existing.parent_id == key.0 && existing.name == key.1 => {}
                     Some(_) => return Err(directory_id_conflict_error(&directory_id)),
                     None => {
-                        self.directories_by_id.insert(
+                        next.directories_by_id.insert(
                             directory_id.clone(),
                             DirectoryDescriptorSeed {
                                 id: directory_id.clone(),
@@ -834,8 +847,10 @@ impl DirectoryPathResolver {
                         );
                     }
                 }
-                self.entries_by_parent_and_name
+                next.entries_by_parent_and_name
                     .insert(key, FilesystemNamespaceEntry::Directory(directory_id));
+                next.validate_directory_parent_graph()?;
+                *self = next;
                 Ok(())
             }
         }
@@ -1332,13 +1347,10 @@ fn fallback_path_resolver(
     resolvers: &BTreeMap<String, DirectoryPathResolver>,
     context: &FilesystemRowContext,
 ) -> Option<DirectoryPathResolver> {
-    if !context.untracked {
-        return None;
-    }
     let fallback_key = filesystem_storage_scope_key(
         &context.branch_id,
         context.global,
-        false,
+        !context.untracked,
         context.file_id.as_deref(),
     );
     resolvers.get(&fallback_key).cloned()
