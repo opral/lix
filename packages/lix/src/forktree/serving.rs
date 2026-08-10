@@ -21,8 +21,9 @@ use super::state::{
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
-    apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, scan_ranges_on_read, validate_root_on_read,
+    apply_ordered_mutations_idempotent_inserts, delete_ordered_range, lookup_many_on_read,
+    lookup_on_read, scan_bounded_page_on_read, scan_page_on_read, scan_ranges_on_read,
+    validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE};
 
@@ -229,6 +230,10 @@ pub(crate) enum StateTreeMutation {
     Remove {
         key: Vec<u8>,
     },
+    RemoveRange {
+        lower: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -275,11 +280,18 @@ impl StateTreeMutation {
         Self::Remove { key }
     }
 
+    pub(crate) fn remove_range(lower: Vec<u8>, upper: Option<Vec<u8>>) -> Self {
+        Self::RemoveRange { lower, upper }
+    }
+
     fn into_ordered(self) -> OrderedTreeMutation {
         match self {
             Self::Insert { key, value, .. } => OrderedTreeMutation::Insert { key, value },
             Self::Update { key, value, .. } => OrderedTreeMutation::Update { key, value },
             Self::Remove { key } => OrderedTreeMutation::Delete { key },
+            Self::RemoveRange { .. } => {
+                unreachable!("range deletion is lowered directly by edit_state_tree")
+            }
         }
     }
 }
@@ -4405,6 +4417,15 @@ where
             StateTreeMutation::Insert { key, value, audit }
             | StateTreeMutation::Update { key, value, audit } => (key, Some(value), audit.as_ref()),
             StateTreeMutation::Remove { key } => (key, None, None),
+            StateTreeMutation::RemoveRange { lower, upper } => {
+                super::state::validate_state_entity_prefix(lower)
+                    .map_err(|error| corruption(error.to_string()))?;
+                if upper.as_ref().is_some_and(|upper| lower >= upper) {
+                    return Err(corruption("state-tree delete range is empty or reversed"));
+                }
+                wrote_tombstone = true;
+                continue;
+            }
         };
         decode_state_key(key).map_err(|error| corruption(error.to_string()))?;
         if let Some(value) = value {
@@ -4422,20 +4443,46 @@ where
             );
         }
     }
-    let mutations = mutations
-        .into_iter()
-        .map(StateTreeMutation::into_ordered)
-        .collect::<Vec<_>>();
-    let edit = apply_ordered_mutations(root, "state", &mutations, read).await?;
+    let mut point_mutations = Vec::new();
+    let mut range_deletes = Vec::new();
+    for mutation in mutations {
+        match mutation {
+            StateTreeMutation::RemoveRange { lower, upper } => {
+                range_deletes.push((lower, upper));
+            }
+            mutation => point_mutations.push(mutation.into_ordered()),
+        }
+    }
+    range_deletes.sort_by(|left, right| left.0.cmp(&right.0));
+    if range_deletes.windows(2).any(|pair| {
+        pair[0]
+            .1
+            .as_ref()
+            .is_none_or(|upper| pair[1].0.as_slice() < upper.as_slice())
+    }) {
+        return Err(corruption("state-tree delete ranges overlap"));
+    }
+    let edit = apply_ordered_mutations(root, "state", &point_mutations, read).await?;
+    let mut next_root = edit.root;
+    let mut objects = edit.objects;
+    let mut copied_nodes = edit.copied_nodes;
+    for (lower, upper) in range_deletes {
+        let overlay = ObjectOverlayRead::new(read, &objects);
+        let range_edit =
+            delete_ordered_range(next_root, "state", &lower, upper.as_deref(), &overlay).await?;
+        next_root = range_edit.root;
+        copied_nodes = copied_nodes.saturating_add(range_edit.copied_nodes);
+        objects.extend(range_edit.objects)?;
+    }
     Ok(StateTreeEdit {
         base_root: root.object_id,
-        root: edit.root.object_id,
-        entry_count: edit.root.entry_count,
-        copied_nodes: edit.copied_nodes,
+        root: next_root.object_id,
+        entry_count: next_root.entry_count,
+        copied_nodes,
         added_blob_roots,
         wrote_tombstone,
         written_commit_ids,
-        objects: edit.objects,
+        objects,
     })
 }
 

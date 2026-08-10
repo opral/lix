@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -187,6 +189,14 @@ pub(crate) struct OrderedTreeEdit {
     pub(crate) root: OrderedTreeRoot,
     pub(crate) objects: ImmutableObjectSet,
     pub(crate) copied_nodes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OrderedTreeRangeDelete {
+    pub(crate) root: OrderedTreeRoot,
+    pub(crate) objects: ImmutableObjectSet,
+    pub(crate) copied_nodes: usize,
+    pub(crate) deleted_entries: u64,
 }
 
 /// Authenticated outgoing object edges from one ordered-tree node.
@@ -447,6 +457,180 @@ where
         root: next_root,
         objects,
         copied_nodes,
+    })
+}
+
+/// Deletes one authenticated half-open key range while copying only its two
+/// boundary paths. Interior subtrees are removed by their authenticated
+/// `entry_count` summaries; their leaves and values are never materialized.
+pub(super) async fn delete_ordered_range<R>(
+    root: OrderedTreeRoot,
+    expected_kind: &'static str,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+    read: &R,
+) -> Result<OrderedTreeRangeDelete, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if upper.is_some_and(|upper| lower >= upper) {
+        return Err(corruption("ordered-tree delete range is empty or reversed"));
+    }
+    let kind = parse_kind(expected_kind)?;
+    let mut objects = ImmutableObjectSet::default();
+    let mut copied_nodes = 0;
+    let rewritten = rewrite_range_node(
+        kind,
+        root.object_id,
+        None,
+        lower,
+        upper,
+        read,
+        &mut objects,
+        &mut copied_nodes,
+    )
+    .await?;
+    let mut roots = match rewritten.refs.as_slice() {
+        [] => vec![stage_leaf(kind, &[], &mut objects)?],
+        _ => rewritten.refs,
+    };
+    while roots.len() > 1 {
+        roots = stage_internal_level(kind, &roots, &mut objects)?;
+        copied_nodes = copied_nodes.saturating_add(roots.len());
+    }
+    let next = roots
+        .pop()
+        .ok_or_else(|| corruption("ordered-tree range delete emitted no root"))?;
+    let next_root = OrderedTreeRoot {
+        object_id: next.id,
+        entry_count: next.summary.entry_count,
+    };
+    if next_root.entry_count
+        != root
+            .entry_count
+            .checked_sub(rewritten.deleted_entries)
+            .ok_or_else(|| corruption("ordered-tree range delete count underflow"))?
+    {
+        return Err(corruption(
+            "ordered-tree range delete count differs from authenticated root",
+        ));
+    }
+    retain_reachable_new_nodes(next_root.object_id, kind, &mut objects)?;
+    Ok(OrderedTreeRangeDelete {
+        root: next_root,
+        objects,
+        copied_nodes,
+        deleted_entries: rewritten.deleted_entries,
+    })
+}
+
+struct RangeRewrite {
+    refs: Vec<NodeRef>,
+    deleted_entries: u64,
+}
+
+#[expect(clippy::too_many_arguments)]
+fn rewrite_range_node<'a, R>(
+    kind: TreeKind,
+    id: ObjectId,
+    expected: Option<NodeRef>,
+    lower: &'a [u8],
+    upper: Option<&'a [u8]>,
+    read: &'a R,
+    objects: &'a mut ImmutableObjectSet,
+    copied_nodes: &'a mut usize,
+) -> Pin<Box<dyn Future<Output = Result<RangeRewrite, StorageError>> + Send + 'a>>
+where
+    R: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(async move {
+        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+        validate_loaded_node(id, &node, kind, expected.as_ref())?;
+        match &node.body {
+            NodeBody::Leaf(original) => {
+                let mut entries = Vec::with_capacity(original.len());
+                let mut deleted_entries = 0_u64;
+                for entry in original {
+                    let in_range = entry.key.as_slice() >= lower
+                        && upper.is_none_or(|upper| entry.key.as_slice() < upper);
+                    if in_range {
+                        deleted_entries = deleted_entries.saturating_add(1);
+                    } else {
+                        entries.push(entry.clone());
+                    }
+                }
+                if deleted_entries == 0 {
+                    return Ok(RangeRewrite {
+                        refs: vec![node_ref(id, &node)],
+                        deleted_entries: 0,
+                    });
+                }
+                *copied_nodes = copied_nodes.saturating_add(1);
+                Ok(RangeRewrite {
+                    refs: if entries.is_empty() {
+                        Vec::new()
+                    } else {
+                        stage_leaf_level(kind, &entries, objects)?
+                    },
+                    deleted_entries,
+                })
+            }
+            NodeBody::Internal(children) => {
+                let mut next = Vec::with_capacity(children.len());
+                let mut previous_max: Option<&[u8]> = None;
+                let mut deleted_entries = 0_u64;
+                let mut changed = false;
+                for child in children {
+                    let before = child.max_key.as_slice() < lower;
+                    let after = upper.is_some_and(|upper| {
+                        previous_max.is_some_and(|previous| previous >= upper)
+                    });
+                    let lower_covers_child =
+                        lower.is_empty() || previous_max.is_some_and(|previous| previous >= lower);
+                    let upper_covers_child =
+                        upper.is_none_or(|upper| child.max_key.as_slice() < upper);
+                    if before || after {
+                        next.push(child.clone());
+                    } else if lower_covers_child && upper_covers_child {
+                        deleted_entries = deleted_entries.saturating_add(child.summary.entry_count);
+                        changed = true;
+                    } else {
+                        let rewritten = rewrite_range_node(
+                            kind,
+                            child.id,
+                            Some(child.clone()),
+                            lower,
+                            upper,
+                            read,
+                            objects,
+                            copied_nodes,
+                        )
+                        .await?;
+                        if rewritten.refs.len() != 1 || rewritten.refs.first() != Some(child) {
+                            changed = true;
+                        }
+                        deleted_entries = deleted_entries.saturating_add(rewritten.deleted_entries);
+                        next.extend(rewritten.refs);
+                    }
+                    previous_max = Some(child.max_key.as_slice());
+                }
+                if !changed {
+                    return Ok(RangeRewrite {
+                        refs: vec![node_ref(id, &node)],
+                        deleted_entries,
+                    });
+                }
+                *copied_nodes = copied_nodes.saturating_add(1);
+                Ok(RangeRewrite {
+                    refs: match next.as_slice() {
+                        [] => Vec::new(),
+                        [only] => vec![only.clone()],
+                        _ => stage_internal_level(kind, &next, objects)?,
+                    },
+                    deleted_entries,
+                })
+            }
+        }
     })
 }
 

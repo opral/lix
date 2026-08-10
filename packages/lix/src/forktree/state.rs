@@ -251,6 +251,10 @@ fn canonical_state_entity_prefix(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
     }
 }
 
+pub(crate) fn validate_state_entity_prefix(bytes: &[u8]) -> Result<(), LixError> {
+    canonical_state_entity_prefix(bytes).map(|_| ())
+}
+
 fn write_entity_pk(output: &mut Vec<u8>, entity_pk: &EntityPk) {
     output.push(ENTITY_PK_CODEC_V1);
     for (index, component) in entity_pk.components.iter().enumerate() {

@@ -184,6 +184,12 @@ impl std::fmt::Display for EntityPkError {
 }
 
 impl EntityPk {
+    pub(crate) fn empty() -> Self {
+        Self {
+            components: EntityPkComponents::Empty,
+        }
+    }
+
     pub(crate) fn single(value: impl Into<String>) -> Self {
         Self {
             components: EntityPkComponents::Single(EntityPkComponent::String(value.into().into())),
