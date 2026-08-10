@@ -1,6 +1,6 @@
 mod descriptor_path;
 mod keys;
-mod path_index;
+pub(crate) mod path_index;
 mod persistent_map;
 mod planner;
 mod read;

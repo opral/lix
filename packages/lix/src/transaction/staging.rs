@@ -21,12 +21,12 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_pk::EntityPk;
-use crate::forktree::StateKey;
+use crate::forktree::{CanonicalBranchId, StateCell, StateKey, StateValue, UntrackedValue};
 #[cfg(test)]
 use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
 use crate::gc::CheckpointPublication;
-use crate::state::CertifiedStatePredecessor;
+use crate::state::{CertifiedStatePredecessor, StagedStateRow, StagedUntrackedStateRow};
 use crate::transaction::types::StagedCommitChangeRefs;
 use crate::transaction::types::{
     CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation,
@@ -613,6 +613,41 @@ fn state_key_from_row(row: PreparedStateRowRef<'_>) -> StateKey {
         schema_key: row.schema_key.to_string(),
         file_id: row.file_id.map(ToString::to_string),
         entity_pk: row.entity_pk.clone(),
+    }
+}
+
+fn staged_cell(snapshot: Option<&StageJson>) -> StateCell {
+    match snapshot {
+        None => StateCell::Tombstone,
+        Some(snapshot) if snapshot.normalized() == "null" => StateCell::Null,
+        Some(snapshot) => StateCell::Value(snapshot.normalized().into()),
+    }
+}
+
+fn state_value_from_prepared(row: PreparedStateRowRef<'_>) -> StateValue {
+    StateValue {
+        change_id: row.change_id.unwrap_or_default(),
+        commit_id: row.commit_id.unwrap_or_default(),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        cell: staged_cell(row.snapshot),
+        metadata: row.metadata.map(|metadata| metadata.normalized().into()),
+        origin_key: row.origin_key.map(ToString::to_string),
+        // File payload publication is represented by the staged filesystem
+        // row and upload owner. The state overlay must not invent a second
+        // BlobRef authority while projecting read-your-writes rows.
+        blob_manifest_object_ids: Vec::new(),
+    }
+}
+
+fn untracked_value_from_prepared(row: PreparedStateRowRef<'_>) -> UntrackedValue {
+    UntrackedValue {
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        cell: staged_cell(row.snapshot),
+        metadata: row.metadata.map(|metadata| metadata.normalized().into()),
+        origin_key: row.origin_key.map(ToString::to_string),
+        blob_manifest_object_ids: Vec::new(),
     }
 }
 
@@ -1338,6 +1373,114 @@ impl TransactionWriteBuffer {
             file_content_writes: Mutex::new(Vec::new()),
             branch_ref_intents: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Projects the live prepared-row owner into the native transaction read
+    /// overlay. The projection is a short-lived snapshot of this buffer: it
+    /// never opens storage, creates a committed-only view, or retains an
+    /// index separate from `TransactionStateView`.
+    pub(crate) fn state_overlay_rows(
+        &self,
+        active_branch_id: &str,
+    ) -> Result<(Vec<StagedStateRow>, Vec<StagedUntrackedStateRow>), LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let rows = match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows,
+        };
+        let global_id = CanonicalBranchId::from_bytes(
+            *uuid::Uuid::parse_str(GLOBAL_BRANCH_ID)
+                .expect("GLOBAL_BRANCH_ID must be a UUID")
+                .as_bytes(),
+        );
+        let active_id = uuid::Uuid::parse_str(active_branch_id).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("transaction active branch ID must be a UUID: {error}"),
+            )
+        })?;
+        let active_id = CanonicalBranchId::from_bytes(*active_id.as_bytes());
+
+        let mut tracked = Vec::<(Vec<u8>, bool, StagedStateRow)>::new();
+        let mut untracked = Vec::<(Vec<u8>, StagedUntrackedStateRow)>::new();
+        for row in rows.iter() {
+            let is_global = row.global || row.branch_id.as_str() == GLOBAL_BRANCH_ID;
+            let is_active = row.branch_id.as_str() == active_branch_id;
+            if !is_global && !is_active {
+                continue;
+            }
+            let key = StateKey {
+                schema_key: row.schema_key.to_string(),
+                file_id: row.file_id.map(ToString::to_string),
+                entity_pk: row.entity_pk.clone(),
+            };
+            let encoded_key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            if row.untracked {
+                let owner = if is_global { global_id } else { active_id };
+                let untracked_row =
+                    StagedUntrackedStateRow::new(owner, key, untracked_value_from_prepared(row));
+                let owner_key = crate::forktree::encode_untracked_key(
+                    owner,
+                    crate::forktree::StateKeyRef {
+                        schema_key: &untracked_row.key.schema_key,
+                        file_id: untracked_row.key.file_id.as_deref(),
+                        entity_pk: &untracked_row.key.entity_pk,
+                    },
+                );
+                untracked.push((owner_key, untracked_row));
+            } else {
+                let staged_key = encoded_key.clone();
+                tracked.push((
+                    encoded_key,
+                    is_global,
+                    StagedStateRow::new(staged_key, state_value_from_prepared(row)),
+                ));
+            }
+        }
+
+        tracked.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let mut tracked_rows: Vec<StagedStateRow> = Vec::with_capacity(tracked.len());
+        for (_, is_global, row) in tracked {
+            if let Some(previous) = tracked_rows.last() {
+                if previous.key == row.key {
+                    // Local staged state masks a global staged value. Two
+                    // writes in the same owner should already have been
+                    // coalesced by the indexed buffer and are corruption.
+                    if is_global {
+                        continue;
+                    }
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "duplicate staged tracked state identity",
+                    ));
+                }
+            }
+            tracked_rows.push(row);
+        }
+
+        untracked.sort_by(|left, right| left.0.cmp(&right.0));
+        for pair in untracked.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "duplicate staged untracked state identity",
+                ));
+            }
+        }
+        let untracked_rows = untracked
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>();
+        Ok((tracked_rows, untracked_rows))
     }
 
     pub(crate) fn certify_complete_collection_replacement(
@@ -2721,6 +2864,28 @@ impl TransactionWriteBuffer {
                 && (row.untracked == domain.untracked() || (domain.untracked() && !row.untracked))
         };
         Ok(rows.iter().any(matches_domain))
+    }
+
+    pub(crate) fn has_staged_collection_rows(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<bool, LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let rows = match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows,
+        };
+        Ok(rows.iter().any(|row| {
+            row.branch_id.as_str() == branch_id
+                && row.schema_key.as_str() == scope.schema_key
+                && row.file_id.map(SharedStr::as_str) == scope.file_id
+        }))
     }
 
     pub(crate) fn collection_replaced(
