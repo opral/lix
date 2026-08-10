@@ -40,41 +40,6 @@ where
         Ok(self.load_head(branch_id).await?.map(|head| head.commit_id))
     }
 
-    pub(crate) async fn load_head_change_id(
-        &self,
-        branch_id: &str,
-    ) -> Result<Option<crate::changelog::ChangeId>, LixError> {
-        let requested = [branch_id.to_string()];
-        Ok(
-            crate::forktree::load_branch_heads_with_metadata(&self.store, Some(&requested))
-                .await?
-                .into_iter()
-                .next()
-                .map(|row| row.change_id),
-        )
-    }
-
-    pub(crate) async fn load_head_metadata(
-        &self,
-        branch_id: &str,
-    ) -> Result<Option<BranchRefMetadata>, LixError> {
-        let requested = [branch_id.to_string()];
-        let row = crate::forktree::load_branch_heads_with_metadata(&self.store, Some(&requested))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    "requested branch selector is absent",
-                )
-            })?;
-        Ok(Some(BranchRefMetadata {
-            change_id: row.change_id,
-            updated_at: row.updated_at,
-        }))
-    }
-
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
         Ok(
             crate::forktree::load_branch_heads_with_metadata(&self.store, None)
@@ -100,13 +65,6 @@ where
 
     async fn load_head_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
         Self::load_head_commit_id(self, branch_id).await
-    }
-
-    async fn load_head_metadata(
-        &self,
-        branch_id: &str,
-    ) -> Result<Option<BranchRefMetadata>, LixError> {
-        Self::load_head_metadata(self, branch_id).await
     }
 
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {

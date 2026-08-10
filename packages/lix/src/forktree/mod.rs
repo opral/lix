@@ -19,18 +19,18 @@ mod tree;
 mod view;
 
 pub(crate) use blob::{
-    AuthenticatedBlobReader, AuthenticatedBlobRef, AuthenticatedBlobStateKey, PreparedUploadPart,
-    UploadBindingRef, blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
+    AuthenticatedBlobReader, AuthenticatedBlobStateKey, PreparedUploadPart, UploadBindingRef,
+    blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
 };
 pub(crate) use bootstrap::initialize_empty_repository;
 pub(crate) use merkle::canonical_blob_id_for_content;
 pub(crate) use model::{
-    BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BlobMerkleInternalV1,
-    BlobMerkleLeafV1, BlobMerkleNodeRefV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId,
-    CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1,
-    CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
-    GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1,
-    SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1, snapshot_selector_key,
+    BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,
+    BranchSnapshotV1, CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner,
+    ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1,
+    CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId,
+    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    snapshot_selector_key,
 };
 pub(crate) use object::ObjectId;
 pub(crate) use publication::{
@@ -39,21 +39,17 @@ pub(crate) use publication::{
 pub(crate) use reachability::{GcBudget, GcStepStatus, advance_gc};
 pub(crate) use serving::{
     CommitTopology, CommitTopologyReader, StateMutationAudit, StateSource, StateTreeMutation,
-    VisibleStateRow, edit_state_tree, edit_state_tree_sequence, load_branch_heads_with_metadata,
-    load_change_records, load_commit, load_commit_member_records, load_commit_records,
-    load_commit_summary, put_change_catalog_entries, put_commit_catalog_entries,
-    scan_change_records, scan_commit_records, scan_commit_topologies,
-    scan_state_rows_at_commit_range, scan_state_rows_at_commit_ranges,
-    select_historical_commit_member, state_point, state_point_on_read, state_points,
-    state_points_on_read, state_range,
+    VisibleStateRow, edit_state_tree, load_branch_heads_with_metadata, load_change_records,
+    load_commit, load_commit_member_records, load_commit_records, load_commit_summary,
+    put_change_catalog_entries, put_commit_catalog_entries, scan_change_records,
+    select_historical_commit_member, state_point, state_points, state_points_on_read, state_range,
 };
 pub(crate) use state::{
-    CanonicalPrefixBounds, HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef,
-    StateValue, StateValueRef, UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef,
-    decode_state_key, decode_state_value, encode_state_entity_prefix,
-    encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
-    encode_untracked_branch_range_bounds, encode_untracked_key, encode_untracked_value,
-    exclusive_prefix_upper_bound,
+    HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
+    UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
+    encode_state_entity_prefix, encode_state_entity_prefix_bounds, encode_state_key,
+    encode_state_value, encode_untracked_branch_range_bounds, encode_untracked_key,
+    encode_untracked_value, exclusive_prefix_upper_bound,
 };
 pub(crate) use tree::diff_roots;
 pub(crate) use tree::{

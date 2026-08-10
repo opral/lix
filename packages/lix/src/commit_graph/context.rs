@@ -132,30 +132,6 @@ where
         Ok(nodes)
     }
 
-    pub(crate) async fn retained_nodes(&mut self) -> Result<Vec<CommitGraphNode>, LixError> {
-        let mut commits = Vec::new();
-        let mut start_after = None;
-        loop {
-            let page =
-                crate::forktree::scan_commit_topologies(self.topology.read(), start_after, 1024)
-                    .await?;
-            if page.is_empty() {
-                break;
-            }
-            let page_len = page.len();
-            for topology in page {
-                let node = commit_graph_node_from_topology(topology);
-                self.node_cache.insert(node.commit_id, node.clone());
-                commits.push(node);
-            }
-            if page_len < 1024 {
-                break;
-            }
-            start_after = commits.last().map(|node| node.commit_id);
-        }
-        Ok(commits)
-    }
-
     /// Reads checkpoint/recovery/undo/redo/tombstone roots from the
     /// authenticated selector space in this reader's one retained view.
     pub(crate) async fn snapshot_roots(&mut self) -> Result<Vec<(String, CommitId)>, LixError> {
@@ -743,10 +719,6 @@ where
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
         Self::reachable_nodes(self, head_commit_id).await
-    }
-
-    async fn retained_nodes(&mut self) -> Result<Vec<CommitGraphNode>, LixError> {
-        Self::retained_nodes(self).await
     }
 
     async fn snapshot_roots(&mut self) -> Result<Vec<(String, CommitId)>, LixError> {

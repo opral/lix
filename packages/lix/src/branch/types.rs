@@ -29,16 +29,6 @@ pub(crate) trait BranchRefReader: Send + Sync {
         Ok(self.load_head(branch_id).await?.map(|head| head.commit_id))
     }
 
-    /// Returns the authenticated RefChange metadata for a branch. Head-only
-    /// readers intentionally return no metadata; production branch-ref
-    /// projection rejects that absence instead of manufacturing values.
-    async fn load_head_metadata(
-        &self,
-        _branch_id: &str,
-    ) -> Result<Option<BranchRefMetadata>, crate::LixError> {
-        Ok(None)
-    }
-
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, crate::LixError>;
 
     /// Returns branch heads and authenticated RefChange metadata from one
