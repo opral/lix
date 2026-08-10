@@ -1044,6 +1044,12 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
+    pub(crate) fn global(&self) -> bool {
+        match self {
+            Self::State(row) => row.global,
+        }
+    }
+
     pub(crate) fn branch_id(&self) -> &str {
         match self {
             Self::State(row) => &row.branch_id,
