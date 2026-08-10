@@ -3,29 +3,8 @@ use crate::branch::{BranchHead, BranchRefMetadata, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
 
-/// Typed access to moving branch heads stored in the direct control plane.
-///
-/// The control record is deliberately below live-state visibility, keeping
-/// the dependency acyclic: `branch-control -> tracked-head -> live-state`.
-pub(super) struct BranchRefContext {}
-
-impl BranchRefContext {
-    pub(super) fn new() -> Self {
-        Self {}
-    }
-
-    /// Creates a branch-ref reader over a caller-provided KV store.
-    #[expect(clippy::unused_self)]
-    pub(super) fn reader<S>(&self, store: S) -> BranchRefStoreReader<S>
-    where
-        S: StorageAdapterRead,
-    {
-        BranchRefStoreReader { store }
-    }
-}
-
 /// Read side for branch heads.
-pub(super) struct BranchRefStoreReader<S>
+pub(crate) struct BranchRefStoreReader<S>
 where
     S: StorageAdapterRead,
 {
@@ -36,6 +15,10 @@ impl<S> BranchRefStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(crate) fn new(store: S) -> Self {
+        Self { store }
+    }
+
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         let requested = [branch_id.to_string()];
         Ok(

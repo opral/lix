@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
-use crate::branch::{BranchContext, BranchRefReader};
+use crate::branch::{BranchRefReader, BranchRefStoreReader};
 use crate::changelog::{ChangeRecord, CommitId, CommitRecord};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -70,7 +70,6 @@ enum PublicationIntent {
 /// this semantic helper here preserves the transaction's pre-validation
 /// ordering without restoring branch-control storage.
 pub(crate) async fn resolve_prepared_commit_parent_heads(
-    branch_ctx: &BranchContext,
     read: &(impl StorageAdapterRead + ?Sized),
     prepared_writes: &PreparedWriteSet,
     require_existing_non_global_targets: bool,
@@ -118,7 +117,7 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
         .collect::<BTreeSet<_>>();
     required_branch_ids.extend(commit_parent_branch_ids.iter().copied());
 
-    let branch_ref = branch_ctx.ref_reader(read);
+    let branch_ref = BranchRefStoreReader::new(read);
     let mut parent_heads = BTreeMap::new();
     for branch_id in required_branch_ids {
         let head = branch_ref.load_head_commit_id(branch_id).await?;

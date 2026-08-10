@@ -9,7 +9,7 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
-    BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
+    BranchLifecycle, BranchOperation, BranchRefReader, BranchRefStoreReader, BranchReferenceRole,
 };
 use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
 use crate::commit_graph::{CommitGraphReader, CommitGraphStoreReader};
@@ -41,7 +41,6 @@ pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 /// Loads the workspace selector from its canonical untracked current-state
 /// member when opening a workspace session.
 pub(crate) async fn load_workspace_branch_id_from_index(
-    branch_ctx: &BranchContext,
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     let forktree = crate::forktree::ForkTreeReadFacade::new(reader);
@@ -95,7 +94,7 @@ pub(crate) async fn load_workspace_branch_id_from_index(
         })?
         .to_string();
 
-    let branch_ref = branch_ctx.ref_reader(reader);
+    let branch_ref = BranchRefStoreReader::new(reader);
     BranchLifecycle::new(&branch_ref)
         .require_existing_ref(
             &branch_id,
@@ -131,7 +130,6 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) mode: SessionMode,
     pub(super) active_account_id: Arc<str>,
     pub(super) storage: StorageAdapter<StorageImpl>,
-    pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -152,7 +150,6 @@ where
     pub(crate) async fn open_workspace(
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -165,7 +162,7 @@ where
     ) -> Result<Self, LixError> {
         let read =
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-        let branch_id = load_workspace_branch_id_from_index(branch_ctx.as_ref(), &read).await?;
+        let branch_id = load_workspace_branch_id_from_index(&read).await?;
         drop(read);
         Ok(Self::new(
             SessionMode::Workspace {
@@ -173,7 +170,6 @@ where
             },
             active_account_id,
             storage,
-            branch_ctx,
             catalog_context,
             sql_planning_cache,
             deterministic_runtime_gate,
@@ -190,7 +186,6 @@ where
         active_branch_id: String,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -207,7 +202,6 @@ where
             },
             active_account_id,
             storage,
-            branch_ctx,
             catalog_context,
             sql_planning_cache,
             deterministic_runtime_gate,
@@ -224,7 +218,6 @@ where
         mode: SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -239,7 +232,6 @@ where
             mode,
             active_account_id,
             storage,
-            branch_ctx,
             catalog_context,
             sql_planning_cache,
             deterministic_runtime_gate,
@@ -258,7 +250,6 @@ where
         mode: SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -275,7 +266,6 @@ where
             mode,
             active_account_id: Arc::from(active_account_id),
             storage,
-            branch_ctx,
             catalog_context,
             sql_planning_cache,
             deterministic_runtime_gate,
@@ -502,7 +492,6 @@ where
             self.active_account_id.to_string(),
             self.storage.clone(),
             self.plugin_host.clone(),
-            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
@@ -601,7 +590,6 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) active_account_id: &'a str,
     pub(super) read_store: SharedStorageAdapterRead<R>,
     pub(super) forktree: crate::forktree::ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
-    pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) functions: FunctionProviderHandle,
@@ -692,7 +680,7 @@ where
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
-        Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
+        Arc::new(BranchRefStoreReader::new(self.read_store.clone()))
     }
 
     fn functions(&self) -> FunctionProviderHandle {

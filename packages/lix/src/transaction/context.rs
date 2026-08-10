@@ -23,7 +23,7 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchLifecycle, BranchOperation, BranchRefReader,
+    BRANCH_REF_SCHEMA_KEY, BranchLifecycle, BranchOperation, BranchRefReader, BranchRefStoreReader,
     BranchReferenceRole,
 };
 use crate::catalog::{
@@ -532,7 +532,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
     active_account_id: String,
     plugin_host: PluginRuntimeHost,
-    branch_ctx: Arc<BranchContext>,
     schema_resolver: TransactionSchemaResolver,
     /// SQL binding is snapshot-isolated at transaction open. Schema writes
     /// staged later in this transaction affect validation but become visible
@@ -959,7 +958,7 @@ where
             ));
         }
 
-        let branch_reader = self.branch_ctx.ref_reader(read);
+        let branch_reader = BranchRefStoreReader::new(read);
         let current_global_head = branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?;
         let current_active_head = branch_reader
             .load_head_commit_id(&self.active_branch_id)
@@ -1451,7 +1450,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         plugin_host: PluginRuntimeHost,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         session_file_views: SessionFileViews,
@@ -1469,8 +1467,7 @@ where
         let opening_read = SharedStorageAdapterRead::new(read);
         let read = opening_read.clone();
         let setup_result = async {
-            let active_branch_id =
-                resolve_active_branch_id(mode, branch_ctx.as_ref(), &read).await?;
+            let active_branch_id = resolve_active_branch_id(mode, &read).await?;
             let runtime_functions = FunctionContext::prepare(&read).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
@@ -1499,7 +1496,7 @@ where
             };
             let opening_selector_fence =
                 load_forktree_selector_fence(&read, &active_branch_id).await?;
-            let branch_reader = branch_ctx.ref_reader(&read);
+            let branch_reader = BranchRefStoreReader::new(&read);
             let opening_active_branch_head =
                 branch_reader.load_head_commit_id(&active_branch_id).await?;
             let opening_global_branch_head = if active_branch_id == GLOBAL_BRANCH_ID {
@@ -1553,7 +1550,6 @@ where
                     active_branch_id,
                     active_account_id,
                     plugin_host,
-                    branch_ctx,
                     schema_resolver,
                     sql_schema_snapshot: sql_schema_catalog,
                     sql_planning_cache,
@@ -1659,22 +1655,17 @@ where
                 .await;
             return Err(error);
         }
-        let commit_parent_heads = match commit::resolve_prepared_commit_parent_heads(
-            transaction.branch_ctx.as_ref(),
-            &read,
-            &prepared_writes,
-            true,
-        )
-        .await
-        {
-            Ok(commit_parent_heads) => commit_parent_heads,
-            Err(error) => {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(error);
-            }
-        };
+        let commit_parent_heads =
+            match commit::resolve_prepared_commit_parent_heads(&read, &prepared_writes, true).await
+            {
+                Ok(commit_parent_heads) => commit_parent_heads,
+                Err(error) => {
+                    transaction
+                        .discard_pending_plugin_actor_publications()
+                        .await;
+                    return Err(error);
+                }
+            };
         if let Err(error) = transaction
             .validate_prepared_writes_by_branch(&read, &prepared_writes)
             .instrument(tracing::debug_span!(
@@ -7097,7 +7088,6 @@ where
         let read_store = self.opening_read();
         let forktree = ForkTreeReadFacade::new(read_store.clone());
         let active_branch_id = self.active_branch_id.clone();
-        let branch_ctx = Arc::clone(&self.branch_ctx);
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
         let staged = self.staged_writes.staging_overlay()?;
@@ -7112,7 +7102,6 @@ where
             active_account_id: self.active_account_id.clone(),
             read_store,
             forktree,
-            branch_ctx,
             visible_schemas,
             functions,
             staged,
@@ -7221,7 +7210,7 @@ where
     /// read. Merge planning must not acquire a second snapshot just to resolve
     /// branch selectors.
     pub(crate) fn branch_ref_reader_on_opening_read(&self) -> impl BranchRefReader + '_ {
-        self.branch_ctx.ref_reader(&self.opening_read)
+        BranchRefStoreReader::new(&self.opening_read)
     }
 
     /// Creates a commit-graph reader over the same immutable read that opened
@@ -7981,7 +7970,6 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     active_account_id: String,
     read_store: SharedStorageAdapterRead<R>,
     forktree: ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
-    branch_ctx: Arc<BranchContext>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
     staged: PreparedStateRowOverlay,
@@ -8063,7 +8051,7 @@ where
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
-        Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
+        Arc::new(BranchRefStoreReader::new(self.read_store.clone()))
     }
 
     fn authenticated_blob_reader(&self) -> Result<Arc<dyn AuthenticatedBlobReader>, LixError> {
@@ -9290,7 +9278,6 @@ pub(crate) async fn open_transaction<StorageImpl>(
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     plugin_host: PluginRuntimeHost,
-    branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     session_file_views: SessionFileViews,
@@ -9303,7 +9290,6 @@ where
         active_account_id,
         storage,
         plugin_host,
-        branch_ctx,
         catalog_context,
         sql_planning_cache,
         session_file_views,
@@ -9318,7 +9304,6 @@ pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     plugin_host: PluginRuntimeHost,
-    branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     session_file_views: SessionFileViews,
@@ -9333,7 +9318,6 @@ where
         active_account_id,
         storage,
         plugin_host,
-        branch_ctx,
         catalog_context,
         sql_planning_cache,
         session_file_views,
@@ -9440,8 +9424,7 @@ where
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
         let read = self.opening_read();
 
-        self.branch_ctx
-            .ref_reader(read)
+        BranchRefStoreReader::new(read)
             .load_head_commit_id(branch_id)
             .await
     }
@@ -12113,7 +12096,6 @@ fn require_valid_storage_scope(branch_id: &str, global: bool) -> Result<(), LixE
 
 async fn resolve_active_branch_id(
     mode: &SessionMode,
-    branch_ctx: &BranchContext,
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     match mode {
@@ -12136,7 +12118,7 @@ async fn resolve_active_branch_id(
                         "workspace branch selector cache is poisoned",
                     )
                 })?;
-            let branch_ref = branch_ctx.ref_reader(read);
+            let branch_ref = BranchRefStoreReader::new(read);
             BranchLifecycle::new(&branch_ref)
                 .require_existing_ref(
                     &branch_id,

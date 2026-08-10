@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::branch::BranchRefReader;
+use crate::branch::{BranchRefReader, BranchRefStoreReader};
 use crate::common::ExecuteStatementMetadata;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
@@ -876,7 +876,6 @@ where
                         active_account_id: self.active_account_id(),
                         read_store,
                         forktree,
-                        branch_ctx: Arc::clone(&self.branch_ctx),
                         catalog_context: Arc::clone(&self.catalog_context),
                         sql_planning_cache: Arc::clone(&self.sql_planning_cache),
                         functions: FunctionProviderHandle::system(),
@@ -1162,7 +1161,7 @@ where
                         forktree.clone(),
                     ));
                 let branch_ref: Arc<dyn BranchRefReader> =
-                    Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+                    Arc::new(BranchRefStoreReader::new(read_store.clone()));
                 let authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader> =
                     Arc::new(crate::forktree::blob_reader_on_read(
                         read_store.clone(),
@@ -1982,7 +1981,6 @@ where
                     active_account_id: self.active_account_id(),
                     read_store,
                     forktree,
-                    branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
                     sql_planning_cache: Arc::clone(&self.sql_planning_cache),
                     functions: FunctionProviderHandle::system(),
@@ -2099,9 +2097,7 @@ where
                 let file_view_collector =
                     acknowledge_file_views.then(sql2::SessionFileViews::default);
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                let active_branch_head = self
-                    .branch_ctx
-                    .ref_reader(read_store.clone())
+                let active_branch_head = BranchRefStoreReader::new(read_store.clone())
                     .load_head(&active_branch_id)
                     .await?
                     .ok_or_else(|| {
@@ -2133,7 +2129,6 @@ where
                     active_account_id: self.active_account_id(),
                     read_store,
                     forktree,
-                    branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
                     sql_planning_cache: Arc::clone(&self.sql_planning_cache),
                     functions: FunctionProviderHandle::system(),
@@ -2310,7 +2305,7 @@ where
                         forktree.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
-                        Arc::new(self.branch_ctx.ref_reader(read_store));
+                        Arc::new(BranchRefStoreReader::new(read_store));
                     sql2::execute_exact_lix_file_root_listing(
                         &active_branch_id,
                         filesystem_path_index,
@@ -2325,7 +2320,7 @@ where
                         forktree.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
-                        Arc::new(self.branch_ctx.ref_reader(read_store));
+                        Arc::new(BranchRefStoreReader::new(read_store));
                     sql2::execute_exact_lix_directory_root_listing(
                         &active_branch_id,
                         filesystem_path_index,
@@ -2342,7 +2337,7 @@ where
                         forktree.clone(),
                     ));
                     let branch_ref: Arc<dyn BranchRefReader> =
-                        Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+                        Arc::new(BranchRefStoreReader::new(read_store.clone()));
                     let authenticated_blob_reader: Arc<
                         dyn crate::forktree::AuthenticatedBlobReader,
                     > = Arc::new(crate::forktree::blob_reader_on_read(
@@ -2430,7 +2425,6 @@ where
             active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
             forktree: forktree.clone(),
-            branch_ctx: Arc::clone(&self.branch_ctx),
             catalog_context: Arc::clone(&self.catalog_context),
             sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             functions: functions.clone(),
@@ -2455,7 +2449,7 @@ where
                     forktree.clone(),
                 ));
             let branch_ref: Arc<dyn BranchRefReader> =
-                Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+                Arc::new(BranchRefStoreReader::new(read_store.clone()));
             let authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader> =
                 Arc::new(crate::forktree::blob_reader_on_read(
                     read_store.clone(),
