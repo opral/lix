@@ -249,14 +249,20 @@ where
     for schema_domain in schema_domains {
         let rows = if schema_domain.untracked() {
             state
-                .untracked_branch_range(None, None, None)
+                .untracked_overlay_branch_range_for_branch(
+                    schema_domain.branch_id(),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
                 .await?
                 .into_iter()
                 .map(catalog_row_from_untracked)
                 .collect()
         } else {
             state
-                .range(None, None, None, false)
+                .branch_range(schema_domain.branch_id(), None, None, None, false)
                 .await?
                 .into_iter()
                 .map(catalog_row_from_state)
