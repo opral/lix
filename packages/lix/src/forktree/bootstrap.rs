@@ -17,6 +17,7 @@ use crate::changelog::{
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonSlot;
+use crate::plugin::{PLUGIN_REGISTRY_KEY, PluginRegistry};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
@@ -135,6 +136,16 @@ where
         None,
         EntityPk::single(WORKSPACE_BRANCH_KEY),
         json!({ "key": WORKSPACE_BRANCH_KEY, "value": main_branch.to_string() }),
+    )?;
+    // Registry absence is corruption, not an implicit empty authority. Seed
+    // the canonical empty registry into the initial authenticated state so
+    // the first install and every later lifecycle mutation replace one
+    // explicit branch-local owner through normal transaction publication.
+    add_row(
+        KEY_VALUE_SCHEMA_KEY,
+        None,
+        EntityPk::single(PLUGIN_REGISTRY_KEY),
+        PluginRegistry::empty().to_snapshot()?,
     )?;
     add_row(
         "lix_branch_descriptor",
