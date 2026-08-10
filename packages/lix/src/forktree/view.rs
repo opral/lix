@@ -1387,7 +1387,16 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, true).await
+        let repository = super::serving::load_repository_root(&self.read).await?;
+        Ok(stale_state_changes_between_commits_on_read(
+            &self.read,
+            &repository,
+            before,
+            after,
+            true,
+        )
+        .await?
+        .payload)
     }
 
     /// Diffs only the branch-local state domain for checkpoint and working
@@ -1398,7 +1407,16 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, false).await
+        let repository = super::serving::load_repository_root(&self.read).await?;
+        Ok(stale_state_changes_between_commits_on_read(
+            &self.read,
+            &repository,
+            before,
+            after,
+            false,
+        )
+        .await?
+        .payload)
     }
 
     /// Returns authenticated state-write identity changes separately from
@@ -1410,7 +1428,30 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateIdentityChange>, crate::LixError> {
-        touched_state_identities_between_commits_on_read(&self.read, before, after).await
+        let repository = super::serving::load_repository_root(&self.read).await?;
+        Ok(stale_state_changes_between_commits_on_read(
+            &self.read,
+            &repository,
+            before,
+            after,
+            true,
+        )
+        .await?
+        .identities)
+    }
+
+    /// Returns payload and write-identity changes from one authenticated root
+    /// diff. Stale reconciliation consumes both projections from this single
+    /// traversal so equal payloads with a new ChangeId remain visible without
+    /// rescanning either endpoint.
+    pub(crate) async fn stale_state_changes_between_commits(
+        &self,
+        before: crate::changelog::CommitId,
+        after: crate::changelog::CommitId,
+    ) -> Result<StaleStateChanges, crate::LixError> {
+        let repository = super::serving::load_repository_root(&self.read).await?;
+        stale_state_changes_between_commits_on_read(&self.read, &repository, before, after, true)
+            .await
     }
 
     /// Resolves one required semantic commit record from the authenticated
@@ -1567,38 +1608,163 @@ where
     }
 }
 
-async fn diff_state_rows_between_commits_on_read<R>(
+#[derive(Debug)]
+pub(crate) struct StaleStateChanges {
+    pub(crate) payload: Vec<super::state::HistoricalStateDiffEntry>,
+    pub(crate) identities: Vec<super::state::HistoricalStateIdentityChange>,
+}
+
+async fn stale_state_changes_between_commits_on_read<R>(
     read: &R,
+    repository: &super::model::RepositoryRootV1,
     before: crate::changelog::CommitId,
     after: crate::changelog::CommitId,
     include_global: bool,
-) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError>
+) -> Result<StaleStateChanges, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let mut before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
-    let mut after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
-    if !include_global {
-        before_rows.retain(|row| !row.global);
-        after_rows.retain(|row| !row.global);
+    if before == after {
+        return Ok(StaleStateChanges {
+            payload: Vec::new(),
+            identities: Vec::new(),
+        });
     }
-    let mut by_key = BTreeMap::new();
-    for row in before_rows {
-        by_key.entry(row.key.clone()).or_insert((Some(row), None));
+
+    let before_roots = super::serving::load_historical_commit_state_roots_from_repository(
+        read, repository, before,
+    )
+    .await?;
+    let after_roots =
+        super::serving::load_historical_commit_state_roots_from_repository(read, repository, after)
+            .await?;
+    let local_changes =
+        super::tree::diff_roots(Some(before_roots.1), Some(after_roots.1), read).await?;
+    let global_changes =
+        super::tree::diff_roots(Some(before_roots.0), Some(after_roots.0), read).await?;
+    let keys = merge_sorted_state_keys(local_changes, global_changes);
+    if keys.is_empty() {
+        return Ok(StaleStateChanges {
+            payload: Vec::new(),
+            identities: Vec::new(),
+        });
     }
-    for row in after_rows {
-        by_key
-            .entry(row.key.clone())
-            .and_modify(|entry| entry.1 = Some(row.clone()))
-            .or_insert((None, Some(row)));
-    }
-    Ok(by_key
-        .into_values()
-        .filter_map(|(before, after)| {
-            let changed = historical_state_payloads_differ(before.as_ref(), after.as_ref());
-            changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
+
+    let encoded = keys
+        .iter()
+        .map(|key| {
+            super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            })
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let before_rows = super::serving::state_points_on_read(
+        before_roots.0,
+        Some(before_roots.1),
+        &encoded,
+        true,
+        read,
+    )
+    .await?;
+    let after_rows = super::serving::state_points_on_read(
+        after_roots.0,
+        Some(after_roots.1),
+        &encoded,
+        true,
+        read,
+    )
+    .await?;
+
+    let mut payload = Vec::new();
+    let mut identities = Vec::new();
+    for ((key, before), after) in keys.into_iter().zip(before_rows).zip(after_rows) {
+        let before = historical_state_row_from_point(key.clone(), before, include_global)?;
+        let after = historical_state_row_from_point(key, after, include_global)?;
+        if historical_state_payloads_differ(before.as_ref(), after.as_ref()) {
+            payload.push(super::state::HistoricalStateDiffEntry {
+                before: before.clone(),
+                after: after.clone(),
+            });
+        }
+        if historical_state_identity_changed(before.as_ref(), after.as_ref()) {
+            let row = after
+                .as_ref()
+                .or(before.as_ref())
+                .expect("identity change has an endpoint");
+            let identity = |row: &super::state::HistoricalStateRow| {
+                super::state::HistoricalStateWriteIdentity {
+                    change_id: row.change_id,
+                    commit_id: row.commit_id,
+                }
+            };
+            identities.push(super::state::HistoricalStateIdentityChange {
+                key: row.key.clone(),
+                before: before.as_ref().map(identity),
+                after: after.as_ref().map(identity),
+            });
+        }
+    }
+    Ok(StaleStateChanges {
+        payload,
+        identities,
+    })
+}
+
+fn historical_state_row_from_point(
+    key: super::state::StateKey,
+    point: Option<(super::state::StateValue, super::serving::StateSource)>,
+    include_global: bool,
+) -> Result<Option<super::state::HistoricalStateRow>, crate::LixError> {
+    let Some((value, source)) = point else {
+        return Ok(None);
+    };
+    if !include_global && source == super::serving::StateSource::Global {
+        return Ok(None);
+    }
+    let (snapshot_content, deleted) = match value.cell {
+        super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+        super::state::StateCell::Null => (None, false),
+        super::state::StateCell::Tombstone => (None, true),
+    };
+    Ok(Some(super::state::HistoricalStateRow {
+        key,
+        global: source == super::serving::StateSource::Global,
+        snapshot_content,
+        metadata: value.metadata,
+        deleted,
+        blob_manifest_object_ids: value.blob_manifest_object_ids,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        change_id: value.change_id,
+        commit_id: value.commit_id,
+    }))
+}
+
+fn merge_sorted_state_keys(
+    left: Vec<super::state::StateKey>,
+    right: Vec<super::state::StateKey>,
+) -> Vec<super::state::StateKey> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut merged = Vec::new();
+    loop {
+        match (left.peek(), right.peek()) {
+            (None, None) => break,
+            (Some(_), None) => merged.push(left.next().expect("peeked left key")),
+            (None, Some(_)) => merged.push(right.next().expect("peeked right key")),
+            (Some(left_key), Some(right_key)) => match left_key.cmp(right_key) {
+                std::cmp::Ordering::Less => merged.push(left.next().expect("peeked left key")),
+                std::cmp::Ordering::Greater => merged.push(right.next().expect("peeked right key")),
+                std::cmp::Ordering::Equal => {
+                    merged.push(left.next().expect("peeked left key"));
+                    right.next();
+                }
+            },
+        }
+    }
+    merged
 }
 
 fn historical_state_payloads_differ(
@@ -1628,52 +1794,6 @@ fn historical_state_identity_changed(
         (Some(_), None) | (None, Some(_)) => true,
         (None, None) => false,
     }
-}
-
-async fn touched_state_identities_between_commits_on_read<R>(
-    read: &R,
-    before: crate::changelog::CommitId,
-    after: crate::changelog::CommitId,
-) -> Result<Vec<super::state::HistoricalStateIdentityChange>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
-    let after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
-    let mut by_key = BTreeMap::new();
-    for row in before_rows {
-        by_key.entry(row.key.clone()).or_insert((Some(row), None));
-    }
-    for row in after_rows {
-        by_key
-            .entry(row.key.clone())
-            .and_modify(|entry| entry.1 = Some(row.clone()))
-            .or_insert((None, Some(row)));
-    }
-    Ok(by_key
-        .into_values()
-        .filter_map(|(before, after)| {
-            historical_state_identity_changed(before.as_ref(), after.as_ref()).then(|| {
-                let key = after
-                    .as_ref()
-                    .or(before.as_ref())
-                    .expect("identity change has an endpoint")
-                    .key
-                    .clone();
-                let identity = |row: &super::state::HistoricalStateRow| {
-                    super::state::HistoricalStateWriteIdentity {
-                        change_id: row.change_id,
-                        commit_id: row.commit_id,
-                    }
-                };
-                super::state::HistoricalStateIdentityChange {
-                    key,
-                    before: before.as_ref().map(identity),
-                    after: after.as_ref().map(identity),
-                }
-            })
-        })
-        .collect())
 }
 
 pub(crate) async fn open_coherent_view<S>(
