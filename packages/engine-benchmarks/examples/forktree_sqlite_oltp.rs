@@ -5,7 +5,7 @@
 //! digest; version-control semantics remain specific to Lix and are not
 //! claimed equivalent here.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use blake3::Hasher;
 use lix::{ExecuteResult, Value};
@@ -25,7 +25,7 @@ mod workload;
 
 const READ_MANY_PK_COUNT: usize = 10;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation {
     Insert,
     Point,
@@ -131,21 +131,27 @@ async fn run(
         let (lix_result, lix_elapsed) = if verify_only {
             (run_lix(&lix_fixture, operation).await, None)
         } else {
-            let start = Instant::now();
-            let result = run_lix(&lix_fixture, operation).await;
-            (result, Some(start.elapsed()))
+            let (result, elapsed) = run_lix_measured(&lix_fixture, operation).await;
+            (result, Some(elapsed))
         };
         let (sqlite_result, sqlite_elapsed) = if verify_only {
             (run_sqlite(&mut sqlite_fixture, operation), None)
         } else {
-            let start = Instant::now();
-            let result = run_sqlite(&mut sqlite_fixture, operation);
-            (result, Some(start.elapsed()))
+            let (result, elapsed) = run_sqlite_measured(&mut sqlite_fixture, operation);
+            (result, Some(elapsed))
         };
         assert_same_digest("operation", &lix_result, &sqlite_result);
 
-        let final_lix = lix_fixture.read_all_result().await;
-        let final_sqlite = sqlite_fixture.read_all_public_result();
+        let final_lix = if operation == Operation::Insert {
+            lix_fixture.read_bulk_insert_result().await
+        } else {
+            lix_fixture.read_all_result().await
+        };
+        let final_sqlite = if operation == Operation::Insert {
+            sqlite_fixture.read_all_text_public_result()
+        } else {
+            sqlite_fixture.read_all_public_result()
+        };
         assert_same_digest("final", &final_lix, &final_sqlite);
 
         println!(
@@ -158,11 +164,59 @@ async fn run(
     }
 }
 
+async fn run_lix_measured(
+    fixture: &sql_session::SqlFixture,
+    operation: Operation,
+) -> (ExecuteResult, Duration) {
+    match operation {
+        Operation::Insert => {
+            let start = Instant::now();
+            fixture.insert_all().await;
+            let elapsed = start.elapsed();
+            (fixture.read_bulk_insert_result().await, elapsed)
+        }
+        Operation::Point => {
+            let start = Instant::now();
+            let result = fixture.read_one_by_pk_result().await;
+            (result, start.elapsed())
+        }
+        Operation::Range => {
+            let start = Instant::now();
+            let result = fixture.read_all_result().await;
+            (result, start.elapsed())
+        }
+        Operation::UpdateOne => {
+            let start = Instant::now();
+            fixture.update_one_by_pk().await;
+            let elapsed = start.elapsed();
+            (fixture.read_all_result().await, elapsed)
+        }
+        Operation::UpdateAll => {
+            let start = Instant::now();
+            fixture.update_all().await;
+            let elapsed = start.elapsed();
+            (fixture.read_all_result().await, elapsed)
+        }
+        Operation::DeleteOne => {
+            let start = Instant::now();
+            fixture.delete_one_by_pk().await;
+            let elapsed = start.elapsed();
+            (fixture.read_all_result().await, elapsed)
+        }
+        Operation::DeleteAll => {
+            let start = Instant::now();
+            fixture.delete_all().await;
+            let elapsed = start.elapsed();
+            (fixture.read_all_result().await, elapsed)
+        }
+    }
+}
+
 async fn run_lix(fixture: &sql_session::SqlFixture, operation: Operation) -> ExecuteResult {
     match operation {
         Operation::Insert => {
             fixture.insert_all().await;
-            fixture.read_all_result().await
+            fixture.read_bulk_insert_result().await
         }
         Operation::Point => fixture.read_one_by_pk_result().await,
         // `range` is the existing ordered full-range public scan; the
@@ -191,7 +245,7 @@ fn run_sqlite(fixture: &mut raw_sqlite::RawSqliteFixture, operation: Operation) 
     match operation {
         Operation::Insert => {
             fixture.insert_all();
-            fixture.read_all_public_result()
+            fixture.read_all_text_public_result()
         }
         Operation::Point => fixture.read_one_by_pk_public_result(),
         Operation::Range => fixture.read_all_public_result(),
@@ -210,6 +264,54 @@ fn run_sqlite(fixture: &mut raw_sqlite::RawSqliteFixture, operation: Operation) 
         Operation::DeleteAll => {
             fixture.delete_all();
             fixture.read_all_public_result()
+        }
+    }
+}
+
+fn run_sqlite_measured(
+    fixture: &mut raw_sqlite::RawSqliteFixture,
+    operation: Operation,
+) -> (ExecuteResult, Duration) {
+    match operation {
+        Operation::Insert => {
+            let start = Instant::now();
+            fixture.insert_all();
+            let elapsed = start.elapsed();
+            (fixture.read_all_text_public_result(), elapsed)
+        }
+        Operation::Point => {
+            let start = Instant::now();
+            let result = fixture.read_one_by_pk_public_result();
+            (result, start.elapsed())
+        }
+        Operation::Range => {
+            let start = Instant::now();
+            let result = fixture.read_all_public_result();
+            (result, start.elapsed())
+        }
+        Operation::UpdateOne => {
+            let start = Instant::now();
+            fixture.update_one_by_pk();
+            let elapsed = start.elapsed();
+            (fixture.read_all_public_result(), elapsed)
+        }
+        Operation::UpdateAll => {
+            let start = Instant::now();
+            fixture.update_all();
+            let elapsed = start.elapsed();
+            (fixture.read_all_public_result(), elapsed)
+        }
+        Operation::DeleteOne => {
+            let start = Instant::now();
+            fixture.delete_one_by_pk();
+            let elapsed = start.elapsed();
+            (fixture.read_all_public_result(), elapsed)
+        }
+        Operation::DeleteAll => {
+            let start = Instant::now();
+            fixture.delete_all();
+            let elapsed = start.elapsed();
+            (fixture.read_all_public_result(), elapsed)
         }
     }
 }

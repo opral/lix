@@ -533,6 +533,14 @@ impl SqlFixture {
         }
     }
 
+    pub(crate) async fn read_bulk_insert_result(&self) -> ExecuteResult {
+        match self {
+            Self::RocksDB(fixture) => fixture.read_bulk_insert_result().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_bulk_insert_result().await,
+        }
+    }
+
     pub(crate) async fn read_many_by_pk(&self) -> usize {
         match self {
             Self::RocksDB(fixture) => fixture.read_many_by_pk().await,
@@ -1005,6 +1013,14 @@ where
 
     async fn read_all_result(&self) -> ExecuteResult {
         execute(&self.session, &self.select_all_sql).await
+    }
+
+    async fn read_bulk_insert_result(&self) -> ExecuteResult {
+        execute(
+            &self.session,
+            "SELECT path, value FROM tracked_crud_insert ORDER BY path",
+        )
+        .await
     }
 
     async fn read_many_by_pk(&self) -> usize {
@@ -1766,7 +1782,7 @@ where
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -1792,7 +1808,7 @@ where
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -1821,7 +1837,7 @@ where
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
             &[Value::Text(schema.to_string())],
         )
         .await
