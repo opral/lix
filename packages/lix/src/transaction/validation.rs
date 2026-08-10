@@ -1066,11 +1066,17 @@ where
     validate_registered_schema_rows(&input, &staged_rows)?;
     let has_inserts = input.staged_writes.inserts().next().is_some();
     let needs_committed_state = staged_rows.iter().any(|row| {
+        let tombstone_needs_committed_state = row_is_tombstone(*row)
+            && (row.schema_key() == "lix_account"
+                || input
+                    .schema_catalog
+                    .delete_plan_for_key(row.schema_key())
+                    .has_committed_checks());
         row.requires_transaction_validation()
             || row.global()
             || row.untracked()
             || row.file_id().is_some()
-            || row_is_tombstone(*row)
+            || tombstone_needs_committed_state
             || matches!(
                 row.schema_key(),
                 FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | "lix_account"
