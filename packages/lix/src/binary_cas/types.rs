@@ -234,7 +234,10 @@ impl BlobBytesBatch {
             .map(|entry| {
                 entry.map(|entry| match entry {
                     BlobBytesEntry::Owned(bytes) => bytes,
-                    BlobBytesEntry::Shared(bytes) => bytes.to_vec(),
+                    BlobBytesEntry::Shared(bytes) => match bytes.try_into_mut() {
+                        Ok(bytes) => bytes.into(),
+                        Err(bytes) => bytes.to_vec(),
+                    },
                 })
             })
             .collect()
@@ -292,6 +295,29 @@ mod tests {
             .flatten()
             .expect("shared entry");
         assert_eq!(blob.as_ref().as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn unique_shared_batches_transfer_vec_storage_without_copying() {
+        let source = vec![0xa5; 32];
+        let source_ptr = source.as_ptr();
+        let returned = BlobBytesBatch::from_shared(vec![Some(Bytes::from(source))])
+            .into_vec()
+            .pop()
+            .flatten()
+            .expect("unique shared entry");
+        assert_eq!(returned.as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn shared_slice_and_static_batches_keep_copy_fallback_correct() {
+        let backing = Bytes::from_static(b"0123456789");
+        let sliced = backing.slice(2..7);
+        let values =
+            BlobBytesBatch::from_shared(vec![Some(sliced), Some(Bytes::from_static(b"static"))])
+                .into_vec();
+        assert_eq!(values[0].as_deref(), Some(b"23456".as_slice()));
+        assert_eq!(values[1].as_deref(), Some(b"static".as_slice()));
     }
 }
 
