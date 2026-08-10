@@ -1510,29 +1510,124 @@ async fn diff_state_rows_between_commits_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let mut before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
-    let mut after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
-    if !include_global {
-        before_rows.retain(|row| !row.global);
-        after_rows.retain(|row| !row.global);
+    let before_roots = super::serving::load_historical_commit_state_roots(read, before).await?;
+    let after_roots = super::serving::load_historical_commit_state_roots(read, after).await?;
+    if before_roots == after_roots {
+        return Ok(Vec::new());
     }
-    let mut by_key = BTreeMap::new();
-    for row in before_rows {
-        by_key.entry(row.key.clone()).or_insert((Some(row), None));
+
+    let local_changes =
+        super::tree::diff_roots(Some(before_roots.1), Some(after_roots.1), read).await?;
+    let changed_keys = if include_global {
+        let global_changes =
+            super::tree::diff_roots(Some(before_roots.0), Some(after_roots.0), read).await?;
+        merge_sorted_state_keys(local_changes, global_changes)
+    } else {
+        local_changes
+    };
+    if changed_keys.is_empty() {
+        return Ok(Vec::new());
     }
-    for row in after_rows {
-        by_key
-            .entry(row.key.clone())
-            .and_modify(|entry| entry.1 = Some(row.clone()))
-            .or_insert((None, Some(row)));
-    }
-    Ok(by_key
-        .into_values()
-        .filter_map(|(before, after)| {
-            let changed = historical_state_payloads_differ(before.as_ref(), after.as_ref());
-            changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
+
+    let encoded_keys = changed_keys
+        .iter()
+        .map(|key| {
+            super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            })
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let before_values = super::serving::state_points_at_roots_on_read(
+        include_global.then_some(before_roots.0),
+        Some(before_roots.1),
+        &encoded_keys,
+        true,
+        read,
+    )
+    .await?;
+    let after_values = super::serving::state_points_at_roots_on_read(
+        include_global.then_some(after_roots.0),
+        Some(after_roots.1),
+        &encoded_keys,
+        true,
+        read,
+    )
+    .await?;
+
+    let mut output = Vec::new();
+    for ((key, before), after) in changed_keys
+        .into_iter()
+        .zip(before_values)
+        .zip(after_values)
+    {
+        let before = before.map(|(value, source)| historical_state_row(key.clone(), value, source));
+        let after = after.map(|(value, source)| historical_state_row(key, value, source));
+        if historical_state_payloads_differ(before.as_ref(), after.as_ref()) {
+            output.push(super::state::HistoricalStateDiffEntry { before, after });
+        }
+    }
+    Ok(output)
+}
+
+fn historical_state_row(
+    key: super::state::StateKey,
+    value: super::state::StateValue,
+    source: super::serving::StateSource,
+) -> super::state::HistoricalStateRow {
+    let super::state::StateValue {
+        change_id,
+        commit_id,
+        created_at,
+        updated_at,
+        cell,
+        metadata,
+        origin_key: _,
+        blob_manifest_object_ids,
+    } = value;
+    let (snapshot_content, deleted) = match cell {
+        super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+        super::state::StateCell::Null => (None, false),
+        super::state::StateCell::Tombstone => (None, true),
+    };
+    super::state::HistoricalStateRow {
+        key,
+        global: source == super::serving::StateSource::Global,
+        change_id,
+        commit_id,
+        created_at,
+        updated_at,
+        snapshot_content,
+        metadata,
+        deleted,
+        blob_manifest_object_ids,
+    }
+}
+
+fn merge_sorted_state_keys(
+    left: Vec<super::state::StateKey>,
+    right: Vec<super::state::StateKey>,
+) -> Vec<super::state::StateKey> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut merged = Vec::new();
+    loop {
+        match (left.peek(), right.peek()) {
+            (None, None) => break,
+            (Some(_), None) => merged.push(left.next().expect("peeked left key")),
+            (None, Some(_)) => merged.push(right.next().expect("peeked right key")),
+            (Some(left_key), Some(right_key)) => match left_key.cmp(right_key) {
+                std::cmp::Ordering::Less => merged.push(left.next().expect("peeked left key")),
+                std::cmp::Ordering::Greater => merged.push(right.next().expect("peeked right key")),
+                std::cmp::Ordering::Equal => {
+                    merged.push(left.next().expect("peeked left key"));
+                    right.next();
+                }
+            },
+        }
+    }
+    merged
 }
 
 fn historical_state_payloads_differ(

@@ -1851,6 +1851,29 @@ pub(crate) async fn state_points_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    state_points_at_roots_on_read(
+        Some(global_state_root),
+        local_state_root,
+        keys,
+        include_tombstone,
+        read,
+    )
+    .await
+}
+
+/// Resolves exact state keys against an explicit pair of authenticated roots.
+/// Either root may be absent so historical branch-only diffs can avoid
+/// reading the global tree at all while retaining the same resolver.
+pub(crate) async fn state_points_at_roots_on_read<R>(
+    global_state_root: Option<ObjectId>,
+    local_state_root: Option<ObjectId>,
+    keys: &[Vec<u8>],
+    include_tombstone: bool,
+    read: &R,
+) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -1868,7 +1891,10 @@ where
         }
     }
     let global_keys = missing_by_key.keys().cloned().collect::<Vec<_>>();
-    let global = lookup_many_on_read(global_state_root, "state", &global_keys, read).await?;
+    let global = match global_state_root {
+        Some(root) => lookup_many_on_read(root, "state", &global_keys, read).await?,
+        None => vec![None; global_keys.len()],
+    };
     let mut global_by_slot = BTreeMap::new();
     for ((_, slots), value) in missing_by_key.into_iter().zip(global) {
         for slot in slots {
@@ -2188,7 +2214,7 @@ where
 /// Loads the complete authenticated state overlay for one historical commit.
 /// A missing commit/catalog/root is an error; an absent key is represented by
 /// the absence of a row in the returned ordered stream.
-async fn load_historical_commit_state_roots<R>(
+pub(crate) async fn load_historical_commit_state_roots<R>(
     read: &R,
     commit_id: crate::changelog::CommitId,
 ) -> Result<(ObjectId, ObjectId), crate::LixError>
