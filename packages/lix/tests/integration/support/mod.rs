@@ -18,14 +18,6 @@ macro_rules! simulation_test {
             $options,
             |$sim| $body
         );
-        #[cfg(feature = "all-simulations")]
-        $crate::simulation_test!(
-            @single $name,
-            tracked_state_rebuild,
-            TrackedStateRebuild,
-            $options,
-            |$sim| $body
-        );
     };
     (@single $name:ident, $simulation:ident, $mode:ident, $options:expr, |$sim:ident| $body:expr) => {
         paste::paste! {

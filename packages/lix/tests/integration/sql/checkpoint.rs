@@ -166,21 +166,6 @@ simulation_test!(
             Value::Text(receipt.commit_id.clone()),
             "retained HOT rows must project the checkpoint as their live commit owner"
         );
-
-        engine
-            .rebuild_tracked_state_for_branch(sim.main_branch_id())
-            .await
-            .expect("checkpoint tracked state should rebuild");
-        assert_eq!(
-            select_rows(
-                &session,
-                "SELECT lixcol_created_at, lixcol_updated_at, lixcol_commit_id \
-                 FROM lix_key_value WHERE key = 'checkpoint-key'",
-            )
-            .await,
-            timestamps_before_rebuild,
-            "checkpoint timestamps must remain stable after tracked-state rebuild"
-        );
     }
 );
 

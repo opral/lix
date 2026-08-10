@@ -158,19 +158,6 @@ where
         .await
     }
 
-    /// Scans authenticated untracked rows for this branch without exposing
-    /// the underlying storage read to callers outside ForkTree.
-    pub(crate) async fn scan_untracked_rows(
-        &self,
-    ) -> Result<Vec<(super::state::StateKey, super::state::UntrackedValue)>, crate::LixError> {
-        Ok(self
-            .scan_untracked_rows_for_scope(false)
-            .await?
-            .into_iter()
-            .map(|(_owner, key, value)| (key, value))
-            .collect())
-    }
-
     /// Scans the authenticated untracked overlay owned by this branch. An
     /// ordinary branch view includes the global owner as the base overlay;
     /// the global view includes only its own rows. Both owners are resolved

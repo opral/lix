@@ -13,7 +13,8 @@ use crate::branch::BranchRefReader;
 ///
 /// Active surfaces read through one session branch. By-branch surfaces either
 /// read explicitly filtered branches or, without a branch predicate, enumerate
-/// every visible branch scope before handing the request to live_state.
+/// every visible branch scope before handing the request to the projection
+/// layer.
 pub(crate) enum SqlBranchScope {
     Active(String),
     Explicit(Vec<String>),
