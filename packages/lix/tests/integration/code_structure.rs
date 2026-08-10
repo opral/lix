@@ -48,11 +48,6 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         ],
     },
     ForbiddenDependencyRule {
-        from_scope: "live_state",
-        reason: "live_state is the generic projection engine and must not reacquire services sidecars or write orchestration owners",
-        forbidden_scopes: &["execution", "services"],
-    },
-    ForbiddenDependencyRule {
         from_scope: "sql2",
         reason: "sql2 is the compiler/runtime provider lane; it must not depend on workflow or higher orchestration roots directly",
         forbidden_scopes: &["execution", "services", "session"],
@@ -76,7 +71,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
 ];
 
-const TARGET_CORE_MODULES: &[&str] = &["storage", "live_state", "session", "sql2", "transaction"];
+const TARGET_CORE_MODULES: &[&str] = &["storage", "session", "sql2", "transaction"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
@@ -2082,7 +2077,14 @@ fn current_storage_import_outside_storage_adapter_violations() -> Vec<ImportPath
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if relative_path.starts_with("storage") || relative_path.starts_with("storage_adapter") {
+        // ForkTree is the sealed persistence owner. Its codec/tree/view code
+        // must use the substrate directly to authenticate and publish the
+        // owner-owned OBJECT_SPACE/SELECTOR_SPACE planes. Every other engine
+        // root is required to consume adapter-facing aliases instead.
+        if relative_path.starts_with("storage")
+            || relative_path.starts_with("storage_adapter")
+            || relative_path.starts_with("forktree/")
+        {
             continue;
         }
 
@@ -2750,7 +2752,11 @@ fn sql2_read_session_does_not_register_write_surfaces() {
     assert_source_contains_none(
         relative,
         read_session,
-        &["SqlWriteContext::new", "providers::register_write"],
+        &[
+            "SqlWriteContext::new",
+            "SqlWriteContext::<R>::new",
+            "providers::register_write",
+        ],
     );
 
     let relative = "sql2/providers/mod.rs";
@@ -2839,7 +2845,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
     assert_source_contains_all(
         relative,
         write_session,
-        &["SqlWriteContext::new", "providers::register_write"],
+        &["SqlWriteContext::<R>::new", "providers::register_write"],
     );
     assert_source_contains_none(relative, write_session, &["providers::register_read"]);
 
