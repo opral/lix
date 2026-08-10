@@ -898,9 +898,50 @@ where
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
+        Self::active_branch_with_state(
+            active_branch_id,
+            FileStateView::Committed(state_view),
+            filesystem_path_index,
+            branch_ref,
+            authenticated_blob_reader,
+            plugin_host,
+            functions,
+        )
+    }
+
+    #[cfg(test)]
+    fn active_branch_test(
+        active_branch_id: impl Into<String>,
+        state_view: FileStateView<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
+        plugin_host: PluginRuntimeHost,
+        functions: FunctionProviderHandle,
+    ) -> Self {
+        Self::active_branch_with_state(
+            active_branch_id,
+            state_view,
+            filesystem_path_index,
+            branch_ref,
+            authenticated_blob_reader,
+            plugin_host,
+            functions,
+        )
+    }
+
+    fn active_branch_with_state(
+        active_branch_id: impl Into<String>,
+        state_view: FileStateView<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
+        plugin_host: PluginRuntimeHost,
+        functions: FunctionProviderHandle,
+    ) -> Self {
         Self {
             schema: lix_file_schema(),
-            state_view: FileStateView::Committed(state_view),
+            state_view,
             filesystem_path_index,
             branch_ref,
             blob_reader: LixFilePayloadReader::Authenticated(Arc::clone(
@@ -952,9 +993,46 @@ where
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
+        Self::by_branch_with_state(
+            FileStateView::Committed(state_view),
+            filesystem_path_index,
+            branch_ref,
+            authenticated_blob_reader,
+            plugin_host,
+            functions,
+        )
+    }
+
+    #[cfg(test)]
+    fn by_branch_test(
+        state_view: FileStateView<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
+        plugin_host: PluginRuntimeHost,
+        functions: FunctionProviderHandle,
+    ) -> Self {
+        Self::by_branch_with_state(
+            state_view,
+            filesystem_path_index,
+            branch_ref,
+            authenticated_blob_reader,
+            plugin_host,
+            functions,
+        )
+    }
+
+    fn by_branch_with_state(
+        state_view: FileStateView<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
+        plugin_host: PluginRuntimeHost,
+        functions: FunctionProviderHandle,
+    ) -> Self {
         Self {
             schema: lix_file_by_branch_schema(),
-            state_view: FileStateView::Committed(state_view),
+            state_view,
             filesystem_path_index,
             branch_ref,
             blob_reader: LixFilePayloadReader::Authenticated(Arc::clone(
@@ -7972,7 +8050,7 @@ mod tests {
     fn path_index_from_rows(
         rows: Vec<FilesystemStateRow>,
     ) -> Result<FilesystemPathIndex, LixError> {
-        FilesystemPathIndex::from_live_batch(&FilesystemStateRows::from_rows(rows))
+        FilesystemPathIndex::from_state_rows(&FilesystemStateRows::from_rows(rows))
     }
 
     fn test_functions() -> FunctionProviderHandle {
@@ -8604,9 +8682,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(FileStateView::test_rejecting(Arc::clone(&state_view_scans))),
+            FileStateView::test_rejecting(Arc::clone(&state_view_scans)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -8701,9 +8779,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(FileStateView::test_rejecting(Arc::clone(&state_view_scans))),
+            FileStateView::test_rejecting(Arc::clone(&state_view_scans)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -8781,8 +8859,8 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::by_branch(
-            Arc::new(FileStateView::test_rejecting(Arc::clone(&state_view_scans))),
+        let spec = LixFileSpec::by_branch_test(
+            FileStateView::test_rejecting(Arc::clone(&state_view_scans)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -8885,12 +8963,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(FileStateView::test_recording(
-                Vec::new(),
-                Arc::clone(&state_view_requests),
-            )),
+            FileStateView::test_recording(Vec::new(), Arc::clone(&state_view_requests)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -9132,12 +9207,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(FileStateView::test_recording(
-                Vec::new(),
-                Arc::clone(&state_view_requests),
-            )),
+            FileStateView::test_recording(Vec::new(), Arc::clone(&state_view_requests)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -9607,12 +9679,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(FileStateView::test_recording(
-                Vec::new(),
-                Arc::clone(&state_view_requests),
-            )),
+            FileStateView::test_recording(Vec::new(), Arc::clone(&state_view_requests)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),

@@ -1531,7 +1531,7 @@ mod tests {
         let blob_ref = entries[0]
             .blob_ref_state_row()
             .expect("projected file should retain its updated blob ref");
-        assert_eq!(blob_ref.branch_id.as_ref(), "branch-a");
+        assert_eq!(blob_ref.branch_id.as_str(), "branch-a");
         assert_eq!(
             blob_ref.snapshot_content.as_deref(),
             Some(r#"{"blob_hash":"hash-after","id":"global-file","size_bytes":7}"#)
