@@ -1045,6 +1045,16 @@ where
     })
 }
 
+/// Reader-local semantic history cache. It is created for one
+/// `load_change_records` invocation and is never persisted or shared with a
+/// different retained read. The existing decoders and page-chain validation
+/// remain authoritative; this only avoids fetching and decoding the same
+/// immutable commit/member closure once per ChangeCatalog entry.
+#[derive(Default)]
+struct SemanticChangeReadCache {
+    closures: BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
+}
+
 pub(crate) async fn load_change_records<R>(
     read: &R,
     ids: &[crate::changelog::ChangeId],
@@ -1053,24 +1063,41 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let repository = load_repository_root(read).await?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = ids
+        .iter()
+        .map(|id| id.as_uuid().as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let values = lookup_many_on_read(repository.change_catalog_root, "change", &keys, read).await?;
     let mut records = Vec::with_capacity(ids.len());
-    for id in ids {
+    let mut cache = SemanticChangeReadCache::default();
+    for (id, value) in ids.iter().zip(values) {
         let id = ChangeId::from_bytes(*id.as_uuid().as_bytes());
-        let Some(value) = lookup_on_read(
-            repository.change_catalog_root,
-            "change",
-            id.as_bytes(),
-            read,
-        )
-        .await?
-        else {
+        let Some(value) = value else {
             records.push(None);
             continue;
         };
         let entry = ChangeCatalogEntry::decode(&value)?;
-        records
-            .push(semantic_change_record(read, repository.change_catalog_root, id, entry).await?);
+        records.push(
+            semantic_change_record_cached(
+                read,
+                repository.commit_catalog_root,
+                repository.change_catalog_root,
+                id,
+                entry,
+                &mut cache,
+            )
+            .await?,
+        );
     }
+    tracing::debug!(
+        target: "lix_perf",
+        requested_change_ids = ids.len(),
+        unique_commit_member_closures = cache.closures.len(),
+        "lix.perf.merge_change_records_batch"
+    );
     Ok(records)
 }
 
@@ -1510,6 +1537,112 @@ fn resolve_cached_topology(
     })
 }
 
+async fn semantic_change_record_cached<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    id: ChangeId,
+    entry: ChangeCatalogEntry,
+    cache: &mut SemanticChangeReadCache,
+) -> Result<Option<crate::changelog::ChangeRecord>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let change = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            let (_, members) = load_authenticated_commit_member_closure(
+                read,
+                commit_catalog_root,
+                commit_object_id,
+                &mut cache.closures,
+            )
+            .await?;
+            let member = members
+                .get(ordinal as usize)
+                .ok_or_else(|| corruption("ChangeCatalog owner ordinal is absent"))?;
+            if member.change_id() != id || member.source().is_some() {
+                return Err(corruption("ChangeCatalog owner/ordinal back-edge is invalid").into());
+            }
+            semantic_change_for_member_with_commit_cache(
+                read,
+                commit_catalog_root,
+                member,
+                &mut cache.closures,
+            )
+            .await?
+        }
+        ChangeCatalogOwner::BranchRef {
+            ref_change_object_id,
+            branch_id,
+        } => {
+            let bytes = super::view::load_object_bytes(read, ref_change_object_id).await?;
+            let change = ChangeObjectV1::decode(ref_change_object_id, &bytes)?;
+            let ChangeObjectV1::BranchRef {
+                branch_id: object_branch,
+                ..
+            } = &change
+            else {
+                return Err(corruption("branch-ref catalog owner names semantic payload").into());
+            };
+            if branch_id != *object_branch {
+                return Err(corruption("ChangeCatalog branch owner/back-edge is invalid").into());
+            }
+            validate_retained_ref_change(read, change_catalog_root, ref_change_object_id, &change)
+                .await?;
+            change
+        }
+    };
+    decode_semantic_change_record(id, change)
+}
+
+fn decode_semantic_change_record(
+    id: ChangeId,
+    change: ChangeObjectV1,
+) -> Result<Option<crate::changelog::ChangeRecord>, crate::LixError> {
+    if change.change_id() != id {
+        return Err(corruption("ChangeCatalog key does not match embedded ChangeId").into());
+    }
+    let (payload, json_payload_object_ids, is_empty_ref_payload) = match change {
+        ChangeObjectV1::Semantic {
+            payload,
+            json_payload_object_ids,
+            ..
+        } => (payload, json_payload_object_ids, false),
+        ChangeObjectV1::BranchRef {
+            payload,
+            json_payload_object_ids,
+            ..
+        } => {
+            let is_empty = payload.is_empty();
+            (payload, json_payload_object_ids, is_empty)
+        }
+    };
+    if is_empty_ref_payload {
+        // Creation RefChanges carry authenticated branch/head edges but no
+        // public lix_change payload. Keep the object/catalog validation above,
+        // while leaving this control-plane fact out of the semantic changelog.
+        return Ok(None);
+    }
+    let record = crate::changelog::decode_forktree_change_payload(
+        &payload,
+        crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*id.as_bytes())),
+    )?;
+    let expected = crate::changelog::forktree_change_json_payload_ids(&record)
+        .into_iter()
+        .map(ObjectId::from_bytes)
+        .collect::<Vec<_>>();
+    if expected != json_payload_object_ids {
+        return Err(corruption(
+            "Change object JSON payload edges do not match its semantic payload",
+        )
+        .into());
+    }
+    Ok(Some(record))
+}
+
 async fn semantic_change_record<R>(
     read: &R,
     change_catalog_root: ObjectId,
@@ -1556,45 +1689,7 @@ where
             change
         }
     };
-    if change.change_id() != id {
-        return Err(corruption("ChangeCatalog key does not match embedded ChangeId").into());
-    }
-    let (payload, json_payload_object_ids, is_empty_ref_payload) = match change {
-        ChangeObjectV1::Semantic {
-            payload,
-            json_payload_object_ids,
-            ..
-        } => (payload, json_payload_object_ids, false),
-        ChangeObjectV1::BranchRef {
-            payload,
-            json_payload_object_ids,
-            ..
-        } => {
-            let is_empty = payload.is_empty();
-            (payload, json_payload_object_ids, is_empty)
-        }
-    };
-    if is_empty_ref_payload {
-        // Creation RefChanges carry authenticated branch/head edges but no
-        // public lix_change payload. Keep the object/catalog validation above,
-        // while leaving this control-plane fact out of the semantic changelog.
-        return Ok(None);
-    }
-    let record = crate::changelog::decode_forktree_change_payload(
-        &payload,
-        crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*id.as_bytes())),
-    )?;
-    let expected = crate::changelog::forktree_change_json_payload_ids(&record)
-        .into_iter()
-        .map(ObjectId::from_bytes)
-        .collect::<Vec<_>>();
-    if expected != json_payload_object_ids {
-        return Err(corruption(
-            "Change object JSON payload edges do not match its semantic payload",
-        )
-        .into());
-    }
-    Ok(Some(record))
+    decode_semantic_change_record(id, change)
 }
 
 async fn validate_commit_catalog_identity<R>(
