@@ -4,7 +4,8 @@
 //! module keeps `StateRow` and the native untracked row as the only row shapes
 //! before Arrow/DataFusion takes ownership.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::future::Future;
 
 use crate::LixError;
@@ -235,7 +236,7 @@ where
     let mut bounds_request = request.clone();
     bounds_request.filter.entity_pks.clear();
     let schema_bounds = schema_bounds(&bounds_request)?;
-    let bounds = if request.filter.entity_pks.is_empty() {
+    let mut bounds = if request.filter.entity_pks.is_empty() {
         vec![schema_bounds]
     } else {
         let schema = bounds_request
@@ -253,19 +254,20 @@ where
             })
             .collect()
     };
+    bounds.sort_by(|left, right| left.0.cmp(&right.0));
     let branch_ids = if request.filter.branch_ids.is_empty() {
         vec![active_branch_id]
     } else {
         request.filter.branch_ids.clone()
     };
-    let mut rows = Vec::new();
+    let mut branch_rows = Vec::new();
     for branch_id in &branch_ids {
-        let mut branch_rows = Vec::new();
+        let mut rows = Vec::new();
         for (lower, upper) in &bounds {
-            branch_rows.extend(scan_branch(branch_id.clone(), lower.clone(), upper.clone()).await?);
+            rows.extend(scan_branch(branch_id.clone(), lower.clone(), upper.clone()).await?);
         }
-        rows.extend(merge_range_slots(
-            branch_rows,
+        branch_rows.push(merge_range_slots(
+            rows,
             Vec::new(),
             request.filter.include_tombstones,
             request.limit,
@@ -274,13 +276,34 @@ where
     let global_id =
         uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID).expect("GLOBAL_BRANCH_ID must be a UUID");
     let mut global_keys = std::collections::BTreeSet::new();
-    rows.sort_by(|left, right| {
-        slot_sort_key(left)
-            .cmp(&slot_sort_key(right))
-            .then(slot_branch_sort_key(left).cmp(&slot_branch_sort_key(right)))
-    });
-    let mut visible = Vec::with_capacity(rows.len());
-    for slot in rows {
+    let mut branch_rows = branch_rows
+        .into_iter()
+        .map(|rows| rows.into_iter().map(Some).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mut cursors = BinaryHeap::new();
+    for (branch_index, rows) in branch_rows.iter().enumerate() {
+        if let Some(Some(slot)) = rows.first() {
+            cursors.push(Reverse((
+                slot_sort_key(slot),
+                slot_branch_sort_key(slot),
+                branch_index,
+                0_usize,
+            )));
+        }
+    }
+    let mut visible = Vec::new();
+    while let Some(Reverse((_key, _branch_sort, branch_index, row_index))) = cursors.pop() {
+        let slot = branch_rows[branch_index][row_index]
+            .take()
+            .expect("k-way branch cursor row");
+        if let Some(Some(next)) = branch_rows[branch_index].get(row_index + 1) {
+            cursors.push(Reverse((
+                slot_sort_key(next),
+                slot_branch_sort_key(next),
+                branch_index,
+                row_index + 1,
+            )));
+        }
         let key = slot_sort_key(&slot);
         let is_global = match &slot {
             EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
@@ -297,9 +320,11 @@ where
                 && !matches!(&slot, EntityStateSlot::Untracked(row) if row.value.cell.deleted())
         {
             visible.push(slot);
+            if request.limit.is_some_and(|limit| visible.len() >= limit) {
+                break;
+            }
         }
     }
-    visible.truncate(request.limit.unwrap_or(usize::MAX));
     Ok(visible)
 }
 
