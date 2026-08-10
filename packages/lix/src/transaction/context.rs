@@ -4755,6 +4755,16 @@ where
         )?))
     }
 
+    fn load_staged_file_bytes_for_owner(
+        &self,
+        branch_id: &str,
+        file_id: &str,
+        expected: BlobId,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        self.staged_writes
+            .load_staged_file_bytes_for_owner(branch_id, file_id, expected)
+    }
+
     async fn filesystem_path_index(
         &mut self,
         request: &FilesystemPathIndexRequest,
