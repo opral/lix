@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::common::LixTimestamp;
 use crate::storage::{
@@ -89,6 +90,17 @@ async fn resolve_semantic_member<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    resolve_semantic_member_with_cache(read, member, &mut BTreeMap::new()).await
+}
+
+async fn resolve_semantic_member_with_cache<R>(
+    read: &R,
+    member: &CommitMemberV1,
+    member_closures: &mut BTreeMap<ObjectId, Arc<[CommitMemberV1]>>,
+) -> Result<ResolvedSemanticMember, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     let expected_change_id = member.change_id();
     let mut current = member.clone();
     let mut visited = BTreeSet::new();
@@ -130,10 +142,19 @@ where
                     ));
                 }
                 selected_created_at.get_or_insert(created_at);
-                let bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
-                let source = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
-                current = load_commit_members(read, &source)
-                    .await?
+                let source_members =
+                    if let Some(members) = member_closures.get(&source_commit_object_id) {
+                        Arc::clone(members)
+                    } else {
+                        let bytes =
+                            super::view::load_object_bytes(read, source_commit_object_id).await?;
+                        let source = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
+                        let members: Arc<[CommitMemberV1]> =
+                            load_commit_members(read, &source).await?.into();
+                        member_closures.insert(source_commit_object_id, Arc::clone(&members));
+                        members
+                    };
+                current = source_members
                     .get(source_ordinal as usize)
                     .cloned()
                     .ok_or_else(|| corruption("selected member source ordinal is absent"))?;
@@ -1175,6 +1196,46 @@ pub(crate) async fn load_state_value_at_commit<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let mut values =
+        load_state_values_at_commit(read, commit_id, &[key.to_vec()], include_tombstone).await?;
+    Ok(values.pop().flatten())
+}
+
+/// Loads exact historical state identities after authenticating the selected
+/// commit envelope and retained member closure once. All tree lookups remain
+/// bound to the caller's retained read and preserve input order/duplicates.
+pub(crate) async fn load_state_values_at_commit<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+    keys: &[Vec<u8>],
+    include_tombstone: bool,
+) -> Result<Vec<Option<(StateValue, StateSource)>>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (global_state_root, local_state_root) =
+        authenticate_historical_state_roots(read, commit_id).await?;
+    state_points_on_read(
+        global_state_root,
+        Some(local_state_root),
+        keys,
+        include_tombstone,
+        read,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+pub(crate) async fn authenticate_historical_state_roots<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+) -> Result<(ObjectId, ObjectId), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     let repository = load_repository_root(read).await?;
     let commit_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
     let entry =
@@ -1199,15 +1260,7 @@ where
         &commit,
     )
     .await?;
-    state_point_on_read(
-        commit.global_state_root,
-        commit.local_state_root,
-        key,
-        include_tombstone,
-        read,
-    )
-    .await
-    .map_err(Into::into)
+    Ok((commit.global_state_root, commit.local_state_root))
 }
 
 pub(crate) async fn scan_change_records<R>(
@@ -1655,6 +1708,192 @@ where
     Ok(())
 }
 
+type AuthenticatedCommitMemberClosure = (CommitObjectV1, Arc<[CommitMemberV1]>);
+
+async fn load_authenticated_commit_member_closure<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
+) -> Result<AuthenticatedCommitMemberClosure, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(closure) = closures.get(&commit_object_id) {
+        return Ok(closure.clone());
+    }
+    let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+    let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+    validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, &commit).await?;
+    let members: Arc<[CommitMemberV1]> = load_commit_members(read, &commit).await?.into();
+    let closure = (commit, members);
+    closures.insert(commit_object_id, closure.clone());
+    Ok(closure)
+}
+
+async fn semantic_change_for_member_with_commit_cache<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    member: &CommitMemberV1,
+    closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
+) -> Result<ChangeObjectV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let expected_change_id = member.change_id();
+    let mut current = member.clone();
+    let mut visited = BTreeSet::new();
+    let mut selected_created_at = None;
+    let resolved = loop {
+        match current {
+            CommitMemberV1::Introduced {
+                change_id,
+                payload,
+                global,
+                updated_at,
+                blob_manifest_object_ids,
+            } => {
+                if change_id != expected_change_id {
+                    return Err(corruption(
+                        "selected member source changes its authenticated ChangeId",
+                    ));
+                }
+                break ResolvedSemanticMember {
+                    change_id,
+                    payload,
+                    global,
+                    updated_at,
+                    selected_created_at,
+                    blob_manifest_object_ids,
+                };
+            }
+            CommitMemberV1::Selected {
+                change_id,
+                source_commit_object_id,
+                source_ordinal,
+                created_at,
+            } => {
+                if change_id != expected_change_id
+                    || !visited.insert((source_commit_object_id, source_ordinal))
+                {
+                    return Err(corruption(
+                        "selected member source is cyclic or changes its ChangeId",
+                    ));
+                }
+                selected_created_at.get_or_insert(created_at);
+                let (_, source_members) = load_authenticated_commit_member_closure(
+                    read,
+                    commit_catalog_root,
+                    source_commit_object_id,
+                    closures,
+                )
+                .await?;
+                current = source_members
+                    .get(source_ordinal as usize)
+                    .cloned()
+                    .ok_or_else(|| corruption("selected member source ordinal is absent"))?;
+            }
+        }
+    };
+    let payload = if let Some(created_at) = resolved.selected_created_at {
+        let public_change_id =
+            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
+        let mut record =
+            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
+                .map_err(|error| corruption(error.to_string()))?;
+        record.created_at = created_at;
+        crate::changelog::encode_forktree_change_payload(&record)
+            .map_err(|error| corruption(error.to_string()))?
+    } else {
+        resolved.payload
+    };
+    Ok(ChangeObjectV1::Semantic {
+        change_id: resolved.change_id,
+        payload,
+        json_payload_object_ids: Vec::new(),
+    })
+}
+
+async fn validate_member_catalog_owner_with_commit_cache<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+    member: &CommitMemberV1,
+    entry: ChangeCatalogEntry,
+    closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let canonical_owner = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            let (_, introduction_members) = load_authenticated_commit_member_closure(
+                read,
+                commit_catalog_root,
+                commit_object_id,
+                closures,
+            )
+            .await?;
+            let introduction_member = introduction_members
+                .get(ordinal as usize)
+                .ok_or_else(|| corruption("ChangeCatalog introduction ordinal is absent"))?;
+            if introduction_member.change_id() != member.change_id()
+                || introduction_member.source().is_some()
+            {
+                return Err(corruption(
+                    "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                ));
+            }
+            (commit_object_id, ordinal)
+        }
+        ChangeCatalogOwner::BranchRef { .. } => {
+            return Err(corruption(
+                "semantic commit member resolves to a branch-ref catalog owner",
+            ));
+        }
+    };
+    match member.source() {
+        None => {
+            let target_ordinal = u32::try_from(target_ordinal)
+                .map_err(|_| corruption("commit member ordinal exceeds u32"))?;
+            if canonical_owner != (target_commit_object_id, target_ordinal) {
+                return Err(corruption(
+                    "introduced membership is not the canonical ChangeCatalog owner",
+                ));
+            }
+        }
+        Some((source_commit_object_id, source_ordinal)) => {
+            let (source_commit, source_members) = load_authenticated_commit_member_closure(
+                read,
+                commit_catalog_root,
+                source_commit_object_id,
+                closures,
+            )
+            .await?;
+            if source_commit.generation >= target_generation {
+                return Err(corruption(
+                    "selected membership source generation is not earlier than its target",
+                ));
+            }
+            if source_members
+                .get(source_ordinal as usize)
+                .map(CommitMemberV1::change_id)
+                != Some(member.change_id())
+            {
+                return Err(corruption(
+                    "selected membership source commit/ordinal back-edge is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn select_historical_commit_member<R>(
     view: &CoherentView<R>,
     source_commit_id: CommitId,
@@ -1930,6 +2169,7 @@ where
     }
 
     let mut output = Vec::with_capacity(selected.len());
+    let mut member_closures = BTreeMap::new();
     for (row, value_ref) in selected.iter().zip(refs) {
         let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
             output.push(None);
@@ -1942,7 +2182,8 @@ where
             .members
             .get(value_ref.page_ordinal as usize)
             .ok_or_else(|| corruption("state value page ordinal is absent"))?;
-        let resolved = resolve_semantic_member(read, member).await?;
+        let resolved =
+            resolve_semantic_member_with_cache(read, member, &mut member_closures).await?;
         let expected_global = *source == StateSource::Global;
         if resolved.global != expected_global {
             return Err(corruption(
@@ -2647,26 +2888,45 @@ where
             ));
         }
     }
-    let members = load_commit_members(read, commit).await?;
-    for (ordinal, member) in members.iter().enumerate() {
-        let change = semantic_change_for_member(read, member).await?;
-        let value = lookup_on_read(
-            change_catalog_root,
-            "change",
-            change.change_id().as_bytes(),
+    validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, commit).await?;
+    let members: Arc<[CommitMemberV1]> = load_commit_members(read, commit).await?.into();
+    let mut closures = BTreeMap::from([(commit_object_id, (commit.clone(), Arc::clone(&members)))]);
+    let change_keys = members
+        .iter()
+        .map(|member| member.change_id().as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let catalog_values =
+        lookup_many_on_read(change_catalog_root, "change", &change_keys, read).await?;
+    if catalog_values.len() != members.len() {
+        return Err(corruption(
+            "batched retained ChangeCatalog lookup returned the wrong number of values",
+        ));
+    }
+    for (ordinal, (member, value)) in members.iter().zip(catalog_values).enumerate() {
+        let change = semantic_change_for_member_with_commit_cache(
             read,
+            commit_catalog_root,
+            member,
+            &mut closures,
         )
-        .await?
-        .ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
+        .await?;
+        if change.change_id() != member.change_id() {
+            return Err(corruption(
+                "resolved retained Change disagrees with its commit member",
+            ));
+        }
+        let value =
+            value.ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
-        validate_member_catalog_owner(
+        validate_member_catalog_owner_with_commit_cache(
             read,
             commit_catalog_root,
             commit_object_id,
             commit.generation,
             ordinal,
-            member.clone(),
+            member,
             entry,
+            &mut closures,
         )
         .await?;
     }

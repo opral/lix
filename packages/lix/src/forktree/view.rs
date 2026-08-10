@@ -898,6 +898,86 @@ where
     }
 }
 
+/// One authenticated historical commit on an operation-owned retained read.
+/// Construction validates the commit/catalog/member closure exactly once;
+/// later exact point batches can only traverse the two bound state roots.
+pub(crate) struct AuthenticatedHistoricalStateView<'a, R: ?Sized> {
+    read: &'a R,
+    global_state_root: ObjectId,
+    local_state_root: ObjectId,
+}
+
+impl<R> AuthenticatedHistoricalStateView<'_, R>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    pub(crate) async fn load_state_value(
+        &self,
+        key: &[u8],
+        include_tombstone: bool,
+    ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, crate::LixError>
+    {
+        let mut values = super::serving::state_points_on_read(
+            self.global_state_root,
+            Some(self.local_state_root),
+            &[key.to_vec()],
+            include_tombstone,
+            self.read,
+        )
+        .await?;
+        Ok(values.pop().flatten())
+    }
+
+    pub(crate) async fn load_state_rows(
+        &self,
+        keys: &[super::state::StateKey],
+    ) -> Result<Vec<Option<super::state::HistoricalStateRow>>, crate::LixError> {
+        let encoded_keys = keys
+            .iter()
+            .map(|key| {
+                super::state::encode_state_key(super::state::StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                })
+            })
+            .collect::<Vec<_>>();
+        let values = super::serving::state_points_on_read(
+            self.global_state_root,
+            Some(self.local_state_root),
+            &encoded_keys,
+            true,
+            self.read,
+        )
+        .await?;
+        Ok(keys
+            .iter()
+            .zip(values)
+            .map(|(key, value)| {
+                value.map(|(value, source)| {
+                    let (snapshot_content, deleted) = match value.cell {
+                        super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+                        super::state::StateCell::Null => (None, false),
+                        super::state::StateCell::Tombstone => (None, true),
+                    };
+                    super::state::HistoricalStateRow {
+                        key: key.clone(),
+                        global: source == super::serving::StateSource::Global,
+                        snapshot_content,
+                        metadata: value.metadata,
+                        deleted,
+                        blob_manifest_object_ids: value.blob_manifest_object_ids,
+                        created_at: value.created_at,
+                        updated_at: value.updated_at,
+                        change_id: value.change_id,
+                        commit_id: value.commit_id,
+                    }
+                })
+            })
+            .collect())
+    }
+}
+
 /// One operation-scoped ForkTree read facade. Branch views borrow the same
 /// retained read identity; no branch or untracked traversal can refresh it.
 #[derive(Clone)]
@@ -955,6 +1035,20 @@ where
 {
     pub(crate) fn new(read: R) -> Self {
         Self { read }
+    }
+
+    pub(crate) async fn historical_state_view(
+        &self,
+        commit_id: &str,
+    ) -> Result<AuthenticatedHistoricalStateView<'_, R>, crate::LixError> {
+        let commit_id = crate::changelog::CommitId::parse_lix(commit_id, "historical commit")?;
+        let (global_state_root, local_state_root) =
+            super::serving::authenticate_historical_state_roots(&self.read, commit_id).await?;
+        Ok(AuthenticatedHistoricalStateView {
+            read: &self.read,
+            global_state_root,
+            local_state_root,
+        })
     }
 
     /// Consumes this operation-owned facade into one retained authenticated
@@ -1144,38 +1238,10 @@ where
         commit_id: &str,
         keys: &[super::state::StateKey],
     ) -> Result<Vec<Option<super::state::HistoricalStateRow>>, crate::LixError> {
-        let commit_id = crate::changelog::CommitId::parse_lix(commit_id, "historical commit")?;
-        let mut rows = Vec::with_capacity(keys.len());
-        for key in keys {
-            let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            });
-            let value = self
-                .load_state_value_at_commit(commit_id, &encoded_key, true)
-                .await?;
-            rows.push(value.map(|(value, source)| {
-                let (snapshot_content, deleted) = match value.cell {
-                    super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
-                    super::state::StateCell::Null => (None, false),
-                    super::state::StateCell::Tombstone => (None, true),
-                };
-                super::state::HistoricalStateRow {
-                    key: key.clone(),
-                    global: source == super::serving::StateSource::Global,
-                    snapshot_content,
-                    metadata: value.metadata,
-                    deleted,
-                    blob_manifest_object_ids: value.blob_manifest_object_ids,
-                    created_at: value.created_at,
-                    updated_at: value.updated_at,
-                    change_id: value.change_id,
-                    commit_id: value.commit_id,
-                }
-            }));
-        }
-        Ok(rows)
+        self.historical_state_view(commit_id)
+            .await?
+            .load_state_rows(keys)
+            .await
     }
 
     /// Loads historical file payloads from exact state keys through this

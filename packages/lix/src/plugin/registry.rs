@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BlobId;
-use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
 use crate::state::StateRow;
 use crate::storage_adapter::StorageAdapterRead;
@@ -455,22 +454,20 @@ impl PluginRegistry {
     }
 }
 
-/// Loads one retained registry through the plugin-owned durable decoder.
-pub(crate) async fn load_plugin_registry_at_commit<R>(
-    facade: &crate::forktree::ForkTreeReadFacade<R>,
+pub(crate) async fn load_plugin_registry_on_historical_view<R>(
+    view: &crate::forktree::AuthenticatedHistoricalStateView<'_, R>,
     commit_id: &str,
 ) -> Result<PluginRegistry, LixError>
 where
-    R: StorageAdapterRead,
+    R: StorageAdapterRead + ?Sized,
 {
-    let commit_id = CommitId::parse_lix(commit_id, "historical plugin registry commit")?;
     let registry_key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
         schema_key: KEY_VALUE_SCHEMA_KEY,
         entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
         file_id: None,
     });
-    let value = facade
-        .load_state_value_at_commit(commit_id, &registry_key, true)
+    let value = view
+        .load_state_value(&registry_key, true)
         .await?
         .ok_or_else(|| {
             LixError::new(
@@ -1454,7 +1451,7 @@ mod tests {
             }),
             value: crate::forktree::StateValue {
                 change_id: ChangeId::new(uuid::Uuid::from_u128(1)),
-                commit_id: CommitId::new(uuid::Uuid::from_u128(2)),
+                commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_u128(2)),
                 created_at: timestamp,
                 updated_at: timestamp,
                 cell: crate::forktree::StateCell::Value(snapshot.into()),
