@@ -1614,10 +1614,20 @@ async fn diff_branch_state_rows_between_commits_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let (before_global_root, before_local_root) =
-        super::serving::authenticate_historical_state_roots(read, before).await?;
-    let (after_global_root, after_local_root) =
-        super::serving::authenticate_historical_state_roots(read, after).await?;
+    let (
+        before_commit_catalog_root,
+        before_change_catalog_root,
+        before_endpoint_commit_object_id,
+        before_global_root,
+        before_local_root,
+    ) = super::serving::authenticate_historical_state_roots_for_diff(read, before).await?;
+    let (
+        after_commit_catalog_root,
+        after_change_catalog_root,
+        after_endpoint_commit_object_id,
+        after_global_root,
+        after_local_root,
+    ) = super::serving::authenticate_historical_state_roots_for_diff(read, after).await?;
 
     // Authenticate every selected state root before local-root pruning. The
     // point resolver may legitimately skip a global lookup when a local row
@@ -1650,25 +1660,30 @@ where
         })
         .collect::<Vec<_>>();
 
-    let before_values = super::serving::state_points_on_read(
+    let before_values = super::serving::state_points_on_read_with_historical_auth(
         before_global_root,
         Some(before_local_root),
         &encoded_keys,
         true,
+        before_commit_catalog_root,
+        before_change_catalog_root,
+        before_endpoint_commit_object_id,
         read,
     )
     .await?;
-    let after_values = super::serving::state_points_on_read(
+    let after_values = super::serving::state_points_on_read_with_historical_auth(
         after_global_root,
         Some(after_local_root),
         &encoded_keys,
         true,
+        after_commit_catalog_root,
+        after_change_catalog_root,
+        after_endpoint_commit_object_id,
         read,
     )
     .await?;
     let before_rows = historical_state_rows_from_points(&encoded_keys, before_values)?;
     let after_rows = historical_state_rows_from_points(&encoded_keys, after_values)?;
-
     Ok(before_rows
         .into_iter()
         .zip(after_rows)
