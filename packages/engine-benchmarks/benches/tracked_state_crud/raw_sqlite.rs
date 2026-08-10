@@ -11,6 +11,7 @@ pub(crate) struct RawSqliteFixture {
     read_many_by_pk_sql: String,
     read_many_by_pk_literal_sql: String,
     literal_update_sql: Vec<String>,
+    rows_are_persisted: bool,
     _dir: TempDir,
 }
 
@@ -55,6 +56,7 @@ pub(crate) fn empty_fixture_with_read_many_pk_count(
         read_many_by_pk_sql: select_many_by_pk_sql(read_many_by_pk_count),
         read_many_by_pk_literal_sql: literal_select_many_by_pk_sql(rows, read_many_by_pk_count),
         literal_update_sql: rows.iter().map(literal_update_sql).collect(),
+        rows_are_persisted: false,
         _dir: dir,
     }
 }
@@ -93,6 +95,7 @@ impl RawSqliteFixture {
             .commit()
             .expect("commit raw sqlite insert transaction");
         assert_eq!(affected, self.rows.len());
+        self.rows_are_persisted = true;
         affected
     }
 
@@ -135,7 +138,36 @@ impl RawSqliteFixture {
         let query = statement
             .query([])
             .expect("query all raw sqlite public-result rows");
-        Self::public_result_from_query(query, self.rows.len())
+        Self::public_result_from_query(
+            query,
+            if self.rows_are_persisted {
+                self.rows.len()
+            } else {
+                0
+            },
+        )
+    }
+
+    /// Returns the bulk-insert table shape. Unlike `json_pointer.value`, the
+    /// certified insert fixture stores its value as SQL text, so the control
+    /// must retain the text instead of parsing it into a JSON value.
+    pub(crate) fn read_all_text_public_result(&self) -> ExecuteResult {
+        let mut statement = self
+            .connection
+            .prepare_cached("SELECT path, value FROM json_pointer ORDER BY path")
+            .expect("prepare raw sqlite text public-result read all");
+        let mut query = statement
+            .query([])
+            .expect("query raw sqlite text public-result rows");
+        let mut rows = Vec::with_capacity(self.rows.len());
+        while let Some(row) = query.next().expect("read raw sqlite text result row") {
+            rows.push(vec![
+                Value::Text(row.get::<_, String>(0).expect("read raw sqlite path")),
+                Value::Text(row.get::<_, String>(1).expect("read raw sqlite value")),
+            ]);
+        }
+        assert_eq!(rows.len(), self.rows.len());
+        ExecuteResult::from_rows(vec!["path".to_string(), "value".to_string()], rows)
     }
 
     pub(crate) fn read_one_by_pk(&self) -> usize {
