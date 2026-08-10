@@ -43,7 +43,8 @@ pub(crate) use serving::{
     load_change_records, load_commit, load_commit_member_records, load_commit_records,
     load_commit_summary, put_change_catalog_entries, put_commit_catalog_entries,
     scan_change_records, scan_commit_records, scan_commit_topologies,
-    select_historical_commit_member, state_point, state_point_on_read, state_points, state_range,
+    select_historical_commit_member, state_point, state_point_on_read, state_points,
+    state_points_on_read, state_range,
 };
 pub(crate) use state::{
     CanonicalPrefixBounds, HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef,
@@ -53,6 +54,7 @@ pub(crate) use state::{
     encode_untracked_branch_range_bounds, encode_untracked_key, encode_untracked_value,
     exclusive_prefix_upper_bound,
 };
+pub(crate) use tree::diff_roots;
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
 };

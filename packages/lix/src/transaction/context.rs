@@ -8043,6 +8043,10 @@ where
 {
     type ReadStore = SharedStorageAdapterRead<R>;
 
+    fn state_view(&self) -> &crate::state::ForkTreeStateView<Self::ReadStore> {
+        &self.state_view
+    }
+
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
     }
