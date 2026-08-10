@@ -19,7 +19,7 @@ use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::forktree::{ForkTreeReadFacade, encode_state_entity_prefix_bounds};
+use crate::forktree::{ForkTreeReadFacade, StateKey, encode_state_entity_prefix_bounds};
 use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
 };
@@ -424,10 +424,17 @@ impl FileHistoryPublicPredicate {
         matches!(self, Self::All)
     }
 
-    fn exact_ids(&self) -> Option<&BTreeSet<String>> {
+    fn exact_ids_for_lookup(&self) -> Option<BTreeSet<String>> {
         match self {
-            Self::Ids(ids) => Some(ids),
-            _ => None,
+            Self::Ids(ids) => Some(ids.clone()),
+            Self::And(left, right) => {
+                match (left.exact_ids_for_lookup(), right.exact_ids_for_lookup()) {
+                    (Some(left), Some(right)) => Some(left.intersection(&right).cloned().collect()),
+                    (Some(ids), None) | (None, Some(ids)) => Some(ids),
+                    (None, None) => None,
+                }
+            }
+            Self::All | Self::Paths(_) | Self::Or(_, _) => None,
         }
     }
 }
@@ -442,7 +449,10 @@ struct FileHistoryLookupIds(BTreeSet<String>);
 
 impl FileHistoryLookupIds {
     fn from_public_predicate(predicate: &FileHistoryPublicPredicate) -> Option<Self> {
-        predicate.exact_ids().cloned().map(Self)
+        predicate
+            .exact_ids_for_lookup()
+            .filter(|ids| !ids.is_empty())
+            .map(Self)
     }
 
     fn entity_pks(&self) -> Result<Vec<String>, LixError> {
@@ -1330,7 +1340,30 @@ where
     S: StorageAdapterRead,
 {
     let commit_id = CommitId::parse_lix(observed_commit_id, "file history observed commit")?;
-    let rows = if !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
+    let rows = if !filter.schema_keys.is_empty()
+        && !filter.entity_pks.is_empty()
+        && let Some(file_ids) = exact_file_id_values(&filter.file_ids)
+    {
+        let keys = filter
+            .schema_keys
+            .iter()
+            .flat_map(|schema_key| {
+                filter.entity_pks.iter().flat_map(|entity_pk| {
+                    file_ids.iter().map(|file_id| StateKey {
+                        schema_key: schema_key.clone(),
+                        file_id: file_id.clone(),
+                        entity_pk: entity_pk.clone(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        historical
+            .load_state_rows_at_commit(observed_commit_id, &keys)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect()
+    } else if !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
         let mut rows = Vec::new();
         for schema_key in &filter.schema_keys {
             for entity_pk in &filter.entity_pks {
@@ -1367,6 +1400,21 @@ where
         })
         .collect();
     ObservedStateRows::from_rows(observed_commit_id.clone(), rows)
+}
+
+fn exact_file_id_values(file_ids: &[NullableKeyFilter<String>]) -> Option<Vec<Option<String>>> {
+    if file_ids.is_empty() {
+        return None;
+    }
+    let mut values = Vec::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        match file_id {
+            NullableKeyFilter::Any => return None,
+            NullableKeyFilter::Null => values.push(None),
+            NullableKeyFilter::Value(file_id) => values.push(Some(file_id.clone())),
+        }
+    }
+    Some(values)
 }
 
 async fn load_plugin_registry_at_observed_commit<S>(
@@ -3627,12 +3675,13 @@ mod tests {
             Operator::And,
             Box::new(eq_filter("path", "/a.md")),
         ));
-        assert!(
-            FileHistoryLookupIds::from_public_predicate(&FileHistoryPublicPredicate::from_filters(
-                &[mixed_conjunction]
-            ))
-            .is_none(),
-            "mixed public predicates retain the existing complete traversal"
+        let mixed_ids = FileHistoryLookupIds::from_public_predicate(
+            &FileHistoryPublicPredicate::from_filters(&[mixed_conjunction]),
+        )
+        .expect("an exact ID conjunct remains safe with a residual path predicate");
+        assert_eq!(
+            mixed_ids.0,
+            BTreeSet::from(["01920000-0000-7000-8000-0000000000a2".to_owned()])
         );
     }
 
