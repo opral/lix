@@ -6,7 +6,6 @@ mod change_materialization;
 mod context;
 mod dml;
 mod entity_batch;
-mod entity_projection;
 mod error;
 mod exec;
 mod file_view;
