@@ -12,7 +12,7 @@ use crate::catalog::snapshot::{
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::schema::schema_key_from_definition;
-use crate::state::{ForkTreeStateView, StateRow, UntrackedStateRow};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView, UntrackedStateRow};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
@@ -45,7 +45,7 @@ impl CatalogContext {
 
     pub(crate) async fn compiled_catalog_for_transaction_open<R>(
         &self,
-        state: &ForkTreeStateView<R>,
+        state: &TransactionStateView<R>,
         domain: &Domain,
         revision: Option<&CatalogRevision>,
     ) -> Result<Arc<CatalogSnapshot>, LixError>
@@ -53,7 +53,9 @@ impl CatalogContext {
         R: crate::storage_adapter::StorageAdapterRead,
     {
         let Some(revision) = revision else {
-            return self.compiled_catalog_for_domain(state, domain).await;
+            return self
+                .compiled_catalog_for_transaction_state(state, domain)
+                .await;
         };
         let key = TransactionOpeningCatalogKey {
             domain: domain.clone(),
@@ -68,7 +70,9 @@ impl CatalogContext {
             return Ok(Arc::clone(snapshot));
         }
 
-        let snapshot = self.compiled_catalog_for_domain(state, domain).await?;
+        let snapshot = self
+            .compiled_catalog_for_transaction_state(state, domain)
+            .await?;
         let mut cache = self
             .transaction_opening_catalogs
             .lock()
@@ -80,6 +84,18 @@ impl CatalogContext {
         }
         cache.insert(key, Arc::clone(&snapshot));
         Ok(snapshot)
+    }
+
+    pub(crate) async fn compiled_catalog_for_transaction_state<R>(
+        &self,
+        state: &TransactionStateView<R>,
+        domain: &Domain,
+    ) -> Result<Arc<CatalogSnapshot>, LixError>
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+    {
+        let catalog_rows = scan_transaction_catalog_rows(state, domain).await?;
+        self.compiled_catalog_for_rows(&catalog_rows)
     }
 
     pub(crate) async fn compiled_catalog_for_domain<R>(
@@ -252,6 +268,41 @@ where
         let rows = if schema_domain.untracked() {
             state
                 .untracked_overlay_rows()
+                .await?
+                .into_iter()
+                .map(catalog_row_from_untracked)
+                .collect()
+        } else {
+            state
+                .range(None, None, None, false)
+                .await?
+                .into_iter()
+                .map(catalog_row_from_state)
+                .collect()
+        };
+        catalog_rows.push(CatalogDomainRows {
+            domain: schema_domain,
+            rows,
+        });
+    }
+    Ok(CatalogRows {
+        domains: catalog_rows,
+    })
+}
+
+async fn scan_transaction_catalog_rows<R>(
+    state: &TransactionStateView<R>,
+    domain: &Domain,
+) -> Result<CatalogRows, LixError>
+where
+    R: crate::storage_adapter::StorageAdapterRead,
+{
+    let schema_domains = domain.schema_catalog_domains();
+    let mut catalog_rows = Vec::with_capacity(schema_domains.len());
+    for schema_domain in schema_domains {
+        let rows = if schema_domain.untracked() {
+            state
+                .untracked_branch_range(None, None, None)
                 .await?
                 .into_iter()
                 .map(catalog_row_from_untracked)
