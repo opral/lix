@@ -331,6 +331,12 @@ where
         include_tombstones: bool,
     ) -> Result<Vec<Option<StateRow>>, LixError> {
         let branch_id = canonical_branch_id(branch_id)?;
+        if self.view.branch_id() == branch_id {
+            return self
+                .points(keys, include_tombstones)
+                .await
+                .map_err(LixError::from);
+        }
         self.view
             .branch_view(branch_id)
             .await?
@@ -356,6 +362,12 @@ where
         include_tombstones: bool,
     ) -> Result<Vec<StateRow>, LixError> {
         let branch_id = canonical_branch_id(branch_id)?;
+        if self.view.branch_id() == branch_id {
+            return self
+                .range(lower, upper, limit, include_tombstones)
+                .await
+                .map_err(LixError::from);
+        }
         self.view
             .branch_view(branch_id)
             .await?
@@ -391,6 +403,9 @@ where
         state_keys: &[Vec<u8>],
     ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
         let branch_id = canonical_branch_id(branch_id)?;
+        if self.view.branch_id() == branch_id {
+            return self.untracked_points(state_keys).await;
+        }
         Ok(self
             .view
             .branch_view(branch_id)
@@ -509,6 +524,11 @@ where
             return Ok(Vec::new());
         }
         let branch_id = canonical_branch_id(branch_id)?;
+        if self.view.branch_id() == branch_id {
+            return self
+                .untracked_overlay_range(lower, upper, limit, include_tombstones)
+                .await;
+        }
         let branch_view = self.view.branch_view(branch_id).await?;
         Ok(branch_view
             .scan_untracked_overlay_branch_range(lower, upper, limit, include_tombstones)
