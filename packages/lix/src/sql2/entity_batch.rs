@@ -5,6 +5,8 @@
 //! before Arrow/DataFusion takes ownership.
 
 use bytes::Bytes;
+use std::collections::BTreeMap;
+use std::future::Future;
 
 use crate::LixError;
 use crate::entity_pk::{EntityPk, EntityPkComponents};
@@ -95,61 +97,232 @@ pub(crate) struct EntityExactRowRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EntityStateSlot {
     Tracked(StateRow),
+    /// A tracked row loaded from an explicit branch selector. The branch
+    /// identity is retained for by-branch projection when one operation
+    /// groups multiple branch ranges.
+    TrackedAt {
+        row: StateRow,
+        branch_id: String,
+    },
     Untracked(UntrackedStateRow),
 }
 
-pub(crate) async fn scan_forktree<S>(
+/// Native range scan with branch routing, tracked/untracked overlay, and
+/// final visibility/limit ordering. Every branch is borrowed from the same
+/// operation-owned ForkTree view; global rows are emitted once when several
+/// branch selectors share them.
+pub(crate) async fn scan_slots_forktree<S>(
     view: &ForkTreeStateView<S>,
     request: &EntityScanRequest,
-) -> Result<Vec<StateRow>, LixError>
+) -> Result<Vec<EntityStateSlot>, LixError>
 where
     S: StorageAdapterRead,
 {
-    if matches!(request.filter.rows, EntityRowSelection::None) {
-        return Ok(Vec::new());
-    }
-    let (lower, upper) = schema_bounds(request)?;
-    if request.filter.untracked != Some(false) {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "native entity range requires the owner-scoped untracked range seam",
-        ));
-    }
-    view.range(
-        lower.as_deref(),
-        upper.as_deref(),
-        request.limit,
-        request.filter.include_tombstones,
+    scan_slots_by_branches(
+        request,
+        view.branch_id(),
+        |branch_id, lower, upper| async move {
+            let tracked = if request.filter.untracked == Some(true) {
+                Vec::new()
+            } else {
+                view.branch_range(&branch_id, lower.as_deref(), upper.as_deref(), None, true)
+                    .await?
+                    .into_iter()
+                    .map(|row| EntityStateSlot::TrackedAt {
+                        row,
+                        branch_id: branch_id.to_string(),
+                    })
+                    .collect()
+            };
+            let untracked = if request.filter.untracked == Some(false) {
+                Vec::new()
+            } else {
+                view.branch_untracked_overlay_range(
+                    &branch_id,
+                    lower.as_deref(),
+                    upper.as_deref(),
+                    None,
+                    true,
+                )
+                .await?
+                .into_iter()
+                .map(EntityStateSlot::Untracked)
+                .collect()
+            };
+            Ok(merge_range_slots(tracked, untracked, true, None))
+        },
     )
     .await
-    .map_err(|e| LixError::new(LixError::CODE_STORAGE_ERROR, e.to_string()))
 }
 
-pub(crate) async fn scan_transaction<S>(
+pub(crate) async fn scan_slots_transaction<S>(
     view: &TransactionStateView<S>,
     request: &EntityScanRequest,
-) -> Result<Vec<StateRow>, LixError>
+) -> Result<Vec<EntityStateSlot>, LixError>
 where
     S: StorageAdapterRead,
+{
+    scan_slots_by_branches(
+        request,
+        view.branch_id(),
+        |branch_id, lower, upper| async move {
+            let tracked = if request.filter.untracked == Some(true) {
+                Vec::new()
+            } else {
+                view.branch_range(&branch_id, lower.as_deref(), upper.as_deref(), None, true)
+                    .await?
+                    .into_iter()
+                    .map(|row| EntityStateSlot::TrackedAt {
+                        row,
+                        branch_id: branch_id.to_string(),
+                    })
+                    .collect()
+            };
+            let untracked = if request.filter.untracked == Some(false) {
+                Vec::new()
+            } else {
+                view.branch_untracked_overlay_range(
+                    &branch_id,
+                    lower.as_deref(),
+                    upper.as_deref(),
+                    None,
+                    true,
+                )
+                .await?
+                .into_iter()
+                .map(EntityStateSlot::Untracked)
+                .collect()
+            };
+            Ok(merge_range_slots(tracked, untracked, true, None))
+        },
+    )
+    .await
+}
+
+async fn scan_slots_by_branches<F, Fut>(
+    request: &EntityScanRequest,
+    active_branch_id: String,
+    mut scan_branch: F,
+) -> Result<Vec<EntityStateSlot>, LixError>
+where
+    F: FnMut(String, Option<Vec<u8>>, Option<Vec<u8>>) -> Fut,
+    Fut: Future<Output = Result<Vec<EntityStateSlot>, LixError>>,
 {
     if matches!(request.filter.rows, EntityRowSelection::None) {
         return Ok(Vec::new());
     }
-    let (lower, upper) = schema_bounds(request)?;
-    if request.filter.untracked != Some(false) {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "native transaction range requires the owner-scoped untracked range seam",
-        ));
+    let mut bounds_request = request.clone();
+    bounds_request.filter.entity_pks.clear();
+    let schema_bounds = schema_bounds(&bounds_request)?;
+    let bounds = if request.filter.entity_pks.is_empty() {
+        vec![schema_bounds]
+    } else {
+        let schema = bounds_request
+            .filter
+            .schema_keys
+            .first()
+            .expect("schema bounds validated");
+        request
+            .filter
+            .entity_pks
+            .iter()
+            .map(|entity_pk| {
+                let bounds = crate::forktree::encode_state_entity_prefix_bounds(schema, entity_pk);
+                (Some(bounds.lower), bounds.upper)
+            })
+            .collect()
+    };
+    let branch_ids = if request.filter.branch_ids.is_empty() {
+        vec![active_branch_id]
+    } else {
+        request.filter.branch_ids.clone()
+    };
+    let mut rows = Vec::new();
+    for branch_id in &branch_ids {
+        let mut branch_rows = Vec::new();
+        for (lower, upper) in &bounds {
+            branch_rows.extend(scan_branch(branch_id.clone(), lower.clone(), upper.clone()).await?);
+        }
+        rows.extend(merge_range_slots(branch_rows, Vec::new(), true, None));
     }
-    view.range(
-        lower.as_deref(),
-        upper.as_deref(),
-        request.limit,
-        request.filter.include_tombstones,
-    )
-    .await
-    .map_err(|e| LixError::new(LixError::CODE_STORAGE_ERROR, e.to_string()))
+    let global_id =
+        uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID).expect("GLOBAL_BRANCH_ID must be a UUID");
+    let mut global_keys = std::collections::BTreeSet::new();
+    rows.sort_by(|left, right| {
+        slot_sort_key(left)
+            .cmp(&slot_sort_key(right))
+            .then(slot_branch_sort_key(left).cmp(&slot_branch_sort_key(right)))
+    });
+    let mut visible = Vec::with_capacity(rows.len());
+    for slot in rows {
+        let key = slot_sort_key(&slot);
+        let is_global = match &slot {
+            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                row.source == crate::state::StateRowSource::Global
+            }
+            EntityStateSlot::Untracked(row) => row.owner.as_bytes() == global_id.as_bytes(),
+        };
+        if is_global && !global_keys.insert(key) {
+            continue;
+        }
+        if request.filter.include_tombstones
+            || !matches!(&slot, EntityStateSlot::Tracked(row) if row.value.cell.deleted())
+                && !matches!(&slot, EntityStateSlot::TrackedAt { row, .. } if row.value.cell.deleted())
+                && !matches!(&slot, EntityStateSlot::Untracked(row) if row.value.cell.deleted())
+        {
+            visible.push(slot);
+        }
+    }
+    visible.truncate(request.limit.unwrap_or(usize::MAX));
+    Ok(visible)
+}
+
+fn slot_sort_key(slot: &EntityStateSlot) -> Vec<u8> {
+    match slot {
+        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => row.key.clone(),
+        EntityStateSlot::Untracked(row) => encode_state_key(StateKeyRef {
+            schema_key: &row.key.schema_key,
+            file_id: row.key.file_id.as_deref(),
+            entity_pk: &row.key.entity_pk,
+        }),
+    }
+}
+
+fn slot_branch_sort_key(slot: &EntityStateSlot) -> String {
+    match slot {
+        EntityStateSlot::Tracked(row) => match row.source {
+            crate::state::StateRowSource::Global => crate::GLOBAL_BRANCH_ID.to_string(),
+            crate::state::StateRowSource::Branch | crate::state::StateRowSource::Staged => {
+                String::new()
+            }
+        },
+        EntityStateSlot::TrackedAt { branch_id, .. } => branch_id.clone(),
+        EntityStateSlot::Untracked(row) => {
+            uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string()
+        }
+    }
+}
+
+fn merge_range_slots(
+    tracked: Vec<EntityStateSlot>,
+    untracked: Vec<EntityStateSlot>,
+    include_tombstones: bool,
+    limit: Option<usize>,
+) -> Vec<EntityStateSlot> {
+    let mut by_key = BTreeMap::<Vec<u8>, EntityStateSlot>::new();
+    for slot in tracked.into_iter().chain(untracked) {
+        by_key.insert(slot_sort_key(&slot), slot);
+    }
+    by_key
+        .into_values()
+        .filter(|slot| {
+            include_tombstones
+                || !matches!(slot, EntityStateSlot::Tracked(row) if row.value.cell.deleted())
+                    && !matches!(slot, EntityStateSlot::TrackedAt { row, .. } if row.value.cell.deleted())
+                    && !matches!(slot, EntityStateSlot::Untracked(row) if row.value.cell.deleted())
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect()
 }
 
 pub(crate) async fn exact_forktree<S>(
@@ -180,18 +353,32 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let tracked = if request.untracked == Some(true) {
-        vec![None; keys.len()]
-    } else {
-        view.points(&keys, true)
-            .await
-            .map_err(|e| LixError::new(LixError::CODE_STORAGE_ERROR, e.to_string()))?
-    };
-    let untracked = if request.untracked == Some(false) {
-        vec![None; keys.len()]
-    } else {
-        view.untracked_points(&keys).await?
-    };
+    let mut tracked = vec![None; keys.len()];
+    let mut untracked = vec![None; keys.len()];
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, row) in request.rows.iter().enumerate() {
+        groups.entry(row.branch_id.clone()).or_default().push(index);
+    }
+    for (branch_id, indices) in groups {
+        let branch_keys = indices
+            .iter()
+            .map(|index| keys[*index].clone())
+            .collect::<Vec<_>>();
+        if request.untracked != Some(true) {
+            let branch_rows = view.branch_points(&branch_id, &branch_keys, true).await?;
+            for (index, row) in indices.iter().copied().zip(branch_rows) {
+                tracked[index] = row;
+            }
+        }
+        if request.untracked != Some(false) {
+            let branch_rows = view
+                .branch_untracked_points(&branch_id, &branch_keys)
+                .await?;
+            for (index, row) in indices.into_iter().zip(branch_rows) {
+                untracked[index] = row;
+            }
+        }
+    }
     merge_exact_slots(request, keys, tracked, untracked)
 }
 
@@ -213,19 +400,32 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let tracked = if request.untracked == Some(true) {
-        vec![None; keys.len()]
-    } else {
-        view.points(&keys, true)
-            .await
-            .map_err(|e| LixError::new(LixError::CODE_STORAGE_ERROR, e.to_string()))?
-    };
-    let untracked = if request.untracked == Some(false) {
-        vec![None; keys.len()]
-    } else {
-        view.untracked_points(&keys, request.include_tombstones)
-            .await?
-    };
+    let mut tracked = vec![None; keys.len()];
+    let mut untracked = vec![None; keys.len()];
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, row) in request.rows.iter().enumerate() {
+        groups.entry(row.branch_id.clone()).or_default().push(index);
+    }
+    for (branch_id, indices) in groups {
+        let branch_keys = indices
+            .iter()
+            .map(|index| keys[*index].clone())
+            .collect::<Vec<_>>();
+        if request.untracked != Some(true) {
+            let branch_rows = view.branch_points(&branch_id, &branch_keys, true).await?;
+            for (index, row) in indices.iter().copied().zip(branch_rows) {
+                tracked[index] = row;
+            }
+        }
+        if request.untracked != Some(false) {
+            let branch_rows = view
+                .branch_untracked_points(&branch_id, &branch_keys)
+                .await?;
+            for (index, row) in indices.into_iter().zip(branch_rows) {
+                untracked[index] = row;
+            }
+        }
+    }
     merge_exact_slots(request, keys, tracked, untracked)
 }
 
@@ -274,7 +474,10 @@ fn merge_exact_slots(
             if !request.include_tombstones && row.value.cell.deleted() {
                 None
             } else {
-                Some(EntityStateSlot::Tracked(row))
+                Some(EntityStateSlot::TrackedAt {
+                    row,
+                    branch_id: requested.branch_id.clone(),
+                })
             }
         } else {
             None
@@ -299,17 +502,6 @@ pub(crate) fn schema_bounds(
             "one native entity scan cannot mix schema keys",
         ));
     }
-    if request
-        .filter
-        .branch_ids
-        .windows(2)
-        .any(|ids| ids[0] != ids[1])
-    {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "one native entity scan cannot mix branch selectors",
-        ));
-    }
     // The native key codec exposes the schema prefix by encoding the empty
     // PK without the trailing file-id component.  This remains a bounded
     // ordered-tree range; it is never replaced by a full scan.
@@ -329,17 +521,19 @@ pub(crate) fn schema_bounds(
 
 pub(crate) fn tracked_slot(row: &EntityStateSlot) -> Option<&StateRow> {
     match row {
-        EntityStateSlot::Tracked(row) => Some(row),
+        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => Some(row),
         EntityStateSlot::Untracked(_) => None,
     }
 }
 
 pub(crate) fn slot_snapshot(row: &EntityStateSlot) -> Option<&str> {
     match row {
-        EntityStateSlot::Tracked(row) => match &row.value.cell {
-            StateCell::Value(value) => Some(value.as_ref()),
-            StateCell::Null | StateCell::Tombstone => None,
-        },
+        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+            match &row.value.cell {
+                StateCell::Value(value) => Some(value.as_ref()),
+                StateCell::Null | StateCell::Tombstone => None,
+            }
+        }
         EntityStateSlot::Untracked(row) => match &row.value.cell {
             StateCell::Value(value) => Some(value.as_ref()),
             StateCell::Null | StateCell::Tombstone => None,
@@ -471,7 +665,7 @@ mod tests {
             .expect("tombstone projection");
         assert!(matches!(
             visible_slots[0],
-            Some(EntityStateSlot::Tracked(_))
+            Some(EntityStateSlot::Tracked(_) | EntityStateSlot::TrackedAt { .. })
         ));
     }
 
