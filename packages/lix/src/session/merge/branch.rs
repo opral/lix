@@ -1808,7 +1808,7 @@ fn merge_conflict_error(conflicts: &[MergeConflict]) -> Result<LixError, LixErro
     let conflict_count = conflicts.len();
     Ok(LixError::new(
         LixError::CODE_MERGE_CONFLICT,
-        format!("merge_branch found {conflict_count} state conflict(s)"),
+        format!("merge_branch found {conflict_count} tracked-state conflict(s)"),
     )
     .with_hint("Resolve the conflicting entities in the target branch, then retry the merge.")
     .with_details(json!({
