@@ -297,7 +297,7 @@ where
 
     async fn points_for_branch(
         &self,
-        _branch_id: &str,
+        branch_id: &str,
         keys: &[Vec<u8>],
         include_tombstones: bool,
     ) -> Result<Vec<Option<StateRow>>, LixError> {
@@ -309,26 +309,124 @@ where
             if let Some(scan_count) = scan_count {
                 scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            let view = views
-                .get(_branch_id)
-                .or_else(|| views.values().next())
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("native test state has no branch '{_branch_id}'"),
-                    )
-                })?;
+            let view = views.get(branch_id).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("native test state has no branch '{branch_id}'"),
+                )
+            })?;
             return view
                 .points(keys, include_tombstones)
                 .await
                 .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()));
         }
-        self.points(keys, include_tombstones).await
+        match self {
+            Self::Committed(view) => {
+                view.branch_points(branch_id, keys, include_tombstones)
+                    .await
+            }
+            Self::Transaction(view) => {
+                view.branch_points(branch_id, keys, include_tombstones)
+                    .await
+            }
+            #[cfg(test)]
+            Self::TestNative { .. } => unreachable!("test native points use a branch binding"),
+        }
+    }
+
+    async fn untracked_points_for_branch(
+        &self,
+        branch_id: &str,
+        keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<crate::state::UntrackedStateRow>>, LixError> {
+        match self {
+            Self::Committed(view) => {
+                view.untracked_points_for_branch(branch_id, keys)
+                    .await
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|row| {
+                                row.filter(|row| include_tombstones || !row.value.cell.deleted())
+                            })
+                            .collect()
+                    })
+            }
+            Self::Transaction(view) => view.untracked_points(keys, include_tombstones).await,
+            #[cfg(test)]
+            Self::TestNative {
+                views, scan_count, ..
+            } => {
+                if let Some(scan_count) = scan_count {
+                    scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let view = views.get(branch_id).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("native test state has no branch '{branch_id}'"),
+                    )
+                })?;
+                view.untracked_points(keys, include_tombstones).await
+            }
+        }
+    }
+
+    async fn untracked_range_for_branch(
+        &self,
+        branch_id: &str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<crate::state::UntrackedStateRow>, LixError> {
+        match self {
+            Self::Committed(view) => {
+                view.untracked_overlay_branch_range_for_branch(
+                    branch_id,
+                    lower,
+                    upper,
+                    limit,
+                    include_tombstones,
+                )
+                .await
+            }
+            Self::Transaction(view) => {
+                view.untracked_overlay_branch_range_for_branch(
+                    branch_id,
+                    lower,
+                    upper,
+                    limit,
+                    include_tombstones,
+                )
+                .await
+            }
+            #[cfg(test)]
+            Self::TestNative {
+                views, scan_count, ..
+            } => {
+                if let Some(scan_count) = scan_count {
+                    scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let view = views.get(branch_id).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("native test state has no branch '{branch_id}'"),
+                    )
+                })?;
+                view.untracked_branch_range(lower, upper, limit)
+                    .await
+                    .map(|rows| {
+                        rows.into_iter()
+                            .filter(|row| include_tombstones || !row.value.cell.deleted())
+                            .collect()
+                    })
+            }
+        }
     }
 
     async fn range_for_branch(
         &self,
-        _branch_id: &str,
+        branch_id: &str,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
         limit: Option<usize>,
@@ -342,21 +440,29 @@ where
             if let Some(scan_count) = scan_count {
                 scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            let view = views
-                .get(_branch_id)
-                .or_else(|| views.values().next())
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("native test state has no branch '{_branch_id}'"),
-                    )
-                })?;
+            let view = views.get(branch_id).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("native test state has no branch '{branch_id}'"),
+                )
+            })?;
             return view
                 .range(lower, upper, limit, include_tombstones)
                 .await
                 .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()));
         }
-        self.range(lower, upper, limit, include_tombstones).await
+        match self {
+            Self::Committed(view) => {
+                view.branch_range(branch_id, lower, upper, limit, include_tombstones)
+                    .await
+            }
+            Self::Transaction(view) => {
+                view.branch_range(branch_id, lower, upper, limit, include_tombstones)
+                    .await
+            }
+            #[cfg(test)]
+            Self::TestNative { .. } => unreachable!("test native ranges use a branch binding"),
+        }
     }
 
     async fn scan_rows(
@@ -374,109 +480,178 @@ where
                 .expect("native test scan request mutex should not be poisoned")
                 .push(request.clone());
         }
-        let branch_id = request
-            .filter
-            .branch_ids
-            .first()
-            .cloned()
-            .or_else(|| self.branch_id())
-            .ok_or_else(|| {
+        let branch_ids = if request.filter.branch_ids.is_empty() {
+            vec![self.branch_id().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     "file state view requires one resolved branch id",
                 )
-            })?;
-        let rows = if request.filter.entity_pks.is_empty() {
+            })?]
+        } else {
+            request.filter.branch_ids.clone()
+        };
+        let schemas = if request.filter.schema_keys.is_empty() {
             if request.full_surface {
-                self.range_for_branch(
-                    &branch_id,
-                    None,
-                    None,
-                    request.limit,
-                    request.filter.include_tombstones,
-                )
-                .await?
+                filesystem_schema_keys()
             } else {
-                let schemas = if request.filter.schema_keys.is_empty() {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "native file scan requires a schema or explicit full surface",
-                    ));
-                } else {
-                    &request.filter.schema_keys
-                };
-                let mut rows = Vec::new();
-                for schema_key in schemas {
-                    let bounds = schema_range_bounds(schema_key);
-                    rows.extend(
-                        self.range_for_branch(
-                            &branch_id,
-                            Some(&bounds.0),
-                            bounds.1.as_deref(),
-                            None,
-                            request.filter.include_tombstones,
-                        )
-                        .await?,
-                    );
-                }
-                rows
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "native file scan requires a schema or explicit full surface",
+                ));
             }
         } else {
-            let mut keys = Vec::new();
-            for schema_key in &request.filter.schema_keys {
-                for entity_pk in &request.filter.entity_pks {
-                    let file_ids = if request.filter.file_ids.is_empty() {
-                        vec![crate::NullableKeyFilter::Any]
+            request.filter.schema_keys.clone()
+        };
+        let mut rows = Vec::new();
+        for branch_id in branch_ids {
+            let modes = match request.filter.untracked {
+                Some(untracked) => vec![untracked],
+                None => vec![false, true],
+            };
+            for untracked in modes {
+                // When both lanes are requested, retain untracked tombstones
+                // long enough to mask a tracked value before final visibility
+                // filtering. Explicit single-lane requests keep their
+                // caller-selected tombstone behavior.
+                let include_tombstones =
+                    request.filter.include_tombstones || request.filter.untracked.is_none();
+                if request.filter.entity_pks.is_empty() {
+                    for schema_key in &schemas {
+                        let bounds = schema_range_bounds(schema_key);
+                        if untracked {
+                            let mut projected = FilesystemStateRows::from_untracked_view_rows(
+                                self.untracked_range_for_branch(
+                                    &branch_id,
+                                    Some(&bounds.0),
+                                    bounds.1.as_deref(),
+                                    None,
+                                    include_tombstones,
+                                )
+                                .await?,
+                            )?
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                            for row in &mut projected {
+                                if row.global {
+                                    row.branch_id = branch_id.clone();
+                                }
+                            }
+                            rows.extend(projected);
+                        } else {
+                            rows.extend(
+                                FilesystemStateRows::from_view_rows(
+                                    self.range_for_branch(
+                                        &branch_id,
+                                        Some(&bounds.0),
+                                        bounds.1.as_deref(),
+                                        None,
+                                        include_tombstones,
+                                    )
+                                    .await?,
+                                    &branch_id,
+                                    false,
+                                )?
+                                .into_iter(),
+                            );
+                        }
+                    }
+                } else {
+                    let mut keys = Vec::new();
+                    for schema_key in &schemas {
+                        for entity_pk in &request.filter.entity_pks {
+                            let file_ids = if request.filter.file_ids.is_empty() {
+                                vec![crate::NullableKeyFilter::Any]
+                            } else {
+                                request.filter.file_ids.clone()
+                            };
+                            for file_id in file_ids {
+                                let file_id = match file_id {
+                                    crate::NullableKeyFilter::Any
+                                    | crate::NullableKeyFilter::Null => None,
+                                    crate::NullableKeyFilter::Value(file_id) => Some(file_id),
+                                };
+                                keys.push(crate::forktree::encode_state_key(
+                                    crate::forktree::StateKeyRef {
+                                        schema_key,
+                                        file_id: file_id.as_deref(),
+                                        entity_pk,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    if untracked {
+                        let mut projected = FilesystemStateRows::from_untracked_view_rows(
+                            self.untracked_points_for_branch(&branch_id, &keys, include_tombstones)
+                                .await?
+                                .into_iter()
+                                .flatten()
+                                .collect(),
+                        )?
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                        for row in &mut projected {
+                            if row.global {
+                                row.branch_id = branch_id.clone();
+                            }
+                        }
+                        rows.extend(projected);
                     } else {
-                        request.filter.file_ids.clone()
-                    };
-                    for file_id in file_ids {
-                        let file_id = match file_id {
-                            crate::NullableKeyFilter::Any => None,
-                            crate::NullableKeyFilter::Null => None,
-                            crate::NullableKeyFilter::Value(file_id) => Some(file_id),
-                        };
-                        keys.push(crate::forktree::encode_state_key(
-                            crate::forktree::StateKeyRef {
-                                schema_key,
-                                file_id: file_id.as_deref(),
-                                entity_pk,
-                            },
-                        ));
+                        rows.extend(
+                            FilesystemStateRows::from_view_rows(
+                                self.points_for_branch(&branch_id, &keys, include_tombstones)
+                                    .await?
+                                    .into_iter()
+                                    .flatten()
+                                    .collect(),
+                                &branch_id,
+                                false,
+                            )?
+                            .into_iter(),
+                        );
                     }
                 }
             }
-            self.points_for_branch(&branch_id, &keys, request.filter.include_tombstones)
-                .await?
-                .into_iter()
-                .flatten()
-                .collect()
-        };
-        let mut rows = FilesystemStateRows::from_view_rows(rows, &branch_id, false)?
-            .into_iter()
-            .filter(|row| {
-                (request.filter.schema_keys.is_empty()
+        }
+        rows.retain(|row| {
+            (request.filter.schema_keys.is_empty()
+                || request
+                    .filter
+                    .schema_keys
+                    .iter()
+                    .any(|schema| schema == &row.schema_key))
+                && (request.filter.entity_pks.is_empty()
                     || request
                         .filter
-                        .schema_keys
+                        .entity_pks
                         .iter()
-                        .any(|schema| schema == &row.schema_key))
-                    && (request.filter.entity_pks.is_empty()
-                        || request
-                            .filter
-                            .entity_pks
-                            .iter()
-                            .any(|pk| pk == &row.entity_pk))
-                    && (request.filter.file_ids.is_empty()
-                        || request.filter.file_ids.iter().any(|file_id| match file_id {
-                            crate::NullableKeyFilter::Any => true,
-                            crate::NullableKeyFilter::Null => row.file_id.is_none(),
-                            crate::NullableKeyFilter::Value(file_id) => {
-                                row.file_id.as_deref() == Some(file_id.as_str())
-                            }
-                        }))
-            })
-            .collect::<Vec<_>>();
+                        .any(|pk| pk == &row.entity_pk))
+                && (request.filter.file_ids.is_empty()
+                    || request.filter.file_ids.iter().any(|file_id| match file_id {
+                        crate::NullableKeyFilter::Any => true,
+                        crate::NullableKeyFilter::Null => row.file_id.is_none(),
+                        crate::NullableKeyFilter::Value(file_id) => {
+                            row.file_id.as_deref() == Some(file_id.as_str())
+                        }
+                    }))
+        });
+        let mut deduplicated = BTreeMap::new();
+        for row in rows {
+            let key = (
+                crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                }),
+                row.schema_key.clone(),
+                row.branch_id.clone(),
+            );
+            deduplicated.insert(key, row);
+        }
+        let mut rows = deduplicated.into_values().collect::<Vec<_>>();
+        if !request.filter.include_tombstones {
+            rows.retain(|row| !row.deleted);
+        }
         if let Some(limit) = request.limit {
             rows.truncate(limit);
         }
@@ -495,47 +670,50 @@ where
     async fn load_exact_batch(
         &self,
         request: &FileExactBatchPlan,
-    ) -> Result<FilesystemStateRows, LixError> {
-        let mut keys = Vec::with_capacity(request.rows.len());
-        for row in &request.rows {
-            let view_branch = self.branch_id();
-            if view_branch
-                .as_deref()
-                .is_some_and(|branch| branch != row.branch_id)
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!(
-                        "exact file state request branch '{}' does not match retained branch {:?}",
-                        row.branch_id, view_branch
-                    ),
+    ) -> Result<Vec<Option<FilesystemStateRow>>, LixError> {
+        let mut groups = BTreeMap::<(String, bool), Vec<(usize, Vec<u8>)>>::new();
+        for (index, row) in request.rows.iter().enumerate() {
+            groups
+                .entry((row.branch_id.clone(), request.untracked == Some(true)))
+                .or_default()
+                .push((
+                    index,
+                    crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        entity_pk: &row.entity_pk,
+                    }),
                 ));
-            }
-            keys.push(crate::forktree::encode_state_key(
-                crate::forktree::StateKeyRef {
-                    schema_key: &row.schema_key,
-                    file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
-                },
-            ));
         }
-        let branch_id = request
-            .rows
-            .first()
-            .map(|row| row.branch_id.as_str())
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "exact file state view requires a resolved branch id",
-                )
-            })?;
-        let rows = self
-            .points_for_branch(branch_id, &keys, request.include_tombstones)
-            .await?;
-        let present = rows.into_iter().flatten().collect::<Vec<_>>();
-        Ok(FilesystemStateRows::from_view_rows(
-            present, &branch_id, false,
-        )?)
+        let mut output = (0..request.rows.len()).map(|_| None).collect::<Vec<_>>();
+        for ((branch_id, untracked), slots) in groups {
+            let keys = slots.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+            if untracked {
+                let rows = self
+                    .untracked_points_for_branch(&branch_id, &keys, request.include_tombstones)
+                    .await?;
+                for ((slot, _), row) in slots.into_iter().zip(rows) {
+                    output[slot] = row
+                        .map(FilesystemStateRow::from_untracked_state_row)
+                        .transpose()?;
+                    if let Some(row) = output[slot].as_mut() {
+                        if row.global {
+                            row.branch_id = branch_id.clone();
+                        }
+                    }
+                }
+            } else {
+                let rows = self
+                    .points_for_branch(&branch_id, &keys, request.include_tombstones)
+                    .await?;
+                for ((slot, _), row) in slots.into_iter().zip(rows) {
+                    output[slot] = row
+                        .map(|row| FilesystemStateRow::from_state_row(row, &branch_id, false))
+                        .transpose()?;
+                }
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -601,19 +779,33 @@ where
     for schema_key in filesystem_schema_keys() {
         let bounds = schema_range_bounds(&schema_key);
         let tracked = state_view
-            .range(Some(&bounds.0), bounds.1.as_deref(), None, true)
+            .branch_range(branch_id, Some(&bounds.0), bounds.1.as_deref(), None, true)
             .await
             .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
         rows.extend(FilesystemStateRows::from_view_rows(
             tracked, branch_id, false,
         )?);
         let untracked = state_view
-            .untracked_branch_range(Some(&bounds.0), bounds.1.as_deref(), None)
+            .untracked_overlay_branch_range_for_branch(
+                branch_id,
+                Some(&bounds.0),
+                bounds.1.as_deref(),
+                None,
+                true,
+            )
             .await
             .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
-        rows.extend(FilesystemStateRows::from_untracked_view_rows(untracked)?);
+        let mut untracked = FilesystemStateRows::from_untracked_view_rows(untracked)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        for row in &mut untracked {
+            if row.global() {
+                row.branch_id = branch_id.to_owned();
+            }
+        }
+        rows.extend(untracked);
     }
-    let rows = FilesystemStateRows::from_rows(rows);
+    let rows = crate::filesystem::merge_filesystem_state_rows(rows, false);
     let mut resolvers = directory_path_resolvers_from_state_batch(&rows)?;
     resolvers
         .entry(filesystem_storage_scope_key(branch_id, false, false, None))
@@ -3924,10 +4116,9 @@ where
             .load_exact_batch(&request)
             .await?;
         for (row_index, (key, request)) in blob_requests.into_iter().enumerate() {
-            if row_index >= rows.len() {
+            let Some(row) = rows.get(row_index).and_then(Option::as_ref) else {
                 continue;
-            }
-            let row = rows.row(row_index);
+            };
             let tracking_mismatch = row.untracked() ^ key.is_untracked();
             if row.branch_id() != key.branch_id()
                 || row.global() != key.global()
@@ -3946,7 +4137,9 @@ where
                 .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
                 .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
         }
-        exact_batches.push(rows);
+        exact_batches.push(FilesystemStateRows::from_rows(
+            rows.into_iter().flatten().collect(),
+        ));
     }
 
     let exact_rows = if exact_batches.len() == 1 {
@@ -6893,7 +7086,8 @@ where
                 ..FileExactBatchPlan::default()
             })
             .await?;
-        for row in rows
+        let present = rows.into_iter().flatten().collect::<Vec<_>>();
+        for row in present
             .iter()
             .filter(|row| row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY && !row.deleted)
         {
@@ -6916,7 +7110,7 @@ where
                 pending.insert(parent_id);
             }
         }
-        directories.extend(rows.into_iter());
+        directories.extend(present);
     }
     Ok(FilesystemStateRows::from_rows(directories))
 }
@@ -7008,7 +7202,9 @@ where
             include_tombstones: request.filter.include_tombstones,
         })
         .await?;
-    Ok(rows)
+    Ok(FilesystemStateRows::from_rows(
+        rows.into_iter().flatten().collect(),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8007,7 +8203,7 @@ mod tests {
         FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemPathIndex,
         FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemRowContext,
     };
-    use crate::forktree::{AuthenticatedBlobReader, ForkTreeReadFacade, StateKey};
+    use crate::forktree::{AuthenticatedBlobReader, ForkTreeReadFacade, StateKey, UntrackedValue};
     use crate::functions::FunctionProviderHandle;
     use crate::plugin::{
         PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentMatcher, PluginFileOwner,
@@ -8017,7 +8213,7 @@ mod tests {
     use crate::sql2::dml::InsertSink;
     use crate::sql2::providers::upsert::UpsertConflictTarget;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::state::{ForkTreeStateView, TransactionStateView};
+    use crate::state::{ForkTreeStateView, StagedUntrackedStateRow, TransactionStateView};
     use crate::storage::{Memory, MemoryRead};
     use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageReadOptions};
     use crate::transaction::types::{
@@ -8083,12 +8279,32 @@ mod tests {
                 .expect("ForkTree branch view should complete without yielding")
                 .expect("initialized main branch view should open");
         let mut selected = BTreeMap::<Vec<u8>, crate::state::StateRow>::new();
+        let mut staged_untracked = Vec::new();
         for row in rows
             .iter()
             .filter(|row| row.branch_id == branch_id || row.branch_id == GLOBAL_BRANCH_ID)
         {
             let native = super::test_filesystem_row_to_state_row(row)
                 .expect("native filesystem fixture should be encodable");
+            if row.untracked {
+                let owner = uuid::Uuid::parse_str(&row.branch_id)
+                    .expect("native untracked fixture owner should be a UUID");
+                let key = crate::forktree::decode_state_key(&native.key)
+                    .expect("native untracked fixture key should decode");
+                staged_untracked.push(StagedUntrackedStateRow::new(
+                    crate::forktree::CanonicalBranchId::from_bytes(*owner.as_bytes()),
+                    key,
+                    UntrackedValue {
+                        created_at: native.value.created_at,
+                        updated_at: native.value.updated_at,
+                        cell: native.value.cell.clone(),
+                        metadata: native.value.metadata.clone(),
+                        origin_key: native.value.origin_key.clone(),
+                        blob_manifest_object_ids: native.value.blob_manifest_object_ids.clone(),
+                    },
+                ));
+                continue;
+            }
             let replace = row.branch_id == branch_id;
             if replace || !selected.contains_key(&native.key) {
                 selected.insert(native.key.clone(), native);
@@ -8098,7 +8314,8 @@ mod tests {
             .into_values()
             .map(|row| crate::state::StagedStateRow::new(row.key, row.value))
             .collect();
-        TransactionStateView::new(committed, staged)
+        staged_untracked.sort_by(|left, right| left.key.cmp(&right.key));
+        TransactionStateView::new_with_untracked(committed, staged, staged_untracked)
             .expect("native transaction overlay should be valid")
     }
 

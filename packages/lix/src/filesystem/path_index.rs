@@ -23,7 +23,7 @@ use super::keys::{
 };
 use super::persistent_map::PersistentMap;
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey};
-use super::{FilesystemStateRow, FilesystemStateRows};
+use super::{FilesystemStateRow, FilesystemStateRows, merge_filesystem_state_rows};
 
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1049,23 +1049,36 @@ async fn build_path_index_from_state<R>(
 where
     R: StorageAdapterRead,
 {
-    let branch_id = request.branch_ids.first().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "filesystem path index requires one operation-owned branch state view",
-        )
-    })?;
-    if request.branch_ids.len() != 1 {
+    if request.branch_ids.is_empty() {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
-            "filesystem path index cannot acquire multiple branch views in one operation",
+            "filesystem path index requires one operation-owned branch state view",
         ));
     }
-    let tracked_rows = state.range(None, None, None, true).await?;
-    let mut rows = FilesystemStateRows::from_view_rows(tracked_rows, branch_id, false)?;
-    rows.extend(FilesystemStateRows::from_untracked_view_rows(
-        state.untracked_overlay_rows().await?,
-    )?);
+    let mut rows = Vec::new();
+    for branch_id in &request.branch_ids {
+        let tracked_rows = state
+            .branch_range(branch_id, None, None, None, true)
+            .await?;
+        rows.extend(FilesystemStateRows::from_view_rows(
+            tracked_rows,
+            branch_id,
+            false,
+        )?);
+        let mut untracked_rows = state
+            .untracked_overlay_branch_range_for_branch(branch_id, None, None, None, true)
+            .await?
+            .into_iter()
+            .map(FilesystemStateRow::from_untracked_state_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in &mut untracked_rows {
+            if row.global() {
+                row.branch_id = branch_id.clone();
+            }
+        }
+        rows.extend(untracked_rows);
+    }
+    let rows = merge_filesystem_state_rows(rows, true);
     #[cfg(test)]
     {
         FULL_REBUILD_BUILDS.fetch_add(1, Ordering::SeqCst);
