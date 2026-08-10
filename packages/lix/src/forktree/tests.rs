@@ -90,6 +90,42 @@ fn branch_ref_timestamp_is_authenticated_and_round_trips() {
     assert_ne!(first_id, second_id);
 }
 
+#[test]
+fn stale_state_key_merge_uses_encoded_order_and_deduplicates_overlay_keys() {
+    // StateKey's derived order places file_id before entity_pk, whereas the
+    // authenticated wire key is schema, entity_pk, file_id.  This pair makes
+    // those orders disagree, and the common key appears from both roots.
+    let file_first = StateKey {
+        schema_key: "app.row".to_owned(),
+        file_id: Some("a-file".to_owned()),
+        entity_pk: EntityPk::single("z-entity"),
+    };
+    let entity_first = StateKey {
+        schema_key: "app.row".to_owned(),
+        file_id: Some("z-file".to_owned()),
+        entity_pk: EntityPk::single("a-entity"),
+    };
+    let merged = super::view::merge_sorted_state_keys(
+        vec![file_first.clone()],
+        vec![
+            entity_first.clone(),
+            entity_first.clone(),
+            file_first.clone(),
+        ],
+    );
+    assert_eq!(merged.len(), 2, "one visible row per canonical key");
+    assert_eq!(
+        merged[0], entity_first,
+        "canonical encoded order is preserved"
+    );
+    assert_eq!(merged[1], file_first);
+    assert_eq!(
+        merged.iter().take(1).count(),
+        1,
+        "LIMIT 1 sees the first canonical row"
+    );
+}
+
 async fn commit_publication_for_test<S>(
     publication: PreparedPublication,
     storage: &S,
@@ -439,7 +475,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         .await
         .expect("open non-ancestor root-bound view");
     let non_ancestor_repository = non_ancestor_view.repository_root();
-    let mut non_ancestor_cache = BTreeMap::new();
+    let mut non_ancestor_cache = super::serving::StaleCommitSummaryCache::default();
     let non_ancestor_summary = super::serving::load_historical_commit_state_roots_for_stale(
         non_ancestor_view.test_storage_read(),
         &non_ancestor_repository,
@@ -1999,7 +2035,7 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("valid repository root"),
     )
     .expect("valid repository");
-    let mut valid_cache = BTreeMap::new();
+    let mut valid_cache = super::serving::StaleCommitSummaryCache::default();
     assert!(
         valid_facade
             .load_stale_commit_state_roots(
@@ -2068,7 +2104,7 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("bad catalog repository root"),
     )
     .expect("bad catalog repository");
-    let mut bad_catalog_cache = BTreeMap::new();
+    let mut bad_catalog_cache = super::serving::StaleCommitSummaryCache::default();
     assert!(
         bad_catalog_facade
             .load_stale_commit_state_roots(
@@ -2111,7 +2147,7 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("bad object repository root"),
     )
     .expect("bad object repository");
-    let mut bad_object_cache = BTreeMap::new();
+    let mut bad_object_cache = super::serving::StaleCommitSummaryCache::default();
     assert!(
         bad_object_facade
             .load_stale_commit_state_roots(
@@ -2159,7 +2195,7 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("bad root repository root"),
     )
     .expect("bad root repository");
-    let mut bad_root_cache = BTreeMap::new();
+    let mut bad_root_cache = super::serving::StaleCommitSummaryCache::default();
     assert!(
         bad_root_facade
             .load_stale_commit_state_roots(
@@ -2203,7 +2239,7 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("bad generation repository root"),
     )
     .expect("bad generation repository");
-    let mut bad_generation_cache = BTreeMap::new();
+    let mut bad_generation_cache = super::serving::StaleCommitSummaryCache::default();
     assert!(
         bad_generation_facade
             .load_stale_commit_state_roots(
@@ -5980,6 +6016,93 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
                     .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
             })
             .is_err()
+    );
+
+    let mut split_pages = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0xa7)),
+        generation: 1,
+        parent_commit_object_ids: Vec::new(),
+        members: (0..513).map(page_member).collect(),
+        member_page_object_ids: Vec::new(),
+        global_state_root: content_id(0x77),
+        local_state_root: content_id(0x78),
+        metadata: b"page-adjacency".to_vec(),
+    };
+    let split_objects = split_pages
+        .prepare_member_pages()
+        .expect("three page closure");
+    let split_map = split_objects.into_iter().collect::<BTreeMap<_, _>>();
+    let split_ids = split_pages.member_page_object_ids.clone();
+    assert!(split_ids.len() >= 3);
+
+    let second = CommitChangePageV2::decode(
+        split_ids[1],
+        split_map.get(&split_ids[1]).expect("second page"),
+    )
+    .expect("decode second page");
+    let first = CommitChangePageV2::decode(
+        split_ids[0],
+        split_map.get(&split_ids[0]).expect("first page"),
+    )
+    .expect("decode first page");
+    let mut gap = second.clone();
+    gap.start_ordinal = gap.start_ordinal.saturating_add(1);
+    let (gap_id, gap_bytes) = gap.encode().expect("gap page remains individually valid");
+    let mut gap_map = split_map.clone();
+    gap_map.remove(&split_ids[1]);
+    gap_map.insert(gap_id, gap_bytes);
+    let mut gap_commit = split_pages.clone();
+    gap_commit.member_page_object_ids[1] = gap_id;
+    assert!(
+        gap_commit
+            .load_members_with(|id| {
+                gap_map
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err(),
+        "a gap between adjacent authenticated page ordinals fails closed"
+    );
+
+    let mut overlap = second.clone();
+    overlap.start_ordinal = first
+        .start_ordinal
+        .checked_add(u32::try_from(first.members.len()).expect("first page member count fits"))
+        .expect("overlap base")
+        .saturating_sub(1);
+    let (overlap_id, overlap_bytes) = overlap
+        .encode()
+        .expect("overlap page remains individually valid");
+    let mut overlap_map = split_map.clone();
+    overlap_map.remove(&split_ids[1]);
+    overlap_map.insert(overlap_id, overlap_bytes);
+    let mut overlap_commit = split_pages.clone();
+    overlap_commit.member_page_object_ids[1] = overlap_id;
+    assert!(
+        overlap_commit
+            .load_members_with(|id| {
+                overlap_map
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err(),
+        "an overlap between adjacent authenticated page ordinals fails closed"
+    );
+
+    let mut repeated_commit = split_pages;
+    repeated_commit.member_page_object_ids[2] = repeated_commit.member_page_object_ids[0];
+    assert!(
+        repeated_commit
+            .load_members_with(|id| {
+                split_map
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::Io("missing member page".to_owned()))
+            })
+            .is_err(),
+        "a repeated non-adjacent page vector entry fails closed"
     );
 
     let duplicate = CommitChangePageV2 {

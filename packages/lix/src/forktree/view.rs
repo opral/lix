@@ -1439,11 +1439,11 @@ where
 
     /// Loads the authenticated commit summary used by stale reconciliation.
     /// The cache is scoped by the caller to this exact retained view/read.
-    pub(crate) async fn load_stale_commit_state_roots(
+    pub(super) async fn load_stale_commit_state_roots(
         &self,
         repository: &RepositoryRootV1,
         commit_id: crate::changelog::CommitId,
-        cache: &mut BTreeMap<crate::changelog::CommitId, super::serving::StaleCommitSummary>,
+        cache: &mut super::serving::StaleCommitSummaryCache,
     ) -> Result<super::serving::StaleCommitSummary, crate::LixError> {
         super::serving::load_historical_commit_state_roots_for_stale(
             &self.read, repository, commit_id, cache,
@@ -1621,7 +1621,7 @@ where
     R: StorageAdapterRead,
 {
     let repository = super::serving::load_repository_root(&view.read).await?;
-    let mut summary_cache = BTreeMap::new();
+    let mut summary_cache = super::serving::StaleCommitSummaryCache::default();
     let before_roots = view
         .load_stale_commit_state_roots(&repository, before, &mut summary_cache)
         .await?;
@@ -1635,14 +1635,14 @@ where
         .load_stale_commit_state_roots(&repository, after, &mut summary_cache)
         .await?;
     let local_changes = super::tree::diff_roots(
-        Some(before_roots.local_state_root),
-        Some(after_roots.local_state_root),
+        Some(before_roots.local_state_root()),
+        Some(after_roots.local_state_root()),
         &view.read,
     )
     .await?;
     let global_changes = super::tree::diff_roots(
-        Some(before_roots.global_state_root),
-        Some(after_roots.global_state_root),
+        Some(before_roots.global_state_root()),
+        Some(after_roots.global_state_root()),
         &view.read,
     )
     .await?;
@@ -1746,28 +1746,39 @@ fn historical_state_row_from_point(
     }))
 }
 
-fn merge_sorted_state_keys(
+pub(super) fn merge_sorted_state_keys(
     left: Vec<super::state::StateKey>,
     right: Vec<super::state::StateKey>,
 ) -> Vec<super::state::StateKey> {
-    let mut left = left.into_iter().peekable();
-    let mut right = right.into_iter().peekable();
-    let mut merged = Vec::new();
-    loop {
-        match (left.peek(), right.peek()) {
-            (None, None) => break,
-            (Some(_), None) => merged.push(left.next().expect("peeked left key")),
-            (None, Some(_)) => merged.push(right.next().expect("peeked right key")),
-            (Some(left_key), Some(right_key)) => match left_key.cmp(right_key) {
-                std::cmp::Ordering::Less => merged.push(left.next().expect("peeked left key")),
-                std::cmp::Ordering::Greater => merged.push(right.next().expect("peeked right key")),
-                std::cmp::Ordering::Equal => {
-                    merged.push(left.next().expect("peeked left key"));
-                    right.next();
-                }
-            },
-        }
-    }
+    // `diff_roots` returns keys in their canonical encoded byte order
+    // (schema, entity_pk, file_id), while `StateKey::Ord` follows the Rust
+    // field order (schema, file_id, entity_pk).  Merge the canonical bytes,
+    // not the incidental struct order, so local/global overlays stay ordered
+    // and duplicate physical acquisition of one key is collapsed.
+    let mut merged = left.into_iter().chain(right).collect::<Vec<_>>();
+    merged.sort_unstable_by(|left, right| {
+        super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: &left.schema_key,
+            file_id: left.file_id.as_deref(),
+            entity_pk: &left.entity_pk,
+        })
+        .cmp(&super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: &right.schema_key,
+            file_id: right.file_id.as_deref(),
+            entity_pk: &right.entity_pk,
+        }))
+    });
+    merged.dedup_by(|left, right| {
+        super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: &left.schema_key,
+            file_id: left.file_id.as_deref(),
+            entity_pk: &left.entity_pk,
+        }) == super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: &right.schema_key,
+            file_id: right.file_id.as_deref(),
+            entity_pk: &right.entity_pk,
+        })
+    });
     merged
 }
 
