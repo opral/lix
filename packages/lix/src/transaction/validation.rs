@@ -374,7 +374,11 @@ fn same_identity(row: PreparedValidationRow<'_>, current: &NativeValidationRow) 
 }
 
 fn same_insert_identity(row: PreparedValidationRow<'_>, current: &NativeValidationRow) -> bool {
-    same_identity(row, current) && prepared_row_is_global(row) == current.global
+    row.schema_key() == current.schema_key()
+        && row.entity_pk() == current.entity_pk()
+        && row.file_id() == current.file_id()
+        && row.branch_id() == current.branch_id
+        && prepared_row_is_global(row) == current.global
 }
 
 fn prepared_row_domain(row: PreparedValidationRow<'_>) -> Domain {
@@ -962,7 +966,6 @@ where
         let row = insert.row;
         let identity = (
             row.branch_id.to_string(),
-            row.untracked,
             row.global,
             row.file_id.map(ToString::to_string),
             row.schema_key.to_string(),
