@@ -141,7 +141,11 @@ impl Domain {
     }
 
     pub(crate) fn schema_catalog_domains(&self) -> Vec<Self> {
-        self.schema_catalog_domain().reachable_target_domains()
+        // Registered schemas are authoritative tracked ForkTree state. The
+        // untracked state domain no longer exists, so projecting a caller's
+        // legacy domain bit into two catalog domains would read the same
+        // tracked branch twice and manufacture duplicate schema identities.
+        vec![self.schema_catalog_domain().with_untracked(false)]
     }
 
     pub(crate) fn fk_target_domains(&self) -> Vec<Self> {
@@ -284,4 +288,17 @@ fn nullable_filter_from_option(value: Option<&String>) -> NullableKeyFilter<Stri
     value.map_or(NullableKeyFilter::Null, |value| {
         NullableKeyFilter::Value(value.clone())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Domain;
+
+    #[test]
+    fn schema_catalog_is_one_tracked_domain_after_untracked_hard_cut() {
+        let domains = Domain::schema_catalog("branch", true).schema_catalog_domains();
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].branch_id(), "branch");
+        assert!(!domains[0].untracked());
+    }
 }

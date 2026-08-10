@@ -323,12 +323,6 @@ where
         },
     );
     let upper = exclusive_prefix_upper_bound(&prefix);
-    if domain.untracked() {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "untracked state validation is no longer supported",
-        ));
-    }
     // Validation is bounded to each affected schema prefix.  The native
     // state view authenticates ordering, branch/global overlay, tombstones,
     // and the transaction's staged replacement before this filter runs.
@@ -374,12 +368,6 @@ fn exact_visible_request(
         },
         entity_pk,
     });
-    if domain.untracked() {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "untracked state validation is no longer supported",
-        ));
-    }
     Ok(ExactVisibleRequest {
         key,
         untracked: false,
@@ -388,7 +376,7 @@ fn exact_visible_request(
 }
 
 /// Resolves all exact validation targets through the one transaction-owned
-/// retained view. Tracked and untracked requests are each batched once, while
+/// retained view. Requests are batched once, while
 /// the returned vector remains aligned with the caller's original request
 /// order. No committed-only reader or alternate materialization authority is
 /// introduced here.
@@ -1140,15 +1128,6 @@ where
                 input.state_view,
                 input.active_branch_id,
                 &Domain::any_file(input.active_branch_id, false),
-                &schema_key,
-            )
-            .await?,
-        );
-        all_rows.extend(
-            visible_rows(
-                input.state_view,
-                input.active_branch_id,
-                &Domain::any_file(input.active_branch_id, true),
                 &schema_key,
             )
             .await?,
