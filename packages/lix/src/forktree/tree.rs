@@ -654,7 +654,7 @@ where
 /// and batching every tree level through the caller's retained read. The
 /// ordered tree remains the sole durable value owner: internal nodes name the
 /// canonical leaf ObjectIds and only requested leaves are materialized.
-pub(super) async fn lookup_many_on_read<R>(
+pub(crate) async fn lookup_many_on_read<R>(
     root: ObjectId,
     expected_kind: &'static str,
     keys: &[Vec<u8>],
@@ -928,118 +928,153 @@ pub(crate) async fn diff_roots<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    diff_roots_with_values(left_root, right_root, read)
+        .await?
+        .into_iter()
+        .map(|entry| {
+            super::state::decode_state_key(&entry.key)
+                .map_err(|error| corruption(format!("state-root diff key is invalid: {error}")))
+        })
+        .collect()
+}
+
+pub(crate) async fn diff_roots_with_values<R>(
+    left_root: Option<ObjectId>,
+    right_root: Option<ObjectId>,
+    read: &R,
+) -> Result<Vec<RawStateDiff>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     let mut cache = BTreeMap::<ObjectId, Arc<Node>>::new();
     let mut frontier = vec![DiffTask {
         left: root_diff_side(left_root),
         right: root_diff_side(right_root),
         span: DiffSpan::unbounded(),
     }];
-    let mut changed_encoded_keys = Vec::new();
+    let mut changed_entries = Vec::new();
 
-    while let Some(task) = frontier.pop() {
-        if same_diff_object(&task.left, &task.right) {
-            continue;
+    while !frontier.is_empty() {
+        // Process one authenticated frontier level as a batch. This keeps
+        // ordered-tree traversal hash-pruned while turning all missing node
+        // reads at that level into one retained-read get_many call.
+        let mut level = std::mem::take(&mut frontier);
+        // The previous stack traversal popped the last task first. Preserve
+        // that authenticated key order while batching the same frontier.
+        level.reverse();
+        let mut missing = BTreeSet::new();
+        for task in &level {
+            if same_diff_object(&task.left, &task.right) {
+                continue;
+            }
+            collect_diff_refs(&task.left, &cache, &mut missing);
+            collect_diff_refs(&task.right, &cache, &mut missing);
         }
-        let left = load_diff_side(task.left, read, &mut cache).await?;
-        let right = load_diff_side(task.right, read, &mut cache).await?;
-        if same_diff_object(&left, &right) {
-            continue;
+        for (id, bytes) in super::view::load_object_map(read, missing).await? {
+            cache.insert(id, Arc::new(decode_node(id, &bytes)?));
         }
 
-        let mut next = Vec::new();
-        match (&left, &right) {
-            (DiffSide::Empty, DiffSide::Empty) => {}
-            (DiffSide::Loaded { node: left, .. }, DiffSide::Loaded { node: right, .. }) => {
-                match (&left.body, &right.body) {
-                    (NodeBody::Leaf(left), NodeBody::Leaf(right)) => append_leaf_diffs(
+        let mut next_level = Vec::new();
+        for task in level {
+            if same_diff_object(&task.left, &task.right) {
+                continue;
+            }
+            let left = load_diff_side_cached(task.left, &cache)?;
+            let right = load_diff_side_cached(task.right, &cache)?;
+            if same_diff_object(&left, &right) {
+                continue;
+            }
+
+            match (&left, &right) {
+                (DiffSide::Empty, DiffSide::Empty) => {}
+                (DiffSide::Loaded { node: left, .. }, DiffSide::Loaded { node: right, .. }) => {
+                    match (&left.body, &right.body) {
+                        (NodeBody::Leaf(left), NodeBody::Leaf(right)) => append_leaf_diffs(
+                            Some(left),
+                            Some(right),
+                            &task.span,
+                            &mut changed_entries,
+                        ),
+                        (NodeBody::Internal(left), NodeBody::Internal(right)) => {
+                            enqueue_internal_pair(left, right, &task.span, &mut next_level);
+                        }
+                        (NodeBody::Internal(left), NodeBody::Leaf(right)) => {
+                            enqueue_internal_leaf(left, &right, &task.span, false, &mut next_level);
+                        }
+                        (NodeBody::Leaf(left), NodeBody::Internal(right)) => {
+                            enqueue_internal_leaf(right, &left, &task.span, true, &mut next_level);
+                        }
+                    }
+                }
+                (DiffSide::Loaded { node, .. }, DiffSide::Empty) => match &node.body {
+                    NodeBody::Leaf(entries) => {
+                        append_leaf_diffs(Some(entries), None, &task.span, &mut changed_entries)
+                    }
+                    NodeBody::Internal(children) => {
+                        enqueue_internal_empty(children, &task.span, false, &mut next_level)
+                    }
+                },
+                (DiffSide::Empty, DiffSide::Loaded { node, .. }) => match &node.body {
+                    NodeBody::Leaf(entries) => {
+                        append_leaf_diffs(None, Some(entries), &task.span, &mut changed_entries)
+                    }
+                    NodeBody::Internal(children) => {
+                        enqueue_internal_empty(children, &task.span, true, &mut next_level)
+                    }
+                },
+                (DiffSide::Leaf { entries }, DiffSide::Empty) => {
+                    append_leaf_diffs(Some(entries), None, &task.span, &mut changed_entries)
+                }
+                (DiffSide::Empty, DiffSide::Leaf { entries }) => {
+                    append_leaf_diffs(None, Some(entries), &task.span, &mut changed_entries)
+                }
+                (DiffSide::Leaf { entries: left }, DiffSide::Leaf { entries: right }) => {
+                    append_leaf_diffs(Some(left), Some(right), &task.span, &mut changed_entries)
+                }
+                (DiffSide::Loaded { node, .. }, DiffSide::Leaf { entries }) => match &node.body {
+                    NodeBody::Leaf(left) => append_leaf_diffs(
                         Some(left),
+                        Some(entries),
+                        &task.span,
+                        &mut changed_entries,
+                    ),
+                    NodeBody::Internal(left) => {
+                        enqueue_internal_leaf(left, entries, &task.span, false, &mut next_level)
+                    }
+                },
+                (DiffSide::Leaf { entries }, DiffSide::Loaded { node, .. }) => match &node.body {
+                    NodeBody::Leaf(right) => append_leaf_diffs(
+                        Some(entries),
                         Some(right),
                         &task.span,
-                        &mut changed_encoded_keys,
+                        &mut changed_entries,
                     ),
-                    (NodeBody::Internal(left), NodeBody::Internal(right)) => {
-                        enqueue_internal_pair(left, right, &task.span, &mut next);
+                    NodeBody::Internal(right) => {
+                        enqueue_internal_leaf(right, entries, &task.span, true, &mut next_level)
                     }
-                    (NodeBody::Internal(left), NodeBody::Leaf(right)) => {
-                        enqueue_internal_leaf(left, &right, &task.span, false, &mut next);
-                    }
-                    (NodeBody::Leaf(left), NodeBody::Internal(right)) => {
-                        enqueue_internal_leaf(right, &left, &task.span, true, &mut next);
-                    }
-                }
+                },
+                _ => unreachable!("diff side resolution leaves no unresolved node refs"),
             }
-            (DiffSide::Loaded { node, .. }, DiffSide::Empty) => match &node.body {
-                NodeBody::Leaf(entries) => {
-                    append_leaf_diffs(Some(entries), None, &task.span, &mut changed_encoded_keys)
-                }
-                NodeBody::Internal(children) => {
-                    enqueue_internal_empty(children, &task.span, false, &mut next)
-                }
-            },
-            (DiffSide::Empty, DiffSide::Loaded { node, .. }) => match &node.body {
-                NodeBody::Leaf(entries) => {
-                    append_leaf_diffs(None, Some(entries), &task.span, &mut changed_encoded_keys)
-                }
-                NodeBody::Internal(children) => {
-                    enqueue_internal_empty(children, &task.span, true, &mut next)
-                }
-            },
-            (DiffSide::Leaf { entries }, DiffSide::Empty) => {
-                append_leaf_diffs(Some(entries), None, &task.span, &mut changed_encoded_keys)
-            }
-            (DiffSide::Empty, DiffSide::Leaf { entries }) => {
-                append_leaf_diffs(None, Some(entries), &task.span, &mut changed_encoded_keys)
-            }
-            (DiffSide::Leaf { entries: left }, DiffSide::Leaf { entries: right }) => {
-                append_leaf_diffs(
-                    Some(left),
-                    Some(right),
-                    &task.span,
-                    &mut changed_encoded_keys,
-                )
-            }
-            (DiffSide::Loaded { node, .. }, DiffSide::Leaf { entries }) => match &node.body {
-                NodeBody::Leaf(left) => append_leaf_diffs(
-                    Some(left),
-                    Some(entries),
-                    &task.span,
-                    &mut changed_encoded_keys,
-                ),
-                NodeBody::Internal(left) => {
-                    enqueue_internal_leaf(left, entries, &task.span, false, &mut next)
-                }
-            },
-            (DiffSide::Leaf { entries }, DiffSide::Loaded { node, .. }) => match &node.body {
-                NodeBody::Leaf(right) => append_leaf_diffs(
-                    Some(entries),
-                    Some(right),
-                    &task.span,
-                    &mut changed_encoded_keys,
-                ),
-                NodeBody::Internal(right) => {
-                    enqueue_internal_leaf(right, entries, &task.span, true, &mut next)
-                }
-            },
-            _ => unreachable!("diff side resolution leaves no unresolved node refs"),
         }
-        frontier.extend(next.into_iter().rev());
+        frontier.extend(next_level.into_iter().rev());
     }
 
-    if changed_encoded_keys
+    if changed_entries
         .windows(2)
-        .any(|pair| pair[0].as_slice() >= pair[1].as_slice())
+        .any(|pair| pair[0].key.as_slice() >= pair[1].key.as_slice())
     {
         return Err(corruption(
             "state-root diff emitted duplicate or out-of-order keys",
         ));
     }
-    changed_encoded_keys
-        .into_iter()
-        .map(|key| {
-            super::state::decode_state_key(&key)
-                .map_err(|error| corruption(format!("state-root diff key is invalid: {error}")))
-        })
-        .collect()
+    Ok(changed_entries)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RawStateDiff {
+    pub(crate) key: Vec<u8>,
+    pub(crate) before: Option<Vec<u8>>,
+    pub(crate) after: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -1088,6 +1123,18 @@ fn root_diff_side(root: Option<ObjectId>) -> DiffSide {
     root.map_or(DiffSide::Empty, |id| DiffSide::Ref { id, expected: None })
 }
 
+fn collect_diff_refs(
+    side: &DiffSide,
+    cache: &BTreeMap<ObjectId, Arc<Node>>,
+    missing: &mut BTreeSet<ObjectId>,
+) {
+    if let DiffSide::Ref { id, .. } = side {
+        if !cache.contains_key(id) {
+            missing.insert(*id);
+        }
+    }
+}
+
 fn same_diff_object(left: &DiffSide, right: &DiffSide) -> bool {
     match (left, right) {
         (
@@ -1119,28 +1166,20 @@ fn same_diff_object(left: &DiffSide, right: &DiffSide) -> bool {
     }
 }
 
-async fn load_diff_side<R>(
+fn load_diff_side_cached(
     side: DiffSide,
-    read: &R,
-    cache: &mut BTreeMap<ObjectId, Arc<Node>>,
-) -> Result<DiffSide, StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
+    cache: &BTreeMap<ObjectId, Arc<Node>>,
+) -> Result<DiffSide, StorageError> {
     let DiffSide::Ref { id, expected } = side else {
         return Ok(side);
     };
     if id == ObjectId::ZERO {
         return Err(corruption("state-root diff references a zero root object"));
     }
-    let node = match cache.get(&id) {
-        Some(node) => Arc::clone(node),
-        None => {
-            let node = Arc::new(decode_node(id, &load_object_on_read(read, id).await?)?);
-            cache.insert(id, Arc::clone(&node));
-            node
-        }
-    };
+    let node = cache
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| corruption(format!("batched state-root node {id} was not loaded")))?;
     validate_loaded_node(id, &node, TreeKind::State, expected.as_ref())?;
     Ok(DiffSide::Loaded { id, node })
 }
@@ -1149,7 +1188,7 @@ fn append_leaf_diffs(
     left: Option<&[LeafEntry]>,
     right: Option<&[LeafEntry]>,
     span: &DiffSpan,
-    output: &mut Vec<Vec<u8>>,
+    output: &mut Vec<RawStateDiff>,
 ) {
     let left = left.unwrap_or_default();
     let right = right.unwrap_or_default();
@@ -1163,32 +1202,52 @@ fn append_leaf_diffs(
                 if left[left_index].value != right[right_index].value
                     && key_in_diff_span(left_key, span)
                 {
-                    output.push(left[left_index].key.clone());
+                    output.push(RawStateDiff {
+                        key: left[left_index].key.clone(),
+                        before: Some(left[left_index].value.clone()),
+                        after: Some(right[right_index].value.clone()),
+                    });
                 }
                 left_index += 1;
                 right_index += 1;
             }
             (Some(left_key), Some(right_key)) if left_key < right_key => {
                 if key_in_diff_span(left_key, span) {
-                    output.push(left[left_index].key.clone());
+                    output.push(RawStateDiff {
+                        key: left[left_index].key.clone(),
+                        before: Some(left[left_index].value.clone()),
+                        after: None,
+                    });
                 }
                 left_index += 1;
             }
             (Some(_), Some(right_key)) => {
                 if key_in_diff_span(right_key, span) {
-                    output.push(right[right_index].key.clone());
+                    output.push(RawStateDiff {
+                        key: right[right_index].key.clone(),
+                        before: None,
+                        after: Some(right[right_index].value.clone()),
+                    });
                 }
                 right_index += 1;
             }
             (Some(left_key), None) => {
                 if key_in_diff_span(left_key, span) {
-                    output.push(left[left_index].key.clone());
+                    output.push(RawStateDiff {
+                        key: left[left_index].key.clone(),
+                        before: Some(left[left_index].value.clone()),
+                        after: None,
+                    });
                 }
                 left_index += 1;
             }
             (None, Some(right_key)) => {
                 if key_in_diff_span(right_key, span) {
-                    output.push(right[right_index].key.clone());
+                    output.push(RawStateDiff {
+                        key: right[right_index].key.clone(),
+                        before: None,
+                        after: Some(right[right_index].value.clone()),
+                    });
                 }
                 right_index += 1;
             }

@@ -42,7 +42,7 @@ pub(crate) use serving::{
     VisibleStateRow, edit_state_tree, edit_state_tree_sequence, load_branch_heads_with_metadata,
     load_change_records, load_commit, load_commit_member_records, load_commit_records,
     load_commit_summary, put_change_catalog_entries, put_commit_catalog_entries,
-    scan_change_records, scan_commit_records, scan_commit_topologies,
+    resolve_state_values_on_read, scan_change_records, scan_commit_records, scan_commit_topologies,
     scan_state_rows_at_commit_range, scan_state_rows_at_commit_ranges,
     select_historical_commit_member, state_point, state_point_on_read, state_points,
     state_points_on_read, state_range,
@@ -55,10 +55,10 @@ pub(crate) use state::{
     encode_untracked_branch_range_bounds, encode_untracked_key, encode_untracked_value,
     exclusive_prefix_upper_bound,
 };
-pub(crate) use tree::diff_roots;
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
 };
+pub(crate) use tree::{RawStateDiff, diff_roots, diff_roots_with_values, lookup_many_on_read};
 pub(crate) use view::{
     CoherentView, ForkTreeReadFacade, SELECTOR_SPACE, load_object_bytes, open_coherent_view,
     open_coherent_view_on_read,

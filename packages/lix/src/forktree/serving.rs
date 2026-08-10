@@ -1942,7 +1942,7 @@ where
         .collect()
 }
 
-async fn resolve_state_values_on_read<R>(
+pub(crate) async fn resolve_state_values_on_read<R>(
     read: &R,
     selected: &[Option<(Vec<u8>, Vec<u8>, StateSource)>],
 ) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>

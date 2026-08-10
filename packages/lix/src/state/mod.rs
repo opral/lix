@@ -572,49 +572,118 @@ where
             return Ok(Vec::new());
         }
 
-        let local_changes =
-            crate::forktree::diff_roots(before.local, after.local, self.view.retained_read())
-                .await?;
-        let global_changes = crate::forktree::diff_roots(
+        let local_changes = crate::forktree::diff_roots_with_values(
+            before.local,
+            after.local,
+            self.view.retained_read(),
+        )
+        .await?;
+        let global_changes = crate::forktree::diff_roots_with_values(
             Some(before.global),
             Some(after.global),
             self.view.retained_read(),
         )
         .await?;
-        let keys = merge_sorted_state_keys(local_changes, global_changes);
-        if keys.is_empty() {
+        let merged = merge_raw_state_diffs(local_changes, global_changes);
+        if merged.is_empty() {
             return Ok(Vec::new());
         }
-        let encoded = keys
+
+        // A root diff already decoded the changed leaf references. Only a
+        // root that was unchanged for a key needs a point lookup to recover
+        // the overlay counterpart; resolve both endpoint batches together so
+        // shared semantic pages are fetched and decoded once.
+        let unchanged_local_keys = merged
             .iter()
-            .map(|key| {
-                crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                    schema_key: &key.schema_key,
-                    file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
-                })
-            })
+            .filter(|entry| entry.local.is_none())
+            .map(|entry| entry.encoded_key.clone())
             .collect::<Vec<_>>();
-        let before_rows = crate::forktree::state_points_on_read(
-            before.global,
-            before.local,
-            &encoded,
-            true,
-            self.view.retained_read(),
-        )
-        .await?;
-        let after_rows = crate::forktree::state_points_on_read(
-            after.global,
-            after.local,
-            &encoded,
-            true,
-            self.view.retained_read(),
-        )
-        .await?;
+        let unchanged_global_keys = merged
+            .iter()
+            .filter(|entry| entry.global.is_none())
+            .map(|entry| entry.encoded_key.clone())
+            .collect::<Vec<_>>();
+        let unchanged_local = match before.local {
+            Some(root) if !unchanged_local_keys.is_empty() => {
+                crate::forktree::lookup_many_on_read(
+                    root,
+                    "state",
+                    &unchanged_local_keys,
+                    self.view.retained_read(),
+                )
+                .await?
+            }
+            _ => vec![None; unchanged_local_keys.len()],
+        };
+        let unchanged_global = if unchanged_global_keys.is_empty() {
+            Vec::new()
+        } else {
+            crate::forktree::lookup_many_on_read(
+                before.global,
+                "state",
+                &unchanged_global_keys,
+                self.view.retained_read(),
+            )
+            .await?
+        };
+        let mut local_unchanged_slot = 0;
+        let mut global_unchanged_slot = 0;
+        let mut selected = Vec::with_capacity(merged.len() * 2);
+        for entry in &merged {
+            let local_unchanged = if entry.local.is_none() {
+                let value = unchanged_local[local_unchanged_slot].clone();
+                local_unchanged_slot += 1;
+                value
+            } else {
+                None
+            };
+            let global_unchanged = if entry.global.is_none() {
+                let value = unchanged_global[global_unchanged_slot].clone();
+                global_unchanged_slot += 1;
+                value
+            } else {
+                None
+            };
+            let local_before = raw_state_endpoint(
+                &entry.encoded_key,
+                entry.local.as_ref(),
+                local_unchanged.as_ref(),
+                true,
+                StateSource::Branch,
+            );
+            let local_after = raw_state_endpoint(
+                &entry.encoded_key,
+                entry.local.as_ref(),
+                local_unchanged.as_ref(),
+                false,
+                StateSource::Branch,
+            );
+            let global_before = raw_state_endpoint(
+                &entry.encoded_key,
+                entry.global.as_ref(),
+                global_unchanged.as_ref(),
+                true,
+                StateSource::Global,
+            );
+            let global_after = raw_state_endpoint(
+                &entry.encoded_key,
+                entry.global.as_ref(),
+                global_unchanged.as_ref(),
+                false,
+                StateSource::Global,
+            );
+            selected.push(local_before.or(global_before));
+            selected.push(local_after.or(global_after));
+        }
+        let resolved =
+            crate::forktree::resolve_state_values_on_read(self.view.retained_read(), &selected)
+                .await?;
         let mut output = Vec::new();
-        for ((key, before), after) in keys.into_iter().zip(before_rows).zip(after_rows) {
-            let before = before.map(|(value, source)| StateDiffValue { value, source });
-            let after = after.map(|(value, source)| StateDiffValue { value, source });
+        for (entry, resolved) in merged.into_iter().zip(resolved.chunks_exact(2)) {
+            let key = crate::forktree::decode_state_key(&entry.encoded_key)
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+            let before = checked_state_diff_value(resolved[0].clone())?;
+            let after = checked_state_diff_value(resolved[1].clone())?;
             if before != after {
                 output.push(StateDiffEntry { key, before, after });
             }
@@ -623,26 +692,101 @@ where
     }
 }
 
-fn merge_sorted_state_keys(left: Vec<StateKey>, right: Vec<StateKey>) -> Vec<StateKey> {
-    let mut left = left.into_iter().peekable();
-    let mut right = right.into_iter().peekable();
+struct MergedRawStateDiff {
+    encoded_key: Vec<u8>,
+    local: Option<crate::forktree::RawStateDiff>,
+    global: Option<crate::forktree::RawStateDiff>,
+}
+
+fn merge_raw_state_diffs(
+    local: Vec<crate::forktree::RawStateDiff>,
+    global: Vec<crate::forktree::RawStateDiff>,
+) -> Vec<MergedRawStateDiff> {
+    let mut left = local.into_iter().peekable();
+    let mut right = global.into_iter().peekable();
     let mut merged = Vec::new();
     loop {
         match (left.peek(), right.peek()) {
             (None, None) => break,
-            (Some(_), None) => merged.push(left.next().expect("peeked left key")),
-            (None, Some(_)) => merged.push(right.next().expect("peeked right key")),
-            (Some(left_key), Some(right_key)) => match left_key.cmp(right_key) {
-                Ordering::Less => merged.push(left.next().expect("peeked left key")),
-                Ordering::Greater => merged.push(right.next().expect("peeked right key")),
+            (Some(_), None) => {
+                let entry = left.next().expect("peeked local diff");
+                merged.push(MergedRawStateDiff {
+                    encoded_key: entry.key.clone(),
+                    local: Some(entry),
+                    global: None,
+                });
+            }
+            (None, Some(_)) => {
+                let entry = right.next().expect("peeked global diff");
+                merged.push(MergedRawStateDiff {
+                    encoded_key: entry.key.clone(),
+                    local: None,
+                    global: Some(entry),
+                });
+            }
+            (Some(left_entry), Some(right_entry)) => match left_entry.key.cmp(&right_entry.key) {
+                Ordering::Less => {
+                    let entry = left.next().expect("peeked local diff");
+                    merged.push(MergedRawStateDiff {
+                        encoded_key: entry.key.clone(),
+                        local: Some(entry),
+                        global: None,
+                    });
+                }
+                Ordering::Greater => {
+                    let entry = right.next().expect("peeked global diff");
+                    merged.push(MergedRawStateDiff {
+                        encoded_key: entry.key.clone(),
+                        local: None,
+                        global: Some(entry),
+                    });
+                }
                 Ordering::Equal => {
-                    merged.push(left.next().expect("peeked left key"));
-                    right.next();
+                    let local = left.next().expect("peeked local diff");
+                    let global = right.next().expect("peeked global diff");
+                    merged.push(MergedRawStateDiff {
+                        encoded_key: local.key.clone(),
+                        local: Some(local),
+                        global: Some(global),
+                    });
                 }
             },
         }
     }
     merged
+}
+
+fn raw_state_endpoint(
+    encoded_key: &[u8],
+    diff: Option<&crate::forktree::RawStateDiff>,
+    unchanged: Option<&Vec<u8>>,
+    before: bool,
+    source: StateSource,
+) -> Option<(Vec<u8>, Vec<u8>, StateSource)> {
+    let value = diff
+        .map(|diff| {
+            if before {
+                diff.before.as_ref()
+            } else {
+                diff.after.as_ref()
+            }
+        })
+        .unwrap_or(unchanged)
+        .cloned()?;
+    Some((encoded_key.to_vec(), value, source))
+}
+
+fn checked_state_diff_value(
+    value: Option<(StateValue, StateSource)>,
+) -> Result<Option<StateDiffValue>, LixError> {
+    match value {
+        None => Ok(None),
+        Some((value, StateSource::Global)) if value.cell.deleted() => Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "global state tree contains a tombstone",
+        )),
+        Some((value, source)) => Ok(Some(StateDiffValue { value, source })),
+    }
 }
 
 fn canonical_untracked_state_key(key: &StateKey) -> Vec<u8> {

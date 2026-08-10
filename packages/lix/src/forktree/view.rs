@@ -1710,7 +1710,7 @@ where
     Ok(())
 }
 
-pub(super) async fn load_object_map<R>(
+pub(crate) async fn load_object_map<R>(
     read: &R,
     ids: impl IntoIterator<Item = ObjectId>,
 ) -> Result<BTreeMap<ObjectId, Bytes>, StorageError>
