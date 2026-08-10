@@ -47,6 +47,15 @@ pub(crate) struct StateKey {
     pub(crate) entity_pk: EntityPk,
 }
 
+/// Half-open bounds for a canonical byte prefix. `upper == None` means that
+/// the prefix has no finite lexicographic successor and therefore extends to
+/// the end of the key space.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalPrefixBounds {
+    pub(crate) lower: Vec<u8>,
+    pub(crate) upper: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StateValueRef {
     pub(crate) page_object_id: ObjectId,
@@ -176,6 +185,78 @@ pub(crate) fn encode_state_entity_prefix(schema_key: &str, entity_pk: &EntityPk)
     output
 }
 
+/// Returns the strict lexicographic successor of a byte prefix. Carry is
+/// propagated from the end, and an all-`0xff` prefix has no finite successor.
+pub(crate) fn exclusive_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for index in (0..upper.len()).rev() {
+        if upper[index] != u8::MAX {
+            upper[index] += 1;
+            upper.truncate(index + 1);
+            return Some(upper);
+        }
+    }
+    None
+}
+
+pub(crate) fn encode_state_entity_prefix_bounds(
+    schema_key: &str,
+    entity_pk: &EntityPk,
+) -> CanonicalPrefixBounds {
+    let lower = encode_state_entity_prefix(schema_key, entity_pk);
+    let upper = exclusive_prefix_upper_bound(&lower);
+    CanonicalPrefixBounds { lower, upper }
+}
+
+fn encode_untracked_branch_prefix(branch_id: CanonicalBranchId) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(UNTRACKED_KEY_MAGIC.len() + 16);
+    prefix.extend_from_slice(UNTRACKED_KEY_MAGIC);
+    prefix.extend_from_slice(branch_id.as_bytes());
+    prefix
+}
+
+/// Builds canonical bounds for the selected branch's untracked rows. The
+/// optional state-key bounds are full canonical state keys and remain
+/// half-open; the finite upper bound is otherwise the successor of the
+/// branch prefix, so another branch can never enter the scan.
+pub(crate) fn encode_untracked_branch_range_bounds(
+    branch_id: CanonicalBranchId,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> Result<CanonicalPrefixBounds, LixError> {
+    let prefix = encode_untracked_branch_prefix(branch_id);
+    let canonical_bound = |bytes: &[u8], name: &str| -> Result<Vec<u8>, LixError> {
+        let decoded = decode_state_key(bytes)?;
+        let canonical = encode_state_key(StateKeyRef {
+            schema_key: &decoded.schema_key,
+            file_id: decoded.file_id.as_deref(),
+            entity_pk: &decoded.entity_pk,
+        });
+        if canonical != bytes {
+            return Err(state_error(format!("{name} is not canonically encoded")));
+        }
+        Ok(canonical)
+    };
+    let lower = lower
+        .map(|bytes| canonical_bound(bytes, "untracked lower bound"))
+        .transpose()?
+        .map_or_else(
+            || prefix.clone(),
+            |bytes| [prefix.as_slice(), bytes.as_slice()].concat(),
+        );
+    let upper = upper
+        .map(|bytes| canonical_bound(bytes, "untracked upper bound"))
+        .transpose()?
+        .map_or_else(
+            || exclusive_prefix_upper_bound(&prefix),
+            |bytes| Some([prefix.as_slice(), bytes.as_slice()].concat()),
+        );
+    if upper.as_ref().is_some_and(|upper| lower > *upper) {
+        return Err(state_error("untracked range bounds are inverted"));
+    }
+    Ok(CanonicalPrefixBounds { lower, upper })
+}
+
 fn write_entity_pk(output: &mut Vec<u8>, entity_pk: &EntityPk) {
     output.push(ENTITY_PK_CODEC_V1);
     for (index, component) in entity_pk.components.iter().enumerate() {
@@ -253,9 +334,8 @@ pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<StateValueRef, LixError
 
 pub(crate) fn encode_untracked_key(branch_id: CanonicalBranchId, key: StateKeyRef<'_>) -> Vec<u8> {
     let state_key = encode_state_key(key);
-    let mut output = Vec::with_capacity(UNTRACKED_KEY_MAGIC.len() + 16 + state_key.len());
-    output.extend_from_slice(UNTRACKED_KEY_MAGIC);
-    output.extend_from_slice(branch_id.as_bytes());
+    let mut output = encode_untracked_branch_prefix(branch_id);
+    output.reserve(state_key.len());
     output.extend_from_slice(&state_key);
     output
 }

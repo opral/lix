@@ -2038,6 +2038,9 @@ pub(crate) async fn state_range_on_roots<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
     // This is an internal authenticated merge, not a public pagination
     // boundary.  A 64-row page repeatedly descended the same immutable tree
     // (sixteen times for the common 1K entity scan), dominating broad reads
@@ -2045,90 +2048,102 @@ where
     // working set bounded while amortizing one tree proof across a useful
     // OLTP batch.
     const STATE_RANGE_PAGE_SIZE: usize = 4_096;
-    let page_size = STATE_RANGE_PAGE_SIZE;
-    let mut selected = Vec::new();
+    let page_size = limit.map_or(STATE_RANGE_PAGE_SIZE, |limit| {
+        limit.max(1).min(STATE_RANGE_PAGE_SIZE)
+    });
     let mut global_cursor = None;
     let mut local_cursor = None;
     let mut global = std::collections::VecDeque::new();
     let mut local = std::collections::VecDeque::new();
     let mut global_done = false;
     let mut local_done = local_state_root.is_none();
+    let mut output = Vec::new();
     loop {
-        if global.is_empty() && !global_done {
-            let page = scan_bounded_page_on_read(
-                global_state_root,
-                "state",
-                lower,
-                upper,
-                global_cursor.as_deref(),
-                page_size,
-                read,
-            )
-            .await?;
-            global_done = page.len() < page_size;
-            global_cursor = page.last().map(|(key, _)| key.clone());
-            global.extend(page);
-        }
-        if local.is_empty() && !local_done {
-            let page = scan_bounded_page_on_read(
-                local_state_root.expect("local state root is present while scanning"),
-                "state",
-                lower,
-                upper,
-                local_cursor.as_deref(),
-                page_size,
-                read,
-            )
-            .await?;
-            local_done = page.len() < page_size;
-            local_cursor = page.last().map(|(key, _)| key.clone());
-            local.extend(page);
-        }
-        if global.is_empty() && local.is_empty() {
-            break;
-        }
-        let take_local = match (global.front(), local.front()) {
-            (None, Some(_)) => true,
-            (Some(_), None) => false,
-            (Some((global_key, _)), Some((local_key, _))) => local_key <= global_key,
-            (None, None) => break,
-        };
-        let (key, encoded, source) = if take_local {
-            let (key, value) = local.pop_front().expect("front local state row");
-            if global
-                .front()
-                .is_some_and(|(global_key, _)| *global_key == key)
-            {
-                global.pop_front();
+        let mut selected = Vec::with_capacity(page_size);
+        while selected.len() < page_size {
+            if global.is_empty() && !global_done {
+                let page = scan_bounded_page_on_read(
+                    global_state_root,
+                    "state",
+                    lower,
+                    upper,
+                    global_cursor.as_deref(),
+                    page_size,
+                    read,
+                )
+                .await?;
+                global_done = page.len() < page_size;
+                global_cursor = page.last().map(|(key, _)| key.clone());
+                global.extend(page);
             }
-            (key, value, StateSource::Branch)
-        } else {
-            let (key, value) = global.pop_front().expect("front global state row");
-            (key, value, StateSource::Global)
-        };
-        selected.push(Some((key, encoded, source)));
-    }
-    let values = resolve_state_values_on_read(read, &selected).await?;
-    let mut output = Vec::with_capacity(values.len());
-    for (selected, value) in selected.into_iter().zip(values) {
-        let Some((key, _, source)) = selected else {
-            continue;
-        };
-        let Some((value, resolved_source)) = value else {
-            return Err(corruption("selected state leaf did not resolve"));
-        };
-        if source != resolved_source {
-            return Err(corruption("state range source changed during resolution"));
+            if local.is_empty() && !local_done {
+                let page = scan_bounded_page_on_read(
+                    local_state_root.expect("local state root is present while scanning"),
+                    "state",
+                    lower,
+                    upper,
+                    local_cursor.as_deref(),
+                    page_size,
+                    read,
+                )
+                .await?;
+                local_done = page.len() < page_size;
+                local_cursor = page.last().map(|(key, _)| key.clone());
+                local.extend(page);
+            }
+            if global.is_empty() && local.is_empty() {
+                break;
+            }
+            let take_local = match (global.front(), local.front()) {
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (Some((global_key, _)), Some((local_key, _))) => local_key <= global_key,
+                (None, None) => break,
+            };
+            let (key, encoded, source) = if take_local {
+                let (key, value) = local.pop_front().expect("front local state row");
+                if global
+                    .front()
+                    .is_some_and(|(global_key, _)| *global_key == key)
+                {
+                    global.pop_front();
+                }
+                (key, value, StateSource::Branch)
+            } else {
+                let (key, value) = global.pop_front().expect("front global state row");
+                (key, value, StateSource::Global)
+            };
+            selected.push(Some((key, encoded, source)));
+            if include_tombstones
+                && limit.is_some_and(|limit| output.len() + selected.len() >= limit)
+            {
+                break;
+            }
         }
-        if source == StateSource::Global && matches!(value.cell, StateCell::Tombstone) {
-            return Err(corruption("global state tree contains a tombstone"));
-        }
-        if value.cell.deleted() && !include_tombstones {
-            continue;
-        }
-        output.push((key, value, source));
-        if limit.is_some_and(|limit| output.len() >= limit) {
+        if selected.is_empty() {
             break;
+        }
+        let values = resolve_state_values_on_read(read, &selected).await?;
+        for (selected, value) in selected.into_iter().zip(values) {
+            let Some((key, _, source)) = selected else {
+                continue;
+            };
+            let Some((value, resolved_source)) = value else {
+                return Err(corruption("selected state leaf did not resolve"));
+            };
+            if source != resolved_source {
+                return Err(corruption("state range source changed during resolution"));
+            }
+            if source == StateSource::Global && matches!(value.cell, StateCell::Tombstone) {
+                return Err(corruption("global state tree contains a tombstone"));
+            }
+            if value.cell.deleted() && !include_tombstones {
+                continue;
+            }
+            output.push((key, value, source));
+            if limit.is_some_and(|limit| output.len() >= limit) {
+                return Ok(output);
+            }
         }
     }
     Ok(output)
