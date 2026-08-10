@@ -49,7 +49,7 @@ use super::values::{required_bool_value, required_string_value};
 pub(super) async fn register_lix_branch_read_provider<R>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    state: ForkTreeStateView<R>,
+    state: &ForkTreeStateView<R>,
     branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError>
 where
@@ -59,7 +59,7 @@ where
         session,
         surface_name,
         Arc::new(BranchSpec {
-            state: BranchState::Committed(state),
+            state: BranchState::Committed(state.clone()),
             branch_ref,
         }),
         WriteAccess::read_only(),

@@ -150,7 +150,7 @@ pub(super) async fn register_lix_directory_active_provider<R>(
     session: &SessionContext,
     surface_name: &str,
     active_branch_id: &str,
-    state: ForkTreeStateView<R>,
+    state: &ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
@@ -163,7 +163,7 @@ where
         surface_name,
         Arc::new(LixDirectorySpec::active_branch(
             active_branch_id,
-            DirectoryState::Committed(state),
+            DirectoryState::Committed(state.clone()),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -175,8 +175,7 @@ where
 pub(super) async fn register_lix_directory_by_branch_provider<R>(
     session: &SessionContext,
     surface_name: &str,
-    active_branch_id: &str,
-    state: ForkTreeStateView<R>,
+    state: &ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
@@ -187,9 +186,8 @@ where
     register_spec_table(
         session,
         surface_name,
-        Arc::new(LixDirectorySpec::by_branch(
-            active_branch_id,
-            DirectoryState::Committed(state),
+        Arc::new(LixDirectorySpec::by_branch_read(
+            DirectoryState::Committed(state.clone()),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -513,6 +511,26 @@ where
             schema: lix_directory_by_branch_schema(),
             state,
             state_branch_id: active_branch_id,
+            filesystem_path_index,
+            branch_ref,
+            functions,
+            branch_binding: BranchBinding::explicit(),
+        }
+    }
+
+    fn by_branch_read(
+        state: DirectoryState<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        functions: FunctionProviderHandle,
+    ) -> Self {
+        Self {
+            schema: lix_directory_by_branch_schema(),
+            state,
+            // Read planning resolves an unqualified by-branch request to all
+            // visible branches. This fallback is used only by helpers that
+            // bypass that planning step; global is the neutral owner there.
+            state_branch_id: GLOBAL_BRANCH_ID.to_string(),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -2091,7 +2109,7 @@ fn lix_directory_record_batch_from_filesystem_rows(
 ) -> Result<RecordBatch, LixError> {
     let mut directory_rows = Vec::new();
 
-    for row in &filesystem_rows {
+    for row in filesystem_rows.iter() {
         if row.schema_key() != DIRECTORY_SCHEMA_KEY || row.deleted() {
             continue;
         }
@@ -2141,7 +2159,7 @@ fn indexed_lix_directory_record_batch(
                     parent_id: entry.parent_id.clone(),
                     name: entry.name.clone(),
                     key: entry.key.clone(),
-                    live: entry.live_row(),
+                    live: entry.state_row(),
                 },
                 Some(entry.path.clone()),
             )
@@ -2604,7 +2622,7 @@ mod tests {
     }
 
     fn branch_state_row(key: u8, source: StateRowSource) -> StateRow {
-        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(u64::from(key));
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(i64::from(key));
         StateRow {
             key: vec![key],
             value: StateValue {
@@ -2718,9 +2736,10 @@ mod tests {
         branch_binding: BranchBinding,
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
-        let state = Arc::new(write_ctx.clone());
+        let write_state = Arc::new(write_ctx.clone());
         let branch_ref = Arc::new(write_ctx.clone());
-        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = state.clone();
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = write_state;
+        let state = DirectoryState::Transaction(write_ctx.state_view().clone());
         let spec = match branch_binding {
             BranchBinding::Active { .. } => LixDirectorySpec::active_branch(
                 write_ctx.active_branch_id(),
@@ -2730,6 +2749,7 @@ mod tests {
                 test_functions(),
             ),
             BranchBinding::Explicit => LixDirectorySpec::by_branch(
+                write_ctx.active_branch_id(),
                 state,
                 filesystem_path_index,
                 branch_ref,
@@ -2746,8 +2766,8 @@ mod tests {
         filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
-        let state = Arc::new(write_ctx.clone());
         let branch_ref = Arc::new(write_ctx.clone());
+        let state = DirectoryState::Transaction(write_ctx.state_view().clone());
         let spec = LixDirectorySpec::active_branch(
             write_ctx.active_branch_id(),
             state,
@@ -3005,7 +3025,7 @@ mod tests {
             id: "01920000-0000-7000-8000-0000000000d3".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            key: FilesystemDescriptorKey::from_live_row(
+            key: FilesystemDescriptorKey::from_state_row(
                 &root_live,
                 "01920000-0000-7000-8000-0000000000d3",
             ),
@@ -3015,7 +3035,7 @@ mod tests {
             id: "01920000-0000-7000-8000-000000000313".to_string(),
             parent_id: Some("01920000-0000-7000-8000-0000000000d3".to_string()),
             name: "guides".to_string(),
-            key: FilesystemDescriptorKey::from_live_row(
+            key: FilesystemDescriptorKey::from_state_row(
                 &child_live,
                 "01920000-0000-7000-8000-000000000313",
             ),
@@ -3761,9 +3781,10 @@ mod tests {
     fn directory_provider_keeps_no_write_authority() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let state = Arc::new(write_ctx.clone());
+        let write_state = Arc::new(write_ctx.clone());
         let branch_ref = Arc::new(write_ctx.clone());
-        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = state.clone();
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = write_state;
+        let state = DirectoryState::Transaction(write_ctx.state_view().clone());
         let provider = SpecTableProvider::new(Arc::new(LixDirectorySpec::active_branch(
             write_ctx.active_branch_id(),
             state,
