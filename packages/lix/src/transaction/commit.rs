@@ -268,6 +268,41 @@ where
         .collect::<Vec<_>>();
     debug_assert!(!tracked_rows.is_empty());
 
+    let complete_replacement_bounds = prepared_writes
+        .state_rows
+        .complete_collection_replacement_proof()
+        .map(|proof| {
+            let first = tracked_rows
+                .first()
+                .copied()
+                .ok_or_else(|| writer_error("complete replacement contains no rows"))?;
+            if proof.replay_bytes == 0
+                || proof.ordered_identity_digest
+                    != crate::collection_generation::ordered_single_string_identity_digest(
+                        tracked_rows.iter().map(|row| row.entity_pk),
+                    )
+                    .ok_or_else(|| {
+                        writer_error("complete replacement has a non-string primary key")
+                    })?
+                || tracked_rows.iter().any(|row| {
+                    row.schema_key != first.schema_key
+                        || row.file_id.is_some()
+                        || row.branch_id != first.branch_id
+                        || row.global
+                        || row.untracked
+                        || row.snapshot.is_none()
+                })
+            {
+                return Err(writer_error(
+                    "complete replacement proof disagrees with its canonical row range",
+                ));
+            }
+            let bounds =
+                encode_state_entity_prefix_bounds(first.schema_key.as_str(), &EntityPk::empty());
+            Ok((bounds.lower, bounds.upper))
+        })
+        .transpose()?;
+
     let change_refs = prepared_writes
         .commit_change_refs_by_branch
         .get(&branch_id)
@@ -306,7 +341,16 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let previous_rows = state_points(&view, &tracked_keys, true).await?;
+    let previous_rows = if complete_replacement_bounds.is_some() {
+        // The complete-set certificate proves that every ordered identity is
+        // the current collection.  Reading every predecessor would recreate
+        // the O(N log N) point path this root replacement is intended to cut.
+        std::iter::repeat_with(|| None)
+            .take(tracked_rows.len())
+            .collect()
+    } else {
+        state_points(&view, &tracked_keys, true).await?
+    };
     if previous_rows.len() != tracked_rows.len() {
         return Err(writer_error(
             "ForkTree predecessor lookup returned the wrong slot count",
@@ -369,6 +413,9 @@ where
     }
     let member_pages = CommitChangePageV2::encode_pages(forktree_commit_id(commit_id), &members)?;
     let mut state_mutations = Vec::with_capacity(pending_rows.len());
+    let mut replacement_entries = complete_replacement_bounds
+        .as_ref()
+        .map(|_| Vec::with_capacity(pending_rows.len()));
     for ((row, key, previous, blob_manifest_object_ids), location) in
         pending_rows.into_iter().zip(&member_pages.member_locations)
     {
@@ -384,6 +431,10 @@ where
                 tombstone: row.snapshot.is_none(),
                 blob_manifest_object_ids,
             };
+            if let Some(entries) = &mut replacement_entries {
+                entries.push((key, encoded, audit));
+                continue;
+            }
             let exists_at_target_root = previous
                 .as_ref()
                 .is_some_and(|value| global || value.source == StateSource::Branch);
@@ -405,7 +456,14 @@ where
     } else {
         view.branch_snapshot().local_state_root
     };
-    let state_edit = view.edit_state_tree(state_base, state_mutations).await?;
+    let state_edit = if let (Some((lower, upper)), Some(entries)) =
+        (complete_replacement_bounds, replacement_entries)
+    {
+        view.replace_state_tree_range(state_base, lower, upper, entries)
+            .await?
+    } else {
+        view.edit_state_tree(state_base, state_mutations).await?
+    };
 
     let expected_parent = commit_parent_heads
         .get(&branch_id)

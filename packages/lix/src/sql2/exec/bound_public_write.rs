@@ -1332,7 +1332,22 @@ async fn try_execute_direct_path_value_replacement_batch(
             }
         }
     }
+    // A generation marker is only an acceleration hint.  When an older
+    // collection has no marker, authenticate the complete visible range once
+    // and compare its cardinality with the already exact, ordered candidate
+    // set.  This is the one O(N) read needed to prove a root replacement; it
+    // replaces N predecessor lookups and N path-copy publications below.
+    let exact_collection_count = if !certified_generation_identity
+        && candidates.len() == unique_row_count
+        && !has_staged_collection_rows
+    {
+        ctx.load_exact_collection_live_count(&active_branch_id, scope)
+            .await?
+    } else {
+        None
+    };
     let replaces_complete_collection = certified_generation_identity
+        || exact_collection_count == Some(unique_row_count as u64)
         || (candidates.len() == unique_row_count
             && collection_generation
                 .is_some_and(|generation| generation.live_count == unique_row_count as u64));
