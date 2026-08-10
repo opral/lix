@@ -1206,6 +1206,60 @@ impl PreparedWriteSet {
         Ok(())
     }
 
+    /// Promotes certified complete-replacement columns into the native
+    /// prepared state batch consumed by the ForkTree publication compiler.
+    ///
+    /// A drained journal is already authenticated and carries its complete
+    /// replacement certificate, so this is a typed column handoff—not a
+    /// compatibility materialization or a second state authority. Keeping
+    /// the handoff here also lets one prepared write set contain journals for
+    /// multiple branch owners before the single publication is assembled.
+    pub(crate) fn promote_complete_ordered_mutation_journals(&mut self) -> Result<(), LixError> {
+        let mut journals = Vec::new();
+        for (branch_id, refs) in &mut self.commit_change_refs_by_branch {
+            if let Some(journal) = refs.take_ordered_mutation_journal() {
+                journals.push((refs.commit_id, branch_id.clone(), journal));
+            }
+        }
+        for intermediate in &mut self.intermediate_commits {
+            if let Some(journal) = intermediate.change_refs.take_ordered_mutation_journal() {
+                journals.push((
+                    intermediate.change_refs.commit_id,
+                    intermediate.branch_id.clone(),
+                    journal,
+                ));
+            }
+        }
+        if journals.is_empty() {
+            return Ok(());
+        }
+        if !self.state_rows.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "complete immutable journals overlap native prepared state rows",
+            ));
+        }
+
+        for (commit_id, branch_id, journal) in journals {
+            if journal.commit_id() != commit_id || journal.branch_id() != branch_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "complete immutable journal commit or branch owner changed",
+                ));
+            }
+            let journal = Arc::try_unwrap(journal).unwrap_or_else(|journal| (*journal).clone());
+            let rows = journal.into_prepared()?;
+            let previous_len = self.state_rows.len();
+            let row_count = rows.len();
+            self.state_rows.append(rows);
+            self.insert_selection.resize_rows(previous_len);
+            for _ in 0..row_count {
+                self.insert_selection.push_not_insert();
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn append_cohort_member(
         &mut self,
         mut other: Self,
@@ -3298,6 +3352,65 @@ mod staging_semantics_tests {
             2
         );
         assert_eq!(drained.state_rows.row(0).commit_id, Some(test_commit_id(1)));
+    }
+
+    #[test]
+    fn certified_ordered_journal_promotes_to_native_prepared_rows() {
+        let staged = test_staged_writes();
+        let identities = [EntityPk::single("alpha"), EntityPk::single("beta")];
+        let identity_digest =
+            crate::collection_generation::ordered_single_string_identity_digest(identities.iter())
+                .expect("test identities are single strings");
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+            SchemaPlanId::for_test(0),
+            "lix_key_value".into(),
+            TEST_BRANCH.into(),
+            None,
+            b"alphabeta".to_vec(),
+            vec![(0, 5), (5, 9)],
+            br#"{"key":"alpha","value":"one"}{"key":"beta","value":"two"}"#.to_vec(),
+            vec![(0, 29), (29, 57)],
+            None,
+            LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00.000Z"),
+        )
+        .expect("ordered journal chunk should validate");
+        assert!(matches!(
+            staged.stage_immutable_mutation_chunk(chunk),
+            Ok(ImmutableMutationChunkStage::Staged)
+        ));
+        assert!(
+            staged
+                .certify_complete_collection_replacement(
+                    "lix_key_value",
+                    TEST_BRANCH,
+                    2,
+                    identity_digest,
+                )
+                .expect("complete replacement should certify")
+        );
+
+        let mut prepared = staged.drain().expect("certified journal should drain");
+        assert!(prepared.state_rows.is_empty());
+        assert!(
+            prepared
+                .commit_change_refs_by_branch
+                .get(TEST_BRANCH)
+                .and_then(StagedCommitChangeRefs::ordered_mutation_journal)
+                .is_some()
+        );
+        prepared
+            .promote_complete_ordered_mutation_journals()
+            .expect("certified journal should use native prepared rows");
+        assert_eq!(prepared.state_rows.len(), 2);
+        assert_eq!(prepared.state_rows.row(0).entity_pk, &identities[0]);
+        assert_eq!(prepared.state_rows.row(1).entity_pk, &identities[1]);
+        assert!(
+            prepared
+                .commit_change_refs_by_branch
+                .get(TEST_BRANCH)
+                .and_then(StagedCommitChangeRefs::ordered_mutation_journal)
+                .is_none()
+        );
     }
 
     #[test]

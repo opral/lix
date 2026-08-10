@@ -190,6 +190,12 @@ pub(crate) async fn prepare_forktree_publication_with_parent_heads<R>(
 where
     R: StorageAdapterRead + Clone,
 {
+    // Complete immutable mutation journals are already certified native
+    // columns. Promote them into the same typed prepared-row input used by
+    // the ForkTree compiler before classifying owners, so multi-branch plans
+    // reach the one batched PreparedPublication instead of the old sentinel.
+    let mut prepared_writes = prepared_writes;
+    prepared_writes.promote_complete_ordered_mutation_journals()?;
     let intent = classify_publication_intent(&prepared_writes, runtime_checkpoint)?;
     if publication_owner_branch_ids(&prepared_writes, runtime_checkpoint.is_some()).len() > 1 {
         return Box::pin(prepare_batched_forktree_publication(
@@ -1529,23 +1535,6 @@ fn classify_publication_intent(
     prepared: &PreparedWriteSet,
     runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
 ) -> Result<PublicationIntent, LixError> {
-    // Commit intent is independent of current-state row count. Inspect every
-    // semantic owner before opening a view or constructing a publication, so
-    // an unsupported ref/history cohort cannot publish unrelated untracked
-    // state or rotate the global epoch while silently dropping its commit.
-    for refs in prepared.commit_change_refs_by_branch.values().chain(
-        prepared
-            .intermediate_commits
-            .iter()
-            .map(|commit| &commit.change_refs),
-    ) {
-        if refs.ordered_mutation_journal().is_some() {
-            return Err(writer_error(
-                "immutable mutation journals require the ForkTree bulk lowering slice",
-            ));
-        }
-    }
-
     let mut expected_commits = BTreeMap::<CommitId, (&str, usize, bool)>::new();
     for (branch_id, refs) in &prepared.commit_change_refs_by_branch {
         if expected_commits
