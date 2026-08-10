@@ -216,7 +216,7 @@ impl JsonStoreWriter {
         .expect("JSON reclaim candidate descriptors are built from arena offsets");
         // The write-set helper coalesces an identical hint emitted by an
         // earlier current-state staging call in the same atomic commit.
-        writes.stage_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
+        writes.stage_content_addressed_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
     }
 
     /// Removes only candidate hints whose payload was proved dead (or whose
