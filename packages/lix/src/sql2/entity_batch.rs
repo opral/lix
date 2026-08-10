@@ -103,7 +103,7 @@ pub(crate) async fn scan_forktree<S>(
     request: &EntityScanRequest,
 ) -> Result<Vec<StateRow>, LixError>
 where
-    S: StorageAdapterRead + Clone,
+    S: StorageAdapterRead,
 {
     if matches!(request.filter.rows, EntityRowSelection::None) {
         return Ok(Vec::new());
@@ -130,7 +130,7 @@ pub(crate) async fn scan_transaction<S>(
     request: &EntityScanRequest,
 ) -> Result<Vec<StateRow>, LixError>
 where
-    S: StorageAdapterRead + Clone,
+    S: StorageAdapterRead,
 {
     if matches!(request.filter.rows, EntityRowSelection::None) {
         return Ok(Vec::new());
@@ -157,7 +157,7 @@ pub(crate) async fn exact_forktree<S>(
     request: &EntityExactBatchRequest,
 ) -> Result<Vec<Option<EntityStateSlot>>, LixError>
 where
-    S: StorageAdapterRead + Clone,
+    S: StorageAdapterRead,
 {
     exact_forktree_inner(view, request).await
 }
@@ -167,7 +167,7 @@ async fn exact_forktree_inner<S>(
     request: &EntityExactBatchRequest,
 ) -> Result<Vec<Option<EntityStateSlot>>, LixError>
 where
-    S: StorageAdapterRead + Clone,
+    S: StorageAdapterRead,
 {
     let keys = request
         .rows
@@ -200,7 +200,7 @@ pub(crate) async fn exact_transaction<S>(
     request: &EntityExactBatchRequest,
 ) -> Result<Vec<Option<EntityStateSlot>>, LixError>
 where
-    S: StorageAdapterRead + Clone,
+    S: StorageAdapterRead,
 {
     let keys = request
         .rows
@@ -242,7 +242,7 @@ fn merge_exact_slots(
         ));
     }
     let mut output = Vec::with_capacity(keys.len());
-    for (((requested, key), tracked), untracked) in
+    for (((requested, _key), tracked), untracked) in
         request.rows.iter().zip(keys).zip(tracked).zip(untracked)
     {
         let slot = if let Some(row) = untracked {
@@ -379,8 +379,8 @@ mod tests {
                 entity_pk: &entity_pk,
             }),
             value: StateValue {
-                change_id: ChangeId::new(uuid::Uuid::from_bytes([1; 16])),
-                commit_id: CommitId::new(uuid::Uuid::from_bytes([2; 16])),
+                change_id: ChangeId::for_test_label("entity-batch-change"),
+                commit_id: CommitId::for_test_label("entity-batch-commit"),
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
                 cell,

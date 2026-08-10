@@ -433,6 +433,16 @@ where
         let slots = exact_transaction(write_ctx.state_view(), &exact_request)
             .await
             .map_err(lix_error_to_datafusion_error)?;
+        let slots = slots
+            .into_iter()
+            .map(|slot| {
+                slot.ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "entity UPDATE RETURNING post-image is missing an updated row".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let batch = entity_record_batch_from_slots(
             &self.spec,
             Arc::clone(&self.schema),
@@ -468,7 +478,7 @@ where
 
     async fn plan_update_with_post_image(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
         returning: Option<DmlReturning>,
@@ -480,7 +490,7 @@ where
         let source = row_source(
             (provider, schema, request, exact_request, row_filters),
             move |(provider, schema, request, exact_request, row_filters)| async move {
-                let (rows, exact_branch_id) = if let Some(exact_request) = exact_request {
+                let rows = if let Some(exact_request) = exact_request {
                     let exact_branch_id =
                         exact_request.rows.first().map(|row| row.branch_id.clone());
                     let slots = provider
@@ -496,13 +506,10 @@ where
                     )?;
                     return Ok(batch);
                 } else {
-                    (
-                        provider
-                            .scan_rows(&request)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?,
-                        None,
-                    )
+                    provider
+                        .scan_rows(&request)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
                 };
                 let filtered = apply_entity_state_filters(rows, &row_filters)?;
                 entity_record_batch_from_state_rows(&provider.spec, schema, &filtered)
@@ -595,9 +602,9 @@ where
         {
             TableProviderFilterPushDown::Exact
         } else if row_filter_analyzer.supports(filter) {
-            // Retain a DataFusion residual even when the row-shaped fallback
-            // also evaluates the predicate. Immutable columnar layouts use
-            // this residual for general typed filtering without a query-shape
+            // Retain a DataFusion residual while the native row projection
+            // evaluates the predicate. Immutable columnar layouts use this
+            // residual for general typed filtering without a query-shape
             // recognizer; later row-group pruning remains an inexact subset.
             TableProviderFilterPushDown::Inexact
         } else {
@@ -2190,31 +2197,32 @@ fn entity_slot_column_array(
         .iter()
         .map(|snapshot| snapshot.as_ref().and_then(|value| value.get(column_name)))
         .collect::<Vec<_>>();
-    Ok(match column_type {
+    let array: ArrayRef = match column_type {
         EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
             values
                 .iter()
                 .map(|value| entity_json_text_value(*value, column_type))
                 .collect::<Result<Vec<_>>>()?,
-        )) as ArrayRef,
+        )),
         EntityColumnType::Integer => Arc::new(Int64Array::from(
             values
                 .iter()
                 .map(|value| entity_i64_value(*value, &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
-        )) as ArrayRef,
+        )),
         EntityColumnType::Number => Arc::new(Float64Array::from(
             values
                 .iter()
                 .map(|value| entity_f64_value(*value, &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
-        )) as ArrayRef,
+        )),
         EntityColumnType::Boolean => Arc::new(BooleanArray::from_iter(
             values
                 .iter()
                 .map(|value| value.and_then(JsonValue::as_bool)),
-        )) as ArrayRef,
-    })
+        )),
+    };
+    Ok(array)
 }
 
 fn slot_state_key(slot: &EntityStateSlot) -> Result<crate::forktree::StateKey, LixError> {
@@ -2267,7 +2275,8 @@ fn entity_slot_system_column_array(
     let keys = slots
         .iter()
         .map(slot_state_key)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(lix_error_to_datafusion_error)?;
     let branch_ids = slots
         .iter()
         .map(|slot| {
@@ -2281,68 +2290,74 @@ fn entity_slot_system_column_array(
                 EntityStateSlot::Untracked(_) => slot_value(slot)?.5,
             })
         })
-        .collect::<Result<Vec<Option<String>>, LixError>>()?;
-    let array = match column_name {
+        .collect::<Result<Vec<Option<String>>, LixError>>()
+        .map_err(lix_error_to_datafusion_error)?;
+    let array: ArrayRef = match column_name {
         "entity_pk" => Arc::new(StringArray::from(
             keys.iter()
                 .map(|key| key.entity_pk.as_json_array_text().map(Some))
-                .collect::<Result<Vec<_>, LixError>>()?
+                .collect::<Result<Vec<_>, LixError>>()
+                .map_err(lix_error_to_datafusion_error)?
                 .into_iter()
                 .collect::<Vec<_>>(),
-        )) as ArrayRef,
+        )),
         "schema_key" => Arc::new(StringArray::from_iter(
             keys.iter().map(|key| Some(key.schema_key.clone())),
-        )) as ArrayRef,
+        )),
         "file_id" => Arc::new(StringArray::from_iter(
             keys.iter().map(|key| key.file_id.clone()),
-        )) as ArrayRef,
+        )),
         "snapshot_content" => Arc::new(StringArray::from_iter(
             slots.iter().map(|slot| slot_snapshot(slot)),
-        )) as ArrayRef,
+        )),
         "metadata" => Arc::new(StringArray::from_iter(
             slots
                 .iter()
                 .map(|slot| {
                     slot_value(slot).map(|value| value.1.map(crate::serialize_row_metadata))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-        )) as ArrayRef,
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(lix_error_to_datafusion_error)?,
+        )),
         "created_at" => Arc::new(StringArray::from_iter(slots.iter().map(
             |slot| match slot {
                 EntityStateSlot::Tracked(row) => Some(row.value.created_at.to_string()),
                 EntityStateSlot::Untracked(row) => Some(row.value.created_at.to_string()),
             },
-        ))) as ArrayRef,
+        ))),
         "updated_at" => Arc::new(StringArray::from_iter(slots.iter().map(
             |slot| match slot {
                 EntityStateSlot::Tracked(row) => Some(row.value.updated_at.to_string()),
                 EntityStateSlot::Untracked(row) => Some(row.value.updated_at.to_string()),
             },
-        ))) as ArrayRef,
+        ))),
         "global" => Arc::new(BooleanArray::from_iter(
             slots
                 .iter()
                 .map(|slot| slot_value(slot).map(|value| Some(value.4)))
-                .collect::<Result<Vec<_>, _>>()?,
-        )) as ArrayRef,
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(lix_error_to_datafusion_error)?,
+        )),
         "change_id" => Arc::new(StringArray::from_iter(
             slots
                 .iter()
                 .map(|slot| slot_value(slot).map(|value| value.2.map(|id| id.to_string())))
-                .collect::<Result<Vec<_>, _>>()?,
-        )) as ArrayRef,
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(lix_error_to_datafusion_error)?,
+        )),
         "commit_id" => Arc::new(StringArray::from_iter(
             slots
                 .iter()
                 .map(|slot| slot_value(slot).map(|value| value.3.map(|id| id.to_string())))
-                .collect::<Result<Vec<_>, _>>()?,
-        )) as ArrayRef,
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(lix_error_to_datafusion_error)?,
+        )),
         "untracked" => Arc::new(BooleanArray::from_iter(
             slots
                 .iter()
                 .map(|slot| Some(matches!(slot, EntityStateSlot::Untracked(_)))),
-        )) as ArrayRef,
-        "branch_id" => Arc::new(StringArray::from_iter(branch_ids)) as ArrayRef,
+        )),
+        "branch_id" => Arc::new(StringArray::from_iter(branch_ids)),
         _ => {
             return Err(DataFusionError::Execution(format!(
                 "sql2 entity provider does not support system column 'lixcol_{column_name}'"
@@ -2586,10 +2601,11 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};
     use crate::forktree::{
-        CanonicalBranchId, ChangeId, CommitId, StateCell, StateKeyRef, StateValue, UntrackedValue,
-        decode_state_key, encode_state_key,
+        CanonicalBranchId, StateCell, StateKeyRef, StateValue, UntrackedValue, decode_state_key,
+        encode_state_key,
     };
     use crate::state::{
         StagedStateRow, StateRow, StateRowSource, TransactionStateView, UntrackedStateRow,
@@ -2615,8 +2631,8 @@ mod tests {
                 entity_pk: &entity_pk,
             }),
             value: StateValue {
-                change_id: ChangeId::from_bytes([1; 16]),
-                commit_id: CommitId::from_bytes([2; 16]),
+                change_id: ChangeId::for_test_label("entity-change"),
+                commit_id: CommitId::for_test_label("entity-commit"),
                 created_at: timestamp(1),
                 updated_at: timestamp(2),
                 cell: StateCell::Value(SharedStr::from(format!(r#"{{"body":"{entity}"}}"#))),
@@ -2723,8 +2739,8 @@ mod tests {
                 entity_pk: &EntityPk::single("broken"),
             }),
             value: StateValue {
-                change_id: ChangeId::from_bytes([3; 16]),
-                commit_id: CommitId::from_bytes([4; 16]),
+                change_id: ChangeId::for_test_label("malformed-change"),
+                commit_id: CommitId::for_test_label("malformed-commit"),
                 created_at: timestamp(1),
                 updated_at: timestamp(1),
                 cell: StateCell::Value(SharedStr::from("{not-json")),
@@ -2796,6 +2812,7 @@ mod tests {
             .begin_read(Default::default())
             .await
             .expect("retain one in-memory read");
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(read);
         let committed = ForkTreeStateView::from_facade(
             crate::forktree::ForkTreeReadFacade::new(read),
             GLOBAL_BRANCH_ID,
@@ -2957,7 +2974,7 @@ mod tests {
         let spec = entity_insert_spec_with_primary_key();
         let filters = vec![
             eq_filter("id", "entity-a"),
-            Expr::InList(datafusion::logical_expr::expr::InList::new(
+            Expr::InList(InList::new(
                 Box::new(column("id")),
                 vec![string_literal("entity-b"), string_literal("entity-a")],
                 false,
@@ -2977,7 +2994,7 @@ mod tests {
                 .expect("named file filter analyzes"),
             Some(vec![Some("file-a".to_string())])
         );
-        let multi = Expr::InList(datafusion::logical_expr::expr::InList::new(
+        let multi = Expr::InList(InList::new(
             Box::new(column("lixcol_file_id")),
             vec![string_literal("file-a"), string_literal("file-b")],
             false,
