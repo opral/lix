@@ -9,12 +9,101 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::LixError;
+use crate::common::LixTimestamp;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, ObjectId, StateCell, StateKey, StateSource, StateValue,
     UntrackedValue, VisibleStateRow,
 };
 use crate::storage::StorageError;
 use crate::storage_adapter::StorageAdapterRead;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// Durable predecessor evidence authenticated by a retained ForkTree view.
+/// Only the timestamp needed by publication is carried; row identity and
+/// payload remain owned by the native state view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CertifiedStatePredecessor {
+    created_at: LixTimestamp,
+}
+
+impl CertifiedStatePredecessor {
+    pub(crate) fn new(created_at: LixTimestamp) -> Self {
+        Self { created_at }
+    }
+
+    pub(crate) fn created_at(&self) -> Result<LixTimestamp, LixError> {
+        Ok(self.created_at)
+    }
+}
+
+const DIFF_ID_PREFIX: &str = "d1.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DiffSides {
+    pub(crate) before: Option<crate::changelog::ChangeId>,
+    pub(crate) after: Option<crate::changelog::ChangeId>,
+}
+
+pub(crate) fn encode_diff_id(
+    before: Option<crate::changelog::ChangeId>,
+    after: Option<crate::changelog::ChangeId>,
+) -> Result<String, LixError> {
+    if before.is_none() && after.is_none() {
+        return Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "invalid diff_id: a diff must contain at least one side",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(33);
+    bytes.push(u8::from(before.is_some()) + u8::from(after.is_some()) * 2);
+    if let Some(change_id) = before {
+        bytes.extend_from_slice(change_id.as_uuid().as_bytes());
+    }
+    if let Some(change_id) = after {
+        bytes.extend_from_slice(change_id.as_uuid().as_bytes());
+    }
+    Ok(format!("{DIFF_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes)))
+}
+
+pub(crate) fn decode_diff_id(value: &str) -> Result<DiffSides, LixError> {
+    let invalid = |message: &str| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("invalid diff_id: {message}"),
+        )
+    };
+    let payload = value
+        .strip_prefix(DIFF_ID_PREFIX)
+        .ok_or_else(|| invalid("unsupported or missing version"))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| invalid("payload is not valid base64url"))?;
+    let Some(flags) = bytes.first().copied() else {
+        return Err(invalid("payload is empty"));
+    };
+    if flags == 0 || flags & !3 != 0 {
+        return Err(invalid("side flags are invalid"));
+    }
+    let expected = 1 + usize::from(flags & 1 != 0) * 16 + usize::from(flags & 2 != 0) * 16;
+    if bytes.len() != expected {
+        return Err(invalid("payload length does not match its side flags"));
+    }
+    let mut offset = 1;
+    let mut take = |present: bool| {
+        if !present {
+            return None;
+        }
+        let uuid = uuid::Uuid::from_slice(&bytes[offset..offset + 16])
+            .expect("validated diff id UUID slice length");
+        offset += 16;
+        Some(crate::changelog::ChangeId::new(uuid))
+    };
+    Ok(DiffSides {
+        before: take(flags & 1 != 0),
+        after: take(flags & 2 != 0),
+    })
+}
 
 /// One logical row returned by a concrete state view.
 #[derive(Clone, Debug, Eq, PartialEq)]

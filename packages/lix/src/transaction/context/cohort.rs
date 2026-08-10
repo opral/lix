@@ -218,16 +218,6 @@ where
         }
     };
     let validation_read = SharedStorageAdapterRead::new(validation_read);
-    if leader
-        .transaction
-        .validate_prepared_writes_by_branch(&validation_read, &merged_writes)
-        .await
-        .is_err()
-    {
-        let mut individual = vec![leader];
-        individual.extend(members);
-        return commit_prepared_individually(individual).await;
-    }
     for member in &mut members {
         member
             .transaction
@@ -319,7 +309,7 @@ struct CohortSemanticCandidate {
 struct CohortPluginGroup {
     plugin: PluginRegistryEntry,
     descriptor: WasmFileDescriptor,
-    candidates: BTreeMap<TrackedStateKey, Vec<CohortSemanticCandidate>>,
+    candidates: BTreeMap<StateKey, Vec<CohortSemanticCandidate>>,
 }
 
 async fn reconcile_cohort_files<'a, StorageImpl>(
@@ -362,7 +352,7 @@ where
                     "cohort semantic row is missing change_id",
                 )
             })?;
-            let key = TrackedStateKey {
+            let key = StateKey {
                 schema_key: row.schema_key.to_string(),
                 file_id: Some(file_id.to_string()),
                 entity_pk: row.entity_pk.clone(),
@@ -385,8 +375,8 @@ where
     for (file_id, group) in &mut groups {
         let keys = group.candidates.keys().cloned().collect::<Vec<_>>();
         let base_rows = load_historical_rows_at_commit(&facade, opening_head, &keys).await?;
-        let mut frontiers = BTreeMap::<TrackedStateKey, Vec<Option<StaleConflictPayload>>>::new();
-        let mut bases = BTreeMap::<TrackedStateKey, Option<StaleConflictPayload>>::new();
+        let mut frontiers = BTreeMap::<StateKey, Vec<Option<StaleConflictPayload>>>::new();
+        let mut bases = BTreeMap::<StateKey, Option<StaleConflictPayload>>::new();
         let rows = replay_batches
             .entry(file_id.clone())
             .or_insert_with(|| RawWriteBatch::with_capacity(keys.len()));
@@ -416,8 +406,7 @@ where
         while frontiers.values().any(|frontier| frontier.len() > 1) {
             let mut conflicts = Vec::new();
             let mut semantic_conflicts = Vec::new();
-            let mut next_frontiers =
-                BTreeMap::<TrackedStateKey, Vec<Option<StaleConflictPayload>>>::new();
+            let mut next_frontiers = BTreeMap::<StateKey, Vec<Option<StaleConflictPayload>>>::new();
             for key in &keys {
                 let Some(frontier) = frontiers.get(key) else {
                     continue;
@@ -510,7 +499,7 @@ where
 
 pub(super) fn push_cohort_payload(
     rows: &mut RawWriteBatch,
-    key: &TrackedStateKey,
+    key: &StateKey,
     payload: Option<&StaleConflictPayload>,
     branch_id: &str,
 ) {
@@ -550,13 +539,13 @@ where
 {
     let owner_keys = file_ids
         .iter()
-        .map(|file_id| TrackedStateKey {
+        .map(|file_id| StateKey {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
             file_id: Some(file_id.clone()),
             entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
         })
         .collect::<Vec<_>>();
-    let registry_key = TrackedStateKey {
+    let registry_key = StateKey {
         schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
         file_id: None,
         entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),

@@ -6,7 +6,6 @@ mod schema_resolver;
 mod staging;
 mod stale_commit;
 pub(crate) mod types;
-mod validation;
 
 pub(crate) use commit_coordinator::CommitCoordinator;
 #[cfg(test)]

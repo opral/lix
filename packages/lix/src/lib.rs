@@ -80,10 +80,6 @@ pub mod storage_bench;
 pub(crate) mod storage_codec;
 pub mod telemetry;
 #[cfg(feature = "storage-benches")]
-pub mod tracked_state;
-#[cfg(not(feature = "storage-benches"))]
-pub(crate) mod tracked_state;
-#[cfg(feature = "storage-benches")]
 pub mod transaction;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod transaction;
