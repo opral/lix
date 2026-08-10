@@ -2447,7 +2447,23 @@ fn entity_slot_system_column_array(
         "change_id" => Arc::new(StringArray::from_iter(
             slots
                 .iter()
-                .map(|slot| slot_value(slot).map(|value| value.2.map(|id| id.to_string())))
+                .map(|slot| match slot {
+                    // Addressable transaction writes deliberately do not
+                    // expose their unpublished change identity through the
+                    // staged post-image. The commit identity remains visible
+                    // and the change id becomes durable at publication.
+                    EntityStateSlot::Tracked(row)
+                        if matches!(row.source, StateRowSource::Staged) =>
+                    {
+                        Ok(None)
+                    }
+                    EntityStateSlot::TrackedAt { row, .. }
+                        if matches!(row.source, StateRowSource::Staged) =>
+                    {
+                        Ok(None)
+                    }
+                    _ => slot_value(slot).map(|value| value.2.map(|id| id.to_string())),
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(lix_error_to_datafusion_error)?,
         )),

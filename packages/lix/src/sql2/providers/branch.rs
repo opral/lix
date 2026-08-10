@@ -617,9 +617,10 @@ where
         }
 
         let branch_ref: Arc<dyn BranchRefReader> = Arc::new(write_ctx.clone());
-        let rows = load_branch_rows(
+        let rows = load_branch_rows_scoped(
             &BranchState::Transaction(write_ctx.state_view().clone()),
             branch_ref,
+            BranchDescriptorScope::Ids(keys.iter().cloned().collect()),
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
@@ -661,12 +662,26 @@ where
     async fn scan_conflict_candidates(
         &self,
         _write_ctx: &SqlWriteContext<R>,
-        _proposed: &RecordBatch,
+        proposed: &RecordBatch,
         _target: &super::upsert::UpsertConflictTarget,
     ) -> Result<RecordBatch> {
-        let rows = load_branch_rows(&self.state, Arc::clone(&self.branch_ref))
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
+        let ids = (0..proposed.num_rows())
+            .map(|row_index| {
+                required_string_value(
+                    proposed,
+                    row_index,
+                    "id",
+                    "lix_branch conflict candidate lookup",
+                )
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let rows = load_branch_rows_scoped(
+            &self.state,
+            Arc::clone(&self.branch_ref),
+            BranchDescriptorScope::Ids(ids),
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
         LIX_BRANCH_COLS
             .build(lix_branch_schema(), &rows)
             .map_err(branch_batch_error)

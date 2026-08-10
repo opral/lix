@@ -561,12 +561,15 @@ where
         let present = all_rows.iter().any(|candidate| {
             !candidate.deleted
                 && candidate.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
-                && candidate.file_id().is_none()
-                && candidate.entity_pk().as_single_string().ok() == Some(file_id)
+                && ((candidate.file_id().is_none()
+                    && candidate.entity_pk().as_single_string().ok() == Some(file_id))
+                    || candidate.file_id() == Some(file_id))
         }) || staged_rows.iter().copied().any(|candidate| {
             !row_is_tombstone(candidate)
                 && candidate.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
-                && candidate.entity_pk().as_single_string().ok() == Some(file_id)
+                && ((candidate.file_id().is_none()
+                    && candidate.entity_pk().as_single_string().ok() == Some(file_id))
+                    || candidate.file_id() == Some(file_id))
         });
         if !present {
             return Err(LixError::new(

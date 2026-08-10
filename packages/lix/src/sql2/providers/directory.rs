@@ -638,12 +638,18 @@ where
     async fn path_resolvers_for_write(
         &self,
         _write_ctx: &SqlWriteContext<R>,
+        batch: Option<&RecordBatch>,
     ) -> Result<BTreeMap<String, DirectoryPathResolver>> {
-        let branch_ids = self
-            .branch_binding
-            .active_branch_id()
-            .map(|branch_id| vec![branch_id.to_string()])
-            .unwrap_or_default();
+        let branch_ids = if let Some(batch) = batch {
+            directory_branch_ids_from_batch(batch, self.branch_binding.active_branch_id())?
+                .into_iter()
+                .collect()
+        } else {
+            self.branch_binding
+                .active_branch_id()
+                .map(|branch_id| vec![branch_id.to_string()])
+                .unwrap_or_default()
+        };
         let index = self
             .filesystem_path_index
             .path_index(&FilesystemPathIndexRequest::new(branch_ids))
@@ -957,7 +963,10 @@ where
         let mut count = 0_u64;
         for batch in batches {
             if path_resolvers.is_none() {
-                path_resolvers = Some(self.path_resolvers_for_write(write_ctx).await?);
+                path_resolvers = Some(
+                    self.path_resolvers_for_write(write_ctx, Some(&batch))
+                        .await?,
+                );
             }
             count = count
                 .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
@@ -1029,7 +1038,10 @@ where
                         keys.push(spec.returning_key_from_batch(&batch, row_index)?);
                     }
                     if path_resolvers.is_none() {
-                        path_resolvers = Some(spec.path_resolvers_for_write(&write_ctx).await?);
+                        path_resolvers = Some(
+                            spec.path_resolvers_for_write(&write_ctx, Some(&batch))
+                                .await?,
+                        );
                     }
                     count = count
                         .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
@@ -1183,8 +1195,9 @@ where
                 let resolver_spec = resolver_spec.clone();
                 let assignments = assignments.clone();
                 async move {
-                    let mut path_resolvers =
-                        resolver_spec.path_resolvers_for_write(&write_ctx).await?;
+                    let mut path_resolvers = resolver_spec
+                        .path_resolvers_for_write(&write_ctx, Some(&matched_batch))
+                        .await?;
                     let write_rows = lix_directory_update_write_rows_from_batch(
                         &matched_batch,
                         &assignments,
@@ -1241,8 +1254,9 @@ where
                             returning_spec.returning_key_from_batch(&matched_batch, row_index)
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let mut path_resolvers =
-                        returning_spec.path_resolvers_for_write(&write_ctx).await?;
+                    let mut path_resolvers = returning_spec
+                        .path_resolvers_for_write(&write_ctx, Some(&matched_batch))
+                        .await?;
                     let write_rows = lix_directory_update_write_rows_from_batch(
                         &matched_batch,
                         &assignments,
@@ -1325,7 +1339,9 @@ where
         batch: &RecordBatch,
     ) -> Result<StagedUpsert> {
         let surface_name = lix_directory_surface_name(&self.branch_binding);
-        let mut path_resolvers = self.path_resolvers_for_write(write_ctx).await?;
+        let mut path_resolvers = self
+            .path_resolvers_for_write(write_ctx, Some(batch))
+            .await?;
 
         let rows = if record_batch_has_non_null_column(batch, "path")? {
             lix_directory_write_rows_from_batch_with_path_resolvers(
@@ -1522,7 +1538,9 @@ where
         augmented: &RecordBatch,
         assignments: &[(String, Arc<dyn PhysicalExpr>)],
     ) -> Result<StagedUpsert> {
-        let mut path_resolvers = self.path_resolvers_for_write(write_ctx).await?;
+        let mut path_resolvers = self
+            .path_resolvers_for_write(write_ctx, Some(augmented))
+            .await?;
         let rows = lix_directory_update_write_rows_from_batch(
             augmented,
             assignments,
