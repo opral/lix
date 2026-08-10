@@ -48,10 +48,9 @@ pub(crate) use serving::{
 };
 pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
-    UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
-    encode_state_entity_prefix, encode_state_entity_prefix_bounds, encode_state_key,
-    encode_state_value, encode_untracked_branch_range_bounds, encode_untracked_key,
-    encode_untracked_value, exclusive_prefix_upper_bound,
+    decode_state_key, decode_state_value, encode_state_entity_prefix,
+    encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
+    exclusive_prefix_upper_bound,
 };
 pub(crate) use tree::diff_roots;
 pub(crate) use tree::{

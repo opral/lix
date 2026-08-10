@@ -86,7 +86,6 @@ pub(crate) struct AuthenticatedBlobStateKey {
     pub(crate) state_key: StateKey,
     pub(crate) branch_id: CanonicalBranchId,
     pub(crate) global: bool,
-    pub(crate) untracked: bool,
 }
 
 #[async_trait]
@@ -197,17 +196,9 @@ where
     {
         let mut refs = Vec::with_capacity(rows.len());
         for row in rows {
-            let reference = if row.untracked {
-                view.bind_untracked_blob_at_state_key_for_scope(
-                    &row.state_key,
-                    row.branch_id,
-                    row.global,
-                )
-                    .await?
-            } else {
-                view.bind_blob_at_state_key_for_scope(&row.state_key, row.branch_id, row.global)
-                    .await?
-            }
+            let reference = view
+                .bind_blob_at_state_key_for_scope(&row.state_key, row.branch_id, row.global)
+                .await?
             .ok_or_else(|| {
                 crate::LixError::new(
                     crate::LixError::CODE_STORAGE_ERROR,
@@ -494,52 +485,6 @@ where
                 )
             })
             .transpose()
-    }
-
-    /// Binds an untracked BlobRef from exactly its selected owner lane. A
-    /// local tombstone therefore suppresses the global row at projection
-    /// time, while a selected global row never probes the local lane.
-    pub(crate) async fn bind_untracked_blob_at_state_key_for_scope(
-        &self,
-        key: &StateKey,
-        branch_id: CanonicalBranchId,
-        global: bool,
-    ) -> Result<Option<AuthenticatedBlobRef>, crate::LixError>
-    where
-        R: Sync,
-    {
-        if !global && branch_id != self.branch_id() {
-            return Err(crate::LixError::new(
-                crate::LixError::CODE_STORAGE_ERROR,
-                "selected filesystem BlobRef branch differs from the retained ForkTree view",
-            ));
-        }
-        let global_id = CanonicalBranchId::from_bytes(
-            *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
-                .expect("GLOBAL_BRANCH_ID must be a UUID")
-                .as_bytes(),
-        );
-        let owner = if global { global_id } else { self.branch_id() };
-        let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
-            schema_key: &key.schema_key,
-            file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
-        });
-        let Some((selected_key, value)) =
-            self.load_untracked_owner_point(owner, &encoded_key).await?
-        else {
-            return Ok(None);
-        };
-        bind_state_blob_ref_parts(
-            selected_key,
-            &value.cell,
-            &value.blob_manifest_object_ids,
-            Some(key),
-            self.branch_id(),
-            self.view_id(),
-            self.view_instance_id(),
-        )
-        .map(Some)
     }
 
     /// Loads complete payloads without allowing the authenticated row edge to

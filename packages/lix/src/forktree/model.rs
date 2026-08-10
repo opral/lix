@@ -1948,20 +1948,18 @@ pub(super) const GC_CURSOR_MAX_BYTES: usize = 4096;
 #[repr(u8)]
 pub(crate) enum GcPhaseV2 {
     RootSelectors = 1,
-    RootUntracked = 2,
-    Traverse = 3,
-    Sweep = 4,
-    Cleanup = 5,
+    Traverse = 2,
+    Sweep = 3,
+    Cleanup = 4,
 }
 
 impl GcPhaseV2 {
     fn decode(value: u8) -> Result<Self, StorageError> {
         match value {
             1 => Ok(Self::RootSelectors),
-            2 => Ok(Self::RootUntracked),
-            3 => Ok(Self::Traverse),
-            4 => Ok(Self::Sweep),
-            5 => Ok(Self::Cleanup),
+            2 => Ok(Self::Traverse),
+            3 => Ok(Self::Sweep),
+            4 => Ok(Self::Cleanup),
             _ => Err(corruption(format!("unknown GC phase {value}"))),
         }
     }
@@ -2333,7 +2331,6 @@ pub(super) struct GcProgressV2 {
     pub(super) expected_global_digest: [u8; 32],
     pub(super) expected_global_epoch: u64,
     pub(super) selector_resume_after: Option<Vec<u8>>,
-    pub(super) untracked_resume_after: Option<Vec<u8>>,
     pub(super) object_resume_after: Option<ObjectId>,
     pub(super) maintenance_resume_after: Option<ObjectId>,
     pub(super) saw_global_selector: bool,
@@ -2356,7 +2353,6 @@ impl GcProgressV2 {
             encoder.fixed(&self.expected_global_digest);
             encoder.u64(self.expected_global_epoch);
             encode_optional_bounded_bytes(encoder, self.selector_resume_after.as_deref())?;
-            encode_optional_bounded_bytes(encoder, self.untracked_resume_after.as_deref())?;
             encode_optional_id(encoder, self.object_resume_after);
             encode_optional_id(encoder, self.maintenance_resume_after);
             encoder.u8(u8::from(self.saw_global_selector));
@@ -2382,10 +2378,6 @@ impl GcProgressV2 {
             selector_resume_after: decode_optional_bounded_bytes(
                 &mut decoder,
                 "GC selector cursor",
-            )?,
-            untracked_resume_after: decode_optional_bounded_bytes(
-                &mut decoder,
-                "GC untracked cursor",
             )?,
             object_resume_after: decode_optional_id(&mut decoder, "GC object cursor")?,
             maintenance_resume_after: decode_optional_id(&mut decoder, "GC maintenance cursor")?,
@@ -2416,10 +2408,6 @@ impl GcProgressV2 {
                 .selector_resume_after
                 .as_ref()
                 .is_some_and(|value| value.len() > GC_CURSOR_MAX_BYTES)
-            || self
-                .untracked_resume_after
-                .as_ref()
-                .is_some_and(|value| value.len() > GC_CURSOR_MAX_BYTES)
             || self.object_resume_after == Some(ObjectId::ZERO)
             || self.maintenance_resume_after == Some(ObjectId::ZERO)
             || self.live_branch_index_root == Some(ObjectId::ZERO)
@@ -2443,21 +2431,13 @@ impl GcProgressV2 {
         }
         let phase_valid = match self.phase {
             GcPhaseV2::RootSelectors => {
-                self.untracked_resume_after.is_none()
-                    && self.object_resume_after.is_none()
+                self.object_resume_after.is_none()
                     && self.maintenance_resume_after.is_none()
                     && self.validated_count == 0
-            }
-            GcPhaseV2::RootUntracked => {
-                self.saw_global_selector
-                    && self.selector_resume_after.is_none()
-                    && self.object_resume_after.is_none()
-                    && self.maintenance_resume_after.is_none()
             }
             GcPhaseV2::Traverse => {
                 self.saw_global_selector
                     && self.selector_resume_after.is_none()
-                    && self.untracked_resume_after.is_none()
                     && self.object_resume_after.is_none()
                     && self.maintenance_resume_after.is_none()
                     && self.mark_index_root.is_some()
@@ -2465,7 +2445,6 @@ impl GcProgressV2 {
             GcPhaseV2::Sweep => {
                 self.saw_global_selector
                     && self.selector_resume_after.is_none()
-                    && self.untracked_resume_after.is_none()
                     && self.maintenance_resume_after.is_none()
                     && self.mark_index_root.is_some()
                     && self.queue_index_root.is_none()
@@ -2475,7 +2454,6 @@ impl GcProgressV2 {
             GcPhaseV2::Cleanup => {
                 self.saw_global_selector
                     && self.selector_resume_after.is_none()
-                    && self.untracked_resume_after.is_none()
                     && self.object_resume_after.is_none()
                     && self.live_branch_index_root.is_none()
                     && self.mark_index_root.is_none()

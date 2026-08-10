@@ -441,8 +441,8 @@ where
         system
             .execute(
                 "INSERT INTO lix_account_by_branch \
-                 (id, name, kind, status, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, $2, $3, 'active', $4, true, false) \
+                 (id, name, kind, status, lixcol_branch_id, lixcol_global) \
+                 VALUES ($1, $2, $3, 'active', $4, true) \
                  ON CONFLICT (id, lixcol_branch_id) \
                  DO NOTHING",
                 &[

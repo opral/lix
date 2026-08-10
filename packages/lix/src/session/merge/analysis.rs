@@ -6,7 +6,7 @@ use crate::state::{ForkTreeStateView, StateRoots};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::conflicts::MergeConflictBatch;
-use super::native::{MergeDiff, MergeKeyExt, MergePayloadBatch, MergePlan, plan_merge};
+use super::native::{MergeDiff, MergePayloadBatch, MergePlan, plan_merge};
 use super::stats::{MergeStats, stats_from_diff, stats_from_plan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,29 +90,6 @@ where
     };
     exclude_internal_checkpoint_markers(&mut source_diff);
     exclude_internal_checkpoint_markers(&mut target_diff);
-
-    let untracked_rows = state_view.untracked_overlay_rows().await?;
-    if let Some(entry) = source_diff.entries.iter().find(|entry| {
-        untracked_rows.iter().any(|row| {
-            row.key.schema_key == entry.identity.schema_key()
-                && row.key.file_id.as_deref() == entry.identity.file_id()
-                && row.key.entity_pk == entry.identity.entity_pk().clone()
-        })
-    }) {
-        return Err(LixError::new(
-            LixError::CODE_MERGE_CONFLICT,
-            format!(
-                "merge source identity conflicts with an untracked current row for schema '{}'",
-                entry.identity.schema_key()
-            ),
-        )
-        .with_details(serde_json::json!({
-            "kind": "trackedUntrackedIdentityCollision",
-            "schemaKey": entry.identity.schema_key(),
-            "entityPk": entry.identity.entity_pk().as_json_array_value()?,
-            "fileId": entry.identity.file_id(),
-        })));
-    }
 
     let outcome = if commits.base_commit_id == commits.source_commit_id {
         MergeOutcome::AlreadyUpToDate

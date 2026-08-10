@@ -119,7 +119,6 @@ impl NativeStateRow {
 
     fn from_state_row(row: StateRow, branch_id: &str) -> Result<Self, LixError> {
         let key = crate::forktree::decode_state_key(&row.key)?;
-        let staged = row.source == StateRowSource::Staged;
         let snapshot_content = match row.value.cell {
             StateCell::Value(value) => Some(value),
             StateCell::Null | StateCell::Tombstone => None,
@@ -133,10 +132,9 @@ impl NativeStateRow {
             created_at: row.value.created_at,
             updated_at: row.value.updated_at,
             global: row.source == StateRowSource::Global,
-            // Staged change IDs are transaction-internal until publication;
-            // RETURNING exposes the committed audit contract and therefore
-            // keeps this field NULL while retaining the staged commit ID.
-            change_id: (!staged).then_some(row.value.change_id),
+            // Both identifiers are authenticated state identity. Staged rows
+            // use the same mandatory identity contract as committed rows.
+            change_id: Some(row.value.change_id),
             commit_id: Some(row.value.commit_id),
             // The retained ForkTree view marks physical global rows explicitly.
             // Preserve that authenticated owner when materializing a native
@@ -149,28 +147,6 @@ impl NativeStateRow {
             },
             untracked: false,
         })
-    }
-
-    fn from_untracked(row: crate::state::UntrackedStateRow) -> Self {
-        let snapshot_content = match row.value.cell {
-            StateCell::Value(value) => Some(value),
-            StateCell::Null | StateCell::Tombstone => None,
-        };
-        Self {
-            entity_pk: row.key.entity_pk,
-            schema_key: row.key.schema_key,
-            file_id: row.key.file_id,
-            snapshot_content,
-            metadata: row.value.metadata,
-            created_at: row.value.created_at,
-            updated_at: row.value.updated_at,
-            global: uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string()
-                == crate::GLOBAL_BRANCH_ID,
-            change_id: None,
-            commit_id: None,
-            branch_id: uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string(),
-            untracked: true,
-        }
     }
 }
 
@@ -518,12 +494,11 @@ async fn try_execute_entity_insert_batch(
         None
     };
     let layout = InsertRowLayout::from_values(&spec, values)?;
-    if layout.columns.iter().any(|target| {
-        !matches!(
-            target,
-            InsertColumnTarget::Visible { .. } | InsertColumnTarget::Untracked
-        )
-    }) {
+    if layout
+        .columns
+        .iter()
+        .any(|target| !matches!(target, InsertColumnTarget::Visible { .. }))
+    {
         return Ok(None);
     }
     let certification_span = tracing::debug_span!(
@@ -4305,21 +4280,6 @@ async fn scan_native_entity_ranges(
                         .map(|row| NativeStateRow::from_state_row(row, branch_id))
                         .collect::<Result<Vec<_>, _>>()?,
                 );
-                let encoded = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                    schema_key,
-                    file_id: None,
-                    entity_pk,
-                });
-                if let Some(row) = ctx
-                    .state_view()
-                    .untracked_points_for_branch(branch_id, std::slice::from_ref(&encoded), false)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .flatten()
-                {
-                    rows.push(NativeStateRow::from_untracked(row));
-                }
             }
         }
     }
@@ -4586,7 +4546,6 @@ enum InsertColumnTarget {
     FileId,
     Metadata,
     Global,
-    Untracked,
     BranchId,
 }
 
@@ -4617,7 +4576,6 @@ impl InsertRowLayout {
                     "lixcol_file_id" => InsertColumnTarget::FileId,
                     "lixcol_metadata" => InsertColumnTarget::Metadata,
                     "lixcol_global" => InsertColumnTarget::Global,
-                    "lixcol_untracked" => InsertColumnTarget::Untracked,
                     "lixcol_branch_id" => InsertColumnTarget::BranchId,
                     _ => {
                         return Err(LixError::new(
@@ -4645,7 +4603,6 @@ struct CertifiedInsertRow {
     file_id: Option<SharedStr>,
     metadata: Option<TransactionJson>,
     global: bool,
-    untracked: bool,
     branch_id: SharedStr,
 }
 
@@ -4720,22 +4677,6 @@ fn certified_entity_insert_parameter_batch(
         }));
     }
     if !allow_generic_fallback {
-        return Ok(None);
-    }
-    // The tracked/untracked lane is part of the registered schema domain, not
-    // merely row payload. A parameterized batch can contain rows from both
-    // lanes; committing that batch would defer the domain error until the
-    // transaction boundary, where it no longer has a statement index. Keep
-    // the established sequential route for this shape so the failing row is
-    // validated and attributed before any batch staging occurs.
-    if values.rows.iter().any(|row| {
-        row.iter().zip(&layout.columns).any(|(expr, target)| {
-            matches!(
-                (expr, target),
-                (BoundExpr::Param(_), InsertColumnTarget::Untracked)
-            )
-        })
-    }) {
         return Ok(None);
     }
     certified_entity_insert_rows(
@@ -5174,7 +5115,6 @@ fn certified_direct_path_value_insert_batch(
     }
     let mut path_param_index = None;
     let mut value_param_index = None;
-    let mut untracked = false;
     for (expr, target) in row.iter().zip(&layout.columns) {
         match (expr, target) {
             (
@@ -5197,9 +5137,6 @@ fn certified_direct_path_value_insert_batch(
                     return Ok(None);
                 };
                 value_param_index = Some(param.index.saturating_sub(1));
-            }
-            (BoundExpr::Literal(BoundLiteral::Bool(true)), InsertColumnTarget::Untracked) => {
-                untracked = true;
             }
             _ => return Ok(None),
         }
@@ -5294,7 +5231,7 @@ fn certified_direct_path_value_insert_batch(
         snapshots,
         layout.schema_key.as_str().into(),
         ctx.active_branch_id().into(),
-        untracked,
+        false,
         CertifiedRawWriteBatchPreparation {
             schema_plan_id,
             facts: PreparedRowFacts {
@@ -5417,7 +5354,6 @@ fn certified_entity_insert_rows<'a>(
             let mut file_id = None;
             let mut metadata = None;
             let mut global = None;
-            let mut untracked = None;
             let mut explicit_branch_id = None;
             for (index, (expr, target)) in row.iter().zip(layout.columns.iter()).enumerate() {
                 if let InsertColumnTarget::Visible { column_type, .. } = target {
@@ -5425,14 +5361,11 @@ fn certified_entity_insert_rows<'a>(
                 }
                 let eval_value =
                     eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
-                if matches!(
-                    target,
-                    InsertColumnTarget::Global | InsertColumnTarget::Untracked
-                ) && entity_eval_value_is_null(&eval_value)
+                if matches!(target, InsertColumnTarget::Global)
+                    && entity_eval_value_is_null(&eval_value)
                 {
                     let column_name = match target {
                         InsertColumnTarget::Global => "lixcol_global",
-                        InsertColumnTarget::Untracked => "lixcol_untracked",
                         _ => unreachable!("matched defaulted boolean system column"),
                     };
                     return Err(LixError::new(
@@ -5492,9 +5425,6 @@ fn certified_entity_insert_rows<'a>(
                     }
                     InsertColumnTarget::Global => {
                         global = bool_value(value, "lixcol_global")?;
-                    }
-                    InsertColumnTarget::Untracked => {
-                        untracked = bool_value(value, "lixcol_untracked")?;
                     }
                     InsertColumnTarget::BranchId => {
                         explicit_branch_id = text_value(value, "lixcol_branch_id")?;
@@ -5590,7 +5520,6 @@ fn certified_entity_insert_rows<'a>(
                 file_id: file_id.map(Into::into),
                 metadata,
                 global,
-                untracked: untracked.unwrap_or(false),
                 branch_id: entity_row_branch_id(plan, explicit_branch_id, global)?.into(),
             };
             if !unique_identities.insert((
@@ -5634,7 +5563,7 @@ fn certified_entity_insert_rows<'a>(
             row.global,
             None,
             None,
-            row.untracked,
+            false,
             row.branch_id,
         );
     }
@@ -5667,7 +5596,6 @@ fn append_entity_insert_row(
     let mut file_id = None;
     let mut metadata = None;
     let mut global = None;
-    let mut untracked = None;
     let mut explicit_branch_id = None;
     let context = EntityEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
 
@@ -5676,14 +5604,9 @@ fn append_entity_insert_row(
             reject_direct_blob_json_value(expr, *column_type, params)?;
         }
         let eval_value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
-        if matches!(
-            target,
-            InsertColumnTarget::Global | InsertColumnTarget::Untracked
-        ) && entity_eval_value_is_null(&eval_value)
-        {
+        if matches!(target, InsertColumnTarget::Global) && entity_eval_value_is_null(&eval_value) {
             let column_name = match target {
                 InsertColumnTarget::Global => "lixcol_global",
-                InsertColumnTarget::Untracked => "lixcol_untracked",
                 _ => unreachable!("matched defaulted boolean system column"),
             };
             return Err(LixError::new(
@@ -5737,9 +5660,6 @@ fn append_entity_insert_row(
             }
             InsertColumnTarget::Global => {
                 global = bool_value(value, "lixcol_global")?;
-            }
-            InsertColumnTarget::Untracked => {
-                untracked = bool_value(value, "lixcol_untracked")?;
             }
             InsertColumnTarget::BranchId => {
                 explicit_branch_id = text_value(value, "lixcol_branch_id")?;
@@ -5796,7 +5716,7 @@ fn append_entity_insert_row(
         global,
         None,
         None,
-        untracked.unwrap_or(false),
+        false,
         branch_id.into(),
     );
     Ok(())
@@ -7287,7 +7207,6 @@ fn column_eval_value(
             .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global()))),
-        "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked()))),
         "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
             row.branch_id().to_string(),
         ))),
@@ -7336,7 +7255,6 @@ fn excluded_column_eval_value(
             .transpose()
             .map(|metadata| metadata.unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
-        "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked))),
         "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
             row.branch_id.to_string(),
         ))),

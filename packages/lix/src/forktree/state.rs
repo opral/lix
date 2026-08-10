@@ -1,17 +1,11 @@
 use std::borrow::Cow;
 
+use super::object::ObjectId;
 use crate::LixError;
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::{EntityPk, EntityPkComponent};
-use crate::storage::StorageSpace;
 
-use super::model::CanonicalBranchId;
-use super::object::ObjectId;
-
-const MAX_BLOB_ROOTS_PER_STATE_ROW: usize = 4;
 const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x02";
-const UNTRACKED_KEY_MAGIC: &[u8; 8] = b"LIXFTU\0\x01";
-const UNTRACKED_VALUE_MAGIC: &[u8; 8] = b"LIXFTW\0\x01";
 
 const KEY_ESCAPE: u8 = 0xff;
 const KEY_PART_FINAL: u8 = 0x00;
@@ -23,15 +17,6 @@ const ENTITY_PK_UUID: u8 = 0x00;
 const ENTITY_PK_INTEGER: u8 = 0x01;
 const ENTITY_PK_STRING: u8 = 0x02;
 const ENTITY_PK_BYTES: u8 = 0x03;
-
-/// Mutable authority retained only for rows whose schema explicitly declares
-/// them untracked. Tracked rows, selectors, catalogs, and roots are forbidden
-/// from this space.
-pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace = StorageSpace::engine_declared(
-    0x0009_0003,
-    "forktree.untracked_row.v1",
-    crate::storage::ValueSemantics::Mutable,
-);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct StateKeyRef<'a> {
@@ -145,26 +130,6 @@ impl StateCell {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct UntrackedValueRef<'a> {
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) updated_at: LixTimestamp,
-    pub(crate) cell: StateCellRef<'a>,
-    pub(crate) metadata: Option<&'a str>,
-    pub(crate) origin_key: Option<&'a str>,
-    pub(crate) blob_manifest_object_ids: &'a [ObjectId],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct UntrackedValue {
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) updated_at: LixTimestamp,
-    pub(crate) cell: StateCell,
-    pub(crate) metadata: Option<SharedStr>,
-    pub(crate) origin_key: Option<String>,
-    pub(crate) blob_manifest_object_ids: Vec<ObjectId>,
-}
-
 pub(crate) fn encode_state_key(key: StateKeyRef<'_>) -> Vec<u8> {
     let mut output = Vec::with_capacity(
         key.schema_key.len()
@@ -210,70 +175,6 @@ pub(crate) fn encode_state_entity_prefix_bounds(
     let lower = encode_state_entity_prefix(schema_key, entity_pk);
     let upper = exclusive_prefix_upper_bound(&lower);
     CanonicalPrefixBounds { lower, upper }
-}
-
-fn encode_untracked_branch_prefix(branch_id: CanonicalBranchId) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(UNTRACKED_KEY_MAGIC.len() + 16);
-    prefix.extend_from_slice(UNTRACKED_KEY_MAGIC);
-    prefix.extend_from_slice(branch_id.as_bytes());
-    prefix
-}
-
-/// Builds canonical bounds for the selected branch's untracked rows. The
-/// optional state-key bounds are full canonical state keys and remain
-/// half-open; the finite upper bound is otherwise the successor of the
-/// branch prefix, so another branch can never enter the scan.
-pub(crate) fn encode_untracked_branch_range_bounds(
-    branch_id: CanonicalBranchId,
-    lower: Option<&[u8]>,
-    upper: Option<&[u8]>,
-) -> Result<CanonicalPrefixBounds, LixError> {
-    let prefix = encode_untracked_branch_prefix(branch_id);
-    let canonical_bound = |bytes: &[u8], name: &str| -> Result<Vec<u8>, LixError> {
-        if let Ok(decoded) = decode_state_key(bytes) {
-            let canonical = encode_state_key(StateKeyRef {
-                schema_key: &decoded.schema_key,
-                file_id: decoded.file_id.as_deref(),
-                entity_pk: &decoded.entity_pk,
-            });
-            if canonical == bytes {
-                return Ok(canonical);
-            }
-        }
-        canonical_state_entity_prefix(bytes)
-            .map_err(|_| state_error(format!("{name} is not canonically encoded")))
-    };
-    let lower = lower
-        .map(|bytes| canonical_bound(bytes, "untracked lower bound"))
-        .transpose()?;
-    let upper = upper
-        .map(|bytes| {
-            if lower
-                .as_ref()
-                .and_then(|lower| exclusive_prefix_upper_bound(lower))
-                .as_deref()
-                == Some(bytes)
-            {
-                return Ok::<Vec<u8>, LixError>(bytes.to_vec());
-            }
-            if canonical_state_entity_prefix_upper_bound(bytes).is_ok() {
-                return Ok::<Vec<u8>, LixError>(bytes.to_vec());
-            }
-            canonical_bound(bytes, "untracked upper bound")
-        })
-        .transpose()?;
-    let lower = lower.map_or_else(
-        || prefix.clone(),
-        |bytes| [prefix.as_slice(), bytes.as_slice()].concat(),
-    );
-    let upper = upper.map_or_else(
-        || exclusive_prefix_upper_bound(&prefix),
-        |bytes| Some([prefix.as_slice(), bytes.as_slice()].concat()),
-    );
-    if upper.as_ref().is_some_and(|upper| lower > *upper) {
-        return Err(state_error("untracked range bounds are inverted"));
-    }
-    Ok(CanonicalPrefixBounds { lower, upper })
 }
 
 /// Accepts the strict successor emitted for a canonical entity prefix. The
@@ -423,82 +324,6 @@ pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<StateValueRef, LixError
         page_object_id,
         page_ordinal,
     })
-}
-
-pub(crate) fn encode_untracked_key(branch_id: CanonicalBranchId, key: StateKeyRef<'_>) -> Vec<u8> {
-    let state_key = encode_state_key(key);
-    let mut output = encode_untracked_branch_prefix(branch_id);
-    output.reserve(state_key.len());
-    output.extend_from_slice(&state_key);
-    output
-}
-
-pub(crate) fn decode_untracked_key(
-    bytes: &[u8],
-) -> Result<(CanonicalBranchId, StateKey), LixError> {
-    if !bytes.starts_with(UNTRACKED_KEY_MAGIC) || bytes.len() < UNTRACKED_KEY_MAGIC.len() + 16 {
-        return Err(state_error("untracked key magic or version is invalid"));
-    }
-    let offset = UNTRACKED_KEY_MAGIC.len() + 16;
-    let branch_id = CanonicalBranchId::from_bytes(
-        bytes[UNTRACKED_KEY_MAGIC.len()..offset]
-            .try_into()
-            .map_err(|_| state_error("untracked branch id is not 16 bytes"))?,
-    );
-    let state_key = decode_state_key(&bytes[offset..])?;
-    Ok((branch_id, state_key))
-}
-
-pub(crate) fn encode_untracked_value(value: UntrackedValueRef<'_>) -> Result<Vec<u8>, LixError> {
-    let mut output = Vec::new();
-    output.extend_from_slice(UNTRACKED_VALUE_MAGIC);
-    output.extend_from_slice(&value.created_at.packed().to_be_bytes());
-    output.extend_from_slice(&value.updated_at.packed().to_be_bytes());
-    put_state_cell(&mut output, value.cell)?;
-    put_optional_bytes(&mut output, value.metadata.map(str::as_bytes))?;
-    put_optional_bytes(&mut output, value.origin_key.map(str::as_bytes))?;
-    put_object_ids(&mut output, value.blob_manifest_object_ids)?;
-    Ok(output)
-}
-
-pub(crate) fn decode_untracked_value(bytes: &[u8]) -> Result<UntrackedValue, LixError> {
-    let mut decoder = ValueDecoder::after_magic(bytes, UNTRACKED_VALUE_MAGIC, "untracked value")?;
-    let created_at = LixTimestamp::from_packed(decoder.u64("untracked created_at")?)
-        .map_err(|error| state_error(error.to_string()))?;
-    let updated_at = LixTimestamp::from_packed(decoder.u64("untracked updated_at")?)
-        .map_err(|error| state_error(error.to_string()))?;
-    let cell = decoder.state_cell("untracked cell")?;
-    let metadata = decoder
-        .optional_string("untracked metadata")?
-        .map(SharedStr::from);
-    let origin_key = decoder.optional_string("untracked origin key")?;
-    let blob_manifest_object_ids = decoder.object_ids("untracked blob manifests")?;
-    decoder.finish("untracked value")?;
-    Ok(UntrackedValue {
-        created_at,
-        updated_at,
-        cell,
-        metadata,
-        origin_key,
-        blob_manifest_object_ids,
-    })
-}
-
-fn put_state_cell(output: &mut Vec<u8>, value: StateCellRef<'_>) -> Result<(), LixError> {
-    match value {
-        StateCellRef::Value(value) => {
-            output.push(0);
-            put_bytes(output, value.as_bytes())
-        }
-        StateCellRef::Null => {
-            output.push(1);
-            Ok(())
-        }
-        StateCellRef::Tombstone => {
-            output.push(2);
-            Ok(())
-        }
-    }
 }
 
 fn write_file_id(output: &mut Vec<u8>, file_id: Option<&str>) {
@@ -704,45 +529,6 @@ fn read_key_bytes_cow<'a>(
     }
 }
 
-fn put_optional_bytes(output: &mut Vec<u8>, value: Option<&[u8]>) -> Result<(), LixError> {
-    match value {
-        Some(value) => {
-            output.push(1);
-            put_bytes(output, value)
-        }
-        None => {
-            output.push(0);
-            Ok(())
-        }
-    }
-}
-
-fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), LixError> {
-    let length = u32::try_from(value.len())
-        .map_err(|_| state_error("ForkTree state field exceeds u32 length"))?;
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(value);
-    Ok(())
-}
-
-fn put_object_ids(output: &mut Vec<u8>, values: &[ObjectId]) -> Result<(), LixError> {
-    if values.len() > MAX_BLOB_ROOTS_PER_STATE_ROW {
-        return Err(state_error(
-            "ForkTree state row exceeds its authenticated blob-root edge bound",
-        ));
-    }
-    let count = u32::try_from(values.len())
-        .map_err(|_| state_error("ForkTree state blob-root count exceeds u32"))?;
-    output.extend_from_slice(&count.to_be_bytes());
-    for value in values {
-        if *value == ObjectId::ZERO {
-            return Err(state_error("ForkTree state contains a zero blob root"));
-        }
-        output.extend_from_slice(value.as_bytes());
-    }
-    Ok(())
-}
-
 struct ValueDecoder<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -759,13 +545,6 @@ impl<'a> ValueDecoder<'a> {
         })
     }
 
-    fn fixed_16(&mut self, field: &str) -> Result<[u8; 16], LixError> {
-        Ok(self
-            .take(16, field)?
-            .try_into()
-            .expect("decoder returned fixed UUID width"))
-    }
-
     fn fixed_32(&mut self, field: &str) -> Result<[u8; 32], LixError> {
         Ok(self
             .take(32, field)?
@@ -779,79 +558,6 @@ impl<'a> ValueDecoder<'a> {
                 .try_into()
                 .expect("decoder returned fixed u32 width"),
         ))
-    }
-
-    fn u64(&mut self, field: &str) -> Result<u64, LixError> {
-        Ok(u64::from_be_bytes(
-            self.take(8, field)?
-                .try_into()
-                .expect("decoder returned fixed u64 width"),
-        ))
-    }
-
-    fn state_cell(&mut self, field: &str) -> Result<StateCell, LixError> {
-        match self.take(1, field)?[0] {
-            0 => {
-                let length = u32::from_be_bytes(
-                    self.take(4, field)?
-                        .try_into()
-                        .expect("decoder returned fixed u32 width"),
-                ) as usize;
-                std::str::from_utf8(self.take(length, field)?)
-                    .map(SharedStr::from)
-                    .map(StateCell::Value)
-                    .map_err(|_| state_error(format!("{field} value is not UTF-8")))
-            }
-            1 => Ok(StateCell::Null),
-            2 => Ok(StateCell::Tombstone),
-            other => Err(state_error(format!("{field} has invalid tag {other}"))),
-        }
-    }
-
-    fn optional_string(&mut self, field: &str) -> Result<Option<String>, LixError> {
-        match self.take(1, field)?[0] {
-            0 => Ok(None),
-            1 => {
-                let length = u32::from_be_bytes(
-                    self.take(4, field)?
-                        .try_into()
-                        .expect("decoder returned fixed u32 width"),
-                ) as usize;
-                std::str::from_utf8(self.take(length, field)?)
-                    .map(str::to_owned)
-                    .map(Some)
-                    .map_err(|_| state_error(format!("{field} is not UTF-8")))
-            }
-            other => Err(state_error(format!(
-                "{field} has invalid option tag {other}"
-            ))),
-        }
-    }
-
-    fn object_ids(&mut self, field: &str) -> Result<Vec<ObjectId>, LixError> {
-        let count = u32::from_be_bytes(
-            self.take(4, field)?
-                .try_into()
-                .expect("decoder returned fixed u32 width"),
-        ) as usize;
-        if count > MAX_BLOB_ROOTS_PER_STATE_ROW
-            || count > self.bytes.len().saturating_sub(self.offset) / 32
-        {
-            return Err(state_error(format!("{field} count exceeds encoded body")));
-        }
-        let mut values = Vec::with_capacity(count);
-        for _ in 0..count {
-            let value = ObjectId::from_bytes(
-                self.take(32, field)?
-                    .try_into()
-                    .expect("decoder returned fixed object-id width"),
-            );
-            if value == ObjectId::ZERO {
-                return Err(state_error(format!("{field} contains a zero object id")));
-            }
-            values.push(value);
-        }
-        Ok(values)
     }
 
     fn take(&mut self, length: usize, field: &str) -> Result<&'a [u8], LixError> {

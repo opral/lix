@@ -302,7 +302,7 @@ simulation_test!(
                    AND column_name IN (\
                      'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
                      'lixcol_entity_pk', 'lixcol_global', 'lixcol_schema_key', \
-                     'lixcol_untracked', 'lixcol_updated_at'\
+                     'lixcol_updated_at'\
                    )\
                  ) OR (\
                    table_name = 'engine_no_pk_contract' \
@@ -360,13 +360,6 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
-                    Value::Text("lixcol_untracked".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("FALSE".to_string()),
-                    Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_column_contract".to_string()),
                     Value::Text("lixcol_updated_at".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
@@ -388,8 +381,7 @@ simulation_test!(
                  FROM information_schema.columns \
                  WHERE table_name IN ('lix_file', 'lix_directory') \
                    AND column_name IN (\
-                     'lixcol_created_at', 'lixcol_global', \
-                     'lixcol_untracked', 'lixcol_updated_at'\
+                     'lixcol_created_at', 'lixcol_global', 'lixcol_updated_at'\
                    ) \
                  ORDER BY table_name, column_name",
                 &[],
@@ -409,13 +401,6 @@ simulation_test!(
                 vec![
                     Value::Text(table_name.to_string()),
                     Value::Text("lixcol_global".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("FALSE".to_string()),
-                    Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text(table_name.to_string()),
-                    Value::Text("lixcol_untracked".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Text("FALSE".to_string()),
                     Value::Text("DEFAULT".to_string()),
@@ -1252,7 +1237,7 @@ simulation_test!(
             vec![vec![Value::Text("old".to_string())]],
         );
 
-        for column_name in ["lixcol_global", "lixcol_untracked"] {
+        for column_name in ["lixcol_global"] {
             let error = session
                 .execute(
                     &format!(

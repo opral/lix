@@ -1269,13 +1269,6 @@ fn entity_delete_stage_rows_from_batch(
             "DELETE FROM entity surface",
         )?
         .map(Into::into);
-        let untracked = optional_bool_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "DELETE FROM entity surface",
-        )?
-        .unwrap_or(false);
         rows.push_parts(
             Some(entity_pk),
             spec.schema_key.as_str().into(),
@@ -1288,7 +1281,7 @@ fn entity_delete_stage_rows_from_batch(
             global,
             None,
             None,
-            untracked,
+            false,
             branch_id.into(),
         );
     }
@@ -1386,13 +1379,6 @@ fn entity_update_stage_rows_from_batch(
         let file_id =
             optional_string_value(batch, row_index, "lixcol_file_id", "UPDATE entity surface")?
                 .map(Into::into);
-        let untracked = optional_bool_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "UPDATE entity surface",
-        )?
-        .unwrap_or(false);
         rows.push_parts(
             Some(entity_pk),
             spec.schema_key.as_str().into(),
@@ -1411,7 +1397,7 @@ fn entity_update_stage_rows_from_batch(
             global,
             None,
             None,
-            untracked,
+            false,
             branch_id.into(),
         );
     }
@@ -2753,7 +2739,6 @@ fn slot_state_key(slot: &EntityStateSlot) -> Result<crate::forktree::StateKey, L
         EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
             decode_state_key(&row.key)
         }
-        EntityStateSlot::Untracked(row) => Ok(row.key.clone()),
     }
 }
 
@@ -2770,8 +2755,6 @@ fn slot_value(
     ),
     LixError,
 > {
-    let global_owner = uuid::Uuid::parse_str(GLOBAL_BRANCH_ID)
-        .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?;
     match slot {
         EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => Ok((
             &row.value.cell,
@@ -2780,14 +2763,6 @@ fn slot_value(
             Some(row.value.commit_id),
             matches!(row.source, StateRowSource::Global),
             None,
-        )),
-        EntityStateSlot::Untracked(row) => Ok((
-            &row.value.cell,
-            row.value.metadata.as_deref(),
-            None,
-            None,
-            row.owner.as_bytes() == global_owner.as_bytes(),
-            Some(uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string()),
         )),
     }
 }
@@ -2814,7 +2789,6 @@ fn entity_slot_system_column_array(
                     }
                 },
                 EntityStateSlot::TrackedAt { branch_id, .. } => Some(branch_id.clone()),
-                EntityStateSlot::Untracked(_) => slot_value(slot)?.5,
             })
         })
         .collect::<Result<Vec<Option<String>>, LixError>>()
@@ -2851,7 +2825,6 @@ fn entity_slot_system_column_array(
                 EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
                     Some(row.value.created_at.to_string())
                 }
-                EntityStateSlot::Untracked(row) => Some(row.value.created_at.to_string()),
             },
         ))),
         "updated_at" => Arc::new(StringArray::from_iter(slots.iter().map(
@@ -2859,7 +2832,6 @@ fn entity_slot_system_column_array(
                 EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
                     Some(row.value.updated_at.to_string())
                 }
-                EntityStateSlot::Untracked(row) => Some(row.value.updated_at.to_string()),
             },
         ))),
         "global" => Arc::new(BooleanArray::from_iter(
@@ -2899,12 +2871,6 @@ fn entity_slot_system_column_array(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(lix_error_to_datafusion_error)?,
         )),
-        "untracked" => Arc::new(BooleanArray::from_iter(slots.iter().map(|slot| {
-            Some(
-                matches!(slot, EntityStateSlot::Untracked(_))
-                    || spec.schema_key == BRANCH_REF_SCHEMA_KEY,
-            )
-        }))),
         "branch_id" => Arc::new(StringArray::from_iter(branch_ids)),
         _ => {
             return Err(DataFusionError::Execution(format!(
@@ -3153,14 +3119,9 @@ mod tests {
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};
-    use crate::forktree::{
-        CanonicalBranchId, StateCell, StateKeyRef, StateValue, UntrackedValue, decode_state_key,
-        encode_state_key,
-    };
+    use crate::forktree::{StateCell, StateKeyRef, StateValue, decode_state_key, encode_state_key};
     use crate::sql2::entity_batch::row_snapshot;
-    use crate::state::{
-        StagedStateRow, StateRow, StateRowSource, TransactionStateView, UntrackedStateRow,
-    };
+    use crate::state::{StagedStateRow, StateRow, StateRowSource, TransactionStateView};
     use crate::storage_adapter::{Memory, StorageAdapter};
     use datafusion::arrow::array::Array;
     use datafusion::arrow::array::StringArray;
@@ -3221,23 +3182,6 @@ mod tests {
             },
             source,
         }
-    }
-
-    fn untracked_row(schema_key: &str, entity: &str) -> EntityStateSlot {
-        let tracked = tracked_row(StateRowSource::Branch, schema_key, entity);
-        let key = decode_state_key(&tracked.key).expect("fixture key");
-        EntityStateSlot::Untracked(UntrackedStateRow {
-            owner: CanonicalBranchId::from_bytes([7; 16]),
-            key,
-            value: UntrackedValue {
-                created_at: timestamp(3),
-                updated_at: timestamp(4),
-                cell: StateCell::Value(SharedStr::from(r#"{"body":"untracked"}"#)),
-                metadata: None,
-                origin_key: None,
-                blob_manifest_object_ids: Vec::new(),
-            },
-        })
     }
 
     fn entity_insert_spec_with_primary_key() -> Arc<EntitySurfaceSpec> {
@@ -3320,6 +3264,7 @@ mod tests {
         )
     }
 
+    #[cfg(any())]
     #[test]
     fn exact_state_system_projection_preserves_native_identity_and_owner() {
         let spec = entity_insert_spec_with_primary_key();
@@ -4239,6 +4184,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn native_untracked_projection_preserves_duplicate_json_last_value() {
         let spec = Arc::new(

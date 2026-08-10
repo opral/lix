@@ -29,8 +29,8 @@ use crate::forktree::{
     CommitObjectV1, HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition,
     PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCellRef, StateKey,
     StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
-    UntrackedValueRef, encode_state_key, encode_state_value, introduced_checkpoint_marker,
-    load_commit, load_commit_summary, open_coherent_view_on_read, select_historical_commit_members,
+    encode_state_key, encode_state_value, introduced_checkpoint_marker, load_commit,
+    load_commit_summary, open_coherent_view_on_read, select_historical_commit_members,
     state_points,
 };
 
@@ -235,113 +235,6 @@ where
 
     for checkpoint in &prepared_writes.checkpoint_publications {
         crate::gc::stage_checkpoint_publication(&mut publication, &view, checkpoint).await?;
-    }
-
-    let runtime_entity_pk =
-        runtime_checkpoint.map(|_| EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_KEY));
-
-    for row in prepared_writes
-        .state_rows
-        .iter()
-        .filter(|row| row.untracked)
-    {
-        if runtime_entity_pk.as_ref().is_some_and(|entity_pk| {
-            row.branch_id.as_str() == crate::GLOBAL_BRANCH_ID
-                && row.schema_key.as_str() == "lix_key_value"
-                && row.file_id.is_none()
-                && row.entity_pk == entity_pk
-        }) {
-            // The engine-owned sequence checkpoint is derived after statement
-            // rollback/savepoint handling. It therefore supersedes a staged
-            // user row at the same protected identity, matching the previous
-            // materializer without creating two values for one untracked key.
-            continue;
-        }
-        let key = StateKeyRef {
-            schema_key: row.schema_key.as_str(),
-            file_id: row.file_id.map(|value| value.as_str()),
-            entity_pk: row.entity_pk,
-        };
-        let untracked_owner = if row.global {
-            canonical_branch_id(crate::GLOBAL_BRANCH_ID)?
-        } else {
-            publication_branch_id
-        };
-        let canonical_snapshot = canonical_snapshot_for_row(
-            row,
-            &prepared_blob_manifests,
-            &prepared_writes.historical_blob_manifest_edges,
-        )?;
-        if let Some(snapshot) = canonical_snapshot.as_deref() {
-            publication.put_untracked_row(
-                untracked_owner,
-                key,
-                UntrackedValueRef {
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                    cell: StateCellRef::Value(snapshot),
-                    metadata: row.metadata.map(|value| value.normalized()),
-                    origin_key: row.origin_key.map(|value| value.as_str()),
-                    blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
-                        row,
-                        &prepared_blob_manifests,
-                        &prepared_writes.historical_blob_manifest_edges,
-                    )?,
-                },
-            )?;
-        } else {
-            publication.delete_untracked_row(untracked_owner, key)?;
-        }
-    }
-
-    if let Some((highest_seen, timestamp, _change_id)) = runtime_checkpoint {
-        let entity_pk = runtime_entity_pk
-            .as_ref()
-            .expect("runtime checkpoint necessarily has an entity identity");
-        let snapshot = deterministic_sequence_snapshot(highest_seen)?;
-        publication.put_untracked_row(
-            canonical_branch_id(crate::GLOBAL_BRANCH_ID)?,
-            StateKeyRef {
-                schema_key: "lix_key_value",
-                file_id: None,
-                entity_pk,
-            },
-            UntrackedValueRef {
-                created_at: timestamp,
-                updated_at: timestamp,
-                cell: StateCellRef::Value(&snapshot),
-                metadata: None,
-                origin_key: None,
-                blob_manifest_object_ids: &[],
-            },
-        )?;
-        let initialized_entity_pk =
-            EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_INITIALIZED_KEY);
-        let initialized_snapshot = serde_json::to_string(&serde_json::json!({
-            "key": crate::functions::DETERMINISTIC_SEQUENCE_INITIALIZED_KEY,
-            "value": true,
-        }))
-        .map_err(|error| {
-            writer_error(format!(
-                "failed to serialize deterministic sequence initialization marker: {error}"
-            ))
-        })?;
-        publication.put_untracked_row(
-            canonical_branch_id(crate::GLOBAL_BRANCH_ID)?,
-            StateKeyRef {
-                schema_key: "lix_key_value",
-                file_id: None,
-                entity_pk: &initialized_entity_pk,
-            },
-            UntrackedValueRef {
-                created_at: timestamp,
-                updated_at: timestamp,
-                cell: StateCellRef::Value(&initialized_snapshot),
-                metadata: None,
-                origin_key: None,
-                blob_manifest_object_ids: &[],
-            },
-        )?;
     }
 
     if !semantic_commit {
@@ -886,26 +779,6 @@ where
             let moves_head = requested_object_id.is_some_and(|object_id| {
                 object_id != target_view.branch_snapshot().semantic_head_commit_object_id
             }) || intent.commit_id.is_none();
-            if moves_head
-                && target_view
-                    .scan_untracked_overlay_rows()
-                    .await?
-                    .into_iter()
-                    .any(|(owner, _, _)| owner == branch_id)
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!(
-                        "cannot {} branch '{}' while branch-local untracked state exists",
-                        if intent.commit_id.is_some() {
-                            "repoint"
-                        } else {
-                            "delete"
-                        },
-                        intent.branch_id
-                    ),
-                ));
-            }
             publication
                 .publish_branch_selector_intent(
                     &target_view,

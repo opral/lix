@@ -44,7 +44,7 @@ use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
     defaultable_text_insert_value, insert_column_is_omitted,
 };
-use crate::state::{ForkTreeStateView, StateRow, TransactionStateView, UntrackedStateRow};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
 use crate::storage_adapter::{StorageAdapterRead, StorageError};
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteRow;
@@ -348,35 +348,6 @@ where
                 .collect()),
         }
     }
-
-    async fn untracked_overlay_branch_range(
-        &self,
-        branch_id: &str,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        match self {
-            Self::Committed(state) => {
-                state
-                    .untracked_overlay_branch_range_for_branch(
-                        // Keep tombstones until the tracked and untracked
-                        // lanes have been merged. A local untracked
-                        // tombstone must shadow a tracked value rather than
-                        // allowing the lower lane to resurrect it.
-                        branch_id, lower, upper, limit, true,
-                    )
-                    .await
-            }
-            Self::Transaction(state) => {
-                state
-                    .untracked_overlay_branch_range_for_branch(branch_id, lower, upper, limit, true)
-                    .await
-            }
-            #[cfg(test)]
-            Self::Fixture(_) => Ok(Vec::new()),
-        }
-    }
 }
 
 /// Stable public identity for a directory post-image. By-branch surfaces need
@@ -474,26 +445,6 @@ where
                     )
                     .map_err(lix_error_to_datafusion_error)?,
                 );
-                let mut untracked_rows = FilesystemStateRows::from_untracked_view_rows(
-                    self.state
-                        .untracked_overlay_branch_range(
-                            &branch_id,
-                            Some(&lower),
-                            upper.as_deref(),
-                            None,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?,
-                )
-                .map_err(lix_error_to_datafusion_error)?
-                .into_iter()
-                .collect::<Vec<_>>();
-                for row in &mut untracked_rows {
-                    if row.global() {
-                        row.branch_id = branch_id.clone();
-                    }
-                }
-                rows.extend(untracked_rows);
             } else {
                 for entity_pk in &request.filter.entity_pks {
                     let bounds = encode_state_entity_prefix_bounds(DIRECTORY_SCHEMA_KEY, entity_pk);
@@ -514,26 +465,6 @@ where
                         )
                         .map_err(lix_error_to_datafusion_error)?,
                     );
-                    let mut untracked_rows = FilesystemStateRows::from_untracked_view_rows(
-                        self.state
-                            .untracked_overlay_branch_range(
-                                &branch_id,
-                                Some(&bounds.lower),
-                                bounds.upper.as_deref(),
-                                None,
-                            )
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?,
-                    )
-                    .map_err(lix_error_to_datafusion_error)?
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                    for row in &mut untracked_rows {
-                        if row.global() {
-                            row.branch_id = branch_id.clone();
-                        }
-                    }
-                    rows.extend(untracked_rows);
                 }
             }
         }
@@ -1377,12 +1308,6 @@ where
                 "lixcol_global",
                 "INSERT into lix_directory",
             )?;
-            defaultable_bool_insert_value(
-                batch,
-                row_index,
-                "lixcol_untracked",
-                "INSERT into lix_directory",
-            )?;
         }
         Ok(())
     }
@@ -1405,11 +1330,7 @@ where
             "lixcol_global",
             Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
         )?;
-        materialize_omitted_column(
-            &materialized,
-            "lixcol_untracked",
-            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
-        )
+        Ok(materialized)
     }
 
     async fn materialize_returning_insert_defaults(
@@ -1510,22 +1431,7 @@ where
         if target.kind() != UpsertConflictKind::Path {
             return Ok(());
         }
-        let existing_untracked =
-            optional_bool_value(existing, existing_row, "lixcol_untracked")?.unwrap_or(false);
-        let proposed_untracked =
-            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
-        if existing_untracked == proposed_untracked {
-            return Ok(());
-        }
-        let path = required_string_value(proposed, proposed_row, "path")?;
-        Err(lix_error_to_datafusion_error(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "INSERT ON CONFLICT (path) on lix_directory cannot write {} path {path:?} over existing {} directory",
-                lane_name(proposed_untracked),
-                lane_name(existing_untracked)
-            ),
-        )))
+        Ok(())
     }
 
     /// Apply the `DO UPDATE` assignments to the augmented batch (existing
@@ -2167,13 +2073,7 @@ fn directory_row_context_from_batch(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: defaultable_bool_insert_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "INSERT into lix_directory",
-        )?
-        .unwrap_or(false),
+        untracked: false,
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_directory")?,
     })
@@ -2202,7 +2102,7 @@ fn directory_row_context_from_update(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        untracked: false,
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: update_optional_metadata_value(
             batch,
@@ -2367,7 +2267,6 @@ where
     let mut created_ats = Vec::new();
     let mut updated_ats = Vec::new();
     let mut commit_ids = Vec::new();
-    let mut untracked_values = Vec::new();
     let mut metadata_values = Vec::new();
     let mut branch_ids = Vec::new();
 
@@ -2384,7 +2283,6 @@ where
         created_ats.push(directory.live.created_at());
         updated_ats.push(directory.live.updated_at());
         commit_ids.push(directory.live.commit_id());
-        untracked_values.push(Some(directory.live.untracked()));
         metadata_values.push(directory.live.metadata());
         let branch_id = if schema.column_with_name("lixcol_branch_id").is_some() {
             directory.key.branch_id().to_owned()
@@ -2409,7 +2307,6 @@ where
             "lixcol_created_at" => Arc::new(StringArray::from(created_ats.clone())),
             "lixcol_updated_at" => Arc::new(StringArray::from(updated_ats.clone())),
             "lixcol_commit_id" => Arc::new(StringArray::from(commit_ids.clone())),
-            "lixcol_untracked" => Arc::new(BooleanArray::from(untracked_values.clone())),
             "lixcol_metadata" => Arc::new(StringArray::from(metadata_values.clone())),
             "lixcol_branch_id" => Arc::new(StringArray::from(branch_ids.clone())),
             other => {
@@ -2660,7 +2557,6 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]))
 }
@@ -3807,12 +3703,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
             "{\"id\":\"01920000-0000-7000-8000-000000000403\",\"parent_id\":null,\"name\":\"docs\"}",
         );
-        let mut untracked = live_row(
-            "01920000-0000-7000-8000-000000000413",
-            "01920000-0000-7000-8000-0000000000a1",
-            "{\"id\":\"01920000-0000-7000-8000-000000000413\",\"parent_id\":null,\"name\":\"docs\"}",
-        );
-        untracked.untracked = true;
         let mut global = live_row(
             "01920000-0000-7000-8000-000000000363",
             "ffffffff-ffff-7fff-bfff-ffffffffffff",
@@ -3825,7 +3715,7 @@ mod tests {
             "{\"id\":\"01920000-0000-7000-8000-000000000383\",\"parent_id\":null,\"name\":\"other\"}",
         );
         let index = Arc::new(
-            path_index_from_rows(vec![tracked, untracked, global, other])
+            path_index_from_rows(vec![tracked, global, other])
                 .expect("filesystem path index should build"),
         );
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
@@ -3870,40 +3760,15 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("candidate global column should be boolean");
-        let untracked = candidates
-            .column_by_name("lixcol_untracked")
-            .expect("candidate untracked column")
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("candidate untracked column should be boolean");
         let lanes = (0..candidates.num_rows())
-            .map(|row| {
-                (
-                    ids.value(row).to_string(),
-                    globals.value(row),
-                    untracked.value(row),
-                )
-            })
+            .map(|row| (ids.value(row).to_string(), globals.value(row)))
             .collect::<BTreeSet<_>>();
 
         assert_eq!(
             lanes,
             [
-                (
-                    "01920000-0000-7000-8000-000000000363".to_string(),
-                    true,
-                    false
-                ),
-                (
-                    "01920000-0000-7000-8000-000000000403".to_string(),
-                    false,
-                    false
-                ),
-                (
-                    "01920000-0000-7000-8000-000000000413".to_string(),
-                    false,
-                    true
-                ),
+                ("01920000-0000-7000-8000-000000000363".to_string(), true,),
+                ("01920000-0000-7000-8000-000000000403".to_string(), false,),
             ]
             .into_iter()
             .collect(),

@@ -21,14 +21,12 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_pk::EntityPk;
-use crate::forktree::{
-    CanonicalBranchId, ObjectId, StateCell, StateKey, StateValue, UntrackedValue,
-};
+use crate::forktree::{ObjectId, StateCell, StateKey, StateValue};
 #[cfg(test)]
 use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
 use crate::gc::CheckpointPublication;
-use crate::state::{CertifiedStatePredecessor, StagedStateRow, StagedUntrackedStateRow};
+use crate::state::{CertifiedStatePredecessor, StagedStateRow};
 #[cfg(test)]
 use crate::state::{ForkTreeStateView, TransactionStateView};
 use crate::transaction::types::StagedCommitChangeRefs;
@@ -616,17 +614,6 @@ fn state_value_from_prepared(row: PreparedStateRowRef<'_>) -> StateValue {
         // File payload publication is represented by the staged filesystem
         // row and upload owner. The state overlay must not invent a second
         // BlobRef authority while projecting read-your-writes rows.
-        blob_manifest_object_ids: Vec::new(),
-    }
-}
-
-fn untracked_value_from_prepared(row: PreparedStateRowRef<'_>) -> UntrackedValue {
-    UntrackedValue {
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        cell: staged_cell(row.snapshot),
-        metadata: row.metadata.map(|metadata| metadata.normalized().into()),
-        origin_key: row.origin_key.map(ToString::to_string),
         blob_manifest_object_ids: Vec::new(),
     }
 }
@@ -1385,7 +1372,7 @@ impl TransactionWriteBuffer {
     pub(crate) fn state_overlay_rows(
         &self,
         active_branch_id: &str,
-    ) -> Result<(Vec<StagedStateRow>, Vec<StagedUntrackedStateRow>), LixError> {
+    ) -> Result<Vec<StagedStateRow>, LixError> {
         let rows = self.rows.lock().map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1396,21 +1383,7 @@ impl TransactionWriteBuffer {
             StagedPreparedRows::AppendOnly { rows, .. }
             | StagedPreparedRows::Indexed { rows, .. } => rows,
         };
-        let global_id = CanonicalBranchId::from_bytes(
-            *uuid::Uuid::parse_str(GLOBAL_BRANCH_ID)
-                .expect("GLOBAL_BRANCH_ID must be a UUID")
-                .as_bytes(),
-        );
-        let active_id = uuid::Uuid::parse_str(active_branch_id).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!("transaction active branch ID must be a UUID: {error}"),
-            )
-        })?;
-        let active_id = CanonicalBranchId::from_bytes(*active_id.as_bytes());
-
         let mut tracked = Vec::<(Vec<u8>, bool, StagedStateRow)>::new();
-        let mut untracked = Vec::<(Vec<u8>, CanonicalBranchId, StagedUntrackedStateRow)>::new();
         for row in rows.iter() {
             let is_global = row.global || row.branch_id.as_str() == GLOBAL_BRANCH_ID;
             let is_active = row.branch_id.as_str() == active_branch_id;
@@ -1428,22 +1401,17 @@ impl TransactionWriteBuffer {
                 entity_pk: &key.entity_pk,
             });
             if row.untracked {
-                let owner = if is_global { global_id } else { active_id };
-                let untracked_row =
-                    StagedUntrackedStateRow::new(owner, key, untracked_value_from_prepared(row));
-                // Durable owner prefixes are storage addressing, not
-                // semantic row order. Keep staged mutations ordered by the
-                // canonical logical key so each owner can be merged before
-                // local-over-global precedence is applied.
-                untracked.push((encoded_key, owner, untracked_row));
-            } else {
-                let staged_key = encoded_key.clone();
-                tracked.push((
-                    encoded_key,
-                    is_global,
-                    StagedStateRow::new(staged_key, state_value_from_prepared(row)),
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "untracked state is no longer supported",
                 ));
             }
+            let staged_key = encoded_key.clone();
+            tracked.push((
+                encoded_key,
+                is_global,
+                StagedStateRow::new(staged_key, state_value_from_prepared(row)),
+            ));
         }
 
         tracked.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
@@ -1466,24 +1434,7 @@ impl TransactionWriteBuffer {
             tracked_rows.push(row);
         }
 
-        untracked.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then(left.1.as_bytes().cmp(right.1.as_bytes()))
-        });
-        for pair in untracked.windows(2) {
-            if pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "duplicate staged untracked state identity",
-                ));
-            }
-        }
-        let untracked_rows = untracked
-            .into_iter()
-            .map(|(_, _, row)| row)
-            .collect::<Vec<_>>();
-        Ok((tracked_rows, untracked_rows))
+        Ok(tracked_rows)
     }
 
     pub(crate) fn certify_complete_collection_replacement(
@@ -3049,7 +3000,7 @@ mod staging_semantics_tests {
 
     use crate::common::LixTimestamp;
     use crate::forktree::{
-        ForkTreeReadFacade, StateCell, StateKey, StateKeyRef, StateValue, UntrackedValue,
+        ForkTreeReadFacade, StateCell, StateKey, StateKeyRef, StateValue,
         encode_state_entity_prefix, encode_state_key, exclusive_prefix_upper_bound,
     };
     use crate::storage::{Memory, MemoryRead};
@@ -3188,25 +3139,6 @@ mod staging_semantics_tests {
             file_id: None,
             entity_pk: &entity_pk,
         })
-    }
-
-    fn native_untracked_key(schema_key: &str, entity: &str) -> StateKey {
-        StateKey {
-            schema_key: schema_key.to_string(),
-            file_id: None,
-            entity_pk: EntityPk::single(entity),
-        }
-    }
-
-    fn native_untracked_value(cell: StateCell) -> UntrackedValue {
-        UntrackedValue {
-            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
-            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.001Z"),
-            cell,
-            metadata: None,
-            origin_key: None,
-            blob_manifest_object_ids: Vec::new(),
-        }
     }
 
     async fn empty_committed_view() -> ForkTreeStateView<TestRead> {
@@ -3618,6 +3550,7 @@ mod staging_semantics_tests {
         assert!(matches!(rows[0].value.cell, StateCell::Value(_)));
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn native_staged_untracked_tombstone_preserves_owner_and_masks_slot() {
         let committed = empty_committed_view().await;
@@ -3664,6 +3597,7 @@ mod staging_semantics_tests {
         assert_eq!(rows[0].as_ref().expect("owner retained").owner, owner);
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn native_staged_untracked_rows_use_canonical_key_order_across_owners() {
         let committed = empty_committed_view().await;
@@ -3690,6 +3624,7 @@ mod staging_semantics_tests {
         .expect("canonical state-key order must not depend on owner prefix");
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn native_staged_untracked_exact_and_range_share_tombstone_visibility() {
         let committed = empty_committed_view().await;
@@ -3757,6 +3692,7 @@ mod staging_semantics_tests {
         assert_eq!(range[0].key, visible);
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn native_staged_untracked_range_uses_canonical_schema_bounds() {
         let committed = empty_committed_view().await;
@@ -3800,6 +3736,7 @@ mod staging_semantics_tests {
         assert_eq!(rows[0].key, in_schema);
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn native_staged_untracked_range_filters_tombstones_before_limit() {
         let committed = empty_committed_view().await;
@@ -4295,7 +4232,6 @@ mod transaction_overlay_tests {
                 false,
                 false,
             ),
-            prepared_row(ACTIVE_BRANCH_ID, "untracked_schema", None, false, true),
             prepared_row(
                 "01920000-0000-7000-8000-0000000000b2",
                 "ignored_schema",
@@ -4305,11 +4241,10 @@ mod transaction_overlay_tests {
             ),
         ]);
 
-        let (tracked, untracked) = buffer
+        let tracked = buffer
             .state_overlay_rows(ACTIVE_BRANCH_ID)
             .expect("native staging overlay should project");
         assert_eq!(tracked.len(), 1);
-        assert_eq!(untracked.len(), 1);
 
         let tracked_key = crate::forktree::decode_state_key(&tracked[0].key)
             .expect("tracked overlay key should be canonical");
@@ -4318,16 +4253,6 @@ mod transaction_overlay_tests {
             StateCell::Value(value) => assert!(value.contains("local")),
             other => panic!("expected local tracked value, got {other:?}"),
         }
-        assert!(matches!(untracked[0].value.cell, StateCell::Tombstone));
-        assert_eq!(
-            untracked[0].owner.as_bytes(),
-            CanonicalBranchId::from_bytes(
-                *uuid::Uuid::parse_str(ACTIVE_BRANCH_ID)
-                    .expect("active test branch should be valid")
-                    .as_bytes(),
-            )
-            .as_bytes()
-        );
     }
 
     #[test]

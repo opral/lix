@@ -22,7 +22,7 @@ use crate::forktree::{
     StateCell, StateKey, StateKeyRef, decode_state_key, encode_state_entity_prefix,
     encode_state_key, exclusive_prefix_upper_bound,
 };
-use crate::state::{StateRow, StateRowSource, TransactionStateView, UntrackedStateRow};
+use crate::state::{StateRow, StateRowSource, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidationSet};
 
@@ -96,23 +96,6 @@ impl NativeValidationRow {
             metadata: row.value.metadata,
             deleted,
         })
-    }
-
-    fn from_untracked(row: UntrackedStateRow) -> Self {
-        let (snapshot, deleted) = match row.value.cell {
-            StateCell::Value(value) => (Some(value), false),
-            StateCell::Null => (Some(SharedStr::from("null")), false),
-            StateCell::Tombstone => (None, true),
-        };
-        Self {
-            key: row.key,
-            branch_id: uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string(),
-            global: false,
-            untracked: true,
-            snapshot,
-            metadata: row.value.metadata,
-            deleted,
-        }
     }
 
     fn schema_key(&self) -> &str {
@@ -341,30 +324,24 @@ where
     );
     let upper = exclusive_prefix_upper_bound(&prefix);
     if domain.untracked() {
-        for row in state_view
-            .untracked_branch_range(Some(&prefix), upper.as_deref(), None)
-            .await?
-        {
-            let row = NativeValidationRow::from_untracked(row);
-            if domain_matches(domain, &row) {
-                output.rows.push(row);
-            }
-        }
-    } else {
-        // Validation is bounded to each affected schema prefix.  The native
-        // state view authenticates ordering, branch/global overlay, tombstones,
-        // and the transaction's staged replacement before this filter runs.
-        for row in state_view
-            .range(Some(&prefix), upper.as_deref(), None, true)
-            .await
-            .map_err(LixError::from)?
-        {
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_transaction_validation_row_visited();
-            let row = NativeValidationRow::from_tracked(row, active_branch_id)?;
-            if domain_matches(domain, &row) {
-                output.rows.push(row);
-            }
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "untracked state validation is no longer supported",
+        ));
+    }
+    // Validation is bounded to each affected schema prefix.  The native
+    // state view authenticates ordering, branch/global overlay, tombstones,
+    // and the transaction's staged replacement before this filter runs.
+    for row in state_view
+        .range(Some(&prefix), upper.as_deref(), None, true)
+        .await
+        .map_err(LixError::from)?
+    {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_transaction_validation_row_visited();
+        let row = NativeValidationRow::from_tracked(row, active_branch_id)?;
+        if domain_matches(domain, &row) {
+            output.rows.push(row);
         }
     }
     Ok(output)
@@ -397,9 +374,15 @@ fn exact_visible_request(
         },
         entity_pk,
     });
+    if domain.untracked() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "untracked state validation is no longer supported",
+        ));
+    }
     Ok(ExactVisibleRequest {
         key,
-        untracked: domain.untracked(),
+        untracked: false,
         include_tombstones,
     })
 }
@@ -422,12 +405,6 @@ where
         .filter(|request| !request.untracked)
         .map(|request| request.key.clone())
         .collect::<Vec<_>>();
-    let untracked_keys = requests
-        .iter()
-        .filter(|request| request.untracked)
-        .map(|request| request.key.clone())
-        .collect::<Vec<_>>();
-
     let tracked_rows = if tracked_keys.is_empty() {
         Vec::new()
     } else {
@@ -436,32 +413,17 @@ where
             .await
             .map_err(LixError::from)?
     };
-    let untracked_rows = if untracked_keys.is_empty() {
-        Vec::new()
-    } else {
-        state_view.untracked_points(&untracked_keys, true).await?
-    };
-
     let mut tracked_rows = tracked_rows.into_iter();
-    let mut untracked_rows = untracked_rows.into_iter();
     let mut output = Vec::with_capacity(requests.len());
     for request in requests {
-        let row = if request.untracked {
-            untracked_rows
-                .next()
-                .expect("untracked validation batch slot count matches requests")
-                .map(NativeValidationRow::from_untracked)
-        } else {
-            tracked_rows
-                .next()
-                .expect("tracked validation batch slot count matches requests")
-                .map(|row| NativeValidationRow::from_tracked(row, active_branch_id))
-                .transpose()?
-        };
+        let row = tracked_rows
+            .next()
+            .expect("tracked validation batch slot count matches requests")
+            .map(|row| NativeValidationRow::from_tracked(row, active_branch_id))
+            .transpose()?;
         output.push(row.filter(|row| request.include_tombstones || !row.deleted));
     }
     debug_assert!(tracked_rows.next().is_none());
-    debug_assert!(untracked_rows.next().is_none());
     Ok(output)
 }
 

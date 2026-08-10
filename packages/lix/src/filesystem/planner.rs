@@ -1528,22 +1528,7 @@ where
     let tracked_rows = state
         .branch_range(branch_id, None, None, None, true)
         .await?;
-    let mut rows = FilesystemStateRows::from_view_rows(tracked_rows, branch_id, false)?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut untracked_rows = FilesystemStateRows::from_untracked_view_rows(
-        state
-            .untracked_overlay_branch_range_for_branch(branch_id, None, None, None, true)
-            .await?,
-    )?
-    .into_iter()
-    .collect::<Vec<_>>();
-    for row in &mut untracked_rows {
-        if row.global() {
-            row.branch_id = branch_id.to_owned();
-        }
-    }
-    rows.extend(untracked_rows);
+    let rows = FilesystemStateRows::from_view_rows(tracked_rows, branch_id, false)?;
     let merged_rows = crate::filesystem::merge_filesystem_state_rows(rows, false);
     let mut resolvers = directory_path_resolvers_from_state_batch(&merged_rows)?;
     let key = filesystem_storage_scope_key(branch_id, false, false, None);

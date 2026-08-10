@@ -440,8 +440,6 @@ async fn apply_state_diff<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    reject_untracked_descriptor_cascade(transaction, target_delta, desired_is_target, target)
-        .await?;
     let cascade_file_ids = descriptor_dependency_cascade_file_ids(target_delta)?;
     let keys = if cascade_file_ids.is_empty() {
         target_delta
@@ -546,59 +544,6 @@ fn descriptor_dependency_cascade_file_ids(
         file_ids.insert(file_id);
     }
     Ok(file_ids.into_iter().collect())
-}
-
-async fn reject_untracked_descriptor_cascade<S>(
-    transaction: &mut Transaction<S>,
-    target_delta: &[HistoricalStateRow],
-    desired_is_target: bool,
-    target: CommitId,
-) -> Result<(), LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let removes_descriptor = |row: &HistoricalStateRow| {
-        if desired_is_target {
-            row.deleted
-        } else {
-            !row.deleted
-        }
-    };
-    let mut file_ids = Vec::new();
-    let mut removes_directory = false;
-    for row in target_delta {
-        if !removes_descriptor(row) {
-            continue;
-        }
-        match row.key.schema_key.as_str() {
-            "lix_file_descriptor" => file_ids.push(
-                row.key
-                    .entity_pk
-                    .as_single_string_owned()
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("undo/redo file descriptor identity is invalid: {error}"),
-                        )
-                    })?,
-            ),
-            "lix_directory_descriptor" => removes_directory = true,
-            _ => {}
-        }
-    }
-    let has_dependency = transaction
-        .has_untracked_file_scoped_rows(&file_ids)
-        .await?
-        || (removes_directory && transaction.has_untracked_rows().await?);
-    if has_dependency {
-        return Err(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "cannot undo/redo commit '{target}' because removing its file or directory would delete untracked state"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 async fn stage_marker<S>(
@@ -930,37 +875,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_transaction_leaves_untracked_state_untouched() {
-        let session = setup().await;
-        let mut transaction = session
-            .begin_transaction()
-            .await
-            .expect("transaction opens");
-        transaction
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('tracked', 'yes')",
-                &[],
-            )
-            .await
-            .expect("tracked row stages");
-        transaction
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('ui', 'open', true)",
-                &[],
-            )
-            .await
-            .expect("untracked row stages");
-        transaction
-            .commit()
-            .await
-            .expect("mixed transaction commits");
-
-        session.undo().await.expect("tracked portion undoes");
-        assert_eq!(value(&session, "tracked").await, None);
-        assert_eq!(value(&session, "ui").await.as_deref(), Some("open"));
-    }
-
-    #[tokio::test]
     async fn file_create_and_update_roundtrip_through_undo_redo() {
         let session = setup().await;
         session
@@ -1114,48 +1028,6 @@ mod tests {
         assert_eq!(
             value(&session, "global-state").await.as_deref(),
             Some("keep-me")
-        );
-    }
-
-    #[tokio::test]
-    async fn undo_file_creation_rejects_deleting_untracked_file_state() {
-        let session = setup().await;
-        session
-            .upsert_file_content("/owned.txt".into(), Blob::from("tracked".as_bytes()))
-            .await
-            .expect("file creates");
-        let file = session
-            .execute("SELECT id FROM lix_file WHERE path = '/owned.txt'", &[])
-            .await
-            .expect("file id reads");
-        let file_id = match file.rows()[0].get::<Value>("id").expect("id projects") {
-            Value::Text(value) => value,
-            value => panic!("expected text file id, got {value:?}"),
-        };
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_file_id, lixcol_untracked) \
-                 VALUES ('file-ui', 'open', $1, true)",
-                &[Value::Text(file_id)],
-            )
-            .await
-            .expect("untracked file state writes");
-
-        let error = session
-            .undo()
-            .await
-            .expect_err("undo must not cascade untracked state");
-        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert_eq!(value(&session, "file-ui").await.as_deref(), Some("open"));
-        assert_eq!(
-            session
-                .read_file_content("/owned.txt".into(), None)
-                .await
-                .expect("file reads")
-                .expect("file remains")
-                .content()
-                .as_ref(),
-            b"tracked"
         );
     }
 

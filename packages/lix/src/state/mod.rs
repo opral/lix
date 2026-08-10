@@ -13,7 +13,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, ObjectId, StateCell, StateKey, StateSource, StateValue,
-    UntrackedValue, VisibleStateRow,
+    VisibleStateRow,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageError};
 use base64::Engine as _;
@@ -123,15 +123,6 @@ pub(crate) struct StateRow {
     pub(crate) source: StateRowSource,
 }
 
-/// One authenticated untracked row, retaining the owner branch identity so a
-/// consumer cannot republish a global value as branch-local state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct UntrackedStateRow {
-    pub(crate) owner: CanonicalBranchId,
-    pub(crate) key: StateKey,
-    pub(crate) value: UntrackedValue,
-}
-
 /// Authenticated global/local state roots for one historical view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StateRoots {
@@ -192,21 +183,6 @@ pub(crate) enum StateRowSource {
 pub(crate) struct StagedStateRow {
     pub(crate) key: Vec<u8>,
     pub(crate) value: StateValue,
-}
-
-/// A staged untracked cell. The owner is explicit because untracked overlay
-/// resolution must preserve branch-over-global precedence and tombstones.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StagedUntrackedStateRow {
-    pub(crate) owner: CanonicalBranchId,
-    pub(crate) key: StateKey,
-    pub(crate) value: UntrackedValue,
-}
-
-impl StagedUntrackedStateRow {
-    pub(crate) fn new(owner: CanonicalBranchId, key: StateKey, value: UntrackedValue) -> Self {
-        Self { owner, key, value }
-    }
 }
 
 impl StagedStateRow {
@@ -365,159 +341,6 @@ where
             .map_err(LixError::from)
     }
 
-    /// Resolves exact untracked state keys through the same retained view.
-    /// Returned slots preserve request order and duplicates, while each
-    /// result retains the authenticated local/global owner.
-    pub(crate) async fn untracked_points(
-        &self,
-        state_keys: &[Vec<u8>],
-    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
-        Ok(self
-            .view
-            .load_untracked_overlay_points(state_keys)
-            .await?
-            .into_iter()
-            .map(|row| row.map(|(owner, key, value)| UntrackedStateRow { owner, key, value }))
-            .collect())
-    }
-
-    /// Resolves exact untracked keys for an explicitly selected branch using
-    /// this view's retained read. The branch view is borrowed from the same
-    /// authenticated coherent read; it does not refresh selectors or acquire
-    /// another storage read.
-    pub(crate) async fn untracked_points_for_branch(
-        &self,
-        branch_id: &str,
-        state_keys: &[Vec<u8>],
-    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
-        let branch_id = canonical_branch_id(branch_id)?;
-        Ok(self
-            .view
-            .branch_view(branch_id)
-            .await?
-            .load_untracked_overlay_points(state_keys)
-            .await?
-            .into_iter()
-            .map(|row| row.map(|(owner, key, value)| UntrackedStateRow { owner, key, value }))
-            .collect())
-    }
-
-    /// Resolves exact untracked rows from one authenticated owner without
-    /// applying the sibling-owner overlay. TransactionStateView uses this
-    /// primitive to apply staged mutations per owner before local-over-global
-    /// precedence, so a staged global row cannot mask a committed local row.
-    pub(crate) async fn untracked_points_for_owner(
-        &self,
-        owner: CanonicalBranchId,
-        state_keys: &[Vec<u8>],
-    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
-        let owner_view = self.view.branch_view(owner).await?;
-        let mut rows = Vec::with_capacity(state_keys.len());
-        for state_key in state_keys {
-            let row = owner_view
-                .load_untracked_owner_point(owner, state_key)
-                .await?
-                .map(|(key, value)| UntrackedStateRow { owner, key, value });
-            rows.push(row);
-        }
-        Ok(rows)
-    }
-
-    /// Scans the authenticated untracked local/global overlay through the
-    /// retained view and keeps the owner attached to every result.
-    pub(crate) async fn untracked_overlay_rows(&self) -> Result<Vec<UntrackedStateRow>, LixError> {
-        Ok(self
-            .view
-            .scan_untracked_overlay_rows()
-            .await?
-            .into_iter()
-            .map(|(owner, key, value)| UntrackedStateRow { owner, key, value })
-            .collect())
-    }
-
-    /// Scans one authenticated branch's untracked key range without opening
-    /// another read or traversing unrelated owners.
-    pub(crate) async fn untracked_branch_range(
-        &self,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        let owner = self.view.branch_id();
-        Ok(self
-            .view
-            .scan_untracked_branch_range(lower, upper, limit)
-            .await?
-            .into_iter()
-            .map(|(key, value)| UntrackedStateRow { owner, key, value })
-            .collect())
-    }
-
-    /// Scans one authenticated untracked owner over a bounded canonical
-    /// state-key range. The owner is selected by the retained coherent view;
-    /// no sibling owner is implicitly substituted.
-    pub(crate) async fn untracked_owner_range(
-        &self,
-        owner: CanonicalBranchId,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        let owner_view = self.view.branch_view(owner).await?;
-        Ok(owner_view
-            .scan_untracked_branch_range(lower, upper, limit)
-            .await?
-            .into_iter()
-            .map(|(key, value)| UntrackedStateRow { owner, key, value })
-            .collect())
-    }
-
-    /// Scans the selected branch's authenticated untracked overlay together
-    /// with the global owner through this same retained read. Branch values
-    /// win for equal state keys, including tombstones, before visibility and
-    /// LIMIT are applied. Each owner is traversed with the supplied bounds;
-    /// this never widens a bounded entity scan to a whole-owner enumeration.
-    pub(crate) async fn untracked_overlay_range(
-        &self,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-        include_tombstones: bool,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        Ok(self
-            .view
-            .scan_untracked_overlay_branch_range(lower, upper, limit, include_tombstones)
-            .await?
-            .into_iter()
-            .map(|(owner, key, value)| UntrackedStateRow { owner, key, value })
-            .collect())
-    }
-
-    /// Scans the bounded untracked overlay for an explicitly selected branch.
-    /// The local and global owner ranges are merged by logical state key so a
-    /// local row (including a tombstone) masks the global row before the
-    /// caller's limit is applied.
-    pub(crate) async fn untracked_overlay_branch_range_for_branch(
-        &self,
-        branch_id: &str,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-        include_tombstones: bool,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        if limit == Some(0) {
-            return Ok(Vec::new());
-        }
-        let branch_id = canonical_branch_id(branch_id)?;
-        let branch_view = self.view.branch_view(branch_id).await?;
-        Ok(branch_view
-            .scan_untracked_overlay_branch_range(lower, upper, limit, include_tombstones)
-            .await?
-            .into_iter()
-            .map(|(owner, key, value)| UntrackedStateRow { owner, key, value })
-            .collect())
-    }
-
     /// Diffs two explicit authenticated root pairs through this retained
     /// ForkTree view. Equal roots short-circuit before any tree descent;
     /// changed keys are merged from the two intrinsically ordered native
@@ -605,114 +428,6 @@ fn merge_sorted_state_keys(left: Vec<StateKey>, right: Vec<StateKey>) -> Vec<Sta
     merged
 }
 
-fn canonical_untracked_state_key(key: &StateKey) -> Vec<u8> {
-    crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-        schema_key: &key.schema_key,
-        file_id: key.file_id.as_deref(),
-        entity_pk: &key.entity_pk,
-    })
-}
-
-fn state_key_in_range(key: &StateKey, lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
-    let encoded = canonical_untracked_state_key(key);
-    lower.is_none_or(|bound| encoded.as_slice() >= bound)
-        && upper.is_none_or(|bound| encoded.as_slice() < bound)
-}
-
-fn merge_untracked_owner_rows(
-    global: Vec<UntrackedStateRow>,
-    local: Vec<UntrackedStateRow>,
-) -> Vec<UntrackedStateRow> {
-    let mut global = global.into_iter().peekable();
-    let mut local = local.into_iter().peekable();
-    let mut merged = Vec::new();
-    loop {
-        match (global.peek(), local.peek()) {
-            (None, None) => break,
-            (Some(_), None) => merged.push(global.next().expect("peeked global row")),
-            (None, Some(_)) => merged.push(local.next().expect("peeked local row")),
-            (Some(global_row), Some(local_row)) => match global_row.key.cmp(&local_row.key) {
-                Ordering::Less => merged.push(global.next().expect("peeked global row")),
-                Ordering::Greater => merged.push(local.next().expect("peeked local row")),
-                // A local row, including a tombstone, masks the global row.
-                Ordering::Equal => {
-                    global.next();
-                    merged.push(local.next().expect("peeked local row"));
-                }
-            },
-        }
-    }
-    merged
-}
-
-/// Applies one owner's staged rows over that owner's committed rows. Both
-/// inputs are ordered by canonical state-key bytes, so this remains a bounded
-/// linear merge and never compares owner-prefixed storage keys.
-fn merge_untracked_owner_overlay(
-    committed: Vec<UntrackedStateRow>,
-    staged: Vec<UntrackedStateRow>,
-) -> Vec<UntrackedStateRow> {
-    let mut committed = committed.into_iter().peekable();
-    let mut staged = staged.into_iter().peekable();
-    let mut merged = Vec::new();
-    loop {
-        match (committed.peek(), staged.peek()) {
-            (None, None) => break,
-            (Some(_), None) => merged.push(committed.next().expect("peeked committed row")),
-            (None, Some(_)) => merged.push(staged.next().expect("peeked staged row")),
-            (Some(committed_row), Some(staged_row)) => match committed_row.key.cmp(&staged_row.key)
-            {
-                Ordering::Less => merged.push(committed.next().expect("peeked committed row")),
-                Ordering::Greater => merged.push(staged.next().expect("peeked staged row")),
-                Ordering::Equal => {
-                    committed.next();
-                    merged.push(staged.next().expect("peeked staged row"));
-                }
-            },
-        }
-    }
-    merged
-}
-
-/// Applies staged owner rows to a committed effective local/global overlay.
-/// The committed input has already resolved its own local-over-global choice;
-/// this merge retains a committed local row when only a staged global row is
-/// present, while still allowing staged local rows to replace it. This keeps
-/// exact points and ranges on the same owner-aware precedence rule.
-fn merge_untracked_overlay_rows(
-    committed: Vec<UntrackedStateRow>,
-    staged_global: Vec<UntrackedStateRow>,
-    staged_local: Vec<UntrackedStateRow>,
-    local_owner: CanonicalBranchId,
-) -> Vec<UntrackedStateRow> {
-    let staged = merge_untracked_owner_rows(staged_global, staged_local);
-    let mut committed = committed.into_iter().peekable();
-    let mut staged = staged.into_iter().peekable();
-    let mut merged = Vec::new();
-    loop {
-        match (committed.peek(), staged.peek()) {
-            (None, None) => break,
-            (Some(_), None) => merged.push(committed.next().expect("peeked committed row")),
-            (None, Some(_)) => merged.push(staged.next().expect("peeked staged row")),
-            (Some(committed_row), Some(staged_row)) => match committed_row.key.cmp(&staged_row.key)
-            {
-                Ordering::Less => merged.push(committed.next().expect("peeked committed row")),
-                Ordering::Greater => merged.push(staged.next().expect("peeked staged row")),
-                Ordering::Equal => {
-                    let committed_row = committed.next().expect("peeked committed row");
-                    let staged_row = staged.next().expect("peeked staged row");
-                    if staged_row.owner == local_owner || committed_row.owner != local_owner {
-                        merged.push(staged_row);
-                    } else {
-                        merged.push(committed_row);
-                    }
-                }
-            },
-        }
-    }
-    merged
-}
-
 /// One transaction's committed retained view plus an ordered staged overlay.
 /// Staged rows are validated once at construction; points and ranges use
 /// linear overlay merges and never materialize a full-key map.
@@ -720,7 +435,6 @@ fn merge_untracked_overlay_rows(
 pub(crate) struct TransactionStateView<R> {
     committed: ForkTreeStateView<R>,
     staged: Vec<StagedStateRow>,
-    staged_untracked: Vec<StagedUntrackedStateRow>,
 }
 
 impl<R> TransactionStateView<R>
@@ -799,93 +513,18 @@ where
                 "staged state rows are not strictly ordered",
             ));
         }
-        Ok(Self {
-            committed,
-            staged,
-            staged_untracked: Vec::new(),
-        })
-    }
-
-    /// Constructs a transaction view with explicitly owned staged untracked
-    /// cells. The untracked overlay is kept ordered and linear just like the
-    /// tracked staged rows; no full-key map is introduced.
-    pub(crate) fn new_with_untracked(
-        committed: ForkTreeStateView<R>,
-        staged: Vec<StagedStateRow>,
-        staged_untracked: Vec<StagedUntrackedStateRow>,
-    ) -> Result<Self, LixError> {
-        let view = Self::new(committed, staged)?;
-        for rows in staged_untracked.windows(2) {
-            let left_key = canonical_untracked_state_key(&rows[0].key);
-            let right_key = canonical_untracked_state_key(&rows[1].key);
-            match left_key.cmp(&right_key) {
-                Ordering::Less => {}
-                Ordering::Greater => {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "staged untracked state rows are not ordered by canonical state key",
-                    ));
-                }
-                Ordering::Equal if rows[0].owner == rows[1].owner => {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "duplicate staged untracked state identity",
-                    ));
-                }
-                Ordering::Equal => {}
-            }
-        }
-        Ok(Self {
-            staged_untracked,
-            ..view
-        })
+        Ok(Self { committed, staged })
     }
 
     /// Rebinds the same retained committed view to the latest transaction
     /// buffer snapshot. This is the only mutable part of an explicit
     /// transaction read: no new storage read or committed-only facade is
     /// acquired between statements.
-    pub(crate) fn with_staged_rows(
-        &self,
-        staged: Vec<StagedStateRow>,
-        staged_untracked: Vec<StagedUntrackedStateRow>,
-    ) -> Result<Self, LixError>
+    pub(crate) fn with_staged_rows(&self, staged: Vec<StagedStateRow>) -> Result<Self, LixError>
     where
         R: Clone,
     {
-        Self::new_with_untracked(self.committed.clone(), staged, staged_untracked)
-    }
-
-    fn staged_untracked_rows_for_owner(
-        &self,
-        owner: CanonicalBranchId,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-    ) -> Vec<UntrackedStateRow> {
-        self.staged_untracked
-            .iter()
-            .filter(|row| row.owner == owner && state_key_in_range(&row.key, lower, upper))
-            .map(|row| UntrackedStateRow {
-                owner: row.owner,
-                key: row.key.clone(),
-                value: row.value.clone(),
-            })
-            .collect()
-    }
-
-    fn staged_untracked_row_for_owner(
-        &self,
-        owner: CanonicalBranchId,
-        key: &StateKey,
-    ) -> Option<UntrackedStateRow> {
-        self.staged_untracked
-            .iter()
-            .find(|row| row.owner == owner && row.key == *key)
-            .map(|row| UntrackedStateRow {
-                owner: row.owner,
-                key: row.key.clone(),
-                value: row.value.clone(),
-            })
+        Self::new(self.committed.clone(), staged)
     }
 
     /// Resolves every requested key before applying visibility. A staged
@@ -1027,219 +666,6 @@ where
             .branch_range(branch_id, lower, upper, limit, include_tombstones)
             .await
     }
-
-    /// Resolves untracked exact points with staged rows taking precedence.
-    /// A staged tombstone suppresses the committed local/global answer even
-    /// when the caller omits tombstones from its result projection.
-    pub(crate) async fn untracked_points(
-        &self,
-        state_keys: &[Vec<u8>],
-        include_tombstones: bool,
-    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
-        let active_owner = canonical_branch_id(self.committed.branch_id().as_str())?;
-        let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
-        let committed_local = self
-            .committed
-            .untracked_points_for_owner(active_owner, state_keys)
-            .await?;
-        let committed_global = if active_owner == global_owner {
-            vec![None; state_keys.len()]
-        } else {
-            self.committed
-                .untracked_points_for_owner(global_owner, state_keys)
-                .await?
-        };
-        let mut output = Vec::with_capacity(state_keys.len());
-        for ((key, committed_local), committed_global) in
-            state_keys.iter().zip(committed_local).zip(committed_global)
-        {
-            let decoded_key = crate::forktree::decode_state_key(key)?;
-            let staged_local = self.staged_untracked_row_for_owner(active_owner, &decoded_key);
-            let staged_global = (active_owner != global_owner)
-                .then(|| self.staged_untracked_row_for_owner(global_owner, &decoded_key))
-                .flatten();
-            // Resolve each owner independently before applying local-over-
-            // global precedence. In particular, a staged global row must
-            // never replace an authenticated committed local row, while a
-            // local staged tombstone must still mask the global owner.
-            let local = staged_local.or(committed_local);
-            let global = staged_global.or(committed_global);
-            let row = local.or(global);
-            let row = row.filter(|row| include_tombstones || !row.value.cell.deleted());
-            output.push(row);
-        }
-        Ok(output)
-    }
-
-    /// Resolves exact untracked keys for another branch through the same
-    /// transaction-owned retained read. Staged rows are applied only when
-    /// the requested branch is the transaction's branch; other branches use
-    /// their authenticated committed overlay.
-    pub(crate) async fn untracked_points_for_branch(
-        &self,
-        branch_id: &str,
-        state_keys: &[Vec<u8>],
-        include_tombstones: bool,
-    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
-        if self.committed.branch_id_matches(branch_id)? {
-            return self.untracked_points(state_keys, include_tombstones).await;
-        }
-        let rows = self
-            .committed
-            .untracked_points_for_branch(branch_id, state_keys)
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| row.filter(|row| include_tombstones || !row.value.cell.deleted()))
-            .collect())
-    }
-
-    /// Returns the effective local/global untracked overlay after applying
-    /// staged owners. The returned rows are canonical-key ordered and retain
-    /// their authenticated owner identity for filesystem projections.
-    pub(crate) async fn untracked_overlay_rows(&self) -> Result<Vec<UntrackedStateRow>, LixError> {
-        let committed = self.committed.untracked_overlay_rows().await?;
-        let active_owner = canonical_branch_id(self.committed.branch_id().as_str())?;
-        let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
-        let staged_global = self.staged_untracked_rows_for_owner(global_owner, None, None);
-        let staged_local = if active_owner == global_owner {
-            Vec::new()
-        } else {
-            self.staged_untracked_rows_for_owner(active_owner, None, None)
-        };
-        Ok(merge_untracked_overlay_rows(
-            committed,
-            staged_global,
-            staged_local,
-            active_owner,
-        ))
-    }
-
-    /// Resolves one bounded untracked branch range through the retained
-    /// ForkTree view and merges the ordered staged overlay. The caller must
-    /// supply a schema/entity prefix range; this method never widens it to a
-    /// whole-owner scan.
-    pub(crate) async fn untracked_branch_range(
-        &self,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        if limit == Some(0) {
-            return Ok(Vec::new());
-        }
-        let committed = self
-            .committed
-            .untracked_branch_range(lower, upper, None)
-            .await?;
-        let owner = uuid::Uuid::parse_str(&self.committed.branch_id())
-            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?;
-        let owner = CanonicalBranchId::from_bytes(*owner.as_bytes());
-        let staged = self.staged_untracked_rows_for_owner(owner, lower, upper);
-        Ok(
-            merge_untracked_overlay_rows(committed, Vec::new(), staged, owner)
-                .into_iter()
-                .take(limit.unwrap_or(usize::MAX))
-                .collect(),
-        )
-    }
-
-    /// Resolves the global+branch untracked range through the committed
-    /// retained view, then applies this transaction's staged untracked rows
-    /// as an ordered overlay. Staged tombstones suppress committed values
-    /// before visibility and LIMIT, matching exact-point semantics.
-    pub(crate) async fn untracked_overlay_range(
-        &self,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-        include_tombstones: bool,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        let active_owner = canonical_branch_id(self.committed.branch_id().as_str())?;
-        let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
-        let committed_local = self
-            .committed
-            .untracked_owner_range(active_owner, lower, upper, None)
-            .await?;
-        let committed_global = if active_owner == global_owner {
-            Vec::new()
-        } else {
-            self.committed
-                .untracked_owner_range(global_owner, lower, upper, None)
-                .await?
-        };
-        let staged_global = self.staged_untracked_rows_for_owner(global_owner, lower, upper);
-        let staged_local = if active_owner == global_owner {
-            Vec::new()
-        } else {
-            self.staged_untracked_rows_for_owner(active_owner, lower, upper)
-        };
-        let effective_local = merge_untracked_owner_overlay(committed_local, staged_local);
-        let effective_global = merge_untracked_owner_overlay(committed_global, staged_global);
-        let rows = merge_untracked_owner_rows(effective_global, effective_local)
-            .into_iter()
-            .filter(|row| include_tombstones || !row.value.cell.deleted())
-            .take(limit.unwrap_or(usize::MAX))
-            .collect();
-        Ok(rows)
-    }
-
-    /// Resolves one bounded untracked overlay range for an explicit branch,
-    /// retaining the transaction's staged overlay when that branch is the
-    /// transaction branch and otherwise using only the committed retained
-    /// view. The merge remains bounded to the requested range.
-    pub(crate) async fn untracked_overlay_branch_range_for_branch(
-        &self,
-        branch_id: &str,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-        include_tombstones: bool,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        if limit == Some(0) {
-            return Ok(Vec::new());
-        }
-        if self.committed.branch_id_matches(branch_id)? {
-            return self
-                .untracked_overlay_range(lower, upper, limit, include_tombstones)
-                .await;
-        }
-        let target = canonical_branch_id(branch_id)?;
-        let global = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
-        let (staged_global, staged_local) = if self.committed.branch_id_matches(branch_id)? {
-            if target == global {
-                (
-                    Vec::new(),
-                    self.staged_untracked_rows_for_owner(target, lower, upper),
-                )
-            } else {
-                (
-                    self.staged_untracked_rows_for_owner(global, lower, upper),
-                    self.staged_untracked_rows_for_owner(target, lower, upper),
-                )
-            }
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let staged_empty = staged_global.is_empty() && staged_local.is_empty();
-        let committed = self
-            .committed
-            .untracked_overlay_branch_range_for_branch(
-                branch_id,
-                lower,
-                upper,
-                staged_empty.then_some(limit).flatten(),
-                staged_empty && include_tombstones,
-            )
-            .await?;
-        Ok(
-            merge_untracked_overlay_rows(committed, staged_global, staged_local, target)
-                .into_iter()
-                .filter(|row| include_tombstones || !row.value.cell.deleted())
-                .take(limit.unwrap_or(usize::MAX))
-                .collect(),
-        )
-    }
 }
 
 fn visible_committed_row(row: StateRow, include_tombstones: bool) -> Option<StateRow> {
@@ -1255,101 +681,5 @@ fn visible_staged_row(row: &StagedStateRow, include_tombstones: bool) -> Option<
         None
     } else {
         Some(StateRow::from_staged(row))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_row(owner: CanonicalBranchId, value: &str) -> UntrackedStateRow {
-        UntrackedStateRow {
-            owner,
-            key: StateKey {
-                schema_key: "app.overlay".into(),
-                file_id: None,
-                entity_pk: EntityPk::single("same"),
-            },
-            value: UntrackedValue {
-                created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
-                updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.001Z"),
-                cell: StateCell::Value(value.into()),
-                metadata: None,
-                origin_key: None,
-                blob_manifest_object_ids: Vec::new(),
-            },
-        }
-    }
-
-    #[test]
-    fn staged_global_does_not_mask_committed_local() {
-        let local = CanonicalBranchId::from_bytes([1; 16]);
-        let global = CanonicalBranchId::from_bytes([2; 16]);
-        let merged = merge_untracked_overlay_rows(
-            vec![test_row(local, "committed-local")],
-            vec![test_row(global, "staged-global")],
-            Vec::new(),
-            local,
-        );
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].owner, local);
-        assert_eq!(
-            merged[0].value.cell,
-            StateCell::Value("committed-local".into())
-        );
-    }
-
-    #[test]
-    fn staged_local_wins_over_staged_global_and_tombstone_masks() {
-        let local = CanonicalBranchId::from_bytes([1; 16]);
-        let global = CanonicalBranchId::from_bytes([2; 16]);
-        let merged = merge_untracked_overlay_rows(
-            Vec::new(),
-            vec![test_row(global, "staged-global")],
-            vec![UntrackedStateRow {
-                value: UntrackedValue {
-                    cell: StateCell::Tombstone,
-                    ..test_row(local, "unused").value
-                },
-                ..test_row(local, "unused")
-            }],
-            local,
-        );
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].owner, local);
-        assert!(merged[0].value.cell.deleted());
-    }
-
-    #[test]
-    fn owner_staging_precedes_local_over_global_for_exact_and_range() {
-        let local = CanonicalBranchId::from_bytes([1; 16]);
-        let global = CanonicalBranchId::from_bytes([2; 16]);
-        let local_tombstone = UntrackedStateRow {
-            value: UntrackedValue {
-                cell: StateCell::Tombstone,
-                ..test_row(local, "unused").value
-            },
-            ..test_row(local, "unused")
-        };
-        let staged_global = test_row(global, "staged-global");
-        let committed_global = test_row(global, "committed-global");
-
-        let effective_local = merge_untracked_owner_overlay(
-            vec![test_row(local, "committed-local")],
-            vec![local_tombstone.clone()],
-        );
-        let effective_global =
-            merge_untracked_owner_overlay(vec![committed_global], vec![staged_global]);
-        let exact = effective_local
-            .first()
-            .cloned()
-            .or_else(|| effective_global.first().cloned());
-        assert_eq!(exact.as_ref().map(|row| row.owner), Some(local));
-        assert!(exact.is_some_and(|row| row.value.cell.deleted()));
-
-        let range = merge_untracked_owner_rows(effective_global, effective_local);
-        assert_eq!(range.len(), 1);
-        assert_eq!(range[0].owner, local);
-        assert!(range[0].value.cell.deleted());
     }
 }

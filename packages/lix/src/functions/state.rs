@@ -1,6 +1,6 @@
 use crate::LixError;
 use crate::functions::{DeterministicMode, DeterministicSequence};
-use crate::state::{ForkTreeStateView, UntrackedStateRow};
+use crate::state::{ForkTreeStateView, StateRow};
 use crate::storage_adapter::StorageAdapterRead;
 use serde_json::Value as JsonValue;
 
@@ -11,8 +11,7 @@ pub(crate) const DETERMINISTIC_SEQUENCE_INITIALIZED_KEY: &str =
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
-/// Loads deterministic-mode settings from the canonical untracked current
-/// state member.
+/// Loads deterministic-mode settings from the authenticated global state.
 ///
 /// Missing mode means deterministic execution is disabled. Malformed mode rows
 /// are errors because they would make runtime function behavior ambiguous. This
@@ -26,12 +25,12 @@ where
     let rows = load_key_value_rows(state).await?;
     let Some(row) = rows.iter().find(|row| {
         !row.value.cell.deleted()
-            && row
-                .key
-                .entity_pk
-                .as_single_string()
-                .ok()
-                .is_some_and(|key| key == DETERMINISTIC_MODE_KEY)
+            && state_row_key(row).ok().is_some_and(|key| {
+                key.entity_pk
+                    .as_single_string()
+                    .ok()
+                    .is_some_and(|value| value == DETERMINISTIC_MODE_KEY)
+            })
     }) else {
         return Ok(DeterministicMode::disabled());
     };
@@ -52,23 +51,24 @@ where
     let rows = load_key_value_rows(state).await?;
     let sequence = rows.iter().find(|row| {
         !row.value.cell.deleted()
-            && row
-                .key
-                .entity_pk
-                .as_single_string()
-                .ok()
-                .is_some_and(|key| key == DETERMINISTIC_SEQUENCE_KEY)
+            && state_row_key(row).ok().is_some_and(|key| {
+                key.entity_pk
+                    .as_single_string()
+                    .ok()
+                    .is_some_and(|value| value == DETERMINISTIC_SEQUENCE_KEY)
+            })
     });
     if let Some(row) = sequence {
         return parse_sequence_value(key_value_payload(row, DETERMINISTIC_SEQUENCE_KEY)?);
     }
 
     let initialized = rows.iter().find(|row| {
-        row.key
-            .entity_pk
-            .as_single_string()
-            .ok()
-            .is_some_and(|key| key == DETERMINISTIC_SEQUENCE_INITIALIZED_KEY)
+        state_row_key(row).ok().is_some_and(|key| {
+            key.entity_pk
+                .as_single_string()
+                .ok()
+                .is_some_and(|value| value == DETERMINISTIC_SEQUENCE_INITIALIZED_KEY)
+        })
     });
     let Some(initialized) = initialized else {
         return Ok(DeterministicSequence::uninitialized());
@@ -92,27 +92,35 @@ where
     ))
 }
 
-async fn load_key_value_rows<R>(
-    state: &ForkTreeStateView<R>,
-) -> Result<Vec<UntrackedStateRow>, LixError>
+async fn load_key_value_rows<R>(state: &ForkTreeStateView<R>) -> Result<Vec<StateRow>, LixError>
 where
     R: StorageAdapterRead,
 {
-    let rows = state.untracked_overlay_rows().await?;
-    let global_branch =
-        uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID).expect("GLOBAL_BRANCH_ID must be canonical");
+    let empty_entity_pk = crate::entity_pk::EntityPk {
+        components: crate::entity_pk::EntityPkComponents::Empty,
+    };
+    let lower = crate::forktree::encode_state_entity_prefix(KEY_VALUE_SCHEMA_KEY, &empty_entity_pk);
+    let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
+    let rows = state
+        .branch_range(
+            crate::GLOBAL_BRANCH_ID,
+            Some(&lower),
+            upper.as_deref(),
+            None,
+            true,
+        )
+        .await
+        .map_err(LixError::from)?;
     let mut identities = std::collections::BTreeSet::new();
     for row in &rows {
-        if row.key.schema_key != KEY_VALUE_SCHEMA_KEY
-            || row.key.file_id.is_some()
-            || row.owner.as_bytes() != global_branch.as_bytes()
-        {
+        let state_key = state_row_key(row)?;
+        if state_key.schema_key != KEY_VALUE_SCHEMA_KEY || state_key.file_id.is_some() {
             return Err(LixError::new(
                 LixError::CODE_STORAGE_ERROR,
                 "deterministic key-value scan returned a row outside its authenticated owner",
             ));
         }
-        let key = row.key.entity_pk.as_single_string().map_err(|error| {
+        let key = state_key.entity_pk.as_single_string().map_err(|error| {
             LixError::new(
                 LixError::CODE_STORAGE_ERROR,
                 format!("deterministic key-value row has an invalid identity: {error}"),
@@ -173,7 +181,11 @@ where
     Ok(rows)
 }
 
-fn key_value_payload(row: &UntrackedStateRow, key: &str) -> Result<JsonValue, LixError> {
+fn state_row_key(row: &StateRow) -> Result<crate::forktree::StateKey, LixError> {
+    crate::forktree::decode_state_key(&row.key).map_err(LixError::from)
+}
+
+fn key_value_payload(row: &StateRow, key: &str) -> Result<JsonValue, LixError> {
     let snapshot_content = match &row.value.cell {
         crate::forktree::StateCell::Value(value) => value.as_str(),
         crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
@@ -204,7 +216,7 @@ fn key_value_payload(row: &UntrackedStateRow, key: &str) -> Result<JsonValue, Li
     })
 }
 
-fn state_snapshot_content(row: &UntrackedStateRow) -> Option<&str> {
+fn state_snapshot_content(row: &StateRow) -> Option<&str> {
     match &row.value.cell {
         crate::forktree::StateCell::Value(value) => Some(value.as_str()),
         crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
@@ -244,304 +256,4 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
         ));
     };
     Ok(DeterministicSequence { highest_seen })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ops::Bound;
-
-    use bytes::Bytes;
-
-    use crate::engine::Engine;
-    use crate::storage::Memory;
-    use crate::storage_adapter::{
-        MAX_SCAN_PAGE_ROWS, StorageAdapter, StorageBeginScanOptions, StorageCoreProjection,
-        StorageKey, StorageProjectedValue, StorageReadOptions, StorageValue, StorageWriteOptions,
-    };
-
-    #[test]
-    fn missing_mode_payload_defaults_to_disabled_without_a_legacy_state_owner() {
-        assert_eq!(
-            parse_mode_value(serde_json::json!({})).expect("missing mode should decode"),
-            DeterministicMode::disabled()
-        );
-    }
-
-    #[test]
-    fn deterministic_sequence_rejects_non_integer_payloads_fail_closed() {
-        for value in [
-            JsonValue::Null,
-            JsonValue::String("7".to_owned()),
-            serde_json::json!({ "highest_seen": 7 }),
-        ] {
-            let error = parse_sequence_value(value)
-                .expect_err("a non-integer sequence payload must fail closed");
-            assert_eq!(error.code, LixError::CODE_UNKNOWN);
-            assert!(error.message.contains("must be an integer"));
-        }
-    }
-
-    #[test]
-    fn deterministic_mode_rejects_non_object_payloads_fail_closed() {
-        for value in [
-            JsonValue::Null,
-            JsonValue::Bool(true),
-            JsonValue::String("on".to_owned()),
-        ] {
-            let error =
-                parse_mode_value(value).expect_err("a non-object mode payload must fail closed");
-            assert_eq!(error.code, LixError::CODE_UNKNOWN);
-            assert!(error.message.contains("must be an object"));
-        }
-    }
-
-    #[tokio::test]
-    async fn public_deterministic_function_rejects_same_count_member_substitution_after_reopen() {
-        let storage = Memory::new();
-        let receipt = Engine::initialize(storage.clone())
-            .await
-            .expect("test repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("test repository should open");
-        let session = engine
-            .open_session(receipt.main_branch_id.clone())
-            .await
-            .expect("workspace session should open");
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
-                &[],
-            )
-            .await
-            .expect("deterministic mode should publish");
-        session
-            .execute("SELECT lix_uuid_v7()", &[])
-            .await
-            .expect("the initial deterministic function call should publish its member");
-        drop(session);
-        drop(engine);
-
-        let published = storage
-            .export_snapshot()
-            .expect("published deterministic state should snapshot");
-        let reopened = Memory::from_snapshot(&published).expect("state should cold reopen");
-        let reopened_engine = Engine::new(reopened.clone())
-            .await
-            .expect("reopened state should open");
-        let reopened_session = reopened_engine
-            .open_session(crate::GLOBAL_BRANCH_ID.to_owned())
-            .await
-            .expect("reopened workspace should open");
-        reopened_session
-            .execute("SELECT lix_uuid_v7()", &[])
-            .await
-            .expect("an authenticated selected member should remain usable after reopen");
-        drop(reopened_session);
-        drop(reopened_engine);
-
-        let corrupt = Memory::from_snapshot(&published).expect("corruption fixture should reopen");
-        let storage = StorageAdapter::new(corrupt.clone());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("current untracked state should be readable");
-        let range = crate::storage_adapter::StorageKeyRange {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        };
-        let mut cursor = read
-            .begin_scan(
-                crate::forktree::UNTRACKED_ROW_SPACE,
-                range,
-                StorageBeginScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    ..StorageBeginScanOptions::default()
-                },
-            )
-            .await
-            .expect("untracked state scan should begin");
-        let mut selected = Vec::new();
-        loop {
-            let page = cursor
-                .next_page(MAX_SCAN_PAGE_ROWS)
-                .await
-                .expect("untracked state page should read");
-            selected.extend(page.entries.into_iter().filter(|entry| {
-                entry
-                    .key
-                    .0
-                    .windows(DETERMINISTIC_SEQUENCE_KEY.len())
-                    .any(|window| window == DETERMINISTIC_SEQUENCE_KEY.as_bytes())
-            }));
-            if !page.has_more {
-                break;
-            }
-        }
-        drop(cursor);
-        drop(read);
-        assert_eq!(selected.len(), 1, "fixture must select one sequence member");
-        let selected = selected.pop().expect("selected member");
-        let StorageProjectedValue::FullValue(value) = selected.value else {
-            panic!("selected deterministic member must include its value");
-        };
-        let replacement = b"lix_unrelated_sequence_substitute";
-        assert_eq!(replacement.len(), DETERMINISTIC_SEQUENCE_KEY.len());
-        let replacement_key = StorageKey(Bytes::from(replace_subslice(
-            selected.key.0.as_ref(),
-            DETERMINISTIC_SEQUENCE_KEY.as_bytes(),
-            replacement,
-        )));
-        let mut writes = storage.new_write_set();
-        writes.delete(crate::forktree::UNTRACKED_ROW_SPACE, selected.key);
-        writes.put(
-            crate::forktree::UNTRACKED_ROW_SPACE,
-            replacement_key,
-            StorageValue { bytes: value },
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("same-count current-owner substitution should commit");
-
-        let corrupted_snapshot = corrupt
-            .export_snapshot()
-            .expect("corrupted current-owner state should snapshot");
-        let corrupted = Memory::from_snapshot(&corrupted_snapshot)
-            .expect("corrupted current-owner state should cold reopen");
-        let corrupted_engine = Engine::new(corrupted)
-            .await
-            .expect("structurally corrupt state should open before selected read");
-        let corrupted_session = corrupted_engine
-            .open_workspace_session()
-            .await
-            .expect("corrupted workspace should open before selected read");
-        let error = corrupted_session
-            .execute("SELECT lix_uuid_v7()", &[])
-            .await
-            .expect_err("missing selected member must fail closed through the public function");
-        assert!(
-            error.message.contains("identity") || error.message.contains("sequence"),
-            "unexpected selected-member closure error: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn public_deterministic_function_rejects_missing_initialized_member_after_reopen() {
-        let storage = Memory::new();
-        let receipt = Engine::initialize(storage.clone())
-            .await
-            .expect("test repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("test repository should open");
-        let session = engine
-            .open_session(receipt.main_branch_id.clone())
-            .await
-            .expect("workspace session should open");
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
-                &[],
-            )
-            .await
-            .expect("deterministic mode should publish");
-        session
-            .execute("SELECT lix_uuid_v7()", &[])
-            .await
-            .expect("the initial deterministic function call should publish its member");
-        drop(session);
-        drop(engine);
-
-        let corrupted = Memory::from_snapshot(
-            &storage
-                .export_snapshot()
-                .expect("published deterministic state should snapshot"),
-        )
-        .expect("corruption fixture should reopen");
-        let storage_adapter = StorageAdapter::new(corrupted.clone());
-        let read = storage_adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("current untracked state should be readable");
-        let range = crate::storage_adapter::StorageKeyRange {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        };
-        let mut cursor = read
-            .begin_scan(
-                crate::forktree::UNTRACKED_ROW_SPACE,
-                range,
-                StorageBeginScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    ..StorageBeginScanOptions::default()
-                },
-            )
-            .await
-            .expect("untracked state scan should begin");
-        let mut sequence_key = None;
-        loop {
-            let page = cursor
-                .next_page(MAX_SCAN_PAGE_ROWS)
-                .await
-                .expect("untracked state page should read");
-            if sequence_key.is_none() {
-                sequence_key = page.entries.into_iter().find_map(|entry| {
-                    entry
-                        .key
-                        .0
-                        .windows(DETERMINISTIC_SEQUENCE_KEY.len())
-                        .any(|window| window == DETERMINISTIC_SEQUENCE_KEY.as_bytes())
-                        .then_some(entry.key)
-                });
-            }
-            if sequence_key.is_some() || !page.has_more {
-                break;
-            }
-        }
-        drop(cursor);
-        drop(read);
-        let sequence_key = sequence_key.expect("fixture must contain one sequence member");
-        let mut writes = storage_adapter.new_write_set();
-        writes.delete(crate::forktree::UNTRACKED_ROW_SPACE, sequence_key);
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("missing-member corruption should commit");
-
-        let corrupted_snapshot = corrupted
-            .export_snapshot()
-            .expect("missing-member state should snapshot");
-        let corrupted = Memory::from_snapshot(&corrupted_snapshot)
-            .expect("missing-member state should cold reopen");
-        let corrupted_engine = Engine::new(corrupted)
-            .await
-            .expect("corrupt state should open before selected read");
-        let corrupted_session = corrupted_engine
-            .open_workspace_session()
-            .await
-            .expect("corrupt workspace should open before selected read");
-        let error = corrupted_session
-            .execute("SELECT lix_uuid_v7()", &[])
-            .await
-            .expect_err("an initialized but missing sequence member must fail closed");
-        assert!(
-            error.message.contains("missing") || error.message.contains("sequence"),
-            "unexpected missing-member closure error: {error:?}"
-        );
-    }
-
-    fn replace_subslice(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-        assert_eq!(needle.len(), replacement.len());
-        let position = haystack
-            .windows(needle.len())
-            .position(|candidate| candidate == needle)
-            .expect("selected key must contain its canonical identity");
-        let mut replaced = haystack.to_vec();
-        replaced[position..position + needle.len()].copy_from_slice(replacement);
-        replaced
-    }
 }

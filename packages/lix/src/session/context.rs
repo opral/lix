@@ -37,8 +37,8 @@ use crate::transaction::CommitCoordinator;
 
 pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 
-/// Loads the workspace selector from its canonical untracked current-state
-/// member when opening a workspace session.
+/// Loads the workspace selector from its canonical authenticated state member
+/// when opening a workspace session.
 pub(crate) async fn load_workspace_branch_id_from_index(
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
@@ -51,7 +51,7 @@ pub(crate) async fn load_workspace_branch_id_from_index(
     });
     let view = ForkTreeStateView::from_facade(forktree, GLOBAL_BRANCH_ID).await?;
     let row = view
-        .untracked_points(&[key])
+        .points(&[key], true)
         .await?
         .into_iter()
         .next()

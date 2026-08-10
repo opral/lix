@@ -333,100 +333,6 @@ where
         }
     }
 
-    async fn untracked_points_for_branch(
-        &self,
-        branch_id: &str,
-        keys: &[Vec<u8>],
-        include_tombstones: bool,
-    ) -> Result<Vec<Option<crate::state::UntrackedStateRow>>, LixError> {
-        match self {
-            Self::Committed(view) => {
-                view.untracked_points_for_branch(branch_id, keys)
-                    .await
-                    .map(|rows| {
-                        rows.into_iter()
-                            .map(|row| {
-                                row.filter(|row| include_tombstones || !row.value.cell.deleted())
-                            })
-                            .collect()
-                    })
-            }
-            Self::Transaction(view) => view.untracked_points(keys, include_tombstones).await,
-            #[cfg(test)]
-            Self::TestNative {
-                views, scan_count, ..
-            } => {
-                if let Some(scan_count) = scan_count {
-                    scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                let view = views.get(branch_id).ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("native test state has no branch '{branch_id}'"),
-                    )
-                })?;
-                view.untracked_points(keys, include_tombstones).await
-            }
-        }
-    }
-
-    async fn untracked_range_for_branch(
-        &self,
-        branch_id: &str,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: Option<usize>,
-        include_tombstones: bool,
-    ) -> Result<Vec<crate::state::UntrackedStateRow>, LixError> {
-        match self {
-            Self::Committed(view) => {
-                view.untracked_overlay_branch_range_for_branch(
-                    branch_id,
-                    lower,
-                    upper,
-                    limit,
-                    include_tombstones,
-                )
-                .await
-            }
-            Self::Transaction(view) if view.branch_id() == branch_id => {
-                view.untracked_overlay_range(lower, upper, limit, include_tombstones)
-                    .await
-            }
-            Self::Transaction(view) => {
-                view.untracked_overlay_branch_range_for_branch(
-                    branch_id,
-                    lower,
-                    upper,
-                    limit,
-                    include_tombstones,
-                )
-                .await
-            }
-            #[cfg(test)]
-            Self::TestNative {
-                views, scan_count, ..
-            } => {
-                if let Some(scan_count) = scan_count {
-                    scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                let view = views.get(branch_id).ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("native test state has no branch '{branch_id}'"),
-                    )
-                })?;
-                view.untracked_branch_range(lower, upper, limit)
-                    .await
-                    .map(|rows| {
-                        rows.into_iter()
-                            .filter(|row| include_tombstones || !row.value.cell.deleted())
-                            .collect()
-                    })
-            }
-        }
-    }
-
     async fn range_for_branch(
         &self,
         branch_id: &str,
@@ -505,115 +411,72 @@ where
         } else {
             request.filter.schema_keys.clone()
         };
+        if request.filter.untracked == Some(true) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "untracked state is no longer supported",
+            ));
+        }
         let mut rows = Vec::new();
         for branch_id in branch_ids {
-            let modes = match request.filter.untracked {
-                Some(untracked) => vec![untracked],
-                None => vec![false, true],
-            };
-            for untracked in modes {
-                // When both lanes are requested, retain untracked tombstones
-                // long enough to mask a tracked value before final visibility
-                // filtering. Explicit single-lane requests keep their
-                // caller-selected tombstone behavior.
-                let include_tombstones =
-                    request.filter.include_tombstones || request.filter.untracked.is_none();
-                if request.filter.entity_pks.is_empty() {
-                    for schema_key in &schemas {
-                        let bounds = schema_range_bounds(schema_key);
-                        if untracked {
-                            let mut projected = FilesystemStateRows::from_untracked_view_rows(
-                                self.untracked_range_for_branch(
-                                    &branch_id,
-                                    Some(&bounds.0),
-                                    bounds.1.as_deref(),
-                                    None,
-                                    include_tombstones,
-                                )
-                                .await?,
-                            )?
-                            .into_iter()
-                            .collect::<Vec<_>>();
-                            for row in &mut projected {
-                                if row.global {
-                                    row.branch_id = branch_id.clone();
-                                }
-                            }
-                            rows.extend(projected);
-                        } else {
-                            rows.extend(
-                                FilesystemStateRows::from_view_rows(
-                                    self.range_for_branch(
-                                        &branch_id,
-                                        Some(&bounds.0),
-                                        bounds.1.as_deref(),
-                                        None,
-                                        include_tombstones,
-                                    )
-                                    .await?,
-                                    &branch_id,
-                                    false,
-                                )?
-                                .into_iter(),
-                            );
-                        }
-                    }
-                } else {
-                    let mut keys = Vec::new();
-                    for schema_key in &schemas {
-                        for entity_pk in &request.filter.entity_pks {
-                            let file_ids = if request.filter.file_ids.is_empty() {
-                                vec![crate::NullableKeyFilter::Any]
-                            } else {
-                                request.filter.file_ids.clone()
-                            };
-                            for file_id in file_ids {
-                                let file_id = match file_id {
-                                    crate::NullableKeyFilter::Any
-                                    | crate::NullableKeyFilter::Null => None,
-                                    crate::NullableKeyFilter::Value(file_id) => Some(file_id),
-                                };
-                                keys.push(crate::forktree::encode_state_key(
-                                    crate::forktree::StateKeyRef {
-                                        schema_key,
-                                        file_id: file_id.as_deref(),
-                                        entity_pk,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                    if untracked {
-                        let mut projected = FilesystemStateRows::from_untracked_view_rows(
-                            self.untracked_points_for_branch(&branch_id, &keys, include_tombstones)
-                                .await?
-                                .into_iter()
-                                .flatten()
-                                .collect(),
-                        )?
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                        for row in &mut projected {
-                            if row.global {
-                                row.branch_id = branch_id.clone();
-                            }
-                        }
-                        rows.extend(projected);
-                    } else {
-                        rows.extend(
-                            FilesystemStateRows::from_view_rows(
-                                self.points_for_branch(&branch_id, &keys, include_tombstones)
-                                    .await?
-                                    .into_iter()
-                                    .flatten()
-                                    .collect(),
+            let include_tombstones = request.filter.include_tombstones;
+            if request.filter.entity_pks.is_empty() {
+                for schema_key in &schemas {
+                    let bounds = schema_range_bounds(schema_key);
+                    rows.extend(
+                        FilesystemStateRows::from_view_rows(
+                            self.range_for_branch(
                                 &branch_id,
-                                false,
-                            )?
-                            .into_iter(),
-                        );
+                                Some(&bounds.0),
+                                bounds.1.as_deref(),
+                                None,
+                                include_tombstones,
+                            )
+                            .await?,
+                            &branch_id,
+                            false,
+                        )?
+                        .into_iter(),
+                    );
+                }
+            } else {
+                let mut keys = Vec::new();
+                for schema_key in &schemas {
+                    for entity_pk in &request.filter.entity_pks {
+                        let file_ids = if request.filter.file_ids.is_empty() {
+                            vec![crate::NullableKeyFilter::Any]
+                        } else {
+                            request.filter.file_ids.clone()
+                        };
+                        for file_id in file_ids {
+                            let file_id = match file_id {
+                                crate::NullableKeyFilter::Any | crate::NullableKeyFilter::Null => {
+                                    None
+                                }
+                                crate::NullableKeyFilter::Value(file_id) => Some(file_id),
+                            };
+                            keys.push(crate::forktree::encode_state_key(
+                                crate::forktree::StateKeyRef {
+                                    schema_key,
+                                    file_id: file_id.as_deref(),
+                                    entity_pk,
+                                },
+                            ));
+                        }
                     }
                 }
+                rows.extend(
+                    FilesystemStateRows::from_view_rows(
+                        self.points_for_branch(&branch_id, &keys, include_tombstones)
+                            .await?
+                            .into_iter()
+                            .flatten()
+                            .collect(),
+                        &branch_id,
+                        false,
+                    )?
+                    .into_iter(),
+                );
             }
         }
         rows.retain(|row| {
@@ -717,36 +580,17 @@ where
         let mut output = (0..request.rows.len()).map(|_| None).collect::<Vec<_>>();
         for (branch_id, slots) in groups {
             let keys = slots.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-            let include_overlay_tombstones =
-                request.include_tombstones || request.untracked.is_none();
-            let tracked = if request.untracked != Some(true) {
-                Some(
-                    self.points_for_branch(&branch_id, &keys, include_overlay_tombstones)
-                        .await?,
-                )
-            } else {
-                None
-            };
-            let untracked = if request.untracked != Some(false) {
-                Some(
-                    self.untracked_points_for_branch(&branch_id, &keys, include_overlay_tombstones)
-                        .await?,
-                )
-            } else {
-                None
-            };
+            if request.untracked == Some(true) {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "untracked state is no longer supported",
+                ));
+            }
+            let tracked = self
+                .points_for_branch(&branch_id, &keys, request.include_tombstones)
+                .await?;
             for (ordinal, (slot, _)) in slots.into_iter().enumerate() {
-                if let Some(row) = untracked.as_ref().and_then(|rows| rows[ordinal].clone()) {
-                    let mut row = FilesystemStateRow::from_untracked_state_row(row)?;
-                    if row.global {
-                        row.branch_id = branch_id.clone();
-                    }
-                    output[slot] = if row.deleted && !request.include_tombstones {
-                        None
-                    } else {
-                        Some(row)
-                    };
-                } else if let Some(row) = tracked.as_ref().and_then(|rows| rows[ordinal].clone()) {
+                if let Some(row) = tracked[ordinal].clone() {
                     output[slot] =
                         Some(FilesystemStateRow::from_state_row(row, &branch_id, false)?);
                 }
@@ -839,25 +683,6 @@ where
             rows.extend(FilesystemStateRows::from_view_rows(
                 tracked, branch_id, false,
             )?);
-            let untracked = state_view
-                .untracked_overlay_branch_range_for_branch(
-                    branch_id,
-                    Some(&bounds.0),
-                    bounds.1.as_deref(),
-                    None,
-                    true,
-                )
-                .await
-                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
-            let mut untracked = FilesystemStateRows::from_untracked_view_rows(untracked)?
-                .into_iter()
-                .collect::<Vec<_>>();
-            for row in &mut untracked {
-                if row.global() {
-                    row.branch_id = branch_id.clone();
-                }
-            }
-            rows.extend(untracked);
         }
     }
     let rows = crate::filesystem::merge_filesystem_state_rows(rows, false);
@@ -2835,12 +2660,6 @@ where
                 "lixcol_global",
                 "INSERT into lix_file",
             )?;
-            defaultable_bool_insert_value(
-                batch,
-                row_index,
-                "lixcol_untracked",
-                "INSERT into lix_file",
-            )?;
             if !insert_column_is_omitted(batch, "content") {
                 insert_optional_binary_value(batch, row_index, "content")?;
             }
@@ -2874,11 +2693,7 @@ where
             "lixcol_global",
             Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
         )?;
-        materialize_omitted_column(
-            &materialized,
-            "lixcol_untracked",
-            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
-        )
+        Ok(materialized)
     }
 
     async fn materialize_returning_insert_defaults(
@@ -3031,22 +2846,7 @@ where
         if target.kind() != UpsertConflictKind::Path {
             return Ok(());
         }
-        let existing_untracked =
-            optional_bool_value(existing, existing_row, "lixcol_untracked")?.unwrap_or(false);
-        let proposed_untracked =
-            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
-        if existing_untracked == proposed_untracked {
-            return Ok(());
-        }
-        let path = required_string_value(proposed, proposed_row, "path")?;
-        Err(lix_error_to_datafusion_error(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "INSERT ON CONFLICT (path) on lix_file cannot write {} path {path:?} over existing {} file",
-                lane_name(proposed_untracked),
-                lane_name(existing_untracked)
-            ),
-        )))
+        Ok(())
     }
 
     async fn apply_conflict_update(
@@ -3441,7 +3241,7 @@ impl FileDescriptorRecord {
         FilesystemRowContext {
             branch_id: live.branch_id().to_owned(),
             global: live.global(),
-            untracked: live.untracked(),
+            untracked: false,
             file_id: live.file_id().map(str::to_owned),
             metadata: None,
         }
@@ -5455,13 +5255,7 @@ fn file_row_context_from_batch(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: defaultable_bool_insert_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "INSERT into lix_file",
-        )?
-        .unwrap_or(false),
+        untracked: false,
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_file")?,
     })
@@ -5490,7 +5284,7 @@ fn file_row_context_from_update(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        untracked: false,
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: update_optional_metadata_value(
             batch,
@@ -5885,12 +5679,6 @@ fn lix_file_record_batch_from_path_selection(
                     .map(|entry| entry.commit_id().map(|id| id.to_string()))
                     .collect::<Vec<_>>(),
             )),
-            "lixcol_untracked" => Arc::new(BooleanArray::from(
-                entries
-                    .iter()
-                    .map(|entry| Some(entry.key.is_untracked()))
-                    .collect::<Vec<_>>(),
-            )),
             "lixcol_metadata" => Arc::new(StringArray::from(
                 entries
                     .iter()
@@ -5954,7 +5742,6 @@ struct LixFileRecordBatchColumns {
     created_ats: Vec<Option<String>>,
     updated_ats: Vec<Option<String>>,
     commit_ids: Vec<Option<String>>,
-    untracked_values: Vec<Option<bool>>,
     metadata_values: Vec<Option<String>>,
     branch_ids: Vec<Option<String>>,
 }
@@ -5975,7 +5762,6 @@ impl LixFileRecordBatchColumns {
         self.created_ats.push(Some(row.created_at));
         self.updated_ats.push(Some(row.updated_at));
         self.commit_ids.push(row.commit_id);
-        self.untracked_values.push(Some(row.untracked));
         self.metadata_values.push(row.metadata);
         self.branch_ids.push(Some(row.branch_id));
     }
@@ -5996,7 +5782,6 @@ impl LixFileRecordBatchColumns {
             created_ats,
             updated_ats,
             commit_ids,
-            untracked_values,
             metadata_values,
             branch_ids,
         } = self;
@@ -6018,7 +5803,6 @@ impl LixFileRecordBatchColumns {
         let created_ats: ArrayRef = Arc::new(StringArray::from(created_ats));
         let updated_ats: ArrayRef = Arc::new(StringArray::from(updated_ats));
         let commit_ids: ArrayRef = Arc::new(StringArray::from(commit_ids));
-        let untracked_values: ArrayRef = Arc::new(BooleanArray::from(untracked_values));
         let metadata_values: ArrayRef = Arc::new(StringArray::from(metadata_values));
         let branch_ids: ArrayRef = Arc::new(StringArray::from(branch_ids));
 
@@ -6038,7 +5822,6 @@ impl LixFileRecordBatchColumns {
                 "lixcol_created_at" => Arc::clone(&created_ats),
                 "lixcol_updated_at" => Arc::clone(&updated_ats),
                 "lixcol_commit_id" => Arc::clone(&commit_ids),
-                "lixcol_untracked" => Arc::clone(&untracked_values),
                 "lixcol_metadata" => Arc::clone(&metadata_values),
                 "lixcol_branch_id" => Arc::clone(&branch_ids),
                 other => {
@@ -6261,7 +6044,7 @@ async fn lix_file_record_batch_from_prepared_with_blob_bytes(
             created_at: live.created_at().to_string(),
             updated_at: content_live.unwrap_or(live).updated_at().to_string(),
             commit_id: live.commit_id().map(|id| id.to_string()),
-            untracked: live.untracked(),
+            untracked: false,
             metadata: live.metadata().map(|value| serialize_row_metadata(value)),
             branch_id: live.branch_id().to_owned(),
         });
@@ -6505,7 +6288,6 @@ async fn load_authenticated_blob_ranges_for_files(
                         state_key: row.state_key.clone(),
                         branch_id: parse_blob_scope_branch_id(live.branch_id())?,
                         global: live.global(),
-                        untracked: live.untracked(),
                     },
                     range.clone(),
                 ));
@@ -6560,7 +6342,6 @@ async fn load_authenticated_blob_bytes_for_files(
                     state_key: row.state_key.clone(),
                     branch_id: parse_blob_scope_branch_id(live.branch_id())?,
                     global: live.global(),
-                    untracked: live.untracked(),
                 });
             }
             *remaining += 1;
@@ -6634,7 +6415,6 @@ where
                         state_key: row.state_key.clone(),
                         branch_id: parse_blob_scope_branch_id(live.branch_id())?,
                         global: live.global(),
-                        untracked: live.untracked(),
                     });
                 }
             }
@@ -8459,7 +8239,6 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]))
 }
@@ -8531,7 +8310,7 @@ mod tests {
         AuthenticatedBlobReader, BranchStateTransition, ChangeCatalogEntry, ChangeCatalogOwner,
         ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitObjectV1, ForkTreeReadFacade,
         PreparedPublication, RepositoryRootV1, StateKey, StateMutationAudit, StateTreeMutation,
-        StateValueRef, UntrackedValue, encode_state_key, encode_state_value,
+        StateValueRef, encode_state_key, encode_state_value,
     };
     use crate::functions::FunctionProviderHandle;
     use crate::json_store::JsonSlot;
@@ -8543,7 +8322,7 @@ mod tests {
     use crate::sql2::dml::InsertSink;
     use crate::sql2::providers::upsert::UpsertConflictTarget;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::state::{ForkTreeStateView, StagedUntrackedStateRow, TransactionStateView};
+    use crate::state::{ForkTreeStateView, TransactionStateView};
     use crate::storage::{Memory, MemoryRead};
     use crate::storage_adapter::{
         SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
@@ -8922,32 +8701,12 @@ mod tests {
                 .expect("ForkTree branch view should complete without yielding")
                 .expect("initialized main branch view should open");
         let mut selected = BTreeMap::<Vec<u8>, crate::state::StateRow>::new();
-        let mut staged_untracked = Vec::new();
-        for row in rows.iter().filter(|row| {
-            (row.branch_id == branch_id && !row.global)
-                || (row.branch_id == GLOBAL_BRANCH_ID && row.untracked)
-        }) {
+        for row in rows
+            .iter()
+            .filter(|row| row.branch_id == branch_id && !row.global)
+        {
             let native = super::test_filesystem_row_to_state_row(row)
                 .expect("native filesystem fixture should be encodable");
-            if row.untracked {
-                let owner = uuid::Uuid::parse_str(&row.branch_id)
-                    .expect("native untracked fixture owner should be a UUID");
-                let key = crate::forktree::decode_state_key(&native.key)
-                    .expect("native untracked fixture key should decode");
-                staged_untracked.push(StagedUntrackedStateRow::new(
-                    crate::forktree::CanonicalBranchId::from_bytes(*owner.as_bytes()),
-                    key,
-                    UntrackedValue {
-                        created_at: native.value.created_at,
-                        updated_at: native.value.updated_at,
-                        cell: native.value.cell.clone(),
-                        metadata: native.value.metadata.clone(),
-                        origin_key: native.value.origin_key.clone(),
-                        blob_manifest_object_ids: native.value.blob_manifest_object_ids.clone(),
-                    },
-                ));
-                continue;
-            }
             let replace = row.branch_id == branch_id;
             if replace || !selected.contains_key(&native.key) {
                 selected.insert(native.key.clone(), native);
@@ -8957,8 +8716,7 @@ mod tests {
             .into_values()
             .map(|row| crate::state::StagedStateRow::new(row.key, row.value))
             .collect();
-        staged_untracked.sort_by(|left, right| left.key.cmp(&right.key));
-        TransactionStateView::new_with_untracked(committed, staged, staged_untracked)
+        TransactionStateView::new(committed, staged)
             .expect("native transaction overlay should be valid")
     }
 
@@ -9711,7 +9469,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000b1",
             r#"{"id":"01920000-0000-7000-8000-000000000522","directory_id":null,"name":"readme.md"}"#,
         );
-        target.untracked = true;
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_file_row(
@@ -9738,7 +9495,6 @@ mod tests {
             "id",
             "lixcol_file_id",
             "lixcol_global",
-            "lixcol_untracked",
             "lixcol_created_at",
             "lixcol_updated_at",
             "lixcol_branch_id",
@@ -9774,21 +9530,11 @@ mod tests {
                 .expect("descriptor column should be string data")
                 .value(0)
         };
-        let boolean_value = |column_name: &str| {
-            batch
-                .column(batch.schema().index_of(column_name).unwrap())
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("descriptor column should be boolean data")
-                .value(0)
-        };
         assert_eq!(string_value("id"), "01920000-0000-7000-8000-000000000522");
         assert_eq!(
             string_value("lixcol_file_id"),
             "01920000-0000-7000-8000-000000000522"
         );
-        assert!(!boolean_value("lixcol_global"));
-        assert!(boolean_value("lixcol_untracked"));
         assert_eq!(
             string_value("lixcol_created_at"),
             "2026-04-23T00:00:00.000Z"
@@ -10230,72 +9976,6 @@ mod tests {
                 )
                 .expect("point entity key"),
             }]]
-        );
-    }
-
-    #[tokio::test]
-    async fn exact_blob_batch_untracked_overlay_masks_tracked_owner() {
-        let file_id = "01920000-0000-7000-8000-0000000000c1";
-        let branch_id = "01920000-0000-7000-8000-0000000000b1";
-        let tracked_data = b"tracked";
-        let untracked_data = b"untracked";
-        let tracked = live_blob_ref_row(
-            file_id,
-            branch_id,
-            file_id,
-            &BlobId::from_canonical_content(tracked_data).to_hex(),
-            tracked_data.len(),
-        );
-        let mut untracked = live_blob_ref_row(
-            file_id,
-            branch_id,
-            file_id,
-            &BlobId::from_canonical_content(untracked_data).to_hex(),
-            untracked_data.len(),
-        );
-        untracked.untracked = true;
-        let entity_pk = crate::entity_pk::EntityPk::uuid_from_canonical(file_id)
-            .expect("blob-ref fixture entity key");
-        let request = FileExactBatchPlan {
-            rows: vec![super::FileExactKeyPlan {
-                branch_id: branch_id.to_owned(),
-                schema_key: super::BLOB_REF_SCHEMA_KEY.to_owned(),
-                entity_pk: entity_pk.clone(),
-                file_id: Some(file_id.to_owned()),
-            }],
-            untracked: None,
-            ..FileExactBatchPlan::default()
-        };
-        let view = FileStateView::test_rows(vec![tracked, untracked.clone()]);
-        let rows = view
-            .load_exact_batch(&request)
-            .await
-            .expect("exact overlay should load both native lanes");
-        let selected = rows[0].as_ref().expect("untracked value should be visible");
-        assert!(selected.untracked);
-        assert!(selected.snapshot_content.as_ref().is_some_and(|snapshot| {
-            snapshot.contains(&BlobId::from_canonical_content(untracked_data).to_hex())
-        }));
-
-        untracked.deleted = true;
-        untracked.snapshot_content = None;
-        let view = FileStateView::test_rows(vec![
-            live_blob_ref_row(
-                file_id,
-                branch_id,
-                file_id,
-                &BlobId::from_canonical_content(tracked_data).to_hex(),
-                tracked_data.len(),
-            ),
-            untracked,
-        ]);
-        let rows = view
-            .load_exact_batch(&request)
-            .await
-            .expect("exact tombstone overlay should load both native lanes");
-        assert!(
-            rows[0].is_none(),
-            "untracked tombstone must suppress tracked owner"
         );
     }
 
@@ -14405,36 +14085,6 @@ mod tests {
                 row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
             })
         );
-    }
-
-    #[tokio::test]
-    async fn fast_file_path_write_rejects_ambiguous_cross_scope_paths_natively() {
-        let tracked = live_file_row(
-            "01920000-0000-7000-8000-000000000122",
-            "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-000000000122","directory_id":null,"name":"shared.md"}"#,
-        );
-        let mut untracked = live_file_row(
-            "01920000-0000-7000-8000-000000000132",
-            "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-000000000132","directory_id":null,"name":"shared.md"}"#,
-        );
-        untracked.untracked = true;
-        let mut write_context = CapturingWriteContext::with_rows(vec![tracked, untracked]);
-        let error = super::execute_fast_lix_file_path_writes(
-            &mut write_context,
-            vec![("/shared.md".to_string(), b"new".to_vec().into(), None, None)],
-            super::FastLixFilePathWriteConflict::UpdateContentAndMetadata,
-            None,
-        )
-        .await
-        .expect_err("ambiguous cross-scope topology should fail natively");
-
-        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert!(error.message.contains("existing untracked file"));
-        assert_eq!(write_context.path_index_count, 1);
-        assert_eq!(write_context.scan_count, 0);
-        assert!(write_context.writes.is_empty());
     }
 
     #[tokio::test]

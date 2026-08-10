@@ -1,8 +1,8 @@
 //! Native entity request decoding and terminal projections.
 //!
 //! Entity providers consume concrete authenticated ForkTree state views.  The
-//! module keeps `StateRow` and the native untracked row as the only row shapes
-//! before Arrow/DataFusion takes ownership.
+//! module keeps `StateRow` as the only row shape before Arrow/DataFusion takes
+//! ownership.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -11,7 +11,7 @@ use std::future::Future;
 use crate::LixError;
 use crate::entity_pk::{EntityPk, EntityPkComponents};
 use crate::forktree::{StateCell, StateKeyRef, decode_state_key, encode_state_key};
-use crate::state::{ForkTreeStateView, StateRow, TransactionStateView, UntrackedStateRow};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,7 +104,6 @@ pub(crate) enum EntityStateSlot {
         row: StateRow,
         branch_id: String,
     },
-    Untracked(UntrackedStateRow),
 }
 
 /// Native range scan with branch routing, tracked/untracked overlay, and
@@ -123,10 +122,14 @@ where
         view.branch_id(),
         |branch_id, lower, upper| async move {
             let (source_limit, source_include_tombstones) = range_source_options(request);
-            let tracked = if request.filter.untracked == Some(true) {
-                Vec::new()
-            } else {
-                view.branch_range(
+            if request.filter.untracked == Some(true) {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "untracked state is no longer supported",
+                ));
+            }
+            Ok(view
+                .branch_range(
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
@@ -139,29 +142,9 @@ where
                     row,
                     branch_id: branch_id.to_string(),
                 })
-                .collect()
-            };
-            let untracked = if request.filter.untracked == Some(false) {
-                Vec::new()
-            } else {
-                view.untracked_overlay_branch_range_for_branch(
-                    &branch_id,
-                    lower.as_deref(),
-                    upper.as_deref(),
-                    source_limit,
-                    source_include_tombstones,
-                )
-                .await?
-                .into_iter()
-                .map(EntityStateSlot::Untracked)
-                .collect()
-            };
-            Ok(merge_range_slots(
-                tracked,
-                untracked,
-                request.filter.include_tombstones,
-                request.limit,
-            ))
+                .filter(|slot| request.filter.include_tombstones || !slot_is_deleted(slot))
+                .take(request.limit.unwrap_or(usize::MAX))
+                .collect())
         },
     )
     .await
@@ -179,10 +162,14 @@ where
         view.branch_id(),
         |branch_id, lower, upper| async move {
             let (source_limit, source_include_tombstones) = range_source_options(request);
-            let tracked = if request.filter.untracked == Some(true) {
-                Vec::new()
-            } else {
-                view.branch_range(
+            if request.filter.untracked == Some(true) {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "untracked state is no longer supported",
+                ));
+            }
+            Ok(view
+                .branch_range(
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
@@ -195,45 +182,16 @@ where
                     row,
                     branch_id: branch_id.to_string(),
                 })
-                .collect()
-            };
-            let untracked = if request.filter.untracked == Some(false) {
-                Vec::new()
-            } else {
-                view.untracked_overlay_branch_range_for_branch(
-                    &branch_id,
-                    lower.as_deref(),
-                    upper.as_deref(),
-                    source_limit,
-                    source_include_tombstones,
-                )
-                .await?
-                .into_iter()
-                .map(EntityStateSlot::Untracked)
-                .collect()
-            };
-            Ok(merge_range_slots(
-                tracked,
-                untracked,
-                request.filter.include_tombstones,
-                request.limit,
-            ))
+                .filter(|slot| request.filter.include_tombstones || !slot_is_deleted(slot))
+                .take(request.limit.unwrap_or(usize::MAX))
+                .collect())
         },
     )
     .await
 }
 
 fn range_source_options(request: &EntityScanRequest) -> (Option<usize>, bool) {
-    let merges_tracked_and_untracked = request.filter.untracked.is_none();
-    let source_limit = match request.limit {
-        Some(0) => Some(0),
-        _ if merges_tracked_and_untracked => None,
-        limit => limit,
-    };
-    (
-        source_limit,
-        request.filter.include_tombstones || merges_tracked_and_untracked,
-    )
+    (request.limit, request.filter.include_tombstones)
 }
 
 async fn scan_slots_by_branches<F, Fut>(
@@ -288,8 +246,6 @@ where
             request.limit,
         ));
     }
-    let global_id =
-        uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID).expect("GLOBAL_BRANCH_ID must be a UUID");
     let mut global_keys = std::collections::BTreeSet::new();
     let mut branch_rows = branch_rows
         .into_iter()
@@ -320,20 +276,12 @@ where
             )));
         }
         let key = slot_sort_key(&slot);
-        let is_global = match &slot {
-            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
-                row.source == crate::state::StateRowSource::Global
-            }
-            EntityStateSlot::Untracked(row) => row.owner.as_bytes() == global_id.as_bytes(),
-        };
+        let is_global = matches!(&slot, EntityStateSlot::Tracked(row) if row.source == crate::state::StateRowSource::Global)
+            || matches!(&slot, EntityStateSlot::TrackedAt { row, .. } if row.source == crate::state::StateRowSource::Global);
         if is_global && !global_keys.insert((slot_branch_sort_key(&slot), key)) {
             continue;
         }
-        if request.filter.include_tombstones
-            || !matches!(&slot, EntityStateSlot::Tracked(row) if row.value.cell.deleted())
-                && !matches!(&slot, EntityStateSlot::TrackedAt { row, .. } if row.value.cell.deleted())
-                && !matches!(&slot, EntityStateSlot::Untracked(row) if row.value.cell.deleted())
-        {
+        if request.filter.include_tombstones || !slot_is_deleted(&slot) {
             visible.push(slot);
             if request.limit.is_some_and(|limit| visible.len() >= limit) {
                 break;
@@ -346,11 +294,6 @@ where
 fn slot_sort_key(slot: &EntityStateSlot) -> Vec<u8> {
     match slot {
         EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => row.key.clone(),
-        EntityStateSlot::Untracked(row) => encode_state_key(StateKeyRef {
-            schema_key: &row.key.schema_key,
-            file_id: row.key.file_id.as_deref(),
-            entity_pk: &row.key.entity_pk,
-        }),
     }
 }
 
@@ -363,9 +306,6 @@ fn slot_branch_sort_key(slot: &EntityStateSlot) -> String {
             }
         },
         EntityStateSlot::TrackedAt { branch_id, .. } => branch_id.clone(),
-        EntityStateSlot::Untracked(row) => {
-            uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string()
-        }
     }
 }
 
@@ -416,7 +356,6 @@ fn slot_is_deleted(slot: &EntityStateSlot) -> bool {
         EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
             row.value.cell.deleted()
         }
-        EntityStateSlot::Untracked(row) => row.value.cell.deleted(),
     }
 }
 
@@ -449,7 +388,6 @@ where
         })
         .collect::<Vec<_>>();
     let mut tracked = vec![None; keys.len()];
-    let mut untracked = vec![None; keys.len()];
     let mut groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, row) in request.rows.iter().enumerate() {
         groups.entry(row.branch_id.clone()).or_default().push(index);
@@ -459,22 +397,18 @@ where
             .iter()
             .map(|index| keys[*index].clone())
             .collect::<Vec<_>>();
-        if request.untracked != Some(true) {
-            let branch_rows = view.branch_points(&branch_id, &branch_keys, true).await?;
-            for (index, row) in indices.iter().copied().zip(branch_rows) {
-                tracked[index] = row;
-            }
+        if request.untracked == Some(true) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "untracked state is no longer supported",
+            ));
         }
-        if request.untracked != Some(false) {
-            let branch_rows = view
-                .untracked_points_for_branch(&branch_id, &branch_keys)
-                .await?;
-            for (index, row) in indices.into_iter().zip(branch_rows) {
-                untracked[index] = row;
-            }
+        let branch_rows = view.branch_points(&branch_id, &branch_keys, true).await?;
+        for (index, row) in indices.iter().copied().zip(branch_rows) {
+            tracked[index] = row;
         }
     }
-    merge_exact_slots(request, keys, tracked, untracked)
+    merge_exact_slots(request, keys, tracked)
 }
 
 pub(crate) async fn exact_transaction<S>(
@@ -496,7 +430,6 @@ where
         })
         .collect::<Vec<_>>();
     let mut tracked = vec![None; keys.len()];
-    let mut untracked = vec![None; keys.len()];
     let mut groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, row) in request.rows.iter().enumerate() {
         groups.entry(row.branch_id.clone()).or_default().push(index);
@@ -506,56 +439,34 @@ where
             .iter()
             .map(|index| keys[*index].clone())
             .collect::<Vec<_>>();
-        if request.untracked != Some(true) {
-            let branch_rows = view.branch_points(&branch_id, &branch_keys, true).await?;
-            for (index, row) in indices.iter().copied().zip(branch_rows) {
-                tracked[index] = row;
-            }
+        if request.untracked == Some(true) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "untracked state is no longer supported",
+            ));
         }
-        if request.untracked != Some(false) {
-            let branch_rows = view
-                .untracked_points_for_branch(&branch_id, &branch_keys, request.include_tombstones)
-                .await?;
-            for (index, row) in indices.into_iter().zip(branch_rows) {
-                untracked[index] = row;
-            }
+        let branch_rows = view.branch_points(&branch_id, &branch_keys, true).await?;
+        for (index, row) in indices.iter().copied().zip(branch_rows) {
+            tracked[index] = row;
         }
     }
-    merge_exact_slots(request, keys, tracked, untracked)
+    merge_exact_slots(request, keys, tracked)
 }
 
 fn merge_exact_slots(
     request: &EntityExactBatchRequest,
     keys: Vec<Vec<u8>>,
     tracked: Vec<Option<StateRow>>,
-    untracked: Vec<Option<UntrackedStateRow>>,
 ) -> Result<Vec<Option<EntityStateSlot>>, LixError> {
-    if tracked.len() != keys.len() || untracked.len() != keys.len() {
+    if tracked.len() != keys.len() {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
             "native entity exact lookup returned the wrong slot count",
         ));
     }
     let mut output = Vec::with_capacity(keys.len());
-    for (((requested, _key), tracked), untracked) in
-        request.rows.iter().zip(keys).zip(tracked).zip(untracked)
-    {
-        let slot = if let Some(row) = untracked {
-            if row.key.schema_key != requested.schema_key
-                || row.key.entity_pk != requested.entity_pk
-                || row.key.file_id != requested.file_id
-            {
-                return Err(LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    "native untracked entity row identity mismatch",
-                ));
-            }
-            if !request.include_tombstones && row.value.cell.deleted() {
-                None
-            } else {
-                Some(EntityStateSlot::Untracked(row))
-            }
-        } else if let Some(row) = tracked {
+    for ((requested, _key), tracked) in request.rows.iter().zip(keys).zip(tracked) {
+        let slot = if let Some(row) = tracked {
             let decoded = decode_state_key(&row.key)?;
             if decoded.schema_key != requested.schema_key
                 || decoded.entity_pk != requested.entity_pk
@@ -618,7 +529,6 @@ pub(crate) fn schema_bounds(
 pub(crate) fn tracked_slot(row: &EntityStateSlot) -> Option<&StateRow> {
     match row {
         EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => Some(row),
-        EntityStateSlot::Untracked(_) => None,
     }
 }
 
@@ -630,10 +540,6 @@ pub(crate) fn slot_snapshot(row: &EntityStateSlot) -> Option<&str> {
                 StateCell::Null | StateCell::Tombstone => None,
             }
         }
-        EntityStateSlot::Untracked(row) => match &row.value.cell {
-            StateCell::Value(value) => Some(value.as_ref()),
-            StateCell::Null | StateCell::Tombstone => None,
-        },
     }
 }
 
@@ -642,238 +548,5 @@ pub(crate) fn row_snapshot(row: &StateRow) -> Option<&str> {
     match &row.value.cell {
         StateCell::Value(value) => Some(value.as_ref()),
         StateCell::Null | StateCell::Tombstone => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::changelog::{ChangeId, CommitId};
-    use crate::common::{LixTimestamp, SharedStr};
-    use crate::forktree::{StateCell, StateValue};
-    use crate::state::StateRowSource;
-
-    fn row(entity: &str, cell: StateCell) -> StateRow {
-        let entity_pk = EntityPk::single(entity);
-        StateRow {
-            key: encode_state_key(StateKeyRef {
-                schema_key: "app.message",
-                file_id: None,
-                entity_pk: &entity_pk,
-            }),
-            value: StateValue {
-                change_id: ChangeId::for_test_label("entity-batch-change"),
-                commit_id: CommitId::for_test_label("entity-batch-commit"),
-                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
-                cell,
-                metadata: None,
-                origin_key: None,
-                blob_manifest_object_ids: Vec::new(),
-            },
-            source: StateRowSource::Branch,
-        }
-    }
-
-    fn untracked(entity: &str, cell: StateCell) -> UntrackedStateRow {
-        let entity_pk = EntityPk::single(entity);
-        UntrackedStateRow {
-            owner: crate::forktree::CanonicalBranchId::from_bytes([7; 16]),
-            key: crate::forktree::StateKey {
-                schema_key: "app.message".to_string(),
-                file_id: None,
-                entity_pk,
-            },
-            value: crate::forktree::UntrackedValue {
-                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
-                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
-                cell,
-                metadata: None,
-                origin_key: None,
-                blob_manifest_object_ids: Vec::new(),
-            },
-        }
-    }
-
-    fn request(entities: &[&str], include_tombstones: bool) -> EntityExactBatchRequest {
-        EntityExactBatchRequest {
-            rows: entities
-                .iter()
-                .map(|entity| EntityExactRowRequest {
-                    schema_key: "app.message".to_string(),
-                    branch_id: "branch-a".to_string(),
-                    entity_pk: EntityPk::single(*entity),
-                    file_id: None,
-                })
-                .collect(),
-            projection: EntityProjection::default(),
-            untracked: Some(false),
-            include_tombstones,
-        }
-    }
-
-    #[tokio::test]
-    async fn range_limit_zero_skips_sources_and_emits_no_rows() {
-        let request = EntityScanRequest {
-            limit: Some(0),
-            ..EntityScanRequest::default()
-        };
-        assert_eq!(range_source_options(&request), (Some(0), true));
-
-        let mut source_calls = 0;
-        let slots = scan_slots_by_branches(&request, "branch-a".to_string(), |_, _, _| {
-            source_calls += 1;
-            async {
-                Ok(vec![EntityStateSlot::Tracked(row(
-                    "visible",
-                    StateCell::Value(SharedStr::from("{}")),
-                ))])
-            }
-        })
-        .await
-        .expect("LIMIT 0 is an empty native scan");
-        assert_eq!(source_calls, 0);
-        assert!(slots.is_empty());
-
-        assert!(
-            merge_range_slots(
-                vec![EntityStateSlot::Tracked(row(
-                    "visible",
-                    StateCell::Value(SharedStr::from("{}")),
-                ))],
-                Vec::new(),
-                false,
-                Some(0),
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn range_sources_defer_positive_limit_until_overlay_visibility() {
-        let mut request = EntityScanRequest {
-            limit: Some(1),
-            ..EntityScanRequest::default()
-        };
-        assert_eq!(range_source_options(&request), (None, true));
-
-        request.filter.untracked = Some(false);
-        assert_eq!(range_source_options(&request), (Some(1), false));
-    }
-
-    #[test]
-    fn exact_merge_preserves_order_duplicates_and_missing_slots() {
-        let request = request(&["a", "a", "missing"], false);
-        let rows = vec![
-            Some(row("a", StateCell::Value(SharedStr::from("{}")))),
-            Some(row("a", StateCell::Value(SharedStr::from("{}")))),
-            None,
-        ];
-        let keys = request
-            .rows
-            .iter()
-            .map(|row| {
-                encode_state_key(StateKeyRef {
-                    schema_key: &row.schema_key,
-                    file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
-                })
-            })
-            .collect();
-        let slots = merge_exact_slots(&request, keys, rows, vec![None, None, None])
-            .expect("native exact merge");
-        assert_eq!(slots.len(), 3);
-        assert!(slots[0].is_some());
-        assert!(slots[1].is_some());
-        assert!(slots[2].is_none());
-    }
-
-    #[test]
-    fn exact_merge_hides_tombstone_until_requested() {
-        let hidden = request(&["gone"], false);
-        let keys = hidden
-            .rows
-            .iter()
-            .map(|row| {
-                encode_state_key(StateKeyRef {
-                    schema_key: &row.schema_key,
-                    file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
-                })
-            })
-            .collect();
-        let tombstone = Some(row("gone", StateCell::Tombstone));
-        let hidden_slots = merge_exact_slots(&hidden, keys, vec![tombstone.clone()], vec![None])
-            .expect("tombstone visibility");
-        assert!(hidden_slots[0].is_none());
-
-        let visible = request(&["gone"], true);
-        let keys = visible
-            .rows
-            .iter()
-            .map(|row| {
-                encode_state_key(StateKeyRef {
-                    schema_key: &row.schema_key,
-                    file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
-                })
-            })
-            .collect();
-        let visible_slots = merge_exact_slots(&visible, keys, vec![tombstone], vec![None])
-            .expect("tombstone projection");
-        assert!(matches!(
-            visible_slots[0],
-            Some(EntityStateSlot::Tracked(_) | EntityStateSlot::TrackedAt { .. })
-        ));
-    }
-
-    #[test]
-    fn exact_merge_rejects_authenticated_identity_substitution() {
-        let request = request(&["expected"], false);
-        let keys = request
-            .rows
-            .iter()
-            .map(|row| {
-                encode_state_key(StateKeyRef {
-                    schema_key: &row.schema_key,
-                    file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
-                })
-            })
-            .collect();
-        let result = merge_exact_slots(
-            &request,
-            keys,
-            vec![Some(row(
-                "different",
-                StateCell::Value(SharedStr::from("{}")),
-            ))],
-            vec![None],
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn range_merge_applies_shadow_tombstones_before_limit() {
-        let tracked = vec![
-            EntityStateSlot::Tracked(row("a", StateCell::Value("a".into()))),
-            EntityStateSlot::Tracked(row("b", StateCell::Value("b".into()))),
-            EntityStateSlot::Tracked(row("c", StateCell::Value("tracked-c".into()))),
-        ];
-        let untracked = vec![
-            EntityStateSlot::Untracked(untracked("a", StateCell::Tombstone)),
-            EntityStateSlot::Untracked(untracked("c", StateCell::Value("overlay-c".into()))),
-            EntityStateSlot::Untracked(untracked("d", StateCell::Value("d".into()))),
-        ];
-
-        let hidden = merge_range_slots(tracked.clone(), untracked.clone(), false, Some(2));
-        assert_eq!(hidden.len(), 2);
-        assert_eq!(slot_snapshot(&hidden[0]), Some("b"));
-        assert_eq!(slot_snapshot(&hidden[1]), Some("overlay-c"));
-
-        let visible = merge_range_slots(tracked, untracked, true, Some(2));
-        assert_eq!(visible.len(), 2);
-        assert!(slot_is_deleted(&visible[0]));
-        assert_eq!(slot_snapshot(&visible[1]), Some("b"));
     }
 }
