@@ -124,14 +124,20 @@ where
             let tracked = if request.filter.untracked == Some(true) {
                 Vec::new()
             } else {
-                view.branch_range(&branch_id, lower.as_deref(), upper.as_deref(), None, true)
-                    .await?
-                    .into_iter()
-                    .map(|row| EntityStateSlot::TrackedAt {
-                        row,
-                        branch_id: branch_id.to_string(),
-                    })
-                    .collect()
+                view.branch_range(
+                    &branch_id,
+                    lower.as_deref(),
+                    upper.as_deref(),
+                    request.limit,
+                    request.filter.include_tombstones,
+                )
+                .await?
+                .into_iter()
+                .map(|row| EntityStateSlot::TrackedAt {
+                    row,
+                    branch_id: branch_id.to_string(),
+                })
+                .collect()
             };
             let untracked = if request.filter.untracked == Some(false) {
                 Vec::new()
@@ -140,15 +146,20 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    None,
-                    true,
+                    request.limit,
+                    request.filter.include_tombstones,
                 )
                 .await?
                 .into_iter()
                 .map(EntityStateSlot::Untracked)
                 .collect()
             };
-            Ok(merge_range_slots(tracked, untracked, true, None))
+            Ok(merge_range_slots(
+                tracked,
+                untracked,
+                request.filter.include_tombstones,
+                request.limit,
+            ))
         },
     )
     .await
@@ -168,14 +179,20 @@ where
             let tracked = if request.filter.untracked == Some(true) {
                 Vec::new()
             } else {
-                view.branch_range(&branch_id, lower.as_deref(), upper.as_deref(), None, true)
-                    .await?
-                    .into_iter()
-                    .map(|row| EntityStateSlot::TrackedAt {
-                        row,
-                        branch_id: branch_id.to_string(),
-                    })
-                    .collect()
+                view.branch_range(
+                    &branch_id,
+                    lower.as_deref(),
+                    upper.as_deref(),
+                    request.limit,
+                    request.filter.include_tombstones,
+                )
+                .await?
+                .into_iter()
+                .map(|row| EntityStateSlot::TrackedAt {
+                    row,
+                    branch_id: branch_id.to_string(),
+                })
+                .collect()
             };
             let untracked = if request.filter.untracked == Some(false) {
                 Vec::new()
@@ -184,15 +201,20 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    None,
-                    true,
+                    request.limit,
+                    request.filter.include_tombstones,
                 )
                 .await?
                 .into_iter()
                 .map(EntityStateSlot::Untracked)
                 .collect()
             };
-            Ok(merge_range_slots(tracked, untracked, true, None))
+            Ok(merge_range_slots(
+                tracked,
+                untracked,
+                request.filter.include_tombstones,
+                request.limit,
+            ))
         },
     )
     .await
@@ -242,7 +264,12 @@ where
         for (lower, upper) in &bounds {
             branch_rows.extend(scan_branch(branch_id.clone(), lower.clone(), upper.clone()).await?);
         }
-        rows.extend(merge_range_slots(branch_rows, Vec::new(), true, None));
+        rows.extend(merge_range_slots(
+            branch_rows,
+            Vec::new(),
+            request.filter.include_tombstones,
+            request.limit,
+        ));
     }
     let global_id =
         uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID).expect("GLOBAL_BRANCH_ID must be a UUID");
@@ -308,20 +335,46 @@ fn merge_range_slots(
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Vec<EntityStateSlot> {
-    let mut by_key = BTreeMap::<Vec<u8>, EntityStateSlot>::new();
-    for slot in tracked.into_iter().chain(untracked) {
-        by_key.insert(slot_sort_key(&slot), slot);
+    let mut tracked = tracked
+        .into_iter()
+        .map(|slot| (slot_sort_key(&slot), slot))
+        .peekable();
+    let mut untracked = untracked
+        .into_iter()
+        .map(|slot| (slot_sort_key(&slot), slot))
+        .peekable();
+    let mut output = Vec::new();
+    while tracked.peek().is_some() || untracked.peek().is_some() {
+        let slot = match (tracked.peek(), untracked.peek()) {
+            (Some((tracked_key, _)), Some((untracked_key, _))) if tracked_key == untracked_key => {
+                tracked.next().expect("peeked tracked slot");
+                untracked.next().expect("peeked untracked slot").1
+            }
+            (Some((tracked_key, _)), Some((untracked_key, _))) if tracked_key < untracked_key => {
+                tracked.next().expect("peeked tracked slot").1
+            }
+            (Some(_), Some(_)) => untracked.next().expect("peeked untracked slot").1,
+            (Some(_), None) => tracked.next().expect("peeked tracked slot").1,
+            (None, Some(_)) => untracked.next().expect("peeked untracked slot").1,
+            (None, None) => break,
+        };
+        if include_tombstones || !slot_is_deleted(&slot) {
+            output.push(slot);
+            if limit.is_some_and(|limit| output.len() >= limit) {
+                break;
+            }
+        }
     }
-    by_key
-        .into_values()
-        .filter(|slot| {
-            include_tombstones
-                || !matches!(slot, EntityStateSlot::Tracked(row) if row.value.cell.deleted())
-                    && !matches!(slot, EntityStateSlot::TrackedAt { row, .. } if row.value.cell.deleted())
-                    && !matches!(slot, EntityStateSlot::Untracked(row) if row.value.cell.deleted())
-        })
-        .take(limit.unwrap_or(usize::MAX))
-        .collect()
+    output
+}
+
+fn slot_is_deleted(slot: &EntityStateSlot) -> bool {
+    match slot {
+        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+            row.value.cell.deleted()
+        }
+        EntityStateSlot::Untracked(row) => row.value.cell.deleted(),
+    }
 }
 
 pub(crate) async fn exact_forktree<S>(
@@ -579,6 +632,26 @@ mod tests {
         }
     }
 
+    fn untracked(entity: &str, cell: StateCell) -> UntrackedStateRow {
+        let entity_pk = EntityPk::single(entity);
+        UntrackedStateRow {
+            owner: crate::forktree::CanonicalBranchId::from_bytes([7; 16]),
+            key: crate::forktree::StateKey {
+                schema_key: "app.message".to_string(),
+                file_id: None,
+                entity_pk,
+            },
+            value: crate::forktree::UntrackedValue {
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                cell,
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+        }
+    }
+
     fn request(entities: &[&str], include_tombstones: bool) -> EntityExactBatchRequest {
         EntityExactBatchRequest {
             rows: entities
@@ -686,5 +759,29 @@ mod tests {
             vec![None],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn range_merge_applies_shadow_tombstones_before_limit() {
+        let tracked = vec![
+            EntityStateSlot::Tracked(row("a", StateCell::Value("a".into()))),
+            EntityStateSlot::Tracked(row("b", StateCell::Value("b".into()))),
+            EntityStateSlot::Tracked(row("c", StateCell::Value("tracked-c".into()))),
+        ];
+        let untracked = vec![
+            EntityStateSlot::Untracked(untracked("a", StateCell::Tombstone)),
+            EntityStateSlot::Untracked(untracked("c", StateCell::Value("overlay-c".into()))),
+            EntityStateSlot::Untracked(untracked("d", StateCell::Value("d".into()))),
+        ];
+
+        let hidden = merge_range_slots(tracked.clone(), untracked.clone(), false, Some(2));
+        assert_eq!(hidden.len(), 2);
+        assert_eq!(slot_snapshot(&hidden[0]), Some("b"));
+        assert_eq!(slot_snapshot(&hidden[1]), Some("overlay-c"));
+
+        let visible = merge_range_slots(tracked, untracked, true, Some(2));
+        assert_eq!(visible.len(), 2);
+        assert!(slot_is_deleted(&visible[0]));
+        assert_eq!(slot_snapshot(&visible[1]), Some("b"));
     }
 }

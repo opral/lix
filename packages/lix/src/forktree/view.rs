@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -671,17 +671,80 @@ where
         upper: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Result<Vec<(super::state::StateKey, super::state::UntrackedValue)>, crate::LixError> {
-        let bounds =
-            super::state::encode_untracked_branch_range_bounds(self.branch_id, lower, upper)?;
         if limit == Some(0) {
             return Ok(Vec::new());
         }
+        let mut after = None;
+        let mut rows = Vec::new();
+        loop {
+            let remaining = limit.map(|limit| limit.saturating_sub(rows.len()));
+            if remaining == Some(0) {
+                break;
+            }
+            let (page, has_more) = self
+                .scan_untracked_branch_range_page(
+                    lower,
+                    upper,
+                    after.as_ref(),
+                    remaining.unwrap_or(256).min(256),
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|(key, _)| key.clone());
+            rows.extend(page);
+            if !has_more {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn scan_untracked_branch_range_page(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        after: Option<&super::state::StateKey>,
+        page_size: usize,
+    ) -> Result<
+        (
+            Vec<(super::state::StateKey, super::state::UntrackedValue)>,
+            bool,
+        ),
+        crate::LixError,
+    > {
+        let bounds =
+            super::state::encode_untracked_branch_range_bounds(self.branch_id, lower, upper)?;
+        let scan_lower = if let Some(after) = after {
+            let encoded = super::state::encode_untracked_key(
+                self.branch_id,
+                super::state::StateKeyRef {
+                    schema_key: &after.schema_key,
+                    file_id: after.file_id.as_deref(),
+                    entity_pk: &after.entity_pk,
+                },
+            );
+            let next = super::state::exclusive_prefix_upper_bound(&encoded).ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "untracked range cursor has no finite successor",
+                )
+            })?;
+            if next > bounds.lower {
+                next
+            } else {
+                bounds.lower.clone()
+            }
+        } else {
+            bounds.lower.clone()
+        };
         let mut cursor = self
             .read
             .begin_scan(
                 super::state::UNTRACKED_ROW_SPACE,
                 KeyRange {
-                    lower: Bound::Included(Key(bounds.lower.into())),
+                    lower: Bound::Included(Key(scan_lower.into())),
                     upper: bounds
                         .upper
                         .map_or(Bound::Unbounded, |upper| Bound::Excluded(Key(upper.into()))),
@@ -692,56 +755,139 @@ where
                 },
             )
             .await?;
+        let page = cursor.next_page(page_size).await?;
         let mut rows = Vec::new();
+        for entry in page.entries {
+            let (branch_id, key) = super::state::decode_untracked_key(&entry.key.0)?;
+            if branch_id != self.branch_id {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "ForkTree bounded untracked range crossed a branch owner boundary",
+                ));
+            }
+            let canonical_key = super::state::encode_untracked_key(
+                branch_id,
+                super::state::StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                },
+            );
+            if canonical_key != entry.key.0 {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "ForkTree bounded untracked range encountered a noncanonical key",
+                ));
+            }
+            let value = match entry.value {
+                ProjectedValue::FullValue(bytes) => super::state::decode_untracked_value(&bytes)?,
+                ProjectedValue::KeyOnly => {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        "ForkTree bounded untracked range returned key-only data",
+                    ));
+                }
+            };
+            rows.push((key, value));
+        }
+        Ok((rows, page.has_more))
+    }
+
+    /// Merges the selected branch and global untracked owners with a resumable
+    /// k-way cursor. Suppressed tombstones and local shadow rows advance only
+    /// their owner cursor, so the public LIMIT is applied after visibility.
+    pub(crate) async fn scan_untracked_overlay_branch_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<
+        Vec<(
+            super::model::CanonicalBranchId,
+            super::state::StateKey,
+            super::state::UntrackedValue,
+        )>,
+        crate::LixError,
+    > {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        const PAGE_SIZE: usize = 256;
+        let global_id = super::model::CanonicalBranchId::from_bytes(
+            *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+                .expect("GLOBAL_BRANCH_ID must be a UUID")
+                .as_bytes(),
+        );
+        let global_view = if self.branch_id == global_id {
+            None
+        } else {
+            Some(self.branch_view(global_id).await?)
+        };
+        let mut local_rows = VecDeque::new();
+        let mut global_rows = VecDeque::new();
+        let mut local_after = None;
+        let mut global_after = None;
+        let mut local_more = true;
+        let mut global_more = global_view.is_some();
+        let mut output = Vec::new();
+
         loop {
-            let remaining = limit.map_or(256, |limit| limit - rows.len());
-            if remaining == 0 {
+            if local_rows.is_empty() && local_more {
+                let (page, has_more) = self
+                    .scan_untracked_branch_range_page(lower, upper, local_after.as_ref(), PAGE_SIZE)
+                    .await?;
+                local_more = has_more;
+                local_rows.extend(page);
+            }
+            if global_rows.is_empty() && global_more {
+                let (page, has_more) = global_view
+                    .as_ref()
+                    .expect("global view exists while its cursor is active")
+                    .scan_untracked_branch_range_page(
+                        lower,
+                        upper,
+                        global_after.as_ref(),
+                        PAGE_SIZE,
+                    )
+                    .await?;
+                global_more = has_more;
+                global_rows.extend(page);
+            }
+            if local_rows.is_empty() && global_rows.is_empty() {
                 break;
             }
-            let page = cursor.next_page(remaining.min(256)).await?;
-            for entry in page.entries {
-                let (branch_id, key) = super::state::decode_untracked_key(&entry.key.0)?;
-                if branch_id != self.branch_id {
-                    return Err(crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        "ForkTree bounded untracked range crossed a branch owner boundary",
-                    ));
+
+            let take_local = match (local_rows.front(), global_rows.front()) {
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some((local_key, _)), Some((global_key, _))) => local_key <= global_key,
+                (None, None) => false,
+            };
+            let (key, value, owner) = if take_local {
+                let (key, value) = local_rows.pop_front().expect("local row is present");
+                local_after = Some(key.clone());
+                if global_rows
+                    .front()
+                    .is_some_and(|(global_key, _)| *global_key == key)
+                {
+                    global_rows.pop_front();
+                    global_after = Some(key.clone());
                 }
-                let canonical_key = super::state::encode_untracked_key(
-                    branch_id,
-                    super::state::StateKeyRef {
-                        schema_key: &key.schema_key,
-                        file_id: key.file_id.as_deref(),
-                        entity_pk: &key.entity_pk,
-                    },
-                );
-                if canonical_key != entry.key.0 {
-                    return Err(crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
-                        "ForkTree bounded untracked range encountered a noncanonical key",
-                    ));
-                }
-                let value = match entry.value {
-                    ProjectedValue::FullValue(bytes) => {
-                        super::state::decode_untracked_value(&bytes)?
-                    }
-                    ProjectedValue::KeyOnly => {
-                        return Err(crate::LixError::new(
-                            crate::LixError::CODE_STORAGE_ERROR,
-                            "ForkTree bounded untracked range returned key-only data",
-                        ));
-                    }
-                };
-                rows.push((key, value));
-                if limit.is_some_and(|limit| rows.len() >= limit) {
+                (key, value, self.branch_id)
+            } else {
+                let (key, value) = global_rows.pop_front().expect("global row is present");
+                global_after = Some(key.clone());
+                (key, value, global_id)
+            };
+            if include_tombstones || !value.cell.deleted() {
+                output.push((owner, key, value));
+                if limit.is_some_and(|limit| output.len() >= limit) {
                     break;
                 }
             }
-            if !page.has_more || limit.is_some_and(|limit| rows.len() >= limit) {
-                break;
-            }
         }
-        Ok(rows)
+        Ok(output)
     }
 
     pub(crate) async fn branch_view(

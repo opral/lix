@@ -46,6 +46,7 @@ struct Config {
     rounds: usize,
     warmups: usize,
     limit: Option<usize>,
+    sql_limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -81,13 +82,16 @@ async fn main() {
         black_box(session);
         return;
     }
-    let select_sql = select_sql(config.rows);
+    let select_sql = select_sql(config.rows, config.sql_limit);
+    let query_rows = config
+        .sql_limit
+        .map_or(config.rows, |limit| limit.min(config.rows));
     let expected_rows = if mode == "count_only" {
-        config.rows
+        query_rows
     } else {
         config
             .limit
-            .map_or(config.rows, |limit| limit.min(config.rows))
+            .map_or(query_rows, |limit| limit.min(query_rows))
     };
 
     for _ in 0..config.warmups {
@@ -125,7 +129,7 @@ async fn main() {
     let expected_materialized = if mode == "count_only" {
         0
     } else if mode == "full" {
-        config.rows
+        query_rows
     } else {
         expected_rows
     };
@@ -135,10 +139,10 @@ async fn main() {
     );
     assert_eq!(
         median.profile.result_rows_retained as usize,
-        usize::from(mode == "full") * config.rows
+        usize::from(mode == "full") * query_rows
     );
     println!(
-        "execute_result_streaming_profile mode={mode} rows={} limit={} rounds={} \
+        "execute_result_streaming_profile mode={mode} rows={} limit={} sql_limit={} rounds={} \
          wall_median_us={:.3} profile_total_us={:.3} logical_us={:.3} physical_us={:.3} \
          arrow_execution_us={:.3} public_result_materialization_us={:.3} \
          other_us={:.3} scan_rows={} scan_batches={} scan_arrow_bytes={} \
@@ -147,6 +151,9 @@ async fn main() {
         config.rows,
         config
             .limit
+            .map_or_else(|| "all".to_string(), |limit| limit.to_string()),
+        config
+            .sql_limit
             .map_or_else(|| "all".to_string(), |limit| limit.to_string()),
         config.rounds,
         micros(median.wall),
@@ -204,7 +211,7 @@ fn checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
     checksum
 }
 
-fn select_sql(rows: usize) -> String {
+fn select_sql(rows: usize, sql_limit: Option<usize>) -> String {
     let rows_per_table = rows.div_ceil(PARTITIONS);
     (0..PARTITIONS)
         .filter_map(|partition| {
@@ -216,6 +223,7 @@ fn select_sql(rows: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join(" UNION ALL ")
+        + &sql_limit.map_or_else(String::new, |limit| format!(" LIMIT {limit}"))
 }
 
 impl Config {
@@ -234,6 +242,18 @@ impl Config {
                 Err(std::env::VarError::NotPresent) => None,
                 Err(std::env::VarError::NotUnicode(_)) => {
                     panic!("LIX_SQL_PROFILE_ROW_LIMIT must be valid UTF-8")
+                }
+            },
+            sql_limit: match std::env::var("LIX_SQL_PROFILE_SQL_LIMIT") {
+                Ok(value) if value == "all" => None,
+                Ok(value) => {
+                    Some(value.parse::<usize>().expect(
+                        "LIX_SQL_PROFILE_SQL_LIMIT must be a non-negative integer or 'all'",
+                    ))
+                }
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    panic!("LIX_SQL_PROFILE_SQL_LIMIT must be valid UTF-8")
                 }
             },
         }
