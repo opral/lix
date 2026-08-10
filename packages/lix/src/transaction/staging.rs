@@ -2851,6 +2851,10 @@ mod tests {
         uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128)
     }
 
+    fn test_commit_id(index: usize) -> CommitId {
+        CommitId::with_change_address_space(test_uuid_value(index))
+    }
+
     fn state_row(key: &str, value: &str) -> TestPreparedStateRow {
         let snapshot = stage_json_from_value(
             TransactionJson::from_value_for_test(serde_json::json!({
@@ -3001,6 +3005,7 @@ mod tests {
                 .tracked_change_count,
             2
         );
+        assert_eq!(drained.state_rows.row(0).commit_id, Some(test_commit_id(1)));
     }
 
     #[test]
@@ -3051,6 +3056,33 @@ mod tests {
                 .expect("snapshot")
                 .normalized(),
             r#"{"key":"same","value":"after"}"#
+        );
+    }
+
+    #[test]
+    fn staged_replacement_preserves_prior_validation_requirement() {
+        let staged = test_staged_writes();
+        let mut prior = tracked_append_row("validated", "before");
+        prior.facts.requires_transaction_validation = true;
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([prior]),
+            })
+            .expect("validated row should stage");
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("validated", "after")]),
+            })
+            .expect("replacement should stage");
+        let drained = staged.drain().expect("replacement should drain");
+        assert!(
+            drained
+                .state_rows
+                .row(0)
+                .facts
+                .requires_transaction_validation
         );
     }
 
