@@ -4416,8 +4416,9 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         valid_multichunk_range[0]
             .as_ref()
             .expect("valid multi-chunk range value")
-            .bytes,
-        b"b"
+            .bytes
+            .as_ref(),
+        b"b".as_slice()
     );
     let same_selectors_different_read = open_coherent_view(&storage, seed.branch_id)
         .await
@@ -4448,7 +4449,7 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         .into_vec();
     assert_eq!(ranges.len(), 1);
     let range = ranges[0].as_ref().expect("range value");
-    assert_eq!(range.bytes, b"at");
+    assert_eq!(range.bytes.as_ref(), b"at".as_slice());
     assert_eq!(range.total_size, 4);
     assert_eq!(range.range, 1..3);
     assert_eq!(
@@ -4617,8 +4618,14 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
         .expect("selected duplicate-owner ranges")
         .into_vec();
     assert_eq!(ranges.len(), 2, "duplicate request slots must be preserved");
-    assert_eq!(ranges[0].as_ref().expect("first range").bytes, b"a");
-    assert_eq!(ranges[1].as_ref().expect("second range").bytes, b"a");
+    assert_eq!(
+        ranges[0].as_ref().expect("first range").bytes.as_ref(),
+        b"a".as_slice()
+    );
+    assert_eq!(
+        ranges[1].as_ref().expect("second range").bytes.as_ref(),
+        b"a".as_slice()
+    );
     assert_eq!(
         reader
             .load_bytes_for_state_keys(&[selected_key])
