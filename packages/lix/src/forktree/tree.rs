@@ -461,43 +461,56 @@ where
 {
     let mut loaded = BTreeMap::<ObjectId, Node>::new();
     let mut pending = vec![(root.object_id, None::<NodeRef>, 0usize, mutations.len())];
-    while let Some((id, expected, start, end)) = pending.pop() {
-        if let Some(node) = loaded.get(&id) {
+    while !pending.is_empty() {
+        // The mutation windows are already partitioned by the current tree
+        // level. Fetch each distinct child ObjectId once for this level; the
+        // edge checks below still run for every authenticated parent edge.
+        let request_ids = pending
+            .iter()
+            .filter_map(|(id, ..)| (!loaded.contains_key(id)).then_some(*id))
+            .collect::<BTreeSet<_>>();
+        if !request_ids.is_empty() {
+            let request_ids = request_ids.into_iter().collect::<Vec<_>>();
+            let objects = load_objects_many_on_read(read, &request_ids).await?;
+            for id in request_ids {
+                let bytes = objects
+                    .get(&id)
+                    .ok_or_else(|| corruption(format!("ordered-tree object {id} is absent")))?;
+                loaded.insert(id, decode_node(id, bytes)?);
+            }
+        }
+
+        let current = std::mem::take(&mut pending);
+        for (id, expected, start, end) in current {
+            let node = loaded
+                .get(&id)
+                .ok_or_else(|| corruption("ordered-tree batch loader lost a node"))?;
             // A content-addressed node may be reached through more than one
             // authenticated edge. Reuse its decoded body only after checking
-            // this edge's expected reference as well; the batch loader must
-            // never turn an unchecked alias into an authority shortcut.
+            // this edge's expected reference as well; batching must never
+            // turn an unchecked alias into an authority shortcut.
             validate_loaded_node(id, node, kind, expected.as_ref())?;
             if id == root.object_id && node.summary.entry_count != root.entry_count {
                 return Err(corruption(
                     "ordered-tree root count does not match its authenticated node",
                 ));
             }
-            continue;
-        }
-        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
-        validate_loaded_node(id, &node, kind, expected.as_ref())?;
-        if id == root.object_id && node.summary.entry_count != root.entry_count {
-            return Err(corruption(
-                "ordered-tree root count does not match its authenticated node",
-            ));
-        }
-        if let NodeBody::Internal(children) = &node.body {
-            let mut offset = start;
-            while offset < end {
-                let index = child_index(children, mutations[offset].key());
-                let child_start = offset;
-                offset += 1;
-                while offset < end && child_index(children, mutations[offset].key()) == index {
+            if let NodeBody::Internal(children) = &node.body {
+                let mut offset = start;
+                while offset < end {
+                    let index = child_index(children, mutations[offset].key());
+                    let child_start = offset;
                     offset += 1;
+                    while offset < end && child_index(children, mutations[offset].key()) == index {
+                        offset += 1;
+                    }
+                    let child = children.get(index).ok_or_else(|| {
+                        corruption("ordered-tree mutation child index is invalid")
+                    })?;
+                    pending.push((child.id, Some(child.clone()), child_start, offset));
                 }
-                let child = children
-                    .get(index)
-                    .ok_or_else(|| corruption("ordered-tree mutation child index is invalid"))?;
-                pending.push((child.id, Some(child.clone()), child_start, offset));
             }
         }
-        loaded.insert(id, node);
     }
     Ok(loaded)
 }

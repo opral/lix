@@ -1362,6 +1362,41 @@ async fn state_root_diff_short_circuits_and_handles_sparse_changes() {
 }
 
 #[tokio::test]
+async fn state_edit_batches_authenticated_object_reads_by_tree_level() {
+    let values = (0..1_000)
+        .map(|index| (index, (index % 251) as u8))
+        .collect::<Vec<_>>();
+    let tree = build_diff_tree(&values);
+    let storage = CountingStorage::new();
+    seed_diff_trees(&storage, &[&tree]).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("state edit read"),
+    );
+
+    let mutations = diff_state_rows(&values)
+        .into_iter()
+        .map(|(key, value)| StateTreeMutation::update(key, value))
+        .collect::<Vec<_>>();
+    edit_state_tree(tree.root.object_id, mutations, &read)
+        .await
+        .expect("batched state edit");
+
+    // State trees use 64-entry leaves and a 32-way internal fanout. This
+    // fixture therefore loads the root and all affected leaves in two
+    // authenticated get_many calls, in addition to the public root validation
+    // performed before editing. The old node-at-a-time path required one
+    // request for the root plus one request for each of the 16 leaves.
+    assert_eq!(
+        storage.object_get_many.load(Ordering::Relaxed),
+        3,
+        "publication reads must be batched by authenticated tree level"
+    );
+}
+
+#[tokio::test]
 async fn state_root_diff_randomized_matches_full_scan_oracle() {
     let mut seed = 0x9e37_79b9_u64;
     for _case in 0..24 {
