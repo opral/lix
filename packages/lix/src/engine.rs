@@ -5,7 +5,6 @@ use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
-use crate::live_state::LiveStateContext;
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
@@ -17,7 +16,6 @@ use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions};
 use crate::storage_adapter::{Storage, StorageAdapter};
 use crate::telemetry::TelemetrySink;
-use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
 use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
@@ -27,7 +25,6 @@ use crate::{LixError, NullableKeyFilter};
 #[expect(missing_debug_implementations)]
 pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
-    live_state: Arc<LiveStateContext>,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -109,7 +106,7 @@ where
     pub async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
         let storage = StorageAdapter::new(storage);
 
-        crate::init::initialize(storage, &TrackedStateContext::new()).await
+        crate::init::initialize(storage).await
     }
 
     /// Creates a clean DataFusion-first engine over an initialized storage.
@@ -150,7 +147,6 @@ where
             options.plugin_max_live_stores,
         )?;
 
-        let live_state = Arc::new(LiveStateContext::new());
         let branch_ctx = Arc::new(BranchContext::new());
         assert_initialized(storage.clone()).await?;
 
@@ -166,7 +162,6 @@ where
         ));
         Ok(Self {
             storage,
-            live_state,
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
             sql_planning_cache: Arc::new(SqlPlanningCache::default()),
@@ -226,7 +221,6 @@ where
             active_branch_id.into(),
             active_account_id,
             self.storage(),
-            Arc::clone(&self.live_state),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
@@ -255,7 +249,6 @@ where
         SessionContext::open_workspace(
             active_account_id,
             self.storage(),
-            Arc::clone(&self.live_state),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),

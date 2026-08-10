@@ -75,7 +75,6 @@ pub struct InitReceipt {
 
 pub(crate) async fn initialize<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
-    _tracked_state: &crate::tracked_state::TrackedStateContext,
 ) -> Result<InitReceipt, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,

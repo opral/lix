@@ -1,11 +1,9 @@
-mod context;
 mod derived;
 mod forktree_reader;
 mod reader;
 mod types;
 pub(crate) mod visibility;
 
-pub(crate) use context::LiveStateContext;
 pub(crate) use derived::is_derived_schema;
 pub(crate) use forktree_reader::{
     load_exact_facade as load_forktree_exact_facade, scan_facade as scan_forktree_facade,

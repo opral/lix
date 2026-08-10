@@ -12,14 +12,13 @@ use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
 };
 use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
-use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
+use crate::commit_graph::{CommitGraphReader, CommitGraphStoreReader};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::{
-    LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateProjection,
-    LiveStateReader,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateProjection, LiveStateReader,
 };
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
@@ -132,7 +131,6 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) mode: SessionMode,
     pub(super) active_account_id: Arc<str>,
     pub(super) storage: StorageAdapter<StorageImpl>,
-    pub(super) live_state: Arc<LiveStateContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -154,7 +152,6 @@ where
     pub(crate) async fn open_workspace(
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -176,7 +173,6 @@ where
             },
             active_account_id,
             storage,
-            live_state,
             branch_ctx,
             catalog_context,
             sql_planning_cache,
@@ -194,7 +190,6 @@ where
         active_branch_id: String,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -212,7 +207,6 @@ where
             },
             active_account_id,
             storage,
-            live_state,
             branch_ctx,
             catalog_context,
             sql_planning_cache,
@@ -230,7 +224,6 @@ where
         mode: SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -246,7 +239,6 @@ where
             mode,
             active_account_id,
             storage,
-            live_state,
             branch_ctx,
             catalog_context,
             sql_planning_cache,
@@ -266,7 +258,6 @@ where
         mode: SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -284,7 +275,6 @@ where
             mode,
             active_account_id: Arc::from(active_account_id),
             storage,
-            live_state,
             branch_ctx,
             catalog_context,
             sql_planning_cache,
@@ -511,7 +501,6 @@ where
             &self.mode,
             self.active_account_id.to_string(),
             self.storage.clone(),
-            Arc::clone(&self.live_state),
             self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
@@ -699,7 +688,7 @@ where
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
-        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+        Box::new(CommitGraphStoreReader::new(self.read_store.clone()))
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
