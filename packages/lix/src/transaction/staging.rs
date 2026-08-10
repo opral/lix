@@ -27,6 +27,10 @@ use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
 use crate::gc::CheckpointPublication;
 use crate::state::CertifiedStatePredecessor;
+#[cfg(test)]
+use crate::state::{
+    ForkTreeStateView, StagedStateRow, StagedUntrackedStateRow, TransactionStateView,
+};
 use crate::transaction::types::StagedCommitChangeRefs;
 use crate::transaction::types::{
     CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation,
@@ -2794,6 +2798,602 @@ impl TransactionWriteBuffer {
             by_identity,
         };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::common::LixTimestamp;
+    use crate::forktree::{
+        ForkTreeReadFacade, StateCell, StateKey, StateKeyRef, StateValue, UntrackedValue,
+        encode_state_key,
+    };
+    use crate::storage::{Memory, MemoryRead};
+    use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageReadOptions};
+    use crate::transaction::types::FileContent;
+
+    type TestRead = SharedStorageAdapterRead<MemoryRead>;
+
+    const TEST_BRANCH: &str = "01920000-0000-7000-8000-0000000000a1";
+    const TEST_GLOBAL: &str = GLOBAL_BRANCH_ID;
+
+    fn test_staged_writes() -> Arc<TransactionWriteBuffer> {
+        let functions: Box<dyn FunctionProvider + Send> = Box::new(TestFunctionProvider::default());
+        Arc::new(TransactionWriteBuffer::new(FunctionProviderHandle::shared(
+            functions,
+        )))
+    }
+
+    #[derive(Default)]
+    struct TestFunctionProvider {
+        uuid_count: usize,
+        timestamp_count: usize,
+    }
+
+    impl FunctionProvider for TestFunctionProvider {
+        fn uuid_v7(&mut self) -> uuid::Uuid {
+            self.uuid_count += 1;
+            test_uuid_value(self.uuid_count)
+        }
+
+        fn timestamp(&mut self) -> LixTimestamp {
+            self.timestamp_count += 1;
+            LixTimestamp::expect_parse(
+                "timestamp",
+                &format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count),
+            )
+        }
+    }
+
+    fn test_uuid_value(index: usize) -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128)
+    }
+
+    fn state_row(key: &str, value: &str) -> TestPreparedStateRow {
+        let snapshot = stage_json_from_value(
+            TransactionJson::from_value_for_test(serde_json::json!({
+                "key": key,
+                "value": value
+            })),
+            "test staged row snapshot_content",
+        )
+        .expect("test snapshot should prepare");
+        TestPreparedStateRow {
+            schema_plan_id: SchemaPlanId::for_test(0),
+            facts: PreparedRowFacts::default(),
+            entity_pk: EntityPk::single(key),
+            schema_key: "lix_key_value".into(),
+            file_id: None,
+            snapshot: Some(snapshot),
+            metadata: None,
+            origin: None,
+            origin_key: None,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.000Z"),
+            global: true,
+            change_id: None,
+            commit_id: None,
+            untracked: true,
+            branch_id: TEST_GLOBAL.into(),
+        }
+    }
+
+    fn tracked_append_row(key: &str, value: &str) -> TestPreparedStateRow {
+        let mut row = state_row(key, value);
+        row.untracked = false;
+        row.global = false;
+        row.branch_id = TEST_BRANCH.into();
+        row.change_id = Some(ChangeId::for_test_label(key));
+        row
+    }
+
+    fn tracked_tombstone_row(key: &str) -> TestPreparedStateRow {
+        let mut row = tracked_append_row(key, "deleted");
+        row.snapshot = None;
+        row
+    }
+
+    fn untracked_branch_row(key: &str, value: &str) -> TestPreparedStateRow {
+        let mut row = state_row(key, value);
+        row.global = false;
+        row.branch_id = TEST_BRANCH.into();
+        row
+    }
+
+    fn prepared_rows(rows: impl IntoIterator<Item = TestPreparedStateRow>) -> PreparedStateBatch {
+        PreparedStateBatch::from_test_rows(rows.into_iter().collect())
+    }
+
+    fn staged_values(set: &PreparedWriteSet) -> Vec<(String, Option<String>, bool, bool)> {
+        set.state_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.entity_pk
+                        .as_single_string_owned()
+                        .expect("test identity is one string"),
+                    row.snapshot.map(|value| value.normalized().to_owned()),
+                    row.untracked,
+                    row.global,
+                )
+            })
+            .collect()
+    }
+
+    fn native_state_value(cell: StateCell, ordinal: usize) -> StateValue {
+        StateValue {
+            change_id: ChangeId::for_test_label(&format!("state-change-{ordinal}")),
+            commit_id: CommitId::for_test_label(&format!("state-commit-{ordinal}")),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.001Z"),
+            cell,
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        }
+    }
+
+    fn native_key(entity: &str) -> Vec<u8> {
+        let entity_pk = EntityPk::single(entity);
+        encode_state_key(StateKeyRef {
+            schema_key: "lix_key_value",
+            file_id: None,
+            entity_pk: &entity_pk,
+        })
+    }
+
+    async fn empty_committed_view() -> ForkTreeStateView<TestRead> {
+        let storage = StorageAdapter::new(Memory::new());
+        crate::forktree::initialize_empty_repository(storage.clone())
+            .await
+            .expect("initialize the native in-memory repository");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open one retained native read");
+        let read = SharedStorageAdapterRead::new(read);
+        let committed = ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), TEST_GLOBAL)
+            .await
+            .expect("open the retained native branch view");
+        committed
+    }
+
+    #[test]
+    fn staged_replace_drains_ordered_rows_and_commit_membership() {
+        let staged = test_staged_writes();
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([
+                    tracked_append_row("a", "one"),
+                    tracked_append_row("b", "two"),
+                ]),
+            })
+            .expect("ordered replacement should stage");
+
+        let drained = staged.drain().expect("staged rows should drain");
+        assert_eq!(drained.state_rows.len(), 2);
+        assert_eq!(
+            drained
+                .state_rows
+                .row(0)
+                .entity_pk
+                .as_single_string_owned()
+                .unwrap(),
+            "a"
+        );
+        assert_eq!(
+            drained
+                .state_rows
+                .row(1)
+                .entity_pk
+                .as_single_string_owned()
+                .unwrap(),
+            "b"
+        );
+        assert_eq!(
+            drained
+                .commit_change_refs_by_branch
+                .get(TEST_BRANCH)
+                .expect("tracked branch membership")
+                .tracked_change_count,
+            2
+        );
+    }
+
+    #[test]
+    fn staged_insert_rejects_duplicate_identity_in_one_batch() {
+        let staged = test_staged_writes();
+        let error = staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: prepared_rows([
+                    tracked_append_row("duplicate", "one"),
+                    tracked_append_row("duplicate", "two"),
+                ]),
+            })
+            .expect_err("duplicate INSERT identity must fail closed");
+        assert!(error.to_string().contains("duplicate"));
+        assert!(
+            staged
+                .drain()
+                .expect("failed batch remains atomic")
+                .state_rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn staged_replacement_coalesces_to_the_latest_row() {
+        let staged = test_staged_writes();
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("same", "before")]),
+            })
+            .expect("initial replacement should stage");
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("same", "after")]),
+            })
+            .expect("replacement should coalesce");
+
+        let drained = staged.drain().expect("coalesced rows should drain");
+        assert_eq!(drained.state_rows.len(), 1);
+        assert_eq!(
+            drained
+                .state_rows
+                .row(0)
+                .snapshot
+                .expect("snapshot")
+                .normalized(),
+            r#"{"key":"same","value":"after"}"#
+        );
+    }
+
+    #[test]
+    fn staged_delete_then_insert_resurrects_the_latest_row() {
+        let staged = test_staged_writes();
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("resurrect", "before")]),
+            })
+            .expect("initial row should stage");
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_tombstone_row("resurrect")]),
+            })
+            .expect("tombstone should stage");
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("resurrect", "after")]),
+            })
+            .expect("resurrection should stage");
+
+        let drained = staged.drain().expect("resurrection should drain");
+        assert_eq!(drained.state_rows.len(), 1);
+        assert!(drained.state_rows.row(0).snapshot.is_some());
+    }
+
+    #[test]
+    fn staged_checkpoint_restore_rolls_back_rows_and_commit_metadata() {
+        let staged = test_staged_writes();
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("kept", "one")]),
+            })
+            .expect("first row should stage");
+        let checkpoint = staged
+            .checkpoint()
+            .expect("checkpoint should capture all owners");
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("rolled-back", "two")]),
+            })
+            .expect("second row should stage");
+        staged
+            .restore(checkpoint)
+            .expect("restore should be atomic");
+        let drained = staged.drain().expect("restored rows should drain");
+        assert_eq!(staged_values(&drained).len(), 1);
+        assert_eq!(staged_values(&drained)[0].0, "kept");
+        assert_eq!(drained.commit_change_refs_by_branch.len(), 1);
+    }
+
+    #[test]
+    fn staged_mixed_durability_rejects_same_identity() {
+        let staged = test_staged_writes();
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("durability", "tracked")]),
+            })
+            .expect("tracked row should stage");
+        let error = staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([untracked_branch_row("durability", "untracked")]),
+            })
+            .expect_err("same identity cannot change durability");
+        assert!(error.to_string().contains("durability"));
+    }
+
+    #[test]
+    fn staged_file_content_survives_native_drain() {
+        let staged = test_staged_writes();
+        let row = tracked_append_row("file-row", "metadata").with_file_id("file-1");
+        let content = TransactionFileContent::new(
+            "file-1".to_string(),
+            Some("file.txt".to_string()),
+            Some("file.txt".to_string()),
+            TEST_BRANCH.to_string(),
+            false,
+            false,
+            FileContent::from(vec![1_u8, 2, 3]),
+        );
+        staged
+            .stage_write(PreparedTransactionWrite::RowsWithFileContent {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([row]),
+                file_content: vec![content],
+                count: 1,
+            })
+            .expect("file row and payload should stage");
+        let drained = staged.drain().expect("file write should drain");
+        assert_eq!(drained.file_content_writes.len(), 1);
+        assert_eq!(drained.file_content_writes[0].file_id, "file-1");
+        assert_eq!(drained.file_content_writes[0].content().len(), 3);
+    }
+
+    #[test]
+    fn staged_commit_membership_excludes_untracked_rows() {
+        let staged = test_staged_writes();
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([state_row("untracked", "value")]),
+            })
+            .expect("untracked row should stage");
+        let drained = staged.drain().expect("untracked row should drain");
+        assert!(drained.commit_change_refs_by_branch.is_empty());
+    }
+
+    #[test]
+    fn staged_global_rows_require_the_global_branch_identity() {
+        let staged = test_staged_writes();
+        let mut row = state_row("bad-global", "value");
+        row.branch_id = TEST_BRANCH.into();
+        let error = staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([row]),
+            })
+            .expect_err("global rows cannot use a local branch identity");
+        assert!(error.to_string().contains("global"));
+    }
+
+    #[test]
+    fn staged_parameter_insert_preserves_statement_slot_order() {
+        let staged = test_staged_writes();
+        staged
+            .stage_parameter_batch_insert(
+                PreparedTransactionWrite::Rows {
+                    mode: TransactionWriteMode::Insert,
+                    rows: prepared_rows([
+                        tracked_append_row("slot-a", "a"),
+                        tracked_append_row("slot-b", "b"),
+                    ]),
+                },
+                vec![7, 3],
+            )
+            .expect("parameter INSERT should stage");
+        let drained = staged.drain().expect("parameter INSERT should drain");
+        assert_eq!(drained.insert_selection.len(), 2);
+        assert_eq!(drained.insert_selection.statement_index(0), Some(7));
+        assert_eq!(drained.insert_selection.statement_index(1), Some(3));
+    }
+
+    #[test]
+    fn staged_schema_catalog_change_invalidates_the_matching_native_domain() {
+        let staged = test_staged_writes();
+        let mut row = state_row("schema-row", "schema");
+        row.schema_key = crate::transaction::normalization::REGISTERED_SCHEMA_KEY.into();
+        row.global = false;
+        row.branch_id = TEST_BRANCH.into();
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([row]),
+            })
+            .expect("schema catalog row should stage");
+        let domain = Domain::exact_file(TEST_BRANCH.to_string(), true, None);
+        assert!(
+            staged
+                .has_staged_schema_catalog_change(&domain)
+                .expect("schema catalog probe should succeed")
+        );
+    }
+
+    #[test]
+    fn failed_file_batch_restores_without_leaking_payload_or_rows() {
+        let staged = test_staged_writes();
+        staged
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("before-failure", "one")]),
+            })
+            .expect("baseline row should stage");
+        let checkpoint = staged
+            .checkpoint()
+            .expect("checkpoint should capture payload owners");
+        staged
+            .stage_write(PreparedTransactionWrite::RowsWithFileContent {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows([tracked_append_row("failed-file", "two")]),
+                file_content: vec![TransactionFileContent::new(
+                    "failed-file".to_string(),
+                    None,
+                    None,
+                    TEST_BRANCH.to_string(),
+                    false,
+                    false,
+                    FileContent::from(vec![9_u8, 8, 7]),
+                )],
+                count: 1,
+            })
+            .expect("file staging itself is valid before simulated SQL failure");
+        staged
+            .restore(checkpoint)
+            .expect("rollback should restore all owners");
+        let drained = staged.drain().expect("restored baseline should drain");
+        assert_eq!(drained.state_rows.len(), 1);
+        assert!(drained.file_content_writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_points_preserve_slots_duplicates_and_tombstones() {
+        let committed = empty_committed_view().await;
+        let key_a = native_key("a");
+        let key_b = native_key("b");
+        let view = TransactionStateView::new(
+            committed,
+            vec![
+                StagedStateRow::new(
+                    key_a.clone(),
+                    native_state_value(StateCell::Value("a".into()), 1),
+                ),
+                StagedStateRow::new(key_b.clone(), native_state_value(StateCell::Tombstone, 2)),
+            ],
+        )
+        .expect("native rows are ordered");
+
+        let rows = view
+            .points(&[key_b.clone(), key_a.clone(), key_b.clone()], true)
+            .await
+            .expect("native exact points should resolve");
+        assert!(matches!(
+            rows[0].as_ref().map(|row| &row.value.cell),
+            Some(StateCell::Tombstone)
+        ));
+        assert!(matches!(
+            rows[1].as_ref().map(|row| &row.value.cell),
+            Some(StateCell::Value(_))
+        ));
+        assert!(matches!(
+            rows[2].as_ref().map(|row| &row.value.cell),
+            Some(StateCell::Tombstone)
+        ));
+
+        let hidden = view
+            .points(&[key_b], false)
+            .await
+            .expect("tombstone omission should preserve slot");
+        assert_eq!(hidden, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn native_range_applies_limit_after_tombstone_visibility() {
+        let committed = empty_committed_view().await;
+        let key_a = native_key("a");
+        let key_b = native_key("b");
+        let key_c = native_key("c");
+        let view = TransactionStateView::new(
+            committed,
+            vec![
+                StagedStateRow::new(key_a.clone(), native_state_value(StateCell::Tombstone, 1)),
+                StagedStateRow::new(
+                    key_b.clone(),
+                    native_state_value(StateCell::Value("b".into()), 2),
+                ),
+                StagedStateRow::new(key_c, native_state_value(StateCell::Value("c".into()), 3)),
+            ],
+        )
+        .expect("native rows are ordered");
+        let rows = view
+            .range(Some(&key_a), None, Some(1), false)
+            .await
+            .expect("native bounded range should resolve");
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].value.cell, StateCell::Value(_)));
+    }
+
+    #[tokio::test]
+    async fn native_staged_untracked_tombstone_preserves_owner_and_masks_slot() {
+        let committed = empty_committed_view().await;
+        let owner = crate::forktree::CanonicalBranchId::from_bytes([7; 16]);
+        let key = StateKey {
+            schema_key: "lix_key_value".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single("untracked"),
+        };
+        let value = UntrackedValue {
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.001Z"),
+            cell: StateCell::Tombstone,
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        };
+        let view = TransactionStateView::new_with_untracked(
+            committed,
+            Vec::new(),
+            vec![StagedUntrackedStateRow::new(owner, key.clone(), value)],
+        )
+        .expect("native untracked overlay should be ordered");
+        let encoded = encode_state_key(StateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        });
+        assert_eq!(
+            view.untracked_points(&[encoded.clone()], false)
+                .await
+                .unwrap(),
+            vec![None]
+        );
+        let rows = view
+            .untracked_points(&[encoded], true)
+            .await
+            .expect("tombstone-inclusive untracked point should resolve");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].as_ref().expect("owner retained").owner, owner);
+    }
+
+    #[tokio::test]
+    async fn native_overlay_rejects_unsorted_rows_without_materializing_a_map() {
+        let committed = empty_committed_view().await;
+        let result = TransactionStateView::new(
+            committed,
+            vec![
+                StagedStateRow::new(native_key("b"), native_state_value(StateCell::Null, 1)),
+                StagedStateRow::new(native_key("a"), native_state_value(StateCell::Null, 2)),
+            ],
+        );
+        assert!(
+            result.is_err(),
+            "native overlay must require intrinsic order"
+        );
+    }
+}
+
+#[cfg(test)]
+trait StagingTestRowExt {
+    fn with_file_id(self, file_id: &str) -> Self;
+}
+
+#[cfg(test)]
+impl StagingTestRowExt for TestPreparedStateRow {
+    fn with_file_id(mut self, file_id: &str) -> Self {
+        self.file_id = Some(file_id.into());
+        self
     }
 }
 
