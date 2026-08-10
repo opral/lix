@@ -866,6 +866,18 @@ where
                         })
                         .flatten()
                 });
+            // Direct native views may be constructed with an authenticated
+            // owner that is neither the transaction branch nor GLOBAL (for
+            // example, a branch-scoped test view).  The exact point request
+            // already identifies the state key, so retain that staged owner
+            // instead of silently filtering the slot.  Transaction-owned
+            // overlays still contain only active/global rows because their
+            // staging projection enforces that boundary before construction.
+            let staged = staged.or_else(|| {
+                self.staged_untracked
+                    .iter()
+                    .find(|row| row.key == decoded_key)
+            });
             let row = staged
                 .map(|row| {
                     if !include_tombstones && row.value.cell.deleted() {
