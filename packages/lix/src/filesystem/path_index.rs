@@ -13,6 +13,7 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
+use crate::forktree::ForkTreeReadFacade;
 use crate::state::ForkTreeStateView;
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -333,7 +334,7 @@ impl FilesystemPathIndex {
                                 "invalid lix_file_descriptor snapshot JSON: {error}"
                             ))
                         })?;
-                    let key = FilesystemDescriptorKey::from_file_descriptor_live_row_ref(
+                    let key = FilesystemDescriptorKey::from_file_descriptor_state_row_ref(
                         row,
                         snapshot.id.clone(),
                     );
@@ -616,7 +617,7 @@ impl FilesystemPathIndex {
         if row.global
             && same_id.iter().any(|entry| {
                 !entry.key.global()
-                    && entry.key.branch_id() == row.branch_id.as_ref()
+                    && entry.key.branch_id() == row.branch_id.as_str()
                     && entry.key.is_untracked() == row.untracked
                     && entry.key.file_id()
                         == if kind == FilesystemPathKind::File {
@@ -630,7 +631,7 @@ impl FilesystemPathIndex {
         }
 
         let key = if kind == FilesystemPathKind::File {
-            FilesystemDescriptorKey::from_file_descriptor_live_row(row, descriptor_id)
+            FilesystemDescriptorKey::from_file_descriptor_state_row(row, descriptor_id)
         } else {
             FilesystemDescriptorKey::from_state_row(row, descriptor_id)
         };
@@ -882,7 +883,7 @@ fn for_each_committed_row_projection(
         || request
             .branch_ids
             .iter()
-            .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref())
+            .any(|branch_id| branch_id.as_str() == row.branch_id.as_str())
     {
         apply(row)?;
     }
@@ -968,29 +969,80 @@ pub(crate) trait FilesystemPathIndexReader: Send + Sync {
 /// caller's retained ForkTree capability; it never opens a second facade or
 /// reaches the underlying storage read directly.
 pub(crate) struct ForkTreeFilesystemPathIndexReader<R> {
-    state: ForkTreeStateView<R>,
+    facade: ForkTreeReadFacade<R>,
 }
 
 impl<R> ForkTreeFilesystemPathIndexReader<R> {
-    pub(crate) fn new(state: ForkTreeStateView<R>) -> Self {
-        Self { state }
+    pub(crate) fn new(facade: ForkTreeReadFacade<R>) -> Self {
+        Self { facade }
     }
 }
 
 #[async_trait]
 impl<R> FilesystemPathIndexReader for ForkTreeFilesystemPathIndexReader<R>
 where
-    R: StorageAdapterRead + Send + Sync + 'static,
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     async fn path_index(
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        build_path_index(&self.state, request).await
+        build_path_index(&self.facade, request).await
     }
 }
 
-pub(crate) async fn build_path_index<R>(
+#[async_trait]
+trait FilesystemPathIndexSource {
+    async fn build_path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError>;
+}
+
+#[async_trait]
+impl<R> FilesystemPathIndexSource for &ForkTreeStateView<R>
+where
+    R: StorageAdapterRead + Send + Sync + 'static,
+{
+    async fn build_path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        build_path_index_from_state(self, request).await
+    }
+}
+
+#[async_trait]
+impl<R> FilesystemPathIndexSource for &ForkTreeReadFacade<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    async fn build_path_index(
+        &self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        let branch_id = request.branch_ids.first().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "filesystem path index requires one operation-owned branch state view",
+            )
+        })?;
+        let state = ForkTreeStateView::from_facade((*self).clone(), branch_id).await?;
+        build_path_index_from_state(&state, request).await
+    }
+}
+
+pub(crate) async fn build_path_index<S>(
+    source: S,
+    request: &FilesystemPathIndexRequest,
+) -> Result<Arc<FilesystemPathIndex>, LixError>
+where
+    S: FilesystemPathIndexSource + Send + Sync,
+{
+    source.build_path_index(request).await
+}
+
+async fn build_path_index_from_state<R>(
     state: &ForkTreeStateView<R>,
     request: &FilesystemPathIndexRequest,
 ) -> Result<Arc<FilesystemPathIndex>, LixError>
@@ -999,13 +1051,13 @@ where
 {
     let branch_id = request.branch_ids.first().ok_or_else(|| {
         LixError::new(
-            LixError::CODE_INVALID_ARGUMENT,
+            LixError::CODE_INVALID_PARAM,
             "filesystem path index requires one operation-owned branch state view",
         )
     })?;
     if request.branch_ids.len() != 1 {
         return Err(LixError::new(
-            LixError::CODE_INVALID_ARGUMENT,
+            LixError::CODE_INVALID_PARAM,
             "filesystem path index cannot acquire multiple branch views in one operation",
         ));
     }

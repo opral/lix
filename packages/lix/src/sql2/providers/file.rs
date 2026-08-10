@@ -297,7 +297,7 @@ where
 
     async fn points_for_branch(
         &self,
-        branch_id: &str,
+        _branch_id: &str,
         keys: &[Vec<u8>],
         include_tombstones: bool,
     ) -> Result<Vec<Option<StateRow>>, LixError> {
@@ -310,12 +310,12 @@ where
                 scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             let view = views
-                .get(branch_id)
+                .get(_branch_id)
                 .or_else(|| views.values().next())
                 .ok_or_else(|| {
                     LixError::new(
-                        LixError::CODE_INVALID_ARGUMENT,
-                        format!("native test state has no branch '{branch_id}'"),
+                        LixError::CODE_INVALID_PARAM,
+                        format!("native test state has no branch '{_branch_id}'"),
                     )
                 })?;
             return view
@@ -328,7 +328,7 @@ where
 
     async fn range_for_branch(
         &self,
-        branch_id: &str,
+        _branch_id: &str,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
         limit: Option<usize>,
@@ -343,12 +343,12 @@ where
                 scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             let view = views
-                .get(branch_id)
+                .get(_branch_id)
                 .or_else(|| views.values().next())
                 .ok_or_else(|| {
                     LixError::new(
-                        LixError::CODE_INVALID_ARGUMENT,
-                        format!("native test state has no branch '{branch_id}'"),
+                        LixError::CODE_INVALID_PARAM,
+                        format!("native test state has no branch '{_branch_id}'"),
                     )
                 })?;
             return view
@@ -382,7 +382,7 @@ where
             .or_else(|| self.branch_id())
             .ok_or_else(|| {
                 LixError::new(
-                    LixError::CODE_INVALID_ARGUMENT,
+                    LixError::CODE_INVALID_PARAM,
                     "file state view requires one resolved branch id",
                 )
             })?;
@@ -399,7 +399,7 @@ where
             } else {
                 let schemas = if request.filter.schema_keys.is_empty() {
                     return Err(LixError::new(
-                        LixError::CODE_INVALID_ARGUMENT,
+                        LixError::CODE_INVALID_PARAM,
                         "native file scan requires a schema or explicit full surface",
                     ));
                 } else {
@@ -504,7 +504,7 @@ where
                 .is_some_and(|branch| branch != row.branch_id)
             {
                 return Err(LixError::new(
-                    LixError::CODE_INVALID_ARGUMENT,
+                    LixError::CODE_INVALID_PARAM,
                     format!(
                         "exact file state request branch '{}' does not match retained branch {:?}",
                         row.branch_id, view_branch
@@ -525,7 +525,7 @@ where
             .map(|row| row.branch_id.as_str())
             .ok_or_else(|| {
                 LixError::new(
-                    LixError::CODE_INVALID_ARGUMENT,
+                    LixError::CODE_INVALID_PARAM,
                     "exact file state view requires a resolved branch id",
                 )
             })?;
@@ -543,13 +543,13 @@ where
 fn test_filesystem_row_to_state_row(row: &FilesystemStateRow) -> Result<StateRow, LixError> {
     let change_id = row.change_id.ok_or_else(|| {
         LixError::new(
-            LixError::CODE_INVALID_ARGUMENT,
+            LixError::CODE_INVALID_PARAM,
             "native file-state fixture is missing change_id",
         )
     })?;
     let commit_id = row.commit_id.ok_or_else(|| {
         LixError::new(
-            LixError::CODE_INVALID_ARGUMENT,
+            LixError::CODE_INVALID_PARAM,
             "native file-state fixture is missing commit_id",
         )
     })?;
@@ -593,7 +593,7 @@ where
 {
     let branch_id = branch_binding.ok_or_else(|| {
         LixError::new(
-            LixError::CODE_INVALID_ARGUMENT,
+            LixError::CODE_INVALID_PARAM,
             "filesystem path resolution requires a branch-bound state view",
         )
     })?;
@@ -631,7 +631,7 @@ where
 {
     let branch_id = branch_binding.ok_or_else(|| {
         LixError::new(
-            LixError::CODE_INVALID_ARGUMENT,
+            LixError::CODE_INVALID_PARAM,
             "filesystem path resolution requires a branch-bound state view",
         )
     })?;
@@ -654,7 +654,7 @@ pub(super) async fn register_lix_file_active_provider<R>(
     session: &SessionContext,
     surface_name: &str,
     active_branch_id: &str,
-    state_view: ForkTreeStateView<R>,
+    state_view: &ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
@@ -671,7 +671,7 @@ where
         Arc::new(
             LixFileSpec::active_branch(
                 active_branch_id,
-                state_view,
+                state_view.clone(),
                 filesystem_path_index,
                 branch_ref,
                 authenticated_blob_reader,
@@ -687,7 +687,7 @@ where
 pub(super) async fn register_lix_file_by_branch_provider<R>(
     session: &SessionContext,
     surface_name: &str,
-    state_view: ForkTreeStateView<R>,
+    state_view: &ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
@@ -703,7 +703,7 @@ where
         surface_name,
         Arc::new(
             LixFileSpec::by_branch(
-                state_view,
+                state_view.clone(),
                 filesystem_path_index,
                 branch_ref,
                 authenticated_blob_reader,
@@ -1744,7 +1744,7 @@ where
             source: scan_row_source(
                 Arc::clone(&projected_schema),
                 (
-                    Arc::clone(&self.state_view),
+                    Arc::new(self.state_view.clone()),
                     self.blob_reader.clone(),
                     self.plugin_host.clone(),
                     Arc::clone(&self.schema),
@@ -3363,7 +3363,7 @@ where
         .map(Some);
     }
 
-    let live_rows = ctx
+    let live_rows = FileStateView::Transaction(ctx.state_view().clone())
         .scan_file_plan(&FileQueryPlan {
             filter: FileQueryFilter {
                 schema_keys: filesystem_schema_keys(),
@@ -3846,9 +3846,10 @@ where
             .load_exact_batch(&request)
             .await?;
         for (row_index, (key, request)) in blob_requests.into_iter().enumerate() {
-            let Some(row) = rows.row(row_index) else {
+            if row_index >= rows.len() {
                 continue;
-            };
+            }
+            let row = rows.row(row_index);
             let tracking_mismatch = row.untracked() ^ key.is_untracked();
             if row.branch_id() != key.branch_id()
                 || row.global() != key.global()
@@ -6349,6 +6350,7 @@ where
                     },
                     projection: plugin_control_state_projection(),
                     limit: Some(1),
+                    full_surface: false,
                 })
                 .await?;
             let row = rows.iter().find(|row| {
@@ -6449,6 +6451,7 @@ where
                         },
                         projection: plugin_control_state_projection(),
                         limit: None,
+                        full_surface: false,
                     })
                     .await?;
                 Ok::<_, LixError>((branch_id, file_ids, rows))
@@ -6672,6 +6675,7 @@ fn lix_file_scan_request(
         },
         projection: lix_file_projection(projected_schema),
         limit,
+        full_surface: false,
     }
 }
 
@@ -6725,7 +6729,7 @@ where
         &file_rows,
         request.filter.branch_ids.first().ok_or_else(|| {
             LixError::new(
-                LixError::CODE_INVALID_ARGUMENT,
+                LixError::CODE_INVALID_PARAM,
                 "exact file scan requires a resolved branch id",
             )
         })?,
@@ -6764,14 +6768,14 @@ where
     {
         let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
             LixError::new(
-                LixError::CODE_INVALID_ARGUMENT,
+                LixError::CODE_INVALID_PARAM,
                 "file descriptor row is missing its snapshot while resolving directories",
             )
         })?;
         let snapshot =
             serde_json::from_str::<FileDescriptorSnapshot>(snapshot_content).map_err(|error| {
                 LixError::new(
-                    LixError::CODE_INVALID_ARGUMENT,
+                    LixError::CODE_INVALID_PARAM,
                     format!(
                         "invalid file descriptor snapshot while resolving directories: {error}"
                     ),
@@ -6817,14 +6821,14 @@ where
         {
             let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
                 LixError::new(
-                    LixError::CODE_INVALID_ARGUMENT,
+                    LixError::CODE_INVALID_PARAM,
                     "directory descriptor row is missing its snapshot while resolving parents",
                 )
             })?;
             let snapshot = serde_json::from_str::<DirectoryDescriptorSnapshot>(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
-                        LixError::CODE_INVALID_ARGUMENT,
+                        LixError::CODE_INVALID_PARAM,
                         format!(
                             "invalid directory descriptor snapshot while resolving parents: {error}"
                         ),

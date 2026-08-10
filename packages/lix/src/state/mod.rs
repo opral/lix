@@ -252,6 +252,13 @@ where
         Ok(self.view.branch_id() == canonical_branch_id(branch_id)?)
     }
 
+    /// Returns the UUID text for the branch bound to this retained view.
+    /// Selector identity remains owned and authenticated by the coherent
+    /// ForkTree view; this is only row provenance for native consumers.
+    pub(crate) fn branch_id(&self) -> String {
+        uuid::Uuid::from_bytes(*self.view.branch_id().as_bytes()).to_string()
+    }
+
     /// Resolves exact keys through the native authenticated ordered-tree
     /// primitive. Result slots preserve request order and duplicates.
     pub(crate) async fn points(
@@ -686,6 +693,95 @@ where
                 })
                 .unwrap_or(committed_row);
             output.push(row);
+        }
+        Ok(output)
+    }
+
+    /// Resolves one bounded untracked branch range through the retained
+    /// ForkTree view and merges the ordered staged overlay. The caller must
+    /// supply a schema/entity prefix range; this method never widens it to a
+    /// whole-owner scan.
+    pub(crate) async fn untracked_branch_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<UntrackedStateRow>, LixError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let committed = self
+            .committed
+            .untracked_branch_range(lower, upper, None)
+            .await?;
+        let owner = uuid::Uuid::parse_str(&self.committed.branch_id())
+            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?;
+        let encode = |owner: CanonicalBranchId, key: &StateKey| {
+            crate::forktree::encode_untracked_key(
+                owner,
+                crate::forktree::StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                },
+            )
+        };
+        let staged = self
+            .staged_untracked
+            .iter()
+            .filter(|row| row.owner == CanonicalBranchId::from_bytes(*owner.as_bytes()))
+            .filter(|row| {
+                let key = encode(row.owner, &row.key);
+                lower.is_none_or(|bound| key.as_slice() >= bound)
+                    && upper.is_none_or(|bound| key.as_slice() < bound)
+            })
+            .map(|row| {
+                (
+                    encode(row.owner, &row.key),
+                    UntrackedStateRow {
+                        owner: row.owner,
+                        key: row.key.clone(),
+                        value: row.value.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut committed_index = 0;
+        let mut staged_index = 0;
+        let mut output = Vec::new();
+        while committed_index < committed.len() || staged_index < staged.len() {
+            let committed_key = committed
+                .get(committed_index)
+                .map(|row| encode(row.owner, &row.key));
+            let staged_key = staged.get(staged_index).map(|(key, _)| key.clone());
+            let choice = match (committed_key.as_deref(), staged_key.as_deref()) {
+                (None, None) => break,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(right),
+            };
+            let row = match choice {
+                Ordering::Less => {
+                    let row = committed[committed_index].clone();
+                    committed_index += 1;
+                    row
+                }
+                Ordering::Equal => {
+                    committed_index += 1;
+                    let row = staged[staged_index].1.clone();
+                    staged_index += 1;
+                    row
+                }
+                Ordering::Greater => {
+                    let row = staged[staged_index].1.clone();
+                    staged_index += 1;
+                    row
+                }
+            };
+            output.push(row);
+            if limit.is_some_and(|bound| output.len() >= bound) {
+                break;
+            }
         }
         Ok(output)
     }
