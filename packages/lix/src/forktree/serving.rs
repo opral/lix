@@ -1795,33 +1795,71 @@ where
 
 type AuthenticatedCommitMemberClosure = (CommitObjectV1, Arc<[CommitMemberV1]>);
 
-#[derive(Default)]
 pub(super) struct StaleMemberAuthCache {
+    view_instance_id: u64,
     commits: BTreeMap<ObjectId, CommitObjectV1>,
     members: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), (CommitMemberV1, u32)>,
     pages: BTreeMap<(ObjectId, ObjectId), super::model::CommitChangePageV2>,
 }
 
+impl StaleMemberAuthCache {
+    pub(super) fn new(view_instance_id: u64) -> Self {
+        Self {
+            view_instance_id,
+            commits: BTreeMap::new(),
+            members: BTreeMap::new(),
+            pages: BTreeMap::new(),
+        }
+    }
+
+    fn require_view(&self, view_instance_id: u64) -> Result<(), StorageError> {
+        if self.view_instance_id != view_instance_id {
+            return Err(corruption(
+                "stale member authentication cache belongs to another retained view",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Authenticated stale summaries are produced only by the retained-view
 /// loader.  The cache has no public map surface, so a caller cannot seed a
 /// summary or token that bypasses endpoint validation.
-#[derive(Default)]
 pub(super) struct StaleCommitSummaryCache {
+    view_instance_id: u64,
     entries: BTreeMap<crate::changelog::CommitId, StaleCommitSummary>,
 }
 
 impl StaleCommitSummaryCache {
-    pub(super) fn with_summary(summary: StaleCommitSummary) -> Self {
+    pub(super) fn new(view_instance_id: u64) -> Self {
+        Self {
+            view_instance_id,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn with_summary(view_instance_id: u64, summary: StaleCommitSummary) -> Self {
+        debug_assert_eq!(summary.view_instance_id, view_instance_id);
         let key =
             crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*summary.commit_id.as_bytes()));
-        let mut cache = Self::default();
+        let mut cache = Self::new(view_instance_id);
         cache.entries.insert(key, summary);
         cache
+    }
+
+    fn require_view(&self, view_instance_id: u64) -> Result<(), StorageError> {
+        if self.view_instance_id != view_instance_id {
+            return Err(corruption(
+                "stale commit summary cache belongs to another retained view",
+            ));
+        }
+        Ok(())
     }
 }
 
 async fn load_stale_page_for_position<R>(
     read: &R,
+    view_instance_id: u64,
     commit_object_id: ObjectId,
     commit_id: CommitId,
     page_object_id: ObjectId,
@@ -1830,6 +1868,7 @@ async fn load_stale_page_for_position<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    cache.require_view(view_instance_id)?;
     let key = (commit_object_id, page_object_id);
     if let Some(page) = cache.pages.get(&key) {
         return Ok(page.clone());
@@ -1853,6 +1892,7 @@ where
 /// not selected by this request.
 pub(super) async fn validate_stale_page_position<R>(
     read: &R,
+    view_instance_id: u64,
     commit_object_id: ObjectId,
     commit_id: CommitId,
     page_object_ids: &[ObjectId],
@@ -1863,6 +1903,7 @@ pub(super) async fn validate_stale_page_position<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    cache.require_view(view_instance_id)?;
     let mut seen = BTreeSet::new();
     for id in page_object_ids {
         if !seen.insert(*id) {
@@ -1881,7 +1922,15 @@ where
         let current = if position == index {
             page.clone()
         } else {
-            load_stale_page_for_position(read, commit_object_id, commit_id, *page_id, cache).await?
+            load_stale_page_for_position(
+                read,
+                view_instance_id,
+                commit_object_id,
+                commit_id,
+                *page_id,
+                cache,
+            )
+            .await?
         };
         if current.start_ordinal != expected_start_ordinal {
             return Err(corruption(
@@ -1901,6 +1950,7 @@ where
 
 async fn load_stale_commit<R>(
     read: &R,
+    view_instance_id: u64,
     commit_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     cache: &mut StaleMemberAuthCache,
@@ -1908,6 +1958,7 @@ async fn load_stale_commit<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    cache.require_view(view_instance_id)?;
     if let Some(commit) = cache.commits.get(&commit_object_id) {
         return Ok(commit.clone());
     }
@@ -1929,6 +1980,7 @@ where
 /// No complete historical member closure is loaded.
 async fn load_stale_member_at_key<R>(
     read: &R,
+    view_instance_id: u64,
     commit_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     state_key: &[u8],
@@ -1938,12 +1990,20 @@ async fn load_stale_member_at_key<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    cache.require_view(view_instance_id)?;
     let cache_key = (
         commit_object_id,
         state_key.to_vec(),
         expected_change_id.as_bytes().to_vec(),
     );
-    let commit = load_stale_commit(read, commit_catalog_root, commit_object_id, cache).await?;
+    let commit = load_stale_commit(
+        read,
+        view_instance_id,
+        commit_catalog_root,
+        commit_object_id,
+        cache,
+    )
+    .await?;
     if let Some(member) = cache.members.get(&cache_key) {
         return Ok((commit, member.0.clone(), member.1));
     }
@@ -1971,6 +2031,7 @@ where
             .insert((commit_object_id, value_ref.page_object_id), page.clone());
         validate_stale_page_position(
             read,
+            view_instance_id,
             commit_object_id,
             commit.commit_id,
             &commit.member_page_object_ids,
@@ -2196,6 +2257,7 @@ where
 
 async fn validate_member_catalog_owner_with_stale_cache<R>(
     read: &R,
+    view_instance_id: u64,
     commit_catalog_root: ObjectId,
     target_commit_object_id: ObjectId,
     target_generation: u64,
@@ -2208,6 +2270,7 @@ async fn validate_member_catalog_owner_with_stale_cache<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    cache.require_view(view_instance_id)?;
     let canonical_owner = match entry.owner {
         ChangeCatalogOwner::CommitMember {
             commit_object_id,
@@ -2216,6 +2279,7 @@ where
             let (_introduction_commit, introduction_member, introduction_ordinal) =
                 load_stale_member_at_key(
                     read,
+                    view_instance_id,
                     commit_catalog_root,
                     commit_object_id,
                     state_key,
@@ -2252,6 +2316,7 @@ where
         Some((source_commit_object_id, source_ordinal)) => {
             let (source_commit, source_member, source_member_ordinal) = load_stale_member_at_key(
                 read,
+                view_instance_id,
                 commit_catalog_root,
                 source_commit_object_id,
                 state_key,
@@ -2278,6 +2343,7 @@ where
 
 pub(super) async fn resolve_semantic_member_with_stale_auth<R>(
     read: &R,
+    view_instance_id: u64,
     member: &CommitMemberV1,
     state_key: &[u8],
     target_commit_object_id: ObjectId,
@@ -2290,6 +2356,7 @@ pub(super) async fn resolve_semantic_member_with_stale_auth<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    cache.require_view(view_instance_id)?;
     let expected_change_id = member.change_id();
     let mut current = member.clone();
     let mut owner = target_commit_object_id;
@@ -2313,6 +2380,7 @@ where
         let entry = ChangeCatalogEntry::decode(&value)?;
         validate_member_catalog_owner_with_stale_cache(
             read,
+            view_instance_id,
             commit_catalog_root,
             owner,
             generation,
@@ -2361,6 +2429,7 @@ where
                 let (source_commit, source_member, source_member_ordinal) =
                     load_stale_member_at_key(
                         read,
+                        view_instance_id,
                         commit_catalog_root,
                         source_commit_object_id,
                         state_key,
@@ -2941,6 +3010,7 @@ where
 pub(super) async fn state_points_on_read_for_stale<R>(
     repository: &RepositoryRootV1,
     summary: StaleCommitSummary,
+    view_instance_id: u64,
     keys: &[Vec<u8>],
     include_tombstone: bool,
     read: &R,
@@ -2948,6 +3018,11 @@ pub(super) async fn state_points_on_read_for_stale<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    if summary.view_instance_id != view_instance_id {
+        return Err(corruption(
+            "stale commit summary belongs to another retained view",
+        ));
+    }
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -3004,8 +3079,9 @@ where
     }
 
     let mut output = Vec::with_capacity(selected.len());
-    let mut summary_cache = StaleCommitSummaryCache::with_summary(summary.clone());
-    let mut stale_member_cache = StaleMemberAuthCache::default();
+    let mut summary_cache =
+        StaleCommitSummaryCache::with_summary(view_instance_id, summary.clone());
+    let mut stale_member_cache = StaleMemberAuthCache::new(view_instance_id);
     for (row, value_ref) in selected.iter().zip(refs) {
         let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
             output.push(None);
@@ -3021,6 +3097,7 @@ where
             read,
             repository,
             page_changelog_id,
+            view_instance_id,
             &mut summary_cache,
         )
         .await
@@ -3035,6 +3112,7 @@ where
         }
         validate_stale_page_position(
             read,
+            view_instance_id,
             page_summary.commit_object_id,
             page_summary.commit_id,
             &page_summary.member_page_object_ids,
@@ -3054,6 +3132,7 @@ where
             .ok_or_else(|| corruption("stale state member ordinal overflows usize"))?;
         let resolved = resolve_semantic_member_with_stale_auth(
             read,
+            view_instance_id,
             member,
             encoded_key,
             page_summary.commit_object_id,
@@ -3092,8 +3171,7 @@ where
                 StateCell::Null
             }
             crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
-            crate::json_store::JsonSlot::Ref(_)
-            | crate::json_store::JsonSlot::ForkTreeObject(_) => {
+            crate::json_store::JsonSlot::ForkTreeObject(_) => {
                 return Err(corruption(
                     "state value page contains an out-of-page JSON reference",
                 ));
@@ -3102,8 +3180,7 @@ where
         let metadata = match record.metadata {
             crate::json_store::JsonSlot::None => None,
             crate::json_store::JsonSlot::Inline(value) => Some(value),
-            crate::json_store::JsonSlot::Ref(_)
-            | crate::json_store::JsonSlot::ForkTreeObject(_) => {
+            crate::json_store::JsonSlot::ForkTreeObject(_) => {
                 return Err(corruption("state value page contains out-of-page metadata"));
             }
         };
@@ -3469,6 +3546,7 @@ where
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StaleCommitSummary {
+    view_instance_id: u64,
     commit_id: CommitId,
     commit_object_id: ObjectId,
     generation: u64,
@@ -3496,11 +3574,13 @@ pub(super) async fn load_historical_commit_state_roots_for_stale<R>(
     read: &R,
     repository: &RepositoryRootV1,
     commit_id: crate::changelog::CommitId,
+    view_instance_id: u64,
     cache: &mut StaleCommitSummaryCache,
 ) -> Result<StaleCommitSummary, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
+    cache.require_view(view_instance_id)?;
     if let Some(roots) = cache.entries.get(&commit_id) {
         return Ok(roots.clone());
     }
@@ -3524,6 +3604,7 @@ where
     validate_root_on_read(commit.global_state_root, "state", read).await?;
     validate_root_on_read(commit.local_state_root, "state", read).await?;
     let summary = StaleCommitSummary {
+        view_instance_id,
         commit_id: catalog_id,
         commit_object_id: entry.commit_object_id,
         generation: commit.generation,

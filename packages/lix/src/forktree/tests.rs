@@ -461,9 +461,10 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         .expect("seed semantic member");
     let state_key = seed.state_keys[0].clone();
     let repository = view.repository_root();
-    let mut closures = super::serving::StaleMemberAuthCache::default();
+    let mut closures = super::serving::StaleMemberAuthCache::new(view.view_instance_id());
     super::serving::resolve_semantic_member_with_stale_auth(
         view.test_storage_read(),
+        view.view_instance_id(),
         &member,
         &state_key,
         seed.commit_object_id,
@@ -476,10 +477,72 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
     .await
     .expect("canonical selected leaf owner");
 
-    let mut wrong_ordinal_closures = super::serving::StaleMemberAuthCache::default();
+    let second_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open second stale selected-leaf view");
+    let mut cross_view_member_cache =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            second_view.test_storage_read(),
+            second_view.view_instance_id(),
+            &member,
+            &state_key,
+            seed.commit_object_id,
+            commit.generation,
+            0,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut cross_view_member_cache,
+        )
+        .await
+        .is_err(),
+        "a stale member cache must not cross retained-view instances"
+    );
+
+    let mut first_view_summary_cache =
+        super::serving::StaleCommitSummaryCache::new(view.view_instance_id());
+    assert!(
+        super::serving::load_historical_commit_state_roots_for_stale(
+            second_view.test_storage_read(),
+            &repository,
+            public_commit_id(0x20),
+            second_view.view_instance_id(),
+            &mut first_view_summary_cache,
+        )
+        .await
+        .is_err(),
+        "a stale summary cache must not cross retained-view instances"
+    );
+    let first_view_summary = super::serving::load_historical_commit_state_roots_for_stale(
+        view.test_storage_read(),
+        &repository,
+        public_commit_id(0x20),
+        view.view_instance_id(),
+        &mut first_view_summary_cache,
+    )
+    .await
+    .expect("authenticate first-view stale summary");
+    assert!(
+        super::serving::state_points_on_read_for_stale(
+            &repository,
+            first_view_summary,
+            second_view.view_instance_id(),
+            &[state_key.clone()],
+            true,
+            second_view.test_storage_read(),
+        )
+        .await
+        .is_err(),
+        "a stale summary from another view must reject before local-root fallback"
+    );
+
+    let mut wrong_ordinal_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
     assert!(
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
+            view.view_instance_id(),
             &member,
             &state_key,
             seed.commit_object_id,
@@ -495,10 +558,12 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
     );
 
     let empty_change_catalog = build_change_catalog(&[]).expect("empty change catalog");
-    let mut missing_catalog_closures = super::serving::StaleMemberAuthCache::default();
+    let mut missing_catalog_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
     assert!(
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
+            view.view_instance_id(),
             &member,
             &state_key,
             seed.commit_object_id,
@@ -519,10 +584,12 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         1,
         LixTimestamp::from_unix_millis_utc_lossy(1),
     );
-    let mut wrong_source_closures = super::serving::StaleMemberAuthCache::default();
+    let mut wrong_source_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
     assert!(
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
+            view.view_instance_id(),
             &selected,
             &state_key,
             content_id(0xa1),
@@ -537,10 +604,12 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         "a selected leaf with a substituted source ordinal must fail closed"
     );
 
-    let mut wrong_generation_closures = super::serving::StaleMemberAuthCache::default();
+    let mut wrong_generation_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
     assert!(
         super::serving::resolve_semantic_member_with_stale_auth(
             view.test_storage_read(),
+            view.view_instance_id(),
             &CommitMemberV1::selected(
                 member.change_id(),
                 seed.commit_object_id,
@@ -586,11 +655,13 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         .await
         .expect("open non-ancestor root-bound view");
     let non_ancestor_repository = non_ancestor_view.repository_root();
-    let mut non_ancestor_cache = super::serving::StaleCommitSummaryCache::default();
+    let mut non_ancestor_cache =
+        super::serving::StaleCommitSummaryCache::new(non_ancestor_view.view_instance_id());
     let non_ancestor_summary = super::serving::load_historical_commit_state_roots_for_stale(
         non_ancestor_view.test_storage_read(),
         &non_ancestor_repository,
         public_commit_id(0x21),
+        non_ancestor_view.view_instance_id(),
         &mut non_ancestor_cache,
     )
     .await
@@ -598,6 +669,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
     let non_ancestor_rows = super::serving::state_points_on_read_for_stale(
         &non_ancestor_repository,
         non_ancestor_summary,
+        non_ancestor_view.view_instance_id(),
         &[non_ancestor.state_keys[0].clone()],
         true,
         non_ancestor_view.test_storage_read(),
@@ -2306,7 +2378,8 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("valid repository root"),
     )
     .expect("valid repository");
-    let mut valid_cache = super::serving::StaleCommitSummaryCache::default();
+    let mut valid_cache =
+        super::serving::StaleCommitSummaryCache::new(valid_facade.view_instance_id());
     assert!(
         valid_facade
             .load_stale_commit_state_roots(
@@ -2375,7 +2448,8 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("bad catalog repository root"),
     )
     .expect("bad catalog repository");
-    let mut bad_catalog_cache = super::serving::StaleCommitSummaryCache::default();
+    let mut bad_catalog_cache =
+        super::serving::StaleCommitSummaryCache::new(bad_catalog_facade.view_instance_id());
     assert!(
         bad_catalog_facade
             .load_stale_commit_state_roots(
@@ -2418,7 +2492,8 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("bad object repository root"),
     )
     .expect("bad object repository");
-    let mut bad_object_cache = super::serving::StaleCommitSummaryCache::default();
+    let mut bad_object_cache =
+        super::serving::StaleCommitSummaryCache::new(bad_object_facade.view_instance_id());
     assert!(
         bad_object_facade
             .load_stale_commit_state_roots(
@@ -2466,7 +2541,8 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("bad root repository root"),
     )
     .expect("bad root repository");
-    let mut bad_root_cache = super::serving::StaleCommitSummaryCache::default();
+    let mut bad_root_cache =
+        super::serving::StaleCommitSummaryCache::new(bad_root_facade.view_instance_id());
     assert!(
         bad_root_facade
             .load_stale_commit_state_roots(
@@ -2510,7 +2586,8 @@ async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
             .expect("bad generation repository root"),
     )
     .expect("bad generation repository");
-    let mut bad_generation_cache = super::serving::StaleCommitSummaryCache::default();
+    let mut bad_generation_cache =
+        super::serving::StaleCommitSummaryCache::new(bad_generation_facade.view_instance_id());
     assert!(
         bad_generation_facade
             .load_stale_commit_state_roots(
@@ -2567,6 +2644,30 @@ async fn stale_equal_commit_authenticates_repository_catalog_commit_and_roots() 
             .await
             .is_err(),
         "equal endpoints must authenticate both state roots before returning empty"
+    );
+
+    let missing_local = build_seed();
+    let missing_local_storage = Memory::new();
+    seed_storage(&missing_local_storage, &missing_local).await;
+    let mut missing_local_write = StorageWriteSet::new();
+    missing_local_write.delete(
+        OBJECT_SPACE,
+        missing_local.local_state_root.as_bytes().to_vec(),
+    );
+    commit_write_set_for_test(missing_local_write, &missing_local_storage).await;
+    let missing_local_read = StorageAdapterReadScope::new(
+        missing_local_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("missing local-root equal-endpoint read"),
+    );
+    let missing_local_facade = ForkTreeReadFacade::new(missing_local_read);
+    assert!(
+        missing_local_facade
+            .stale_state_changes_between_commits(public_commit_id(0x20), public_commit_id(0x20),)
+            .await
+            .is_err(),
+        "a missing authenticated local root must not fall through to the global root"
     );
 }
 
@@ -6426,14 +6527,16 @@ async fn stale_page_prefix_authentication_rejects_earlier_corruption() {
         .begin_read(StorageReadOptions::default())
         .await
         .expect("canonical stale page read");
+    let canonical_facade = ForkTreeReadFacade::new(canonical_read);
     super::serving::validate_stale_page_position(
-        &canonical_read,
+        &canonical_facade,
+        canonical_facade.view_instance_id(),
         content_id(0xbe),
         commit_id,
         &page_ids,
         page_ids[2],
         &selected_page,
-        &mut super::serving::StaleMemberAuthCache::default(),
+        &mut super::serving::StaleMemberAuthCache::new(canonical_facade.view_instance_id()),
     )
     .await
     .expect("canonical page prefix is valid");
@@ -6464,17 +6567,19 @@ async fn stale_page_prefix_authentication_rejects_earlier_corruption() {
         .begin_read(StorageReadOptions::default())
         .await
         .expect("gap stale page read");
+    let gap_facade = ForkTreeReadFacade::new(gap_read);
     let mut gap_page_ids = page_ids.clone();
     gap_page_ids[1] = gap_id;
     assert!(
         super::serving::validate_stale_page_position(
-            &gap_read,
+            &gap_facade,
+            gap_facade.view_instance_id(),
             content_id(0xbe),
             commit_id,
             &gap_page_ids,
             page_ids[2],
             &selected_page,
-            &mut super::serving::StaleMemberAuthCache::default(),
+            &mut super::serving::StaleMemberAuthCache::new(gap_facade.view_instance_id()),
         )
         .await
         .is_err(),
@@ -6502,17 +6607,19 @@ async fn stale_page_prefix_authentication_rejects_earlier_corruption() {
         .begin_read(StorageReadOptions::default())
         .await
         .expect("wrong-commit stale page read");
+    let wrong_facade = ForkTreeReadFacade::new(wrong_read);
     let mut wrong_page_ids = page_ids;
     wrong_page_ids[1] = wrong_id;
     assert!(
         super::serving::validate_stale_page_position(
-            &wrong_read,
+            &wrong_facade,
+            wrong_facade.view_instance_id(),
             content_id(0xbe),
             commit_id,
             &wrong_page_ids,
             wrong_page_ids[2],
             &selected_page,
-            &mut super::serving::StaleMemberAuthCache::default(),
+            &mut super::serving::StaleMemberAuthCache::new(wrong_facade.view_instance_id()),
         )
         .await
         .is_err(),

@@ -955,6 +955,7 @@ where
 #[derive(Clone)]
 pub(crate) struct ForkTreeReadFacade<R> {
     read: R,
+    view_instance_id: u64,
 }
 
 /// Let snapshot-bound ForkTree serving primitives consume the operation-owned
@@ -1006,7 +1007,15 @@ where
     R: StorageAdapterRead,
 {
     pub(crate) fn new(read: R) -> Self {
-        Self { read }
+        let view_instance_id = NEXT_VIEW_INSTANCE_ID.fetch_add(1, Ordering::Relaxed).max(1);
+        Self {
+            read,
+            view_instance_id,
+        }
+    }
+
+    pub(super) fn view_instance_id(&self) -> u64 {
+        self.view_instance_id
     }
 
     pub(crate) async fn historical_state_view(
@@ -1414,7 +1423,11 @@ where
         cache: &mut super::serving::StaleCommitSummaryCache,
     ) -> Result<super::serving::StaleCommitSummary, crate::LixError> {
         super::serving::load_historical_commit_state_roots_for_stale(
-            &self.read, repository, commit_id, cache,
+            &self.read,
+            repository,
+            commit_id,
+            self.view_instance_id,
+            cache,
         )
         .await
     }
@@ -1582,7 +1595,7 @@ where
     R: StorageAdapterRead,
 {
     let repository = super::serving::load_repository_root(&view.read).await?;
-    let mut summary_cache = super::serving::StaleCommitSummaryCache::default();
+    let mut summary_cache = super::serving::StaleCommitSummaryCache::new(view.view_instance_id());
     let before_roots = view
         .load_stale_commit_state_roots(&repository, before, &mut summary_cache)
         .await?;
@@ -1628,6 +1641,7 @@ where
     let before_rows = super::serving::state_points_on_read_for_stale(
         &repository,
         before_roots,
+        view.view_instance_id(),
         &encoded,
         true,
         &view.read,
@@ -1636,6 +1650,7 @@ where
     let after_rows = super::serving::state_points_on_read_for_stale(
         &repository,
         after_roots,
+        view.view_instance_id(),
         &encoded,
         true,
         &view.read,
