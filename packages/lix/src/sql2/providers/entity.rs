@@ -23,16 +23,20 @@ use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
     entity_surface_schema,
 };
+#[cfg(test)]
+use crate::sql2::entity_batch::row_snapshot;
 use crate::sql2::entity_batch::{
     EntityExactBatchRequest, EntityExactRowRequest, EntityProjection, EntityRowSelection,
     EntityScanFilter, EntityScanRequest, EntityStateSlot, exact_forktree, exact_transaction,
-    row_snapshot, scan_slots_forktree, scan_slots_transaction, slot_snapshot,
+    scan_slots_forktree, scan_slots_transaction, slot_snapshot,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
-use crate::state::{ForkTreeStateView, StateRow, StateRowSource};
+#[cfg(test)]
+use crate::state::StateRow;
+use crate::state::{ForkTreeStateView, StateRowSource};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter, parse_row_metadata_value};
 
 use crate::sql2::{SqlChangelogQuerySource, SqlWriteContext, WriteAccess};
@@ -1998,6 +2002,7 @@ fn identity_matches_parts(
         })
 }
 
+#[cfg(test)]
 fn apply_entity_state_filters(
     rows: Vec<StateRow>,
     filters: &[EntityRowFilter],
@@ -2117,6 +2122,7 @@ fn projection_column_names(schema: &Schema) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn direct_entity_batch_eligible(
     schema: &Schema,
     request: &EntityScanRequest,
@@ -2138,6 +2144,7 @@ fn direct_entity_batch_eligible(
 /// string primary-key components stored verbatim in the current-state key.
 /// DataFusion still plans and executes every relational operator above this
 /// scan; the provider merely avoids JSON decoding to reproduce identity data.
+#[cfg(test)]
 fn direct_primary_key_projection_eligible(
     spec: &EntitySurfaceSpec,
     schema: &Schema,
@@ -2168,6 +2175,7 @@ fn visible_exact_slots(
         .collect()
 }
 
+#[cfg(test)]
 fn simple_string_primary_key_index(spec: &EntitySurfaceSpec, column_name: &str) -> Option<usize> {
     spec.primary_key_paths
         .iter()
@@ -2181,6 +2189,7 @@ fn simple_string_primary_key_index(spec: &EntitySurfaceSpec, column_name: &str) 
         })
 }
 
+#[cfg(test)]
 fn entity_record_batch_from_state_rows(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
@@ -2426,6 +2435,7 @@ fn entity_slot_system_column_array(
     Ok(array)
 }
 
+#[cfg(test)]
 fn entity_primary_key_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
@@ -2458,6 +2468,7 @@ fn entity_primary_key_record_batch(
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
 
+#[cfg(test)]
 #[expect(trivial_casts)]
 fn entity_column_array(
     spec: &EntitySurfaceSpec,
@@ -2512,6 +2523,7 @@ fn entity_column_array(
 }
 
 /// Materialize `lixcol_*` only at the Arrow boundary from native rows.
+#[cfg(test)]
 fn entity_state_system_column_array(column_name: &str, rows: &[StateRow]) -> Result<ArrayRef> {
     #[expect(trivial_casts)]
     let array = match column_name {
@@ -2656,8 +2668,6 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
 }
 
 #[cfg(test)]
-#[expect(trivial_casts)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::branch::{BranchHead, BranchRefReader};
@@ -2667,6 +2677,7 @@ mod tests {
         CanonicalBranchId, StateCell, StateKeyRef, StateValue, UntrackedValue, decode_state_key,
         encode_state_key,
     };
+    use crate::sql2::entity_batch::row_snapshot;
     use crate::state::{
         StagedStateRow, StateRow, StateRowSource, TransactionStateView, UntrackedStateRow,
     };
