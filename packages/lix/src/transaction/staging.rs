@@ -3550,6 +3550,54 @@ mod staging_semantics_tests {
         assert!(matches!(rows[0].value.cell, StateCell::Value(_)));
     }
 
+    #[tokio::test]
+    async fn native_batched_ranges_preserve_slots_order_and_staged_tombstones() {
+        let committed = empty_committed_view().await;
+        let key_a = native_key("a");
+        let key_b = native_key("b");
+        let key_c = native_key("c");
+        let view = TransactionStateView::new(
+            committed,
+            vec![
+                StagedStateRow::new(
+                    key_a.clone(),
+                    native_state_value(StateCell::Value("a".into()), 1),
+                ),
+                StagedStateRow::new(key_b.clone(), native_state_value(StateCell::Tombstone, 2)),
+                StagedStateRow::new(
+                    key_c.clone(),
+                    native_state_value(StateCell::Value("c".into()), 3),
+                ),
+            ],
+        )
+        .expect("native rows are ordered");
+        let ranges = vec![
+            (
+                key_a.clone(),
+                crate::forktree::exclusive_prefix_upper_bound(&key_a),
+            ),
+            (key_b, crate::forktree::exclusive_prefix_upper_bound(&key_c)),
+        ];
+        let visible = view
+            .branch_ranges(TEST_GLOBAL, &ranges, false)
+            .await
+            .expect("native batched ranges should resolve");
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].len(), 1);
+        assert_eq!(visible[1].len(), 1);
+        assert_eq!(visible[1][0].key, key_c);
+
+        let with_tombstones = view
+            .branch_ranges(TEST_GLOBAL, &ranges, true)
+            .await
+            .expect("tombstone-inclusive native batched ranges should resolve");
+        assert_eq!(with_tombstones[1].len(), 2);
+        assert!(matches!(
+            with_tombstones[1][0].value.cell,
+            StateCell::Tombstone
+        ));
+    }
+
     #[cfg(any())]
     #[tokio::test]
     async fn native_staged_untracked_tombstone_preserves_owner_and_masks_slot() {

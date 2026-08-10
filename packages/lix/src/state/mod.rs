@@ -307,6 +307,12 @@ where
         include_tombstones: bool,
     ) -> Result<Vec<Option<StateRow>>, LixError> {
         let branch_id = canonical_branch_id(branch_id)?;
+        if self.view.branch_id() == branch_id {
+            return self
+                .points(keys, include_tombstones)
+                .await
+                .map_err(Into::into);
+        }
         self.view
             .branch_view(branch_id)
             .await?
@@ -332,6 +338,12 @@ where
         include_tombstones: bool,
     ) -> Result<Vec<StateRow>, LixError> {
         let branch_id = canonical_branch_id(branch_id)?;
+        if self.view.branch_id() == branch_id {
+            return self
+                .range(lower, upper, limit, include_tombstones)
+                .await
+                .map_err(Into::into);
+        }
         self.view
             .branch_view(branch_id)
             .await?
@@ -339,6 +351,31 @@ where
             .await
             .map(|rows| rows.into_iter().map(StateRow::from_committed).collect())
             .map_err(LixError::from)
+    }
+
+    /// Resolves disjoint ranges from one branch through a single retained
+    /// authenticated traversal. Active-branch requests reuse this exact view;
+    /// alternate branches borrow one coherent view on the same storage read.
+    pub(crate) async fn branch_ranges(
+        &self,
+        branch_id: &str,
+        ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+        include_tombstones: bool,
+    ) -> Result<Vec<Vec<StateRow>>, LixError> {
+        let branch_id = canonical_branch_id(branch_id)?;
+        let rows = if self.view.branch_id() == branch_id {
+            self.view.ranges(ranges, include_tombstones).await?
+        } else {
+            self.view
+                .branch_view(branch_id)
+                .await?
+                .ranges(ranges, include_tombstones)
+                .await?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|rows| rows.into_iter().map(StateRow::from_committed).collect())
+            .collect())
     }
 
     /// Diffs two explicit authenticated root pairs through this retained
@@ -666,6 +703,86 @@ where
             .branch_range(branch_id, lower, upper, limit, include_tombstones)
             .await
     }
+
+    /// Resolves disjoint ranges with the transaction's ordered staged overlay.
+    /// Each range is independently merged in linear key order after one
+    /// committed ForkTree traversal.
+    pub(crate) async fn branch_ranges(
+        &self,
+        branch_id: &str,
+        ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+        include_tombstones: bool,
+    ) -> Result<Vec<Vec<StateRow>>, LixError> {
+        if !self.committed.branch_id_matches(branch_id)? {
+            return self
+                .committed
+                .branch_ranges(branch_id, ranges, include_tombstones)
+                .await;
+        }
+        let committed = self
+            .committed
+            .branch_ranges(branch_id, ranges, true)
+            .await?;
+        Ok(ranges
+            .iter()
+            .zip(committed)
+            .map(|((lower, upper), committed)| {
+                merge_staged_range(
+                    committed,
+                    &self.staged,
+                    lower,
+                    upper.as_deref(),
+                    include_tombstones,
+                )
+            })
+            .collect())
+    }
+}
+
+fn merge_staged_range(
+    committed: Vec<StateRow>,
+    staged: &[StagedStateRow],
+    lower: &[u8],
+    upper: Option<&[u8]>,
+    include_tombstones: bool,
+) -> Vec<StateRow> {
+    let mut committed_index = 0;
+    let mut staged_index = staged.partition_point(|row| row.key.as_slice() < lower);
+    let mut output = Vec::new();
+    while committed_index < committed.len() || staged_index < staged.len() {
+        let committed_key = committed.get(committed_index).map(|row| row.key.as_slice());
+        let staged_key = staged.get(staged_index).and_then(|row| {
+            (!upper.is_some_and(|upper| row.key.as_slice() >= upper)).then_some(row.key.as_slice())
+        });
+        let choice = match (committed_key, staged_key) {
+            (None, None) => break,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(committed), Some(staged)) => committed.cmp(staged),
+        };
+        let row = match choice {
+            Ordering::Less => {
+                let row = committed[committed_index].clone();
+                committed_index += 1;
+                visible_committed_row(row, include_tombstones)
+            }
+            Ordering::Equal => {
+                let row = visible_staged_row(&staged[staged_index], include_tombstones);
+                committed_index += 1;
+                staged_index += 1;
+                row
+            }
+            Ordering::Greater => {
+                let row = visible_staged_row(&staged[staged_index], include_tombstones);
+                staged_index += 1;
+                row
+            }
+        };
+        if let Some(row) = row {
+            output.push(row);
+        }
+    }
+    output
 }
 
 fn visible_committed_row(row: StateRow, include_tombstones: bool) -> Option<StateRow> {

@@ -1393,6 +1393,10 @@ where
             .await?;
             let opening_transaction_state_view =
                 TransactionStateView::new(opening_state_view.clone(), Vec::new())?;
+            // Untracked state is no longer a public or durable lane. SQL
+            // planning and tracked mutation normalization therefore consume
+            // the same authenticated schema catalog instead of compiling two
+            // synthetic visibility variants from the same retained roots.
             let sql_schema_catalog = catalog_context
                 .compiled_catalog_for_transaction_state(
                     &opening_transaction_state_view,

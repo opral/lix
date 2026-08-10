@@ -67,14 +67,6 @@ impl Domain {
         &self.file_scope
     }
 
-    pub(crate) fn with_untracked(&self, untracked: bool) -> Self {
-        Self {
-            branch_id: self.branch_id.clone(),
-            untracked,
-            file_scope: self.file_scope.clone(),
-        }
-    }
-
     pub(crate) fn with_file_scope(&self, file_scope: DomainFileScope) -> Self {
         Self {
             branch_id: self.branch_id.clone(),
@@ -119,19 +111,11 @@ impl Domain {
     }
 
     fn reachable_target_domains(&self) -> Vec<Self> {
-        if self.untracked {
-            vec![self.with_untracked(false), self.clone()]
-        } else {
-            vec![self.clone()]
-        }
+        vec![self.clone()]
     }
 
     fn source_domains_that_can_reach(&self) -> Vec<Self> {
-        if self.untracked {
-            vec![self.clone()]
-        } else {
-            vec![self.clone(), self.with_untracked(true)]
-        }
+        vec![self.clone()]
     }
 
     fn can_reach(&self, target: &Self) -> bool {
@@ -300,5 +284,19 @@ mod tests {
         assert_eq!(domains.len(), 1);
         assert_eq!(domains[0].branch_id(), "branch");
         assert!(!domains[0].untracked());
+    }
+
+    #[test]
+    fn tracked_domains_do_not_synthesize_the_removed_untracked_lane() {
+        let domain = Domain::any_file("11111111-1111-1111-1111-111111111111", false);
+        assert_eq!(domain.schema_catalog_domains(), vec![domain.clone()]);
+        assert_eq!(domain.fk_target_domains(), vec![domain.clone()]);
+        assert_eq!(domain.fk_source_domains_for_target(), vec![domain.clone()]);
+        assert_eq!(domain.file_owner_domains(), vec![domain.clone()]);
+        assert_eq!(domain.directory_parent_domains(), vec![domain.clone()]);
+        assert_eq!(
+            domain.branch_descriptor_domains_for_ref_delete(),
+            vec![domain]
+        );
     }
 }

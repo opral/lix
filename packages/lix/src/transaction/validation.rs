@@ -554,14 +554,6 @@ fn prepared_row_domain(row: PreparedValidationRow<'_>) -> Domain {
     )
 }
 
-fn prepared_row_sibling_domain(row: PreparedValidationRow<'_>) -> Domain {
-    Domain::exact_file(
-        row.branch_id().to_owned(),
-        !row.untracked(),
-        row.file_id().map(str::to_owned),
-    )
-}
-
 fn prepared_row_is_global(row: PreparedValidationRow<'_>) -> bool {
     match row {
         PreparedValidationRow::State(row) => row.global,
@@ -1191,7 +1183,7 @@ where
 {
     let mut seen = BTreeSet::new();
     let inserts = input.staged_writes.inserts().collect::<Vec<_>>();
-    let mut requests = Vec::with_capacity(inserts.len() * 2);
+    let mut requests = Vec::with_capacity(inserts.len());
     for insert in &inserts {
         let row = insert.row;
         let identity = (
@@ -1213,20 +1205,12 @@ where
             row.entity_pk,
             true,
         )?);
-        requests.push(exact_visible_request(
-            &prepared_row_sibling_domain(PreparedValidationRow::State(insert.row)),
-            row.schema_key,
-            row.entity_pk,
-            true,
-        )?);
     }
     let rows =
         batched_exact_visible_rows(input.state_view, input.active_branch_id, requests).await?;
-    for (insert, pair) in inserts.iter().zip(rows.chunks_exact(2)) {
+    for (insert, current) in inserts.iter().zip(rows.iter()) {
         let row = insert.row;
-        let current = pair[0].as_ref();
-        let sibling = pair[1].as_ref();
-        if [current, sibling].into_iter().flatten().any(|current| {
+        if current.as_ref().is_some_and(|current| {
             !current.deleted
                 && same_insert_identity(PreparedValidationRow::State(insert.row), &current)
         }) {
