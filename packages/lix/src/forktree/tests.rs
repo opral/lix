@@ -6519,3 +6519,495 @@ async fn stale_page_prefix_authentication_rejects_earlier_corruption() {
         "a wrong-commit page in the earlier prefix must reject the later selected page"
     );
 }
+
+#[derive(Clone)]
+struct ThreePageStaleFixture {
+    seed: SeedData,
+    after_commit_id: CommitId,
+    after_commit_object_id: ObjectId,
+    members: Vec<CommitMemberV1>,
+    selected_key: Vec<u8>,
+    selected_change_id: ChangeId,
+    page_ids: Vec<ObjectId>,
+}
+
+fn build_three_page_stale_fixture() -> ThreePageStaleFixture {
+    let mut seed = build_seed();
+    let entries = (0..513)
+        .map(|index| {
+            test_state_member(
+                &format!("stale-page-{index:03}"),
+                StateCellRef::Value("after"),
+                0xc1,
+                &[],
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let (rows, members, page_objects) = encode_test_state_entries(0xc1, entries);
+    let page_ids = page_objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    assert_eq!(
+        page_ids.len(),
+        3,
+        "the actual stale fixture needs three pages"
+    );
+    for (id, bytes) in page_objects {
+        seed.objects.insert(id, bytes).expect("stale page object");
+    }
+    let selected_row = rows[512].clone();
+    let selected_key = selected_row.0.clone();
+    let selected_change_id = members[512].change_id();
+    let mut local_rows = scan_all(seed.local_state_root, "state", &load_from(&seed.objects))
+        .expect("seed local state rows");
+    local_rows.push(selected_row);
+    local_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let state_tree = build_state_tree(&local_rows).expect("selected state tree");
+    let local_state_root = state_tree.root.object_id;
+    seed.objects
+        .extend(state_tree.objects)
+        .expect("selected state objects");
+
+    let after_commit_id = CommitId::from_bytes(raw_id(0xc1));
+    let after_commit = CommitObjectV1 {
+        commit_id: after_commit_id,
+        generation: 2,
+        parent_commit_object_ids: vec![seed.commit_object_id],
+        members: members.clone(),
+        member_page_object_ids: page_ids.clone(),
+        global_state_root: seed.global_state_root,
+        local_state_root,
+        metadata: b"three-page-stale".to_vec(),
+    };
+    let (after_commit_object_id, after_commit_bytes) = after_commit.encode().expect("after commit");
+    seed.objects
+        .insert(after_commit_object_id, after_commit_bytes)
+        .expect("after commit object");
+    let ref_change = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0xc2)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+        branch_id: seed.branch_id,
+        before_semantic_head_commit_object_id: Some(seed.commit_object_id),
+        after_semantic_head_commit_object_id: Some(after_commit_object_id),
+        previous_ref_change_object_id: Some(seed.ref_change_object_id),
+        payload: b"three-page-stale-ref".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (ref_object_id, ref_bytes) = ref_change.encode().expect("after ref change");
+    seed.objects
+        .insert(ref_object_id, ref_bytes)
+        .expect("after ref object");
+    let commit_entries = vec![
+        (
+            seed.commit_id,
+            CommitCatalogEntry {
+                commit_object_id: seed.commit_object_id,
+            },
+        ),
+        (
+            after_commit_id,
+            CommitCatalogEntry {
+                commit_object_id: after_commit_object_id,
+            },
+        ),
+    ];
+    let mut change_entries = seed_member_catalog_entries(&seed, seed.commit_object_id);
+    change_entries.extend(members.iter().enumerate().map(|(ordinal, member)| {
+        (
+            member.change_id(),
+            ChangeCatalogEntry {
+                owner: ChangeCatalogOwner::CommitMember {
+                    commit_object_id: after_commit_object_id,
+                    ordinal: u32::try_from(ordinal).expect("after member ordinal"),
+                },
+            },
+        )
+    }));
+    change_entries.push((
+        ref_change.change_id(),
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_object_id,
+                branch_id: seed.branch_id,
+            },
+        },
+    ));
+    replace_selected_history_graph(
+        &mut seed,
+        &commit_entries,
+        &change_entries,
+        after_commit_object_id,
+        ref_object_id,
+    );
+    ThreePageStaleFixture {
+        seed,
+        after_commit_id,
+        after_commit_object_id,
+        members,
+        selected_key,
+        selected_change_id,
+        page_ids,
+    }
+}
+
+fn rewrite_three_page_fixture(
+    fixture: &ThreePageStaleFixture,
+    page_ids: Vec<ObjectId>,
+    extra_objects: &[(ObjectId, Bytes)],
+    selected_owner: Option<ChangeCatalogEntry>,
+    ref_byte: u8,
+) -> SeedData {
+    rewrite_three_page_fixture_with_raw_commit(
+        fixture,
+        page_ids,
+        extra_objects,
+        selected_owner,
+        ref_byte,
+        None,
+    )
+}
+
+fn rewrite_three_page_fixture_with_raw_commit(
+    fixture: &ThreePageStaleFixture,
+    page_ids: Vec<ObjectId>,
+    extra_objects: &[(ObjectId, Bytes)],
+    selected_owner: Option<ChangeCatalogEntry>,
+    ref_byte: u8,
+    raw_commit: Option<(ObjectId, Bytes)>,
+) -> SeedData {
+    let mut seed = fixture.seed.clone();
+    for (id, bytes) in extra_objects {
+        seed.objects
+            .insert(*id, bytes.clone())
+            .expect("replacement page object");
+    }
+    let original = CommitObjectV1::decode(
+        fixture.after_commit_object_id,
+        seed.objects
+            .get(fixture.after_commit_object_id)
+            .expect("original after commit"),
+    )
+    .expect("decode original after commit");
+    let (rewritten_object_id, rewritten_bytes) = raw_commit.unwrap_or_else(|| {
+        let rewritten = CommitObjectV1 {
+            commit_id: original.commit_id,
+            generation: original.generation,
+            parent_commit_object_ids: original.parent_commit_object_ids,
+            members: Vec::new(),
+            member_page_object_ids: page_ids,
+            global_state_root: original.global_state_root,
+            local_state_root: original.local_state_root,
+            metadata: original.metadata,
+        };
+        rewritten.encode().expect("rewrite commit")
+    });
+    seed.objects
+        .insert(rewritten_object_id, rewritten_bytes)
+        .expect("rewritten commit object");
+    let ref_change = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(ref_byte)),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(i64::from(ref_byte)),
+        branch_id: seed.branch_id,
+        before_semantic_head_commit_object_id: Some(seed.commit_object_id),
+        after_semantic_head_commit_object_id: Some(rewritten_object_id),
+        previous_ref_change_object_id: Some(seed.ref_change_object_id),
+        payload: b"rewritten-stale-ref".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (ref_object_id, ref_bytes) = ref_change.encode().expect("rewritten ref");
+    seed.objects
+        .insert(ref_object_id, ref_bytes)
+        .expect("rewritten ref object");
+    let commit_entries = vec![
+        (
+            seed.commit_id,
+            CommitCatalogEntry {
+                commit_object_id: seed.commit_object_id,
+            },
+        ),
+        (
+            fixture.after_commit_id,
+            CommitCatalogEntry {
+                commit_object_id: rewritten_object_id,
+            },
+        ),
+    ];
+    let mut change_entries = seed_member_catalog_entries(&seed, seed.commit_object_id);
+    change_entries.extend(fixture.members.iter().enumerate().map(|(ordinal, member)| {
+        let owner = if member.change_id() == fixture.selected_change_id {
+            selected_owner
+                .clone()
+                .unwrap_or_else(|| ChangeCatalogEntry {
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id: rewritten_object_id,
+                        ordinal: u32::try_from(ordinal).expect("rewritten member ordinal"),
+                    },
+                })
+        } else {
+            ChangeCatalogEntry {
+                owner: ChangeCatalogOwner::CommitMember {
+                    commit_object_id: rewritten_object_id,
+                    ordinal: u32::try_from(ordinal).expect("rewritten member ordinal"),
+                },
+            }
+        };
+        (member.change_id(), owner)
+    }));
+    change_entries.push((
+        ref_change.change_id(),
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_object_id,
+                branch_id: seed.branch_id,
+            },
+        },
+    ));
+    replace_selected_history_graph(
+        &mut seed,
+        &commit_entries,
+        &change_entries,
+        rewritten_object_id,
+        ref_object_id,
+    );
+    seed
+}
+
+async fn run_stale_reconciliation_fixture(
+    seed: &SeedData,
+    after_commit_id: CommitId,
+) -> Result<super::view::StaleStateChanges, crate::LixError> {
+    let storage = Memory::new();
+    seed_storage(&storage, seed).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("stale reconciliation read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    facade
+        .stale_state_changes_between_commits(
+            public_commit_id(0x20),
+            public_commit_id(after_commit_id.as_bytes()[0]),
+        )
+        .await
+}
+
+fn encode_duplicate_page_commit(
+    fixture: &ThreePageStaleFixture,
+    page_ids: &[ObjectId],
+) -> (ObjectId, Bytes) {
+    super::object::encode_object(super::object::ObjectDomain::Commit, |encoder| {
+        encoder.fixed(fixture.after_commit_id.as_bytes());
+        encoder.u64(2);
+        encoder.u32(1);
+        super::object::encode_id(encoder, fixture.seed.commit_object_id);
+        encoder.u32(u32::try_from(page_ids.len()).expect("duplicate page vector length"));
+        for page_id in page_ids {
+            super::object::encode_id(encoder, *page_id);
+        }
+        super::object::encode_id(encoder, fixture.seed.global_state_root);
+        super::object::encode_id(encoder, fixture.seed.local_state_root);
+        encoder.bytes(b"malformed-duplicate-page-vector")
+    })
+    .expect("malformed duplicate-page commit encoding")
+}
+
+#[tokio::test]
+async fn stale_reconciliation_authenticates_three_page_prefix_after_reopen() {
+    let fixture = build_three_page_stale_fixture();
+    let result = run_stale_reconciliation_fixture(&fixture.seed, fixture.after_commit_id)
+        .await
+        .expect("unequal-endpoint stale reconciliation should resolve the selected later page");
+    assert_eq!(result.identities.len(), 1);
+    assert_eq!(
+        result.identities[0].key,
+        super::decode_state_key(&fixture.selected_key).expect("selected key decodes")
+    );
+    assert_eq!(
+        result.identities[0]
+            .after
+            .as_ref()
+            .expect("selected identity has an after row")
+            .change_id,
+        crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+            *fixture.selected_change_id.as_bytes(),
+        ))
+    );
+
+    let storage = CrashStorage::new();
+    seed_storage(&storage, &fixture.seed).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("pre-reopen stale read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    facade
+        .stale_state_changes_between_commits(
+            public_commit_id(0x20),
+            public_commit_id(fixture.after_commit_id.as_bytes()[0]),
+        )
+        .await
+        .expect("pre-reopen stale reconciliation");
+    let reopened = storage.reopen();
+    let read = StorageAdapterReadScope::new(
+        reopened
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("cold-reopen stale read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    let reopened_result = facade
+        .stale_state_changes_between_commits(
+            public_commit_id(0x20),
+            public_commit_id(fixture.after_commit_id.as_bytes()[0]),
+        )
+        .await
+        .expect("cold reopen must preserve actual stale reconciliation");
+    assert_eq!(reopened_result.identities.len(), 1);
+
+    // The remaining assertions deliberately exercise the public stale
+    // reconciliation caller with unequal endpoints.  They must not be
+    // reduced to direct calls to validate_stale_page_position: the caller
+    // authenticates the selected CommitCatalog/ChangeCatalog owner and the
+    // endpoint roots before resolving the selected page prefix.
+    let second_page = CommitChangePageV2::decode(
+        fixture.page_ids[1],
+        fixture
+            .seed
+            .objects
+            .get(fixture.page_ids[1])
+            .expect("fixture second page"),
+    )
+    .expect("fixture second page decodes");
+
+    let mut gap_page = second_page.clone();
+    gap_page.start_ordinal = gap_page.start_ordinal.checked_add(1).expect("gap ordinal");
+    let (gap_id, gap_bytes) = gap_page.encode().expect("gap page encodes");
+    let mut gap_page_ids = fixture.page_ids.clone();
+    gap_page_ids[1] = gap_id;
+    let gap_seed =
+        rewrite_three_page_fixture(&fixture, gap_page_ids, &[(gap_id, gap_bytes)], None, 0xd1);
+    assert!(
+        run_stale_reconciliation_fixture(&gap_seed, fixture.after_commit_id)
+            .await
+            .is_err(),
+        "the actual stale caller rejects an earlier hidden page-prefix gap"
+    );
+
+    let mut wrong_commit_page = second_page.clone();
+    wrong_commit_page.commit_id = CommitId::from_bytes(raw_id(0xd2));
+    let (wrong_id, wrong_bytes) = wrong_commit_page
+        .encode()
+        .expect("wrong-commit page encodes");
+    let mut wrong_page_ids = fixture.page_ids.clone();
+    wrong_page_ids[1] = wrong_id;
+    let wrong_seed = rewrite_three_page_fixture(
+        &fixture,
+        wrong_page_ids,
+        &[(wrong_id, wrong_bytes)],
+        None,
+        0xd3,
+    );
+    assert!(
+        run_stale_reconciliation_fixture(&wrong_seed, fixture.after_commit_id)
+            .await
+            .is_err(),
+        "the actual stale caller rejects a wrong-commit hidden prefix page"
+    );
+
+    let mut missing_seed =
+        rewrite_three_page_fixture(&fixture, fixture.page_ids.clone(), &[], None, 0xd4);
+    missing_seed.objects.remove(fixture.page_ids[1]);
+    assert!(
+        run_stale_reconciliation_fixture(&missing_seed, fixture.after_commit_id)
+            .await
+            .is_err(),
+        "the actual stale caller rejects a missing selected-prefix page"
+    );
+
+    let mut malformed_seed =
+        rewrite_three_page_fixture(&fixture, fixture.page_ids.clone(), &[], None, 0xd7);
+    malformed_seed.objects.remove(fixture.page_ids[1]);
+    malformed_seed
+        .objects
+        .insert(fixture.page_ids[1], Bytes::from_static(b"malformed-page"))
+        .expect("malformed page replacement");
+    assert!(
+        run_stale_reconciliation_fixture(&malformed_seed, fixture.after_commit_id)
+            .await
+            .is_err(),
+        "the actual stale caller rejects a malformed selected-prefix page"
+    );
+
+    let duplicate_page_ids = vec![
+        fixture.page_ids[0],
+        fixture.page_ids[0],
+        fixture.page_ids[2],
+    ];
+    let duplicate_commit = encode_duplicate_page_commit(&fixture, &duplicate_page_ids);
+    let duplicate_seed = rewrite_three_page_fixture_with_raw_commit(
+        &fixture,
+        duplicate_page_ids,
+        &[],
+        None,
+        0xd8,
+        Some(duplicate_commit),
+    );
+    assert!(
+        run_stale_reconciliation_fixture(&duplicate_seed, fixture.after_commit_id)
+            .await
+            .is_err(),
+        "the actual stale caller rejects a duplicate page vector"
+    );
+
+    let wrong_owner_seed = rewrite_three_page_fixture(
+        &fixture,
+        fixture.page_ids.clone(),
+        &[],
+        Some(ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::CommitMember {
+                commit_object_id: fixture.seed.commit_object_id,
+                ordinal: 0,
+            },
+        }),
+        0xd5,
+    );
+    assert!(
+        run_stale_reconciliation_fixture(&wrong_owner_seed, fixture.after_commit_id)
+            .await
+            .is_err(),
+        "the actual stale caller rejects a selected member with a substituted owner"
+    );
+
+    let branch_owner_seed = rewrite_three_page_fixture(
+        &fixture,
+        fixture.page_ids.clone(),
+        &[],
+        Some(ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: fixture.seed.ref_change_object_id,
+                branch_id: fixture.seed.branch_id,
+            },
+        }),
+        0xd6,
+    );
+    assert!(
+        run_stale_reconciliation_fixture(&branch_owner_seed, fixture.after_commit_id)
+            .await
+            .is_err(),
+        "the actual stale caller rejects a selected member substituted with a branch ref"
+    );
+
+    let mut missing_root_seed = fixture.seed.clone();
+    missing_root_seed
+        .objects
+        .remove(missing_root_seed.repository_root_id);
+    assert!(
+        run_stale_reconciliation_fixture(&missing_root_seed, fixture.after_commit_id)
+            .await
+            .is_err(),
+        "the actual stale caller rejects a missing selector/root binding"
+    );
+}
