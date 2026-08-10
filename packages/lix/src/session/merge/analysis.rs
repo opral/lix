@@ -205,23 +205,35 @@ where
                     format!("merge state row lost change payload '{}'", state.change_id),
                 )
             })?;
-            let snapshot = match &state.cell {
-                crate::forktree::StateCell::Tombstone => crate::json_store::JsonSlot::None,
-                crate::forktree::StateCell::Null => crate::json_store::JsonSlot::from_json("null"),
-                crate::forktree::StateCell::Value(value) => {
-                    crate::json_store::JsonSlot::from_json(value)
+            // ForkTree change payloads own their canonical JSON inline, while
+            // `JsonSlot::from_json` selects the retired side-plane `Ref` shape
+            // for values larger than the legacy inline threshold. Authenticate
+            // the canonical bytes and lifecycle directly instead of comparing
+            // those two storage representations.
+            let snapshot_matches = match (&record.snapshot, &state.cell) {
+                (crate::json_store::JsonSlot::None, crate::forktree::StateCell::Tombstone) => true,
+                (crate::json_store::JsonSlot::Inline(value), crate::forktree::StateCell::Null) => {
+                    value.as_ref() == "null"
                 }
+                (
+                    crate::json_store::JsonSlot::Inline(expected),
+                    crate::forktree::StateCell::Value(actual),
+                ) => expected.as_ref() == actual.as_str(),
+                _ => false,
             };
-            let metadata = state.metadata.as_deref().map_or(
-                crate::json_store::JsonSlot::None,
-                crate::json_store::JsonSlot::from_json,
-            );
+            let metadata_matches = match (&record.metadata, state.metadata.as_deref()) {
+                (crate::json_store::JsonSlot::None, None) => true,
+                (crate::json_store::JsonSlot::Inline(expected), Some(actual)) => {
+                    expected.as_ref() == actual
+                }
+                _ => false,
+            };
             if record.schema_key != entry.key.schema_key
                 || record.file_id != entry.key.file_id
                 || record.entity_pk != entry.key.entity_pk
                 || record.created_at != state.created_at
-                || record.snapshot != snapshot
-                || record.metadata != metadata
+                || !snapshot_matches
+                || !metadata_matches
             {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,

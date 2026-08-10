@@ -353,16 +353,20 @@ impl PluginRegistry {
         Self::from_optional_value(Some(value))
     }
 
-    pub(crate) fn from_optional_state_row(
+    pub(crate) fn from_required_state_row(
         row: Option<&StateRow>,
         branch_id: &str,
     ) -> Result<Self, LixError> {
         let Some(row) = row else {
-            return Ok(Self::empty());
+            return Err(invalid_registry(format!(
+                "authenticated plugin registry is missing for branch '{branch_id}'"
+            )));
         };
         validate_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id)?;
-        if row.value.cell.deleted() || state_snapshot_content(row).is_none() {
-            return Ok(Self::empty());
+        if !matches!(row.value.cell, crate::forktree::StateCell::Value(_)) {
+            return Err(invalid_registry(format!(
+                "authenticated plugin registry is not a value for branch '{branch_id}'"
+            )));
         }
         let snapshot = parse_snapshot_content(row, "plugin registry")?;
         Self::from_optional_snapshot(Some(&snapshot))
@@ -1099,11 +1103,7 @@ fn validate_state_identity(
         || state_key.entity_pk.as_single_string().ok() != Some(key)
         || state_key.file_id.as_deref() != expected_file_id
         || branch_id.is_empty()
-        || !matches!(
-            (expected_file_id, row.source),
-            (Some(_), crate::state::StateRowSource::Branch)
-                | (None, crate::state::StateRowSource::Global)
-        )
+        || row.source != crate::state::StateRowSource::Branch
     {
         return Err(invalid_registry(format!(
             "reserved plugin row '{key}' has invalid tracked branch-local storage identity"
@@ -1162,6 +1162,7 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Arc;
 
+    use crate::changelog::ChangeId;
     use serde_json::{Value as JsonValue, json};
 
     use super::*;
@@ -1435,6 +1436,56 @@ mod tests {
             registry_row.entity_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_REGISTRY_KEY
         );
+    }
+
+    #[test]
+    fn registry_state_identity_is_branch_local_and_never_global() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let snapshot = PluginRegistry::empty().to_snapshot().unwrap().to_string();
+        let timestamp = crate::common::LixTimestamp::expect_parse(
+            "plugin registry test timestamp",
+            "2026-08-10T00:00:00Z",
+        );
+        let row = StateRow {
+            key: crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                schema_key: KEY_VALUE_SCHEMA_KEY,
+                file_id: None,
+                entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
+            }),
+            value: crate::forktree::StateValue {
+                change_id: ChangeId::new(uuid::Uuid::from_u128(1)),
+                commit_id: CommitId::new(uuid::Uuid::from_u128(2)),
+                created_at: timestamp,
+                updated_at: timestamp,
+                cell: crate::forktree::StateCell::Value(snapshot.into()),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source: crate::state::StateRowSource::Branch,
+        };
+        assert_eq!(
+            PluginRegistry::from_required_state_row(Some(&row), branch_id).unwrap(),
+            PluginRegistry::empty()
+        );
+
+        let error = PluginRegistry::from_required_state_row(
+            Some(&StateRow {
+                source: crate::state::StateRowSource::Global,
+                ..row
+            }),
+            branch_id,
+        )
+        .expect_err("global state must not impersonate a branch plugin registry");
+        assert!(
+            error
+                .message
+                .contains("tracked branch-local storage identity")
+        );
+
+        let error = PluginRegistry::from_required_state_row(None, branch_id)
+            .expect_err("missing registry must not become implicit empty authority");
+        assert!(error.message.contains("registry is missing"));
     }
 
     #[test]
