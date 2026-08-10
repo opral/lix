@@ -90,6 +90,42 @@ fn branch_ref_timestamp_is_authenticated_and_round_trips() {
     assert_ne!(first_id, second_id);
 }
 
+#[test]
+fn stale_state_key_merge_uses_encoded_order_and_deduplicates_overlay_keys() {
+    // StateKey's derived order places file_id before entity_pk, whereas the
+    // authenticated wire key is schema, entity_pk, file_id.  This pair makes
+    // those orders disagree, and the common key appears from both roots.
+    let file_first = StateKey {
+        schema_key: "app.row".to_owned(),
+        file_id: Some("a-file".to_owned()),
+        entity_pk: EntityPk::single("z-entity"),
+    };
+    let entity_first = StateKey {
+        schema_key: "app.row".to_owned(),
+        file_id: Some("z-file".to_owned()),
+        entity_pk: EntityPk::single("a-entity"),
+    };
+    let merged = super::view::merge_sorted_state_keys(
+        vec![file_first.clone()],
+        vec![
+            entity_first.clone(),
+            entity_first.clone(),
+            file_first.clone(),
+        ],
+    );
+    assert_eq!(merged.len(), 2, "one visible row per canonical key");
+    assert_eq!(
+        merged[0], entity_first,
+        "canonical encoded order is preserved"
+    );
+    assert_eq!(merged[1], file_first);
+    assert_eq!(
+        merged.iter().take(1).count(),
+        1,
+        "LIMIT 1 sees the first canonical row"
+    );
+}
+
 async fn commit_publication_for_test<S>(
     publication: PreparedPublication,
     storage: &S,
@@ -402,6 +438,320 @@ async fn selected_member_batch_proof_rejects_wrong_view_owner_ordinal_generation
     );
 
     assert_eq!(valid.source_commit.generation, 1);
+}
+
+#[tokio::test]
+async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open stale selected-leaf view");
+    let commit = CommitObjectV1::decode(
+        seed.commit_object_id,
+        seed.objects
+            .get(seed.commit_object_id)
+            .expect("seed commit"),
+    )
+    .expect("decode seed commit");
+    let seed_members = seed_commit_members(&seed);
+    let repository = view.repository_root();
+    let mut shadowed_cache = super::serving::StaleMemberAuthCache::new(view.view_instance_id());
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            view.view_instance_id(),
+            &seed_members[0],
+            &seed.state_keys[0],
+            seed.commit_object_id,
+            commit.generation,
+            0,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut shadowed_cache,
+        )
+        .await
+        .is_err(),
+        "a local row with a different ChangeId must not fall through to the global root"
+    );
+    let member = seed_members[2].clone();
+    let state_key = seed.state_keys[2].clone();
+    let mut closures = super::serving::StaleMemberAuthCache::new(view.view_instance_id());
+    super::serving::resolve_semantic_member_with_stale_auth(
+        view.test_storage_read(),
+        view.view_instance_id(),
+        &member,
+        &state_key,
+        seed.commit_object_id,
+        commit.generation,
+        2,
+        repository.commit_catalog_root,
+        repository.change_catalog_root,
+        &mut closures,
+    )
+    .await
+    .expect("canonical selected leaf owner");
+
+    let mut wrong_ordinal_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            view.view_instance_id(),
+            &member,
+            &state_key,
+            seed.commit_object_id,
+            commit.generation,
+            1,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut wrong_ordinal_closures,
+        )
+        .await
+        .is_err(),
+        "a content-valid member at the wrong target ordinal must fail closed"
+    );
+
+    let empty_change_catalog = build_change_catalog(&[]).expect("empty change catalog");
+    let mut missing_catalog_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            view.view_instance_id(),
+            &member,
+            &state_key,
+            seed.commit_object_id,
+            commit.generation,
+            0,
+            repository.commit_catalog_root,
+            empty_change_catalog.root.object_id,
+            &mut missing_catalog_closures,
+        )
+        .await
+        .is_err(),
+        "a selected leaf without a ChangeCatalog back-edge must fail closed"
+    );
+
+    let selected = CommitMemberV1::selected(
+        member.change_id(),
+        seed.commit_object_id,
+        1,
+        LixTimestamp::from_unix_millis_utc_lossy(1),
+    );
+    let mut wrong_source_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            view.view_instance_id(),
+            &selected,
+            &state_key,
+            content_id(0xa1),
+            2,
+            0,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut wrong_source_closures,
+        )
+        .await
+        .is_err(),
+        "a selected leaf with a substituted source ordinal must fail closed"
+    );
+
+    let mut wrong_generation_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            view.view_instance_id(),
+            &CommitMemberV1::selected(
+                member.change_id(),
+                seed.commit_object_id,
+                0,
+                LixTimestamp::from_unix_millis_utc_lossy(1),
+            ),
+            &state_key,
+            content_id(0xa1),
+            1,
+            0,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut wrong_generation_closures,
+        )
+        .await
+        .is_err(),
+        "a selected source at the target generation must fail closed"
+    );
+
+    // A merge may legitimately select a page from a non-ancestor source
+    // commit.  The endpoint's authenticated roots plus the page's catalog
+    // membership are the required proof; serial ancestry is not.
+    let mut non_ancestor = build_seed();
+    let global_state_root = non_ancestor.global_state_root;
+    let local_state_root = non_ancestor.local_state_root;
+    let (non_ancestor_id, non_ancestor_object_id) = insert_graph_commit_with_roots(
+        &mut non_ancestor,
+        0x21,
+        2,
+        Vec::new(),
+        global_state_root,
+        local_state_root,
+    );
+    install_graph_head(
+        &mut non_ancestor,
+        &[(non_ancestor_id, non_ancestor_object_id)],
+        non_ancestor_object_id,
+        0x22,
+    );
+    let non_ancestor_storage = Memory::new();
+    seed_storage(&non_ancestor_storage, &non_ancestor).await;
+    let non_ancestor_view = open_coherent_view(&non_ancestor_storage, non_ancestor.branch_id)
+        .await
+        .expect("open non-ancestor root-bound view");
+    let non_ancestor_repository = non_ancestor_view.repository_root();
+    let mut non_ancestor_cache =
+        super::serving::StaleCommitSummaryCache::new(non_ancestor_view.view_instance_id());
+    let non_ancestor_summary = super::serving::load_historical_commit_state_roots_for_stale(
+        non_ancestor_view.test_storage_read(),
+        non_ancestor_view.view_instance_id(),
+        &non_ancestor_repository,
+        public_commit_id(0x21),
+        &mut non_ancestor_cache,
+    )
+    .await
+    .expect("authenticate non-ancestor endpoint summary");
+    let non_ancestor_rows = super::serving::state_points_on_read_for_stale(
+        &non_ancestor_repository,
+        non_ancestor_summary,
+        &[non_ancestor.state_keys[0].clone()],
+        true,
+        non_ancestor_view.view_instance_id(),
+        non_ancestor_view.test_storage_read(),
+    )
+    .await
+    .expect("root-bound non-ancestor page is valid");
+    assert!(
+        non_ancestor_rows[0].is_some(),
+        "root-bound non-ancestor page must remain readable without serial ancestry"
+    );
+}
+
+fn four_page_stale_fixture() -> (
+    CommitId,
+    Vec<(ObjectId, Bytes)>,
+    Vec<ObjectId>,
+    Vec<CommitChangePageV2>,
+) {
+    let commit_id = CommitId::from_bytes(raw_id(0xd0));
+    let members = (0..769).map(zero_edge_page_member).collect::<Vec<_>>();
+    let pages =
+        CommitChangePageV2::encode_pages(commit_id, &members).expect("four-page stale fixture");
+    let page_ids = pages.objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let decoded = pages
+        .objects
+        .iter()
+        .map(|(id, bytes)| CommitChangePageV2::decode(*id, bytes).expect("fixture page"))
+        .collect::<Vec<_>>();
+    (commit_id, pages.objects, page_ids, decoded)
+}
+
+async fn validate_four_page_stale_fixture(
+    commit_id: CommitId,
+    objects: Vec<(ObjectId, Bytes)>,
+    page_ids: Vec<ObjectId>,
+    selected_page_object_id: ObjectId,
+    selected_page: &CommitChangePageV2,
+) -> Result<(), StorageError> {
+    let storage = Memory::new();
+    let mut writes = StorageWriteSet::new();
+    for (object_id, bytes) in objects {
+        writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(writes, &storage).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("four-page stale read"),
+    );
+    let binding_id = 1;
+    let mut cache = super::serving::StaleMemberAuthCache::new(binding_id);
+    super::serving::validate_stale_page_position(
+        &read,
+        binding_id,
+        content_id(0xd1),
+        commit_id,
+        &page_ids,
+        selected_page_object_id,
+        selected_page,
+        &mut cache,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn stale_page_prefix_gap_before_selected_page_fails_closed() {
+    let (commit_id, mut objects, page_ids, pages) = four_page_stale_fixture();
+    let mut middle = pages[1].clone();
+    middle.start_ordinal += 1;
+    let (middle_id, middle_bytes) = middle.encode().expect("gapped middle page");
+    let mut selected = pages[3].clone();
+    selected.start_ordinal += 1;
+    let (selected_id, selected_bytes) = selected.encode().expect("shifted selected page");
+    objects.push((middle_id, middle_bytes));
+    objects.push((selected_id, selected_bytes));
+    let page_ids = vec![page_ids[0], middle_id, page_ids[2], selected_id];
+    assert!(
+        validate_four_page_stale_fixture(commit_id, objects, page_ids, selected_id, &selected,)
+            .await
+            .is_err(),
+        "a gap hidden before the selected page must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn stale_page_prefix_wrong_commit_fails_closed() {
+    let (commit_id, mut objects, page_ids, pages) = four_page_stale_fixture();
+    let mut wrong_first = pages[0].clone();
+    wrong_first.commit_id = CommitId::from_bytes(raw_id(0xd2));
+    let (wrong_first_id, wrong_first_bytes) = wrong_first.encode().expect("wrong first page");
+    objects.push((wrong_first_id, wrong_first_bytes));
+    let page_ids = vec![wrong_first_id, page_ids[1], page_ids[2], page_ids[3]];
+    let selected_page_object_id = page_ids[3];
+    assert!(
+        validate_four_page_stale_fixture(
+            commit_id,
+            objects,
+            page_ids,
+            selected_page_object_id,
+            &pages[3],
+        )
+        .await
+        .is_err(),
+        "a wrong-commit prefix page must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn stale_page_prefix_missing_page_fails_closed() {
+    let (commit_id, objects, page_ids, pages) = four_page_stale_fixture();
+    let missing_id = content_id(0xd3);
+    let page_ids = vec![page_ids[0], missing_id, page_ids[2], page_ids[3]];
+    let selected_page_object_id = page_ids[3];
+    assert!(
+        validate_four_page_stale_fixture(
+            commit_id,
+            objects,
+            page_ids,
+            selected_page_object_id,
+            &pages[3],
+        )
+        .await
+        .is_err(),
+        "a missing prefix page must fail closed"
+    );
 }
 
 #[tokio::test]
@@ -951,6 +1301,24 @@ fn insert_graph_commit(
     generation: u64,
     parent_commit_object_ids: Vec<ObjectId>,
 ) -> (CommitId, ObjectId) {
+    insert_graph_commit_with_roots(
+        seed,
+        byte,
+        generation,
+        parent_commit_object_ids,
+        seed.global_state_root,
+        seed.local_state_root,
+    )
+}
+
+fn insert_graph_commit_with_roots(
+    seed: &mut SeedData,
+    byte: u8,
+    generation: u64,
+    parent_commit_object_ids: Vec<ObjectId>,
+    global_state_root: ObjectId,
+    local_state_root: ObjectId,
+) -> (CommitId, ObjectId) {
     let commit_id = CommitId::from_bytes(raw_id(byte));
     let commit = CommitObjectV1 {
         commit_id,
@@ -958,8 +1326,8 @@ fn insert_graph_commit(
         parent_commit_object_ids,
         members: Vec::new(),
         member_page_object_ids: Vec::new(),
-        global_state_root: seed.global_state_root,
-        local_state_root: seed.local_state_root,
+        global_state_root,
+        local_state_root,
         metadata: format!("graph-{byte:02x}").into_bytes(),
     };
     let (object_id, bytes) = commit.encode().expect("graph commit");
@@ -2050,6 +2418,257 @@ async fn historical_missing_state_root_fails_before_empty_result() {
             .await
             .is_err(),
         "branch-root diff must reject a missing authenticated root before equality pruning"
+    );
+}
+
+#[tokio::test]
+async fn stale_commit_summary_authenticates_only_required_envelope_edges() {
+    let mut valid = build_seed();
+    let valid_parent_object_id = valid.commit_object_id;
+    let (valid_child_id, valid_child_object_id) =
+        insert_graph_commit(&mut valid, 0x90, 2, vec![valid_parent_object_id]);
+    install_graph_head(
+        &mut valid,
+        &[(valid_child_id, valid_child_object_id)],
+        valid_child_object_id,
+        0x91,
+    );
+    let valid_storage = Memory::new();
+    seed_storage(&valid_storage, &valid).await;
+    let valid_read = StorageAdapterReadScope::new(
+        valid_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("valid summary read"),
+    );
+    let valid_facade = ForkTreeReadFacade::new(valid_read);
+    let valid_repository = RepositoryRootV1::decode(
+        valid.repository_root_id,
+        valid
+            .objects
+            .get(valid.repository_root_id)
+            .expect("valid repository root"),
+    )
+    .expect("valid repository");
+    let mut valid_cache = super::serving::StaleCommitSummaryCache::new(valid_facade.operation_id());
+    assert!(
+        valid_facade
+            .load_stale_commit_state_roots(
+                &valid_repository,
+                public_commit_id(0x90),
+                &mut valid_cache,
+            )
+            .await
+            .is_ok(),
+        "a valid catalog/object/root/generation envelope must authenticate"
+    );
+
+    let mut bad_catalog = build_seed();
+    let bad_catalog_parent_object_id = bad_catalog.commit_object_id;
+    let (bad_catalog_child_id, bad_catalog_child_object_id) = insert_graph_commit(
+        &mut bad_catalog,
+        0x92,
+        2,
+        vec![bad_catalog_parent_object_id],
+    );
+    install_graph_head(
+        &mut bad_catalog,
+        &[(bad_catalog_child_id, bad_catalog_child_object_id)],
+        bad_catalog_child_object_id,
+        0x93,
+    );
+    let catalog_changes = seed_member_catalog_entries(&bad_catalog, bad_catalog.commit_object_id);
+    let bad_catalog_commit_id = bad_catalog.commit_id;
+    let bad_catalog_commit_object_id = bad_catalog.commit_object_id;
+    let bad_catalog_orphan_object_id = bad_catalog.orphan_object_id;
+    let bad_catalog_ref_change_object_id = bad_catalog.ref_change_object_id;
+    replace_selected_history_graph(
+        &mut bad_catalog,
+        &[
+            (
+                bad_catalog_commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: bad_catalog_commit_object_id,
+                },
+            ),
+            (
+                bad_catalog_child_id,
+                CommitCatalogEntry {
+                    commit_object_id: bad_catalog_orphan_object_id,
+                },
+            ),
+        ],
+        &catalog_changes,
+        bad_catalog_child_object_id,
+        bad_catalog_ref_change_object_id,
+    );
+    let bad_catalog_storage = Memory::new();
+    seed_storage(&bad_catalog_storage, &bad_catalog).await;
+    let bad_catalog_read = StorageAdapterReadScope::new(
+        bad_catalog_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("bad catalog summary read"),
+    );
+    let bad_catalog_facade = ForkTreeReadFacade::new(bad_catalog_read);
+    let bad_catalog_repository = RepositoryRootV1::decode(
+        bad_catalog.repository_root_id,
+        bad_catalog
+            .objects
+            .get(bad_catalog.repository_root_id)
+            .expect("bad catalog repository root"),
+    )
+    .expect("bad catalog repository");
+    let mut bad_catalog_cache =
+        super::serving::StaleCommitSummaryCache::new(bad_catalog_facade.operation_id());
+    assert!(
+        bad_catalog_facade
+            .load_stale_commit_state_roots(
+                &bad_catalog_repository,
+                public_commit_id(0x92),
+                &mut bad_catalog_cache,
+            )
+            .await
+            .is_err(),
+        "a catalog entry substituted with a non-Commit object must fail closed"
+    );
+
+    let mut bad_object = build_seed();
+    let bad_object_parent_object_id = bad_object.commit_object_id;
+    let (bad_object_child_id, bad_object_child_object_id) =
+        insert_graph_commit(&mut bad_object, 0x94, 2, vec![bad_object_parent_object_id]);
+    install_graph_head(
+        &mut bad_object,
+        &[(bad_object_child_id, bad_object_child_object_id)],
+        bad_object_child_object_id,
+        0x95,
+    );
+    let bad_object_storage = Memory::new();
+    seed_storage(&bad_object_storage, &bad_object).await;
+    let mut bad_object_write = StorageWriteSet::new();
+    bad_object_write.delete(OBJECT_SPACE, bad_object_child_object_id.as_bytes().to_vec());
+    commit_write_set_for_test(bad_object_write, &bad_object_storage).await;
+    let bad_object_read = StorageAdapterReadScope::new(
+        bad_object_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("bad object summary read"),
+    );
+    let bad_object_facade = ForkTreeReadFacade::new(bad_object_read);
+    let bad_object_repository = RepositoryRootV1::decode(
+        bad_object.repository_root_id,
+        bad_object
+            .objects
+            .get(bad_object.repository_root_id)
+            .expect("bad object repository root"),
+    )
+    .expect("bad object repository");
+    let mut bad_object_cache =
+        super::serving::StaleCommitSummaryCache::new(bad_object_facade.operation_id());
+    assert!(
+        bad_object_facade
+            .load_stale_commit_state_roots(
+                &bad_object_repository,
+                public_commit_id(0x94),
+                &mut bad_object_cache,
+            )
+            .await
+            .is_err(),
+        "a missing Commit object must fail closed before stale classification"
+    );
+
+    let mut bad_root = build_seed();
+    let bad_root_parent_object_id = bad_root.commit_object_id;
+    let bad_root_object_id = bad_root.orphan_object_id;
+    let bad_root_local_state_root = bad_root.local_state_root;
+    let (bad_root_child_id, bad_root_child_object_id) = insert_graph_commit_with_roots(
+        &mut bad_root,
+        0x96,
+        2,
+        vec![bad_root_parent_object_id],
+        bad_root_object_id,
+        bad_root_local_state_root,
+    );
+    install_graph_head(
+        &mut bad_root,
+        &[(bad_root_child_id, bad_root_child_object_id)],
+        bad_root_child_object_id,
+        0x97,
+    );
+    let bad_root_storage = Memory::new();
+    seed_storage(&bad_root_storage, &bad_root).await;
+    let bad_root_read = StorageAdapterReadScope::new(
+        bad_root_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("bad root summary read"),
+    );
+    let bad_root_facade = ForkTreeReadFacade::new(bad_root_read);
+    let bad_root_repository = RepositoryRootV1::decode(
+        bad_root.repository_root_id,
+        bad_root
+            .objects
+            .get(bad_root.repository_root_id)
+            .expect("bad root repository root"),
+    )
+    .expect("bad root repository");
+    let mut bad_root_cache =
+        super::serving::StaleCommitSummaryCache::new(bad_root_facade.operation_id());
+    assert!(
+        bad_root_facade
+            .load_stale_commit_state_roots(
+                &bad_root_repository,
+                public_commit_id(0x96),
+                &mut bad_root_cache,
+            )
+            .await
+            .is_err(),
+        "a wrong-domain state root must fail closed before stale classification"
+    );
+
+    let mut bad_generation = build_seed();
+    let bad_generation_parent_object_id = bad_generation.commit_object_id;
+    let (bad_generation_child_id, bad_generation_child_object_id) = insert_graph_commit(
+        &mut bad_generation,
+        0x98,
+        1,
+        vec![bad_generation_parent_object_id],
+    );
+    install_graph_head(
+        &mut bad_generation,
+        &[(bad_generation_child_id, bad_generation_child_object_id)],
+        bad_generation_child_object_id,
+        0x99,
+    );
+    let bad_generation_storage = Memory::new();
+    seed_storage(&bad_generation_storage, &bad_generation).await;
+    let bad_generation_read = StorageAdapterReadScope::new(
+        bad_generation_storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("bad generation summary read"),
+    );
+    let bad_generation_facade = ForkTreeReadFacade::new(bad_generation_read);
+    let bad_generation_repository = RepositoryRootV1::decode(
+        bad_generation.repository_root_id,
+        bad_generation
+            .objects
+            .get(bad_generation.repository_root_id)
+            .expect("bad generation repository root"),
+    )
+    .expect("bad generation repository");
+    let mut bad_generation_cache =
+        super::serving::StaleCommitSummaryCache::new(bad_generation_facade.operation_id());
+    assert!(
+        bad_generation_facade
+            .load_stale_commit_state_roots(
+                &bad_generation_repository,
+                public_commit_id(0x98),
+                &mut bad_generation_cache,
+            )
+            .await
+            .is_err(),
+        "a parent with an invalid generation edge must fail closed"
     );
 }
 

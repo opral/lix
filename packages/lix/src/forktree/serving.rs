@@ -74,7 +74,7 @@ where
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedSemanticMember {
+pub(super) struct ResolvedSemanticMember {
     change_id: ChangeId,
     payload: Vec<u8>,
     global: bool,
@@ -1318,7 +1318,7 @@ where
     Ok(records)
 }
 
-async fn load_repository_root<R>(read: &R) -> Result<RepositoryRootV1, crate::LixError>
+pub(crate) async fn load_repository_root<R>(read: &R) -> Result<RepositoryRootV1, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1979,6 +1979,491 @@ where
     Ok(())
 }
 
+pub(super) struct StaleMemberAuthCache {
+    binding_id: u64,
+    commits: BTreeMap<ObjectId, CommitObjectV1>,
+    members: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), (CommitMemberV1, u32)>,
+    pages: BTreeMap<(ObjectId, ObjectId), super::model::CommitChangePageV2>,
+}
+
+impl StaleMemberAuthCache {
+    pub(super) fn new(binding_id: u64) -> Self {
+        Self {
+            binding_id,
+            commits: BTreeMap::new(),
+            members: BTreeMap::new(),
+            pages: BTreeMap::new(),
+        }
+    }
+
+    fn assert_binding(&self, binding_id: u64) -> Result<(), StorageError> {
+        if self.binding_id != binding_id {
+            return Err(corruption(
+                "stale member cache is bound to a different retained read",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated stale summaries are produced only by the retained-view
+/// loader.  The cache has no public map surface, so a caller cannot seed a
+/// summary or token that bypasses endpoint validation.
+pub(super) struct StaleCommitSummaryCache {
+    binding_id: u64,
+    entries: BTreeMap<crate::changelog::CommitId, StaleCommitSummary>,
+}
+
+impl StaleCommitSummaryCache {
+    pub(super) fn new(binding_id: u64) -> Self {
+        Self {
+            binding_id,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn assert_binding(&self, binding_id: u64) -> Result<(), StorageError> {
+        if self.binding_id != binding_id {
+            return Err(corruption(
+                "stale summary cache is bound to a different retained read",
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn load_stale_page_for_position<R>(
+    read: &R,
+    binding_id: u64,
+    commit_object_id: ObjectId,
+    commit_id: CommitId,
+    page_object_id: ObjectId,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<super::model::CommitChangePageV2, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let key = (commit_object_id, page_object_id);
+    if let Some(page) = cache.pages.get(&key) {
+        return Ok(page.clone());
+    }
+    let bytes = super::view::load_object_bytes(read, page_object_id).await?;
+    let page = super::model::CommitChangePageV2::decode(page_object_id, &bytes)?;
+    if page.commit_id != commit_id {
+        return Err(corruption(
+            "commit change page belongs to a different Commit",
+        ));
+    }
+    cache.pages.insert(key, page.clone());
+    Ok(page)
+}
+
+/// Proves the selected page's position in the commit's authenticated ordered
+/// page vector without loading the unrelated member closure.  The selected
+/// page and its immediate neighbors establish ordinal adjacency; duplicate
+/// vector entries are rejected globally because they make the vector
+/// ambiguous even when the duplicate is not selected by this request.
+pub(super) async fn validate_stale_page_position<R>(
+    read: &R,
+    binding_id: u64,
+    commit_object_id: ObjectId,
+    commit_id: CommitId,
+    page_object_ids: &[ObjectId],
+    page_object_id: ObjectId,
+    page: &super::model::CommitChangePageV2,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    cache.assert_binding(binding_id)?;
+    let mut seen = BTreeSet::new();
+    for id in page_object_ids {
+        if !seen.insert(*id) {
+            return Err(corruption("commit change-page vector repeats an object"));
+        }
+    }
+    let index = page_object_ids
+        .iter()
+        .position(|id| *id == page_object_id)
+        .ok_or_else(|| corruption("selected page is absent from the Commit page vector"))?;
+    if page.commit_id != commit_id {
+        return Err(corruption("selected page belongs to a different Commit"));
+    }
+    let mut expected_start = 0_u32;
+    for prefix_page_object_id in page_object_ids.iter().take(index + 1) {
+        let prefix_page = load_stale_page_for_position(
+            read,
+            binding_id,
+            commit_object_id,
+            commit_id,
+            *prefix_page_object_id,
+            cache,
+        )
+        .await?;
+        if prefix_page.start_ordinal != expected_start {
+            return Err(corruption(
+                "commit change-page vector has a gap or overlap in the selected prefix",
+            ));
+        }
+        expected_start = prefix_page
+            .start_ordinal
+            .checked_add(
+                u32::try_from(prefix_page.members.len())
+                    .map_err(|_| corruption("commit member page count overflows u32"))?,
+            )
+            .ok_or_else(|| corruption("commit member page ordinal overflows u32"))?;
+    }
+    if let Some(next_id) = page_object_ids.get(index + 1) {
+        let next = load_stale_page_for_position(
+            read,
+            binding_id,
+            commit_object_id,
+            commit_id,
+            *next_id,
+            cache,
+        )
+        .await?;
+        let expected = page
+            .start_ordinal
+            .checked_add(
+                u32::try_from(page.members.len())
+                    .map_err(|_| corruption("selected page member count overflows u32"))?,
+            )
+            .ok_or_else(|| corruption("selected page ordinal overflows u32"))?;
+        if next.start_ordinal != expected {
+            return Err(corruption(
+                "commit change-page vector has a gap or overlap after selected page",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn load_stale_commit<R>(
+    read: &R,
+    binding_id: u64,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<CommitObjectV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    cache.assert_binding(binding_id)?;
+    if let Some(commit) = cache.commits.get(&commit_object_id) {
+        return Ok(commit.clone());
+    }
+    let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+    let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+    validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, &commit).await?;
+    validate_commit_topology(read, commit_catalog_root, commit.commit_id, &commit)
+        .await
+        .map_err(|error| corruption(error.to_string()))?;
+    validate_root_on_read(commit.global_state_root, "state", read).await?;
+    validate_root_on_read(commit.local_state_root, "state", read).await?;
+    cache.commits.insert(commit_object_id, commit.clone());
+    Ok(commit)
+}
+
+/// Resolves one authenticated member through a commit's visible state root.
+/// The commit envelope/catalog/topology bind both roots, the exact state key
+/// selects the authenticated page, and that page binds ordinal and ChangeId.
+/// No complete historical member closure is loaded.
+async fn load_stale_member_at_key<R>(
+    read: &R,
+    binding_id: u64,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    state_key: &[u8],
+    expected_change_id: ChangeId,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<(CommitObjectV1, CommitMemberV1, u32), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    cache.assert_binding(binding_id)?;
+    let cache_key = (
+        commit_object_id,
+        state_key.to_vec(),
+        expected_change_id.as_bytes().to_vec(),
+    );
+    let commit = load_stale_commit(
+        read,
+        binding_id,
+        commit_catalog_root,
+        commit_object_id,
+        cache,
+    )
+    .await?;
+    if let Some(member) = cache.members.get(&cache_key) {
+        return Ok((commit, member.0.clone(), member.1));
+    }
+    for (root, expected_global) in [
+        (commit.local_state_root, false),
+        (commit.global_state_root, true),
+    ] {
+        let Some(encoded) = lookup_on_read(root, "state", state_key, read).await? else {
+            continue;
+        };
+        let value_ref = decode_state_value_storage(&encoded)?;
+        let page_bytes = super::view::load_object_bytes(read, value_ref.page_object_id).await?;
+        let page = super::model::CommitChangePageV2::decode(value_ref.page_object_id, &page_bytes)?;
+        if page.commit_id != commit.commit_id
+            || !commit
+                .member_page_object_ids
+                .contains(&value_ref.page_object_id)
+        {
+            return Err(corruption(
+                "authenticated source state page is not owned by its Commit",
+            ));
+        }
+        cache
+            .pages
+            .insert((commit_object_id, value_ref.page_object_id), page.clone());
+        validate_stale_page_position(
+            read,
+            binding_id,
+            commit_object_id,
+            commit.commit_id,
+            &commit.member_page_object_ids,
+            value_ref.page_object_id,
+            &page,
+            cache,
+        )
+        .await?;
+        let page_ordinal = usize::try_from(value_ref.page_ordinal)
+            .map_err(|_| corruption("authenticated source page ordinal overflows usize"))?;
+        let member = page
+            .members
+            .get(page_ordinal)
+            .cloned()
+            .ok_or_else(|| corruption("authenticated source state page ordinal is absent"))?;
+        if member.change_id() != expected_change_id {
+            return Err(corruption(
+                "authenticated source state key resolves to a different ChangeId",
+            ));
+        }
+        if let CommitMemberV1::Introduced { global, .. } = &member
+            && *global != expected_global
+        {
+            return Err(corruption(
+                "authenticated source state scope differs from its member",
+            ));
+        }
+        let member_ordinal = page
+            .start_ordinal
+            .checked_add(value_ref.page_ordinal)
+            .ok_or_else(|| corruption("authenticated source member ordinal overflows u32"))?;
+        cache
+            .members
+            .insert(cache_key, (member.clone(), member_ordinal));
+        return Ok((commit, member, member_ordinal));
+    }
+    Err(corruption(
+        "authenticated source state key does not contain its expected ChangeId",
+    ))
+}
+async fn validate_member_catalog_owner_with_stale_cache<R>(
+    read: &R,
+    binding_id: u64,
+    commit_catalog_root: ObjectId,
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+    state_key: &[u8],
+    member: &CommitMemberV1,
+    entry: ChangeCatalogEntry,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    cache.assert_binding(binding_id)?;
+    let canonical_owner = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            let (_introduction_commit, introduction_member, introduction_ordinal) =
+                load_stale_member_at_key(
+                    read,
+                    binding_id,
+                    commit_catalog_root,
+                    commit_object_id,
+                    state_key,
+                    member.change_id(),
+                    cache,
+                )
+                .await?;
+            if introduction_member.change_id() != member.change_id()
+                || introduction_member.source().is_some()
+                || introduction_ordinal != ordinal
+            {
+                return Err(corruption(
+                    "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                ));
+            }
+            (commit_object_id, ordinal)
+        }
+        ChangeCatalogOwner::BranchRef { .. } => {
+            return Err(corruption(
+                "semantic commit member resolves to a branch-ref catalog owner",
+            ));
+        }
+    };
+    match member.source() {
+        None => {
+            let target_ordinal = u32::try_from(target_ordinal)
+                .map_err(|_| corruption("commit member ordinal exceeds u32"))?;
+            if canonical_owner != (target_commit_object_id, target_ordinal) {
+                return Err(corruption(
+                    "introduced membership is not the canonical ChangeCatalog owner",
+                ));
+            }
+        }
+        Some((source_commit_object_id, source_ordinal)) => {
+            let (source_commit, source_member, source_member_ordinal) = load_stale_member_at_key(
+                read,
+                binding_id,
+                commit_catalog_root,
+                source_commit_object_id,
+                state_key,
+                member.change_id(),
+                cache,
+            )
+            .await?;
+            if source_commit.generation >= target_generation {
+                return Err(corruption(
+                    "selected membership source generation is not earlier than its target",
+                ));
+            }
+            if source_member.change_id() != member.change_id()
+                || source_member_ordinal != source_ordinal
+            {
+                return Err(corruption(
+                    "selected membership source commit/ordinal back-edge is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn resolve_semantic_member_with_stale_auth<R>(
+    read: &R,
+    binding_id: u64,
+    member: &CommitMemberV1,
+    state_key: &[u8],
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<ResolvedSemanticMember, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    cache.assert_binding(binding_id)?;
+    let expected_change_id = member.change_id();
+    let mut current = member.clone();
+    let mut owner = target_commit_object_id;
+    let mut generation = target_generation;
+    let mut ordinal = target_ordinal;
+    let mut visited = BTreeSet::new();
+    let mut selected_created_at = None;
+
+    loop {
+        if !visited.insert((owner, ordinal as u32)) {
+            return Err(corruption("selected member source ownership is cyclic"));
+        }
+        let value = lookup_on_read(
+            change_catalog_root,
+            "change",
+            current.change_id().as_bytes(),
+            read,
+        )
+        .await?
+        .ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?;
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        validate_member_catalog_owner_with_stale_cache(
+            read,
+            binding_id,
+            commit_catalog_root,
+            owner,
+            generation,
+            ordinal,
+            state_key,
+            &current,
+            entry,
+            cache,
+        )
+        .await?;
+
+        match current {
+            CommitMemberV1::Introduced {
+                change_id,
+                payload,
+                global,
+                updated_at,
+                blob_manifest_object_ids,
+            } => {
+                if change_id != expected_change_id {
+                    return Err(corruption(
+                        "selected member source changes its authenticated ChangeId",
+                    ));
+                }
+                return Ok(ResolvedSemanticMember {
+                    change_id,
+                    payload,
+                    global,
+                    updated_at,
+                    selected_created_at,
+                    blob_manifest_object_ids,
+                });
+            }
+            CommitMemberV1::Selected {
+                change_id,
+                source_commit_object_id,
+                source_ordinal,
+                created_at,
+            } => {
+                if change_id != expected_change_id {
+                    return Err(corruption(
+                        "selected member source changes its authenticated ChangeId",
+                    ));
+                }
+                selected_created_at.get_or_insert(created_at);
+                let (source_commit, source_member, source_member_ordinal) =
+                    load_stale_member_at_key(
+                        read,
+                        binding_id,
+                        commit_catalog_root,
+                        source_commit_object_id,
+                        state_key,
+                        expected_change_id,
+                        cache,
+                    )
+                    .await?;
+                if source_member_ordinal != source_ordinal {
+                    return Err(corruption(
+                        "selected member source state ordinal is inconsistent",
+                    ));
+                }
+                current = source_member;
+                if current.change_id() != expected_change_id {
+                    return Err(corruption(
+                        "selected member source changes its authenticated ChangeId",
+                    ));
+                }
+                owner = source_commit_object_id;
+                generation = source_commit.generation;
+                ordinal = source_ordinal as usize;
+            }
+        }
+    }
+}
 /// One ordered-history identity selected from an already published commit.
 ///
 /// Callers identify the semantic member and state row only. Catalog roots,
@@ -2525,6 +3010,211 @@ where
         .collect()
 }
 
+/// Resolves the changed leaves used by stale reconciliation with the
+/// endpoint commit's authenticated catalog identity.  This deliberately
+/// shares the ordinary state-tree point selection, but the selected semantic
+/// member chain is checked against CommitCatalog and ChangeCatalog at every
+/// owner edge before its payload is exposed.
+pub(super) async fn state_points_on_read_for_stale<R>(
+    repository: &RepositoryRootV1,
+    summary: StaleCommitSummary,
+    keys: &[Vec<u8>],
+    include_tombstone: bool,
+    binding_id: u64,
+    read: &R,
+) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let local_encoded = lookup_many_on_read(summary.local_state_root, "state", keys, read).await?;
+    let mut missing_by_key = BTreeMap::<Vec<u8>, Vec<usize>>::new();
+    for (slot, encoded) in local_encoded.iter().enumerate() {
+        if encoded.is_none() {
+            missing_by_key
+                .entry(keys[slot].clone())
+                .or_default()
+                .push(slot);
+        }
+    }
+    let global_keys = missing_by_key.keys().cloned().collect::<Vec<_>>();
+    let global =
+        lookup_many_on_read(summary.global_state_root, "state", &global_keys, read).await?;
+    let mut global_by_slot = BTreeMap::new();
+    for ((_, slots), value) in missing_by_key.into_iter().zip(global) {
+        for slot in slots {
+            global_by_slot.insert(slot, value.clone());
+        }
+    }
+    let selected = local_encoded
+        .into_iter()
+        .enumerate()
+        .map(|(slot, local)| {
+            local
+                .map(|encoded| (keys[slot].clone(), encoded, StateSource::Branch))
+                .or_else(|| {
+                    global_by_slot
+                        .remove(&slot)
+                        .flatten()
+                        .map(|encoded| (keys[slot].clone(), encoded, StateSource::Global))
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let mut refs = Vec::with_capacity(selected.len());
+    let mut page_ids = BTreeSet::new();
+    for row in &selected {
+        let value_ref = row
+            .as_ref()
+            .map(|(_, encoded, _)| decode_state_value_storage(encoded))
+            .transpose()?;
+        if let Some(value_ref) = value_ref {
+            page_ids.insert(value_ref.page_object_id);
+        }
+        refs.push(value_ref);
+    }
+    let pages = super::view::load_object_map(read, page_ids).await?;
+    let mut decoded_pages = BTreeMap::new();
+    for (id, bytes) in pages {
+        decoded_pages.insert(id, super::model::CommitChangePageV2::decode(id, &bytes)?);
+    }
+
+    let mut output = Vec::with_capacity(selected.len());
+    let mut summary_cache = StaleCommitSummaryCache::new(binding_id);
+    let mut stale_member_cache = StaleMemberAuthCache::new(binding_id);
+    for (row, value_ref) in selected.iter().zip(refs) {
+        let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
+            output.push(None);
+            continue;
+        };
+        let page = decoded_pages
+            .get(&value_ref.page_object_id)
+            .ok_or_else(|| corruption("state value page is absent"))?;
+        let page_commit_id = page.commit_id;
+        let page_changelog_id =
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*page_commit_id.as_bytes()));
+        let page_summary = load_historical_commit_state_roots_for_stale(
+            read,
+            binding_id,
+            repository,
+            page_changelog_id,
+            &mut summary_cache,
+        )
+        .await
+        .map_err(|error| corruption(error.to_string()))?;
+        if !page_summary
+            .member_page_object_ids
+            .contains(&value_ref.page_object_id)
+        {
+            return Err(corruption(
+                "stale state value page is not owned by its authenticated commit",
+            ));
+        }
+        validate_stale_page_position(
+            read,
+            binding_id,
+            page_summary.commit_object_id,
+            page_summary.commit_id,
+            &page_summary.member_page_object_ids,
+            value_ref.page_object_id,
+            page,
+            &mut stale_member_cache,
+        )
+        .await?;
+        let page_ordinal = value_ref.page_ordinal as usize;
+        let member = page
+            .members
+            .get(page_ordinal)
+            .ok_or_else(|| corruption("state value page ordinal is absent"))?;
+        let target_ordinal = usize::try_from(page.start_ordinal)
+            .ok()
+            .and_then(|start| start.checked_add(page_ordinal))
+            .ok_or_else(|| corruption("stale state member ordinal overflows usize"))?;
+        let resolved = resolve_semantic_member_with_stale_auth(
+            read,
+            binding_id,
+            member,
+            encoded_key,
+            page_summary.commit_object_id,
+            page_summary.generation,
+            target_ordinal,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut stale_member_cache,
+        )
+        .await?;
+        let expected_global = *source == StateSource::Global;
+        if resolved.global != expected_global {
+            return Err(corruption(
+                "state value page domain differs from its state root",
+            ));
+        }
+        let public_change_id =
+            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
+        let record =
+            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
+                .map_err(|error| corruption(error.to_string()))?;
+        let created_at = resolved.selected_created_at.unwrap_or(record.created_at);
+        if encode_state_key(super::state::StateKeyRef {
+            schema_key: &record.schema_key,
+            file_id: record.file_id.as_deref(),
+            entity_pk: &record.entity_pk,
+        }) != *encoded_key
+        {
+            return Err(corruption(
+                "state value page identity differs from its state key",
+            ));
+        }
+        let cell = match record.snapshot {
+            crate::json_store::JsonSlot::None => StateCell::Tombstone,
+            crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => {
+                StateCell::Null
+            }
+            crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
+            crate::json_store::JsonSlot::ForkTreeObject(_) => {
+                return Err(corruption(
+                    "state value page contains an out-of-page JSON reference",
+                ));
+            }
+        };
+        let metadata = match record.metadata {
+            crate::json_store::JsonSlot::None => None,
+            crate::json_store::JsonSlot::Inline(value) => Some(value),
+            crate::json_store::JsonSlot::ForkTreeObject(_) => {
+                return Err(corruption("state value page contains out-of-page metadata"));
+            }
+        };
+        output.push(Some((
+            StateValue {
+                change_id: public_change_id,
+                commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+                    *page.commit_id.as_bytes(),
+                )),
+                created_at,
+                updated_at: resolved.updated_at,
+                cell,
+                metadata: metadata.map(Into::into),
+                origin_key: record.origin_key,
+                blob_manifest_object_ids: resolved.blob_manifest_object_ids,
+            },
+            *source,
+        )));
+    }
+
+    output
+        .into_iter()
+        .map(|value| match value {
+            None => Ok(None),
+            Some((value, StateSource::Global)) if matches!(value.cell, StateCell::Tombstone) => {
+                Err(corruption("global state tree contains a tombstone"))
+            }
+            Some((value, _)) if value.cell.deleted() && !include_tombstone => Ok(None),
+            value => Ok(value),
+        })
+        .collect()
+}
 async fn resolve_state_values_on_read<R>(
     read: &R,
     selected: &[Option<(Vec<u8>, Vec<u8>, StateSource)>],
@@ -2809,7 +3499,7 @@ where
 /// Loads the complete authenticated state overlay for one historical commit.
 /// A missing commit/catalog/root is an error; an absent key is represented by
 /// the absence of a row in the returned ordered stream.
-async fn load_historical_commit_state_roots<R>(
+pub(crate) async fn load_historical_commit_state_roots<R>(
     read: &R,
     commit_id: crate::changelog::CommitId,
 ) -> Result<(ObjectId, ObjectId), crate::LixError>
@@ -2820,7 +3510,7 @@ where
     load_historical_commit_state_roots_from_repository(read, &repository, commit_id).await
 }
 
-async fn load_historical_commit_state_roots_from_repository<R>(
+pub(crate) async fn load_historical_commit_state_roots_from_repository<R>(
     read: &R,
     repository: &RepositoryRootV1,
     commit_id: crate::changelog::CommitId,
@@ -2853,6 +3543,80 @@ where
     )
     .await?;
     Ok((commit.global_state_root, commit.local_state_root))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct StaleCommitSummary {
+    commit_id: CommitId,
+    commit_object_id: ObjectId,
+    generation: u64,
+    global_state_root: ObjectId,
+    local_state_root: ObjectId,
+    member_page_object_ids: Vec<ObjectId>,
+}
+
+impl StaleCommitSummary {
+    pub(super) fn global_state_root(&self) -> ObjectId {
+        self.global_state_root
+    }
+
+    pub(super) fn local_state_root(&self) -> ObjectId {
+        self.local_state_root
+    }
+}
+
+/// Authenticates only the commit envelope and root/topology summary required
+/// by stale reconciliation. Semantic member closure remains lazy and is
+/// authenticated by the changed state leaves that stale classification reads.
+/// The successful result is cached only in the caller's retained-read
+/// operation; failures are never inserted.
+pub(super) async fn load_historical_commit_state_roots_for_stale<R>(
+    read: &R,
+    binding_id: u64,
+    repository: &RepositoryRootV1,
+    commit_id: crate::changelog::CommitId,
+    cache: &mut StaleCommitSummaryCache,
+) -> Result<StaleCommitSummary, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    cache.assert_binding(binding_id)?;
+    if let Some(summary) = cache.entries.get(&commit_id) {
+        return Ok(summary.clone());
+    }
+    let catalog_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
+    let entry =
+        load_required_commit_catalog_entry(read, repository.commit_catalog_root, catalog_id)
+            .await?;
+    let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != catalog_id {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
+    }
+    validate_commit_catalog_identity(
+        read,
+        repository.commit_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit).await?;
+    validate_root_on_read(commit.global_state_root, "state", read).await?;
+    validate_root_on_read(commit.local_state_root, "state", read).await?;
+    let summary = StaleCommitSummary {
+        commit_id: catalog_id,
+        commit_object_id: entry.commit_object_id,
+        generation: commit.generation,
+        global_state_root: commit.global_state_root,
+        local_state_root: commit.local_state_root,
+        member_page_object_ids: commit.member_page_object_ids.clone(),
+    };
+    cache.entries.insert(commit_id, summary);
+    Ok(cache
+        .entries
+        .get(&commit_id)
+        .expect("stale summary was just inserted")
+        .clone())
 }
 
 fn historical_state_rows_from_range(
