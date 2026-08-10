@@ -922,6 +922,23 @@ where
         ForkTreeReadFacade::new(self.opening_read())
     }
 
+    /// Exposes the transaction's committed authenticated view without
+    /// acquiring another storage read. Staged rows are added by the
+    /// transaction overlay owner before a consumer asks for the combined
+    /// `TransactionStateView`.
+    pub(crate) async fn committed_state_view(
+        &self,
+    ) -> Result<
+        crate::state::ForkTreeStateView<SharedStorageAdapterRead<StorageImpl::Read<'static>>>,
+        LixError,
+    > {
+        crate::state::ForkTreeStateView::from_facade(
+            self.forktree_read_facade(),
+            &self.active_branch_id,
+        )
+        .await
+    }
+
     async fn reconcile_stale_disjoint_writes<S>(
         &mut self,
         read: &S,
@@ -7088,6 +7105,9 @@ where
         let read_store = self.opening_read();
         let forktree = ForkTreeReadFacade::new(read_store.clone());
         let active_branch_id = self.active_branch_id.clone();
+        let state_view =
+            crate::state::ForkTreeStateView::from_facade(forktree.clone(), &active_branch_id)
+                .await?;
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
         let staged = self.staged_writes.staging_overlay()?;
@@ -7102,6 +7122,7 @@ where
             active_account_id: self.active_account_id.clone(),
             read_store,
             forktree,
+            state_view,
             visible_schemas,
             functions,
             staged,
@@ -7970,6 +7991,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     active_account_id: String,
     read_store: SharedStorageAdapterRead<R>,
     forktree: ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
+    state_view: crate::state::ForkTreeStateView<SharedStorageAdapterRead<R>>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
     staged: PreparedStateRowOverlay,
@@ -7978,6 +8000,17 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     plugin_host: PluginRuntimeHost,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     sql_catalog_fingerprint: CatalogFingerprint,
+}
+
+impl<R> TransactionSqlReadExecutionContext<R>
+where
+    R: crate::storage_adapter::StorageRead,
+{
+    pub(crate) fn state_view(
+        &self,
+    ) -> &crate::state::ForkTreeStateView<SharedStorageAdapterRead<R>> {
+        &self.state_view
+    }
 }
 
 impl<R> Clone for TransactionSqlReadExecutionContext<R>
@@ -7990,6 +8023,7 @@ where
             active_account_id: self.active_account_id.clone(),
             read_store: self.read_store.clone(),
             forktree: self.forktree.clone(),
+            state_view: self.state_view.clone(),
             visible_schemas: self.visible_schemas.clone(),
             functions: self.functions.clone(),
             staged: self.staged.clone(),
@@ -8040,10 +8074,6 @@ where
         &self.active_account_id
     }
 
-    fn live_state(&self) -> Arc<dyn LiveStateReader> {
-        Arc::new(self.clone())
-    }
-
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         Arc::new(self.clone())
     }
@@ -8079,26 +8109,6 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
-    }
-}
-
-#[async_trait]
-impl<R> LiveStateReader for TransactionSqlReadExecutionContext<R>
-where
-    R: crate::storage_adapter::StorageRead + 'static,
-{
-    async fn scan_batch(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        overlay_scan_batch(&self.forktree, &self.staged, request).await
-    }
-
-    async fn load_exact_batch(
-        &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        overlay_load_exact_batch(&self.forktree, &self.staged, request).await
     }
 }
 
@@ -8781,10 +8791,10 @@ mod transaction_validation_reader_tests {
             .expect("transaction SQL context end");
         let context = &source[start..end];
         assert!(context.contains("forktree: ForkTreeReadFacade"));
-        assert!(context.contains("impl<R> LiveStateReader for TransactionSqlReadExecutionContext"));
+        assert!(context.contains("state_view: crate::state::ForkTreeStateView"));
+        assert!(context.contains("pub(crate) fn state_view("));
+        assert!(!context.contains("LiveStateReader"));
         assert!(!context.contains("transaction_reader("));
-        assert!(context.contains("overlay_scan_batch(&self.forktree"));
-        assert!(context.contains("overlay_load_exact_batch(&self.forktree"));
     }
 
     #[test]
@@ -9381,20 +9391,6 @@ where
             self.opening_read(),
             &self.active_branch_id,
         )?))
-    }
-
-    async fn scan_live_state_batch(
-        &mut self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_visible_live_state_batch(request).await
-    }
-
-    async fn load_exact_live_state_batch(
-        &mut self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        self.load_visible_exact_live_state_batch(request).await
     }
 
     async fn filesystem_path_index(

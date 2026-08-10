@@ -16,10 +16,8 @@ use crate::commit_graph::{CommitGraphReader, CommitGraphStoreReader};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
+use crate::forktree::{StateCell, StateKeyRef, encode_state_key};
 use crate::functions::FunctionProviderHandle;
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateProjection, LiveStateReader,
-};
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
@@ -27,6 +25,7 @@ use crate::sql2::{
     ChangelogQuerySource, SessionFileViews, SqlChangelogQuerySource, SqlExecutionContext,
     SqlPlanningCache,
 };
+use crate::state::ForkTreeStateView;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
@@ -44,44 +43,41 @@ pub(crate) async fn load_workspace_branch_id_from_index(
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     let forktree = crate::forktree::ForkTreeReadFacade::new(reader);
-    let rows = crate::live_state::load_forktree_exact_facade(
-        &forktree,
-        &LiveStateExactBatchRequest {
-            rows: vec![LiveStateExactRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(WORKSPACE_BRANCH_KEY),
-                file_id: None,
-            }],
-            projection: LiveStateProjection {
-                columns: vec!["snapshot_content".to_string()],
-            },
-            untracked: Some(true),
-            include_tombstones: false,
-        },
-    )
-    .await?;
-    let row = rows.row(0).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "workspace branch selector is missing lix_key_value:lix_workspace_branch_id",
-        )
-    })?;
-    let snapshot_content = row
-        .snapshot_content()
-        .map(|value| value.as_ref())
+    let entity_pk = EntityPk::single(WORKSPACE_BRANCH_KEY);
+    let key = encode_state_key(StateKeyRef {
+        schema_key: "lix_key_value",
+        file_id: None,
+        entity_pk: &entity_pk,
+    });
+    let view = ForkTreeStateView::from_facade(forktree, GLOBAL_BRANCH_ID).await?;
+    let row = view
+        .points(&[key], false)
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "workspace branch selector is missing snapshot_content",
+                "workspace branch selector is missing lix_key_value:lix_workspace_branch_id",
             )
         })?;
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("workspace branch selector snapshot is invalid JSON: {error}"),
-        )
-    })?;
+    let snapshot_content = match row.value.cell {
+        StateCell::Value(value) => value,
+        StateCell::Null | StateCell::Tombstone => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "workspace branch selector is missing snapshot_content",
+            ));
+        }
+    };
+    let snapshot =
+        serde_json::from_str::<JsonValue>(snapshot_content.as_ref()).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("workspace branch selector snapshot is invalid JSON: {error}"),
+            )
+        })?;
     let branch_id = snapshot
         .get("value")
         .and_then(JsonValue::as_str)
@@ -590,6 +586,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) active_account_id: &'a str,
     pub(super) read_store: SharedStorageAdapterRead<R>,
     pub(super) forktree: crate::forktree::ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
+    pub(crate) state_view: crate::state::ForkTreeStateView<SharedStorageAdapterRead<R>>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) functions: FunctionProviderHandle,
@@ -601,6 +598,12 @@ impl<R> SessionSqlExecutionContext<'_, R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
 {
+    pub(crate) fn state_view(
+        &self,
+    ) -> &crate::state::ForkTreeStateView<SharedStorageAdapterRead<R>> {
+        &self.state_view
+    }
+
     async fn compiled_sql_catalog(&self) -> Result<Arc<CatalogSnapshot>, LixError> {
         let revision = load_catalog_revision(&self.read_store)
             .instrument(tracing::debug_span!(
@@ -608,10 +611,9 @@ where
                 "lix.perf.public_read.catalog_revision"
             ))
             .await?;
-        let live_state = self.live_state();
         self.catalog_context
             .compiled_catalog_for_transaction_open(
-                live_state.as_ref(),
+                self.state_view(),
                 &Domain::schema_catalog(self.active_branch_id.to_string(), true),
                 revision.as_ref(),
             )
@@ -656,11 +658,6 @@ where
 
     fn active_account_id(&self) -> &str {
         self.active_account_id
-    }
-
-    #[expect(trivial_casts)]
-    fn live_state(&self) -> Arc<dyn LiveStateReader> {
-        Arc::new(self.forktree.clone()) as Arc<dyn LiveStateReader>
     }
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {

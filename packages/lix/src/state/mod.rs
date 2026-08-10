@@ -6,6 +6,7 @@
 //! trait or a compatibility request/batch vocabulary.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::LixError;
 use crate::forktree::{ForkTreeReadFacade, StateCell, StateSource, StateValue, VisibleStateRow};
@@ -64,8 +65,9 @@ impl StagedStateRow {
 }
 
 /// Authenticated committed state over one retained ForkTree read.
+#[derive(Clone)]
 pub(crate) struct ForkTreeStateView<R> {
-    view: crate::forktree::CoherentView<R>,
+    view: Arc<crate::forktree::CoherentView<R>>,
 }
 
 impl<R> ForkTreeStateView<R>
@@ -73,7 +75,9 @@ where
     R: StorageAdapterRead,
 {
     pub(crate) fn new(view: crate::forktree::CoherentView<R>) -> Self {
-        Self { view }
+        Self {
+            view: Arc::new(view),
+        }
     }
 
     pub(crate) async fn from_facade(
@@ -119,6 +123,7 @@ where
 /// One transaction's committed retained view plus an ordered staged overlay.
 /// Staged rows are validated once at construction; points and ranges use
 /// linear overlay merges and never materialize a full-key map.
+#[derive(Clone)]
 pub(crate) struct TransactionStateView<R> {
     committed: ForkTreeStateView<R>,
     staged: Vec<StagedStateRow>,
