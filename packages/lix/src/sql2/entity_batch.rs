@@ -230,8 +230,17 @@ where
 
 fn overlay_source_options(request: &EntityScanRequest) -> (Option<usize>, bool) {
     let needs_overlay = request.filter.untracked.is_none();
+    let source_limit = if request.limit == Some(0) {
+        // LIMIT 0 must remain bounded even when tracked and untracked
+        // authorities would otherwise need complete inputs for precedence.
+        Some(0)
+    } else if needs_overlay {
+        None
+    } else {
+        request.limit
+    };
     (
-        (!needs_overlay).then_some(request.limit).flatten(),
+        source_limit,
         request.filter.include_tombstones || needs_overlay,
     )
 }
@@ -375,6 +384,9 @@ fn merge_range_slots(
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Vec<EntityStateSlot> {
+    if limit == Some(0) {
+        return Vec::new();
+    }
     let mut tracked = tracked
         .into_iter()
         .map(|slot| (slot_sort_key(&slot), slot))
@@ -724,6 +736,25 @@ mod tests {
 
         request.filter.include_tombstones = false;
         assert_eq!(overlay_source_options(&request), (Some(1), false));
+    }
+
+    #[test]
+    fn range_limit_zero_bounds_overlay_sources_and_emits_no_rows() {
+        let request = EntityScanRequest {
+            limit: Some(0),
+            ..EntityScanRequest::default()
+        };
+        assert_eq!(overlay_source_options(&request), (Some(0), true));
+
+        let tracked = vec![EntityStateSlot::Tracked(row(
+            "visible",
+            StateCell::Value(SharedStr::from("{}")),
+        ))];
+        let untracked = vec![EntityStateSlot::Untracked(untracked(
+            "visible",
+            StateCell::Tombstone,
+        ))];
+        assert!(merge_range_slots(tracked, untracked, false, Some(0)).is_empty());
     }
 
     #[test]
