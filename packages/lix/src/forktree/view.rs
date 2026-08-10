@@ -1390,7 +1390,7 @@ where
         Ok(
             stale_state_changes_between_commits_on_read(self, before, after, true)
                 .await?
-                .payload,
+                .complete,
         )
     }
 
@@ -1608,6 +1608,9 @@ where
 #[derive(Debug)]
 pub(crate) struct StaleStateChanges {
     pub(crate) payload: Vec<super::state::HistoricalStateDiffEntry>,
+    /// Complete public historical changes, including authenticated write
+    /// identity-only changes whose endpoint payloads are equal.
+    pub(crate) complete: Vec<super::state::HistoricalStateDiffEntry>,
     pub(crate) identities: Vec<super::state::HistoricalStateIdentityChange>,
 }
 
@@ -1628,6 +1631,7 @@ where
     if before == after {
         return Ok(StaleStateChanges {
             payload: Vec::new(),
+            complete: Vec::new(),
             identities: Vec::new(),
         });
     }
@@ -1650,6 +1654,7 @@ where
     if keys.is_empty() {
         return Ok(StaleStateChanges {
             payload: Vec::new(),
+            complete: Vec::new(),
             identities: Vec::new(),
         });
     }
@@ -1682,20 +1687,25 @@ where
     .await?;
 
     let mut payload = Vec::new();
+    let mut complete = Vec::new();
     let mut identities = Vec::new();
     for ((key, before), after) in keys.into_iter().zip(before_rows).zip(after_rows) {
         let before = historical_state_row_from_point(key.clone(), before, include_global)?;
         let after = historical_state_row_from_point(key, after, include_global)?;
-        if historical_state_payloads_differ(before.as_ref(), after.as_ref()) {
-            payload.push(super::state::HistoricalStateDiffEntry {
-                before: before.clone(),
-                after: after.clone(),
-            });
+        let payload_changed = historical_state_payloads_differ(before.as_ref(), after.as_ref());
+        let identity_changed = historical_state_identity_changed(before.as_ref(), after.as_ref());
+        let entry = super::state::HistoricalStateDiffEntry { before, after };
+        if payload_changed {
+            payload.push(entry.clone());
         }
-        if historical_state_identity_changed(before.as_ref(), after.as_ref()) {
-            let row = after
+        if historical_state_change_is_public(payload_changed, identity_changed) {
+            complete.push(entry.clone());
+        }
+        if identity_changed {
+            let row = entry
+                .after
                 .as_ref()
-                .or(before.as_ref())
+                .or(entry.before.as_ref())
                 .expect("identity change has an endpoint");
             let identity = |row: &super::state::HistoricalStateRow| {
                 super::state::HistoricalStateWriteIdentity {
@@ -1705,13 +1715,14 @@ where
             };
             identities.push(super::state::HistoricalStateIdentityChange {
                 key: row.key.clone(),
-                before: before.as_ref().map(identity),
-                after: after.as_ref().map(identity),
+                before: entry.before.as_ref().map(identity),
+                after: entry.after.as_ref().map(identity),
             });
         }
     }
     Ok(StaleStateChanges {
         payload,
+        complete,
         identities,
     })
 }
@@ -1809,6 +1820,10 @@ fn historical_state_identity_changed(
         (Some(_), None) | (None, Some(_)) => true,
         (None, None) => false,
     }
+}
+
+fn historical_state_change_is_public(payload_changed: bool, identity_changed: bool) -> bool {
+    payload_changed || identity_changed
 }
 
 pub(crate) async fn open_coherent_view<S>(
@@ -2116,8 +2131,8 @@ fn projected_required(
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_marker_matches_commit, historical_state_identity_changed,
-        historical_state_payloads_differ,
+        checkpoint_marker_matches_commit, historical_state_change_is_public,
+        historical_state_identity_changed, historical_state_payloads_differ,
     };
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
@@ -2175,6 +2190,8 @@ mod tests {
             Some(&before),
             Some(&same_payload_new_change),
         ));
+        assert!(historical_state_change_is_public(true, true));
+        assert!(historical_state_change_is_public(false, true));
         assert!(!historical_state_identity_changed(
             Some(&before),
             Some(&before)
