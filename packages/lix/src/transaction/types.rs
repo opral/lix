@@ -14,9 +14,9 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
+use crate::forktree::StateKey;
 use crate::json_store::JsonRef;
-use crate::live_state::{CertifiedCurrentStatePredecessor, MaterializedLiveStateRow};
-use crate::tracked_state::TrackedStateDiffIdentity;
+use crate::state::CertifiedStatePredecessor;
 use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -458,7 +458,7 @@ pub(crate) struct RawWriteBatch {
     entity_pks: Vec<Option<EntityPk>>,
     snapshots: Vec<Option<TransactionJson>>,
     metadata: Vec<Option<TransactionJson>>,
-    durable_predecessors: Vec<Option<CertifiedCurrentStatePredecessor>>,
+    durable_predecessors: Vec<Option<CertifiedStatePredecessor>>,
     strings: Vec<SharedStr>,
     string_index: Option<HashMap<SharedStr, u32>>,
     expected_rows: usize,
@@ -1323,14 +1323,14 @@ impl RawWriteBatch {
     pub(crate) fn take_durable_predecessor(
         &mut self,
         index: usize,
-    ) -> Option<CertifiedCurrentStatePredecessor> {
+    ) -> Option<CertifiedStatePredecessor> {
         self.durable_predecessors[index].take()
     }
 
     pub(crate) fn set_durable_predecessor(
         &mut self,
         index: usize,
-        value: Option<CertifiedCurrentStatePredecessor>,
+        value: Option<CertifiedStatePredecessor>,
     ) {
         self.durable_predecessors[index] = value;
     }
@@ -2745,7 +2745,7 @@ pub(crate) struct PreparedStateBatch {
     strings: Vec<SharedStr>,
     string_index: HashMap<SharedStr, u32>,
     json: Vec<StageJson>,
-    durable_predecessors: Vec<CertifiedCurrentStatePredecessor>,
+    durable_predecessors: Vec<CertifiedStatePredecessor>,
     origins: Vec<TransactionWriteOrigin>,
     origin_index: HashMap<TransactionWriteOrigin, u32>,
     origin_column_sets: Vec<Arc<[String]>>,
@@ -2856,7 +2856,7 @@ pub(crate) struct PreparedStateRowRef<'a> {
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
     pub(crate) branch_id: &'a SharedStr,
-    pub(crate) durable_predecessor: Option<&'a CertifiedCurrentStatePredecessor>,
+    pub(crate) durable_predecessor: Option<&'a CertifiedStatePredecessor>,
 }
 
 pub(crate) struct PreparedStateRows<'a> {
@@ -3242,7 +3242,7 @@ impl PreparedStateBatch {
     pub(crate) fn set_durable_predecessor(
         &mut self,
         row: usize,
-        value: Option<CertifiedCurrentStatePredecessor>,
+        value: Option<CertifiedStatePredecessor>,
     ) {
         self.expand_dense_certified_parameter();
         self.slots[row].durable_predecessor = value.map(|value| {
@@ -3841,69 +3841,6 @@ impl PartialEq for PreparedStateRowRef<'_> {
 
 impl Eq for PreparedStateRowRef<'_> {}
 
-impl From<PreparedStateRowRef<'_>> for MaterializedLiveStateRow {
-    fn from(row: PreparedStateRowRef<'_>) -> Self {
-        Self {
-            entity_pk: row.entity_pk.clone(),
-            schema_key: row.schema_key.to_string(),
-            file_id: row.file_id.map(ToString::to_string),
-            snapshot_content: row.snapshot.map(StageJson::materialize_shared),
-            metadata: row.metadata.map(StageJson::materialize_shared),
-            deleted: row.snapshot.is_none(),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            change_id: row.change_id,
-            commit_id: row.commit_id,
-            untracked: row.untracked,
-            branch_id: Arc::from(row.branch_id.as_str()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<TestPreparedStateRow> for MaterializedLiveStateRow {
-    fn from(row: TestPreparedStateRow) -> Self {
-        let deleted = row.snapshot.is_none();
-        Self {
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key.into(),
-            file_id: row.file_id.map(Into::into),
-            snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize_shared()),
-            metadata: row.metadata.map(|metadata| metadata.materialize_shared()),
-            deleted,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            change_id: row.change_id,
-            commit_id: row.commit_id,
-            untracked: row.untracked,
-            branch_id: Arc::from(row.branch_id.as_str()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<&TestPreparedStateRow> for MaterializedLiveStateRow {
-    fn from(row: &TestPreparedStateRow) -> Self {
-        Self {
-            entity_pk: row.entity_pk.clone(),
-            schema_key: row.schema_key.to_string(),
-            file_id: row.file_id.as_ref().map(ToString::to_string),
-            snapshot_content: row.snapshot.as_ref().map(StageJson::materialize_shared),
-            metadata: row.metadata.as_ref().map(StageJson::materialize_shared),
-            deleted: row.snapshot.is_none(),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            change_id: row.change_id,
-            commit_id: row.commit_id,
-            untracked: row.untracked,
-            branch_id: Arc::from(row.branch_id.as_str()),
-        }
-    }
-}
-
 /// Transaction-local commit change refs accumulated while rows are staged.
 ///
 /// Final commit row materialization owns commit ids, parent heads, and commit
@@ -3974,7 +3911,7 @@ impl StagedCommitChangeRefs {
 /// batch. Cloning this batch through transaction staging is O(1).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct StagedCommitChangeColumns {
-    identities: Vec<TrackedStateDiffIdentity>,
+    identities: Vec<StateKey>,
     source_commit_ids: Vec<CommitId>,
     change_ids: Vec<ChangeId>,
     deleted: Vec<bool>,
@@ -4001,7 +3938,7 @@ pub(crate) struct StagedCommitChangeBatchBuilder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StagedCommitChangeRef<'a> {
-    identity: &'a TrackedStateDiffIdentity,
+    identity: &'a StateKey,
     pub(crate) source_commit_id: CommitId,
     pub(crate) change_id: ChangeId,
     pub(crate) deleted: bool,
@@ -4025,7 +3962,7 @@ impl StagedCommitChangeBatchBuilder {
 
     pub(crate) fn push(
         &mut self,
-        identity: TrackedStateDiffIdentity,
+        identity: StateKey,
         source_commit_id: CommitId,
         change_id: ChangeId,
         deleted: bool,
@@ -4143,7 +4080,7 @@ impl StagedCommitChangeBatch {
 
 impl<'a> StagedCommitChangeRef<'a> {
     #[cfg(test)]
-    pub(crate) fn identity(&self) -> &'a TrackedStateDiffIdentity {
+    pub(crate) fn identity(&self) -> &'a StateKey {
         self.identity
     }
 
@@ -4305,7 +4242,7 @@ impl StagedCommitChangeRefs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
+    use crate::forktree::StateKey;
 
     #[test]
     fn certified_replacement_keeps_dense_complete_collection_proof() {
@@ -4474,16 +4411,13 @@ mod tests {
     #[test]
     fn ten_thousand_selected_changes_retain_one_shared_typed_batch() {
         const ROW_COUNT: usize = 10_000;
-        let identities = TrackedStateDiffIdentity::from_key_batch(
-            (0..ROW_COUNT)
-                .map(|index| TrackedStateKey {
-                    schema_key: "shared_schema".to_string(),
-                    file_id: Some("shared_file".to_string()),
-                    entity_pk: EntityPk::single(format!("entity-{index:05}")),
-                })
-                .collect(),
-        )
-        .expect("identity batch should fit");
+        let identities = (0..ROW_COUNT)
+            .map(|index| StateKey {
+                schema_key: "shared_schema".to_string(),
+                file_id: Some("shared_file".to_string()),
+                entity_pk: EntityPk::single(format!("entity-{index:05}")),
+            })
+            .collect::<Vec<_>>();
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let mut builder = StagedCommitChangeBatchBuilder::with_capacity(ROW_COUNT);
         for (index, identity) in identities.iter().enumerate() {
@@ -4504,8 +4438,8 @@ mod tests {
             batch
                 .iter()
                 .zip(&identities)
-                .all(|(change, identity)| change.identity().shares_batch_with(identity)),
-            "selected changes must retain the diff identity batch"
+                .all(|(change, identity)| change.identity() == identity),
+            "selected changes must retain the exact native identity"
         );
 
         let mut staged = StagedCommitChangeRefs::default();
@@ -4529,17 +4463,14 @@ mod tests {
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let source_commit = CommitId::for_test_label("shared-source");
         let shared_change = ChangeId::for_test_label("shared-change");
-        let identities = TrackedStateDiffIdentity::from_key_batch(
-            ["entity-a", "entity-b"]
-                .into_iter()
-                .map(|entity| TrackedStateKey {
-                    schema_key: "schema".to_string(),
-                    file_id: Some("file".to_string()),
-                    entity_pk: EntityPk::single(entity),
-                })
-                .collect(),
-        )
-        .expect("identity batch should fit");
+        let identities = ["entity-a", "entity-b"]
+            .into_iter()
+            .map(|entity| StateKey {
+                schema_key: "schema".to_string(),
+                file_id: Some("file".to_string()),
+                entity_pk: EntityPk::single(entity),
+            })
+            .collect::<Vec<_>>();
 
         let mut first = StagedCommitChangeBatchBuilder::with_capacity(1);
         first.push(

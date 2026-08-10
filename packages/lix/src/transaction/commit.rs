@@ -18,7 +18,7 @@ use crate::entity_pk::EntityPk;
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::transaction::staging::{BranchRefPublicationIntent, PreparedWriteSet};
-use crate::transaction::types::{PreparedStateRowRef, StageJson};
+use crate::transaction::types::PreparedStateRowRef;
 
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
@@ -1756,7 +1756,7 @@ mod intent_tests {
     use super::*;
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
-    use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
+    use crate::forktree::StateKey;
     use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
     use crate::transaction::types::{
         FileContent, PreparedStateBatch, StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
@@ -1844,11 +1844,11 @@ mod intent_tests {
         let mut refs = StagedCommitChangeRefs::default();
         let mut batch = StagedCommitChangeBatchBuilder::with_capacity(1);
         batch.push(
-            TrackedStateDiffIdentity::from_key(TrackedStateKey {
+            StateKey {
                 schema_key: "app.row".to_string(),
                 file_id: None,
                 entity_pk: EntityPk::single("selected"),
-            }),
+            },
             CommitId::for_test_label("selected-source"),
             crate::changelog::ChangeId::for_test_label("selected-change"),
             false,
