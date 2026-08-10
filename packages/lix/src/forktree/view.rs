@@ -91,7 +91,7 @@ where
         &self.read
     }
 
-    pub(super) fn retained_read(&self) -> &R {
+    pub(crate) fn retained_read(&self) -> &R {
         &self.read
     }
 
@@ -812,6 +812,84 @@ where
         open_coherent_view_on_read(self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
             .await
             .map_err(crate::LixError::from)
+    }
+
+    /// Loads one authenticated collection-generation marker from the
+    /// operation-owned branch view. This is a native marker lookup, not a
+    /// compatibility scan or a second reader acquisition.
+    pub(crate) async fn collection_generation(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<crate::collection_generation::CollectionGeneration>, crate::LixError> {
+        let expected_scope = crate::collection_generation::collection_scope_key(scope);
+        let entity_pk = EntityPk::single(&expected_scope);
+        let key = super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY,
+            file_id: None,
+            entity_pk: &entity_pk,
+        });
+        let row = self
+            .branch(branch_id)
+            .await?
+            .points(&[key], true)
+            .await
+            .map_err(crate::LixError::from)?
+            .pop()
+            .flatten();
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let decoded = super::state::decode_state_key(&row.encoded_key)?;
+        if decoded.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+            || decoded.file_id.is_some()
+            || decoded.entity_pk != entity_pk
+        {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "collection generation row identity does not match its requested scope",
+            ));
+        }
+        let snapshot = match row.value.cell {
+            super::state::StateCell::Value(value) => value,
+            super::state::StateCell::Null | super::state::StateCell::Tombstone => return Ok(None),
+        };
+        let snapshot =
+            serde_json::from_str::<serde_json::Value>(snapshot.as_str()).map_err(|error| {
+                crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    format!("collection generation row is malformed: {error}"),
+                )
+            })?;
+        if snapshot
+            .get("scope_key")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_scope.as_str())
+            || snapshot
+                .get("schema_key")
+                .and_then(serde_json::Value::as_str)
+                != Some(scope.schema_key)
+            || snapshot.get("file_id").and_then(serde_json::Value::as_str) != scope.file_id
+        {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "collection generation row identity does not match its requested scope",
+            ));
+        }
+        let live_count = snapshot
+            .get("live_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "collection generation row is missing live_count",
+                )
+            })?;
+        Ok(Some(crate::collection_generation::CollectionGeneration {
+            active_generation: row.value.commit_id,
+            live_count,
+            ordered_identity_digest: None,
+        }))
     }
 
     pub(crate) async fn branch(

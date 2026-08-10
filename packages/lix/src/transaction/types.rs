@@ -4085,15 +4085,15 @@ impl<'a> StagedCommitChangeRef<'a> {
     }
 
     pub(crate) fn schema_key(&self) -> &'a str {
-        self.identity.schema_key()
+        self.identity.schema_key.as_str()
     }
 
     pub(crate) fn file_id(&self) -> Option<&'a str> {
-        self.identity.file_id()
+        self.identity.file_id.as_deref()
     }
 
     pub(crate) fn entity_pk(&self) -> &'a EntityPk {
-        self.identity.entity_pk()
+        &self.identity.entity_pk
     }
 }
 

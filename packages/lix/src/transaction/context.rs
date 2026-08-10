@@ -68,8 +68,7 @@ use crate::sql2::{
     SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
-use crate::state::CertifiedStatePredecessor;
-use crate::state::ForkTreeStateView;
+use crate::state::{CertifiedStatePredecessor, ForkTreeStateView, TransactionStateView};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
@@ -102,11 +101,10 @@ use crate::transaction::types::{
 };
 
 use crate::wasm::{
-    WasmCertifiedEntityBatch, WasmChangeEffect, WasmComponentActor, WasmComponentFactory,
-    WasmConflictResolution, WasmConflictTake, WasmConflictUpdate, WasmDocumentCheckpoint,
-    WasmDocumentHandle, WasmDurableDocumentCheckpoint, WasmEntityChange, WasmEntityConflict,
-    WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor, WasmHostBytes, WasmHostEntityChanges,
-    WasmPluginSelection, WasmTransitionLimits,
+    WasmCertifiedEntityBatch, WasmChangeEffect, WasmConflictResolution, WasmConflictTake,
+    WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
+    WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor,
+    WasmHostBytes, WasmHostEntityChanges, WasmPluginSelection, WasmTransitionLimits,
 };
 use crate::{LixError, SqlQueryResult, Value};
 
@@ -422,6 +420,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// Coherent storage snapshot retained for explicit transaction reads.
     /// This field is declared before `storage` so it is dropped first.
     opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+    state_view: TransactionStateView<SharedStorageAdapterRead<StorageImpl::Read<'static>>>,
     storage: Arc<StorageAdapter<StorageImpl>>,
     functions: FunctionProviderHandle,
     /// Raw authenticated ForkTree selector pair observed by the coherent
@@ -727,7 +726,7 @@ where
         else {
             return Ok(false);
         };
-        let row = entry.blob_ref_live_row().ok_or_else(|| {
+        let row = entry.blob_ref_state_row().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_STORAGE_ERROR,
                 "visible upload target has no authenticated BlobRef",
@@ -798,7 +797,9 @@ where
         &self,
     ) -> Result<ForkTreeStateView<SharedStorageAdapterRead<StorageImpl::Read<'static>>>, LixError>
     {
-        ForkTreeStateView::from_facade(self.forktree_read_facade(), &self.active_branch_id).await
+        let read = self.opening_read();
+        let branch_id = self.active_branch_id.clone();
+        ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), &branch_id).await
     }
 
     async fn reconcile_stale_disjoint_writes<S>(
@@ -1346,12 +1347,16 @@ where
             let runtime_functions = FunctionContext::prepare(&read).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
+            let opening_state_view = ForkTreeStateView::from_facade(
+                ForkTreeReadFacade::new(read.clone()),
+                &active_branch_id,
+            )
+            .await?;
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let catalog_revision = load_catalog_revision(&read).await?;
-                let visible_forktree = ForkTreeReadFacade::new(read.clone());
                 let sql_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
-                        &visible_forktree,
+                        &opening_state_view,
                         &Domain::schema_catalog(active_branch_id.clone(), true),
                         catalog_revision.as_ref(),
                     )
@@ -1362,7 +1367,7 @@ where
                 // first write never falls back to a catalog scan.
                 let tracked_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
-                        &visible_forktree,
+                        &opening_state_view,
                         &Domain::schema_catalog(active_branch_id.clone(), false),
                         catalog_revision.as_ref(),
                     )
@@ -1388,6 +1393,7 @@ where
                 opening_selector_fence,
                 opening_active_branch_head,
                 opening_global_branch_head,
+                opening_state_view,
                 runtime_boundary_result,
             ))
         }
@@ -1401,6 +1407,7 @@ where
             opening_selector_fence,
             opening_active_branch_head,
             opening_global_branch_head,
+            opening_state_view,
             runtime_boundary_result,
         ) = match setup_result {
             Ok(result) => result,
@@ -1419,6 +1426,7 @@ where
             tracked_schema_catalog,
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
+        let state_view = TransactionStateView::new(opening_state_view, Vec::new())?;
         Ok((
             OpenTransaction {
                 transaction: Self {
@@ -1436,6 +1444,7 @@ where
                     filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                     filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
                     opening_read,
+                    state_view,
                     storage,
                     functions,
                     opening_selector_fence,
@@ -2345,7 +2354,8 @@ where
             let timestamp = self.functions.call_timestamp();
             return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
         }
-        let state_view = self.opening_state_view().await?;
+        let state_view =
+            Self::open_state_view(self.opening_read(), self.active_branch_id.clone()).await?;
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
             let catalog = self
@@ -2498,11 +2508,12 @@ where
         Ok(prepared_rows)
     }
 
-    async fn opening_state_view(
-        &self,
+    async fn open_state_view(
+        read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+        branch_id: String,
     ) -> Result<ForkTreeStateView<SharedStorageAdapterRead<StorageImpl::Read<'static>>>, LixError>
     {
-        ForkTreeStateView::from_facade(self.forktree_read_facade(), &self.active_branch_id).await
+        ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), &branch_id).await
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
@@ -2550,13 +2561,12 @@ where
         if file_ids.is_empty() {
             return Ok(false);
         }
-        let rows = self
-            .opening_state_view()
+        let rows = Self::open_state_view(self.opening_read(), self.active_branch_id.clone())
             .await?
             .untracked_overlay_rows()
             .await?;
         Ok(rows.into_iter().any(|row| {
-            row.owner.as_str() == self.active_branch_id
+            uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string() == self.active_branch_id
                 && row
                     .key
                     .file_id
@@ -2567,12 +2577,13 @@ where
 
     /// Reports whether the active branch has any visible untracked state.
     pub(crate) async fn has_untracked_rows(&mut self) -> Result<bool, LixError> {
-        Ok(!self
-            .opening_state_view()
-            .await?
-            .untracked_branch_range(None, None, Some(1))
-            .await?
-            .is_empty())
+        Ok(
+            !Self::open_state_view(self.opening_read(), self.active_branch_id.clone())
+                .await?
+                .untracked_branch_range(None, None, Some(1))
+                .await?
+                .is_empty(),
+        )
     }
 
     /// Stages the protocol replay receipt into this transaction's final
@@ -3204,7 +3215,6 @@ where
         let commit_id = self
             .staged_writes
             .stage_selected_commit_change_refs(branch_id.clone(), selected_changes)?;
-        let checkpoint_commit_id = CommitId::parse_lix(&commit_id, "staged checkpoint commit id")?;
         self.staged_writes
             .set_first_commit_parent(branch_id.clone(), previous_checkpoint_commit_id)?;
         self.staged_writes
@@ -3484,7 +3494,8 @@ where
             };
             plans.push((diff_id, identity, expected, target));
         }
-        let state_view = self.opening_state_view().await?;
+        let state_view =
+            Self::open_state_view(self.opening_read(), self.active_branch_id.clone()).await?;
         let state_keys = plans
             .iter()
             .map(|(_, (schema_key, entity_pk, file_id), _, _)| {
@@ -3769,7 +3780,7 @@ where
 }
 
 async fn load_immutable_mutation_predecessors(
-    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + 'static>,
+    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + Clone + 'static>,
     schema_key: &str,
     branch_id: &str,
     entity_pk_chunks: &[Arc<[EntityPk]>],
@@ -3896,12 +3907,12 @@ async fn resolve_prepared_mutation_collection_generation(
 }
 
 async fn load_opening_state_points(
-    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + 'static>,
+    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + Clone + 'static>,
     schema_key: &str,
     branch_id: &str,
     entity_pks: &[EntityPk],
 ) -> Result<Vec<Option<crate::state::StateRow>>, LixError> {
-    let view = ForkTreeStateView::from_facade(forktree.clone(), branch_id).await?;
+    let view = ForkTreeStateView::from_facade((*forktree).clone(), branch_id).await?;
     let keys = entity_pks
         .iter()
         .map(|entity_pk| {
@@ -4099,7 +4110,7 @@ where
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        crate::filesystem::build_path_index(&self.forktree, request).await
+        crate::filesystem::build_path_index(&self.state_view, request).await
     }
 }
 
@@ -4606,6 +4617,12 @@ impl<StorageImpl> SqlWriteExecutionContext for Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    type ReadStore = SharedStorageAdapterRead<StorageImpl::Read<'static>>;
+
+    fn state_view(&self) -> &TransactionStateView<Self::ReadStore> {
+        &self.state_view
+    }
+
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
     }
@@ -4676,8 +4693,9 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
-        let forktree = self.forktree_read_facade();
-        forktree.collection_generation(branch_id, scope).await
+        self.forktree_read_facade()
+            .collection_generation(branch_id, scope)
+            .await
     }
 
     async fn load_exact_collection_live_count(
@@ -5202,7 +5220,7 @@ fn reject_external_plugin_registry_rows(rows: &RawWriteBatch) -> Result<(), LixE
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone)]
 struct DecodedDurablePluginCheckpoint {
     generation: String,
     semantic_root: String,

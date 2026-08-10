@@ -205,19 +205,6 @@ where
         merged_writes.replace_reconciled_file_writes(replacement, &affected_file_ids);
     }
 
-    let validation_storage = leader.transaction.storage.clone();
-    let validation_read = match validation_storage
-        .begin_read(StorageReadOptions::default())
-        .await
-    {
-        Ok(read) => read,
-        Err(_) => {
-            let mut individual = vec![leader];
-            individual.extend(members);
-            return commit_prepared_individually(individual).await;
-        }
-    };
-    let validation_read = SharedStorageAdapterRead::new(validation_read);
     for member in &mut members {
         member
             .transaction

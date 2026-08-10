@@ -80,6 +80,43 @@ struct NativeStateRow {
 struct NativeStateRowRef<'a>(&'a NativeStateRow);
 
 impl NativeStateRow {
+    fn entity_pk(&self) -> &EntityPk {
+        &self.entity_pk
+    }
+    fn schema_key(&self) -> &str {
+        &self.schema_key
+    }
+    fn file_id(&self) -> Option<&str> {
+        self.file_id.as_deref()
+    }
+    fn snapshot_content(&self) -> Option<&str> {
+        self.snapshot_content.as_deref()
+    }
+    fn metadata(&self) -> Option<&str> {
+        self.metadata.as_deref()
+    }
+    fn created_at(&self) -> crate::common::LixTimestamp {
+        self.created_at
+    }
+    fn updated_at(&self) -> crate::common::LixTimestamp {
+        self.updated_at
+    }
+    fn global(&self) -> bool {
+        self.global
+    }
+    fn change_id(&self) -> Option<crate::changelog::ChangeId> {
+        self.change_id
+    }
+    fn commit_id(&self) -> Option<CommitId> {
+        self.commit_id
+    }
+    fn untracked(&self) -> bool {
+        self.untracked
+    }
+    fn branch_id(&self) -> &str {
+        &self.branch_id
+    }
+
     fn from_state_row(row: StateRow, branch_id: &str) -> Result<Self, LixError> {
         let key = crate::forktree::decode_state_key(&row.key)?;
         let snapshot_content = match row.value.cell {
@@ -115,10 +152,11 @@ impl NativeStateRow {
             metadata: row.value.metadata,
             created_at: row.value.created_at,
             updated_at: row.value.updated_at,
-            global: row.owner.to_string() == crate::GLOBAL_BRANCH_ID,
+            global: uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string()
+                == crate::GLOBAL_BRANCH_ID,
             change_id: None,
             commit_id: None,
-            branch_id: row.owner.to_string(),
+            branch_id: uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string(),
             untracked: true,
         }
     }
@@ -135,10 +173,10 @@ impl<'a> NativeStateRowRef<'a> {
         self.0.file_id.as_deref()
     }
     fn snapshot_content(self) -> Option<&'a str> {
-        self.0.snapshot_content.as_deref().map(SharedStr::as_str)
+        self.0.snapshot_content.as_deref()
     }
     fn metadata(self) -> Option<&'a str> {
-        self.0.metadata.as_deref().map(SharedStr::as_str)
+        self.0.metadata.as_deref()
     }
     fn created_at(self) -> crate::common::LixTimestamp {
         self.0.created_at
@@ -1558,14 +1596,14 @@ impl<'a> EntityLiveRowRef<'a> {
     fn snapshot_content(self) -> Option<&'a str> {
         match self {
             Self::Owned(row) => row.snapshot_content.as_deref(),
-            Self::Batch(row) => row.snapshot_content().map(SharedStr::as_str),
+            Self::Batch(row) => row.snapshot_content(),
         }
     }
 
     fn metadata(self) -> Option<&'a str> {
         match self {
             Self::Owned(row) => row.metadata.as_deref(),
-            Self::Batch(row) => row.metadata().map(SharedStr::as_str),
+            Self::Batch(row) => row.metadata(),
         }
     }
 
@@ -3519,7 +3557,7 @@ async fn entity_staged_postimage_returning_rows(
     // and retain the previous ambiguity check.
     let mut candidates_by_identity = std::collections::HashMap::with_capacity(candidates.len());
     for candidate in candidates.iter() {
-        let identity = entity_live_returning_identity(candidate);
+        let identity = entity_live_returning_identity(NativeStateRowRef(candidate));
         if candidates_by_identity.insert(identity, candidate).is_some() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -4069,9 +4107,12 @@ fn find_conflict_candidate<'a>(
     inserted_entity_pk: &EntityPk,
     candidates: &'a NativeStateBatch,
 ) -> Option<NativeStateRowRef<'a>> {
-    candidates.iter().find(|candidate| {
-        candidate_matches_insert_identity(*candidate, insert_row, inserted_entity_pk)
-    })
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate_matches_insert_identity(*candidate, insert_row, inserted_entity_pk)
+        })
+        .map(NativeStateRowRef)
 }
 
 fn candidate_matches_insert_identity<'a>(
@@ -4104,7 +4145,7 @@ async fn scan_entity_conflict_candidates(
                 NullableKeyFilter::Value(file_id.into())
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<NullableKeyFilter<SharedStr>>>();
 
     // Retention is an attribute of the one canonical live identity, not part
     // of SQL conflict identity. Resolve exact entity prefixes through the

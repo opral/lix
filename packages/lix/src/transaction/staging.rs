@@ -15,8 +15,7 @@ use bytes::Bytes;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-#[cfg(test)]
-use crate::binary_cas::BlobBytesBatch;
+use crate::binary_cas::BlobId;
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
@@ -32,8 +31,9 @@ use crate::transaction::types::StagedCommitChangeRefs;
 use crate::transaction::types::{
     CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation,
     CompleteCollectionReplacementProof, LogicalPrimaryKey, PreparedRowFacts, PreparedStateBatch,
-    PreparedStateRowRef, StageJson, TransactionFileContent, TransactionJson, TransactionWriteMode,
-    TransactionWriteOperation, TransactionWriteOrigin,
+    PreparedStateRowRef, PreparedTransactionWrite, StageJson, StagedCommitChangeBatch,
+    TransactionFileContent, TransactionJson, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteOutcome,
 };
 #[cfg(test)]
 use crate::transaction::types::{TestPreparedStateRow, stage_json_from_value};
@@ -534,6 +534,7 @@ pub(crate) enum RowSlot {
 /// The normal write path is an ordered journal. It becomes an indexed overlay
 /// only if a later write overlaps it or a transaction-local read actually
 /// needs read-your-writes semantics.
+#[derive(Clone)]
 enum StagedPreparedRows {
     AppendOnly {
         rows: PreparedStateBatch,
@@ -1689,6 +1690,842 @@ impl TransactionWriteBuffer {
                 .is_empty()
     }
 
+    fn stage_append_only_if_possible(
+        &self,
+        mode: Option<TransactionWriteMode>,
+        mut rows: PreparedStateBatch,
+        statement_indices: Option<&[u32]>,
+    ) -> Result<AppendOnlyStage, LixError> {
+        let inserts = mode == Some(TransactionWriteMode::Insert);
+        let certified_tracked_keys_strictly_ordered =
+            inserts && rows.certified_tracked_keys_strictly_ordered();
+        if !matches!(
+            mode,
+            Some(TransactionWriteMode::Replace | TransactionWriteMode::Insert)
+        ) || (!certified_tracked_keys_strictly_ordered
+            && inserts
+            && !rows
+                .iter()
+                .all(|row| row_is_insert(mode, row) && row.snapshot.is_some()))
+        {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+        let mut staged_rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::AppendOnly {
+            rows: existing_rows,
+            insert_selection,
+            last_key,
+        } = &mut *staged_rows
+        else {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        };
+        let append_shape_matches = if certified_tracked_keys_strictly_ordered {
+            rows.first().is_none_or(|first| {
+                is_normal_tracked_append_row(first)
+                    && first.snapshot.is_some()
+                    && last_key.as_ref().is_none_or(|previous| {
+                        compare_tracked_key_to_row(previous, first) == std::cmp::Ordering::Less
+                    })
+            })
+        } else {
+            rows_are_append_only_tracked(&rows, last_key.as_ref())
+        };
+        if !append_shape_matches {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+
+        let mut commit_change_refs = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit change refs lock",
+            )
+        })?;
+        if let Some(first_row) = rows.first() {
+            if !commit_change_refs.contains_key(first_row.branch_id.as_str()) {
+                commit_change_refs.insert(first_row.branch_id.to_string(), {
+                    let timestamp = self.functions.call_timestamp();
+                    StagedCommitChangeRefs::new(
+                        CommitId::with_change_address_space(self.functions.call_uuid_v7()),
+                        ChangeId::from(self.functions.call_uuid_v7()),
+                        ChangeId::from(self.functions.call_uuid_v7()),
+                        timestamp,
+                    )
+                });
+            }
+            let change_refs = commit_change_refs
+                .get_mut(first_row.branch_id.as_str())
+                .expect("branch change refs were inserted above");
+            let commit_id = change_refs.commit_id;
+            change_refs.add_change_count(rows.len());
+            rows.set_commit_id_all(commit_id);
+        }
+        if certified_tracked_keys_strictly_ordered {
+            insert_selection.push_certified_ordinal_inserts(rows.len());
+        } else {
+            insert_selection.reserve_rows(rows.len(), inserts);
+            for (row_index, row) in rows.iter().enumerate() {
+                if inserts {
+                    insert_selection.push(
+                        row.origin,
+                        statement_indices.map(|indices| indices[row_index] as usize),
+                    );
+                } else {
+                    insert_selection.push_not_insert();
+                }
+            }
+        }
+        if let Some(row) = rows.last() {
+            *last_key = Some(state_key_from_row(row));
+        }
+        if existing_rows.is_empty() {
+            *existing_rows = rows;
+        } else {
+            existing_rows.append(rows);
+        }
+        Ok(AppendOnlyStage::Staged)
+    }
+
+    fn stage_fresh_tracked_file_batch_if_possible(
+        &self,
+        mode: Option<TransactionWriteMode>,
+        mut rows: PreparedStateBatch,
+    ) -> Result<AppendOnlyStage, LixError> {
+        if !matches!(
+            mode,
+            Some(TransactionWriteMode::Replace | TransactionWriteMode::Insert)
+        ) {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+        let Some(first) = rows.first() else {
+            return Ok(AppendOnlyStage::Staged);
+        };
+        if !is_normal_tracked_append_row(first)
+            || rows.iter().any(|row| {
+                !is_normal_tracked_append_row(row)
+                    || row.branch_id != first.branch_id
+                    || row.facts.requires_transaction_validation
+                    || (row_is_insert(mode, row) && row.snapshot.is_none())
+            })
+        {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+        let mut order = (0..rows.len()).collect::<Vec<_>>();
+        order.sort_unstable_by(|&left, &right| {
+            compare_rows_by_tracked_key(rows.row(left), rows.row(right))
+                .then_with(|| left.cmp(&right))
+        });
+        if order.windows(2).any(|pair| {
+            compare_rows_by_tracked_key(rows.row(pair[0]), rows.row(pair[1]))
+                == std::cmp::Ordering::Equal
+        }) {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+
+        let mut staged_rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::AppendOnly {
+            rows: existing_rows,
+            insert_selection,
+            last_key,
+        } = &mut *staged_rows
+        else {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        };
+        if !existing_rows.is_empty() {
+            return Ok(AppendOnlyStage::Fallback(rows));
+        }
+
+        let mut commit_change_refs = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit change refs lock",
+            )
+        })?;
+        reorder_rows_by_source_permutation(&mut rows, &mut order);
+        let branch_id = rows.row(0).branch_id.clone();
+        if !commit_change_refs.contains_key(branch_id.as_str()) {
+            let timestamp = self.functions.call_timestamp();
+            commit_change_refs.insert(
+                branch_id.to_string(),
+                StagedCommitChangeRefs::new(
+                    CommitId::with_change_address_space(self.functions.call_uuid_v7()),
+                    ChangeId::from(self.functions.call_uuid_v7()),
+                    ChangeId::from(self.functions.call_uuid_v7()),
+                    timestamp,
+                ),
+            );
+        }
+        let change_refs = commit_change_refs
+            .get_mut(branch_id.as_str())
+            .expect("branch change refs were inserted above");
+        let commit_id = change_refs.commit_id;
+        change_refs.add_change_count(rows.len());
+        let has_inserts = rows.iter().any(|row| row_is_insert(mode, row));
+        insert_selection.reserve_rows(rows.len(), has_inserts);
+        for index in 0..rows.len() {
+            let row = rows.row(index);
+            if row_is_insert(mode, row) {
+                insert_selection.push(row.origin, None);
+            } else {
+                insert_selection.push_not_insert();
+            }
+            rows.set_commit_id(index, Some(commit_id));
+        }
+        *last_key = rows.last().map(state_key_from_row);
+        *existing_rows = rows;
+        Ok(AppendOnlyStage::Staged)
+    }
+
+    pub(crate) fn drain(&self) -> Result<PreparedWriteSet, LixError> {
+        let mut rows_guard = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let mut ordered_guard = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
+        let mut file_guard = self.file_content_writes.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        let mut refs_guard = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit change refs lock",
+            )
+        })?;
+        let mut parents_guard = self.extra_commit_parents_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged extra commit parents lock",
+            )
+        })?;
+        let mut intermediate_guard = self.intermediate_commits.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged intermediate commits lock",
+            )
+        })?;
+        let mut first_parent_guard =
+            self.first_commit_parent_override_by_branch
+                .lock()
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "failed to acquire transaction staged first commit parent overrides lock",
+                    )
+                })?;
+        let mut publication_guard = self.checkpoint_publications.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged checkpoint publications lock",
+            )
+        })?;
+        let mut branch_ref_guard = self.branch_ref_intents.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged branch selector intents lock",
+            )
+        })?;
+        let (state_rows, insert_selection) = match std::mem::take(&mut *rows_guard) {
+            StagedPreparedRows::AppendOnly {
+                rows,
+                insert_selection,
+                ..
+            }
+            | StagedPreparedRows::Indexed {
+                rows,
+                insert_selection,
+                ..
+            } => (rows, insert_selection),
+        };
+        let ordered_replacement = std::mem::take(&mut *ordered_guard);
+        if ordered_replacement
+            .as_ref()
+            .is_some_and(|journal| journal.replacement_proof.is_none())
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal reached commit without complete-replacement certification",
+            ));
+        }
+        if ordered_replacement.is_some() && !state_rows.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable replacement journal overlaps generic prepared rows",
+            ));
+        }
+        if let Some(journal) = ordered_replacement {
+            let refs = refs_guard.get_mut(journal.branch_id()).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal has no commit membership",
+                )
+            })?;
+            if refs.commit_id != journal.commit_id() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal commit owner changed",
+                ));
+            }
+            refs.attach_ordered_mutation_journal(Arc::new(journal))?;
+        }
+        Ok(PreparedWriteSet {
+            state_rows,
+            insert_selection,
+            commit_change_refs_by_branch: std::mem::take(&mut *refs_guard),
+            first_commit_parent_override_by_branch: std::mem::take(&mut *first_parent_guard),
+            checkpoint_publications: std::mem::take(&mut *publication_guard),
+            extra_commit_parents_by_branch: std::mem::take(&mut *parents_guard),
+            intermediate_commits: std::mem::take(&mut *intermediate_guard),
+            file_content_writes: std::mem::take(&mut *file_guard),
+            branch_ref_intents: std::mem::take(&mut *branch_ref_guard),
+        })
+    }
+
+    pub(crate) fn stage_branch_ref_intent(
+        &self,
+        intent: BranchRefPublicationIntent,
+    ) -> Result<(), LixError> {
+        self.branch_ref_intents
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire transaction staged branch selector intents lock",
+                )
+            })?
+            .push(intent);
+        Ok(())
+    }
+
+    pub(crate) fn add_checkpoint_publication(
+        &self,
+        publication: CheckpointPublication,
+    ) -> Result<(), LixError> {
+        self.checkpoint_publications
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire transaction staged checkpoint publications lock",
+                )
+            })?
+            .push(publication);
+        Ok(())
+    }
+
+    pub(crate) fn commit_id_for_branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<CommitId>, LixError> {
+        Ok(self
+            .commit_change_refs_by_branch
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire transaction staged commit change refs lock",
+                )
+            })?
+            .get(branch_id)
+            .map(|refs| refs.commit_id))
+    }
+
+    pub(crate) fn set_first_commit_parent(
+        &self,
+        branch_id: String,
+        parent_commit_id: CommitId,
+    ) -> Result<(), LixError> {
+        self.first_commit_parent_override_by_branch
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire transaction staged first commit parent overrides lock",
+                )
+            })?
+            .insert(branch_id, parent_commit_id);
+        Ok(())
+    }
+
+    pub(crate) fn add_commit_parent(
+        &self,
+        branch_id: String,
+        parent_commit_id: CommitId,
+    ) -> Result<(), LixError> {
+        let mut guard = self.extra_commit_parents_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged extra commit parents lock",
+            )
+        })?;
+        let parents = guard.entry(branch_id).or_default();
+        if !parents.contains(&parent_commit_id) {
+            parents.push(parent_commit_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_selected_commit_change_refs(
+        &self,
+        branch_id: String,
+        selected_changes: StagedCommitChangeBatch,
+    ) -> Result<String, LixError> {
+        let functions = self.functions.clone();
+        let mut guard = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit change refs lock",
+            )
+        })?;
+        let refs = guard.entry(branch_id).or_insert_with(|| {
+            let timestamp = functions.call_timestamp();
+            StagedCommitChangeRefs::new(
+                CommitId::with_change_address_space(functions.call_uuid_v7()),
+                ChangeId::from(functions.call_uuid_v7()),
+                ChangeId::from(functions.call_uuid_v7()),
+                timestamp,
+            )
+        });
+        refs.allow_empty();
+        refs.add_selected_change_batch(selected_changes);
+        Ok(refs.commit_id.to_string())
+    }
+
+    pub(crate) fn stage_intermediate_commit(
+        &self,
+        branch_id: String,
+        parent_commit_id: CommitId,
+        selected_changes: StagedCommitChangeBatch,
+    ) -> Result<CommitId, LixError> {
+        let timestamp = self.functions.call_timestamp();
+        let mut refs = StagedCommitChangeRefs::new(
+            CommitId::with_change_address_space(self.functions.call_uuid_v7()),
+            ChangeId::from(self.functions.call_uuid_v7()),
+            ChangeId::from(self.functions.call_uuid_v7()),
+            timestamp,
+        );
+        refs.allow_empty();
+        refs.add_selected_change_batch(selected_changes);
+        let commit_id = refs.commit_id;
+        self.intermediate_commits
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire transaction staged intermediate commits lock",
+                )
+            })?
+            .push(StagedIntermediateCommit {
+                branch_id,
+                parent_commit_id,
+                change_refs: refs,
+            });
+        Ok(commit_id)
+    }
+
+    pub(crate) fn stage_intermediate_rows(
+        &self,
+        commit_id: CommitId,
+        mut batch: PreparedStateBatch,
+    ) -> Result<(), LixError> {
+        let mut intermediate_commits = self.intermediate_commits.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged intermediate commits lock",
+            )
+        })?;
+        let commit = intermediate_commits
+            .iter_mut()
+            .find(|commit| commit.change_refs.commit_id == commit_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("unknown staged intermediate commit '{commit_id}'"),
+                )
+            })?;
+        if batch
+            .iter()
+            .any(|row| row.branch_id.as_str() != commit.branch_id || row.untracked)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "intermediate commit row has an incompatible branch or durability",
+            ));
+        }
+        for index in 0..batch.len() {
+            batch.set_commit_id(index, Some(commit_id));
+        }
+        let identities = batch
+            .iter()
+            .map(PreparedStateRowIdentity::from)
+            .collect::<Vec<_>>();
+        self.ensure_identity_index(true)?;
+        let mut rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::Indexed {
+            rows,
+            insert_selection,
+            by_identity,
+        } = &mut *rows
+        else {
+            unreachable!("intermediate row staging requires the identity index");
+        };
+        if identities
+            .iter()
+            .any(|identity| by_identity.contains_key(identity))
+        {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "intermediate checkpoint marker overlaps an existing staged row",
+            ));
+        }
+        let start = rows.len();
+        let count = batch.len();
+        insert_selection.reserve_rows(count, false);
+        for _ in 0..count {
+            insert_selection.push_not_insert();
+        }
+        rows.append(batch);
+        for (offset, identity) in identities.into_iter().enumerate() {
+            by_identity.insert(identity, RowSlot::State(start + offset));
+        }
+        commit.change_refs.add_change_count(count);
+        Ok(())
+    }
+
+    pub(crate) fn load_staged_file_bytes_for_owner(
+        &self,
+        branch_id: &str,
+        file_id: &str,
+        expected: BlobId,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        let writes = self.file_content_writes.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        for write in writes.iter().rev() {
+            if write.branch_id != branch_id || write.file_id != file_id {
+                continue;
+            }
+            if let Some(bytes) = write.inline_data()
+                && BlobId::from_canonical_content(bytes) == expected
+            {
+                return Ok(Some(bytes.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn stage_write(
+        &self,
+        write: PreparedTransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_inner(write, None)
+    }
+
+    pub(crate) fn stage_parameter_batch_insert(
+        &self,
+        write: PreparedTransactionWrite,
+        statement_indices: Vec<u32>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_inner(write, Some(statement_indices))
+    }
+
+    pub(crate) fn stage_certified_parameter_batch_insert(
+        &self,
+        write: PreparedTransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let (mode, count) = match &write {
+            PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
+            PreparedTransactionWrite::RowsWithFileContent { .. } => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified parameter INSERT unexpectedly contains file data",
+                ));
+            }
+        };
+        let (rows, file_content_writes) = Self::state_rows_from_stage_write(write);
+        debug_assert!(file_content_writes.is_empty());
+        match self.stage_append_only_if_possible(mode, rows, None)? {
+            AppendOnlyStage::Staged => Ok(TransactionWriteOutcome { count }),
+            AppendOnlyStage::Fallback(rows) => {
+                let statement_indices = (0..rows.len())
+                    .map(|index| {
+                        u32::try_from(index).map_err(|_| {
+                            LixError::new(
+                                LixError::CODE_INVALID_PARAM,
+                                "parameter batch row count exceeds u32",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.stage_write_inner(
+                    PreparedTransactionWrite::Rows {
+                        mode: TransactionWriteMode::Insert,
+                        rows,
+                    },
+                    Some(statement_indices),
+                )
+            }
+        }
+    }
+
+    fn stage_write_inner(
+        &self,
+        write: PreparedTransactionWrite,
+        statement_indices: Option<Vec<u32>>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let (mode, count) = match &write {
+            PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
+            PreparedTransactionWrite::RowsWithFileContent { mode, count, .. } => {
+                (Some(*mode), *count)
+            }
+        };
+        let (mut rows, file_content_writes) = Self::state_rows_from_stage_write(write);
+        if let Some(indices) = &statement_indices {
+            debug_assert_eq!(indices.len(), rows.len());
+        }
+        if rows.is_empty() {
+            if !file_content_writes.is_empty() {
+                self.file_content_writes
+                    .lock()
+                    .map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "failed to acquire transaction staged file data lock",
+                        )
+                    })?
+                    .extend(file_content_writes);
+            }
+            return Ok(TransactionWriteOutcome { count });
+        }
+        if file_content_writes.is_empty() {
+            match self.stage_append_only_if_possible(mode, rows, statement_indices.as_deref())? {
+                AppendOnlyStage::Staged => return Ok(TransactionWriteOutcome { count }),
+                AppendOnlyStage::Fallback(fallback_rows) => rows = fallback_rows,
+            }
+        } else {
+            match self.stage_fresh_tracked_file_batch_if_possible(mode, rows)? {
+                AppendOnlyStage::Staged => {
+                    self.file_content_writes
+                        .lock()
+                        .map_err(|_| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "failed to acquire transaction staged file data lock",
+                            )
+                        })?
+                        .extend(file_content_writes);
+                    return Ok(TransactionWriteOutcome { count });
+                }
+                AppendOnlyStage::Fallback(fallback_rows) => rows = fallback_rows,
+            }
+        }
+        let identities = rows
+            .iter()
+            .map(PreparedStateRowIdentity::from)
+            .collect::<Vec<_>>();
+        let identities_are_unique = validate_batch_row_identities(&rows, &identities)?;
+        self.ensure_identity_index(true)?;
+        let mut guard = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::Indexed {
+            rows: staged_rows,
+            insert_selection,
+            by_identity,
+        } = &mut *guard
+        else {
+            unreachable!("generic staging must promote the identity index");
+        };
+        let mut refs = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit change refs lock",
+            )
+        })?;
+        for row in rows.iter() {
+            if row.global && row.branch_id != GLOBAL_BRANCH_ID {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "global staged rows must use the global branch id",
+                ));
+            }
+            if let Some(RowSlot::State(index)) = by_identity
+                .get(&PreparedStateRowIdentity::from(row))
+                .copied()
+                && let Some(previous) = staged_rows.get(index)
+                && previous.untracked != row.untracked
+            {
+                return Err(mixed_durability_error(row));
+            }
+        }
+        let insert_count = rows.iter().filter(|row| row_is_insert(mode, *row)).count();
+        if insert_count != 0 {
+            let mut insert_order = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| row_is_insert(mode, row).then_some(index))
+                .collect::<Vec<_>>();
+            insert_order.sort_unstable_by(|&left, &right| {
+                identities[left]
+                    .cmp(&identities[right])
+                    .then(left.cmp(&right))
+            });
+            let duplicate_in_batch = insert_order
+                .windows(2)
+                .find(|pair| identities[pair[0]] == identities[pair[1]])
+                .map(|pair| pair[1]);
+            let duplicate_staged = insert_order
+                .iter()
+                .copied()
+                .find(|&index| by_identity.contains_key(&identities[index]));
+            if let Some(index) = duplicate_in_batch.into_iter().chain(duplicate_staged).min() {
+                return Err(duplicate_insert_identity_error(rows.row(index)));
+            }
+        }
+        if identities_are_unique && staged_rows.is_empty() && by_identity.is_empty() {
+            insert_selection.reserve_rows(rows.len(), insert_count != 0);
+            for index in 0..rows.len() {
+                let row = rows.row(index);
+                let commit_id = add_row_to_commit_change_refs(&mut refs, row, &self.functions);
+                if row_is_insert(mode, row) {
+                    insert_selection.push(
+                        row.origin,
+                        statement_indices
+                            .as_ref()
+                            .map(|indices| indices[index] as usize),
+                    );
+                } else {
+                    insert_selection.push_not_insert();
+                }
+                by_identity.insert(PreparedStateRowIdentity::from(row), RowSlot::State(index));
+                rows.set_commit_id(index, commit_id);
+            }
+            *staged_rows = rows;
+            if !file_content_writes.is_empty() {
+                self.file_content_writes
+                    .lock()
+                    .map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "failed to acquire transaction staged file data lock",
+                        )
+                    })?
+                    .extend(file_content_writes);
+            }
+            return Ok(TransactionWriteOutcome { count });
+        }
+        let staged_len = staged_rows.len();
+        insert_selection.reserve_rows(rows.len(), insert_count != 0);
+        let mut next_destination = staged_len;
+        let mut placements = Vec::with_capacity(rows.len());
+        let mut inserted_destinations = Vec::with_capacity(insert_count);
+        let mut latest_incoming_source_by_destination =
+            HashMap::<usize, usize>::with_capacity(rows.len());
+        for (source_index, identity) in identities.into_iter().enumerate() {
+            let row = rows.row(source_index);
+            let is_insert = row_is_insert(mode, row);
+            let existing_slot = by_identity.get(&identity).copied();
+            let mut requires_validation = row.facts.requires_transaction_validation;
+            if let Some(RowSlot::State(index)) = existing_slot {
+                let previous = latest_incoming_source_by_destination
+                    .get(&index)
+                    .map_or_else(|| staged_rows.row(index), |source| rows.row(*source));
+                requires_validation |= previous.facts.requires_transaction_validation;
+                remove_row_from_commit_change_refs(&mut refs, previous);
+            }
+            if requires_validation != row.facts.requires_transaction_validation {
+                rows.set_requires_transaction_validation(source_index, true);
+            }
+            let row = rows.row(source_index);
+            let commit_id = add_row_to_commit_change_refs(&mut refs, row, &self.functions);
+            let insert_metadata = is_insert.then_some((
+                row.origin.cloned(),
+                statement_indices
+                    .as_ref()
+                    .map(|indices| indices[source_index] as usize),
+            ));
+            rows.set_commit_id(source_index, commit_id);
+            let destination = existing_slot.map_or_else(
+                || {
+                    let index = next_destination;
+                    next_destination += 1;
+                    index
+                },
+                |RowSlot::State(index)| index,
+            );
+            if let Some(metadata) = insert_metadata {
+                inserted_destinations.push((destination, metadata));
+            }
+            placements.push((destination, source_index));
+            latest_incoming_source_by_destination.insert(destination, source_index);
+            by_identity.insert(identity, RowSlot::State(destination));
+        }
+        staged_rows.append(rows);
+        for (destination, source_index) in placements {
+            let source = staged_len + source_index;
+            if destination != source {
+                staged_rows.swap_rows(destination, source);
+            }
+        }
+        staged_rows.truncate_rows(next_destination);
+        insert_selection.resize_rows(next_destination);
+        for (destination, (origin, statement_index)) in inserted_destinations {
+            insert_selection.mark(destination, origin.as_ref(), statement_index);
+        }
+        if !file_content_writes.is_empty() {
+            self.file_content_writes
+                .lock()
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "failed to acquire transaction staged file data lock",
+                    )
+                })?
+                .extend(file_content_writes);
+        }
+        Ok(TransactionWriteOutcome { count })
+    }
+
+    fn state_rows_from_stage_write(
+        write: PreparedTransactionWrite,
+    ) -> (PreparedStateBatch, Vec<TransactionFileContent>) {
+        match write {
+            PreparedTransactionWrite::Rows { rows, .. } => (rows, Vec::new()),
+            PreparedTransactionWrite::RowsWithFileContent {
+                rows, file_content, ..
+            } => (rows, file_content),
+        }
+    }
+
     /// Captures every mutable staging structure before a statement that may
     /// need post-stage SQL projection. Restoring this checkpoint preserves
     /// earlier explicit-transaction statements even when the current one
@@ -2002,7 +2839,8 @@ fn compare_rows_by_tracked_key(
     right: PreparedStateRowRef<'_>,
 ) -> std::cmp::Ordering {
     left.schema_key
-        .cmp(&right.schema_key)
+        .as_str()
+        .cmp(right.schema_key.as_str())
         .then_with(|| {
             left.file_id
                 .map(|value| value.as_str())
@@ -2016,7 +2854,8 @@ fn compare_tracked_key_to_row(
     right: PreparedStateRowRef<'_>,
 ) -> std::cmp::Ordering {
     left.schema_key
-        .cmp(&right.schema_key)
+        .as_str()
+        .cmp(right.schema_key.as_str())
         .then_with(|| {
             left.file_id
                 .as_deref()
