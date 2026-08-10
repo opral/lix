@@ -82,9 +82,7 @@ impl NativeValidationRow {
             StateCell::Null => (Some(SharedStr::from("null")), false),
             StateCell::Tombstone => (None, true),
         };
-        let branch_id = if row.source == StateRowSource::Global
-            || key.schema_key == BRANCH_DESCRIPTOR_SCHEMA_KEY
-        {
+        let branch_id = if key.schema_key == BRANCH_DESCRIPTOR_SCHEMA_KEY {
             GLOBAL_BRANCH_ID.to_owned()
         } else {
             branch_id.to_owned()
