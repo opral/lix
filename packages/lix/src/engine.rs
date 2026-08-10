@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::branch::{BranchContext, BranchRefReader};
+use crate::branch::{BranchRefReader, BranchRefStoreReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
@@ -25,7 +25,6 @@ use crate::{LixError, NullableKeyFilter};
 #[expect(missing_debug_implementations)]
 pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
-    branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -147,7 +146,6 @@ where
             options.plugin_max_live_stores,
         )?;
 
-        let branch_ctx = Arc::new(BranchContext::new());
         assert_initialized(storage.clone()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
@@ -162,7 +160,6 @@ where
         ));
         Ok(Self {
             storage,
-            branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
             sql_planning_cache: Arc::new(SqlPlanningCache::default()),
             deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -193,9 +190,7 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let result = self
-            .branch_ctx
-            .ref_reader(read)
+        let result = BranchRefStoreReader::new(read)
             .load_head_commit_id(branch_id)
             .await?
             .map(|commit_id| commit_id.to_string());
@@ -221,7 +216,6 @@ where
             active_branch_id.into(),
             active_account_id,
             self.storage(),
-            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
             Arc::clone(&self.deterministic_runtime_gate),
@@ -249,7 +243,6 @@ where
         SessionContext::open_workspace(
             active_account_id,
             self.storage(),
-            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
             Arc::clone(&self.deterministic_runtime_gate),

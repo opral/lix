@@ -58,7 +58,6 @@ where
                 self.active_account_id.to_string(),
                 self.storage.clone(),
                 self.plugin_host.clone(),
-                Arc::clone(&self.branch_ctx),
                 Arc::clone(&self.catalog_context),
                 Arc::clone(&self.sql_planning_cache),
                 self.file_views.clone(),

@@ -2,7 +2,7 @@ use serde_json::json;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
+use crate::branch::{BranchLifecycle, BranchOperation, BranchRefStoreReader, BranchReferenceRole};
 use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
 use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 
@@ -53,7 +53,7 @@ where
                         .begin_read(StorageReadOptions::default())
                         .await?,
                 );
-                let reader = self.branch_ctx.ref_reader(read);
+                let reader = BranchRefStoreReader::new(read);
                 BranchLifecycle::new(&reader)
                     .require_existing_commit_id(
                         &branch_id,
