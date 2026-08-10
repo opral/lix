@@ -95,9 +95,7 @@ use crate::filesystem::{
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
-use crate::sql2::{
-    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
-};
+use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext, WriteAccess};
 use crate::transaction::types::{
     FileContent, LogicalPrimaryKey, TransactionFileContent, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin,
@@ -367,7 +365,7 @@ impl LixFileSpec {
     ) -> Result<Self, LixError> {
         let active_branch_id = write_ctx.active_branch_id();
         let functions = write_ctx.functions();
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let live_state = Arc::new(write_ctx.clone());
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let authenticated_blob_reader = write_ctx.authenticated_blob_reader()?;
         let plugin_host = write_ctx.plugin_host();
@@ -420,7 +418,7 @@ impl LixFileSpec {
         options: SqlWriteSessionOptions,
     ) -> Result<Self, LixError> {
         let functions = write_ctx.functions();
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let live_state = Arc::new(write_ctx.clone());
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
         let authenticated_blob_reader = write_ctx.authenticated_blob_reader()?;
         let plugin_host = write_ctx.plugin_host();
@@ -487,8 +485,7 @@ impl LixFileSpec {
                 captured,
             )| async move {
                 *captured.lock().expect("lix_file DML source mutex poisoned") = None;
-                let live_state: Arc<dyn LiveStateReader> =
-                    Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+                let live_state: Arc<dyn LiveStateReader> = Arc::new(write_ctx.clone());
                 let (prepared, path_resolvers, path_index) = if let Some(indexed_matches) =
                     indexed_matches.as_ref()
                 {
@@ -1379,7 +1376,7 @@ impl TableSpec for LixFileSpec {
                     if path_resolvers.is_none() {
                         path_resolvers = Some(
                             directory_path_resolvers_from_live_state(
-                                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                                Arc::new(write_ctx.clone()),
                                 spec.branch_binding.active_branch_id(),
                             )
                             .await
@@ -1677,7 +1674,7 @@ impl LixFileSpec {
                         path_resolvers
                     } else {
                         directory_path_resolvers_from_live_state(
-                            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                            Arc::new(write_ctx.clone()),
                             branch_binding.active_branch_id(),
                         )
                         .await
@@ -1789,12 +1786,10 @@ impl UpsertSupport for LixFileSpec {
         let branch_binding = self.branch_binding.active_branch_id();
         let include_data_writes = record_batch_has_non_null_column(batch, "content")?;
 
-        let mut path_resolvers = directory_path_resolvers_from_live_state(
-            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-            branch_binding,
-        )
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
+        let mut path_resolvers =
+            directory_path_resolvers_from_live_state(Arc::new(write_ctx.clone()), branch_binding)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
 
         let staged = if record_batch_has_non_null_column(batch, "path")? {
             lix_file_insert_stage_from_batch_with_path_resolvers(
@@ -1956,8 +1951,7 @@ impl UpsertSupport for LixFileSpec {
                 .await?
         };
 
-        let live_state: Arc<dyn LiveStateReader> =
-            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let live_state: Arc<dyn LiveStateReader> = Arc::new(write_ctx.clone());
         let prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
             // Conflict probes only need the proposed exact IDs or paths. Use
             // the visible filesystem index for descriptor matching, then fetch
@@ -2071,8 +2065,7 @@ impl UpsertSupport for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
 
-        let live_state: Arc<dyn LiveStateReader> =
-            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let live_state: Arc<dyn LiveStateReader> = Arc::new(write_ctx.clone());
         // The augmented conflict batch already carries the selected
         // descriptors. Recover only their correlated blob refs; rebuilding
         // the path index here would duplicate the conflict probe's topology
@@ -2130,7 +2123,7 @@ impl UpsertSupport for LixFileSpec {
         if update_columns.requires_path_resolver() {
             path_resolvers = Some(
                 directory_path_resolvers_from_live_state(
-                    Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                    Arc::new(write_ctx.clone()),
                     branch_binding,
                 )
                 .await
@@ -2300,7 +2293,7 @@ impl InsertSink for LixFileInsertSink {
             if path_resolvers.is_none() {
                 path_resolvers = Some(
                     directory_path_resolvers_from_live_state(
-                        Arc::new(WriteContextLiveStateReader::new(self.write_ctx.clone())),
+                        Arc::new(self.write_ctx.clone()),
                         self.branch_binding.active_branch_id(),
                     )
                     .await

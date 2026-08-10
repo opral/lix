@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
-use crate::branch::{BranchRefReader, BranchRefStoreReader};
+use crate::branch::BranchRefStoreReader;
 use crate::changelog::{ChangeRecord, CommitId, CommitRecord};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;

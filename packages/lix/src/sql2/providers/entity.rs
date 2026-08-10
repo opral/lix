@@ -44,10 +44,7 @@ use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter, parse_row_metadata_value};
 
-use crate::sql2::{
-    EntitySnapshotReader, SqlChangelogQuerySource, SqlWriteContext, WriteAccess,
-    WriteContextLiveStateReader,
-};
+use crate::sql2::{EntitySnapshotReader, SqlChangelogQuerySource, SqlWriteContext, WriteAccess};
 use crate::transaction::types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
@@ -513,8 +510,7 @@ impl EntitySpec {
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         let active_branch_id = write_ctx.active_branch_id();
-        let live_state: Arc<dyn LiveStateReader> =
-            Arc::new(WriteContextLiveStateReader::new(write_ctx));
+        let live_state: Arc<dyn LiveStateReader> = Arc::new(write_ctx);
         let entity_snapshot_reader = Arc::new(crate::sql2::CanonicalEntitySnapshotProjection::new(
             Arc::clone(&live_state),
         ));
@@ -550,8 +546,7 @@ impl EntitySpec {
         write_ctx: SqlWriteContext,
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
-        let live_state: Arc<dyn LiveStateReader> =
-            Arc::new(WriteContextLiveStateReader::new(write_ctx));
+        let live_state: Arc<dyn LiveStateReader> = Arc::new(write_ctx);
         let entity_snapshot_reader = Arc::new(crate::sql2::CanonicalEntitySnapshotProjection::new(
             Arc::clone(&live_state),
         ));
@@ -677,7 +672,8 @@ impl EntitySpec {
             untracked: None,
             include_tombstones: false,
         };
-        let rows = WriteContextLiveStateReader::new(write_ctx.clone())
+        let rows = write_ctx
+            .clone()
             .load_exact_batch(&exact_request)
             .await
             .map_err(lix_error_to_datafusion_error)?
