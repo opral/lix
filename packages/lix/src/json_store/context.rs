@@ -135,7 +135,6 @@ impl JsonStoreWriter {
                 .as_hash_bytes()
                 .try_into()
                 .expect("json ref hash is fixed size");
-            #[cfg(feature = "storage-benches")]
             order.push(json_ref);
             if seen.insert(hash) {
                 value_plan.push_json(normalized)?;
