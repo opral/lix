@@ -481,7 +481,13 @@ impl CommitChangePageV2 {
         members: &[CommitMemberV1],
     ) -> Result<PreparedCommitChangePages, StorageError> {
         if members.is_empty() {
-            return Err(corruption("cannot page an empty commit member set"));
+            // Empty/ref-only commits are represented by an empty authenticated
+            // page vector. There is no member object to page, and the commit
+            // envelope remains the sole authority for the empty membership.
+            return Ok(PreparedCommitChangePages {
+                objects: Vec::new(),
+                member_locations: Vec::new(),
+            });
         }
         let mut chunks = Vec::<(u32, Vec<CommitMemberV1>)>::new();
         let mut start = 0usize;
@@ -2342,4 +2348,17 @@ pub(crate) fn snapshot_selector_key(role: SnapshotRole, selector_id: SnapshotSel
 
 pub(super) fn gc_progress_selector_key() -> Bytes {
     Bytes::from_static(b"gc-progress")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommitChangePageV2, CommitId};
+
+    #[test]
+    fn empty_commit_change_pages_are_a_valid_empty_closure() {
+        let pages = CommitChangePageV2::encode_pages(CommitId::from_bytes([0x42; 16]), &[])
+            .expect("empty commit page closure should be encodable");
+        assert!(pages.member_locations.is_empty());
+        assert!(pages.objects.is_empty());
+    }
 }

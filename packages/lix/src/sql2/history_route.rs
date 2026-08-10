@@ -22,6 +22,45 @@ struct AuthenticatedMemberSource {
     record: ChangeRecord,
 }
 
+async fn authenticated_history_metadata<R>(
+    reader: &crate::forktree::ForkTreeReadFacade<R>,
+    commit_id: CommitId,
+    depth: u32,
+    created_at: String,
+    account_id: Option<String>,
+    include_created_at: bool,
+) -> Result<(u32, String, String), LixError>
+where
+    R: StorageAdapterRead,
+{
+    if account_id.is_some() && (!include_created_at || !created_at.is_empty()) {
+        return Ok((
+            depth,
+            created_at,
+            account_id.expect("account presence checked above"),
+        ));
+    }
+    let record = reader.load_required_commit_record(commit_id).await?;
+    if record.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "authenticated history commit '{}' changed identity",
+                commit_id
+            ),
+        ));
+    }
+    Ok((
+        depth,
+        if include_created_at {
+            record.created_at.to_string()
+        } else {
+            created_at
+        },
+        record.account_id,
+    ))
+}
+
 /// Shared routing state for commit-shaped history SQL surfaces.
 ///
 /// History providers differ in how they shape rows, but they should not drift
@@ -425,8 +464,10 @@ where
                     } else {
                         String::new()
                     };
-                    reachable_by_id
-                        .insert(reachable.commit.commit_id, (reachable.depth, created_at));
+                    reachable_by_id.insert(
+                        reachable.commit.commit_id,
+                        (reachable.depth, created_at, Some(record.account_id.clone())),
+                    );
                 }
             }
             (history.entries, reachable_by_id)
@@ -438,7 +479,7 @@ where
         // provenance closure; do not treat an arbitrary state-row commit ID as
         // reachable merely because it is present in a state root.
         let mut member_sources_by_change = BTreeMap::<ChangeId, AuthenticatedMemberSource>::new();
-        for (owner_commit_id, (owner_depth, _)) in &reachable_by_id {
+        for (owner_commit_id, (owner_depth, _, _)) in &reachable_by_id {
             let members = forktree_reader
                 .load_commit_member_sources(*owner_commit_id)
                 .await?
@@ -481,7 +522,7 @@ where
                 Some(
                     reachable_by_id
                         .get(&entry.observed_commit_id)
-                        .map(|(_, created_at)| created_at)
+                        .map(|(_, created_at, _)| created_at)
                         .cloned()
                         .ok_or_else(|| {
                             LixError::new(
@@ -507,43 +548,12 @@ where
 
         let certified_commit_ids = reachable_by_id
             .iter()
-            .filter(|(_, (depth, _))| {
+            .filter(|(_, (depth, _, _))| {
                 request.min_depth.is_none_or(|minimum| *depth >= minimum)
                     && request.max_depth.is_none_or(|maximum| *depth <= maximum)
             })
             .map(|(commit_id, _)| *commit_id)
             .collect::<Vec<_>>();
-        let certified_records = if certified_commit_ids.is_empty() {
-            Vec::new()
-        } else {
-            let mut guard = commit_graph.lock().await;
-            guard.load_commit_records(&certified_commit_ids).await?
-        };
-        if certified_records.len() != certified_commit_ids.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "certified history record batch length does not match requested commit IDs",
-            ));
-        }
-        let mut accounts_by_commit = BTreeMap::new();
-        for (index, commit_id) in certified_commit_ids.iter().copied().enumerate() {
-            let record = certified_records
-                .get(index)
-                .and_then(Option::as_ref)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("certified historical row references missing commit '{commit_id}'"),
-                    )
-                })?;
-            if record.commit_id != commit_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("certified historical commit identity mismatch for '{commit_id}'"),
-                ));
-            }
-            accounts_by_commit.insert(commit_id, record.account_id.clone());
-        }
         let mut existing_change_ids = rows
             .iter()
             .map(|entry| entry.change.id.clone())
@@ -564,23 +574,18 @@ where
                 {
                     validate_authenticated_member_row(&forktree_reader, &row, &source.record)
                         .await?;
-                    if let Some((depth, created_at)) = reachable_by_id.get(&row.commit_id) {
-                        (
-                                *depth,
-                                created_at.clone(),
-                                accounts_by_commit
-                                    .get(&row.commit_id)
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        LixError::new(
-                                            LixError::CODE_INTERNAL_ERROR,
-                                            format!(
-                                                "certified historical row commit '{}' has no authenticated account",
-                                                row.commit_id
-                                            ),
-                                        )
-                                    })?,
-                            )
+                    if let Some((depth, created_at, account_id)) =
+                        reachable_by_id.get(&row.commit_id)
+                    {
+                        authenticated_history_metadata(
+                            &forktree_reader,
+                            row.commit_id,
+                            *depth,
+                            created_at.clone(),
+                            account_id.clone(),
+                            metadata_projection.commit_created_at,
+                        )
+                        .await?
                     } else if source.source_commit_id == row.commit_id {
                         let source_commit = forktree_reader
                             .load_required_commit_record(source.source_commit_id)
@@ -599,20 +604,18 @@ where
                             ),
                         ));
                     }
-                } else if let Some((depth, created_at)) = reachable_by_id.get(&row.commit_id) {
-                    (
-                            *depth,
-                            created_at.clone(),
-                            accounts_by_commit.get(&row.commit_id).cloned().ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INTERNAL_ERROR,
-                                    format!(
-                                        "certified historical row commit '{}' has no authenticated account",
-                                        row.commit_id
-                                    ),
-                                )
-                            })?,
-                        )
+                } else if let Some((depth, created_at, account_id)) =
+                    reachable_by_id.get(&row.commit_id)
+                {
+                    authenticated_history_metadata(
+                        &forktree_reader,
+                        row.commit_id,
+                        *depth,
+                        created_at.clone(),
+                        account_id.clone(),
+                        metadata_projection.commit_created_at,
+                    )
+                    .await?
                 } else {
                     // A compacted state root can retain a row whose source
                     // commit is not on the public parent walk and was not
@@ -661,7 +664,7 @@ where
                     (
                         reachable_by_id
                             .get(&certified_commit_id)
-                            .map(|(depth, _)| *depth)
+                            .map(|(depth, _, _)| *depth)
                             .ok_or_else(|| {
                                 LixError::new(
                                     LixError::CODE_INTERNAL_ERROR,

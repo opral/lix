@@ -2378,8 +2378,15 @@ where
                     .into_iter()
                     .filter_map(|mut write| {
                         let key = PluginFileWriteKey::from(&write);
+                        // A path-only file insert still owns an authenticated
+                        // zero-length BlobRef. Preserve that empty payload
+                        // through reconciliation so publication can create
+                        // its canonical empty Merkle manifest; empty updates
+                        // with an existing BlobRef remain tombstones.
+                        let retain_empty_blob = write.is_empty() && !write.had_blob_ref;
                         let retain_payload = !reconciliation.file_keys.contains(&key)
-                            && (!write.is_empty()
+                            && (retain_empty_blob
+                                || !write.is_empty()
                                 || reconciliation.materialized_file_keys.contains(&key));
                         if retain_payload {
                             return Some(write);

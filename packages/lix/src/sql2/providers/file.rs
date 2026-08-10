@@ -5212,6 +5212,8 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     .map(plugin_storage_archive_file_id)
                     .unwrap_or_else(|| generate_directory_id())
             });
+            let needs_empty_blob_ref = data.is_none() && plugin_key.is_none();
+            let blob_ref_context = context.clone();
             let mut plan = plan_parsed_file_path_write_with_resolvers(
                 path_resolvers,
                 parsed_path,
@@ -5221,6 +5223,30 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 generate_directory_id,
             )
             .map_err(lix_error_to_datafusion_error)?;
+            if needs_empty_blob_ref {
+                let filename = path.rsplit('/').next().map(ToOwned::to_owned);
+                stage_lix_file_content_insert_write(
+                    &mut staged,
+                    file_id.clone(),
+                    Some(path.clone()),
+                    filename,
+                    FileContent::inline(Vec::<u8>::new()),
+                    blob_ref_context.clone(),
+                    Some(lix_file_insert_origin(surface_name, &file_id)),
+                )?;
+                BlobRefRowInput {
+                    file_id: file_id.clone(),
+                    blob_hash: BlobId::from_canonical_content(&[]),
+                    size_bytes: 0,
+                    plugin_checkpoint: None,
+                    context: FilesystemRowContext {
+                        file_id: None,
+                        ..blob_ref_context
+                    },
+                }
+                .append_to(&mut plan.rows)
+                .map_err(lix_error_to_datafusion_error)?;
+            }
             attach_lix_file_insert_origin(&mut plan.rows, surface_name, &file_id);
             staged
                 .extend_filesystem_plan(plan)
