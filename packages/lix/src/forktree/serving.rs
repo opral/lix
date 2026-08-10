@@ -2570,6 +2570,47 @@ where
     Ok((commit.global_state_root, commit.local_state_root))
 }
 
+/// Authenticates only the commit envelope and root/topology summary required
+/// by stale reconciliation. Semantic member closure remains lazy and is
+/// authenticated by the changed state leaves that stale classification reads.
+/// The successful result is cached only in the caller's retained-read
+/// operation; failures are never inserted.
+pub(crate) async fn load_historical_commit_state_roots_for_stale<R>(
+    read: &R,
+    repository: &RepositoryRootV1,
+    commit_id: crate::changelog::CommitId,
+    cache: &mut BTreeMap<crate::changelog::CommitId, (ObjectId, ObjectId)>,
+) -> Result<(ObjectId, ObjectId), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(roots) = cache.get(&commit_id) {
+        return Ok(*roots);
+    }
+    let catalog_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
+    let entry =
+        load_required_commit_catalog_entry(read, repository.commit_catalog_root, catalog_id)
+            .await?;
+    let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != catalog_id {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
+    }
+    validate_commit_catalog_identity(
+        read,
+        repository.commit_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit).await?;
+    validate_root_on_read(commit.global_state_root, "state", read).await?;
+    validate_root_on_read(commit.local_state_root, "state", read).await?;
+    let roots = (commit.global_state_root, commit.local_state_root);
+    cache.insert(commit_id, roots);
+    Ok(roots)
+}
+
 fn historical_state_rows_from_range(
     rows: Vec<(Vec<u8>, StateValue, StateSource)>,
 ) -> Result<Vec<HistoricalStateRow>, crate::LixError> {
