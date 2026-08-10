@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::common::LixTimestamp;
+use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, ObjectId, StateCell, StateKey, StateSource, StateValue,
     UntrackedValue, VisibleStateRow,
@@ -247,6 +248,36 @@ where
         ids: &[crate::changelog::ChangeId],
     ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
         crate::forktree::load_change_records(self.view.retained_read(), ids).await
+    }
+
+    /// Checks authorship against the authenticated ForkTree ChangeCatalog.
+    /// Changes are topology-owned rather than state rows, so account deletion
+    /// must consult this retained view directly instead of inventing a second
+    /// changelog/state authority.
+    pub(crate) async fn has_authored_change(&self, account_id: &str) -> Result<bool, LixError> {
+        const PAGE_SIZE: usize = 256;
+        let mut start_after = None;
+        loop {
+            let records = crate::forktree::scan_change_records(
+                self.view.retained_read(),
+                start_after,
+                PAGE_SIZE,
+            )
+            .await?;
+            if records.is_empty() {
+                return Ok(false);
+            }
+            if records.iter().any(|record| record.account_id == account_id) {
+                return Ok(true);
+            }
+            let Some(last) = records.last() else {
+                return Ok(false);
+            };
+            start_after = Some(last.change_id);
+            if records.len() < PAGE_SIZE {
+                return Ok(false);
+            }
+        }
     }
 
     pub(crate) fn branch_id_matches(&self, branch_id: &str) -> Result<bool, LixError> {
@@ -631,6 +662,64 @@ where
 {
     pub(crate) fn branch_id(&self) -> String {
         self.committed.branch_id()
+    }
+
+    /// Revalidates the author against this transaction's current authenticated
+    /// committed view. Session admission is intentionally insufficient: an
+    /// already-open session must not publish after its account is deleted or
+    /// disabled by another operation.
+    pub(crate) async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
+        let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
+            LixError::new(
+                "LIX_INVALID_ACCOUNT_ID",
+                format!("active account id '{account_id}' is not a canonical UUID"),
+            )
+        })?;
+        let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+            schema_key: "lix_account",
+            file_id: None,
+            entity_pk: &account_pk,
+        });
+        let row = self
+            .points(&[key], true)
+            .await
+            .map_err(LixError::from)?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ACCOUNT_NOT_FOUND",
+                    format!("active account '{account_id}' does not exist"),
+                )
+            })?;
+        let snapshot = match row.value.cell {
+            StateCell::Value(value) => value,
+            StateCell::Null | StateCell::Tombstone => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("account '{account_id}' has no snapshot"),
+                ));
+            }
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("account '{account_id}' has invalid JSON: {error}"),
+                )
+            })?;
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("active") {
+            return Err(LixError::new(
+                "LIX_ACCOUNT_DISABLED",
+                format!("active account '{account_id}' is disabled"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn has_authored_change(&self, account_id: &str) -> Result<bool, LixError> {
+        self.committed.has_authored_change(account_id).await
     }
 
     pub(crate) fn new(
