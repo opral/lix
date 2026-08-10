@@ -106,6 +106,19 @@ pub(super) fn authenticate_object_domain(
     ObjectDomain::decode(domain)
 }
 
+/// Hashes an object envelope without materializing its payload. The parts are
+/// concatenated after the same magic/domain prefix used by `encode_object`.
+/// Callers must provide the exact canonical payload encoding for the domain.
+pub(super) fn hash_object_parts(domain: ObjectDomain, parts: &[&[u8]]) -> ObjectId {
+    let mut hasher = blake3::Hasher::new_derive_key(OBJECT_HASH_DOMAIN);
+    hasher.update(OBJECT_MAGIC);
+    hasher.update(&(domain as u32).to_be_bytes());
+    for part in parts {
+        hasher.update(part);
+    }
+    ObjectId(*hasher.finalize().as_bytes())
+}
+
 pub(super) fn encode_object(
     domain: ObjectDomain,
     encode_payload: impl FnOnce(&mut Encoder) -> Result<(), StorageError>,
