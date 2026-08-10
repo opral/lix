@@ -1422,7 +1422,7 @@ where
     /// column schema (the same builder the scan path uses).
     async fn scan_conflict_candidates(
         &self,
-        write_ctx: &SqlWriteContext<R>,
+        _write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
         target: &UpsertConflictTarget,
     ) -> Result<RecordBatch> {
@@ -1464,23 +1464,18 @@ where
                 .path_index(&FilesystemPathIndexRequest::new(
                     request.filter.branch_ids.clone(),
                 ))
-                .await;
-            if let Ok(index) = index {
-                let matches = indexed_path_matches(
-                    index,
-                    &proposed_directory_path_predicate(proposed)?,
-                    FilesystemPathKind::Directory,
-                );
-                return indexed_lix_directory_record_batch(&self.schema, &matches)
-                    .map_err(lix_error_to_datafusion_error);
-            }
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            let matches = indexed_path_matches(
+                index,
+                &proposed_directory_path_predicate(proposed)?,
+                FilesystemPathKind::Directory,
+            );
+            return indexed_lix_directory_record_batch(&self.schema, &matches)
+                .map_err(lix_error_to_datafusion_error);
         }
 
-        let transaction_spec = Self {
-            state: DirectoryState::Transaction(write_ctx.state_view().clone()),
-            ..self.clone()
-        };
-        let rows = transaction_spec.load_rows(&request).await?;
+        let rows = self.load_rows(&request).await?;
         lix_directory_record_batch_with_branch_ids(&self.schema, rows)
             .map_err(lix_error_to_datafusion_error)
     }
@@ -2867,7 +2862,7 @@ mod tests {
         let write_state = Arc::new(write_ctx.clone());
         let branch_ref = Arc::new(write_ctx.clone());
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = write_state;
-        let state = DirectoryState::Transaction(write_ctx.state_view().clone());
+        let state = DirectoryState::Fixture(Vec::new());
         let spec = match branch_binding {
             BranchBinding::Active { .. } => LixDirectorySpec::active_branch(
                 write_ctx.active_branch_id(),
@@ -2895,7 +2890,7 @@ mod tests {
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
         let branch_ref = Arc::new(write_ctx.clone());
-        let state = DirectoryState::Transaction(write_ctx.state_view().clone());
+        let state = DirectoryState::Fixture(Vec::new());
         let spec = LixDirectorySpec::active_branch(
             write_ctx.active_branch_id(),
             state,
@@ -2931,7 +2926,7 @@ mod tests {
         type ReadStore = FixtureRead;
 
         fn state_view(&self) -> &crate::state::TransactionStateView<Self::ReadStore> {
-            panic!("this focused write fixture must use its injected path-index owner")
+            panic!("directory fixture must use its native state/path-index owner")
         }
 
         fn active_branch_id(&self) -> &str {
@@ -2944,6 +2939,13 @@ mod tests {
 
         fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
             Ok(Vec::new())
+        }
+
+        async fn filesystem_path_index(
+            &mut self,
+            _request: &FilesystemPathIndexRequest,
+        ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+            Ok(Arc::new(path_index_from_rows(self.rows.clone())?))
         }
 
         async fn load_branch_head(
@@ -3019,6 +3021,43 @@ mod tests {
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
+    }
+
+    fn state_rows_from_filesystem_rows(rows: &[FilesystemStateRow]) -> Vec<StateRow> {
+        rows.iter()
+            .map(|row| {
+                let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                });
+                let cell = if row.deleted {
+                    StateCell::Tombstone
+                } else if let Some(snapshot) = &row.snapshot_content {
+                    StateCell::Value(snapshot.clone())
+                } else {
+                    StateCell::Null
+                };
+                StateRow {
+                    key,
+                    value: StateValue {
+                        change_id: row.change_id.expect("fixture row change id"),
+                        commit_id: row.commit_id.expect("fixture row commit id"),
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        cell,
+                        metadata: row.metadata.clone(),
+                        origin_key: None,
+                        blob_manifest_object_ids: Vec::new(),
+                    },
+                    source: if row.global {
+                        StateRowSource::Global
+                    } else {
+                        StateRowSource::Branch
+                    },
+                }
+            })
+            .collect()
     }
 
     fn filesystem_rows() -> Vec<FilesystemStateRow> {
@@ -3755,7 +3794,9 @@ mod tests {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             let spec = LixDirectorySpec::active_branch(
                 "01920000-0000-7000-8000-0000000000a1",
-                DirectoryState::<FixtureRead>::Fixture(Vec::new()),
+                DirectoryState::<FixtureRead>::Fixture(state_rows_from_filesystem_rows(
+                    &write_context.rows,
+                )),
                 filesystem_path_index,
                 Arc::new(TestBranchRefReader),
                 test_functions(),
@@ -3877,11 +3918,12 @@ mod tests {
             writes: Vec::new(),
             reject_scans: false,
         };
+        let state_rows = state_rows_from_filesystem_rows(&write_context.rows);
         let candidates = {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             let spec = LixDirectorySpec::active_branch(
                 "01920000-0000-7000-8000-0000000000a1",
-                DirectoryState::<FixtureRead>::Fixture(Vec::new()),
+                DirectoryState::<FixtureRead>::Fixture(state_rows),
                 filesystem_path_index,
                 Arc::new(TestBranchRefReader),
                 test_functions(),
@@ -3912,7 +3954,7 @@ mod tests {
         let write_state = Arc::new(write_ctx.clone());
         let branch_ref = Arc::new(write_ctx.clone());
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = write_state;
-        let state = DirectoryState::Transaction(write_ctx.state_view().clone());
+        let state = DirectoryState::<FixtureRead>::Fixture(Vec::new());
         let provider = SpecTableProvider::new(Arc::new(LixDirectorySpec::active_branch(
             write_ctx.active_branch_id(),
             state,
