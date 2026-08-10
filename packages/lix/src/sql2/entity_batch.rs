@@ -122,6 +122,12 @@ where
         request,
         view.branch_id(),
         |branch_id, lower, upper| async move {
+            // When both authorities participate, fetch their complete bounded
+            // inputs and retain tombstones until the native merge resolves
+            // precedence. Applying the public limit or hiding tombstones in
+            // either input can resurrect a tracked row or discard a later
+            // visible row before visibility is known.
+            let (source_limit, source_include_tombstones) = overlay_source_options(request);
             let tracked = if request.filter.untracked == Some(true) {
                 Vec::new()
             } else {
@@ -129,8 +135,8 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    request.limit,
-                    request.filter.include_tombstones,
+                    source_limit,
+                    source_include_tombstones,
                 )
                 .await?
                 .into_iter()
@@ -147,8 +153,8 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    request.limit,
-                    request.filter.include_tombstones,
+                    source_limit,
+                    source_include_tombstones,
                 )
                 .await?
                 .into_iter()
@@ -177,6 +183,7 @@ where
         request,
         view.branch_id(),
         |branch_id, lower, upper| async move {
+            let (source_limit, source_include_tombstones) = overlay_source_options(request);
             let tracked = if request.filter.untracked == Some(true) {
                 Vec::new()
             } else {
@@ -184,8 +191,8 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    request.limit,
-                    request.filter.include_tombstones,
+                    source_limit,
+                    source_include_tombstones,
                 )
                 .await?
                 .into_iter()
@@ -202,8 +209,8 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    request.limit,
-                    request.filter.include_tombstones,
+                    source_limit,
+                    source_include_tombstones,
                 )
                 .await?
                 .into_iter()
@@ -219,6 +226,14 @@ where
         },
     )
     .await
+}
+
+fn overlay_source_options(request: &EntityScanRequest) -> (Option<usize>, bool) {
+    let needs_overlay = request.filter.untracked.is_none();
+    (
+        (!needs_overlay).then_some(request.limit).flatten(),
+        request.filter.include_tombstones || needs_overlay,
+    )
 }
 
 async fn scan_slots_by_branches<F, Fut>(
@@ -692,6 +707,23 @@ mod tests {
             untracked: Some(false),
             include_tombstones,
         }
+    }
+
+    #[test]
+    fn range_overlay_resolves_visibility_before_source_limit() {
+        let mut request = EntityScanRequest::default();
+        request.limit = Some(1);
+
+        assert_eq!(overlay_source_options(&request), (None, true));
+
+        request.filter.include_tombstones = true;
+        assert_eq!(overlay_source_options(&request), (None, true));
+
+        request.filter.untracked = Some(false);
+        assert_eq!(overlay_source_options(&request), (Some(1), true));
+
+        request.filter.include_tombstones = false;
+        assert_eq!(overlay_source_options(&request), (Some(1), false));
     }
 
     #[test]
