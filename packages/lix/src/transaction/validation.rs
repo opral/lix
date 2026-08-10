@@ -11,7 +11,6 @@ use std::collections::BTreeSet;
 
 use serde_json::Value as JsonValue;
 
-use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::catalog::{CatalogSnapshot, SchemaPlan};
 use crate::common::{SharedStr, json_pointer_get, validate_row_metadata};
@@ -81,13 +80,9 @@ impl NativeValidationRow {
             StateCell::Null => (Some(SharedStr::from("null")), false),
             StateCell::Tombstone => (None, true),
         };
-        let branch_id = match row.source {
-            StateRowSource::Global => GLOBAL_BRANCH_ID.to_owned(),
-            StateRowSource::Branch | StateRowSource::Staged => branch_id.to_owned(),
-        };
         Ok(Self {
             key,
-            branch_id,
+            branch_id: branch_id.to_owned(),
             global: matches!(row.source, StateRowSource::Global),
             untracked: false,
             snapshot,

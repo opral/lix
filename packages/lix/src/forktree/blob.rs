@@ -456,7 +456,7 @@ where
     where
         R: Sync,
     {
-        if branch_id != self.branch_id() {
+        if !global && branch_id != self.branch_id() {
             return Err(crate::LixError::new(
                 crate::LixError::CODE_STORAGE_ERROR,
                 "selected filesystem BlobRef branch differs from the retained ForkTree view",
@@ -508,7 +508,7 @@ where
     where
         R: Sync,
     {
-        if branch_id != self.branch_id() {
+        if !global && branch_id != self.branch_id() {
             return Err(crate::LixError::new(
                 crate::LixError::CODE_STORAGE_ERROR,
                 "selected filesystem BlobRef branch differs from the retained ForkTree view",
