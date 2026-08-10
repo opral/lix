@@ -926,14 +926,15 @@ where
         }
 
         let facade = self.forktree_read_facade();
-        let concurrent_payload = facade
-            .diff_state_rows_between_commits(opening_head, current_head)
+        let concurrent_changes = facade
+            .stale_state_changes_between_commits(opening_head, current_head)
             .instrument(tracing::debug_span!(
                 target: "lix_transaction",
-                "lix.transaction.stale.forktree_diff"
+                "lix.transaction.stale.forktree_root_diff"
             ))
             .await?;
-        let mut concurrent_keys = concurrent_payload
+        let mut concurrent_keys = concurrent_changes
+            .payload
             .into_iter()
             .filter_map(|entry| entry.after.or(entry.before))
             .map(|row| StateKey {
@@ -942,18 +943,16 @@ where
                 entity_pk: row.key.entity_pk,
             })
             .collect::<Vec<_>>();
-        let concurrent_identity = facade
-            .touched_state_identities_between_commits(opening_head, current_head)
-            .instrument(tracing::debug_span!(
-                target: "lix_transaction",
-                "lix.transaction.stale.forktree_identity"
-            ))
-            .await?;
-        concurrent_keys.extend(concurrent_identity.into_iter().map(|change| StateKey {
-            schema_key: change.key.schema_key,
-            file_id: change.key.file_id,
-            entity_pk: change.key.entity_pk,
-        }));
+        concurrent_keys.extend(
+            concurrent_changes
+                .identities
+                .into_iter()
+                .map(|change| StateKey {
+                    schema_key: change.key.schema_key,
+                    file_id: change.key.file_id,
+                    entity_pk: change.key.entity_pk,
+                }),
+        );
         concurrent_keys.sort();
         concurrent_keys.dedup();
         let concurrent_change_count = concurrent_keys.len();

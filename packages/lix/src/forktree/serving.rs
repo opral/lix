@@ -1318,7 +1318,7 @@ where
     Ok(records)
 }
 
-async fn load_repository_root<R>(read: &R) -> Result<RepositoryRootV1, crate::LixError>
+pub(crate) async fn load_repository_root<R>(read: &R) -> Result<RepositoryRootV1, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -2820,7 +2820,7 @@ where
     load_historical_commit_state_roots_from_repository(read, &repository, commit_id).await
 }
 
-async fn load_historical_commit_state_roots_from_repository<R>(
+pub(crate) async fn load_historical_commit_state_roots_from_repository<R>(
     read: &R,
     repository: &RepositoryRootV1,
     commit_id: crate::changelog::CommitId,
