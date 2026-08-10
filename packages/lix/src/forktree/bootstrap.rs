@@ -590,6 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_accepts_first_repository_and_rejects_second() {
+        let _race_test_lock = race_test_lock().await;
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
