@@ -12,7 +12,7 @@ use crate::catalog::snapshot::{
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::schema::schema_key_from_definition;
-use crate::state::{ForkTreeStateView, StateRow, TransactionStateView, UntrackedStateRow};
+use crate::state::{StateRow, TransactionStateView, UntrackedStateRow};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
@@ -95,18 +95,6 @@ impl CatalogContext {
         R: crate::storage_adapter::StorageAdapterRead,
     {
         let catalog_rows = scan_transaction_catalog_rows(state, domain).await?;
-        self.compiled_catalog_for_rows(&catalog_rows)
-    }
-
-    pub(crate) async fn compiled_catalog_for_domain<R>(
-        &self,
-        state: &ForkTreeStateView<R>,
-        domain: &Domain,
-    ) -> Result<Arc<CatalogSnapshot>, LixError>
-    where
-        R: crate::storage_adapter::StorageAdapterRead,
-    {
-        let catalog_rows = scan_catalog_rows(state, domain).await?;
         self.compiled_catalog_for_rows(&catalog_rows)
     }
 
@@ -247,47 +235,6 @@ fn catalog_row_from_untracked(row: UntrackedStateRow) -> CatalogRow {
         snapshot_content,
         untracked: true,
     }
-}
-
-async fn scan_catalog_rows<R>(
-    state: &ForkTreeStateView<R>,
-    domain: &Domain,
-) -> Result<CatalogRows, LixError>
-where
-    R: crate::storage_adapter::StorageAdapterRead,
-{
-    let schema_domains = domain.schema_catalog_domains();
-    let mut catalog_rows = Vec::with_capacity(schema_domains.len());
-    for schema_domain in schema_domains {
-        if schema_domain.untracked() {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                "untracked schema catalogs require the TransactionStateView untracked seam",
-            ));
-        }
-        let rows = if schema_domain.untracked() {
-            state
-                .untracked_overlay_rows()
-                .await?
-                .into_iter()
-                .map(catalog_row_from_untracked)
-                .collect()
-        } else {
-            state
-                .range(None, None, None, false)
-                .await?
-                .into_iter()
-                .map(catalog_row_from_state)
-                .collect()
-        };
-        catalog_rows.push(CatalogDomainRows {
-            domain: schema_domain,
-            rows,
-        });
-    }
-    Ok(CatalogRows {
-        domains: catalog_rows,
-    })
 }
 
 async fn scan_transaction_catalog_rows<R>(
