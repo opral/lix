@@ -147,10 +147,6 @@ struct NativeValidationRows {
 }
 
 impl NativeValidationRows {
-    fn iter(&self) -> impl Iterator<Item = &NativeValidationRow> {
-        self.rows.iter()
-    }
-
     fn extend(&mut self, other: Self) {
         self.rows.extend(other.rows);
     }
@@ -159,6 +155,7 @@ impl NativeValidationRows {
 type PropertyGroupKey = Vec<Vec<String>>;
 type PropertyValueKey = (String, PropertyGroupKey, Vec<String>);
 type InsertIdentityKey = (String, bool, Option<String>, String, EntityPk);
+type NamespaceKey = (String, bool, Option<String>, String);
 
 /// One-pass indexes over the authenticated committed rows used by validation.
 /// The old implementation re-scanned every committed row for every staged row
@@ -170,6 +167,7 @@ struct NativeValidationIndex {
     property_values: BTreeMap<PropertyValueKey, Vec<usize>>,
     file_owners: BTreeMap<String, Vec<usize>>,
     insert_identities: BTreeMap<InsertIdentityKey, Vec<usize>>,
+    namespace_paths: BTreeMap<NamespaceKey, Vec<usize>>,
 }
 
 impl NativeValidationIndex {
@@ -184,6 +182,10 @@ impl NativeValidationIndex {
             }
             for foreign_key in &plan.foreign_keys {
                 property_groups
+                    .entry(plan.key.schema_key.clone())
+                    .or_default()
+                    .insert(foreign_key.local_properties.clone());
+                property_groups
                     .entry(foreign_key.referenced_schema.schema_key.clone())
                     .or_default()
                     .insert(foreign_key.referenced_properties.clone());
@@ -193,6 +195,7 @@ impl NativeValidationIndex {
         let mut property_values = BTreeMap::<PropertyValueKey, Vec<usize>>::new();
         let mut file_owners = BTreeMap::<String, Vec<usize>>::new();
         let mut insert_identities = BTreeMap::<InsertIdentityKey, Vec<usize>>::new();
+        let mut namespace_paths = BTreeMap::<NamespaceKey, Vec<usize>>::new();
         for (index, row) in rows.rows.iter().enumerate() {
             if row.deleted {
                 continue;
@@ -222,6 +225,18 @@ impl NativeValidationIndex {
                 }
             }
 
+            if matches!(
+                row.schema_key(),
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY | FILE_DESCRIPTOR_SCHEMA_KEY
+            ) {
+                if let Ok(Some((parent, name))) = descriptor_namespace_parts(row) {
+                    namespace_paths
+                        .entry((row.branch_id.clone(), row.untracked, parent, name))
+                        .or_default()
+                        .push(index);
+                }
+            }
+
             let Some(groups) = property_groups.get(row.schema_key()) else {
                 continue;
             };
@@ -243,11 +258,8 @@ impl NativeValidationIndex {
             property_values,
             file_owners,
             insert_identities,
+            namespace_paths,
         })
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &NativeValidationRow> {
-        self.rows.iter()
     }
 
     fn row(&self, index: usize) -> &NativeValidationRow {
@@ -276,6 +288,24 @@ impl NativeValidationIndex {
     fn insert_identity_candidates(&self, key: &InsertIdentityKey) -> &[usize] {
         self.insert_identities
             .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn namespace_candidates(
+        &self,
+        branch_id: &str,
+        untracked: bool,
+        parent: Option<&str>,
+        name: &str,
+    ) -> &[usize] {
+        self.namespace_paths
+            .get(&(
+                branch_id.to_owned(),
+                untracked,
+                parent.map(str::to_owned),
+                name.to_owned(),
+            ))
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
@@ -823,24 +853,19 @@ where
         let Some((parent, name)) = prepared_descriptor_namespace_parts(row)? else {
             continue;
         };
-        let committed_conflict = all_rows.iter().any(|candidate| {
-            !candidate.deleted
-                && candidate.schema_key() != row.schema_key()
-                && matches!(
-                    candidate.schema_key(),
-                    DIRECTORY_DESCRIPTOR_SCHEMA_KEY | FILE_DESCRIPTOR_SCHEMA_KEY
-                )
-                && same_scope(candidate, row)
-                && candidate.entity_pk() != row.entity_pk()
-                && !staged_rows
-                    .iter()
-                    .copied()
-                    .any(|staged| staged_identity_matches(candidate, staged))
-                && descriptor_namespace_parts(candidate)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|parts| parts == (parent.clone(), name.clone()))
-        });
+        let committed_conflict = all_rows
+            .namespace_candidates(row.branch_id(), row.untracked(), parent.as_deref(), &name)
+            .iter()
+            .map(|&candidate_index| all_rows.row(candidate_index))
+            .any(|candidate| {
+                candidate.schema_key() != row.schema_key()
+                    && same_scope(candidate, row)
+                    && candidate.entity_pk() != row.entity_pk()
+                    && !staged_rows
+                        .iter()
+                        .copied()
+                        .any(|staged| staged_identity_matches(candidate, staged))
+            });
         if committed_conflict {
             return Err(constraint_error(format!(
                 "filesystem namespace conflict for parent {:?} entry {:?}",
@@ -913,23 +938,22 @@ where
             ) else {
                 continue;
             };
-            let committed_conflict = all_rows.iter().any(|candidate| {
-                !candidate.deleted
-                    && candidate.schema_key() == reference.source_key.schema_key
-                    && candidate.untracked == tombstone.untracked()
-                    && !staged_rows
-                        .iter()
-                        .copied()
-                        .any(|row| staged_identity_matches(candidate, row))
-                    && candidate
-                        .snapshot_json()
-                        .ok()
-                        .flatten()
-                        .and_then(|snapshot| {
-                            pointer_group_value(&snapshot, &reference.foreign_key.local_properties)
-                        })
-                        == Some(deleted_value.clone())
-            });
+            let committed_conflict = all_rows
+                .property_candidates(
+                    reference.source_key.schema_key.as_str(),
+                    &reference.foreign_key.local_properties,
+                    &deleted_value,
+                )
+                .iter()
+                .map(|&candidate_index| all_rows.row(candidate_index))
+                .any(|candidate| {
+                    candidate.schema_key() == reference.source_key.schema_key
+                        && candidate.untracked == tombstone.untracked()
+                        && !staged_rows
+                            .iter()
+                            .copied()
+                            .any(|row| staged_identity_matches(candidate, row))
+                });
             let staged_conflict = staged_rows.iter().copied().any(|candidate| {
                 !row_is_tombstone(candidate)
                     && candidate.schema_key() == reference.source_key.schema_key
@@ -1263,8 +1287,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
     }
 
-    #[test]
-    fn validation_index_candidate_count_stays_bounded_by_changed_values() {
+    fn validation_index_candidate_count(row_count: usize) -> usize {
         let schema = serde_json::json!({
             "x-lix-key": "validation_scale",
             "x-lix-primary-key": ["/id"],
@@ -1280,14 +1303,13 @@ mod tests {
         let catalog =
             CatalogSnapshot::from_visible_schemas(&[schema]).expect("test schema must compile");
         let mut rows = NativeValidationRows::default();
-        for index in 0..4096 {
+        for index in 0..row_count {
             rows.rows.push(native_row(
                 "validation_scale",
                 &format!(r#"{{"id":"{index}","slug":"slug-{index}"}}"#),
             ));
         }
 
-        let row_count = rows.rows.len();
         let validation_index =
             NativeValidationIndex::build(rows, &catalog).expect("test rows must index");
         let unique_group = vec![vec!["slug".to_owned()]];
@@ -1298,9 +1320,6 @@ mod tests {
                 &["\"slug-2048\"".to_owned()],
             )
             .len();
-
-        assert_eq!(row_count, 4096);
-        assert_eq!(candidate_count, 1);
         assert_eq!(
             validation_index
                 .property_candidates(
@@ -1311,5 +1330,16 @@ mod tests {
                 .len(),
             0
         );
+        candidate_count
+    }
+
+    #[test]
+    fn validation_index_4k_candidate_count_stays_bounded_by_changed_values() {
+        assert_eq!(validation_index_candidate_count(4_096), 1);
+    }
+
+    #[test]
+    fn validation_index_50k_candidate_count_stays_bounded_by_changed_values() {
+        assert_eq!(validation_index_candidate_count(50_000), 1);
     }
 }
