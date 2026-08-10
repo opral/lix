@@ -190,16 +190,6 @@ where
     })
 }
 
-async fn semantic_change_for_member_on_view<R>(
-    view: &CoherentView<R>,
-    member: &CommitMemberV1,
-) -> Result<ChangeObjectV1, StorageError>
-where
-    R: StorageAdapterRead,
-{
-    semantic_change_for_member(view.retained_read(), member).await
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateSource {
     Global,
@@ -1989,50 +1979,280 @@ where
     Ok(())
 }
 
-pub(crate) async fn select_historical_commit_member<R>(
-    view: &CoherentView<R>,
+/// One ordered-history identity selected from an already published commit.
+///
+/// Callers identify the semantic member and state row only. Catalog roots,
+/// object addresses, member ordinals, source-state roots, and sequence-state
+/// roots are derived and authenticated inside [`select_historical_commit_members`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoricalMemberSelection {
     source_commit_id: CommitId,
     change_id: ChangeId,
-) -> Result<(CommitMemberV1, CommitObjectV1, ChangeObjectV1), StorageError>
+    state_key: Vec<u8>,
+}
+
+impl HistoricalMemberSelection {
+    pub(crate) fn new(source_commit_id: CommitId, change_id: ChangeId, state_key: Vec<u8>) -> Self {
+        Self {
+            source_commit_id,
+            change_id,
+            state_key,
+        }
+    }
+}
+
+/// Authenticated resolution of one ordered historical member.
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedHistoricalMember {
+    pub(crate) member: CommitMemberV1,
+    pub(crate) source_commit: CommitObjectV1,
+    pub(crate) source_change: ChangeObjectV1,
+    pub(crate) source_state: StateValue,
+    pub(crate) source_domain: StateSource,
+    pub(crate) sequence_state: Option<(StateValue, StateSource)>,
+}
+
+/// One operation-owned selected-member result. The authenticated sequence
+/// parent is returned so ordered publication can reuse its roots for fresh
+/// rows without reopening or accepting caller-supplied tree targets.
+#[derive(Debug)]
+pub(crate) struct SelectedHistoricalMemberBatch {
+    sequence_parent: CommitObjectV1,
+    selected: Vec<SelectedHistoricalMember>,
+    proof: HistoricalMemberBatchProof,
+}
+
+impl SelectedHistoricalMemberBatch {
+    pub(crate) fn sequence_parent(&self) -> &CommitObjectV1 {
+        &self.sequence_parent
+    }
+
+    pub(crate) fn take_selected(&mut self) -> Vec<SelectedHistoricalMember> {
+        std::mem::take(&mut self.selected)
+    }
+
+    pub(super) fn consume_proof(
+        &mut self,
+        view_instance_id: u64,
+        target_generation: u64,
+        member: &CommitMemberV1,
+    ) -> Result<(), StorageError> {
+        self.proof
+            .consume(view_instance_id, target_generation, member)
+    }
+
+    pub(super) fn finish_proof(self, view_instance_id: u64) -> Result<(), StorageError> {
+        if !self.selected.is_empty() {
+            return Err(corruption(
+                "ordered history publication received unconsumed selected rows",
+            ));
+        }
+        self.proof.finish(view_instance_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HistoricalMemberProofKey {
+    source_commit_object_id: ObjectId,
+    source_ordinal: u32,
+    change_id: ChangeId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HistoricalMemberProofEntry {
+    source_generation: u64,
+    remaining: usize,
+}
+
+/// Ephemeral evidence produced only by the authenticated selected-member
+/// resolver. Ordered publication consumes it on the exact originating view;
+/// callers cannot construct roots, owner entries, ordinals, or generations.
+#[derive(Debug)]
+struct HistoricalMemberBatchProof {
+    view_instance_id: u64,
+    members: BTreeMap<HistoricalMemberProofKey, HistoricalMemberProofEntry>,
+}
+
+impl HistoricalMemberBatchProof {
+    pub(super) fn consume(
+        &mut self,
+        view_instance_id: u64,
+        target_generation: u64,
+        member: &CommitMemberV1,
+    ) -> Result<(), StorageError> {
+        if self.view_instance_id != view_instance_id {
+            return Err(corruption(
+                "selected-member proof belongs to another retained view",
+            ));
+        }
+        let (source_commit_object_id, source_ordinal) = member
+            .source()
+            .ok_or_else(|| corruption("selected-member proof received an introduced member"))?;
+        let key = HistoricalMemberProofKey {
+            source_commit_object_id,
+            source_ordinal,
+            change_id: member.change_id(),
+        };
+        let entry = self
+            .members
+            .get_mut(&key)
+            .ok_or_else(|| corruption("ordered history member has no authenticated batch proof"))?;
+        if entry.remaining == 0 || entry.source_generation >= target_generation {
+            return Err(corruption(
+                "ordered history member proof is exhausted or has an invalid generation",
+            ));
+        }
+        entry.remaining -= 1;
+        Ok(())
+    }
+
+    pub(super) fn finish(self, view_instance_id: u64) -> Result<(), StorageError> {
+        if self.view_instance_id != view_instance_id
+            || self.members.values().any(|entry| entry.remaining != 0)
+        {
+            return Err(corruption(
+                "ordered history did not consume its exact authenticated member batch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct HistoricalSourceClosure {
+    object_id: ObjectId,
+    commit: CommitObjectV1,
+    members: Arc<[CommitMemberV1]>,
+    ordinal_by_change: BTreeMap<ChangeId, usize>,
+}
+
+/// Resolves an ordered merge/checkpoint selection with one retained view.
+///
+/// Work is grouped by source commit. Each source CommitCatalog/object/member
+/// closure is authenticated once, each closure receives one ChangeId index,
+/// source-state points are batched per source root pair, and sequence-state
+/// points are resolved in one batch. The returned vector preserves request
+/// order and repeated requests; malformed duplicate closure membership remains
+/// fail-closed in the canonical commit decoder.
+pub(crate) async fn select_historical_commit_members<R>(
+    view: &CoherentView<R>,
+    sequence_parent_id: CommitId,
+    selections: &[HistoricalMemberSelection],
+) -> Result<SelectedHistoricalMemberBatch, StorageError>
 where
     R: StorageAdapterRead,
 {
-    let source = load_commit(view, source_commit_id)
+    let sequence_parent = load_commit(view, sequence_parent_id)
         .await?
-        .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
-    let (source_commit_object_id, _) = source.encode()?;
-    let source_members = view.load_commit_members(&source).await?;
-    for (source_ordinal, source_member) in source_members.iter().enumerate() {
-        if source_member.change_id() != change_id {
-            continue;
-        }
-        let change = semantic_change_for_member_on_view(view, source_member).await?;
-        let value = view
-            .lookup_tree_value(
-                view.repository_root().change_catalog_root,
-                "change",
-                change_id.as_bytes(),
-            )
+        .ok_or_else(|| corruption("ordered history sequence parent is absent"))?;
+    if selections.is_empty() {
+        return Ok(SelectedHistoricalMemberBatch {
+            sequence_parent,
+            selected: Vec::new(),
+            proof: HistoricalMemberBatchProof {
+                view_instance_id: view.view_instance_id(),
+                members: BTreeMap::new(),
+            },
+        });
+    }
+
+    let unique_source_ids = selections
+        .iter()
+        .map(|selection| selection.source_commit_id)
+        .collect::<BTreeSet<_>>();
+    let mut sources = BTreeMap::<CommitId, HistoricalSourceClosure>::new();
+    let mut authenticated_closures = BTreeMap::<ObjectId, AuthenticatedCommitMemberClosure>::new();
+    for source_commit_id in unique_source_ids {
+        let (source_object_id, source, members) = load_commit_with_members(view, source_commit_id)
             .await?
-            .ok_or_else(|| corruption("selected Change has no ChangeCatalog introduction owner"))?;
-        let entry = ChangeCatalogEntry::decode(&value)?;
-        view.validate_member_catalog_owner(
+            .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
+        let mut ordinal_by_change = BTreeMap::new();
+        for (ordinal, member) in members.iter().enumerate() {
+            if ordinal_by_change
+                .insert(member.change_id(), ordinal)
+                .is_some()
+            {
+                return Err(corruption(
+                    "selected source commit repeats one authenticated ChangeId",
+                ));
+            }
+        }
+        authenticated_closures.insert(source_object_id, (source.clone(), Arc::clone(&members)));
+        sources.insert(
+            source_commit_id,
+            HistoricalSourceClosure {
+                object_id: source_object_id,
+                commit: source,
+                members,
+                ordinal_by_change,
+            },
+        );
+    }
+
+    let mut resolved_members = Vec::with_capacity(selections.len());
+    let mut proof_members = BTreeMap::<HistoricalMemberProofKey, HistoricalMemberProofEntry>::new();
+    for selection in selections {
+        let source = sources
+            .get(&selection.source_commit_id)
+            .ok_or_else(|| corruption("selected source commit batch is incomplete"))?;
+        let source_ordinal = *source
+            .ordinal_by_change
+            .get(&selection.change_id)
+            .ok_or_else(|| {
+                corruption(
+                    "selected ChangeId is absent from its authenticated source commit membership",
+                )
+            })?;
+        let source_member = source
+            .members
+            .get(source_ordinal)
+            .ok_or_else(|| corruption("selected source ordinal is absent"))?;
+        let source_change = semantic_change_for_member_with_commit_cache(
+            view.retained_read(),
             view.repository_root().commit_catalog_root,
-            source_commit_object_id,
-            source.generation,
-            source_ordinal,
-            source_member.clone(),
-            entry,
+            source_member,
+            &mut authenticated_closures,
         )
         .await?;
-        return Ok((
+        if source_change.change_id() != selection.change_id {
+            return Err(corruption(
+                "selected source Change disagrees with requested ChangeId",
+            ));
+        }
+        let proof_key = HistoricalMemberProofKey {
+            source_commit_object_id: source.object_id,
+            source_ordinal: u32::try_from(source_ordinal)
+                .map_err(|_| corruption("selected source ordinal exceeds u32"))?,
+            change_id: selection.change_id,
+        };
+        match proof_members.entry(proof_key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(HistoricalMemberProofEntry {
+                    source_generation: source.commit.generation,
+                    remaining: 1,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().source_generation != source.commit.generation {
+                    return Err(corruption(
+                        "selected-member proof repeats an owner with another generation",
+                    ));
+                }
+                entry.get_mut().remaining = entry
+                    .get()
+                    .remaining
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("selected-member proof count overflows usize"))?;
+            }
+        }
+        resolved_members.push((
             CommitMemberV1::selected(
-                change_id,
-                source_commit_object_id,
+                selection.change_id,
+                source.object_id,
                 u32::try_from(source_ordinal)
                     .map_err(|_| corruption("selected source ordinal exceeds u32"))?,
                 crate::changelog::decode_forktree_change_payload(
-                    match &change {
+                    match &source_change {
                         ChangeObjectV1::Semantic { payload, .. } => payload,
                         ChangeObjectV1::BranchRef { .. } => {
                             return Err(corruption(
@@ -2040,18 +2260,85 @@ where
                             ));
                         }
                     },
-                    crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*change_id.as_bytes())),
+                    crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+                        *selection.change_id.as_bytes(),
+                    )),
                 )
                 .map_err(|error| corruption(error.to_string()))?
                 .created_at,
             ),
-            source,
-            change,
+            source.commit.clone(),
+            source_change,
         ));
     }
-    Err(corruption(
-        "selected ChangeId is absent from its authenticated source commit membership",
-    ))
+
+    let mut source_state = vec![None; selections.len()];
+    let mut requests_by_source = BTreeMap::<CommitId, Vec<usize>>::new();
+    for (slot, selection) in selections.iter().enumerate() {
+        requests_by_source
+            .entry(selection.source_commit_id)
+            .or_default()
+            .push(slot);
+    }
+    for (source_commit_id, slots) in requests_by_source {
+        let source = sources
+            .get(&source_commit_id)
+            .ok_or_else(|| corruption("selected source state batch is incomplete"))?;
+        let keys = slots
+            .iter()
+            .map(|slot| selections[*slot].state_key.clone())
+            .collect::<Vec<_>>();
+        let values = state_points_on_read(
+            source.commit.global_state_root,
+            Some(source.commit.local_state_root),
+            &keys,
+            true,
+            view.retained_read(),
+        )
+        .await?;
+        for (slot, value) in slots.into_iter().zip(values) {
+            source_state[slot] = value;
+        }
+    }
+
+    let sequence_keys = selections
+        .iter()
+        .map(|selection| selection.state_key.clone())
+        .collect::<Vec<_>>();
+    let sequence_state = state_points_on_read(
+        sequence_parent.global_state_root,
+        Some(sequence_parent.local_state_root),
+        &sequence_keys,
+        true,
+        view.retained_read(),
+    )
+    .await?;
+
+    let mut selected = Vec::with_capacity(selections.len());
+    for (((member, source_commit, source_change), source_state), sequence_state) in resolved_members
+        .into_iter()
+        .zip(source_state)
+        .zip(sequence_state)
+    {
+        let (source_state, source_domain) = source_state
+            .ok_or_else(|| corruption("selected history source state row is absent"))?;
+        selected.push(SelectedHistoricalMember {
+            member,
+            source_commit,
+            source_change,
+            source_state,
+            source_domain,
+            sequence_state,
+        });
+    }
+    Ok(SelectedHistoricalMemberBatch {
+        sequence_parent,
+        selected,
+        proof: HistoricalMemberBatchProof {
+            view_instance_id: view.view_instance_id(),
+            members: proof_members,
+        },
+    })
 }
 
 fn required_full_value(
@@ -2877,6 +3164,18 @@ pub(crate) async fn load_commit<R>(
 where
     R: StorageAdapterRead,
 {
+    Ok(load_commit_with_members(view, id)
+        .await?
+        .map(|(_, commit, _)| commit))
+}
+
+async fn load_commit_with_members<R>(
+    view: &CoherentView<R>,
+    id: CommitId,
+) -> Result<Option<(ObjectId, CommitObjectV1, Arc<[CommitMemberV1]>)>, StorageError>
+where
+    R: StorageAdapterRead,
+{
     let Some(value) = view
         .lookup_tree_value(
             view.repository_root().commit_catalog_root,
@@ -2895,14 +3194,15 @@ where
             "CommitCatalog key does not match embedded CommitId",
         ));
     }
-    view.validate_retained_commit(
+    let members = validate_retained_commit_members(
+        view.retained_read(),
         view.repository_root().commit_catalog_root,
         view.repository_root().change_catalog_root,
         entry.commit_object_id,
         &commit,
     )
     .await?;
-    Ok(Some(commit))
+    Ok(Some((entry.commit_object_id, commit, members)))
 }
 
 /// Loads the authenticated commit envelope and immediate topology needed to
@@ -2974,6 +3274,27 @@ pub(super) async fn validate_retained_commit<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    validate_retained_commit_members(
+        read,
+        commit_catalog_root,
+        change_catalog_root,
+        commit_object_id,
+        commit,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn validate_retained_commit_members<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<Arc<[CommitMemberV1]>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     for parent_id in &commit.parent_commit_object_ids {
         let bytes = super::view::load_object_bytes(read, *parent_id).await?;
         let parent = CommitObjectV1::decode(*parent_id, &bytes)?;
@@ -3025,7 +3346,7 @@ where
         )
         .await?;
     }
-    Ok(())
+    Ok(members)
 }
 
 /// Authenticates one visited standalone branch-ref fact and its immediate

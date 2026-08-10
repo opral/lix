@@ -238,13 +238,25 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("open selected history view");
-    let (member, source_commit, source_change) = super::serving::select_historical_commit_member(
-        &view,
+    let selection = super::HistoricalMemberSelection::new(
         seed.commit_id,
         seed.semantic_change_id,
+        seed.state_keys[0].clone(),
+    );
+    let mut batch = super::serving::select_historical_commit_members(
+        &view,
+        seed.commit_id,
+        std::slice::from_ref(&selection),
     )
     .await
-    .expect("select authenticated historical member");
+    .expect("select authenticated historical member batch");
+    let selected = batch
+        .take_selected()
+        .pop()
+        .expect("selected historical member");
+    let member = selected.member;
+    let source_commit = selected.source_commit;
+    let source_change = selected.source_change;
     assert_eq!(source_commit.commit_id, seed.commit_id);
     assert_eq!(source_change.change_id(), seed.semantic_change_id);
     assert_eq!(
@@ -260,6 +272,12 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
             LixTimestamp::from_unix_millis_utc_lossy(1),
         )
     );
+    batch
+        .consume_proof(view.view_instance_id(), 2, &member)
+        .expect("publisher consumes exact selected-member proof");
+    batch
+        .finish_proof(view.view_instance_id())
+        .expect("publisher consumes the complete proof batch");
     let entry = ChangeCatalogEntry {
         owner: ChangeCatalogOwner::CommitMember {
             commit_object_id: seed.commit_object_id,
@@ -294,6 +312,106 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
 }
 
 #[tokio::test]
+async fn selected_member_batch_proof_rejects_wrong_view_owner_ordinal_generation_and_cardinality() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open selected history view");
+    let selection = super::HistoricalMemberSelection::new(
+        seed.commit_id,
+        seed.semantic_change_id,
+        seed.state_keys[0].clone(),
+    );
+    let resolve = || {
+        super::serving::select_historical_commit_members(
+            &view,
+            seed.commit_id,
+            std::slice::from_ref(&selection),
+        )
+    };
+
+    let mut wrong_ordinal = resolve().await.expect("wrong-ordinal proof source");
+    let valid = wrong_ordinal
+        .take_selected()
+        .pop()
+        .expect("selected member");
+    let wrong = CommitMemberV1::selected(
+        seed.semantic_change_id,
+        seed.commit_object_id,
+        1,
+        LixTimestamp::from_unix_millis_utc_lossy(1),
+    );
+    assert!(
+        wrong_ordinal
+            .consume_proof(view.view_instance_id(), 2, &wrong)
+            .is_err(),
+        "a different source ordinal must not consume the sealed proof"
+    );
+
+    let mut wrong_owner = resolve().await.expect("wrong-owner proof source");
+    let _ = wrong_owner.take_selected();
+    let wrong = CommitMemberV1::selected(
+        seed.semantic_change_id,
+        content_id(0xa1),
+        0,
+        LixTimestamp::from_unix_millis_utc_lossy(1),
+    );
+    assert!(
+        wrong_owner
+            .consume_proof(view.view_instance_id(), 2, &wrong)
+            .is_err(),
+        "a different source object must not consume the sealed proof"
+    );
+
+    let mut same_generation = resolve().await.expect("generation proof source");
+    let selected = same_generation
+        .take_selected()
+        .pop()
+        .expect("selected member");
+    assert!(
+        same_generation
+            .consume_proof(view.view_instance_id(), 1, &selected.member)
+            .is_err(),
+        "same-generation selected history must fail closed"
+    );
+
+    let second_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open distinct retained view");
+    let mut wrong_view = resolve().await.expect("cross-view proof source");
+    let selected = wrong_view.take_selected().pop().expect("selected member");
+    assert!(
+        wrong_view
+            .consume_proof(second_view.view_instance_id(), 2, &selected.member)
+            .is_err(),
+        "a proof must not cross retained-view instances"
+    );
+
+    let mut duplicate = resolve().await.expect("duplicate proof source");
+    let selected = duplicate.take_selected().pop().expect("selected member");
+    duplicate
+        .consume_proof(view.view_instance_id(), 2, &selected.member)
+        .expect("first proof consumption");
+    assert!(
+        duplicate
+            .consume_proof(view.view_instance_id(), 2, &selected.member)
+            .is_err(),
+        "one authenticated request must not authorize two publications"
+    );
+
+    let mut unused = resolve().await.expect("unused proof source");
+    let _ = unused.take_selected();
+    assert!(
+        unused.finish_proof(view.view_instance_id()).is_err(),
+        "publication must consume the exact requested proof cardinality"
+    );
+
+    assert_eq!(valid.source_commit.generation, 1);
+}
+
+#[tokio::test]
 async fn commit_summary_defers_unaccessed_member_authentication() {
     let seed = build_seed();
     let storage = Memory::new();
@@ -314,6 +432,21 @@ async fn commit_summary_defers_unaccessed_member_authentication() {
         .expect("authenticated commit summary")
         .expect("seed summary");
     assert_eq!(summary.commit_id, seed.commit_id);
+    let selection = super::HistoricalMemberSelection::new(
+        seed.commit_id,
+        seed.semantic_change_id,
+        seed.state_keys[0].clone(),
+    );
+    assert!(
+        super::serving::select_historical_commit_members(
+            &view,
+            seed.commit_id,
+            std::slice::from_ref(&selection),
+        )
+        .await
+        .is_err(),
+        "a missing authenticated member page must not issue a selected-member proof"
+    );
     assert!(
         load_commit(&view, seed.commit_id).await.is_err(),
         "later member consumption must fail closed on the missing member"
