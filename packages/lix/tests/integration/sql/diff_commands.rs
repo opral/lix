@@ -190,6 +190,54 @@ simulation_test!(
             ]
         );
 
+        let second_checkpoint = session
+            .execute(
+                "INSERT INTO lix_create_checkpoint (diff_id) \
+                 SELECT diff_id FROM lix_working_diff \
+                 WHERE schema_key = $1 \
+                   AND entity_pk = lix_json($2) \
+                 RETURNING commit_id",
+                &[
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("[\"b\"]".to_string()),
+                ],
+            )
+            .await
+            .expect("second partial checkpoint should succeed");
+        assert_eq!(second_checkpoint.rows_affected(), 1);
+        let second_checkpoint_commit_id =
+            match second_checkpoint.get(&second_checkpoint.rows()[0], "commit_id") {
+                Some(Value::Text(commit_id)) => commit_id.clone(),
+                value => {
+                    panic!("second checkpoint RETURNING should contain a commit ID, got {value:?}")
+                }
+            };
+        assert_ne!(second_checkpoint_commit_id, checkpoint_commit_id);
+        assert!(
+            select_rows(
+                &session,
+                "SELECT diff_id FROM lix_working_diff WHERE schema_key = 'lix_key_value'",
+            )
+            .await
+            .is_empty(),
+            "two consecutive partial checkpoints must advance the working-diff baseline"
+        );
+        let checkpoint_history = select_rows(
+            &session,
+            "SELECT commit_id, lixcol_depth FROM lix_checkpoint ORDER BY lixcol_depth",
+        )
+        .await;
+        assert_eq!(
+            checkpoint_history.first().map(|row| &row[0]),
+            Some(&Value::Text(second_checkpoint_commit_id.clone())),
+            "the second partial checkpoint must be the branch-bound latest checkpoint"
+        );
+        assert!(
+            checkpoint_history
+                .iter()
+                .any(|row| { row.first() == Some(&Value::Text(checkpoint_commit_id.clone())) })
+        );
+
         let head_before_empty = engine
             .load_branch_head_commit_id(sim.main_branch_id())
             .await

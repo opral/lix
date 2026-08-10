@@ -14,7 +14,7 @@ pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace = StorageSpace::engine_
     ValueSemantics::Mutable,
 );
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v61";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v62";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepositoryProtocolStatus {

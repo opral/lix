@@ -7391,23 +7391,12 @@ where
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let branch_id = self.active_branch_id.clone();
         let _previous_recovery = self.checkpoint_publication_state(&branch_id).await?;
-        let head_commit_id = self
-            .load_branch_head(&branch_id)
-            .await?
-            .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
-        let previous_checkpoint_commit_id = self
+        let baseline = self
             .forktree_read_facade()
-            .checkpoint_history_from_head(head_commit_id, &branch_id)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("branch '{branch_id}' has no checkpoint baseline"),
-                )
-            })?
-            .commit_id;
+            .checkpoint_baseline_for_branch(&branch_id)
+            .await?;
+        let head_commit_id = baseline.head_commit_id;
+        let previous_checkpoint_commit_id = baseline.checkpoint_commit_id;
         let diff = self
             .forktree_read_facade()
             .diff_branch_state_rows_between_commits(previous_checkpoint_commit_id, head_commit_id)

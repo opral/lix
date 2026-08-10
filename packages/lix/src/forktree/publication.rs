@@ -12,11 +12,52 @@ use super::blob::{AuthenticatedBlobRef, CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeObjectV1, CommitObjectV1, GlobalSelectorV1, RepositoryRootV1,
-    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
-    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
-    upload_selector_key,
+    ChangeCatalogOwner, ChangeObjectV1, CheckpointCursorV1, CommitObjectV1, GlobalSelectorV1,
+    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
+    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
+    snapshot_selector_key, upload_selector_key,
 };
+
+pub(crate) fn introduced_checkpoint_marker(
+    members: &[super::model::CommitMemberV1],
+    branch_id: super::model::CanonicalBranchId,
+) -> Result<bool, StorageError> {
+    let expected_branch = uuid::Uuid::from_bytes(*branch_id.as_bytes()).to_string();
+    let mut found = false;
+    for member in members {
+        let Some((payload, global, _, _)) = member.introduced_payload() else {
+            continue;
+        };
+        let change_id =
+            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*member.change_id().as_bytes()));
+        let record = crate::changelog::decode_forktree_change_payload(payload, change_id)
+            .map_err(|error| corruption(error.to_string()))?;
+        if record.schema_key != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY {
+            continue;
+        }
+        if found || global || record.file_id.is_some() {
+            return Err(corruption(
+                "checkpoint commit contains an invalid or duplicate marker",
+            ));
+        }
+        let crate::json_store::JsonSlot::Inline(snapshot) = record.snapshot else {
+            return Err(corruption(
+                "checkpoint marker snapshot is absent or indirect",
+            ));
+        };
+        let payload: serde_json::Value = serde_json::from_str(&snapshot)
+            .map_err(|error| corruption(format!("checkpoint marker is malformed: {error}")))?;
+        if payload.get("branch_id").and_then(serde_json::Value::as_str)
+            != Some(expected_branch.as_str())
+        {
+            return Err(corruption(
+                "checkpoint marker branch identity does not match its commit owner",
+            ));
+        }
+        found = true;
+    }
+    Ok(found)
+}
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, SelectedHistoricalMemberBatch, StateTreeEdit};
 use super::state::StateKey;
@@ -1217,6 +1258,13 @@ impl PreparedPublication {
         if is_global && state_edit.wrote_tombstone {
             return Err(corruption("global state publication contains a tombstone"));
         }
+        if semantic_commit.parent_commit_object_ids.first()
+            != Some(&view.branch_snapshot().semantic_head_commit_object_id)
+        {
+            return Err(corruption(
+                "semantic commit first parent is not the selected branch head",
+            ));
+        }
         let member_pages = semantic_commit.prepare_member_pages()?;
         let (commit_id, commit_bytes) = semantic_commit.encode()?;
         if state_edit
@@ -1250,27 +1298,36 @@ impl PreparedPublication {
                 "repository catalogs do not authenticate the semantic commit",
             ));
         }
-        if semantic_commit.parent_commit_object_ids.is_empty()
-            || !semantic_commit
-                .parent_commit_object_ids
-                .contains(&view.branch_snapshot().semantic_head_commit_object_id)
-        {
-            return Err(corruption(
-                "semantic commit does not descend from the selected branch head",
-            ));
-        }
         let mut parent_ids = BTreeSet::new();
-        for parent_id in &semantic_commit.parent_commit_object_ids {
+        let mut first_parent = None;
+        for (parent_index, parent_id) in semantic_commit.parent_commit_object_ids.iter().enumerate()
+        {
             if !parent_ids.insert(*parent_id) {
                 return Err(corruption("semantic commit repeats one parent"));
             }
             let bytes = view.load_object_bytes(*parent_id).await?;
             let parent = CommitObjectV1::decode(*parent_id, &bytes)?;
+            if parent_index == 0 {
+                first_parent = Some((*parent_id, parent.clone()));
+            }
             if parent.generation >= semantic_commit.generation {
                 return Err(corruption(
                     "semantic commit generation does not follow every parent",
                 ));
             }
+        }
+        let (first_parent_id, first_parent) =
+            first_parent.ok_or_else(|| corruption("semantic commit has no first parent"))?;
+        let expected_checkpoint_cursor = CheckpointCursorV1::after_first_parent(
+            first_parent_id,
+            &first_parent,
+            view.branch_id(),
+            introduced_checkpoint_marker(&semantic_commit.members, view.branch_id())?,
+        )?;
+        if semantic_commit.checkpoint_cursor != expected_checkpoint_cursor {
+            return Err(corruption(
+                "semantic commit checkpoint cursor does not derive from its first parent and marker",
+            ));
         }
 
         let mut encoded_changes = BTreeMap::new();
@@ -1509,7 +1566,8 @@ impl PreparedPublication {
             expected_state_base = state_edit.root;
 
             let mut parent_objects = BTreeSet::new();
-            for parent_id in &commit.parent_commit_object_ids {
+            let mut first_parent = None;
+            for (parent_index, parent_id) in commit.parent_commit_object_ids.iter().enumerate() {
                 if !parent_objects.insert(*parent_id) {
                     return Err(corruption("ordered Commit repeats one parent edge"));
                 }
@@ -1519,11 +1577,27 @@ impl PreparedPublication {
                     let bytes = view.load_object_bytes(*parent_id).await?;
                     CommitObjectV1::decode(*parent_id, &bytes)?
                 };
+                if parent_index == 0 {
+                    first_parent = Some((*parent_id, parent.clone()));
+                }
                 if parent.generation >= commit.generation {
                     return Err(corruption(
                         "ordered Commit generation does not strictly follow every parent",
                     ));
                 }
+            }
+            let (first_parent_id, first_parent) =
+                first_parent.ok_or_else(|| corruption("ordered Commit has no first parent"))?;
+            let expected_checkpoint_cursor = CheckpointCursorV1::after_first_parent(
+                first_parent_id,
+                &first_parent,
+                view.branch_id(),
+                introduced_checkpoint_marker(&commit.members, view.branch_id())?,
+            )?;
+            if commit.checkpoint_cursor != expected_checkpoint_cursor {
+                return Err(corruption(
+                    "ordered Commit checkpoint cursor does not derive from its first parent and marker",
+                ));
             }
 
             let mut member_ids = BTreeSet::new();

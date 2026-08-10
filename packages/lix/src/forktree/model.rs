@@ -626,7 +626,240 @@ pub(crate) struct CommitObjectV1 {
     pub(crate) member_page_object_ids: Vec<ObjectId>,
     pub(crate) global_state_root: ObjectId,
     pub(crate) local_state_root: ObjectId,
+    /// Authenticated, branch-bound first-parent checkpoint chronology.
+    pub(crate) checkpoint_cursor: CheckpointCursorV1,
     pub(crate) metadata: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointCursorV1 {
+    /// The repository root is the implicit checkpoint shared by every branch.
+    Root,
+    Ordinary {
+        owner_branch_id: CanonicalBranchId,
+        root_commit_object_id: ObjectId,
+        distance_to_root: u32,
+        latest_checkpoint_object_id: ObjectId,
+        distance_to_latest: u32,
+    },
+    Checkpoint {
+        owner_branch_id: CanonicalBranchId,
+        root_commit_object_id: ObjectId,
+        distance_to_root: u32,
+        previous_checkpoint_object_id: ObjectId,
+        distance_to_previous: u32,
+    },
+}
+
+impl CheckpointCursorV1 {
+    pub(crate) const fn root() -> Self {
+        Self::Root
+    }
+
+    pub(crate) fn after_first_parent(
+        parent_object_id: ObjectId,
+        parent: &CommitObjectV1,
+        owner_branch_id: CanonicalBranchId,
+        is_checkpoint: bool,
+    ) -> Result<Self, StorageError> {
+        let (root_commit_object_id, distance_to_root) = match parent.checkpoint_cursor {
+            Self::Root => (parent_object_id, 1),
+            Self::Ordinary {
+                root_commit_object_id,
+                distance_to_root,
+                ..
+            }
+            | Self::Checkpoint {
+                root_commit_object_id,
+                distance_to_root,
+                ..
+            } => (
+                root_commit_object_id,
+                distance_to_root
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("checkpoint root distance overflowed"))?,
+            ),
+        };
+        let (latest_checkpoint_object_id, distance_to_latest) = match parent.checkpoint_cursor {
+            Self::Root => (parent_object_id, 1),
+            Self::Ordinary {
+                owner_branch_id: parent_owner,
+                latest_checkpoint_object_id,
+                distance_to_latest,
+                ..
+            } if parent_owner == owner_branch_id => (
+                latest_checkpoint_object_id,
+                distance_to_latest
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("checkpoint latest distance overflowed"))?,
+            ),
+            Self::Checkpoint {
+                owner_branch_id: parent_owner,
+                ..
+            } if parent_owner == owner_branch_id => (parent_object_id, 1),
+            Self::Ordinary { .. } | Self::Checkpoint { .. } => {
+                (root_commit_object_id, distance_to_root)
+            }
+        };
+        let value = if is_checkpoint {
+            Self::Checkpoint {
+                owner_branch_id,
+                root_commit_object_id,
+                distance_to_root,
+                previous_checkpoint_object_id: latest_checkpoint_object_id,
+                distance_to_previous: distance_to_latest,
+            }
+        } else {
+            Self::Ordinary {
+                owner_branch_id,
+                root_commit_object_id,
+                distance_to_root,
+                latest_checkpoint_object_id,
+                distance_to_latest,
+            }
+        };
+        value.validate(false)?;
+        Ok(value)
+    }
+
+    pub(crate) fn root_edge(self, current_object_id: ObjectId) -> (ObjectId, u32) {
+        match self {
+            Self::Root => (current_object_id, 0),
+            Self::Ordinary {
+                root_commit_object_id,
+                distance_to_root,
+                ..
+            }
+            | Self::Checkpoint {
+                root_commit_object_id,
+                distance_to_root,
+                ..
+            } => (root_commit_object_id, distance_to_root),
+        }
+    }
+
+    pub(crate) const fn owner_branch_id(self) -> Option<CanonicalBranchId> {
+        match self {
+            Self::Root => None,
+            Self::Ordinary {
+                owner_branch_id, ..
+            }
+            | Self::Checkpoint {
+                owner_branch_id, ..
+            } => Some(owner_branch_id),
+        }
+    }
+
+    pub(crate) fn latest_for_branch(
+        self,
+        current_object_id: ObjectId,
+        branch_id: CanonicalBranchId,
+    ) -> (ObjectId, u32) {
+        match self {
+            Self::Root => (current_object_id, 0),
+            Self::Checkpoint {
+                owner_branch_id, ..
+            } if owner_branch_id == branch_id => (current_object_id, 0),
+            Self::Ordinary {
+                owner_branch_id,
+                latest_checkpoint_object_id,
+                distance_to_latest,
+                ..
+            } if owner_branch_id == branch_id => (latest_checkpoint_object_id, distance_to_latest),
+            value => value.root_edge(current_object_id),
+        }
+    }
+
+    pub(crate) fn previous_checkpoint(self) -> Option<(ObjectId, u32)> {
+        match self {
+            Self::Checkpoint {
+                previous_checkpoint_object_id,
+                distance_to_previous,
+                ..
+            } => Some((previous_checkpoint_object_id, distance_to_previous)),
+            Self::Root | Self::Ordinary { .. } => None,
+        }
+    }
+
+    pub(crate) fn edges(self) -> impl Iterator<Item = ObjectId> {
+        let edges = match self {
+            Self::Root => [None, None],
+            Self::Ordinary {
+                root_commit_object_id,
+                latest_checkpoint_object_id,
+                ..
+            } => [
+                Some(root_commit_object_id),
+                Some(latest_checkpoint_object_id),
+            ],
+            Self::Checkpoint {
+                root_commit_object_id,
+                previous_checkpoint_object_id,
+                ..
+            } => [
+                Some(root_commit_object_id),
+                Some(previous_checkpoint_object_id),
+            ],
+        };
+        edges.into_iter().flatten()
+    }
+
+    fn checked_non_root_fields(
+        root_commit_object_id: ObjectId,
+        distance_to_root: u32,
+        checkpoint_object_id: ObjectId,
+        checkpoint_distance: u32,
+    ) -> Result<(), StorageError> {
+        if root_commit_object_id == ObjectId::ZERO
+            || checkpoint_object_id == ObjectId::ZERO
+            || distance_to_root == 0
+            || checkpoint_distance == 0
+            || checkpoint_distance > distance_to_root
+        {
+            return Err(corruption("checkpoint chronology cursor is invalid"));
+        }
+        Ok(())
+    }
+
+    fn validate(self, root: bool) -> Result<(), StorageError> {
+        if root {
+            if self != Self::Root {
+                return Err(corruption(
+                    "root commit must carry the implicit checkpoint cursor",
+                ));
+            }
+            return Ok(());
+        }
+        match self {
+            Self::Root => Err(corruption(
+                "non-root commit cannot carry the implicit checkpoint cursor",
+            )),
+            Self::Ordinary {
+                root_commit_object_id,
+                distance_to_root,
+                latest_checkpoint_object_id,
+                distance_to_latest,
+                ..
+            } => Self::checked_non_root_fields(
+                root_commit_object_id,
+                distance_to_root,
+                latest_checkpoint_object_id,
+                distance_to_latest,
+            ),
+            Self::Checkpoint {
+                root_commit_object_id,
+                distance_to_root,
+                previous_checkpoint_object_id,
+                distance_to_previous,
+                ..
+            } => Self::checked_non_root_fields(
+                root_commit_object_id,
+                distance_to_root,
+                previous_checkpoint_object_id,
+                distance_to_previous,
+            ),
+        }
+    }
 }
 
 impl CommitObjectV1 {
@@ -640,6 +873,8 @@ impl CommitObjectV1 {
             "commit state",
             &[self.global_state_root, self.local_state_root],
         )?;
+        self.checkpoint_cursor
+            .validate(self.parent_commit_object_ids.is_empty())?;
         let parent_count = u32::try_from(self.parent_commit_object_ids.len())
             .map_err(|_| corruption("commit has too many parents"))?;
         if !self.members.is_empty() && self.member_page_object_ids.is_empty() {
@@ -647,7 +882,7 @@ impl CommitObjectV1 {
                 "nonempty commit members have no authenticated pages",
             ));
         }
-        encode_object(ObjectDomain::Commit, |encoder| {
+        encode_object(ObjectDomain::CommitV2, |encoder| {
             encoder.fixed(self.commit_id.as_bytes());
             encoder.u64(self.generation);
             encoder.u32(parent_count);
@@ -663,12 +898,43 @@ impl CommitObjectV1 {
             }
             encode_id(encoder, self.global_state_root);
             encode_id(encoder, self.local_state_root);
+            match self.checkpoint_cursor {
+                CheckpointCursorV1::Root => encoder.u8(0),
+                CheckpointCursorV1::Ordinary {
+                    owner_branch_id,
+                    root_commit_object_id,
+                    distance_to_root,
+                    latest_checkpoint_object_id,
+                    distance_to_latest,
+                } => {
+                    encoder.u8(1);
+                    encoder.fixed(owner_branch_id.as_bytes());
+                    encode_id(encoder, root_commit_object_id);
+                    encoder.u32(distance_to_root);
+                    encode_id(encoder, latest_checkpoint_object_id);
+                    encoder.u32(distance_to_latest);
+                }
+                CheckpointCursorV1::Checkpoint {
+                    owner_branch_id,
+                    root_commit_object_id,
+                    distance_to_root,
+                    previous_checkpoint_object_id,
+                    distance_to_previous,
+                } => {
+                    encoder.u8(2);
+                    encoder.fixed(owner_branch_id.as_bytes());
+                    encode_id(encoder, root_commit_object_id);
+                    encoder.u32(distance_to_root);
+                    encode_id(encoder, previous_checkpoint_object_id);
+                    encoder.u32(distance_to_previous);
+                }
+            }
             encoder.bytes(&self.metadata)
         })
     }
 
     pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
-        let mut decoder = decode_object(id, ObjectDomain::Commit, bytes)?;
+        let mut decoder = decode_object(id, ObjectDomain::CommitV2, bytes)?;
         let commit_id = CommitId::from_bytes(decoder.fixed()?);
         let generation = decoder.u64()?;
         let parent_count = decoder.usize("commit parent count")?;
@@ -696,6 +962,34 @@ impl CommitObjectV1 {
             member_page_object_ids,
             global_state_root: decode_id(&mut decoder)?,
             local_state_root: decode_id(&mut decoder)?,
+            checkpoint_cursor: match decoder.u8()? {
+                0 => CheckpointCursorV1::Root,
+                tag @ (1 | 2) => {
+                    let owner_branch_id = CanonicalBranchId::from_bytes(decoder.fixed()?);
+                    let root_commit_object_id = decode_id(&mut decoder)?;
+                    let distance_to_root = decoder.u32()?;
+                    let checkpoint_object_id = decode_id(&mut decoder)?;
+                    let checkpoint_distance = decoder.u32()?;
+                    if tag == 1 {
+                        CheckpointCursorV1::Ordinary {
+                            owner_branch_id,
+                            root_commit_object_id,
+                            distance_to_root,
+                            latest_checkpoint_object_id: checkpoint_object_id,
+                            distance_to_latest: checkpoint_distance,
+                        }
+                    } else {
+                        CheckpointCursorV1::Checkpoint {
+                            owner_branch_id,
+                            root_commit_object_id,
+                            distance_to_root,
+                            previous_checkpoint_object_id: checkpoint_object_id,
+                            distance_to_previous: checkpoint_distance,
+                        }
+                    }
+                }
+                _ => return Err(corruption("checkpoint cursor tag is not canonical")),
+            },
             metadata: decoder.bytes("commit metadata")?,
         };
         decoder.finish()?;
@@ -707,6 +1001,9 @@ impl CommitObjectV1 {
             "commit state",
             &[value.global_state_root, value.local_state_root],
         )?;
+        value
+            .checkpoint_cursor
+            .validate(value.parent_commit_object_ids.is_empty())?;
         value.validate_edge_bound()?;
         Ok(value)
     }
@@ -725,6 +1022,7 @@ impl CommitObjectV1 {
             .len()
             .checked_add(self.member_page_object_ids.len())
             .and_then(|count| count.checked_add(2))
+            .and_then(|count| count.checked_add(self.checkpoint_cursor.edges().count()))
             .is_none_or(|count| count > AUTHENTICATED_EDGE_PAGE_ENTRIES)
         {
             return Err(corruption(

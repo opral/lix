@@ -398,6 +398,121 @@ where
     ) -> Result<CoherentView<&R>, StorageError> {
         open_coherent_view_on_read(&self.read, branch_id).await
     }
+
+    async fn checkpoint_history(
+        &self,
+        min_depth: Option<u32>,
+        max_depth: Option<u32>,
+        limit: Option<usize>,
+    ) -> Result<CheckpointBranchHistory, crate::LixError> {
+        let head_id = self.branch_snapshot.semantic_head_commit_object_id;
+        let commit_catalog_root = self.repository_root.commit_catalog_root;
+        let (head, head_record) = super::serving::load_checkpoint_commit_envelope(
+            &self.read,
+            commit_catalog_root,
+            head_id,
+        )
+        .await?;
+        let (root_id, head_distance_to_root) = head.checkpoint_cursor.root_edge(head_id);
+        let head_commit_id = head_record.commit_id;
+        let (mut current_id, mut depth) = head
+            .checkpoint_cursor
+            .latest_for_branch(head_id, self.branch_id);
+        if depth > head_distance_to_root {
+            return Err(corruption(
+                "checkpoint chronology target exceeds the authenticated root distance",
+            )
+            .into());
+        }
+
+        let mut current = if current_id == head_id {
+            (head, head_record)
+        } else {
+            super::serving::load_checkpoint_commit_envelope(
+                &self.read,
+                commit_catalog_root,
+                current_id,
+            )
+            .await?
+        };
+        let mut visited = HashSet::new();
+        let mut history = Vec::new();
+        loop {
+            if !visited.insert(current_id) {
+                return Err(corruption("checkpoint chronology contains a cycle").into());
+            }
+            let (current_root_id, current_distance_to_root) =
+                current.0.checkpoint_cursor.root_edge(current_id);
+            if current_root_id != root_id
+                || current_distance_to_root
+                    .checked_add(depth)
+                    .is_none_or(|distance| distance != head_distance_to_root)
+            {
+                return Err(corruption(
+                    "checkpoint chronology edge disagrees with the authenticated root distance",
+                )
+                .into());
+            }
+            match current.0.checkpoint_cursor {
+                super::model::CheckpointCursorV1::Root if current_id == root_id => {}
+                super::model::CheckpointCursorV1::Checkpoint {
+                    owner_branch_id, ..
+                } if owner_branch_id == self.branch_id => {}
+                super::model::CheckpointCursorV1::Root => {
+                    return Err(corruption(
+                        "checkpoint chronology reached a substituted repository root",
+                    )
+                    .into());
+                }
+                super::model::CheckpointCursorV1::Ordinary { .. }
+                | super::model::CheckpointCursorV1::Checkpoint { .. } => {
+                    return Err(corruption(
+                        "checkpoint chronology target is not owned by the selected branch",
+                    )
+                    .into());
+                }
+            }
+
+            if max_depth.is_some_and(|maximum| depth > maximum) {
+                break;
+            }
+            if min_depth.is_none_or(|minimum| depth >= minimum) {
+                history.push(CheckpointHistoryEntry {
+                    commit_id: current.1.commit_id,
+                    created_at: current.1.created_at.to_string(),
+                    depth,
+                });
+                if limit.is_some_and(|limit| history.len() >= limit) {
+                    break;
+                }
+            }
+
+            let Some((next_id, distance)) = current.0.checkpoint_cursor.previous_checkpoint()
+            else {
+                break;
+            };
+            depth = depth
+                .checked_add(distance)
+                .ok_or_else(|| corruption("checkpoint chronology depth overflowed"))?;
+            if depth > head_distance_to_root {
+                return Err(corruption(
+                    "checkpoint chronology previous edge exceeds the repository root",
+                )
+                .into());
+            }
+            current_id = next_id;
+            current = super::serving::load_checkpoint_commit_envelope(
+                &self.read,
+                commit_catalog_root,
+                current_id,
+            )
+            .await?;
+        }
+        Ok(CheckpointBranchHistory {
+            head_commit_id,
+            entries: history,
+        })
+    }
 }
 
 /// One authenticated historical commit on an operation-owned retained read.
@@ -525,11 +640,14 @@ pub(crate) struct CheckpointHistoryEntry {
     pub(crate) depth: u32,
 }
 
-fn checkpoint_marker_matches_commit(
-    marker_commit_id: crate::changelog::CommitId,
-    walked_commit_id: crate::changelog::CommitId,
-) -> bool {
-    marker_commit_id == walked_commit_id
+pub(crate) struct CheckpointBranchHistory {
+    pub(crate) head_commit_id: crate::changelog::CommitId,
+    pub(crate) entries: Vec<CheckpointHistoryEntry>,
+}
+
+pub(crate) struct CheckpointBranchBaseline {
+    pub(crate) head_commit_id: crate::changelog::CommitId,
+    pub(crate) checkpoint_commit_id: crate::changelog::CommitId,
 }
 
 impl<R> ForkTreeReadFacade<R>
@@ -968,118 +1086,56 @@ where
         super::serving::load_required_commit_record(&self.read, commit_id).await
     }
 
-    /// Returns the authenticated checkpoint history for one branch head. The
-    /// root is an implicit checkpoint; every other checkpoint requires an
-    /// active marker whose authenticated state-row commit_id equals the
-    /// walked commit. This is the sole chronology owner used by SQL and
-    /// filesystem working-diff baselines.
-    pub(crate) async fn checkpoint_history_from_head(
+    /// Returns authenticated first-parent checkpoint history and its head from
+    /// one selector-bound branch view. The caller cannot supply a detached head
+    /// or cursor. Unfiltered LIMIT 1 follows one sealed chronology edge,
+    /// independent of ordinary history height. Filtered history visits only
+    /// authenticated checkpoint edges, but may skip entries before satisfying
+    /// a minimum-depth predicate.
+    pub(crate) async fn checkpoint_history_for_branch(
         &self,
-        head: crate::changelog::CommitId,
         branch_id: &str,
-    ) -> Result<Vec<CheckpointHistoryEntry>, crate::LixError> {
-        let marker_key = super::state::StateKey {
-            schema_key: "lix_checkpoint_marker".to_string(),
-            file_id: None,
-            entity_pk: EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
-                crate::LixError::new(
-                    crate::LixError::CODE_INVALID_PARAM,
-                    format!("checkpoint branch_id must be a canonical UUID: {error}"),
-                )
-            })?,
-        };
-        let mut checkpoints = Vec::new();
-        let mut current = Some(head);
-        let mut depth = 0_u32;
-        let mut visited = HashSet::new();
-        while let Some(commit_id) = current {
-            if !visited.insert(commit_id) {
-                return Err(crate::LixError::new(
-                    crate::LixError::CODE_INTERNAL_ERROR,
-                    "cycle encountered while walking checkpoint first-parent history",
-                ));
-            }
-            let record = self.load_required_commit_record(commit_id).await?;
-            let is_root = record.parent_commit_ids.is_empty();
-            let row = self
-                .load_state_rows_at_commit(
-                    &commit_id.to_string(),
-                    std::slice::from_ref(&marker_key),
-                )
-                .await?
-                .into_iter()
-                .next()
-                .flatten();
-            let marker_matches = match row {
-                None => false,
-                Some(row) if row.deleted => false,
-                Some(row) => {
-                    let snapshot = row.snapshot_content.ok_or_else(|| {
-                        crate::LixError::new(
-                            crate::LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "checkpoint marker for branch '{branch_id}' is null at commit '{commit_id}'"
-                            ),
-                        )
-                    })?;
-                    let payload: serde_json::Value = serde_json::from_str(snapshot.as_str())
-                        .map_err(|error| {
-                            crate::LixError::new(
-                                crate::LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "checkpoint marker for branch '{branch_id}' is malformed: {error}"
-                                ),
-                            )
-                        })?;
-                    let payload_branch = payload
-                        .get("branch_id")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            crate::LixError::new(
-                                crate::LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "checkpoint marker for branch '{branch_id}' has the wrong shape"
-                                ),
-                            )
-                        })?;
-                    if payload_branch != branch_id {
-                        return Err(crate::LixError::new(
-                            crate::LixError::CODE_INTERNAL_ERROR,
-                            format!("checkpoint marker branch identity mismatch for '{branch_id}'"),
-                        ));
-                    }
-                    checkpoint_marker_matches_commit(row.commit_id, commit_id)
-                }
-            };
-            if is_root || marker_matches {
-                checkpoints.push(CheckpointHistoryEntry {
-                    commit_id,
-                    created_at: record.created_at.to_string(),
-                    depth,
-                });
-            }
-            current = record.parent_commit_ids.first().copied();
-            depth = depth.checked_add(1).ok_or_else(|| {
-                crate::LixError::new(
-                    crate::LixError::CODE_INTERNAL_ERROR,
-                    "checkpoint history depth overflow",
-                )
-            })?;
+        min_depth: Option<u32>,
+        max_depth: Option<u32>,
+        limit: Option<usize>,
+    ) -> Result<CheckpointBranchHistory, crate::LixError> {
+        if limit == Some(0) {
+            let view = self.branch(branch_id).await?;
+            let head_id = view.branch_snapshot.semantic_head_commit_object_id;
+            let (_, head_record) = super::serving::load_checkpoint_commit_envelope(
+                &view.read,
+                view.repository_root.commit_catalog_root,
+                head_id,
+            )
+            .await?;
+            return Ok(CheckpointBranchHistory {
+                head_commit_id: head_record.commit_id,
+                entries: Vec::new(),
+            });
         }
-        Ok(checkpoints)
+        self.branch(branch_id)
+            .await?
+            .checkpoint_history(min_depth, max_depth, limit)
+            .await
     }
 
-    pub(crate) async fn latest_checkpoint_for_branch(
+    pub(crate) async fn checkpoint_baseline_for_branch(
         &self,
-        head: crate::changelog::CommitId,
         branch_id: &str,
-    ) -> Result<Option<crate::changelog::CommitId>, crate::LixError> {
-        Ok(self
-            .checkpoint_history_from_head(head, branch_id)
-            .await?
+    ) -> Result<CheckpointBranchBaseline, crate::LixError> {
+        let history = self
+            .checkpoint_history_for_branch(branch_id, None, None, Some(1))
+            .await?;
+        let checkpoint_commit_id = history
+            .entries
             .into_iter()
             .next()
-            .map(|entry| entry.commit_id))
+            .ok_or_else(|| corruption("selected branch has no checkpoint baseline"))?
+            .commit_id;
+        Ok(CheckpointBranchBaseline {
+            head_commit_id: history.head_commit_id,
+            checkpoint_commit_id,
+        })
     }
 
     pub(crate) async fn load_json_slot(
@@ -1309,10 +1365,20 @@ async fn diff_branch_state_rows_between_commits_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let (before_global_root, before_local_root) =
-        super::serving::authenticate_historical_state_roots(read, before).await?;
-    let (after_global_root, after_local_root) =
-        super::serving::authenticate_historical_state_roots(read, after).await?;
+    let (
+        before_commit_catalog_root,
+        before_change_catalog_root,
+        before_endpoint_commit_object_id,
+        before_global_root,
+        before_local_root,
+    ) = super::serving::authenticate_historical_state_roots_for_diff(read, before).await?;
+    let (
+        after_commit_catalog_root,
+        after_change_catalog_root,
+        after_endpoint_commit_object_id,
+        after_global_root,
+        after_local_root,
+    ) = super::serving::authenticate_historical_state_roots_for_diff(read, after).await?;
 
     // Authenticate every selected state root before local-root pruning. The
     // point resolver may legitimately skip a global lookup when a local row
@@ -1345,25 +1411,30 @@ where
         })
         .collect::<Vec<_>>();
 
-    let before_values = super::serving::state_points_on_read(
+    let before_values = super::serving::state_points_on_read_with_historical_auth(
         before_global_root,
         Some(before_local_root),
         &encoded_keys,
         true,
+        before_commit_catalog_root,
+        before_change_catalog_root,
+        before_endpoint_commit_object_id,
         read,
     )
     .await?;
-    let after_values = super::serving::state_points_on_read(
+    let after_values = super::serving::state_points_on_read_with_historical_auth(
         after_global_root,
         Some(after_local_root),
         &encoded_keys,
         true,
+        after_commit_catalog_root,
+        after_change_catalog_root,
+        after_endpoint_commit_object_id,
         read,
     )
     .await?;
     let before_rows = historical_state_rows_from_points(&encoded_keys, before_values)?;
     let after_rows = historical_state_rows_from_points(&encoded_keys, after_values)?;
-
     Ok(before_rows
         .into_iter()
         .zip(after_rows)
@@ -1751,13 +1822,14 @@ fn projected_required(
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_marker_matches_commit, historical_state_change_is_public,
-        historical_state_identity_changed, historical_state_payloads_differ,
+        historical_state_change_is_public, historical_state_identity_changed,
+        historical_state_payloads_differ,
     };
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::forktree::state::{HistoricalStateRow, StateKey};
+    use crate::forktree::{CanonicalBranchId, CheckpointCursorV1, ObjectId};
 
     fn historical_row(
         change_id: ChangeId,
@@ -1785,10 +1857,24 @@ mod tests {
 
     #[test]
     fn inherited_marker_does_not_classify_descendant_commit() {
-        let checkpoint = CommitId::for_test_label("checkpoint");
-        let ordinary = CommitId::for_test_label("ordinary");
-        assert!(checkpoint_marker_matches_commit(checkpoint, checkpoint));
-        assert!(!checkpoint_marker_matches_commit(checkpoint, ordinary));
+        let owner = CanonicalBranchId::from_bytes([0x11; 16]);
+        let inheriting_branch = CanonicalBranchId::from_bytes([0x12; 16]);
+        let root = ObjectId::from_bytes([0x21; 32]);
+        let checkpoint = ObjectId::from_bytes([0x22; 32]);
+        let ordinary = ObjectId::from_bytes([0x23; 32]);
+        let cursor = CheckpointCursorV1::Ordinary {
+            owner_branch_id: owner,
+            root_commit_object_id: root,
+            distance_to_root: 3,
+            latest_checkpoint_object_id: checkpoint,
+            distance_to_latest: 1,
+        };
+
+        assert_eq!(cursor.latest_for_branch(ordinary, owner), (checkpoint, 1));
+        assert_eq!(
+            cursor.latest_for_branch(ordinary, inheriting_branch),
+            (ordinary, 0),
+        );
     }
 
     #[test]

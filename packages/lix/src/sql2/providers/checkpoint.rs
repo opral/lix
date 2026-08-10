@@ -133,14 +133,23 @@ where
                     .map_err(lix_error_to_datafusion_error)?;
                     let mut rows = Vec::new();
                     for head in heads {
+                        let remaining = limit.map(|limit| limit.saturating_sub(rows.len()));
+                        let min_depth = depth_route
+                            .min_depth
+                            .map(|depth| u32::try_from(depth).expect("negative depth rejected"));
+                        let max_depth = depth_route
+                            .max_depth
+                            .map(|depth| u32::try_from(depth).expect("negative depth rejected"));
                         let history = historical
-                            .checkpoint_history_from_head(head.commit_id, &head.branch_id)
+                            .checkpoint_history_for_branch(
+                                &head.branch_id,
+                                min_depth,
+                                max_depth,
+                                remaining,
+                            )
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
-                        for entry in history {
-                            if !checkpoint_depth_matches(&depth_route, entry.depth) {
-                                continue;
-                            }
+                        for entry in history.entries {
                             rows.push(CheckpointSqlRow {
                                 commit_id: entry.commit_id.to_string(),
                                 created_at: entry.created_at,
@@ -211,6 +220,7 @@ fn checkpoint_depth_scan_limit(route: &HistoryRoute) -> Option<usize> {
         .and_then(|depth| depth.checked_add(1))
 }
 
+#[cfg(test)]
 fn checkpoint_depth_matches(route: &HistoryRoute, depth: u32) -> bool {
     let depth = i64::from(depth);
     route.min_depth.is_none_or(|minimum| depth >= minimum)
