@@ -304,13 +304,6 @@ impl StorageWriteSet {
         self.stats.written_bytes += written_bytes;
     }
 
-    /// Retains a compact, already-validated owner until backend lowering.
-    ///
-    /// Deferred sources are intentionally exclusive per target space. This
-    /// makes their no-duplicate certificate compositional with the ordinary
-    /// write-set validator instead of silently bypassing mutations staged by
-    /// another domain writer.
-    ///
     /// Retains one contiguous content-addressed batch while coalescing puts
     /// already present in the same storage-space lane.
     ///
