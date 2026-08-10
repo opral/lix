@@ -3385,13 +3385,6 @@ impl StorageWrite for SlateDBWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             if space.value_semantics() == ValueSemantics::Immutable {
-                // Acquire the operation's write fence before materializing
-                // immutable segments. The segment is content-addressed by
-                // its authenticated member identities, so filtering already
-                // visible immutable values after packing would otherwise
-                // upload an entire replacement segment before the idempotent
-                // check can discard its existing locators.
-                self.serialize_publication().await?;
                 let mut put_entries = 0_u64;
                 let mut segment_writer = ImmutableSegmentWriter::default();
                 let mut written_bytes = 0_u64;
@@ -3405,20 +3398,19 @@ impl StorageWrite for SlateDBWrite {
                         ))
                     })
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let visible_values = if self.writer_permit.is_some() {
-                    read_visible_immutable_values(
-                        &self.worker,
-                        &self.write_pipeline,
-                        &self.point_cache,
-                        &self.immutable_value_store,
-                        staged_entries.iter().map(|(key, _)| key.clone()).collect(),
-                    )
-                    .await?
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                } else {
-                    vec![None; staged_entries.len()]
-                };
+                // This read is deliberately outside the write fence. It
+                // prevents unchanged immutable values from being packed into
+                // a replacement segment while allowing concurrent immutable
+                // uploads and mutable publications to proceed. The fence is
+                // acquired after upload for the authenticated recheck below.
+                let visible_values = read_visible_immutable_values(
+                    &self.worker,
+                    &self.write_pipeline,
+                    &self.point_cache,
+                    &self.immutable_value_store,
+                    staged_entries.iter().map(|(key, _)| key.clone()).collect(),
+                )
+                .await?;
                 for ((physical_key, value), visible) in
                     staged_entries.into_iter().zip(visible_values)
                 {
@@ -3474,6 +3466,12 @@ impl StorageWrite for SlateDBWrite {
                 for (physical_key, locator) in immutable_locators {
                     self.overlay.insert(physical_key, Some(locator));
                 }
+                // A concurrent writer may have published one of the values
+                // after the preflight read. Recheck under the existing fence;
+                // identical assignments discard our duplicate locator, while
+                // conflicting bytes fail closed. Unpublished segments remain
+                // protected by process_segments for reachability GC.
+                self.serialize_publication().await?;
                 self.stats.put_entries += put_entries;
                 self.stats.written_bytes += written_bytes;
                 self.stats.storage_calls += 1;
