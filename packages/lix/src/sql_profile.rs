@@ -44,6 +44,30 @@ pub struct SqlReadProfile {
     /// Checksum of consumed scalar values. This is a benchmark-only
     /// correctness witness, not a public result API.
     pub result_checksum: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_branch_range_calls: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_untracked_overlay_calls: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_view_acquisitions: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_page_reads: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_page_entries: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_page_bytes: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_member_resolutions: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_source_closure_gets: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_member_closure_hits: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_merge_rows: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_tombstone_drops: u64,
+    #[cfg(feature = "storage-benches")]
+    pub scan_owner_key_clones: u64,
 }
 
 impl SqlReadProfile {
@@ -91,6 +115,39 @@ pub(crate) fn record_scan(rows: usize, batches: usize, arrow_bytes: usize, elaps
         profile.scan_batches = profile.scan_batches.saturating_add(batches as u64);
         profile.scan_arrow_bytes = profile.scan_arrow_bytes.saturating_add(arrow_bytes as u64);
         profile.scan_elapsed += elapsed;
+    });
+}
+
+#[cfg(feature = "storage-benches")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_scan_owner(
+    branch_range_calls: u64,
+    untracked_overlay_calls: u64,
+    view_acquisitions: u64,
+    page_reads: u64,
+    page_entries: u64,
+    page_bytes: u64,
+    member_resolutions: u64,
+    source_closure_gets: u64,
+    member_closure_hits: u64,
+    merge_rows: u64,
+    tombstone_drops: u64,
+    key_clones: u64,
+) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.scan_owner_branch_range_calls += branch_range_calls;
+        profile.scan_owner_untracked_overlay_calls += untracked_overlay_calls;
+        profile.scan_owner_view_acquisitions += view_acquisitions;
+        profile.scan_owner_page_reads += page_reads;
+        profile.scan_owner_page_entries += page_entries;
+        profile.scan_owner_page_bytes += page_bytes;
+        profile.scan_owner_member_resolutions += member_resolutions;
+        profile.scan_owner_source_closure_gets += source_closure_gets;
+        profile.scan_owner_member_closure_hits += member_closure_hits;
+        profile.scan_owner_merge_rows += merge_rows;
+        profile.scan_owner_tombstone_drops += tombstone_drops;
+        profile.scan_owner_key_clones += key_clones;
     });
 }
 

@@ -2794,12 +2794,6 @@ async fn consume_profile_cursor(
 
 #[cfg(feature = "storage-benches")]
 fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixError> {
-    if values.len() != 3 {
-        return Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            "streaming profile expected exactly three projected values",
-        ));
-    }
     let mut checksum = if checksum == 0 {
         0xcbf2_9ce4_8422_2325
     } else {

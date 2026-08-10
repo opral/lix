@@ -361,6 +361,8 @@ where
         limit: Option<usize>,
         include_tombstones: bool,
     ) -> Result<Vec<StateRow>, LixError> {
+        #[cfg(feature = "storage-benches")]
+        crate::sql_profile::record_scan_owner(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         let branch_id = canonical_branch_id(branch_id)?;
         if self.view.branch_id() == branch_id {
             return self
@@ -520,6 +522,8 @@ where
         limit: Option<usize>,
         include_tombstones: bool,
     ) -> Result<Vec<UntrackedStateRow>, LixError> {
+        #[cfg(feature = "storage-benches")]
+        crate::sql_profile::record_scan_owner(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         if limit == Some(0) {
             return Ok(Vec::new());
         }

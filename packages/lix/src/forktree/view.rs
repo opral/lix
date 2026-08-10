@@ -756,6 +756,30 @@ where
             )
             .await?;
         let page = cursor.next_page(page_size).await?;
+        #[cfg(feature = "storage-benches")]
+        crate::sql_profile::record_scan_owner(
+            0,
+            0,
+            0,
+            1,
+            page.entries.len() as u64,
+            page.entries
+                .iter()
+                .map(|entry| {
+                    let value_bytes = match &entry.value {
+                        ProjectedValue::FullValue(bytes) => bytes.len(),
+                        ProjectedValue::KeyOnly => 0,
+                    };
+                    (entry.key.0.len() + value_bytes) as u64
+                })
+                .sum(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            page.entries.len() as u64,
+        );
         let mut rows = Vec::new();
         for entry in page.entries {
             let (branch_id, key) = super::state::decode_untracked_key(&entry.key.0)?;
@@ -894,6 +918,8 @@ where
         &self,
         branch_id: CanonicalBranchId,
     ) -> Result<CoherentView<&R>, StorageError> {
+        #[cfg(feature = "storage-benches")]
+        crate::sql_profile::record_scan_owner(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         open_coherent_view_on_read(&self.read, branch_id).await
     }
 }

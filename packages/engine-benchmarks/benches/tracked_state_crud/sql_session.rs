@@ -511,6 +511,14 @@ impl SqlFixture {
         }
     }
 
+    pub(crate) async fn profile_stream(&self, sql: &str, mode: &str) -> lix::SqlReadProfile {
+        match self {
+            Self::RocksDB(fixture) => fixture.profile_stream(sql, mode).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.profile_stream(sql, mode).await,
+        }
+    }
+
     async fn read_olap_timed(&self, shape: OlapReadShape) -> usize {
         match self {
             Self::RocksDB(fixture) => fixture.read_olap_timed(shape).await,
@@ -1164,6 +1172,13 @@ where
             .rows_affected();
         assert_eq!(affected, 1);
         affected as usize
+    }
+
+    async fn profile_stream(&self, sql: &str, mode: &str) -> lix::SqlReadProfile {
+        self.session
+            .execute_result_streaming_profiled(sql, &[], mode, None)
+            .await
+            .expect("profile SQL result stream")
     }
 }
 

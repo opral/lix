@@ -144,8 +144,12 @@ where
                 selected_created_at.get_or_insert(created_at);
                 let source_members =
                     if let Some(members) = member_closures.get(&source_commit_object_id) {
+                        #[cfg(feature = "storage-benches")]
+                        crate::sql_profile::record_scan_owner(0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0);
                         Arc::clone(members)
                     } else {
+                        #[cfg(feature = "storage-benches")]
+                        crate::sql_profile::record_scan_owner(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0);
                         let bytes =
                             super::view::load_object_bytes(read, source_commit_object_id).await?;
                         let source = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
@@ -2277,6 +2281,8 @@ where
             .members
             .get(value_ref.page_ordinal as usize)
             .ok_or_else(|| corruption("state value page ordinal is absent"))?;
+        #[cfg(feature = "storage-benches")]
+        crate::sql_profile::record_scan_owner(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0);
         let resolved =
             resolve_semantic_member_with_cache(read, member, &mut member_closures).await?;
         let expected_global = *source == StateSource::Global;
@@ -2444,6 +2450,23 @@ where
                     read,
                 )
                 .await?;
+                #[cfg(feature = "storage-benches")]
+                crate::sql_profile::record_scan_owner(
+                    0,
+                    0,
+                    0,
+                    1,
+                    page.len() as u64,
+                    page.iter()
+                        .map(|(key, value)| (key.len() + value.len()) as u64)
+                        .sum(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    u64::from(page.last().is_some()),
+                );
                 global_done = page.len() < page_size;
                 global_cursor = page.last().map(|(key, _)| key.clone());
                 global.extend(page);
@@ -2459,6 +2482,23 @@ where
                     read,
                 )
                 .await?;
+                #[cfg(feature = "storage-benches")]
+                crate::sql_profile::record_scan_owner(
+                    0,
+                    0,
+                    0,
+                    1,
+                    page.len() as u64,
+                    page.iter()
+                        .map(|(key, value)| (key.len() + value.len()) as u64)
+                        .sum(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    u64::from(page.last().is_some()),
+                );
                 local_done = page.len() < page_size;
                 local_cursor = page.last().map(|(key, _)| key.clone());
                 local.extend(page);
@@ -2510,6 +2550,8 @@ where
                 return Err(corruption("global state tree contains a tombstone"));
             }
             if value.cell.deleted() && !include_tombstones {
+                #[cfg(feature = "storage-benches")]
+                crate::sql_profile::record_scan_owner(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0);
                 continue;
             }
             output.push((key, value, source));
