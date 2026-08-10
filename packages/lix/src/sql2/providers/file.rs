@@ -35,7 +35,9 @@ use serde::Deserialize;
 use crate::binary_cas::BlobDataReader;
 use crate::binary_cas::{BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
-use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
+use crate::common::{
+    LixPath, MutationIdentity, RequestBlobSpliceProvenance, SharedStr, compose_file_path,
+};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     FilesystemIndex, FilesystemStateRow, FilesystemStateRows, filesystem_schema_keys,
@@ -3879,13 +3881,16 @@ where
                         context.branch_id = GLOBAL_BRANCH_ID.to_string();
                     }
                     context.metadata = write.metadata;
-                    FileDescriptorWriteIntent {
-                        id: Some(existing.id.clone()),
-                        directory_id: existing.directory_id.clone(),
-                        name: existing.name.clone(),
-                        context: context.clone(),
-                    }
-                    .append_to(&mut staged.state_rows);
+                    append_file_descriptor_write(
+                        &mut staged.state_rows,
+                        FileDescriptorWriteIntent {
+                            id: Some(existing.id.clone()),
+                            directory_id: existing.directory_id.clone(),
+                            name: existing.name.clone(),
+                            context: context.clone(),
+                        },
+                        None,
+                    );
                     let file_content_start = staged.file_content_writes.len();
                     stage_lix_file_content_update_write(
                         &mut staged,
@@ -4128,13 +4133,16 @@ where
                         != write.metadata.as_ref().map(TransactionJson::normalized);
                     context.metadata = write.metadata;
                     if metadata_changed {
-                        FileDescriptorWriteIntent {
-                            id: Some(entry.id().to_string()),
-                            directory_id: entry.parent_id.clone(),
-                            name: entry.name.clone(),
-                            context: context.clone(),
-                        }
-                        .append_to(&mut staged.state_rows);
+                        append_file_descriptor_write(
+                            &mut staged.state_rows,
+                            FileDescriptorWriteIntent {
+                                id: Some(entry.id().to_string()),
+                                directory_id: entry.parent_id.clone(),
+                                name: entry.name.clone(),
+                                context: context.clone(),
+                            },
+                            Some(entry.created_at()),
+                        );
                     }
                 }
                 FastLixFilePathWriteConflict::None
@@ -4439,13 +4447,17 @@ where
         }
         if let Some(metadata) = &metadata_update {
             context.metadata.clone_from(metadata);
-            FileDescriptorWriteIntent {
-                id: Some(existing.id.clone()),
-                directory_id: existing.directory_id.clone(),
-                name: existing.name.clone(),
-                context: context.clone(),
-            }
-            .append_to(&mut staged.state_rows);
+            let created_at = live_rows.row(existing.live).created_at().to_string();
+            append_file_descriptor_write(
+                &mut staged.state_rows,
+                FileDescriptorWriteIntent {
+                    id: Some(existing.id.clone()),
+                    directory_id: existing.directory_id.clone(),
+                    name: existing.name.clone(),
+                    context: context.clone(),
+                },
+                Some(&created_at),
+            );
         }
         let content = file_content_from_request_splice(data.clone(), splice_provenance.as_ref());
         stage_lix_file_content_update_write(
@@ -4809,13 +4821,17 @@ fn lix_file_existing_update_stage_from_batch(
                     .file_path(directory_id.as_deref(), &name)
                     .map_err(lix_error_to_datafusion_error)?;
             }
-            FileDescriptorWriteIntent {
-                id: Some(id.clone()),
-                directory_id,
-                name,
-                context: context.clone(),
-            }
-            .append_to(&mut staged.state_rows);
+            let created_at = optional_string_value(batch, row_index, "lixcol_created_at")?;
+            append_file_descriptor_write(
+                &mut staged.state_rows,
+                FileDescriptorWriteIntent {
+                    id: Some(id.clone()),
+                    directory_id,
+                    name,
+                    context: context.clone(),
+                },
+                created_at.as_deref(),
+            );
         }
 
         if include_data_writes {
@@ -5058,7 +5074,7 @@ fn lix_file_path_update_stage_from_batch(
             None
         };
 
-        let plan = plan_parsed_file_path_update_with_resolvers(
+        let mut plan = plan_parsed_file_path_update_with_resolvers(
             path_resolvers,
             id.clone(),
             parsed_path,
@@ -5066,6 +5082,9 @@ fn lix_file_path_update_stage_from_batch(
             generate_directory_id,
         )
         .map_err(lix_error_to_datafusion_error)?;
+        let created_at = optional_string_value(batch, row_index, "lixcol_created_at")?;
+        preserve_file_descriptor_created_at(&mut plan.rows, &id, created_at.as_deref())
+            .map_err(lix_error_to_datafusion_error)?;
         staged
             .extend_filesystem_plan(plan)
             .map_err(lix_error_to_datafusion_error)?;
@@ -5448,6 +5467,43 @@ fn attach_lix_file_insert_origin(rows: &mut RawWriteBatch, surface_name: &str, f
             rows.set_origin(index, Some(origin.clone()));
         }
     }
+}
+
+fn append_file_descriptor_write(
+    rows: &mut RawWriteBatch,
+    intent: FileDescriptorWriteIntent,
+    created_at: Option<&str>,
+) {
+    let row_index = rows.len();
+    intent.append_to(rows);
+    if let Some(created_at) = created_at {
+        rows.set_created_at(row_index, Some(SharedStr::from(created_at)));
+    }
+}
+
+fn preserve_file_descriptor_created_at(
+    rows: &mut RawWriteBatch,
+    file_id: &str,
+    created_at: Option<&str>,
+) -> std::result::Result<(), LixError> {
+    let Some(created_at) = created_at else {
+        return Ok(());
+    };
+    let row_index = (0..rows.len()).find(|&index| {
+        let row = rows.row(index);
+        row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+            && row
+                .file_id
+                .is_some_and(|candidate| candidate.as_str() == file_id)
+    });
+    let Some(row_index) = row_index else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("file path update did not stage descriptor for file {file_id}"),
+        ));
+    };
+    rows.set_created_at(row_index, Some(SharedStr::from(created_at)));
+    Ok(())
 }
 
 fn lix_file_insert_origin(surface_name: &str, file_id: &str) -> TransactionWriteOrigin {

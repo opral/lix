@@ -107,12 +107,23 @@ pub(crate) async fn resolve_sql_branch_scope(
 ) -> Result<Vec<String>, LixError> {
     match scope {
         SqlBranchScope::Active(branch_id) => {
-            if branch_ref.load_head(&branch_id).await?.is_none() {
-                return Err(LixError::branch_not_found(
-                    branch_id,
-                    "resolve SQL active branch scope",
-                    "active branch",
-                ));
+            match branch_ref.load_head(&branch_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(LixError::branch_not_found(
+                        branch_id,
+                        "resolve SQL active branch scope",
+                        "active branch",
+                    ));
+                }
+                Err(error) if error.code == LixError::CODE_INVALID_PARAM => {
+                    return Err(LixError::branch_not_found(
+                        branch_id,
+                        "resolve SQL active branch scope",
+                        "active branch",
+                    ));
+                }
+                Err(error) => return Err(error),
             }
             Ok(vec![branch_id])
         }
