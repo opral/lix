@@ -1799,6 +1799,139 @@ type AuthenticatedCommitMemberClosure = (CommitObjectV1, Arc<[CommitMemberV1]>);
 pub(super) struct StaleMemberAuthCache {
     commits: BTreeMap<ObjectId, CommitObjectV1>,
     members: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), (CommitMemberV1, u32)>,
+    pages: BTreeMap<(ObjectId, ObjectId), super::model::CommitChangePageV2>,
+}
+
+/// Authenticated stale summaries are produced only by the retained-view
+/// loader.  The cache has no public map surface, so a caller cannot seed a
+/// summary or token that bypasses endpoint validation.
+#[derive(Default)]
+pub(super) struct StaleCommitSummaryCache {
+    entries: BTreeMap<crate::changelog::CommitId, StaleCommitSummary>,
+}
+
+impl StaleCommitSummaryCache {
+    pub(super) fn with_summary(summary: StaleCommitSummary) -> Self {
+        let key =
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*summary.commit_id.as_bytes()));
+        let mut cache = Self::default();
+        cache.entries.insert(key, summary);
+        cache
+    }
+}
+
+async fn load_stale_page_for_position<R>(
+    read: &R,
+    commit_object_id: ObjectId,
+    commit_id: CommitId,
+    page_object_id: ObjectId,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<super::model::CommitChangePageV2, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let key = (commit_object_id, page_object_id);
+    if let Some(page) = cache.pages.get(&key) {
+        return Ok(page.clone());
+    }
+    let bytes = super::view::load_object_bytes(read, page_object_id).await?;
+    let page = super::model::CommitChangePageV2::decode(page_object_id, &bytes)?;
+    if page.commit_id != commit_id {
+        return Err(corruption(
+            "commit change page belongs to a different Commit",
+        ));
+    }
+    cache.pages.insert(key, page.clone());
+    Ok(page)
+}
+
+/// Proves the selected page's position in the commit's authenticated ordered
+/// page vector without loading the unrelated member closure.  The selected
+/// page and its immediate neighbors establish ordinal adjacency; duplicate
+/// vector entries are rejected globally because they make the vector
+/// ambiguous even when the duplicate is not selected by this request.
+async fn validate_stale_page_position<R>(
+    read: &R,
+    commit_object_id: ObjectId,
+    commit_id: CommitId,
+    page_object_ids: &[ObjectId],
+    page_object_id: ObjectId,
+    page: &super::model::CommitChangePageV2,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut seen = BTreeSet::new();
+    for id in page_object_ids {
+        if !seen.insert(*id) {
+            return Err(corruption("commit change-page vector repeats an object"));
+        }
+    }
+    let index = page_object_ids
+        .iter()
+        .position(|id| *id == page_object_id)
+        .ok_or_else(|| corruption("selected page is absent from the Commit page vector"))?;
+    if page.commit_id != commit_id {
+        return Err(corruption("selected page belongs to a different Commit"));
+    }
+    if index == 0 && page.start_ordinal != 0 {
+        return Err(corruption(
+            "first commit change page does not start at ordinal zero",
+        ));
+    }
+    if index > 0 {
+        let first = load_stale_page_for_position(
+            read,
+            commit_object_id,
+            commit_id,
+            page_object_ids[0],
+            cache,
+        )
+        .await?;
+        if first.start_ordinal != 0 {
+            return Err(corruption(
+                "commit change-page vector starts at a nonzero ordinal",
+            ));
+        }
+        let previous = load_stale_page_for_position(
+            read,
+            commit_object_id,
+            commit_id,
+            page_object_ids[index - 1],
+            cache,
+        )
+        .await?;
+        let expected = previous
+            .start_ordinal
+            .checked_add(
+                u32::try_from(previous.members.len())
+                    .map_err(|_| corruption("previous page member count overflows u32"))?,
+            )
+            .ok_or_else(|| corruption("previous page ordinal overflows u32"))?;
+        if page.start_ordinal != expected {
+            return Err(corruption(
+                "commit change-page vector has a gap or overlap before selected page",
+            ));
+        }
+    }
+    if let Some(next_id) = page_object_ids.get(index + 1) {
+        let next = load_stale_page_for_position(read, commit_object_id, commit_id, *next_id, cache)
+            .await?;
+        let expected = page
+            .start_ordinal
+            .checked_add(
+                u32::try_from(page.members.len())
+                    .map_err(|_| corruption("selected page member count overflows u32"))?,
+            )
+            .ok_or_else(|| corruption("selected page ordinal overflows u32"))?;
+        if next.start_ordinal != expected {
+            return Err(corruption(
+                "commit change-page vector has a gap or overlap after selected page",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn load_stale_commit<R>(
@@ -1868,6 +2001,19 @@ where
                 "authenticated source state page is not owned by its Commit",
             ));
         }
+        cache
+            .pages
+            .insert((commit_object_id, value_ref.page_object_id), page.clone());
+        validate_stale_page_position(
+            read,
+            commit_object_id,
+            commit.commit_id,
+            &commit.member_page_object_ids,
+            value_ref.page_object_id,
+            &page,
+            cache,
+        )
+        .await?;
         let page_ordinal = usize::try_from(value_ref.page_ordinal)
             .map_err(|_| corruption("authenticated source page ordinal overflows usize"))?;
         let member = page
@@ -2827,7 +2973,7 @@ where
 /// shares the ordinary state-tree point selection, but the selected semantic
 /// member chain is checked against CommitCatalog and ChangeCatalog at every
 /// owner edge before its payload is exposed.
-pub(crate) async fn state_points_on_read_for_stale<R>(
+pub(super) async fn state_points_on_read_for_stale<R>(
     repository: &RepositoryRootV1,
     summary: StaleCommitSummary,
     keys: &[Vec<u8>],
@@ -2893,9 +3039,7 @@ where
     }
 
     let mut output = Vec::with_capacity(selected.len());
-    let summary_cache_key =
-        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*summary.commit_id.as_bytes()));
-    let mut summary_cache = BTreeMap::from([(summary_cache_key, summary.clone())]);
+    let mut summary_cache = StaleCommitSummaryCache::with_summary(summary.clone());
     let mut stale_member_cache = StaleMemberAuthCache::default();
     for (row, value_ref) in selected.iter().zip(refs) {
         let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
@@ -2924,6 +3068,16 @@ where
                 "stale state value page is not owned by its authenticated commit",
             ));
         }
+        validate_stale_page_position(
+            read,
+            page_summary.commit_object_id,
+            page_summary.commit_id,
+            &page_summary.member_page_object_ids,
+            value_ref.page_object_id,
+            page,
+            &mut stale_member_cache,
+        )
+        .await?;
         let page_ordinal = value_ref.page_ordinal as usize;
         let member = page
             .members
@@ -3349,13 +3503,23 @@ where
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StaleCommitSummary {
-    pub(crate) commit_id: CommitId,
-    pub(crate) commit_object_id: ObjectId,
-    pub(crate) generation: u64,
-    pub(crate) global_state_root: ObjectId,
-    pub(crate) local_state_root: ObjectId,
-    pub(crate) member_page_object_ids: Vec<ObjectId>,
+pub(super) struct StaleCommitSummary {
+    commit_id: CommitId,
+    commit_object_id: ObjectId,
+    generation: u64,
+    global_state_root: ObjectId,
+    local_state_root: ObjectId,
+    member_page_object_ids: Vec<ObjectId>,
+}
+
+impl StaleCommitSummary {
+    pub(super) fn global_state_root(&self) -> ObjectId {
+        self.global_state_root
+    }
+
+    pub(super) fn local_state_root(&self) -> ObjectId {
+        self.local_state_root
+    }
 }
 
 /// Authenticates only the commit envelope and root/topology summary required
@@ -3363,16 +3527,16 @@ pub(crate) struct StaleCommitSummary {
 /// authenticated by the changed state leaves that stale classification reads.
 /// The successful result is cached only in the caller's retained-read
 /// operation; failures are never inserted.
-pub(crate) async fn load_historical_commit_state_roots_for_stale<R>(
+pub(super) async fn load_historical_commit_state_roots_for_stale<R>(
     read: &R,
     repository: &RepositoryRootV1,
     commit_id: crate::changelog::CommitId,
-    cache: &mut BTreeMap<crate::changelog::CommitId, StaleCommitSummary>,
+    cache: &mut StaleCommitSummaryCache,
 ) -> Result<StaleCommitSummary, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    if let Some(roots) = cache.get(&commit_id) {
+    if let Some(roots) = cache.entries.get(&commit_id) {
         return Ok(roots.clone());
     }
     let catalog_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
@@ -3402,8 +3566,9 @@ where
         local_state_root: commit.local_state_root,
         member_page_object_ids: commit.member_page_object_ids.clone(),
     };
-    cache.insert(commit_id, summary);
+    cache.entries.insert(commit_id, summary);
     Ok(cache
+        .entries
         .get(&commit_id)
         .expect("stale summary was just inserted")
         .clone())
