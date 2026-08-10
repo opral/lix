@@ -122,6 +122,7 @@ where
         request,
         view.branch_id(),
         |branch_id, lower, upper| async move {
+            let (source_limit, source_include_tombstones) = range_source_options(request);
             let tracked = if request.filter.untracked == Some(true) {
                 Vec::new()
             } else {
@@ -129,8 +130,8 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    request.limit,
-                    request.filter.include_tombstones,
+                    source_limit,
+                    source_include_tombstones,
                 )
                 .await?
                 .into_iter()
@@ -147,8 +148,8 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    request.limit,
-                    request.filter.include_tombstones,
+                    source_limit,
+                    source_include_tombstones,
                 )
                 .await?
                 .into_iter()
@@ -177,6 +178,7 @@ where
         request,
         view.branch_id(),
         |branch_id, lower, upper| async move {
+            let (source_limit, source_include_tombstones) = range_source_options(request);
             let tracked = if request.filter.untracked == Some(true) {
                 Vec::new()
             } else {
@@ -184,8 +186,8 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    request.limit,
-                    request.filter.include_tombstones,
+                    source_limit,
+                    source_include_tombstones,
                 )
                 .await?
                 .into_iter()
@@ -202,8 +204,8 @@ where
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
-                    request.limit,
-                    request.filter.include_tombstones,
+                    source_limit,
+                    source_include_tombstones,
                 )
                 .await?
                 .into_iter()
@@ -221,6 +223,19 @@ where
     .await
 }
 
+fn range_source_options(request: &EntityScanRequest) -> (Option<usize>, bool) {
+    let merges_tracked_and_untracked = request.filter.untracked.is_none();
+    let source_limit = match request.limit {
+        Some(0) => Some(0),
+        _ if merges_tracked_and_untracked => None,
+        limit => limit,
+    };
+    (
+        source_limit,
+        request.filter.include_tombstones || merges_tracked_and_untracked,
+    )
+}
+
 async fn scan_slots_by_branches<F, Fut>(
     request: &EntityScanRequest,
     active_branch_id: String,
@@ -230,7 +245,7 @@ where
     F: FnMut(String, Option<Vec<u8>>, Option<Vec<u8>>) -> Fut,
     Fut: Future<Output = Result<Vec<EntityStateSlot>, LixError>>,
 {
-    if matches!(request.filter.rows, EntityRowSelection::None) {
+    if request.limit == Some(0) || matches!(request.filter.rows, EntityRowSelection::None) {
         return Ok(Vec::new());
     }
     let mut bounds_request = request.clone();
@@ -360,6 +375,9 @@ fn merge_range_slots(
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Vec<EntityStateSlot> {
+    if limit == Some(0) {
+        return Vec::new();
+    }
     let mut tracked = tracked
         .into_iter()
         .map(|slot| (slot_sort_key(&slot), slot))
@@ -692,6 +710,55 @@ mod tests {
             untracked: Some(false),
             include_tombstones,
         }
+    }
+
+    #[tokio::test]
+    async fn range_limit_zero_skips_sources_and_emits_no_rows() {
+        let request = EntityScanRequest {
+            limit: Some(0),
+            ..EntityScanRequest::default()
+        };
+        assert_eq!(range_source_options(&request), (Some(0), true));
+
+        let mut source_calls = 0;
+        let slots = scan_slots_by_branches(&request, "branch-a".to_string(), |_, _, _| {
+            source_calls += 1;
+            async {
+                Ok(vec![EntityStateSlot::Tracked(row(
+                    "visible",
+                    StateCell::Value(SharedStr::from("{}")),
+                ))])
+            }
+        })
+        .await
+        .expect("LIMIT 0 is an empty native scan");
+        assert_eq!(source_calls, 0);
+        assert!(slots.is_empty());
+
+        assert!(
+            merge_range_slots(
+                vec![EntityStateSlot::Tracked(row(
+                    "visible",
+                    StateCell::Value(SharedStr::from("{}")),
+                ))],
+                Vec::new(),
+                false,
+                Some(0),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn range_sources_defer_positive_limit_until_overlay_visibility() {
+        let mut request = EntityScanRequest {
+            limit: Some(1),
+            ..EntityScanRequest::default()
+        };
+        assert_eq!(range_source_options(&request), (None, true));
+
+        request.filter.untracked = Some(false);
+        assert_eq!(range_source_options(&request), (Some(1), false));
     }
 
     #[test]
