@@ -5139,7 +5139,10 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
         .await
         .expect("role view");
     let mut roles = PreparedPublication::from_global_epoch(&view).expect("roles");
-    for (index, role) in [SnapshotRole::Recovery].into_iter().enumerate() {
+    for (index, role) in [SnapshotRole::Recovery, SnapshotRole::CheckpointBaseline]
+        .into_iter()
+        .enumerate()
+    {
         let selector_id = SnapshotSelectorId::from_bytes(raw_id(index as u8 + 2));
         roles
             .publish_current_snapshot_pin(&view, role, selector_id, SelectorExpectation::Absent)
@@ -5152,7 +5155,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, target_id).await);
 
-    for retired_role in [3_u8, 4, 5] {
+    for retired_role in [4_u8, 5] {
         assert!(
             SnapshotRole::decode(retired_role).is_err(),
             "retired snapshot role {retired_role} must fail closed"

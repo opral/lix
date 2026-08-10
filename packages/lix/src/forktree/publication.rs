@@ -60,6 +60,10 @@ pub(crate) struct OrderedBranchHistoryTransition {
     pub(crate) branch_ref_change: ChangeObjectV1,
     pub(crate) branch_snapshot: BranchSnapshotV1,
     pub(crate) repository_root: RepositoryRootV1,
+    /// Selected members were fully authenticated by the transaction-owned
+    /// retained view before this publication was constructed. Carry only
+    /// that proof, not a second closure/cache, across the writer boundary.
+    pub(crate) authenticated_selected_members: BTreeSet<(ObjectId, u32, super::model::ChangeId)>,
 }
 
 /// One prepared atomic publication. It always exact-CASes and rotates the
@@ -537,6 +541,14 @@ impl PreparedPublication {
             },
             SelectorExpectation::Absent,
         )?;
+        self.publish_snapshot_pin_to_commit(
+            super::model::SnapshotRole::CheckpointBaseline,
+            super::model::SnapshotSelectorId::from_bytes(*branch_id.as_bytes()),
+            branch_id,
+            snapshot_id,
+            source_commit_object_id,
+            SelectorExpectation::Absent,
+        )?;
         Ok(snapshot_id)
     }
 
@@ -555,6 +567,24 @@ impl PreparedPublication {
         R: StorageAdapterRead,
     {
         let Some(next_commit) = next_commit else {
+            let baseline_key = super::model::snapshot_selector_key(
+                super::model::SnapshotRole::CheckpointBaseline,
+                super::model::SnapshotSelectorId::from_bytes(*view.branch_id().as_bytes()),
+            );
+            if let Some(raw_baseline) = view.load_selector_value(&baseline_key).await? {
+                let baseline = SnapshotSelectorV1::decode(&raw_baseline)?;
+                if baseline.role != super::model::SnapshotRole::CheckpointBaseline
+                    || baseline.selector_id
+                        != super::model::SnapshotSelectorId::from_bytes(
+                            *view.branch_id().as_bytes(),
+                        )
+                {
+                    return Err(corruption(
+                        "checkpoint baseline selector identity does not match its branch",
+                    ));
+                }
+                self.delete_snapshot_selector(baseline, raw_baseline)?;
+            }
             return self.delete_branch_selector(
                 view.branch_selector(),
                 view.raw_branch_selector().clone(),
@@ -1097,16 +1127,15 @@ impl PreparedPublication {
 
     /// Pins the exact selected branch snapshot/head under any retained-root
     /// role without letting a caller supply an unrelated object edge.
-    pub(crate) fn publish_current_snapshot_pin<R>(
+    pub(crate) fn publish_snapshot_pin_to_commit(
         &mut self,
-        view: &CoherentView<R>,
         role: super::model::SnapshotRole,
         selector_id: super::model::SnapshotSelectorId,
+        branch_id: super::model::CanonicalBranchId,
+        branch_snapshot_object_id: ObjectId,
+        semantic_commit_object_id: ObjectId,
         expected: SelectorExpectation,
-    ) -> Result<ObjectId, StorageError>
-    where
-        R: StorageAdapterRead,
-    {
+    ) -> Result<ObjectId, StorageError> {
         let selector_generation = match &expected {
             SelectorExpectation::Absent => 1,
             SelectorExpectation::Equals(raw_selector) => {
@@ -1125,9 +1154,9 @@ impl PreparedPublication {
         let target = SnapshotTargetV1 {
             role,
             selector_id,
-            branch_id: view.branch_id(),
-            branch_snapshot_object_id: view.branch_selector().branch_snapshot_object_id,
-            semantic_commit_object_id: view.branch_snapshot().semantic_head_commit_object_id,
+            branch_id,
+            branch_snapshot_object_id,
+            semantic_commit_object_id,
         };
         let target_id = self.stage_snapshot_target(target)?;
         self.put_snapshot_selector(
@@ -1140,6 +1169,26 @@ impl PreparedPublication {
             expected,
         )?;
         Ok(target_id)
+    }
+
+    pub(crate) fn publish_current_snapshot_pin<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        role: super::model::SnapshotRole,
+        selector_id: super::model::SnapshotSelectorId,
+        expected: SelectorExpectation,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        self.publish_snapshot_pin_to_commit(
+            role,
+            selector_id,
+            view.branch_id(),
+            view.branch_selector().branch_snapshot_object_id,
+            view.branch_snapshot().semantic_head_commit_object_id,
+            expected,
+        )
     }
 
     #[cfg(test)]
@@ -1437,6 +1486,7 @@ impl PreparedPublication {
             branch_ref_change,
             branch_snapshot,
             repository_root,
+            authenticated_selected_members,
         } = transition;
         let mut member_pages = Vec::new();
         for commit in &mut semantic_commits {
@@ -1604,25 +1654,21 @@ impl PreparedPublication {
                         }
                     }
                     Some(_) => {
-                        let raw_entry = view
-                            .lookup_tree_value(
-                                view.repository_root().change_catalog_root,
-                                "change",
-                                change_id.as_bytes(),
-                            )
-                            .await?
-                            .ok_or_else(|| {
-                                corruption("selected history member has no ChangeCatalog owner")
-                            })?;
-                        view.validate_member_catalog_owner(
-                            view.repository_root().commit_catalog_root,
-                            commit_object_id,
-                            commit.generation,
-                            ordinal,
-                            member.clone(),
-                            super::model::ChangeCatalogEntry::decode(&raw_entry)?,
-                        )
-                        .await?;
+                        let Some((source_commit_object_id, source_ordinal)) = member.source()
+                        else {
+                            return Err(corruption(
+                                "selected history member lost its authenticated source edge",
+                            ));
+                        };
+                        if !authenticated_selected_members.contains(&(
+                            source_commit_object_id,
+                            source_ordinal,
+                            change_id,
+                        )) {
+                            return Err(corruption(
+                                "selected history member lacks preauthenticated closure proof",
+                            ));
+                        }
                     }
                 }
             }

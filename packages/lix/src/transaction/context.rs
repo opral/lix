@@ -45,9 +45,9 @@ use crate::filesystem::{
     FilesystemPathKind, FilesystemRowContext, append_blob_ref_tombstone_row,
 };
 use crate::forktree::{
-    AuthenticatedBlobReader, CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow,
-    PreparedPublication, StateCell, StateKey, StateKeyRef, UploadBindingRef, decode_state_key,
-    encode_state_key, prepare_upload_part,
+    AuthenticatedBlobReader, CanonicalUploadId, ForkTreeReadFacade, HistoricalStateDiffEntry,
+    HistoricalStateRow, PreparedPublication, StateCell, StateKey, StateKeyRef, StateSource,
+    UploadBindingRef, decode_state_key, encode_state_key, load_commit_summary, prepare_upload_part,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_publication_state};
@@ -79,7 +79,9 @@ use crate::sql2::{
     SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
-use crate::state::{CertifiedStatePredecessor, ForkTreeStateView, StateRow, TransactionStateView};
+use crate::state::{
+    CertifiedStatePredecessor, ForkTreeStateView, StateRoots, StateRow, TransactionStateView,
+};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
@@ -7029,6 +7031,12 @@ where
         let commit_id = self
             .staged_writes
             .stage_selected_commit_change_refs(branch_id.clone(), selected_changes)?;
+        let checkpoint_commit_id = CommitId::parse(&commit_id).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("staged checkpoint commit id is not canonical: {error}"),
+            )
+        })?;
         self.staged_writes
             .set_first_commit_parent(branch_id.clone(), previous_checkpoint_commit_id)?;
         self.staged_writes
@@ -7038,6 +7046,7 @@ where
                     recovered_head_commit_id,
                     interval_has_commits,
                 },
+                checkpoint_commit_id,
             })?;
         Ok(commit_id)
     }
@@ -7459,21 +7468,119 @@ where
             .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
         let previous_checkpoint_commit_id = self
             .forktree_read_facade()
-            .checkpoint_history_from_head(head_commit_id, &branch_id)
+            .latest_checkpoint_for_branch(head_commit_id, &branch_id)
             .await?
-            .into_iter()
-            .next()
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("branch '{branch_id}' has no checkpoint baseline"),
                 )
-            })?
-            .commit_id;
-        let diff = self
-            .forktree_read_facade()
-            .diff_branch_state_rows_between_commits(previous_checkpoint_commit_id, head_commit_id)
-            .await?;
+            })?;
+        // Checkpoint selection is a root-to-root operation.  The historical
+        // row diff used by working-diff consumers walks both complete endpoint
+        // states and is therefore quadratic in the authenticated point reads
+        // for a large interval.  Keep this path on the native ordered-root
+        // diff: the retained branch view authenticates both commit envelopes,
+        // prunes equal subtrees, and resolves only changed keys in bounded
+        // point batches.  The public historical row bridge remains unchanged
+        // for its separate consumers.
+        let diff = {
+            let historical = self.forktree_read_facade();
+            let view = historical.branch(&branch_id).await?;
+            let before = load_commit_summary(
+                &view,
+                crate::forktree::CommitId::from_bytes(
+                    *previous_checkpoint_commit_id.as_uuid().as_bytes(),
+                ),
+            )
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    "checkpoint baseline commit is missing",
+                )
+            })?;
+            let after = load_commit_summary(
+                &view,
+                crate::forktree::CommitId::from_bytes(*head_commit_id.as_uuid().as_bytes()),
+            )
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    "checkpoint head commit is missing",
+                )
+            })?;
+            let state_view = ForkTreeStateView::new(view);
+            let entries = state_view
+                .diff_roots(
+                    StateRoots {
+                        global: before.global_state_root,
+                        local: Some(before.local_state_root),
+                    },
+                    StateRoots {
+                        global: after.global_state_root,
+                        local: Some(after.local_state_root),
+                    },
+                )
+                .await?;
+            entries
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .before
+                        .as_ref()
+                        .or(entry.after.as_ref())
+                        .is_some_and(|value| {
+                            value.source == StateSource::Branch
+                                && entry.key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
+                                && entry.key.schema_key
+                                    != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                        })
+                })
+                .map(|entry| {
+                    let before = entry.before.map(|value| {
+                        let (snapshot_content, deleted) = match value.value.cell {
+                            StateCell::Value(snapshot) => (Some(snapshot), false),
+                            StateCell::Null => (None, false),
+                            StateCell::Tombstone => (None, true),
+                        };
+                        HistoricalStateRow {
+                            key: entry.key.clone(),
+                            global: value.source == StateSource::Global,
+                            change_id: value.value.change_id,
+                            commit_id: value.value.commit_id,
+                            created_at: value.value.created_at,
+                            updated_at: value.value.updated_at,
+                            snapshot_content,
+                            metadata: value.value.metadata,
+                            deleted,
+                            blob_manifest_object_ids: value.value.blob_manifest_object_ids,
+                        }
+                    });
+                    let after = entry.after.map(|value| {
+                        let (snapshot_content, deleted) = match value.value.cell {
+                            StateCell::Value(snapshot) => (Some(snapshot), false),
+                            StateCell::Null => (None, false),
+                            StateCell::Tombstone => (None, true),
+                        };
+                        HistoricalStateRow {
+                            key: entry.key,
+                            global: value.source == StateSource::Global,
+                            change_id: value.value.change_id,
+                            commit_id: value.value.commit_id,
+                            created_at: value.value.created_at,
+                            updated_at: value.value.updated_at,
+                            snapshot_content,
+                            metadata: value.value.metadata,
+                            deleted,
+                            blob_manifest_object_ids: value.value.blob_manifest_object_ids,
+                        }
+                    });
+                    HistoricalStateDiffEntry { before, after }
+                })
+                .collect::<Vec<_>>()
+        };
         let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
         if requested.len() != diff_ids.len() {
             return Err(LixError::new(
@@ -7572,6 +7679,7 @@ where
                         recovered_head_commit_id: head_commit_id,
                         interval_has_commits,
                     },
+                    checkpoint_commit_id,
                 })?;
             checkpoint_commit_id.to_string()
         };

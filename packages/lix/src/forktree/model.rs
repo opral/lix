@@ -1526,6 +1526,7 @@ impl UploadSelectorV1 {
 pub(crate) enum SnapshotRole {
     Checkpoint = 1,
     Recovery = 2,
+    CheckpointBaseline = 3,
 }
 
 impl SnapshotRole {
@@ -1533,6 +1534,7 @@ impl SnapshotRole {
         match value {
             1 => Ok(Self::Checkpoint),
             2 => Ok(Self::Recovery),
+            3 => Ok(Self::CheckpointBaseline),
             _ => Err(corruption(format!(
                 "unknown retained snapshot role {value}"
             ))),
@@ -1543,6 +1545,7 @@ impl SnapshotRole {
         match self {
             Self::Checkpoint => b"checkpoint/",
             Self::Recovery => b"recovery/",
+            Self::CheckpointBaseline => b"checkpoint-baseline/",
         }
     }
 }

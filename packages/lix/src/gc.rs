@@ -24,6 +24,7 @@ pub(crate) struct CheckpointRecoveryRef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointPublication {
     pub(crate) recovery_ref: CheckpointRecoveryRef,
+    pub(crate) checkpoint_commit_id: CommitId,
 }
 
 /// Stages one stable per-branch recovery selector in the same authenticated
