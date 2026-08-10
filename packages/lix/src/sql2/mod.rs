@@ -5,6 +5,7 @@ mod catalog;
 mod change_materialization;
 mod context;
 mod dml;
+pub(crate) mod entity_batch;
 mod entity_projection;
 mod error;
 mod exec;
