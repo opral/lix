@@ -795,7 +795,7 @@ where
     /// transaction overlay owner before a consumer asks for the combined
     /// `TransactionStateView`.
     pub(crate) async fn committed_state_view(
-        &self,
+        &mut self,
     ) -> Result<ForkTreeStateView<SharedStorageAdapterRead<StorageImpl::Read<'static>>>, LixError>
     {
         let read = self.opening_read();
