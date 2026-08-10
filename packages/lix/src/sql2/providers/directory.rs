@@ -2207,7 +2207,7 @@ fn lix_directory_record_batch_from_filesystem_rows(
                     format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
                 )
             })?;
-        let key = FilesystemDescriptorKey::from_state_row_ref(row, snapshot.id.clone());
+        let key = FilesystemDescriptorKey::from_state_row(row, snapshot.id.clone());
         directory_rows.push(DirectoryDescriptorRecord {
             id: snapshot.id,
             parent_id: snapshot.parent_id,
@@ -2343,7 +2343,12 @@ where
         commit_ids.push(directory.live.commit_id());
         untracked_values.push(Some(directory.live.untracked()));
         metadata_values.push(directory.live.metadata());
-        branch_ids.push(Some(directory.live.branch_id().to_owned()));
+        let branch_id = if schema.column_with_name("lixcol_branch_id").is_some() {
+            directory.key.branch_id().to_owned()
+        } else {
+            directory.live.branch_id().to_owned()
+        };
+        branch_ids.push(Some(branch_id));
     }
 
     let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());

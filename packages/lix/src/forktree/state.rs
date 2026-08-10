@@ -252,6 +252,9 @@ pub(crate) fn encode_untracked_branch_range_bounds(
             {
                 return Ok::<Vec<u8>, LixError>(bytes.to_vec());
             }
+            if canonical_state_entity_prefix_upper_bound(bytes).is_ok() {
+                return Ok::<Vec<u8>, LixError>(bytes.to_vec());
+            }
             canonical_bound(bytes, "untracked upper bound")
         })
         .transpose()?;
@@ -267,6 +270,31 @@ pub(crate) fn encode_untracked_branch_range_bounds(
         return Err(state_error("untracked range bounds are inverted"));
     }
     Ok(CanonicalPrefixBounds { lower, upper })
+}
+
+/// Accepts the strict successor emitted for a canonical entity prefix. The
+/// successor is a valid storage boundary, but it is intentionally not itself
+/// decodable as a state key/prefix because the increment truncates the
+/// terminal key-part byte.
+fn canonical_state_entity_prefix_upper_bound(bytes: &[u8]) -> Result<(), LixError> {
+    let Some(last) = bytes.last().copied() else {
+        return Err(state_error("state entity prefix upper bound is empty"));
+    };
+    if last == 0 {
+        return Err(state_error(
+            "state entity prefix upper bound has no predecessor",
+        ));
+    }
+    let mut predecessor = bytes.to_vec();
+    *predecessor
+        .last_mut()
+        .expect("non-empty upper bound has a last byte") -= 1;
+    if exclusive_prefix_upper_bound(&predecessor).as_deref() != Some(bytes) {
+        return Err(state_error(
+            "state entity prefix upper bound is not canonical",
+        ));
+    }
+    canonical_state_entity_prefix(&predecessor).map(|_| ())
 }
 
 /// Canonicalizes the state-key prefix emitted by
