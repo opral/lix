@@ -1747,6 +1747,44 @@ where
     Ok(rows.pop().flatten())
 }
 
+/// Resolves one row from exactly one authenticated state root. Unlike the
+/// public overlay point helper this never consults the sibling root, so an
+/// owner selected by a filesystem projection cannot silently bind to a
+/// same-key row from another scope.
+pub(crate) async fn state_point_at_root_on_read<R>(
+    root: ObjectId,
+    key: &[u8],
+    global: bool,
+    include_tombstone: bool,
+    read: &R,
+) -> Result<Option<StateValue>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let encoded = lookup_on_read(root, "state", key, read).await?;
+    let selected = encoded.map(|encoded| {
+        (
+            key.to_vec(),
+            encoded,
+            if global {
+                StateSource::Global
+            } else {
+                StateSource::Branch
+            },
+        )
+    });
+    let value = resolve_state_values_on_read(read, &[selected])
+        .await?
+        .pop()
+        .flatten()
+        .map(|(value, _)| value);
+    match value {
+        None => Ok(None),
+        Some(value) if value.cell.deleted() && !include_tombstone => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
+}
+
 /// Resolves an exact batch through the canonical ordered-tree index on one
 /// retained view. Each internal node and requested leaf is decoded at most
 /// once per root, and result slots preserve caller order and duplicates.

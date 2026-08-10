@@ -77,6 +77,18 @@ pub(crate) struct ForkTreeBlobReader<R> {
     branch_id: CanonicalBranchId,
 }
 
+/// The scope selected by the native filesystem overlay for one BlobRef row.
+/// `StateKey` intentionally remains the semantic identity; these flags retain
+/// the owner lane that selected that identity so a same-key row cannot bind
+/// through a different overlay.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthenticatedBlobStateKey {
+    pub(crate) state_key: StateKey,
+    pub(crate) branch_id: CanonicalBranchId,
+    pub(crate) global: bool,
+    pub(crate) untracked: bool,
+}
+
 #[async_trait]
 pub(crate) trait AuthenticatedBlobReader: Send + Sync {
     async fn load_bytes_for_rows(
@@ -87,6 +99,16 @@ pub(crate) trait AuthenticatedBlobReader: Send + Sync {
     async fn load_ranges_for_rows(
         &self,
         requests: &[(StateKey, Range<u64>)],
+    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError>;
+
+    async fn load_bytes_for_scoped_rows(
+        &self,
+        rows: &[AuthenticatedBlobStateKey],
+    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError>;
+
+    async fn load_ranges_for_scoped_rows(
+        &self,
+        requests: &[(AuthenticatedBlobStateKey, Range<u64>)],
     ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError>;
 }
 
@@ -107,6 +129,20 @@ where
         requests: &[(StateKey, Range<u64>)],
     ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError> {
         self.load_ranges_for_state_keys(requests).await
+    }
+
+    async fn load_bytes_for_scoped_rows(
+        &self,
+        rows: &[AuthenticatedBlobStateKey],
+    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError> {
+        self.load_bytes_for_scoped_state_keys(rows).await
+    }
+
+    async fn load_ranges_for_scoped_rows(
+        &self,
+        requests: &[(AuthenticatedBlobStateKey, Range<u64>)],
+    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError> {
+        self.load_ranges_for_scoped_state_keys(requests).await
     }
 }
 
@@ -140,16 +176,44 @@ where
     {
         let mut refs = Vec::with_capacity(keys.len());
         for key in keys {
-            let reference = view
-                .bind_blob_at_state_key(key)
-                .await?
-                .or(view.bind_untracked_blob_at_state_key(key).await?)
-                .ok_or_else(|| {
+            let reference = view.bind_blob_at_state_key(key).await?.ok_or_else(|| {
                     crate::LixError::new(
                         crate::LixError::CODE_STORAGE_ERROR,
                         "selected filesystem BlobRef owner is absent from the authenticated ForkTree view",
                     )
                 })?;
+            refs.push(reference);
+        }
+        Ok(refs)
+    }
+
+    async fn bind_scoped_state_keys(
+        &self,
+        view: &CoherentView<R>,
+        rows: &[AuthenticatedBlobStateKey],
+    ) -> Result<Vec<AuthenticatedBlobRef>, crate::LixError>
+    where
+        R: Sync,
+    {
+        let mut refs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let reference = if row.untracked {
+                view.bind_untracked_blob_at_state_key_for_scope(
+                    &row.state_key,
+                    row.branch_id,
+                    row.global,
+                )
+                    .await?
+            } else {
+                view.bind_blob_at_state_key_for_scope(&row.state_key, row.branch_id, row.global)
+                    .await?
+            }
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "selected filesystem BlobRef owner is absent from the authenticated ForkTree view",
+                )
+            })?;
             refs.push(reference);
         }
         Ok(refs)
@@ -188,6 +252,48 @@ where
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         let refs = self.bind_state_keys(&view, &keys).await?;
+        view.load_blob_ranges_many(
+            &refs
+                .into_iter()
+                .zip(requests.iter().map(|(_, range)| range.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+
+    async fn load_bytes_for_scoped_state_keys(
+        &self,
+        rows: &[AuthenticatedBlobStateKey],
+    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError>
+    where
+        R: Sync,
+    {
+        if rows.is_empty() {
+            return Ok(crate::binary_cas::BlobBytesBatch::new(Vec::new()));
+        }
+        let view =
+            super::view::open_coherent_view_on_read(self.read.clone(), self.branch_id).await?;
+        let refs = self.bind_scoped_state_keys(&view, rows).await?;
+        view.load_blob_bytes_many(&refs).await
+    }
+
+    async fn load_ranges_for_scoped_state_keys(
+        &self,
+        requests: &[(AuthenticatedBlobStateKey, Range<u64>)],
+    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError>
+    where
+        R: Sync,
+    {
+        if requests.is_empty() {
+            return Ok(crate::binary_cas::BlobRangeBytesBatch::new(Vec::new()));
+        }
+        let view =
+            super::view::open_coherent_view_on_read(self.read.clone(), self.branch_id).await?;
+        let rows = requests
+            .iter()
+            .map(|(row, _)| row.clone())
+            .collect::<Vec<_>>();
+        let refs = self.bind_scoped_state_keys(&view, &rows).await?;
         view.load_blob_ranges_many(
             &refs
                 .into_iter()
@@ -337,28 +443,90 @@ where
         .transpose()
     }
 
-    /// Re-resolves an untracked filesystem BlobRef through the same
-    /// authenticated coherent view. Untracked rows have no committed ChangeId
-    /// or CommitId, but their semantic value and manifest edge are still
-    /// authenticated by the untracked owner tree.
-    pub(crate) async fn bind_untracked_blob_at_state_key(
+    /// Binds a tracked BlobRef from the exact selected owner root. The
+    /// ordinary point helper is an overlay read; this scoped form is used
+    /// when a projected row has already established whether it is global or
+    /// branch-local and must not be rebound through the sibling root.
+    pub(crate) async fn bind_blob_at_state_key_for_scope(
         &self,
         key: &StateKey,
+        branch_id: CanonicalBranchId,
+        global: bool,
     ) -> Result<Option<AuthenticatedBlobRef>, crate::LixError>
     where
         R: Sync,
     {
+        if branch_id != self.branch_id() {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "selected filesystem BlobRef branch differs from the retained ForkTree view",
+            ));
+        }
+        let root = if global {
+            self.repository_root().global_state_root
+        } else {
+            self.branch_snapshot().local_state_root
+        };
         let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
             entity_pk: &key.entity_pk,
         });
-        let Some((_, selected_key, value)) = self
-            .load_untracked_overlay_points(&[encoded_key])
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
+        let value = super::serving::state_point_at_root_on_read(
+            root,
+            &encoded_key,
+            global,
+            false,
+            self.retained_read(),
+        )
+        .await
+        .map_err(crate::LixError::from)?;
+        value
+            .map(|value| {
+                bind_state_blob_ref_parts(
+                    key.clone(),
+                    &value.cell,
+                    &value.blob_manifest_object_ids,
+                    Some(key),
+                    self.branch_id(),
+                    self.view_id(),
+                    self.view_instance_id(),
+                )
+            })
+            .transpose()
+    }
+
+    /// Binds an untracked BlobRef from exactly its selected owner lane. A
+    /// local tombstone therefore suppresses the global row at projection
+    /// time, while a selected global row never probes the local lane.
+    pub(crate) async fn bind_untracked_blob_at_state_key_for_scope(
+        &self,
+        key: &StateKey,
+        branch_id: CanonicalBranchId,
+        global: bool,
+    ) -> Result<Option<AuthenticatedBlobRef>, crate::LixError>
+    where
+        R: Sync,
+    {
+        if branch_id != self.branch_id() {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "selected filesystem BlobRef branch differs from the retained ForkTree view",
+            ));
+        }
+        let global_id = CanonicalBranchId::from_bytes(
+            *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+                .expect("GLOBAL_BRANCH_ID must be a UUID")
+                .as_bytes(),
+        );
+        let owner = if global { global_id } else { self.branch_id() };
+        let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        });
+        let Some((selected_key, value)) =
+            self.load_untracked_owner_point(owner, &encoded_key).await?
         else {
             return Ok(None);
         };

@@ -2311,6 +2311,11 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
     seed_storage(&storage, &seed).await;
     let local_pk = EntityPk::single("local");
     let global_pk = EntityPk::single("global-only");
+    let global_branch_id = CanonicalBranchId::from_bytes(
+        *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .expect("global branch UUID")
+            .as_bytes(),
+    );
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("untracked publication view");
@@ -2392,7 +2397,7 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
     });
     storage.untracked_get_many.store(0, Ordering::Relaxed);
     let local = view
-        .load_untracked_overlay_points(&[local_key.clone(), local_key])
+        .load_untracked_overlay_points(&[local_key.clone(), local_key.clone()])
         .await
         .expect("local exact rows");
     assert_eq!(storage.untracked_get_many.load(Ordering::Relaxed), 1);
@@ -2401,6 +2406,31 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
         row.as_ref()
             .is_some_and(|(_, _, value)| value.cell.deleted())
     }));
+    let local_owner = view
+        .load_untracked_owner_point(
+            seed.branch_id,
+            &encode_state_key(StateKeyRef {
+                schema_key: "app.exact",
+                file_id: None,
+                entity_pk: &local_pk,
+            }),
+        )
+        .await
+        .expect("local owner point");
+    assert!(
+        local_owner
+            .as_ref()
+            .is_some_and(|(_, value)| value.cell.deleted())
+    );
+    let global_owner = view
+        .load_untracked_owner_point(global_branch_id, &local_key)
+        .await
+        .expect("global owner point");
+    assert!(global_owner
+        .as_ref()
+        .is_some_and(|(_, value)| {
+            matches!(&value.cell, StateCell::Value(cell) if <_ as AsRef<str>>::as_ref(cell) == "global-shadowed")
+        }));
 
     let global_key = encode_state_key(StateKeyRef {
         schema_key: "app.exact",
