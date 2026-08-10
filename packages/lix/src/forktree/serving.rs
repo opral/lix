@@ -1860,7 +1860,7 @@ where
 /// page and its immediate neighbors establish ordinal adjacency; duplicate
 /// vector entries are rejected globally because they make the vector
 /// ambiguous even when the duplicate is not selected by this request.
-async fn validate_stale_page_position<R>(
+pub(super) async fn validate_stale_page_position<R>(
     read: &R,
     commit_object_id: ObjectId,
     commit_id: CommitId,
@@ -1885,45 +1885,28 @@ where
     if page.commit_id != commit_id {
         return Err(corruption("selected page belongs to a different Commit"));
     }
-    if index == 0 && page.start_ordinal != 0 {
-        return Err(corruption(
-            "first commit change page does not start at ordinal zero",
-        ));
-    }
-    if index > 0 {
-        let first = load_stale_page_for_position(
+    let mut expected_start = 0_u32;
+    for prefix_page_object_id in page_object_ids.iter().take(index + 1) {
+        let prefix_page = load_stale_page_for_position(
             read,
             commit_object_id,
             commit_id,
-            page_object_ids[0],
+            *prefix_page_object_id,
             cache,
         )
         .await?;
-        if first.start_ordinal != 0 {
+        if prefix_page.start_ordinal != expected_start {
             return Err(corruption(
-                "commit change-page vector starts at a nonzero ordinal",
+                "commit change-page vector has a gap or overlap in the selected prefix",
             ));
         }
-        let previous = load_stale_page_for_position(
-            read,
-            commit_object_id,
-            commit_id,
-            page_object_ids[index - 1],
-            cache,
-        )
-        .await?;
-        let expected = previous
+        expected_start = prefix_page
             .start_ordinal
             .checked_add(
-                u32::try_from(previous.members.len())
-                    .map_err(|_| corruption("previous page member count overflows u32"))?,
+                u32::try_from(prefix_page.members.len())
+                    .map_err(|_| corruption("commit member page count overflows u32"))?,
             )
-            .ok_or_else(|| corruption("previous page ordinal overflows u32"))?;
-        if page.start_ordinal != expected {
-            return Err(corruption(
-                "commit change-page vector has a gap or overlap before selected page",
-            ));
-        }
+            .ok_or_else(|| corruption("commit member page ordinal overflows u32"))?;
     }
     if let Some(next_id) = page_object_ids.get(index + 1) {
         let next = load_stale_page_for_position(read, commit_object_id, commit_id, *next_id, cache)

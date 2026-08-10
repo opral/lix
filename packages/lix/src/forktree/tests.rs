@@ -499,6 +499,120 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
     );
 }
 
+fn three_page_stale_fixture() -> (
+    CommitId,
+    Vec<(ObjectId, Bytes)>,
+    Vec<ObjectId>,
+    Vec<CommitChangePageV2>,
+) {
+    let commit_id = CommitId::from_bytes(raw_id(0xd0));
+    let members = (0..513).map(zero_edge_page_member).collect::<Vec<_>>();
+    let pages =
+        CommitChangePageV2::encode_pages(commit_id, &members).expect("three-page stale fixture");
+    let page_ids = pages.objects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let decoded = pages
+        .objects
+        .iter()
+        .map(|(id, bytes)| CommitChangePageV2::decode(*id, bytes).expect("fixture page"))
+        .collect::<Vec<_>>();
+    (commit_id, pages.objects, page_ids, decoded)
+}
+
+async fn validate_three_page_stale_fixture(
+    commit_id: CommitId,
+    objects: Vec<(ObjectId, Bytes)>,
+    page_ids: Vec<ObjectId>,
+    selected_page_object_id: ObjectId,
+    selected_page: &CommitChangePageV2,
+) -> Result<(), StorageError> {
+    let storage = Memory::new();
+    let mut writes = StorageWriteSet::new();
+    for (object_id, bytes) in objects {
+        writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(writes, &storage).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("three-page stale read"),
+    );
+    let mut cache = super::serving::StaleMemberAuthCache::default();
+    super::serving::validate_stale_page_position(
+        &read,
+        content_id(0xd1),
+        commit_id,
+        &page_ids,
+        selected_page_object_id,
+        selected_page,
+        &mut cache,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn stale_page_prefix_gap_before_selected_page_fails_closed() {
+    let (commit_id, mut objects, page_ids, pages) = three_page_stale_fixture();
+    let mut middle = pages[1].clone();
+    middle.start_ordinal += 1;
+    let (middle_id, middle_bytes) = middle.encode().expect("gapped middle page");
+    let mut selected = pages[2].clone();
+    selected.start_ordinal += 1;
+    let (selected_id, selected_bytes) = selected.encode().expect("shifted selected page");
+    objects.push((middle_id, middle_bytes));
+    objects.push((selected_id, selected_bytes));
+    let page_ids = vec![page_ids[0], middle_id, selected_id];
+    assert!(
+        validate_three_page_stale_fixture(commit_id, objects, page_ids, selected_id, &selected,)
+            .await
+            .is_err(),
+        "a gap hidden before the selected page must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn stale_page_prefix_wrong_commit_fails_closed() {
+    let (commit_id, mut objects, page_ids, pages) = three_page_stale_fixture();
+    let mut wrong_first = pages[0].clone();
+    wrong_first.commit_id = CommitId::from_bytes(raw_id(0xd2));
+    let (wrong_first_id, wrong_first_bytes) = wrong_first.encode().expect("wrong first page");
+    objects.push((wrong_first_id, wrong_first_bytes));
+    let page_ids = vec![wrong_first_id, page_ids[1], page_ids[2]];
+    let selected_page_object_id = page_ids[2];
+    assert!(
+        validate_three_page_stale_fixture(
+            commit_id,
+            objects,
+            page_ids,
+            selected_page_object_id,
+            &pages[2],
+        )
+        .await
+        .is_err(),
+        "a wrong-commit prefix page must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn stale_page_prefix_missing_page_fails_closed() {
+    let (commit_id, objects, page_ids, pages) = three_page_stale_fixture();
+    let missing_id = content_id(0xd3);
+    let page_ids = vec![page_ids[0], missing_id, page_ids[2]];
+    let selected_page_object_id = page_ids[2];
+    assert!(
+        validate_three_page_stale_fixture(
+            commit_id,
+            objects,
+            page_ids,
+            selected_page_object_id,
+            &pages[2],
+        )
+        .await
+        .is_err(),
+        "a missing prefix page must fail closed"
+    );
+}
+
 #[tokio::test]
 async fn commit_summary_defers_unaccessed_member_authentication() {
     let seed = build_seed();
