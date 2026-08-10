@@ -123,8 +123,7 @@ where
     };
 
     let merge_plan = if outcome == MergeOutcome::MergeCommitted {
-        let payloads = MergePayloadBatch::default();
-        Some(plan_merge(&target_diff, &source_diff, &payloads)?)
+        Some(plan_merge(&target_diff, &source_diff)?)
     } else {
         None
     };

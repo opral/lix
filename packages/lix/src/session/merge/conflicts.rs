@@ -122,8 +122,8 @@ mod tests {
     use crate::common::LixTimestamp;
 
     fn row(identity: crate::forktree::StateKey, label: &str) -> MergeRow {
+        let _ = identity;
         MergeRow {
-            key: identity,
             deleted: false,
             created_at: LixTimestamp::expect_parse("created", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("updated", "2026-01-01T00:00:00Z"),

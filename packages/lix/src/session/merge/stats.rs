@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::LixError;
 
-use super::native::{MergeDiff, MergeDiffKind, MergePick, MergePlan};
+use super::native::{MergeDiff, MergeDiffKind, MergePlan};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct MergeStats {
@@ -24,19 +24,19 @@ pub(crate) fn stats_from_plan(
     plan: &MergePlan,
     source_diff: &MergeDiff,
 ) -> Result<MergeStats, LixError> {
-    if identities_are_strictly_sorted(plan.picks.iter().map(pick_identity), plan.picks.len())
-        && identities_are_strictly_sorted(
-            source_diff.entries.iter().map(|entry| &entry.identity),
-            source_diff.entries.len(),
-        )
-    {
-        return stats_from_sorted_plan(plan, source_diff);
+    if !identities_are_strictly_sorted(
+        plan.picks.iter().map(|pick| pick.identity(source_diff)),
+        plan.picks.len(),
+    ) || !identities_are_strictly_sorted(
+        source_diff.entries.iter().map(|entry| &entry.identity),
+        source_diff.entries.len(),
+    ) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native merge stats received non-canonical StateKey order",
+        ));
     }
-
-    // Defensive hand-built callers can supply unsorted inputs. Keep their
-    // behavior correct without imposing an index allocation on the normal
-    // tree-diff path, whose entries and merge picks are already key ordered.
-    stats_from_unsorted_plan(plan, source_diff)
+    stats_from_sorted_plan(plan, source_diff)
 }
 
 fn stats_from_sorted_plan(
@@ -46,7 +46,7 @@ fn stats_from_sorted_plan(
     let mut stats = MergeStats::default();
     let mut source_index = 0;
     for pick in &plan.picks {
-        let identity = pick_identity(pick);
+        let identity = pick.identity(source_diff);
         let mut found = false;
         while let Some(entry) = source_diff.entries.get(source_index) {
             match identity_cmp(&entry.identity, identity) {
@@ -63,25 +63,6 @@ fn stats_from_sorted_plan(
         if !found {
             return Err(missing_source_entry(identity));
         }
-    }
-    Ok(stats)
-}
-
-fn stats_from_unsorted_plan(
-    plan: &MergePlan,
-    source_diff: &MergeDiff,
-) -> Result<MergeStats, LixError> {
-    let mut stats = MergeStats::default();
-    for pick in &plan.picks {
-        let identity = pick_identity(pick);
-        let Some(entry) = source_diff
-            .entries
-            .iter()
-            .find(|entry| &entry.identity == identity)
-        else {
-            return Err(missing_source_entry(identity));
-        };
-        stats.add(entry.kind);
     }
     Ok(stats)
 }
@@ -151,13 +132,9 @@ impl MergeStats {
     }
 }
 
-fn pick_identity(pick: &MergePick) -> &crate::forktree::StateKey {
-    &pick.identity
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::native::{MergeDiffEntry, MergeDiffKind, MergePlan, MergeRow};
+    use super::super::native::{MergeDiffEntry, MergeDiffKind, MergePick, MergePlan, MergeRow};
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
@@ -182,7 +159,6 @@ mod tests {
                 .enumerate()
                 .map(|(index, identity)| {
                     let row = MergeRow {
-                        key: identity.clone(),
                         deleted: false,
                         created_at: timestamp,
                         updated_at: timestamp,
@@ -207,10 +183,10 @@ mod tests {
             picks: source_diff
                 .entries
                 .iter()
-                .map(|entry| MergePick {
-                    identity: entry.identity.clone(),
+                .enumerate()
+                .map(|(index, _entry)| MergePick {
                     change_id,
-                    selected_row: entry.after.clone().expect("source row"),
+                    source_index: index,
                 })
                 .collect(),
             conflicts: Vec::new(),
