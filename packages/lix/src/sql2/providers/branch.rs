@@ -31,7 +31,7 @@ use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
     defaultable_text_insert_value, insert_column_is_omitted,
 };
-use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
+use crate::sql2::{SqlWriteContext, WriteAccess};
 use crate::transaction::types::{
     LogicalPrimaryKey, RawWriteBatch, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteRow,
@@ -69,7 +69,7 @@ pub(super) async fn register_write_provider(
     write_ctx: SqlWriteContext,
     branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
-    let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+    let live_state = Arc::new(write_ctx.clone());
     register_spec_table(
         session,
         surface_name,
@@ -586,8 +586,7 @@ impl UpsertSupport for BranchSpec {
 
         // Build fresh readers rather than reuse the session's cached branch
         // ref: a conflict update may have just staged a new branch head.
-        let live_state: Arc<dyn LiveStateReader> =
-            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let live_state: Arc<dyn LiveStateReader> = Arc::new(write_ctx.clone());
         let branch_ref: Arc<dyn BranchRefReader> = Arc::new(
             crate::sql2::WriteContextBranchRefReader::new(write_ctx.clone()),
         );

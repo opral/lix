@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::branch::{BranchRefReader, BranchRefStoreReader};
+use crate::branch::BranchRefStoreReader;
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;

@@ -528,18 +528,8 @@ impl WriteAccess {
     }
 }
 
-pub(crate) struct WriteContextLiveStateReader {
-    ctx: SqlWriteContext,
-}
-
-impl WriteContextLiveStateReader {
-    pub(crate) fn new(ctx: SqlWriteContext) -> Self {
-        Self { ctx }
-    }
-}
-
 #[async_trait]
-impl LiveStateReader for WriteContextLiveStateReader {
+impl LiveStateReader for SqlWriteContext {
     async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
@@ -550,26 +540,26 @@ impl LiveStateReader for WriteContextLiveStateReader {
             // predicate are scoped to the transaction's active branch. The
             // operation context still owns the same retained ForkTree read;
             // this only supplies the missing logical scope.
-            request.filter.branch_ids = vec![self.ctx.active_branch_id()];
+            request.filter.branch_ids = vec![self.active_branch_id()];
         }
-        self.ctx.scan_live_state_batch(&request).await
+        self.scan_live_state_batch(&request).await
     }
 
     async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        self.ctx.load_exact_live_state_batch(request).await
+        self.load_exact_live_state_batch(request).await
     }
 }
 
 #[async_trait]
-impl FilesystemPathIndexReader for WriteContextLiveStateReader {
+impl FilesystemPathIndexReader for SqlWriteContext {
     async fn path_index(
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        self.ctx.filesystem_path_index(request).await
+        self.filesystem_path_index(request).await
     }
 }
 

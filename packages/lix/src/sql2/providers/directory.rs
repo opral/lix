@@ -65,7 +65,7 @@ use crate::filesystem::{
     plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
+use crate::sql2::{SqlWriteContext, WriteAccess};
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
 use super::file::{
@@ -197,7 +197,7 @@ pub(super) async fn register_by_branch_write_provider(
     branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     let functions = write_ctx.functions();
-    let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+    let live_state = Arc::new(write_ctx.clone());
     let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
     register_spec_table(
         session,
@@ -220,7 +220,7 @@ pub(super) async fn register_active_write_provider(
 ) -> Result<(), LixError> {
     let active_branch_id = write_ctx.active_branch_id();
     let functions = write_ctx.functions();
-    let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+    let live_state = Arc::new(write_ctx.clone());
     let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
     register_spec_table(
         session,
@@ -347,7 +347,7 @@ impl LixDirectorySpec {
             // previous directory-write behavior rather than failing a write
             // that the directory-only live-state resolver can still plan.
             Err(_) => directory_path_resolvers_from_live_state(
-                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                Arc::new(write_ctx.clone()),
                 self.branch_binding.active_branch_id(),
             )
             .await
@@ -831,12 +831,9 @@ impl TableSpec for LixDirectorySpec {
                     for branch_id in branch_ids {
                         visible_filesystems.insert(
                             branch_id.clone(),
-                            VisibleFilesystem::load(
-                                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                                &branch_id,
-                            )
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?,
+                            VisibleFilesystem::load(Arc::new(write_ctx.clone()), &branch_id)
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?,
                         );
                     }
                     let (write_rows, count) = lix_directory_recursive_delete_rows_from_batch(
@@ -882,7 +879,7 @@ impl TableSpec for LixDirectorySpec {
                 let assignments = assignments.clone();
                 async move {
                     let mut path_resolvers = directory_path_resolvers_from_live_state(
-                        Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                        Arc::new(write_ctx.clone()),
                         branch_binding.active_branch_id(),
                     )
                     .await
@@ -944,7 +941,7 @@ impl TableSpec for LixDirectorySpec {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let mut path_resolvers = directory_path_resolvers_from_live_state(
-                        Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                        Arc::new(write_ctx.clone()),
                         branch_binding.active_branch_id(),
                     )
                     .await
@@ -1229,7 +1226,7 @@ impl UpsertSupport for LixDirectorySpec {
         assignments: &[(String, Arc<dyn PhysicalExpr>)],
     ) -> Result<StagedUpsert> {
         let mut path_resolvers = directory_path_resolvers_from_live_state(
-            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+            Arc::new(write_ctx.clone()),
             self.branch_binding.active_branch_id(),
         )
         .await
@@ -2531,9 +2528,7 @@ mod tests {
         branch_binding: BranchBinding,
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
-        let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
-            write_ctx.clone(),
-        ));
+        let live_state = Arc::new(write_ctx.clone());
         let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
             write_ctx.clone(),
         ));
@@ -2564,9 +2559,7 @@ mod tests {
         filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
-        let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
-            write_ctx.clone(),
-        ));
+        let live_state = Arc::new(write_ctx.clone());
         let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
             write_ctx.clone(),
         ));
@@ -3641,9 +3634,7 @@ mod tests {
     fn directory_provider_keeps_no_write_authority() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
-            write_ctx.clone(),
-        ));
+        let live_state = Arc::new(write_ctx.clone());
         let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
             write_ctx.clone(),
         ));
