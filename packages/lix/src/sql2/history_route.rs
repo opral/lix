@@ -1539,6 +1539,10 @@ mod tests {
             }]))
         }
 
+        async fn snapshot_roots(&mut self) -> Result<Vec<(String, CommitId)>, LixError> {
+            Ok(Vec::new())
+        }
+
         async fn load_commit_records(
             &mut self,
             commit_ids: &[CommitId],
