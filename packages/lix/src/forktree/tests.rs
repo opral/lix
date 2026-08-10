@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -26,7 +27,7 @@ use super::model::{
 use super::object::OBJECT_SPACE;
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
-    ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_state_tree,
+    ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_state_tree, diff_roots,
     empty_receipt_tree, insert_receipt_part, lookup, scan_all, validate_branch_snapshot_ref_edge,
     validate_change_catalog_back_edge, validate_commit_catalog_back_edge, validate_receipt_tree,
     validate_upload_progress_tree, validate_upload_selector_progress,
@@ -830,6 +831,76 @@ where
     commit_write_set_for_test(writes, storage).await;
 }
 
+fn diff_state_rows(values: &[(usize, u8)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows = values
+        .iter()
+        .map(|(index, value)| {
+            let entity_pk = EntityPk::single(format!("row-{index:05}"));
+            let key = encode_state_key(StateKeyRef {
+                schema_key: "diff.row",
+                file_id: Some("file"),
+                entity_pk: &entity_pk,
+            });
+            let value = encode_state_value(StateValueRef {
+                page_object_id: content_id(value.saturating_add(1)),
+                page_ordinal: *index as u32,
+            })
+            .expect("state diff value");
+            (key, value)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+fn build_diff_tree(values: &[(usize, u8)]) -> super::tree::TreeBuild {
+    build_state_tree(&diff_state_rows(values)).expect("state diff tree")
+}
+
+async fn seed_diff_trees<S>(storage: &S, trees: &[&super::tree::TreeBuild])
+where
+    S: Storage,
+{
+    let mut writes = StorageWriteSet::new();
+    for tree in trees {
+        for (id, bytes) in tree.objects.iter() {
+            writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+        }
+    }
+    commit_write_set_for_test(writes, storage).await;
+}
+
+fn expected_diff_trees(
+    left: &super::tree::TreeBuild,
+    right: &super::tree::TreeBuild,
+) -> BTreeSet<Vec<u8>> {
+    let left = scan_all(left.root.object_id, "state", load_from(&left.objects))
+        .expect("full-scan left oracle")
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let right = scan_all(right.root.object_id, "state", load_from(&right.objects))
+        .expect("full-scan right oracle")
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    left.keys()
+        .chain(right.keys())
+        .filter(|key| left.get(*key) != right.get(*key))
+        .cloned()
+        .collect()
+}
+
+fn encoded_state_keys(keys: &[StateKey]) -> Vec<Vec<u8>> {
+    keys.iter()
+        .map(|key| {
+            encode_state_key(StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            })
+        })
+        .collect()
+}
+
 fn load_from(
     objects: &ImmutableObjectSet,
 ) -> impl Fn(ObjectId) -> Result<Bytes, StorageError> + '_ {
@@ -1123,6 +1194,135 @@ fn canonical_prefix_bounds_handle_carry_and_reject_invalid_untracked_bounds() {
             .is_err()
     );
     assert!(super::encode_untracked_branch_range_bounds(branch_id, Some(&[0xff]), None).is_err());
+}
+
+#[tokio::test]
+async fn state_root_diff_short_circuits_and_handles_sparse_changes() {
+    let left_rows = vec![(1, 1), (2, 2), (3, 3), (80, 4), (160, 5)];
+    let right_rows = vec![(1, 1), (2, 9), (4, 6), (80, 4), (161, 7)];
+    let left = build_diff_tree(&left_rows);
+    let right = build_diff_tree(&right_rows);
+    let storage = CountingStorage::new();
+    seed_diff_trees(&storage, &[&left, &right]).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("diff read"),
+    );
+
+    let equal = diff_roots(Some(left.root.object_id), Some(left.root.object_id), &read)
+        .await
+        .expect("equal roots");
+    assert!(equal.is_empty());
+    assert_eq!(
+        storage.object_get_many.load(Ordering::Relaxed),
+        0,
+        "equal roots must not load a node"
+    );
+
+    let actual = diff_roots(Some(left.root.object_id), Some(right.root.object_id), &read)
+        .await
+        .expect("sparse diff");
+    let actual = encoded_state_keys(&actual);
+    assert_eq!(
+        actual,
+        expected_diff_trees(&left, &right)
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+
+    let inserted = diff_roots(None, Some(right.root.object_id), &read)
+        .await
+        .expect("empty-to-tree diff");
+    assert_eq!(
+        encoded_state_keys(&inserted),
+        diff_state_rows(&right_rows)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn state_root_diff_randomized_matches_full_scan_oracle() {
+    let mut seed = 0x9e37_79b9_u64;
+    for _case in 0..24 {
+        let mut left = BTreeMap::new();
+        let mut right = BTreeMap::new();
+        for key in 0..192_usize {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            if seed & 3 != 0 {
+                left.insert(key, (seed >> 24) as u8);
+            }
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            if seed & 3 != 0 {
+                right.insert(key, (seed >> 24) as u8);
+            }
+        }
+        let left_rows = left.into_iter().collect::<Vec<_>>();
+        let right_rows = right.into_iter().collect::<Vec<_>>();
+        let left_tree = build_diff_tree(&left_rows);
+        let right_tree = build_diff_tree(&right_rows);
+        let storage = CountingStorage::new();
+        seed_diff_trees(&storage, &[&left_tree, &right_tree]).await;
+        let read = StorageAdapterReadScope::new(
+            storage
+                .begin_read(ReadOptions::default())
+                .await
+                .expect("random diff read"),
+        );
+        let actual = diff_roots(
+            Some(left_tree.root.object_id),
+            Some(right_tree.root.object_id),
+            &read,
+        )
+        .await
+        .expect("random diff");
+        let actual = encoded_state_keys(&actual)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let expected = expected_diff_trees(&left_tree, &right_tree);
+        if actual != expected {
+            panic!(
+                "random case {_case}: missing={} extra={} extra_key={:?}",
+                expected.difference(&actual).count(),
+                actual.difference(&expected).count(),
+                actual.difference(&expected).next()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn state_root_diff_rejects_corrupt_nodes_and_preserves_order() {
+    let tree = build_diff_tree(&(0..256).map(|index| (index, 1)).collect::<Vec<_>>());
+    let mut corrupted = tree
+        .objects
+        .get(tree.root.object_id)
+        .expect("root bytes")
+        .to_vec();
+    *corrupted.first_mut().expect("root is nonempty") ^= 1;
+    let mut writes = StorageWriteSet::new();
+    writes.put(
+        OBJECT_SPACE,
+        tree.root.object_id.as_bytes().to_vec(),
+        corrupted,
+    );
+    let storage = CountingStorage::new();
+    commit_write_set_for_test(writes, &storage).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("corrupt diff read"),
+    );
+    assert!(
+        diff_roots(None, Some(tree.root.object_id), &read)
+            .await
+            .is_err(),
+        "a corrupted authenticated root must fail closed"
+    );
 }
 
 #[tokio::test]
@@ -1644,11 +1844,13 @@ async fn recovery_selector_replacement_advances_generation_and_rejects_corruptio
 struct CountingStorage {
     inner: Memory,
     begin_reads: Arc<AtomicUsize>,
+    object_get_many: Arc<AtomicUsize>,
     untracked_get_many: Arc<AtomicUsize>,
 }
 
 struct CountingRead {
     inner: MemoryRead,
+    object_get_many: Arc<AtomicUsize>,
     untracked_get_many: Arc<AtomicUsize>,
 }
 
@@ -1713,6 +1915,13 @@ impl StorageRead for CountingRead {
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        self.object_get_many.fetch_add(
+            requests
+                .iter()
+                .filter(|request| request.space == OBJECT_SPACE)
+                .count(),
+            Ordering::Relaxed,
+        );
         self.untracked_get_many.fetch_add(
             requests
                 .iter()
@@ -1738,6 +1947,7 @@ impl CountingStorage {
         Self {
             inner: Memory::new(),
             begin_reads: Arc::new(AtomicUsize::new(0)),
+            object_get_many: Arc::new(AtomicUsize::new(0)),
             untracked_get_many: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -1751,6 +1961,7 @@ impl Storage for CountingStorage {
         self.begin_reads.fetch_add(1, Ordering::Relaxed);
         Ok(CountingRead {
             inner: self.inner.begin_read(options).await?,
+            object_get_many: Arc::clone(&self.object_get_many),
             untracked_get_many: Arc::clone(&self.untracked_get_many),
         })
     }
