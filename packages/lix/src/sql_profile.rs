@@ -44,6 +44,10 @@ pub struct SqlReadProfile {
     /// Checksum of consumed scalar values. This is a benchmark-only
     /// correctness witness, not a public result API.
     pub result_checksum: u64,
+    /// Number of selector/root reads caused by opening a sibling branch view.
+    /// The retained active-branch shortcut must leave this at zero.
+    #[cfg(feature = "storage-benches")]
+    pub selector_reads: u64,
 }
 
 impl SqlReadProfile {
@@ -91,6 +95,14 @@ pub(crate) fn record_scan(rows: usize, batches: usize, arrow_bytes: usize, elaps
         profile.scan_batches = profile.scan_batches.saturating_add(batches as u64);
         profile.scan_arrow_bytes = profile.scan_arrow_bytes.saturating_add(arrow_bytes as u64);
         profile.scan_elapsed += elapsed;
+    });
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) fn record_selector_read() {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.selector_reads = profile.selector_reads.saturating_add(1);
     });
 }
 

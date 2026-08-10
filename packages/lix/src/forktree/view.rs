@@ -894,6 +894,8 @@ where
         &self,
         branch_id: CanonicalBranchId,
     ) -> Result<CoherentView<&R>, StorageError> {
+        #[cfg(feature = "storage-benches")]
+        crate::sql_profile::record_selector_read();
         open_coherent_view_on_read(&self.read, branch_id).await
     }
 }

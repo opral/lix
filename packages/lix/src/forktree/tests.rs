@@ -2464,6 +2464,343 @@ async fn exact_untracked_lookup_is_local_first_and_preserves_duplicate_slots() {
 }
 
 #[tokio::test]
+async fn native_state_active_branch_shortcut_matches_sibling_view_for_points_ranges_and_untracked()
+{
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let branch_text = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
+    let alternate_branch = CanonicalBranchId::from_bytes(raw_id(0x99));
+    let alternate_branch_text = uuid::Uuid::from_bytes(*alternate_branch.as_bytes()).to_string();
+    let global_branch = CanonicalBranchId::from_bytes(
+        *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .expect("global branch UUID")
+            .as_bytes(),
+    );
+    let alternate_ref_change_id = ChangeId::from_bytes(raw_id(0x44));
+    let alternate_ref_change = ChangeObjectV1::BranchRef {
+        change_id: alternate_ref_change_id,
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(7),
+        branch_id: alternate_branch,
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(seed.commit_object_id),
+        previous_ref_change_object_id: None,
+        payload: b"create alternate branch".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (alternate_ref_change_object_id, alternate_ref_change_bytes) = alternate_ref_change
+        .encode()
+        .expect("alternate branch ref change");
+    let global_ref_change_id = ChangeId::from_bytes(raw_id(0x45));
+    let global_ref_change = ChangeObjectV1::BranchRef {
+        change_id: global_ref_change_id,
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(8),
+        branch_id: global_branch,
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(seed.commit_object_id),
+        previous_ref_change_object_id: None,
+        payload: b"create global owner".to_vec(),
+        json_payload_object_ids: Vec::new(),
+    };
+    let (global_ref_change_object_id, global_ref_change_bytes) =
+        global_ref_change.encode().expect("global owner ref change");
+    let current_repository = RepositoryRootV1::decode(
+        seed.repository_root_id,
+        seed.objects
+            .get(seed.repository_root_id)
+            .expect("seed repository root"),
+    )
+    .expect("seed repository root decodes");
+    let mut change_entries = seed_member_catalog_entries(&seed, seed.commit_object_id);
+    change_entries.push((
+        seed.ref_change_id,
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: seed.ref_change_object_id,
+                branch_id: seed.branch_id,
+            },
+        },
+    ));
+    change_entries.push((
+        alternate_ref_change_id,
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: alternate_ref_change_object_id,
+                branch_id: alternate_branch,
+            },
+        },
+    ));
+    change_entries.push((
+        global_ref_change_id,
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: global_ref_change_object_id,
+                branch_id: global_branch,
+            },
+        },
+    ));
+    change_entries.sort_by_key(|(id, _)| *id.as_bytes());
+    let alternate_change_catalog =
+        build_change_catalog(&change_entries).expect("alternate change catalog");
+    let alternate_repository = RepositoryRootV1 {
+        change_catalog_root: alternate_change_catalog.root.object_id,
+        ..current_repository
+    };
+    let (alternate_repository_id, alternate_repository_bytes) = alternate_repository
+        .encode()
+        .expect("alternate repository root");
+    let alternate_snapshot = BranchSnapshotV1 {
+        branch_id: alternate_branch,
+        local_state_root: seed.local_state_root,
+        semantic_head_commit_object_id: seed.commit_object_id,
+        latest_ref_change_object_id: Some(alternate_ref_change_object_id),
+        historical_global_state_root: seed.global_state_root,
+    };
+    let (alternate_snapshot_id, alternate_snapshot_bytes) = alternate_snapshot
+        .encode()
+        .expect("alternate branch snapshot");
+    let global_snapshot = BranchSnapshotV1 {
+        branch_id: global_branch,
+        local_state_root: seed.local_state_root,
+        semantic_head_commit_object_id: seed.commit_object_id,
+        latest_ref_change_object_id: Some(global_ref_change_object_id),
+        historical_global_state_root: seed.global_state_root,
+    };
+    let (global_snapshot_id, global_snapshot_bytes) =
+        global_snapshot.encode().expect("global owner snapshot");
+    let mut alternate_writes = StorageWriteSet::new();
+    alternate_writes.put(
+        OBJECT_SPACE,
+        alternate_ref_change_object_id.as_bytes().to_vec(),
+        alternate_ref_change_bytes.to_vec(),
+    );
+    alternate_writes.put(
+        OBJECT_SPACE,
+        global_ref_change_object_id.as_bytes().to_vec(),
+        global_ref_change_bytes.to_vec(),
+    );
+    for (object_id, bytes) in alternate_change_catalog.objects.iter() {
+        alternate_writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    alternate_writes.put(
+        OBJECT_SPACE,
+        alternate_repository_id.as_bytes().to_vec(),
+        alternate_repository_bytes.to_vec(),
+    );
+    alternate_writes.put(
+        OBJECT_SPACE,
+        alternate_snapshot_id.as_bytes().to_vec(),
+        alternate_snapshot_bytes.to_vec(),
+    );
+    alternate_writes.put(
+        OBJECT_SPACE,
+        global_snapshot_id.as_bytes().to_vec(),
+        global_snapshot_bytes.to_vec(),
+    );
+    alternate_writes.put(
+        SELECTOR_SPACE,
+        branch_selector_key(alternate_branch).to_vec(),
+        BranchSelectorV1 {
+            branch_id: alternate_branch,
+            branch_snapshot_object_id: alternate_snapshot_id,
+            selector_generation: 1,
+        }
+        .encode()
+        .expect("alternate branch selector")
+        .to_vec(),
+    );
+    alternate_writes.put(
+        SELECTOR_SPACE,
+        branch_selector_key(global_branch).to_vec(),
+        BranchSelectorV1 {
+            branch_id: global_branch,
+            branch_snapshot_object_id: global_snapshot_id,
+            selector_generation: 1,
+        }
+        .encode()
+        .expect("global owner selector")
+        .to_vec(),
+    );
+    alternate_writes.put(
+        SELECTOR_SPACE,
+        global_selector_key().to_vec(),
+        GlobalSelectorV1 {
+            repository_root: alternate_repository_id,
+            epoch: seed.global_selector.epoch,
+            selector_generation: seed.global_selector.selector_generation + 1,
+        }
+        .encode()
+        .expect("alternate global selector")
+        .to_vec(),
+    );
+    commit_write_set_for_test(alternate_writes, &storage).await;
+    let local_pk = EntityPk::single("shortcut-local");
+    let global_only_pk = EntityPk::single("shortcut-global-only");
+    let local_key = encode_state_key(StateKeyRef {
+        schema_key: "app.shortcut",
+        file_id: None,
+        entity_pk: &local_pk,
+    });
+    let global_only_key = encode_state_key(StateKeyRef {
+        schema_key: "app.shortcut",
+        file_id: None,
+        entity_pk: &global_only_pk,
+    });
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("publication view");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("publication");
+    publication
+        .put_untracked_row(
+            global_branch,
+            StateKeyRef {
+                schema_key: "app.shortcut",
+                file_id: None,
+                entity_pk: &local_pk,
+            },
+            UntrackedValueRef {
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                cell: StateCellRef::Value("global-shadowed"),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &[],
+            },
+        )
+        .expect("global shadowed row");
+    publication
+        .put_untracked_row(
+            seed.branch_id,
+            StateKeyRef {
+                schema_key: "app.shortcut",
+                file_id: None,
+                entity_pk: &local_pk,
+            },
+            UntrackedValueRef {
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(3),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(4),
+                cell: StateCellRef::Tombstone,
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &[],
+            },
+        )
+        .expect("local tombstone");
+    publication
+        .put_untracked_row(
+            global_branch,
+            StateKeyRef {
+                schema_key: "app.shortcut",
+                file_id: None,
+                entity_pk: &global_only_pk,
+            },
+            UntrackedValueRef {
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(5),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(6),
+                cell: StateCellRef::Value("global-only"),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &[],
+            },
+        )
+        .expect("global-only row");
+    drop(view);
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("commit untracked shortcut rows");
+
+    let active_read = StorageAdapter::new(storage.clone())
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("active retained read");
+    let active_read = SharedStorageAdapterRead::new(active_read);
+    let active = crate::state::ForkTreeStateView::from_facade(
+        ForkTreeReadFacade::new(active_read),
+        &branch_text,
+    )
+    .await
+    .expect("active state view");
+
+    let sibling_read = StorageAdapter::new(storage.clone())
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("sibling retained read");
+    let sibling_read = SharedStorageAdapterRead::new(sibling_read);
+    let sibling = crate::state::ForkTreeStateView::from_facade(
+        ForkTreeReadFacade::new(sibling_read),
+        &alternate_branch_text,
+    )
+    .await
+    .expect("global state view");
+
+    let point_keys = seed.state_keys[..2].to_vec();
+    let active_points = active
+        .branch_points(&branch_text, &point_keys, true)
+        .await
+        .expect("active points");
+    let sibling_points = sibling
+        .branch_points(&branch_text, &point_keys, true)
+        .await
+        .expect("sibling points");
+    assert_eq!(active_points, sibling_points);
+
+    let active_range = active
+        .branch_range(&branch_text, None, None, Some(64), true)
+        .await
+        .expect("active range");
+    let sibling_range = sibling
+        .branch_range(&branch_text, None, None, Some(64), true)
+        .await
+        .expect("sibling range");
+    assert_eq!(active_range, sibling_range);
+
+    let untracked_keys = vec![local_key, global_only_key];
+    let active_untracked = active
+        .untracked_points_for_branch(&branch_text, &untracked_keys)
+        .await
+        .expect("active untracked points");
+    let sibling_untracked = sibling
+        .untracked_points_for_branch(&branch_text, &untracked_keys)
+        .await
+        .expect("sibling untracked points");
+    assert_eq!(active_untracked, sibling_untracked);
+    assert!(
+        active_untracked[0]
+            .as_ref()
+            .is_some_and(|row| row.value.cell.deleted())
+    );
+
+    let active_untracked_range = active
+        .untracked_overlay_branch_range_for_branch(&branch_text, None, None, Some(1), true)
+        .await
+        .expect("active untracked range");
+    let sibling_untracked_range = sibling
+        .untracked_overlay_branch_range_for_branch(&branch_text, None, None, Some(1), true)
+        .await
+        .expect("sibling untracked range");
+    assert_eq!(active_untracked_range, sibling_untracked_range);
+    assert_eq!(active_untracked_range.len(), 1);
+
+    #[cfg(feature = "storage-benches")]
+    {
+        let (_, active_profile) = crate::sql_profile::scope(async {
+            active
+                .branch_range(&branch_text, None, None, Some(64), true)
+                .await
+        })
+        .await;
+        assert_eq!(active_profile.selector_reads, 0);
+        let (_, sibling_profile) = crate::sql_profile::scope(async {
+            sibling
+                .branch_range(&branch_text, None, None, Some(64), true)
+                .await
+        })
+        .await;
+        assert_eq!(sibling_profile.selector_reads, 1);
+    }
+}
+
+#[tokio::test]
 async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk() {
     let mut seed = build_seed();
     let grandparent = CommitObjectV1 {
