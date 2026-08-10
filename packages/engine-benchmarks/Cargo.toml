@@ -17,6 +17,7 @@ default = ["rocksdb"]
 rocksdb = ["dep:lix_storage_rocksdb"]
 slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix/storage-benches", "rocksdb"]
+large-binary-qualification = ["storage-benches", "slatedb"]
 tpch = ["dep:duckdb", "dep:tpchgen"]
 # Opt-in profiling build that routes Rust allocations through libc so tools
 # such as heaptrack can attribute transient allocation churn to call stacks.
@@ -194,6 +195,12 @@ name = "native_file_read_component"
 path = "benches/native_file_read_component.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "large_binary_multimedia_qualification"
+path = "benches/large_binary_multimedia_qualification.rs"
+harness = false
+required-features = ["large-binary-qualification"]
 
 [[bench]]
 name = "large_blob_updates"
