@@ -13,8 +13,8 @@ use crate::entity_pk::EntityPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
-use crate::storage_adapter::StorageAdapterRead;
 use crate::state::encode_diff_id;
+use crate::storage_adapter::StorageAdapterRead;
 use crate::{LixError, NullableKeyFilter};
 
 use super::checkpoint::{filter_conjuncts, selected_heads};
