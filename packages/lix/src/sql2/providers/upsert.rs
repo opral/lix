@@ -29,6 +29,7 @@ use crate::sql2::SqlWriteContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::exec::datafusion::LIX_INSERT_COLUMN_OMITTED_METADATA_KEY;
 use crate::sql2::write_normalization::{insert_column_is_omitted, mark_omitted_insert_columns};
+use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction::types::{
     RawWriteBatch, TransactionFileContent, TransactionWrite, TransactionWriteMode,
 };
@@ -172,7 +173,10 @@ impl UpsertReturningRow {
 /// The per-table capabilities the generic upsert driver composes. Every method
 /// reuses logic the spec already has for plain INSERT/UPDATE.
 #[async_trait]
-pub(super) trait UpsertSupport: Send + Sync {
+pub(super) trait UpsertSupport<R>: Send + Sync
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     /// The columns forming the default physical identity.
     fn conflict_identity_columns(&self) -> &[&'static str];
 
@@ -196,7 +200,7 @@ pub(super) trait UpsertSupport: Send + Sync {
     /// `stage_insert` uses).
     async fn insert_staged_rows(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         batch: &RecordBatch,
     ) -> Result<StagedUpsert>;
 
@@ -217,7 +221,7 @@ pub(super) trait UpsertSupport: Send + Sync {
     /// conflict assignment replace those placeholders here.
     async fn materialize_excluded_defaults(
         &self,
-        _write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
     ) -> Result<RecordBatch> {
         Ok(proposed.clone())
@@ -229,7 +233,7 @@ pub(super) trait UpsertSupport: Send + Sync {
     /// can never silently fall back to a count-only upsert.
     async fn materialize_returning_insert_defaults(
         &self,
-        _write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         _proposed: &RecordBatch,
     ) -> Result<RecordBatch> {
         Err(DataFusionError::Execution(
@@ -241,7 +245,7 @@ pub(super) trait UpsertSupport: Send + Sync {
     /// Filesystem providers reload derived and audit values from the overlay.
     async fn capture_upsert_returning(
         &self,
-        _write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         _affected_rows: Vec<UpsertReturningRow>,
         _returning: DmlReturning,
     ) -> Result<()> {
@@ -254,7 +258,7 @@ pub(super) trait UpsertSupport: Send + Sync {
     /// batch in this table's column schema.
     async fn scan_conflict_candidates(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
         target: &UpsertConflictTarget,
     ) -> Result<RecordBatch>;
@@ -278,7 +282,7 @@ pub(super) trait UpsertSupport: Send + Sync {
     /// the proposed row) — producing the staged replacement rows.
     async fn apply_conflict_update(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         augmented: &RecordBatch,
         assignments: &[(String, Arc<dyn PhysicalExpr>)],
     ) -> Result<StagedUpsert>;
@@ -286,13 +290,16 @@ pub(super) trait UpsertSupport: Send + Sync {
 
 /// Run an upsert over the collected proposed input batches and return the
 /// affected-row count (the number of logical rows inserted or updated).
-pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
+pub(super) async fn execute_upsert<R, S: UpsertSupport<R> + ?Sized>(
     spec: &S,
-    write_ctx: &SqlWriteContext,
+    write_ctx: &SqlWriteContext<R>,
     proposed_batches: Vec<RecordBatch>,
     target: &UpsertConflictTarget,
     action: &UpsertAction,
-) -> Result<u64> {
+) -> Result<u64>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let conflict_columns = target.columns();
     let mut staged = StagedUpsert::default();
     let mut affected: u64 = 0;
@@ -370,14 +377,17 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
 /// algorithm retains the stable identity for every logical insert/update in
 /// input-row order, then asks the provider to reload that post-image from the
 /// transaction overlay once all staged writes are visible.
-pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
+pub(super) async fn execute_upsert_with_returning<R, S: UpsertSupport<R> + ?Sized>(
     spec: &S,
-    write_ctx: &SqlWriteContext,
+    write_ctx: &SqlWriteContext<R>,
     proposed_batches: Vec<RecordBatch>,
     target: &UpsertConflictTarget,
     action: &UpsertAction,
     returning: DmlReturning,
-) -> Result<u64> {
+) -> Result<u64>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let conflict_columns = target.columns();
     let mut staged = StagedUpsert::default();
     let mut affected = 0_u64;
@@ -482,11 +492,14 @@ pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
     Ok(affected)
 }
 
-async fn stage_upsert(
-    write_ctx: &SqlWriteContext,
+async fn stage_upsert<R>(
+    write_ctx: &SqlWriteContext<R>,
     staged: StagedUpsert,
     affected: u64,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     if staged.is_empty() {
         return Ok(());
     }

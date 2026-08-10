@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::branch_ref::PreparedBranchRefReader;
 use super::providers;
@@ -98,13 +99,14 @@ where
     Ok(session)
 }
 
-pub(crate) async fn build_transaction_read_session<C>(
+pub(crate) async fn build_transaction_read_session<C, R>(
     read_ctx: &C,
-    write_ctx: &mut dyn SqlWriteExecutionContext,
+    write_ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     statement: &DataFusionStatement,
 ) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let session = read_ctx.datafusion_read_session();
     let read_branch_ref: Arc<dyn BranchRefReader> = read_ctx.branch_ref();
@@ -123,7 +125,7 @@ where
     let commit_graph = Arc::new(tokio::sync::Mutex::new(commit_graph));
     let changelog_query_source = read_ctx.changelog_query_source();
     providers::register_diff_function(&session, changelog_query_source.clone());
-    let write_ctx = SqlWriteContext::new(write_ctx);
+    let write_ctx = SqlWriteContext::<R>::new(write_ctx);
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(write_ctx.clone());
     let provider_selection =
         providers::read_provider_selection(&session, std::slice::from_ref(statement));
@@ -149,21 +151,30 @@ pub(crate) struct SqlWriteSessionOptions {
     pub(crate) explicit_insert_columns: Option<BTreeSet<String>>,
 }
 
-pub(crate) struct SqlWriteSession {
+pub(crate) struct SqlWriteSession<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     datafusion: SessionContext,
-    write_targets: Arc<providers::WriteTargetRegistry>,
+    write_targets: Arc<providers::WriteTargetRegistry<R>>,
 }
 
-impl SqlWriteSession {
+impl<R> SqlWriteSession<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     pub(crate) fn write_target(
         &self,
         table_name: &str,
-    ) -> Result<Arc<providers::SpecWriteTarget>, LixError> {
+    ) -> Result<Arc<providers::SpecWriteTarget<R>>, LixError> {
         self.write_targets.target(table_name)
     }
 }
 
-impl Deref for SqlWriteSession {
+impl<R> Deref for SqlWriteSession<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     type Target = SessionContext;
 
     fn deref(&self) -> &Self::Target {
@@ -171,13 +182,16 @@ impl Deref for SqlWriteSession {
     }
 }
 
-pub(crate) async fn build_write_session_with_options(
-    ctx: &mut dyn SqlWriteExecutionContext,
+pub(crate) async fn build_write_session_with_options<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     options: SqlWriteSessionOptions,
     provider_selection: &providers::ProviderSelection,
-) -> Result<SqlWriteSession, LixError> {
+) -> Result<SqlWriteSession<R>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let session = ctx.datafusion_session();
-    let write_ctx = SqlWriteContext::new(ctx)
+    let write_ctx = SqlWriteContext::<R>::new(ctx)
         .with_explicit_insert_columns(options.explicit_insert_columns.clone());
     let write_targets = write_ctx.write_targets()?;
     let active_branch_id = write_ctx.active_branch_id();

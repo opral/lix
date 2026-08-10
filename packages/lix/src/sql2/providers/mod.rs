@@ -9,6 +9,7 @@ use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::live_state::LiveStateReader;
+use crate::storage_adapter::StorageAdapterRead;
 
 mod branch;
 mod change;
@@ -37,7 +38,6 @@ use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKi
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlChangelogQuerySource, SqlExecutionContext, SqlWriteContext};
 
-use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::TableSource;
 
 pub(crate) type SharedCommitGraph = Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>;
@@ -58,12 +58,15 @@ pub(crate) use spec::{DmlReturning, SpecWriteTarget, WriteTargetRegistry};
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 
 pub(crate) fn history_anchor_column(source: &dyn TableSource) -> Option<&'static str> {
-    let source = source.as_any().downcast_ref::<DefaultTableSource>()?;
-    let provider = source
-        .table_provider
-        .as_any()
-        .downcast_ref::<spec::SpecTableProvider>()?;
-    provider.history_anchor_column()
+    match source
+        .schema()
+        .metadata()
+        .get("lix.history_anchor_column")
+        .map(String::as_str)
+    {
+        Some("lixcol_as_of_commit_id") => Some("lixcol_as_of_commit_id"),
+        _ => None,
+    }
 }
 
 pub(crate) async fn register_read<C>(
@@ -524,33 +527,37 @@ where
     Ok(())
 }
 
-pub(crate) async fn register_write(
+pub(crate) async fn register_write<R>(
     session: &SessionContext,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
     selection: &ProviderSelection,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let catalog = write_ctx.public_catalog()?;
     register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
         .await?;
     crate::sql2::information_schema::register(session, &catalog)
 }
 
-pub(crate) async fn register_transaction<C>(
+pub(crate) async fn register_transaction<C, R>(
     session: &SessionContext,
     read_ctx: &C,
     read_branch_ref: Arc<dyn BranchRefReader>,
     active_branch_commit_id: Option<String>,
     commit_graph: SharedCommitGraph,
     query_source: SqlChangelogQuerySource<C::ReadStore>,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     write_branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
     selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     // Both capabilities project the same transaction-scoped schema snapshot.
     // Reuse that immutable metadata, then install read-only providers from the
@@ -580,14 +587,17 @@ where
     crate::sql2::information_schema::register(session, &catalog)
 }
 
-async fn register_write_from_catalog(
+async fn register_write_from_catalog<R>(
     session: &SessionContext,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
     catalog: &PublicCatalog,
     selection: &ProviderSelection,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     for surface in catalog.surfaces() {
         if !selection.includes(surface) {
             continue;
