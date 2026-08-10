@@ -962,6 +962,7 @@ where
         let mut rows = RawWriteBatch::with_capacity(row_capacity);
         let mut count = 0_u64;
         for batch in batches {
+            validate_lix_directory_schema_boundary_batch(&batch)?;
             if path_resolvers.is_none() {
                 path_resolvers = Some(
                     self.path_resolvers_for_write(write_ctx, Some(&batch))
@@ -1034,6 +1035,7 @@ where
                 let mut count = 0_u64;
                 for batch in batches {
                     let batch = spec.materialize_returning_insert_defaults(&batch)?;
+                    validate_lix_directory_schema_boundary_batch(&batch)?;
                     for row_index in 0..batch.num_rows() {
                         keys.push(spec.returning_key_from_batch(&batch, row_index)?);
                     }
@@ -1339,6 +1341,7 @@ where
         batch: &RecordBatch,
     ) -> Result<StagedUpsert> {
         let surface_name = lix_directory_surface_name(&self.branch_binding);
+        validate_lix_directory_schema_boundary_batch(batch)?;
         let mut path_resolvers = self
             .path_resolvers_for_write(write_ctx, Some(batch))
             .await?;
@@ -2065,6 +2068,20 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         }
     }
     Ok(rows)
+}
+
+/// Validate descriptor names before acquiring any path/index state. A direct
+/// descriptor write must report the schema-boundary error even when preparing
+/// the transaction-visible resolver would fail for an unrelated reason.
+fn validate_lix_directory_schema_boundary_batch(batch: &RecordBatch) -> Result<()> {
+    for row_index in 0..batch.num_rows() {
+        if optional_string_value(batch, row_index, "path")?.is_some() {
+            continue;
+        }
+        let name = required_string_value(batch, row_index, "name")?;
+        validate_lix_directory_name_at_schema_boundary(&name)?;
+    }
+    Ok(())
 }
 
 fn validate_lix_directory_name_at_schema_boundary(name: &str) -> Result<()> {

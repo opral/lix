@@ -388,8 +388,12 @@ where
                 let assignments = assignments.clone();
                 let table_schema = Arc::clone(&table_schema);
                 async move {
-                    let branch_rows =
+                    let updates =
                         branch_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
+                    let branch_rows = updates
+                        .iter()
+                        .map(|update| update.after.clone())
+                        .collect::<Vec<_>>();
                     reject_protected_branch_updates(&branch_rows)?;
                     let ignored_ids = branch_rows
                         .iter()
@@ -403,13 +407,22 @@ where
                     let mut rows =
                         RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
                     let mut branch_ref_intents = Vec::new();
-                    for row in branch_rows {
-                        branch_ref_intents.push(push_branch_descriptor_row(
-                            &mut rows,
-                            row,
-                            TransactionWriteOperation::Update,
-                            false,
-                        ));
+                    for update in updates {
+                        if update.descriptor_changed() {
+                            push_branch_descriptor_row(
+                                &mut rows,
+                                update.after.clone(),
+                                TransactionWriteOperation::Update,
+                                false,
+                            );
+                        }
+                        if update.selector_changed() {
+                            branch_ref_intents.push((
+                                update.after.id,
+                                Some(update.after.commit_id),
+                                false,
+                            ));
+                        }
                     }
 
                     if !rows.is_empty() {
@@ -446,8 +459,12 @@ where
                 let table_schema = Arc::clone(&table_schema);
                 let returning = returning.clone();
                 async move {
-                    let branch_rows =
+                    let updates =
                         branch_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
+                    let branch_rows = updates
+                        .iter()
+                        .map(|update| update.after.clone())
+                        .collect::<Vec<_>>();
                     reject_protected_branch_updates(&branch_rows)?;
                     let ignored_ids = branch_rows
                         .iter()
@@ -464,13 +481,22 @@ where
                     let mut rows =
                         RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
                     let mut branch_ref_intents = Vec::new();
-                    for row in branch_rows {
-                        branch_ref_intents.push(push_branch_descriptor_row(
-                            &mut rows,
-                            row,
-                            TransactionWriteOperation::Update,
-                            false,
-                        ));
+                    for update in updates {
+                        if update.descriptor_changed() {
+                            push_branch_descriptor_row(
+                                &mut rows,
+                                update.after.clone(),
+                                TransactionWriteOperation::Update,
+                                false,
+                            );
+                        }
+                        if update.selector_changed() {
+                            branch_ref_intents.push((
+                                update.after.id,
+                                Some(update.after.commit_id),
+                                false,
+                            ));
+                        }
                     }
 
                     if !rows.is_empty() {
@@ -715,8 +741,11 @@ where
         augmented: &RecordBatch,
         assignments: &[(String, Arc<dyn PhysicalExpr>)],
     ) -> Result<StagedUpsert> {
-        let branch_rows =
-            branch_update_rows_from_batch(augmented, assignments, &lix_branch_schema())?;
+        let updates = branch_update_rows_from_batch(augmented, assignments, &lix_branch_schema())?;
+        let branch_rows = updates
+            .iter()
+            .map(|update| update.after.clone())
+            .collect::<Vec<_>>();
         reject_protected_branch_updates(&branch_rows)?;
         let ignored_ids = branch_rows
             .iter()
@@ -725,13 +754,18 @@ where
         reject_branch_identity_conflicts(write_ctx, &branch_rows, &ignored_ids).await?;
         let mut rows = RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
         let mut branch_ref_intents = Vec::new();
-        for row in branch_rows {
-            branch_ref_intents.push(push_branch_descriptor_row(
-                &mut rows,
-                row,
-                TransactionWriteOperation::Update,
-                false,
-            ));
+        for update in updates {
+            if update.descriptor_changed() {
+                push_branch_descriptor_row(
+                    &mut rows,
+                    update.after.clone(),
+                    TransactionWriteOperation::Update,
+                    false,
+                );
+            }
+            if update.selector_changed() {
+                branch_ref_intents.push((update.after.id, Some(update.after.commit_id), false));
+            }
         }
         Ok(StagedUpsert::rows_with_branch_ref_intents(
             rows,
@@ -746,6 +780,22 @@ struct BranchRow {
     name: String,
     hidden: bool,
     commit_id: CommitId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchUpdate {
+    before: BranchRow,
+    after: BranchRow,
+}
+
+impl BranchUpdate {
+    fn descriptor_changed(&self) -> bool {
+        self.before.name != self.after.name || self.before.hidden != self.after.hidden
+    }
+
+    fn selector_changed(&self) -> bool {
+        self.before.commit_id != self.after.commit_id
+    }
 }
 
 static LIX_BRANCH_COLS: ColumnTable<BranchRow> = ColumnTable {
@@ -1244,9 +1294,10 @@ fn branch_update_rows_from_batch(
     batch: &RecordBatch,
     assignments: &[(String, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
-) -> Result<Vec<BranchRow>> {
+) -> Result<Vec<BranchUpdate>> {
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
-    (0..batch.num_rows())
+    let before = branch_rows_from_batch(batch)?;
+    let after = (0..batch.num_rows())
         .map(|row_index| {
             Ok(BranchRow {
                 id: required_string_value(batch, row_index, "id", "UPDATE lix_branch")?,
@@ -1276,7 +1327,12 @@ fn branch_update_rows_from_batch(
                 )?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(before
+        .into_iter()
+        .zip(after)
+        .map(|(before, after)| BranchUpdate { before, after })
+        .collect())
 }
 
 fn parse_branch_row_commit_id(
