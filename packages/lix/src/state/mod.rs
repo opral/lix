@@ -445,52 +445,12 @@ where
         limit: Option<usize>,
         include_tombstones: bool,
     ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        let global_id = CanonicalBranchId::from_bytes(
-            *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
-                .expect("GLOBAL_BRANCH_ID must be a UUID")
-                .as_bytes(),
-        );
-        let active_id = self.view.branch_id();
-        let mut rows = std::collections::BTreeMap::new();
-        let insert = |rows: &mut std::collections::BTreeMap<Vec<u8>, UntrackedStateRow>,
-                      owner: CanonicalBranchId,
-                      key: StateKey,
-                      value: UntrackedValue| {
-            let encoded = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            });
-            rows.insert(encoded, UntrackedStateRow { owner, key, value });
-        };
-        if active_id == global_id {
-            for (key, value) in self
-                .view
-                .scan_untracked_branch_range(lower, upper, None)
-                .await?
-            {
-                insert(&mut rows, global_id, key, value);
-            }
-        } else {
-            let global = self.view.branch_view(global_id).await?;
-            for (key, value) in global
-                .scan_untracked_branch_range(lower, upper, None)
-                .await?
-            {
-                insert(&mut rows, global_id, key, value);
-            }
-            for (key, value) in self
-                .view
-                .scan_untracked_branch_range(lower, upper, None)
-                .await?
-            {
-                insert(&mut rows, active_id, key, value);
-            }
-        }
-        Ok(rows
-            .into_values()
-            .filter(|row| include_tombstones || !row.value.cell.deleted())
-            .take(limit.unwrap_or(usize::MAX))
+        Ok(self
+            .view
+            .scan_untracked_overlay_branch_range(lower, upper, limit, include_tombstones)
+            .await?
+            .into_iter()
+            .map(|(owner, key, value)| UntrackedStateRow { owner, key, value })
             .collect())
     }
 
@@ -510,51 +470,12 @@ where
             return Ok(Vec::new());
         }
         let branch_id = canonical_branch_id(branch_id)?;
-        let global_id = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
         let branch_view = self.view.branch_view(branch_id).await?;
-        let local = branch_view
-            .scan_untracked_branch_range(lower, upper, None)
+        Ok(branch_view
+            .scan_untracked_overlay_branch_range(lower, upper, limit, include_tombstones)
             .await?
             .into_iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    UntrackedStateRow {
-                        owner: branch_id,
-                        key,
-                        value,
-                    },
-                )
-            });
-        let global = if branch_id == global_id {
-            Vec::new()
-        } else {
-            self.view
-                .branch_view(global_id)
-                .await?
-                .scan_untracked_branch_range(lower, upper, None)
-                .await?
-                .into_iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        UntrackedStateRow {
-                            owner: global_id,
-                            key,
-                            value,
-                        },
-                    )
-                })
-                .collect()
-        };
-        let mut merged = BTreeMap::<StateKey, UntrackedStateRow>::new();
-        for (key, row) in global.into_iter().chain(local) {
-            merged.insert(key, row);
-        }
-        Ok(merged
-            .into_values()
-            .filter(|row| include_tombstones || !row.value.cell.deleted())
-            .take(limit.unwrap_or(usize::MAX))
+            .map(|(owner, key, value)| UntrackedStateRow { owner, key, value })
             .collect())
     }
 
@@ -1174,10 +1095,6 @@ where
         limit: Option<usize>,
         include_tombstones: bool,
     ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        let committed = self
-            .committed
-            .untracked_overlay_range(lower, upper, None, true)
-            .await?;
         let active_owner = canonical_branch_id(self.committed.branch_id().as_str())?;
         let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
         let staged_global = self.staged_untracked_rows_for_owner(global_owner, lower, upper);
@@ -1186,6 +1103,16 @@ where
         } else {
             self.staged_untracked_rows_for_owner(active_owner, lower, upper)
         };
+        let staged_empty = staged_global.is_empty() && staged_local.is_empty();
+        let committed = self
+            .committed
+            .untracked_overlay_range(
+                lower,
+                upper,
+                staged_empty.then_some(limit).flatten(),
+                staged_empty && include_tombstones,
+            )
+            .await?;
         Ok(
             merge_untracked_overlay_rows(committed, staged_global, staged_local, active_owner)
                 .into_iter()
@@ -1212,10 +1139,6 @@ where
         }
         let target = canonical_branch_id(branch_id)?;
         let global = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
-        let committed = self
-            .committed
-            .untracked_overlay_branch_range_for_branch(branch_id, lower, upper, None, true)
-            .await?;
         let (staged_global, staged_local) = if self.committed.branch_id_matches(branch_id)? {
             if target == global {
                 (
@@ -1231,6 +1154,17 @@ where
         } else {
             (Vec::new(), Vec::new())
         };
+        let staged_empty = staged_global.is_empty() && staged_local.is_empty();
+        let committed = self
+            .committed
+            .untracked_overlay_branch_range_for_branch(
+                branch_id,
+                lower,
+                upper,
+                staged_empty.then_some(limit).flatten(),
+                staged_empty && include_tombstones,
+            )
+            .await?;
         Ok(
             merge_untracked_overlay_rows(committed, staged_global, staged_local, target)
                 .into_iter()
