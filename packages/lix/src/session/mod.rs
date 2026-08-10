@@ -24,6 +24,7 @@ mod media_upload;
 pub(crate) mod observe;
 mod switch_branch;
 mod transaction;
+mod undo_redo;
 
 pub use crate::common::{
     ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,
@@ -44,6 +45,7 @@ pub use media_upload::{FILE_UPLOAD_PART_BYTES, FileUploadProgress};
 pub use observe::{ObserveEvent, ObserveEvents};
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
+pub use undo_redo::{RedoReceipt, UndoReceipt};
 
 /// Zero-cost adapter for futures that rustc cannot prove `Send` because an
 /// opaque async call contains higher-ranked references. Construction is unsafe:
