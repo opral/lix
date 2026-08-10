@@ -708,11 +708,6 @@ enum IdempotencyReceiptResolution {
     Replay(ExecuteIdempotencyReceipt),
 }
 
-// Keep the single-file legacy-topology fallback semantically identical to the
-// public `lix_file` upsert. Batch writes intentionally stay direct-only.
-const NATIVE_FILE_UPSERT_SQL: &str = "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
-    ON CONFLICT (path) DO UPDATE SET content = excluded.content";
-
 fn validate_native_file_upsert_batch(writes: &[(String, Blob)]) -> Result<(), LixError> {
     if writes.is_empty() {
         return Err(LixError::new(
@@ -1044,39 +1039,26 @@ where
         // its specific path errors intact.
         crate::common::LixPath::try_from_file_path(&path)?;
         let write_access = self.begin_session_write_access().await?;
-        let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
         self.with_write_transaction_reserved_lending(
             write_access,
             async move |transaction| {
-                // `Blob` is reference-counted. Retaining a copy lets the rare
-                // general-write fallback reuse the same payload without a
-                // second allocation or a second transaction.
-                let fast_path = sql2::execute_fast_lix_file_path_writes(
+                sql2::execute_fast_lix_file_path_writes(
                     transaction,
-                    vec![(path.clone(), content.clone(), None, None)],
+                    vec![(path, content, None, None)],
                     sql2::FastLixFilePathWriteConflict::UpdateContent,
                     None,
                 )
-                .await?;
-                if let Some(count) = fast_path {
-                    return Ok(count);
-                }
-
-                // The fast helper declines pre-existing cross-scope path
-                // collisions before staging anything. The general provider
-                // handles those valid legacy layouts, so keep this request in
-                // the same transaction and use its public upsert semantics.
-                let statement = sql_planning_cache.parse_statement(NATIVE_FILE_UPSERT_SQL)?;
-                let plan = transaction
-                    .prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)?;
-                sql2::execute_write_logical_plan_result_with_metadata(
-                    transaction,
-                    plan,
-                    &[Value::Text(path), Value::Blob(content)],
-                    &ExecuteStatementMetadata::default(),
-                )
-                .await
-                .map(|result| result.rows_affected)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        "upsert_file_content requires a filesystem layout that its direct path index can route unambiguously",
+                    )
+                    .with_details(serde_json::json!({
+                        "operation": "upsertFileContent",
+                        "expected": "a filesystem layout that the direct path index can route unambiguously",
+                    }))
+                })
             },
             |_| Ok(()),
         )
@@ -4538,6 +4520,47 @@ mod tests {
                 .get::<serde_json::Value>("value")
                 .expect("value should be JSON"),
             serde_json::json!("after")
+        );
+    }
+
+    #[tokio::test]
+    async fn single_file_upsert_uses_the_native_filesystem_path() {
+        let session = open_session().await;
+
+        assert_eq!(
+            session
+                .upsert_file_content(
+                    "/native-upsert.txt".to_string(),
+                    Blob::from(b"old".as_slice())
+                )
+                .await
+                .expect("the native file upsert should create the file"),
+            1
+        );
+        assert_eq!(
+            session
+                .upsert_file_content(
+                    "/native-upsert.txt".to_string(),
+                    Blob::from(b"new".as_slice())
+                )
+                .await
+                .expect("the native file upsert should update the file"),
+            1
+        );
+
+        let result = session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/native-upsert.txt'",
+                &[],
+            )
+            .await
+            .expect("the upserted file should remain queryable");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0]
+                .get::<Blob>("content")
+                .expect("content should be a blob"),
+            Blob::from(b"new".as_slice())
         );
     }
 }
