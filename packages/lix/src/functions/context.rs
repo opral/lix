@@ -37,7 +37,6 @@ impl FunctionContext {
     ///
     /// If deterministic mode is absent or disabled, the context uses system
     /// functions. If enabled, it starts from the persisted sequence + 1.
-    #[expect(trivial_casts)]
     pub(crate) async fn prepare(
         read: &(impl StorageAdapterRead + ?Sized),
     ) -> Result<Self, LixError> {
@@ -47,6 +46,7 @@ impl FunctionContext {
         Self::prepare_from_view(&global_state_view).await
     }
 
+    #[expect(trivial_casts)]
     async fn prepare_from_view<R>(state_view: &ForkTreeStateView<R>) -> Result<Self, LixError>
     where
         R: StorageAdapterRead,
