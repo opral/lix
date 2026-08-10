@@ -12,8 +12,8 @@ use crate::entity_pk::EntityPk;
 use crate::json_store::JsonSlot;
 use crate::storage::{
     BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
-    KeyRange, Memory, MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage,
-    StorageError, StorageRead, StorageWrite, WriteOptions,
+    KeyRange, Memory, MemoryRead, MemoryWrite, ProjectedValue, PutBatch, ReadOptions, ScanCursor,
+    Storage, StorageError, StorageRead, StorageWrite, WriteOptions,
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
@@ -25,7 +25,7 @@ use super::model::{
     GcProgressSelectorV2, GcProgressV2, branch_selector_key, gc_progress_selector_key,
     global_selector_key, snapshot_selector_key, upload_binding_digest, upload_selector_key,
 };
-use super::object::OBJECT_SPACE;
+use super::object::{OBJECT_SPACE, ObjectDomain, encode_id, encode_object};
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_state_tree, diff_roots,
@@ -37,8 +37,8 @@ use super::view::SELECTOR_SPACE;
 use super::{
     BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, CanonicalUploadId,
-    ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView,
-    CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
+    ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CheckpointCursorV1,
+    CoherentView, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
     CommitTopologyReader, ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId,
     PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
     ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
@@ -53,6 +53,132 @@ use super::{
 
 fn raw_id(byte: u8) -> [u8; 16] {
     [byte; 16]
+}
+
+fn chronology_fixture_commit(
+    commit_byte: u8,
+    generation: u64,
+    parent_ids: Vec<ObjectId>,
+    checkpoint_cursor: CheckpointCursorV1,
+) -> CommitObjectV1 {
+    CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(commit_byte)),
+        generation,
+        parent_commit_object_ids: parent_ids,
+        members: Vec::new(),
+        member_page_object_ids: Vec::new(),
+        global_state_root: ObjectId::from_bytes([0xa1; 32]),
+        local_state_root: ObjectId::from_bytes([0xa2; 32]),
+        checkpoint_cursor,
+        metadata: vec![commit_byte],
+    }
+}
+
+#[test]
+fn checkpoint_cursor_models_branch_rewind_merge_and_partial_replay() {
+    let main = CanonicalBranchId::from_bytes(raw_id(0x11));
+    let branch = CanonicalBranchId::from_bytes(raw_id(0x12));
+    let root = chronology_fixture_commit(1, 0, Vec::new(), CheckpointCursorV1::root());
+    let (root_id, _) = root.encode().expect("root cursor encodes");
+
+    let first_cursor = CheckpointCursorV1::after_first_parent(root_id, &root, main, false)
+        .expect("ordinary cursor");
+    let first = chronology_fixture_commit(2, 1, vec![root_id], first_cursor);
+    let (first_id, _) = first.encode().expect("ordinary commit encodes");
+    assert_eq!(first_cursor.latest_for_branch(first_id, main), (root_id, 1));
+
+    let checkpoint_cursor = CheckpointCursorV1::after_first_parent(first_id, &first, main, true)
+        .expect("checkpoint cursor");
+    let checkpoint = chronology_fixture_commit(3, 2, vec![first_id], checkpoint_cursor);
+    let (checkpoint_id, _) = checkpoint.encode().expect("checkpoint encodes");
+    assert_eq!(
+        checkpoint_cursor.latest_for_branch(checkpoint_id, main),
+        (checkpoint_id, 0)
+    );
+    assert_eq!(checkpoint_cursor.previous_checkpoint(), Some((root_id, 2)));
+
+    let replay_cursor =
+        CheckpointCursorV1::after_first_parent(checkpoint_id, &checkpoint, main, false)
+            .expect("partial replay cursor");
+    let replay = chronology_fixture_commit(4, 3, vec![checkpoint_id], replay_cursor);
+    let (replay_id, _) = replay.encode().expect("partial replay encodes");
+    assert_eq!(
+        replay_cursor.latest_for_branch(replay_id, main),
+        (checkpoint_id, 1)
+    );
+
+    // A merge derives chronology from its first parent only. The second edge
+    // cannot seed an independent checkpoint target.
+    let merge_cursor = CheckpointCursorV1::after_first_parent(replay_id, &replay, main, false)
+        .expect("merge cursor");
+    let merge = chronology_fixture_commit(5, 4, vec![replay_id, first_id], merge_cursor);
+    let (merge_id, _) = merge.encode().expect("merge encodes");
+    assert_eq!(
+        merge_cursor.latest_for_branch(merge_id, main),
+        (checkpoint_id, 2)
+    );
+
+    // Rewinding selects the cursor carried by that historical head. A branch
+    // inheriting another owner's head sees only the implicit repository root.
+    assert_eq!(
+        checkpoint_cursor.latest_for_branch(checkpoint_id, main),
+        (checkpoint_id, 0)
+    );
+    assert_eq!(
+        merge_cursor.latest_for_branch(merge_id, branch),
+        (root_id, 4)
+    );
+
+    // The first branch-owned checkpoint starts its own chain at the root.
+    let branch_checkpoint_cursor =
+        CheckpointCursorV1::after_first_parent(merge_id, &merge, branch, true)
+            .expect("branch checkpoint cursor");
+    assert_eq!(
+        branch_checkpoint_cursor.previous_checkpoint(),
+        Some((root_id, 5))
+    );
+
+    let malformed = chronology_fixture_commit(
+        6,
+        5,
+        vec![merge_id],
+        CheckpointCursorV1::Ordinary {
+            owner_branch_id: main,
+            root_commit_object_id: root_id,
+            distance_to_root: 5,
+            latest_checkpoint_object_id: checkpoint_id,
+            distance_to_latest: 0,
+        },
+    );
+    assert!(malformed.encode().is_err());
+}
+
+#[test]
+fn current_commit_decoder_rejects_authenticated_pre_cursor_envelope() {
+    let old_commit_id = CommitId::from_bytes(raw_id(0x0f));
+    let old_global_root = ObjectId::from_bytes([0xa1; 32]);
+    let old_local_root = ObjectId::from_bytes([0xa2; 32]);
+    let (old_object_id, old_bytes) = encode_object(ObjectDomain::CommitV1, |encoder| {
+        encoder.fixed(old_commit_id.as_bytes());
+        encoder.u64(0);
+        encoder.u32(0);
+        encoder.u32(0);
+        encode_id(encoder, old_global_root);
+        encode_id(encoder, old_local_root);
+        encoder.bytes(b"pre-cursor-v1")
+    })
+    .expect("authentic pre-cursor CommitV1 envelope");
+
+    let error = CommitObjectV1::decode(old_object_id, &old_bytes)
+        .expect_err("current decoder must reject the obsolete authenticated domain");
+    assert!(
+        matches!(
+            error,
+            StorageError::Corruption(ref message)
+                if message.contains("CommitV1") && message.contains("CommitV2")
+        ),
+        "obsolete CommitV1 must fail at the authenticated domain boundary: {error:?}",
+    );
 }
 
 #[test]
@@ -474,6 +600,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
         member_page_object_ids: seed_commit.member_page_object_ids,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::root(),
         metadata: b"remapped-source-commit".to_vec(),
     };
     let (remapped_source_object_id, remapped_source_bytes) =
@@ -551,6 +678,43 @@ fn content_id(byte: u8) -> ObjectId {
 
 fn public_commit_id(byte: u8) -> crate::changelog::CommitId {
     crate::changelog::CommitId::new(uuid::Uuid::from_bytes(raw_id(byte)))
+}
+
+fn chronology_commit_metadata(
+    commit_byte: u8,
+    generation: u64,
+    parent_commit_ids: Vec<crate::changelog::CommitId>,
+) -> Vec<u8> {
+    chronology_commit_metadata_for(
+        CommitId::from_bytes(raw_id(commit_byte)),
+        generation,
+        parent_commit_ids,
+    )
+}
+
+fn chronology_commit_metadata_for(
+    commit_id: CommitId,
+    generation: u64,
+    parent_commit_ids: Vec<crate::changelog::CommitId>,
+) -> Vec<u8> {
+    let public_commit_id =
+        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*commit_id.as_bytes()));
+    let mut change_bytes = *commit_id.as_bytes();
+    change_bytes[0] ^= 0x80;
+    crate::changelog::encode_forktree_commit_payload(&crate::changelog::CommitRecord {
+        format_version: 2,
+        commit_id: public_commit_id,
+        generation,
+        parent_commit_ids,
+        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(change_bytes)),
+        account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(i64::from_be_bytes(
+            commit_id.as_bytes()[8..]
+                .try_into()
+                .expect("commit id timestamp suffix"),
+        )),
+    })
+    .expect("chronology commit payload")
 }
 
 fn test_change_id(commit_byte: u8, key: &[u8], global: bool) -> ChangeId {
@@ -776,6 +940,7 @@ fn build_seed() -> SeedData {
         members: members.clone(),
         global_state_root,
         local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::root(),
         metadata: b"commit".to_vec(),
     };
     let (commit_object_id, commit_bytes) = commit.encode().expect("commit");
@@ -958,22 +1123,164 @@ fn insert_graph_commit(
     generation: u64,
     parent_commit_object_ids: Vec<ObjectId>,
 ) -> (CommitId, ObjectId) {
+    insert_graph_commit_with_checkpoint(seed, byte, generation, parent_commit_object_ids, false)
+}
+
+fn insert_graph_commit_with_checkpoint(
+    seed: &mut SeedData,
+    byte: u8,
+    generation: u64,
+    parent_commit_object_ids: Vec<ObjectId>,
+    introduces_checkpoint: bool,
+) -> (CommitId, ObjectId) {
     let commit_id = CommitId::from_bytes(raw_id(byte));
+    let parent_commit_ids = parent_commit_object_ids
+        .iter()
+        .map(|parent_id| {
+            let parent = CommitObjectV1::decode(
+                *parent_id,
+                seed.objects.get(*parent_id).expect("graph parent object"),
+            )
+            .expect("graph parent commit");
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*parent.commit_id.as_bytes()))
+        })
+        .collect();
+    let checkpoint_cursor = match parent_commit_object_ids.first().copied() {
+        None => CheckpointCursorV1::root(),
+        Some(parent_id) => {
+            let parent = CommitObjectV1::decode(
+                parent_id,
+                seed.objects.get(parent_id).expect("graph parent object"),
+            )
+            .expect("graph parent commit");
+            CheckpointCursorV1::after_first_parent(
+                parent_id,
+                &parent,
+                seed.branch_id,
+                introduces_checkpoint,
+            )
+            .expect("graph checkpoint cursor")
+        }
+    };
+    let members = chronology_checkpoint_members(seed, commit_id, introduces_checkpoint);
+    let pages = CommitChangePageV2::encode_pages(commit_id, &members)
+        .expect("graph chronology member pages");
+    for (id, bytes) in &pages.objects {
+        seed.objects
+            .insert(*id, bytes.clone())
+            .expect("graph chronology member page");
+    }
     let commit = CommitObjectV1 {
         commit_id,
         generation,
         parent_commit_object_ids,
         members: Vec::new(),
-        member_page_object_ids: Vec::new(),
+        member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
-        metadata: format!("graph-{byte:02x}").into_bytes(),
+        checkpoint_cursor,
+        metadata: chronology_commit_metadata(byte, generation, parent_commit_ids),
     };
     let (object_id, bytes) = commit.encode().expect("graph commit");
     seed.objects
         .insert(object_id, bytes)
         .expect("graph commit object");
     (commit_id, object_id)
+}
+
+fn indexed_chronology_id(index: u32) -> CommitId {
+    let mut bytes = [0_u8; 16];
+    bytes[0] = 0xc7;
+    bytes[12..].copy_from_slice(&index.to_be_bytes());
+    CommitId::from_bytes(bytes)
+}
+
+fn insert_indexed_chronology_commit(
+    seed: &mut SeedData,
+    index: u32,
+    parent: Option<(ObjectId, &CommitObjectV1)>,
+    introduces_checkpoint: bool,
+) -> (CommitId, ObjectId, CommitObjectV1) {
+    let commit_id = indexed_chronology_id(index);
+    let generation = u64::from(index) + 1;
+    let (parent_commit_object_ids, parent_commit_ids, checkpoint_cursor) = match parent {
+        None => (Vec::new(), Vec::new(), CheckpointCursorV1::root()),
+        Some((parent_id, parent)) => (
+            vec![parent_id],
+            vec![crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+                *parent.commit_id.as_bytes(),
+            ))],
+            CheckpointCursorV1::after_first_parent(
+                parent_id,
+                parent,
+                seed.branch_id,
+                introduces_checkpoint,
+            )
+            .expect("indexed checkpoint cursor"),
+        ),
+    };
+    let members = chronology_checkpoint_members(seed, commit_id, introduces_checkpoint);
+    let pages = CommitChangePageV2::encode_pages(commit_id, &members)
+        .expect("indexed chronology member pages");
+    for (id, bytes) in &pages.objects {
+        seed.objects
+            .insert(*id, bytes.clone())
+            .expect("indexed chronology member page");
+    }
+    let commit = CommitObjectV1 {
+        commit_id,
+        generation,
+        parent_commit_object_ids,
+        members: Vec::new(),
+        member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        checkpoint_cursor,
+        metadata: chronology_commit_metadata_for(commit_id, generation, parent_commit_ids),
+    };
+    let (object_id, bytes) = commit.encode().expect("indexed chronology commit");
+    seed.objects
+        .insert(object_id, bytes)
+        .expect("indexed chronology object");
+    (commit_id, object_id, commit)
+}
+
+fn chronology_checkpoint_members(
+    seed: &SeedData,
+    commit_id: CommitId,
+    introduces_checkpoint: bool,
+) -> Vec<CommitMemberV1> {
+    if !introduces_checkpoint {
+        return Vec::new();
+    }
+    let mut change_bytes = *commit_id.as_bytes();
+    change_bytes[1] ^= 0x5a;
+    let change_id = ChangeId::from_bytes(change_bytes);
+    let branch_id = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
+    let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+        format_version: 2,
+        change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(change_bytes)),
+        account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+        schema_key: crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY.to_owned(),
+        entity_pk: EntityPk::uuid_from_canonical(&branch_id).expect("checkpoint branch UUID"),
+        file_id: None,
+        snapshot: JsonSlot::Inline(
+            serde_json::json!({ "branch_id": branch_id })
+                .to_string()
+                .into(),
+        ),
+        metadata: JsonSlot::None,
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        origin_key: None,
+    })
+    .expect("checkpoint marker payload");
+    vec![CommitMemberV1::introduced(
+        change_id,
+        payload,
+        false,
+        LixTimestamp::from_unix_millis_utc_lossy(1),
+        Vec::new(),
+    )]
 }
 
 fn install_graph_head(
@@ -1012,6 +1319,18 @@ fn install_graph_head(
         )
     }));
     let mut change_entries = seed_member_catalog_entries(seed, seed.commit_object_id);
+    for (_, commit_object_id) in commits {
+        change_entries.extend(commit_member_catalog_entries(seed, *commit_object_id));
+    }
+    change_entries.push((
+        seed.ref_change_id,
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: seed.ref_change_object_id,
+                branch_id: seed.branch_id,
+            },
+        },
+    ));
     change_entries.push((
         ref_change.change_id(),
         ChangeCatalogEntry {
@@ -1055,6 +1374,677 @@ where
             .to_vec(),
     );
     commit_write_set_for_test(writes, storage).await;
+}
+
+fn build_checkpoint_chronology_seed() -> (SeedData, [(CommitId, ObjectId); 4]) {
+    let mut seed = build_seed();
+    let root = insert_graph_commit_with_checkpoint(&mut seed, 0x90, 1, Vec::new(), false);
+    let ordinary = insert_graph_commit_with_checkpoint(&mut seed, 0x91, 2, vec![root.1], false);
+    let checkpoint =
+        insert_graph_commit_with_checkpoint(&mut seed, 0x92, 3, vec![ordinary.1], true);
+    let head = insert_graph_commit_with_checkpoint(&mut seed, 0x93, 4, vec![checkpoint.1], false);
+    let commits = [root, ordinary, checkpoint, head];
+    install_graph_head(&mut seed, &commits, head.1, 0x94);
+    (seed, commits)
+}
+
+async fn checkpoint_history_from_seed(
+    seed: &SeedData,
+) -> Result<Vec<super::view::CheckpointHistoryEntry>, LixError> {
+    let storage = Memory::new();
+    seed_storage(&storage, seed).await;
+    let adapter = StorageAdapter::new(storage);
+    let read = adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("one retained checkpoint read");
+    let branch_id = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
+    Ok(ForkTreeReadFacade::new(read)
+        .checkpoint_history_for_branch(&branch_id, None, None, Some(1))
+        .await?
+        .entries)
+}
+
+#[tokio::test]
+async fn checkpoint_chronology_authenticates_branch_target_commit_and_presence() {
+    let (seed, _) = build_checkpoint_chronology_seed();
+    let history = checkpoint_history_from_seed(&seed)
+        .await
+        .expect("selector-bound latest checkpoint");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].commit_id, public_commit_id(0x92));
+    assert_eq!(history[0].depth, 1);
+
+    let (mut substituted_target, commits) = build_checkpoint_chronology_seed();
+    let replacement_checkpoint = insert_graph_commit_with_checkpoint(
+        &mut substituted_target,
+        0x98,
+        3,
+        vec![commits[1].1],
+        true,
+    );
+    let current_head = CommitObjectV1::decode(
+        commits[3].1,
+        substituted_target
+            .objects
+            .get(commits[3].1)
+            .expect("chronology head"),
+    )
+    .expect("decode chronology head");
+    let substituted_head = CommitObjectV1 {
+        checkpoint_cursor: CheckpointCursorV1::Ordinary {
+            owner_branch_id: substituted_target.branch_id,
+            root_commit_object_id: commits[0].1,
+            distance_to_root: 3,
+            latest_checkpoint_object_id: replacement_checkpoint.1,
+            distance_to_latest: 1,
+        },
+        ..current_head
+    };
+    let (substituted_head_id, substituted_head_bytes) = substituted_head
+        .encode()
+        .expect("substituted chronology head");
+    substituted_target
+        .objects
+        .insert(substituted_head_id, substituted_head_bytes)
+        .expect("substituted chronology head object");
+    install_graph_head(
+        &mut substituted_target,
+        &[
+            commits[0],
+            commits[1],
+            commits[2],
+            replacement_checkpoint,
+            (substituted_head.commit_id, substituted_head_id),
+        ],
+        substituted_head_id,
+        0x95,
+    );
+    let error = checkpoint_history_from_seed(&substituted_target)
+        .await
+        .expect_err("a coherent checkpoint target substitution must fail derivation");
+    assert!(
+        error.to_string().contains("does not derive"),
+        "substituted checkpoint target must fail closed: {error}"
+    );
+
+    let (mut substituted_root, commits) = build_checkpoint_chronology_seed();
+    let replacement_root =
+        insert_graph_commit_with_checkpoint(&mut substituted_root, 0x99, 1, Vec::new(), false);
+    let current_head = CommitObjectV1::decode(
+        commits[3].1,
+        substituted_root
+            .objects
+            .get(commits[3].1)
+            .expect("chronology head"),
+    )
+    .expect("decode chronology head");
+    let substituted_head = CommitObjectV1 {
+        checkpoint_cursor: CheckpointCursorV1::Ordinary {
+            owner_branch_id: substituted_root.branch_id,
+            root_commit_object_id: replacement_root.1,
+            distance_to_root: 3,
+            latest_checkpoint_object_id: commits[2].1,
+            distance_to_latest: 1,
+        },
+        ..current_head
+    };
+    let (substituted_head_id, substituted_head_bytes) = substituted_head
+        .encode()
+        .expect("root-substituted chronology head");
+    substituted_root
+        .objects
+        .insert(substituted_head_id, substituted_head_bytes)
+        .expect("root-substituted chronology head object");
+    install_graph_head(
+        &mut substituted_root,
+        &[
+            replacement_root,
+            commits[0],
+            commits[1],
+            commits[2],
+            (substituted_head.commit_id, substituted_head_id),
+        ],
+        substituted_head_id,
+        0x96,
+    );
+    let error = checkpoint_history_from_seed(&substituted_root)
+        .await
+        .expect_err("a coherent repository-root substitution must fail derivation");
+    assert!(
+        error.to_string().contains("does not derive"),
+        "substituted chronology root must fail closed: {error}"
+    );
+
+    let (mut wrong_branch, commits) = build_checkpoint_chronology_seed();
+    let checkpoint = CommitObjectV1::decode(
+        commits[2].1,
+        wrong_branch
+            .objects
+            .get(commits[2].1)
+            .expect("chronology checkpoint"),
+    )
+    .expect("decode chronology checkpoint");
+    let foreign_checkpoint = CommitObjectV1 {
+        checkpoint_cursor: CheckpointCursorV1::Checkpoint {
+            owner_branch_id: CanonicalBranchId::from_bytes(raw_id(0x55)),
+            root_commit_object_id: commits[0].1,
+            distance_to_root: 2,
+            previous_checkpoint_object_id: commits[0].1,
+            distance_to_previous: 2,
+        },
+        ..checkpoint
+    };
+    let (foreign_checkpoint_id, foreign_checkpoint_bytes) =
+        foreign_checkpoint.encode().expect("foreign checkpoint");
+    wrong_branch
+        .objects
+        .insert(foreign_checkpoint_id, foreign_checkpoint_bytes)
+        .expect("foreign checkpoint object");
+    let head = CommitObjectV1 {
+        parent_commit_object_ids: vec![foreign_checkpoint_id],
+        checkpoint_cursor: CheckpointCursorV1::Ordinary {
+            owner_branch_id: wrong_branch.branch_id,
+            root_commit_object_id: commits[0].1,
+            distance_to_root: 3,
+            latest_checkpoint_object_id: foreign_checkpoint_id,
+            distance_to_latest: 1,
+        },
+        metadata: chronology_commit_metadata(0x93, 4, vec![public_commit_id(0x92)]),
+        ..CommitObjectV1::decode(
+            commits[3].1,
+            wrong_branch
+                .objects
+                .get(commits[3].1)
+                .expect("chronology head"),
+        )
+        .expect("decode chronology head")
+    };
+    let (head_id, head_bytes) = head.encode().expect("wrong-branch head");
+    wrong_branch
+        .objects
+        .insert(head_id, head_bytes)
+        .expect("wrong-branch head object");
+    install_graph_head(
+        &mut wrong_branch,
+        &[
+            commits[0],
+            commits[1],
+            (foreign_checkpoint.commit_id, foreign_checkpoint_id),
+            (head.commit_id, head_id),
+        ],
+        head_id,
+        0xa5,
+    );
+    let error = checkpoint_history_from_seed(&wrong_branch)
+        .await
+        .expect_err("a branch-owned cursor cannot target another branch's checkpoint");
+    assert!(
+        error.to_string().contains("does not derive")
+            || error
+                .to_string()
+                .contains("not owned by the selected branch")
+    );
+
+    let (mut wrong_commit, commits) = build_checkpoint_chronology_seed();
+    let checkpoint = CommitObjectV1::decode(
+        commits[2].1,
+        wrong_commit
+            .objects
+            .get(commits[2].1)
+            .expect("chronology checkpoint"),
+    )
+    .expect("decode chronology checkpoint");
+    let substituted_checkpoint = CommitObjectV1 {
+        metadata: {
+            let mut record = crate::changelog::decode_forktree_commit_payload(&checkpoint.metadata)
+                .expect("checkpoint metadata");
+            record.account_id = "substituted-owner".to_owned();
+            crate::changelog::encode_forktree_commit_payload(&record)
+                .expect("substituted checkpoint metadata")
+        },
+        ..checkpoint
+    };
+    let (substituted_id, substituted_bytes) = substituted_checkpoint
+        .encode()
+        .expect("substituted checkpoint");
+    wrong_commit
+        .objects
+        .insert(substituted_id, substituted_bytes)
+        .expect("substituted checkpoint object");
+    install_graph_head(
+        &mut wrong_commit,
+        &[
+            commits[0],
+            commits[1],
+            (substituted_checkpoint.commit_id, substituted_id),
+            commits[3],
+        ],
+        commits[3].1,
+        0xa6,
+    );
+    let error = checkpoint_history_from_seed(&wrong_commit)
+        .await
+        .expect_err("a chronology target must match its CommitCatalog back-edge");
+    assert!(error.to_string().contains("CommitCatalog"));
+
+    let (mut wrong_kind, commits) = build_checkpoint_chronology_seed();
+    let current_head = CommitObjectV1::decode(
+        commits[3].1,
+        wrong_kind
+            .objects
+            .get(commits[3].1)
+            .expect("chronology head"),
+    )
+    .expect("decode chronology head");
+    let wrong_kind_head = CommitObjectV1 {
+        checkpoint_cursor: CheckpointCursorV1::Ordinary {
+            owner_branch_id: wrong_kind.branch_id,
+            root_commit_object_id: commits[0].1,
+            distance_to_root: 3,
+            latest_checkpoint_object_id: commits[1].1,
+            distance_to_latest: 2,
+        },
+        ..current_head
+    };
+    let (wrong_kind_head_id, wrong_kind_head_bytes) =
+        wrong_kind_head.encode().expect("wrong-kind head");
+    wrong_kind
+        .objects
+        .insert(wrong_kind_head_id, wrong_kind_head_bytes)
+        .expect("wrong-kind head object");
+    install_graph_head(
+        &mut wrong_kind,
+        &[
+            commits[0],
+            commits[1],
+            commits[2],
+            (wrong_kind_head.commit_id, wrong_kind_head_id),
+        ],
+        wrong_kind_head_id,
+        0xa7,
+    );
+    let error = checkpoint_history_from_seed(&wrong_kind)
+        .await
+        .expect_err("an ordinary commit cannot be substituted for a checkpoint target");
+    assert!(
+        error.to_string().contains("does not derive")
+            || error
+                .to_string()
+                .contains("not owned by the selected branch")
+    );
+
+    let (mut missing, commits) = build_checkpoint_chronology_seed();
+    missing.objects.remove(commits[2].1);
+    let error = checkpoint_history_from_seed(&missing)
+        .await
+        .expect_err("a missing sealed checkpoint target must fail closed");
+    assert!(
+        error.to_string().contains("missing")
+            || error.to_string().contains("absent")
+            || error.to_string().contains("not found"),
+        "missing checkpoint error must remain fail-closed: {error}"
+    );
+
+    let (mut missing_page, commits) = build_checkpoint_chronology_seed();
+    let checkpoint = CommitObjectV1::decode(
+        commits[2].1,
+        missing_page
+            .objects
+            .get(commits[2].1)
+            .expect("chronology checkpoint"),
+    )
+    .expect("decode chronology checkpoint");
+    let page_id = *checkpoint
+        .member_page_object_ids
+        .first()
+        .expect("checkpoint marker page");
+    missing_page.objects.remove(page_id);
+    let error = checkpoint_history_from_seed(&missing_page)
+        .await
+        .expect_err("a missing checkpoint marker page must fail closed");
+    assert!(
+        error.to_string().contains("missing")
+            || error.to_string().contains("absent")
+            || error.to_string().contains("not found"),
+        "missing marker page must remain fail-closed: {error}"
+    );
+
+    let (mut corrupt_page, commits) = build_checkpoint_chronology_seed();
+    let checkpoint = CommitObjectV1::decode(
+        commits[2].1,
+        corrupt_page
+            .objects
+            .get(commits[2].1)
+            .expect("chronology checkpoint"),
+    )
+    .expect("decode chronology checkpoint");
+    let page_id = *checkpoint
+        .member_page_object_ids
+        .first()
+        .expect("checkpoint marker page");
+    corrupt_page.objects.remove(page_id);
+    corrupt_page
+        .objects
+        .insert(page_id, Bytes::from_static(b"wrong-domain checkpoint page"))
+        .expect("corrupt checkpoint marker page");
+    checkpoint_history_from_seed(&corrupt_page)
+        .await
+        .expect_err("a malformed checkpoint marker page must fail closed");
+
+    let (mut cycle_attempt, commits) = build_checkpoint_chronology_seed();
+    let checkpoint = CommitObjectV1::decode(
+        commits[2].1,
+        cycle_attempt
+            .objects
+            .get(commits[2].1)
+            .expect("chronology checkpoint"),
+    )
+    .expect("decode chronology checkpoint");
+    let cycle_checkpoint = CommitObjectV1 {
+        checkpoint_cursor: CheckpointCursorV1::Checkpoint {
+            owner_branch_id: cycle_attempt.branch_id,
+            root_commit_object_id: commits[0].1,
+            distance_to_root: 2,
+            previous_checkpoint_object_id: commits[3].1,
+            distance_to_previous: 1,
+        },
+        ..checkpoint
+    };
+    let (cycle_checkpoint_id, cycle_checkpoint_bytes) =
+        cycle_checkpoint.encode().expect("cycle-shaped checkpoint");
+    cycle_attempt
+        .objects
+        .insert(cycle_checkpoint_id, cycle_checkpoint_bytes)
+        .expect("cycle-shaped checkpoint object");
+    let current_head = CommitObjectV1::decode(
+        commits[3].1,
+        cycle_attempt
+            .objects
+            .get(commits[3].1)
+            .expect("chronology head"),
+    )
+    .expect("decode chronology head");
+    let cycle_head = CommitObjectV1 {
+        parent_commit_object_ids: vec![cycle_checkpoint_id],
+        checkpoint_cursor: CheckpointCursorV1::after_first_parent(
+            cycle_checkpoint_id,
+            &cycle_checkpoint,
+            cycle_attempt.branch_id,
+            false,
+        )
+        .expect("head after cycle-shaped checkpoint"),
+        ..current_head
+    };
+    let (cycle_head_id, cycle_head_bytes) = cycle_head.encode().expect("cycle-shaped head");
+    cycle_attempt
+        .objects
+        .insert(cycle_head_id, cycle_head_bytes)
+        .expect("cycle-shaped head object");
+    install_graph_head(
+        &mut cycle_attempt,
+        &[
+            commits[0],
+            commits[1],
+            (cycle_checkpoint.commit_id, cycle_checkpoint_id),
+            (cycle_head.commit_id, cycle_head_id),
+        ],
+        cycle_head_id,
+        0xa8,
+    );
+    let error = checkpoint_history_from_seed(&cycle_attempt)
+        .await
+        .expect_err("a cycle-shaped stale back-edge must fail before traversal");
+    assert!(
+        error.to_string().contains("does not derive")
+            || error.to_string().contains("CommitCatalog"),
+        "cycle-shaped chronology must fail closed: {error}"
+    );
+}
+
+fn build_checkpoint_height_seed(
+    height: u32,
+) -> (
+    SeedData,
+    Vec<(CommitId, ObjectId)>,
+    crate::changelog::CommitId,
+) {
+    assert!(height >= 2);
+    let mut seed = build_seed();
+    let root = insert_indexed_chronology_commit(&mut seed, 0, None, false);
+    let checkpoint = insert_indexed_chronology_commit(&mut seed, 1, Some((root.1, &root.2)), true);
+    let checkpoint_id =
+        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*checkpoint.0.as_bytes()));
+    let mut commits = vec![(root.0, root.1), (checkpoint.0, checkpoint.1)];
+    let mut parent = checkpoint;
+    for index in 2..=height {
+        let current =
+            insert_indexed_chronology_commit(&mut seed, index, Some((parent.1, &parent.2)), false);
+        commits.push((current.0, current.1));
+        parent = current;
+    }
+    install_graph_head(&mut seed, &commits, parent.1, 0xe1);
+    (seed, commits, checkpoint_id)
+}
+
+fn build_checkpoint_interval_seed(
+    height: u32,
+    interval: u32,
+) -> (SeedData, Vec<(CommitId, ObjectId)>) {
+    assert!(height > 0);
+    assert!(interval > 0);
+    let mut seed = build_seed();
+    let root = insert_indexed_chronology_commit(&mut seed, 0, None, false);
+    let mut commits = vec![(root.0, root.1)];
+    let mut parent = root;
+    for index in 1..=height {
+        let current = insert_indexed_chronology_commit(
+            &mut seed,
+            index,
+            Some((parent.1, &parent.2)),
+            index % interval == 0,
+        );
+        commits.push((current.0, current.1));
+        parent = current;
+    }
+    install_graph_head(&mut seed, &commits, parent.1, 0xe2);
+    (seed, commits)
+}
+
+#[tokio::test]
+async fn latest_checkpoint_loads_are_bounded_at_heights_10_100_and_1000() {
+    let mut observed_reads = None;
+    let mut observed_bytes = Vec::new();
+    let mut observed_calls = Vec::new();
+    let mut observed_keys = Vec::new();
+    let mut observed_total_bytes = Vec::new();
+    for height in [10_u32, 100, 1_000] {
+        let (seed, commits, checkpoint_id) = build_checkpoint_height_seed(height);
+        let commit_bytes = Arc::new(
+            commits
+                .iter()
+                .map(|(_, object_id)| {
+                    (
+                        object_id.as_bytes().to_vec(),
+                        seed.objects
+                            .get(*object_id)
+                            .expect("chronology commit object")
+                            .len(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        );
+        let storage = Memory::new();
+        seed_storage(&storage, &seed).await;
+        let commit_reads = Arc::new(AtomicUsize::new(0));
+        let requested_commit_bytes = Arc::new(AtomicUsize::new(0));
+        let get_many_calls = Arc::new(AtomicUsize::new(0));
+        let requested_keys = Arc::new(AtomicUsize::new(0));
+        let returned_bytes = Arc::new(AtomicUsize::new(0));
+        let read = ChronologyCountingRead {
+            inner: StorageAdapterReadScope::new(
+                storage
+                    .begin_read(ReadOptions::default())
+                    .await
+                    .expect("one retained chronology read"),
+            ),
+            commit_bytes,
+            commit_reads: Arc::clone(&commit_reads),
+            requested_commit_bytes: Arc::clone(&requested_commit_bytes),
+            get_many_calls: Arc::clone(&get_many_calls),
+            requested_keys: Arc::clone(&requested_keys),
+            returned_bytes: Arc::clone(&returned_bytes),
+        };
+        let branch_id = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
+        let latest = ForkTreeReadFacade::new(read)
+            .checkpoint_history_for_branch(&branch_id, None, None, Some(1))
+            .await
+            .expect("bounded latest checkpoint")
+            .entries;
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].commit_id, checkpoint_id);
+        assert_eq!(latest[0].depth, height - 1);
+
+        let reads = commit_reads.load(Ordering::Relaxed);
+        let bytes = requested_commit_bytes.load(Ordering::Relaxed);
+        assert!(reads <= 8, "height {height} used {reads} Commit loads");
+        assert_eq!(
+            observed_reads.get_or_insert(reads),
+            &reads,
+            "LIMIT 1 Commit loads must not grow with history height"
+        );
+        observed_bytes.push(bytes);
+        observed_calls.push(get_many_calls.load(Ordering::Relaxed));
+        observed_keys.push(requested_keys.load(Ordering::Relaxed));
+        observed_total_bytes.push(returned_bytes.load(Ordering::Relaxed));
+    }
+    let minimum = *observed_bytes.iter().min().expect("bounded byte samples");
+    let maximum = *observed_bytes.iter().max().expect("bounded byte samples");
+    assert!(
+        maximum <= minimum + 64,
+        "LIMIT 1 Commit bytes must remain fixed-size in H: {observed_bytes:?}"
+    );
+    let minimum_calls = *observed_calls.iter().min().expect("bounded call samples");
+    let maximum_calls = *observed_calls.iter().max().expect("bounded call samples");
+    assert!(
+        maximum_calls <= minimum_calls + 4,
+        "LIMIT 1 total get_many calls may add one catalog-tree level but must not scale with H: {observed_calls:?}"
+    );
+    let minimum_keys = *observed_keys.iter().min().expect("bounded key samples");
+    let maximum_keys = *observed_keys.iter().max().expect("bounded key samples");
+    assert!(
+        maximum_keys <= minimum_keys + 4,
+        "LIMIT 1 requested keys may add one catalog-tree level but must not scale with H: {observed_keys:?}"
+    );
+    let total_minimum = *observed_total_bytes
+        .iter()
+        .min()
+        .expect("bounded total-byte samples");
+    let total_maximum = *observed_total_bytes
+        .iter()
+        .max()
+        .expect("bounded total-byte samples");
+    assert!(
+        total_maximum <= total_minimum.saturating_mul(4),
+        "LIMIT 1 authenticated bytes must stay page-bounded rather than scale with H: {observed_total_bytes:?}"
+    );
+    eprintln!(
+        "checkpoint LIMIT 1 H=[10,100,1000] calls={observed_calls:?} keys={observed_keys:?} returned_bytes={observed_total_bytes:?}"
+    );
+}
+
+#[tokio::test]
+async fn depth_filtered_limit_visits_checkpoint_edges_not_ordinary_commits() {
+    let (seed, commits) = build_checkpoint_interval_seed(100, 10);
+    let commit_bytes = Arc::new(
+        commits
+            .iter()
+            .map(|(_, object_id)| {
+                (
+                    object_id.as_bytes().to_vec(),
+                    seed.objects
+                        .get(*object_id)
+                        .expect("chronology commit object")
+                        .len(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
+    );
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let commit_reads = Arc::new(AtomicUsize::new(0));
+    let requested_commit_bytes = Arc::new(AtomicUsize::new(0));
+    let get_many_calls = Arc::new(AtomicUsize::new(0));
+    let requested_keys = Arc::new(AtomicUsize::new(0));
+    let returned_bytes = Arc::new(AtomicUsize::new(0));
+    let read = ChronologyCountingRead {
+        inner: StorageAdapterReadScope::new(
+            storage
+                .begin_read(ReadOptions::default())
+                .await
+                .expect("one retained chronology read"),
+        ),
+        commit_bytes,
+        commit_reads: Arc::clone(&commit_reads),
+        requested_commit_bytes,
+        get_many_calls: Arc::clone(&get_many_calls),
+        requested_keys: Arc::clone(&requested_keys),
+        returned_bytes: Arc::clone(&returned_bytes),
+    };
+    let branch_id = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
+    let history = ForkTreeReadFacade::new(read)
+        .checkpoint_history_for_branch(&branch_id, Some(50), None, Some(1))
+        .await
+        .expect("depth-filtered checkpoint history")
+        .entries;
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].commit_id,
+        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+            *indexed_chronology_id(50).as_bytes(),
+        ))
+    );
+    assert_eq!(history[0].depth, 50);
+
+    let reads = commit_reads.load(Ordering::Relaxed);
+    let calls = get_many_calls.load(Ordering::Relaxed);
+    let keys = requested_keys.load(Ordering::Relaxed);
+    let bytes = returned_bytes.load(Ordering::Relaxed);
+    assert!(
+        reads <= 16,
+        "six visited checkpoint envelopes must not load 50 ordinary commits: {reads}"
+    );
+    assert!(
+        calls <= 64 && keys <= 64,
+        "filtered LIMIT 1 must scale with visited checkpoint edges: calls={calls} keys={keys}"
+    );
+    eprintln!(
+        "checkpoint filtered LIMIT 1 visited=6 calls={calls} keys={keys} returned_bytes={bytes}"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_chronology_survives_gc_and_cold_reopen() {
+    let (seed, _, checkpoint_id) = build_checkpoint_height_seed(100);
+    let storage = CrashStorage::new();
+    seed_storage(&storage, &seed).await;
+    sweep(&storage, seed.branch_id).await;
+
+    let reopened = storage.reopen();
+    let adapter = StorageAdapter::new(reopened);
+    let read = adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("cold-reopened chronology read");
+    let branch_id = uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string();
+    let latest = ForkTreeReadFacade::new(read)
+        .checkpoint_history_for_branch(&branch_id, None, None, Some(1))
+        .await
+        .expect("checkpoint after GC and cold reopen")
+        .entries;
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].commit_id, checkpoint_id);
+    assert_eq!(latest[0].depth, 99);
 }
 
 fn diff_state_rows(values: &[(usize, u8)]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1155,7 +2145,23 @@ fn seed_member_catalog_entries(
     seed: &SeedData,
     commit_object_id: ObjectId,
 ) -> Vec<(ChangeId, ChangeCatalogEntry)> {
-    seed_commit_members(seed)
+    commit_member_catalog_entries(seed, commit_object_id)
+}
+
+fn commit_member_catalog_entries(
+    seed: &SeedData,
+    commit_object_id: ObjectId,
+) -> Vec<(ChangeId, ChangeCatalogEntry)> {
+    let commit = CommitObjectV1::decode(
+        commit_object_id,
+        seed.objects
+            .get(commit_object_id)
+            .expect("cataloged commit object"),
+    )
+    .expect("decode cataloged commit");
+    commit
+        .load_members_with(load_from(&seed.objects))
+        .expect("load cataloged commit members")
         .into_iter()
         .enumerate()
         .map(|(ordinal, member)| {
@@ -1265,14 +2271,28 @@ async fn branch_transition_with_members<R: StorageAdapterRead>(
             .map(|(id, _)| *id)
             .collect()
     };
+    let parent_id = view.branch_snapshot().semantic_head_commit_object_id;
+    let parent_bytes = view
+        .load_object_bytes(parent_id)
+        .await
+        .expect("transition parent object");
+    let parent =
+        CommitObjectV1::decode(parent_id, &parent_bytes).expect("transition parent commit");
     let semantic_commit = CommitObjectV1 {
         commit_id,
         generation: identity as u64,
-        parent_commit_object_ids: vec![view.branch_snapshot().semantic_head_commit_object_id],
+        parent_commit_object_ids: vec![parent_id],
         members,
         member_page_object_ids,
         global_state_root: view.repository_root().global_state_root,
         local_state_root: state_edit.root,
+        checkpoint_cursor: CheckpointCursorV1::after_first_parent(
+            parent_id,
+            &parent,
+            view.branch_id(),
+            false,
+        )
+        .expect("transition checkpoint cursor"),
         metadata: vec![identity],
     };
     let (commit_object_id, _) = semantic_commit.encode().expect("next commit");
@@ -1863,6 +2883,7 @@ async fn historical_missing_state_root_fails_before_empty_result() {
         member_page_object_ids: seed_commit.member_page_object_ids,
         global_state_root: content_id(0xf1),
         local_state_root: seed.local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::root(),
         metadata: b"missing-state-root".to_vec(),
     };
     let (commit_object_id, commit_bytes) = commit.encode().expect("missing-root commit");
@@ -2114,6 +3135,73 @@ struct SharedParentCountingRead<R> {
     member_object_reads: Arc<AtomicUsize>,
 }
 
+struct ChronologyCountingRead<R> {
+    inner: R,
+    commit_bytes: Arc<BTreeMap<Vec<u8>, usize>>,
+    commit_reads: Arc<AtomicUsize>,
+    requested_commit_bytes: Arc<AtomicUsize>,
+    get_many_calls: Arc<AtomicUsize>,
+    requested_keys: Arc<AtomicUsize>,
+    returned_bytes: Arc<AtomicUsize>,
+}
+
+impl<R> StorageAdapterRead for ChronologyCountingRead<R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.inner.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        self.get_many_calls.fetch_add(1, Ordering::Relaxed);
+        self.requested_keys.fetch_add(
+            requests.iter().map(|request| request.keys.len()).sum(),
+            Ordering::Relaxed,
+        );
+        for request in requests {
+            if request.space != OBJECT_SPACE {
+                continue;
+            }
+            for key in request.keys {
+                if let Some(bytes) = self.commit_bytes.get(key.0.as_ref()) {
+                    self.commit_reads.fetch_add(1, Ordering::Relaxed);
+                    self.requested_commit_bytes
+                        .fetch_add(*bytes, Ordering::Relaxed);
+                }
+            }
+        }
+        let read = self.inner.get_many(requests);
+        let returned_bytes = Arc::clone(&self.returned_bytes);
+        async move {
+            let result = read.await?;
+            let bytes = result
+                .values
+                .iter()
+                .filter_map(|value| value.as_ref())
+                .map(|value| match value {
+                    ProjectedValue::KeyOnly => 0,
+                    ProjectedValue::FullValue(bytes) => bytes.len(),
+                })
+                .sum();
+            returned_bytes.fetch_add(bytes, Ordering::Relaxed);
+            Ok(result)
+        }
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.inner.begin_scan(space, range, opts)
+    }
+}
+
 impl<R> StorageAdapterRead for SharedParentCountingRead<R>
 where
     R: StorageAdapterRead,
@@ -2330,6 +3418,7 @@ async fn zero_edge_commit_change_pages_reopen_at_member_count_boundary() {
             member_page_object_ids: Vec::new(),
             global_state_root: content_id(0xb2),
             local_state_root: content_id(0xb3),
+            checkpoint_cursor: CheckpointCursorV1::root(),
             metadata: b"zero-edge-page-reopen".to_vec(),
         };
         let pages = commit.prepare_member_pages().expect("zero-edge pages");
@@ -2607,6 +3696,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         member_page_object_ids: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::root(),
         metadata: b"grandparent".to_vec(),
     };
     let (grandparent_object_id, grandparent_bytes) = grandparent.encode().expect("grandparent");
@@ -2625,6 +3715,13 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         member_page_object_ids: parent_page_ids,
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::after_first_parent(
+            grandparent_object_id,
+            &grandparent,
+            seed.branch_id,
+            false,
+        )
+        .expect("parent checkpoint cursor"),
         metadata: b"shared-parent".to_vec(),
     };
     let (parent_object_id, parent_bytes) = parent.encode().expect("shared parent");
@@ -2639,6 +3736,13 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         member_page_object_ids: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::after_first_parent(
+            parent_object_id,
+            &parent,
+            seed.branch_id,
+            false,
+        )
+        .expect("child a checkpoint cursor"),
         metadata: b"child-a".to_vec(),
     };
     let (child_a_object_id, child_a_bytes) = child_a.encode().expect("child a");
@@ -2653,6 +3757,13 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         member_page_object_ids: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::after_first_parent(
+            parent_object_id,
+            &parent,
+            seed.branch_id,
+            false,
+        )
+        .expect("child b checkpoint cursor"),
         metadata: b"child-b".to_vec(),
     };
     let (child_b_object_id, child_b_bytes) = child_b.encode().expect("child b");
@@ -2935,6 +4046,17 @@ async fn commit_graph_cycle_and_generation_edges_fail_closed() {
         member_page_object_ids: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
+        checkpoint_cursor: {
+            let second = CommitObjectV1::decode(
+                second_object_id,
+                seed.objects
+                    .get(second_object_id)
+                    .expect("cycle second object"),
+            )
+            .expect("cycle second commit");
+            CheckpointCursorV1::after_first_parent(second_object_id, &second, seed.branch_id, false)
+                .expect("cycle checkpoint cursor")
+        },
         metadata: b"cycle-first".to_vec(),
     };
     let (first_object_id, first_bytes) = first_commit.encode().expect("cycle first");
@@ -3282,6 +4404,23 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         member_page_object_ids: Vec::new(),
         global_state_root: out_of_uuid_order.global_state_root,
         local_state_root: out_of_uuid_order.local_state_root,
+        checkpoint_cursor: {
+            let parent = CommitObjectV1::decode(
+                out_of_uuid_order.commit_object_id,
+                out_of_uuid_order
+                    .objects
+                    .get(out_of_uuid_order.commit_object_id)
+                    .expect("branch parent object"),
+            )
+            .expect("branch parent commit");
+            CheckpointCursorV1::after_first_parent(
+                out_of_uuid_order.commit_object_id,
+                &parent,
+                out_of_uuid_order.branch_id,
+                false,
+            )
+            .expect("branch checkpoint cursor")
+        },
         metadata: b"next branch head".to_vec(),
     };
     let (next_commit_object_id, next_commit_bytes) =
@@ -3429,6 +4568,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         member_page_object_ids: Vec::new(),
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::root(),
         metadata: b"parent".to_vec(),
     };
     let (parent_id, parent_bytes) = parent.encode().expect("parent commit");
@@ -3448,6 +4588,13 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         member_page_object_ids: child_page_ids,
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
+        checkpoint_cursor: CheckpointCursorV1::after_first_parent(
+            parent_id,
+            &parent,
+            bad_generation.branch_id,
+            false,
+        )
+        .expect("bad-generation checkpoint cursor"),
         metadata: b"child".to_vec(),
     };
     let (child_id, child_bytes) = child.encode().expect("child commit");
@@ -4122,7 +5269,9 @@ async fn corrupted_persisted_gc_index_fails_closed_without_authorizing_deletion(
 
 #[tokio::test]
 async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
-    let seed = build_seed();
+    let mut seed = build_seed();
+    let selected_head = seed.commit_object_id;
+    let (_, unrelated_parent_id) = insert_graph_commit(&mut seed, 0x70, 2, vec![selected_head]);
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
     let view = open_coherent_view(&storage, seed.branch_id)
@@ -4161,6 +5310,42 @@ async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
         .await
         .is_err(),
         "catalog updates must use canonical raw-UUID order"
+    );
+
+    let reordered_state = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        Vec::new(),
+        view.test_storage_read(),
+    )
+    .await
+    .expect("reordered-parent state edit");
+    let mut reordered = branch_transition(&view, reordered_state, 0x71).await;
+    let unrelated_bytes = view
+        .load_object_bytes(unrelated_parent_id)
+        .await
+        .expect("unrelated parent object");
+    let unrelated_parent = CommitObjectV1::decode(unrelated_parent_id, &unrelated_bytes)
+        .expect("unrelated parent commit");
+    reordered.semantic_commit.parent_commit_object_ids = vec![unrelated_parent_id, selected_head];
+    reordered.semantic_commit.checkpoint_cursor = CheckpointCursorV1::after_first_parent(
+        unrelated_parent_id,
+        &unrelated_parent,
+        view.branch_id(),
+        false,
+    )
+    .expect("cursor derived from unrelated first parent");
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    let error = publication
+        .publish_state_transition(&view, reordered)
+        .await
+        .expect_err("selected head in a non-first parent position must fail before staging");
+    assert!(
+        matches!(
+            error,
+            StorageError::Corruption(ref message)
+                if message.contains("first parent is not the selected branch head")
+        ),
+        "parent ordering must fail at the publisher authority boundary: {error:?}",
     );
 
     let wrong_base = edit_state_tree(
@@ -5507,6 +6692,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
             member_page_object_ids: Vec::new(),
             global_state_root: content_id(0x71),
             local_state_root: content_id(0x72),
+            checkpoint_cursor: CheckpointCursorV1::root(),
             metadata: b"page-boundary".to_vec(),
         };
         let pages = commit.prepare_member_pages().expect("page closure");
@@ -5574,6 +6760,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         member_page_object_ids: Vec::new(),
         global_state_root: content_id(0x73),
         local_state_root: content_id(0x74),
+        checkpoint_cursor: CheckpointCursorV1::root(),
         metadata: b"page-corruption".to_vec(),
     };
     let pages = commit.prepare_member_pages().expect("corruption pages");
@@ -5648,6 +6835,7 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         member_page_object_ids: vec![ObjectId::ZERO],
         global_state_root: content_id(0x75),
         local_state_root: content_id(0x76),
+        checkpoint_cursor: CheckpointCursorV1::root(),
         metadata: b"zero-page-edge".to_vec(),
     };
     assert!(zero_page_edge.encode().is_err());

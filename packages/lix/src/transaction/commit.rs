@@ -24,13 +24,14 @@ use crate::transaction::types::PreparedStateRowRef;
 
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1,
-    HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition, PreparedPublication,
-    RepositoryRootV1, SelectedHistoricalMember, StateCellRef, StateKey, StateKeyRef,
-    StateMutationAudit, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
-    encode_state_key, encode_state_value, load_commit, load_commit_summary,
-    open_coherent_view_on_read, select_historical_commit_members, state_points,
+    ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CheckpointCursorV1,
+    CommitCatalogEntry, CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1,
+    CommitObjectV1, HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition,
+    PreparedPublication, RepositoryRootV1, SelectedHistoricalMember, StateCellRef, StateKey,
+    StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
+    UntrackedValueRef, encode_state_key, encode_state_value, introduced_checkpoint_marker,
+    load_commit, load_commit_summary, open_coherent_view_on_read, select_historical_commit_members,
+    state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -572,6 +573,12 @@ where
         account_id: active_account_id.to_string(),
         created_at: change_refs.created_at,
     };
+    let checkpoint_cursor = CheckpointCursorV1::after_first_parent(
+        selected_parent_object_id,
+        &selected_parent,
+        publication_branch_id,
+        introduced_checkpoint_marker(&members, publication_branch_id)?,
+    )?;
     let mut semantic_commit = CommitObjectV1 {
         commit_id: forktree_commit_id(commit_id),
         generation,
@@ -580,6 +587,7 @@ where
         member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
         global_state_root,
         local_state_root,
+        checkpoint_cursor,
         metadata: crate::changelog::encode_forktree_commit_payload(&commit_record)?,
     };
     let _member_pages = semantic_commit.prepare_member_pages()?;
@@ -1380,7 +1388,8 @@ where
     for (content, state_edit) in contents.iter().zip(&state_edits) {
         let mut generation = None::<u64>;
         let mut parent_object_ids = Vec::with_capacity(content.draft.parent_commit_ids.len());
-        for parent_id in &content.draft.parent_commit_ids {
+        let mut first_parent = None::<(ObjectId, CommitObjectV1)>;
+        for (parent_index, parent_id) in content.draft.parent_commit_ids.iter().enumerate() {
             let (parent_object_id, parent) =
                 if let Some((object_id, commit)) = staged_commits.get(parent_id) {
                     (*object_id, commit.clone())
@@ -1391,6 +1400,9 @@ where
                     let (object_id, _) = commit.encode()?;
                     (object_id, commit)
                 };
+            if parent_index == 0 {
+                first_parent = Some((parent_object_id, parent.clone()));
+            }
             parent_object_ids.push(parent_object_id);
             generation =
                 Some(generation.map_or(parent.generation, |value| value.max(parent.generation)));
@@ -1416,6 +1428,14 @@ where
             account_id: active_account_id.to_string(),
             created_at: content.draft.created_at,
         };
+        let (first_parent_object_id, first_parent) = first_parent
+            .ok_or_else(|| writer_error("ordered history commit has no first parent"))?;
+        let checkpoint_cursor = CheckpointCursorV1::after_first_parent(
+            first_parent_object_id,
+            &first_parent,
+            view.branch_id(),
+            introduced_checkpoint_marker(&content.members, view.branch_id())?,
+        )?;
         let mut commit = CommitObjectV1 {
             commit_id: forktree_commit_id(content.draft.commit_id),
             generation,
@@ -1424,6 +1444,7 @@ where
             member_page_object_ids: content.member_page_object_ids.clone(),
             global_state_root,
             local_state_root,
+            checkpoint_cursor,
             metadata: crate::changelog::encode_forktree_commit_payload(&record)?,
         };
         let _member_pages = commit.prepare_member_pages()?;

@@ -404,6 +404,7 @@ mod predecessor_protocol_tests {
             b"packed-current-base.v27".as_slice(),
             b"checkpoint-owned-hot-baseline.v27".as_slice(),
             b"checkpoint-source-delta.v33".as_slice(),
+            b"immutable-physical-commit-state.v61".as_slice(),
         ];
 
         for marker in markers {

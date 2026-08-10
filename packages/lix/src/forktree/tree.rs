@@ -234,7 +234,7 @@ pub(super) fn ordered_tree_edges(
                                 .map_err(|_| corruption("CommitCatalog key is not a UUID"))?,
                         );
                         let value = CommitCatalogEntry::decode(&entry.value)?;
-                        object_ids.push((value.commit_object_id, ObjectDomain::Commit));
+                        object_ids.push((value.commit_object_id, ObjectDomain::CommitV2));
                         commit_entries.push((key, value));
                     }
                     TreeKind::ChangeCatalog => {
@@ -250,7 +250,7 @@ pub(super) fn ordered_tree_edges(
                             ChangeCatalogOwner::CommitMember {
                                 commit_object_id, ..
                             } => {
-                                object_ids.push((commit_object_id, ObjectDomain::Commit));
+                                object_ids.push((commit_object_id, ObjectDomain::CommitV2));
                             }
                             ChangeCatalogOwner::BranchRef {
                                 ref_change_object_id,
