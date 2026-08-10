@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1619,11 +1619,20 @@ where
     let (after_global_root, after_local_root) =
         super::serving::authenticate_historical_state_roots(read, after).await?;
 
-    // Equal local roots are normally a zero-key fast path. Validate the
-    // shared root once first so an equal-but-corrupt root cannot be mistaken
-    // for an authenticated empty diff.
-    if before_local_root == after_local_root {
-        super::tree::validate_root_on_read(before_local_root, "state", read).await?;
+    // Authenticate every selected state root before local-root pruning. The
+    // point resolver may legitimately skip a global lookup when a local row
+    // masks that key; that optimization must not turn a missing/corrupt
+    // global root into a successful working diff.
+    let mut authenticated_roots = BTreeSet::new();
+    for root in [
+        before_global_root,
+        before_local_root,
+        after_global_root,
+        after_local_root,
+    ] {
+        if authenticated_roots.insert(root) {
+            super::tree::validate_root_on_read(root, "state", read).await?;
+        }
     }
     let changed_keys =
         super::tree::diff_roots(Some(before_local_root), Some(after_local_root), read).await?;
