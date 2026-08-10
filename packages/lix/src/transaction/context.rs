@@ -8719,7 +8719,7 @@ mod transaction_validation_reader_tests {
             .expect("validation facade owner");
         let owner = &source[owner_start..owner_start + 300];
         assert!(owner.contains("-> ForkTreeReadFacade"));
-        assert!(!owner.contains("ForkTreeValidationReader"));
+        assert!(!owner.contains(concat!("ForkTree", "ValidationReader")));
     }
 
     #[test]
