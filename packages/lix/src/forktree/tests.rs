@@ -1087,6 +1087,44 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
     assert!(build_state_tree(&[(b"opaque".to_vec(), b"opaque".to_vec())]).is_err());
 }
 
+#[test]
+fn canonical_prefix_bounds_handle_carry_and_reject_invalid_untracked_bounds() {
+    assert_eq!(
+        super::exclusive_prefix_upper_bound(&[0x12, 0xff, 0xff]),
+        Some(vec![0x13])
+    );
+    assert_eq!(
+        super::exclusive_prefix_upper_bound(&[0xff, 0xff]),
+        None,
+        "an all-maximum prefix has an unbounded exclusive edge"
+    );
+
+    let entity_pk = EntityPk::single("entity");
+    let bounds = super::encode_state_entity_prefix_bounds("app.row", &entity_pk);
+    let full_key = super::encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: Some("file"),
+        entity_pk: &entity_pk,
+    });
+    assert!(full_key.starts_with(&bounds.lower));
+    assert!(bounds.upper.as_ref().is_some_and(|upper| full_key < *upper));
+    let other_schema = super::encode_state_key(StateKeyRef {
+        schema_key: "app.other",
+        file_id: Some("file"),
+        entity_pk: &entity_pk,
+    });
+    assert!(!other_schema.starts_with(&bounds.lower));
+
+    let branch_id = CanonicalBranchId::from_bytes(raw_id(0x44));
+    let lower = state_entry("z", StateCellRef::Null, 0x44, &[]).0;
+    let upper = state_entry("a", StateCellRef::Null, 0x44, &[]).0;
+    assert!(
+        super::encode_untracked_branch_range_bounds(branch_id, Some(&lower), Some(&upper),)
+            .is_err()
+    );
+    assert!(super::encode_untracked_branch_range_bounds(branch_id, Some(&[0xff]), None).is_err());
+}
+
 #[tokio::test]
 async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     let seed = build_seed();
@@ -1144,6 +1182,27 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
         exact[2].is_none(),
         "branch tombstone must mask global state"
     );
+    let view_points = view
+        .points(&seed.state_keys[..2], false)
+        .await
+        .expect("view exact points");
+    assert_eq!(view_points.len(), 2);
+    let view_range = view
+        .range(None, None, Some(2), false)
+        .await
+        .expect("view bounded range");
+    assert_eq!(view_range.len(), 2);
+    assert!(
+        view.range(
+            Some(&seed.state_keys[0]),
+            Some(&seed.state_keys[0]),
+            Some(1),
+            false,
+        )
+        .await
+        .expect("empty equal-bound range")
+        .is_empty()
+    );
     let rows = state_range(&view, None, None, Some(3), false)
         .await
         .expect("merged range");
@@ -1171,6 +1230,95 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     // Both mutations are lowered through one authenticated batch edit; they
     // may share the same copied leaf and ancestor path.
     assert!(edit.copied_nodes() >= 1);
+}
+
+#[tokio::test]
+async fn untracked_range_is_branch_bounded_ordered_and_limited() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let global_branch_id = CanonicalBranchId::from_bytes(
+        *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .expect("global branch id")
+            .as_bytes(),
+    );
+    let other_branch_id = CanonicalBranchId::from_bytes(raw_id(0x99));
+    let entries = [
+        (seed.branch_id, "branch-a", "branch-a"),
+        (seed.branch_id, "branch-b", "branch-b"),
+        (global_branch_id, "global", "global"),
+        (other_branch_id, "other", "other"),
+    ];
+    let mut writes = StorageWriteSet::new();
+    for (branch_id, primary_key, value) in entries {
+        let (encoded_key, _) = state_entry(primary_key, StateCellRef::Null, 0x55, &[]);
+        let decoded_key = super::decode_state_key(&encoded_key).expect("state key");
+        let encoded_value = super::encode_untracked_value(UntrackedValueRef {
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+            cell: StateCellRef::Value(value),
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: &[],
+        })
+        .expect("untracked value");
+        writes.put(
+            UNTRACKED_ROW_SPACE,
+            super::encode_untracked_key(
+                branch_id,
+                StateKeyRef {
+                    schema_key: &decoded_key.schema_key,
+                    file_id: decoded_key.file_id.as_deref(),
+                    entity_pk: &decoded_key.entity_pk,
+                },
+            ),
+            encoded_value,
+        );
+    }
+    commit_write_set_for_test(writes, &storage).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("coherent view");
+    let limited = view
+        .scan_untracked_branch_range(None, None, Some(1))
+        .await
+        .expect("bounded untracked range");
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].0.file_id.as_deref(), Some("file"));
+    assert!(matches!(limited[0].1.cell, StateCell::Value(_)));
+    let all = view
+        .scan_untracked_branch_range(None, None, None)
+        .await
+        .expect("all selected-branch untracked rows");
+    assert_eq!(all.len(), 2);
+    assert!(all.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+
+    let (corrupt_key, _) = state_entry("branch-a", StateCellRef::Null, 0x55, &[]);
+    let decoded_key = super::decode_state_key(&corrupt_key).expect("state key");
+    let mut corrupt_write = StorageWriteSet::new();
+    corrupt_write.put(
+        UNTRACKED_ROW_SPACE,
+        super::encode_untracked_key(
+            seed.branch_id,
+            StateKeyRef {
+                schema_key: &decoded_key.schema_key,
+                file_id: decoded_key.file_id.as_deref(),
+                entity_pk: &decoded_key.entity_pk,
+            },
+        ),
+        vec![0xff],
+    );
+    commit_write_set_for_test(corrupt_write, &storage).await;
+    let reopened = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("reopen after untracked corruption");
+    assert!(
+        reopened
+            .scan_untracked_branch_range(None, None, None)
+            .await
+            .is_err(),
+        "a selected-branch malformed value must fail closed"
+    );
 }
 
 #[tokio::test]

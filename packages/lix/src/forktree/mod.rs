@@ -46,10 +46,12 @@ pub(crate) use serving::{
     select_historical_commit_member, state_point, state_point_on_read, state_points, state_range,
 };
 pub(crate) use state::{
-    HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
-    UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
-    encode_state_entity_prefix, encode_state_key, encode_state_value, encode_untracked_key,
-    encode_untracked_value,
+    CanonicalPrefixBounds, HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef,
+    StateValue, StateValueRef, UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef,
+    decode_state_key, decode_state_value, encode_state_entity_prefix,
+    encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
+    encode_untracked_branch_range_bounds, encode_untracked_key, encode_untracked_value,
+    exclusive_prefix_upper_bound,
 };
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -604,6 +605,112 @@ where
             include_tombstones,
         )
         .await
+    }
+
+    /// Resolves exact canonical state keys through this view's retained read.
+    /// The ordered-tree lookup batches shared authenticated paths, giving
+    /// `O(K log_F N)` work for `K` requested keys without a repository scan.
+    pub(crate) async fn points(
+        &self,
+        keys: &[Vec<u8>],
+        include_tombstone: bool,
+    ) -> Result<Vec<Option<super::serving::VisibleStateRow>>, StorageError> {
+        super::serving::state_points(self, keys, include_tombstone).await
+    }
+
+    /// Resolves a canonical half-open state-key range through this view's
+    /// retained read. The ordered-tree descent skips unrelated subtrees and
+    /// returns at most `limit` rows.
+    pub(crate) async fn range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<super::serving::VisibleStateRow>, StorageError> {
+        super::serving::state_range(self, lower, upper, limit, include_tombstones).await
+    }
+
+    /// Scans only the selected branch's untracked rows. The encoded branch
+    /// prefix is part of the storage range, so the scan cannot walk unrelated
+    /// repository owners; returned rows are `O(log_F N + R)` for `R` rows.
+    pub(crate) async fn scan_untracked_branch_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(super::state::StateKey, super::state::UntrackedValue)>, crate::LixError> {
+        let bounds =
+            super::state::encode_untracked_branch_range_bounds(self.branch_id, lower, upper)?;
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut cursor = self
+            .read
+            .begin_scan(
+                super::state::UNTRACKED_ROW_SPACE,
+                KeyRange {
+                    lower: Bound::Included(Key(bounds.lower.into())),
+                    upper: bounds
+                        .upper
+                        .map_or(Bound::Unbounded, |upper| Bound::Excluded(Key(upper.into()))),
+                },
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    order: ScanOrder::Ascending,
+                },
+            )
+            .await?;
+        let mut rows = Vec::new();
+        loop {
+            let remaining = limit.map_or(256, |limit| limit - rows.len());
+            if remaining == 0 {
+                break;
+            }
+            let page = cursor.next_page(remaining.min(256)).await?;
+            for entry in page.entries {
+                let (branch_id, key) = super::state::decode_untracked_key(&entry.key.0)?;
+                if branch_id != self.branch_id {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        "ForkTree bounded untracked range crossed a branch owner boundary",
+                    ));
+                }
+                let canonical_key = super::state::encode_untracked_key(
+                    branch_id,
+                    super::state::StateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        entity_pk: &key.entity_pk,
+                    },
+                );
+                if canonical_key != entry.key.0 {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        "ForkTree bounded untracked range encountered a noncanonical key",
+                    ));
+                }
+                let value = match entry.value {
+                    ProjectedValue::FullValue(bytes) => {
+                        super::state::decode_untracked_value(&bytes)?
+                    }
+                    ProjectedValue::KeyOnly => {
+                        return Err(crate::LixError::new(
+                            crate::LixError::CODE_STORAGE_ERROR,
+                            "ForkTree bounded untracked range returned key-only data",
+                        ));
+                    }
+                };
+                rows.push((key, value));
+                if limit.is_some_and(|limit| rows.len() >= limit) {
+                    break;
+                }
+            }
+            if !page.has_more || limit.is_some_and(|limit| rows.len() >= limit) {
+                break;
+            }
+        }
+        Ok(rows)
     }
 
     pub(crate) async fn branch_view(
