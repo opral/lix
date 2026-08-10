@@ -238,6 +238,7 @@ where
 /// payload. Such a row must not appear as a public diff modification.
 fn same_authenticated_state(before: &HistoricalStateRow, after: &HistoricalStateRow) -> bool {
     before.key == after.key
+        && before.global == after.global
         && before.change_id == after.change_id
         && before.created_at == after.created_at
         && before.updated_at == after.updated_at
@@ -371,14 +372,89 @@ fn diff_batch_error(error: ColumnTableError) -> DataFusionError {
 
 #[cfg(test)]
 mod tests {
-    use super::is_internal_marker_schema;
+    use super::{is_internal_marker_schema, same_authenticated_state};
+    use crate::changelog::{ChangeId, CommitId};
     use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
+    use crate::common::{LixTimestamp, SharedStr};
+    use crate::entity_pk::EntityPk;
+    use crate::forktree::{HistoricalStateRow, ObjectId, StateKey};
     use crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY;
+
+    fn semantic_row() -> HistoricalStateRow {
+        HistoricalStateRow {
+            key: StateKey {
+                schema_key: "test".to_owned(),
+                file_id: Some("file".to_owned()),
+                entity_pk: EntityPk::single("row"),
+            },
+            global: false,
+            change_id: ChangeId::for_test_label("change"),
+            commit_id: CommitId::for_test_label("page-placement"),
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+            snapshot_content: Some(SharedStr::from("value")),
+            metadata: Some(SharedStr::from("metadata")),
+            deleted: false,
+            blob_manifest_object_ids: vec![ObjectId::from_bytes([0x11; 32])],
+        }
+    }
 
     #[test]
     fn internal_markers_are_suppressed_when_present_only_after() {
         assert!(is_internal_marker_schema(CHECKPOINT_MARKER_SCHEMA_KEY));
         assert!(is_internal_marker_schema(UNDO_REDO_MARKER_SCHEMA_KEY));
         assert!(!is_internal_marker_schema("lix_file_descriptor"));
+    }
+
+    #[test]
+    fn semantic_diff_equality_ignores_only_page_provenance() {
+        let cases: [(&str, Box<dyn Fn(&mut HistoricalStateRow)>); 10] = [
+            ("global", Box::new(|row| row.global = true)),
+            (
+                "change_id",
+                Box::new(|row| row.change_id = ChangeId::for_test_label("other-change")),
+            ),
+            (
+                "key",
+                Box::new(|row| row.key.entity_pk = EntityPk::single("other-row")),
+            ),
+            (
+                "created_at",
+                Box::new(|row| row.created_at = LixTimestamp::from_unix_millis_utc_lossy(3)),
+            ),
+            (
+                "updated_at",
+                Box::new(|row| row.updated_at = LixTimestamp::from_unix_millis_utc_lossy(4)),
+            ),
+            ("value_to_null", Box::new(|row| row.snapshot_content = None)),
+            ("deleted", Box::new(|row| row.deleted = true)),
+            (
+                "metadata",
+                Box::new(|row| row.metadata = Some(SharedStr::from("other-metadata"))),
+            ),
+            (
+                "blob_manifest",
+                Box::new(|row| {
+                    row.blob_manifest_object_ids = vec![ObjectId::from_bytes([0x22; 32])]
+                }),
+            ),
+            (
+                "null_to_value",
+                Box::new(|row| row.snapshot_content = Some(SharedStr::from("other-value"))),
+            ),
+        ];
+
+        for (field, mutate) in cases {
+            let mut changed = semantic_row();
+            mutate(&mut changed);
+            assert!(
+                !same_authenticated_state(&semantic_row(), &changed),
+                "semantic field {field} must remain visible"
+            );
+        }
+
+        let mut page_republished = semantic_row();
+        page_republished.commit_id = CommitId::for_test_label("republished-page");
+        assert!(same_authenticated_state(&semantic_row(), &page_republished));
     }
 }

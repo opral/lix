@@ -400,12 +400,18 @@ simulation_test!(
         })
         .await
         .expect("merge should succeed");
+        let merged_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("post-merge head should load")
+            .expect("post-merge head should exist")
+            .to_string();
 
         let rows = select_rows(
             &main,
             &format!(
                 "SELECT entity_pk, diff_type, before_change_id, after_change_id \
-                 FROM lix_diff('{base}', '{}') \
+                 FROM lix_diff('{}', '{merged_head}') \
                  WHERE schema_key = 'change_id_branch_regression' ORDER BY entity_pk",
                 preview.target_head_commit_id
             ),
@@ -413,16 +419,15 @@ simulation_test!(
         .await;
         assert_eq!(
             rows.len(),
-            2,
-            "only target-edited rows belong to the target diff"
+            1,
+            "only the source-edited row belongs to the post-merge target diff"
         );
-        for row in rows {
-            assert_eq!(row[1], Value::Text("modified".to_owned()));
-            let (Value::Text(before), Value::Text(after)) = (&row[2], &row[3]) else {
-                panic!("modified rows must expose two ChangeIds: {row:?}");
-            };
-            assert_ne!(before, after, "modified rows must have distinct ChangeIds");
-        }
+        assert_eq!(rows[0][0], Value::Json(json!(["row-2"])));
+        assert_eq!(rows[0][1], Value::Text("modified".to_owned()));
+        let (Value::Text(before), Value::Text(after)) = (&rows[0][2], &rows[0][3]) else {
+            panic!("modified rows must expose two ChangeIds: {:?}", rows[0]);
+        };
+        assert_ne!(before, after, "modified rows must have distinct ChangeIds");
     }
 );
 
