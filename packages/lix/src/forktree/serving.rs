@@ -1746,6 +1746,83 @@ where
     Ok(())
 }
 
+/// Loads one authenticated Commit envelope for checkpoint chronology without
+/// materializing its Change-member closure. The CommitCatalog back-edge is the
+/// sole public-ID authority; the chronology cursor and timestamp live in the
+/// same immutable object.
+async fn load_checkpoint_commit_envelope_raw<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+) -> Result<(CommitObjectV1, crate::changelog::CommitRecord), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+    let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+    validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, &commit).await?;
+    let record = crate::changelog::decode_forktree_commit_payload(&commit.metadata)?;
+    let expected_commit_id =
+        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*commit.commit_id.as_bytes()));
+    if record.commit_id != expected_commit_id
+        || record.generation != commit.generation
+        || record.parent_commit_ids.len() != commit.parent_commit_object_ids.len()
+    {
+        return Err(corruption(
+            "checkpoint chronology Commit payload disagrees with its authenticated envelope",
+        )
+        .into());
+    }
+    Ok((commit, record))
+}
+
+/// Loads and re-derives one checkpoint cursor from the authenticated first
+/// parent and this commit's complete member closure. Publication performs the
+/// same derivation before commit; repeating it on a cold read prevents a
+/// coherently encoded but unrelated checkpoint/root edge from becoming a
+/// serving authority.
+pub(super) async fn load_checkpoint_commit_envelope<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+) -> Result<(CommitObjectV1, crate::changelog::CommitRecord), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let (commit, record) =
+        load_checkpoint_commit_envelope_raw(read, commit_catalog_root, commit_object_id).await?;
+    let Some(first_parent_object_id) = commit.parent_commit_object_ids.first().copied() else {
+        return Ok((commit, record));
+    };
+    let (first_parent, first_parent_record) =
+        load_checkpoint_commit_envelope_raw(read, commit_catalog_root, first_parent_object_id)
+            .await?;
+    if record.parent_commit_ids.first().copied() != Some(first_parent_record.commit_id) {
+        return Err(corruption(
+            "checkpoint chronology first-parent object disagrees with Commit payload",
+        )
+        .into());
+    }
+    let members = load_commit_members(read, &commit).await?;
+    let owner_branch_id = commit
+        .checkpoint_cursor
+        .owner_branch_id()
+        .ok_or_else(|| corruption("non-root checkpoint cursor has no branch owner"))?;
+    let expected = super::model::CheckpointCursorV1::after_first_parent(
+        first_parent_object_id,
+        &first_parent,
+        owner_branch_id,
+        super::publication::introduced_checkpoint_marker(&members, owner_branch_id)?,
+    )?;
+    if commit.checkpoint_cursor != expected {
+        return Err(corruption(
+            "checkpoint chronology cursor does not derive from its authenticated first parent and marker",
+        )
+        .into());
+    }
+    Ok((commit, record))
+}
+
 pub(super) async fn validate_member_catalog_owner<R>(
     read: &R,
     commit_catalog_root: ObjectId,

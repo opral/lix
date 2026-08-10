@@ -42,7 +42,7 @@ impl std::fmt::Display for ObjectId {
 pub(super) enum ObjectDomain {
     RepositoryRoot = 1,
     BranchSnapshot = 2,
-    Commit = 3,
+    CommitV1 = 3,
     BranchRefChange = 5,
     OrderedTreeNode = 6,
     UploadPart = 7,
@@ -58,6 +58,7 @@ pub(super) enum ObjectDomain {
     BlobMerkleLeafV1 = 18,
     BlobMerkleInternalV1 = 19,
     CommitChangePageV2 = 20,
+    CommitV2 = 21,
 }
 
 impl ObjectDomain {
@@ -65,7 +66,7 @@ impl ObjectDomain {
         match value {
             1 => Ok(Self::RepositoryRoot),
             2 => Ok(Self::BranchSnapshot),
-            3 => Ok(Self::Commit),
+            3 => Ok(Self::CommitV1),
             5 => Ok(Self::BranchRefChange),
             6 => Ok(Self::OrderedTreeNode),
             7 => Ok(Self::UploadPart),
@@ -81,6 +82,7 @@ impl ObjectDomain {
             18 => Ok(Self::BlobMerkleLeafV1),
             19 => Ok(Self::BlobMerkleInternalV1),
             20 => Ok(Self::CommitChangePageV2),
+            21 => Ok(Self::CommitV2),
             _ => Err(corruption(format!("unknown object domain {value}"))),
         }
     }

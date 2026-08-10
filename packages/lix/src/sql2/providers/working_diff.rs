@@ -127,20 +127,14 @@ where
                         if limit.is_some_and(|limit| rows.len() >= limit) {
                             break;
                         }
-                        let checkpoint_commit_id = historical
-                            .latest_checkpoint_for_branch(head.commit_id, &head.branch_id)
+                        let baseline = historical
+                            .checkpoint_baseline_for_branch(&head.branch_id)
                             .await
-                            .map_err(lix_error_to_datafusion_error)?
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "branch '{}' has no checkpoint baseline",
-                                    head.branch_id
-                                ))
-                            })?;
+                            .map_err(lix_error_to_datafusion_error)?;
                         let diff = historical
                             .diff_branch_state_rows_between_commits(
-                                checkpoint_commit_id,
-                                head.commit_id,
+                                baseline.checkpoint_commit_id,
+                                baseline.head_commit_id,
                             )
                             .await
                             .map_err(lix_error_to_datafusion_error)?;

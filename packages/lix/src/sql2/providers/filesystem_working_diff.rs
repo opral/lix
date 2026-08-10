@@ -136,20 +136,14 @@ where
                     .map_err(lix_error_to_datafusion_error)?;
                     let mut rows = Vec::new();
                     for head in heads {
-                        let checkpoint_id = historical
-                            .latest_checkpoint_for_branch(head.commit_id, &head.branch_id)
+                        let baseline = historical
+                            .checkpoint_baseline_for_branch(&head.branch_id)
                             .await
-                            .map_err(lix_error_to_datafusion_error)?
-                            .ok_or_else(|| {
-                                datafusion::common::DataFusionError::Execution(format!(
-                                    "branch '{}' has no checkpoint baseline",
-                                    head.branch_id
-                                ))
-                            })?;
+                            .map_err(lix_error_to_datafusion_error)?;
                         let mut branch_rows = load_rows(
                             &historical,
-                            &checkpoint_id.to_string(),
-                            &head.commit_id.to_string(),
+                            &baseline.checkpoint_commit_id.to_string(),
+                            &baseline.head_commit_id.to_string(),
                             &head.branch_id,
                             kind,
                         )

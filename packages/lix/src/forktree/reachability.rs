@@ -931,7 +931,7 @@ where
             validate_selected_ref_change(read, repository_root_id, &value).await?;
             edges.extend([
                 typed(value.local_state_root, ObjectDomain::OrderedTreeNode),
-                typed(value.semantic_head_commit_object_id, ObjectDomain::Commit),
+                typed(value.semantic_head_commit_object_id, ObjectDomain::CommitV2),
                 typed(
                     value.historical_global_state_root,
                     ObjectDomain::OrderedTreeNode,
@@ -941,7 +941,12 @@ where
                 edges.push(typed(id, ObjectDomain::BranchRefChange));
             }
         }
-        ObjectDomain::Commit => {
+        ObjectDomain::CommitV1 => {
+            return Err(corruption(
+                "obsolete CommitV1 envelope cannot participate in the current graph",
+            ));
+        }
+        ObjectDomain::CommitV2 => {
             let value = CommitObjectV1::decode(id, bytes)?;
             let commit_catalog_root = repository_commit_catalog(read, repository_root_id).await?;
             let change_catalog_root = repository_change_catalog(read, repository_root_id).await?;
@@ -952,7 +957,7 @@ where
                     .parent_commit_object_ids
                     .iter()
                     .copied()
-                    .map(|id| typed(id, ObjectDomain::Commit)),
+                    .map(|id| typed(id, ObjectDomain::CommitV2)),
             );
             edges.extend(
                 value
@@ -965,6 +970,12 @@ where
                 typed(value.global_state_root, ObjectDomain::OrderedTreeNode),
                 typed(value.local_state_root, ObjectDomain::OrderedTreeNode),
             ]);
+            edges.extend(
+                value
+                    .checkpoint_cursor
+                    .edges()
+                    .map(|id| typed(id, ObjectDomain::CommitV2)),
+            );
         }
         ObjectDomain::CommitChangePageV2 => {
             let page = CommitChangePageV2::decode(id, bytes)?;
@@ -978,7 +989,7 @@ where
                     );
                 }
                 if let Some((source_commit_object_id, _)) = member.source() {
-                    edges.push(typed(source_commit_object_id, ObjectDomain::Commit));
+                    edges.push(typed(source_commit_object_id, ObjectDomain::CommitV2));
                 }
             }
         }
@@ -1000,7 +1011,7 @@ where
                 before_semantic_head_commit_object_id
                     .into_iter()
                     .chain(after_semantic_head_commit_object_id)
-                    .map(|id| typed(id, ObjectDomain::Commit)),
+                    .map(|id| typed(id, ObjectDomain::CommitV2)),
             );
             if let Some(id) = previous_ref_change_object_id {
                 edges.push(typed(id, ObjectDomain::BranchRefChange));
@@ -1077,7 +1088,7 @@ where
                     value.branch_snapshot_object_id,
                     ObjectDomain::BranchSnapshot,
                 ),
-                typed(value.semantic_commit_object_id, ObjectDomain::Commit),
+                typed(value.semantic_commit_object_id, ObjectDomain::CommitV2),
             ]);
         }
         ObjectDomain::GcMarkPackV2

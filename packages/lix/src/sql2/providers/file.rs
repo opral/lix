@@ -8702,6 +8702,13 @@ mod tests {
             member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
             global_state_root: state_edit.root,
             local_state_root: initial_view.branch_snapshot().local_state_root,
+            checkpoint_cursor: crate::forktree::CheckpointCursorV1::after_first_parent(
+                parent_id,
+                &parent,
+                initial_view.branch_id(),
+                false,
+            )
+            .expect("global native fixture checkpoint cursor"),
             metadata: b"native-file-fixture-global".to_vec(),
         };
         let (commit_object_id, _) = semantic_commit
