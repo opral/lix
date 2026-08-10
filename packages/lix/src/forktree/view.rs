@@ -42,6 +42,7 @@ pub(crate) struct CoherentView<R> {
     branch_selector: BranchSelectorV1,
     repository_root: RepositoryRootV1,
     branch_snapshot: BranchSnapshotV1,
+    semantic_head_commit: CommitObjectV1,
     view_id: [u8; 32],
     view_instance_id: u64,
 }
@@ -84,6 +85,14 @@ where
 
     pub(crate) fn branch_snapshot(&self) -> BranchSnapshotV1 {
         self.branch_snapshot
+    }
+
+    /// Returns the semantic head envelope authenticated while this view was
+    /// opened. Callers must still validate any deeper topology they consume,
+    /// but they must not reload this selector-owned object through another
+    /// authority.
+    pub(crate) fn semantic_head_commit(&self) -> &CommitObjectV1 {
+        &self.semantic_head_commit
     }
 
     #[cfg(test)]
@@ -1775,7 +1784,7 @@ where
             "branch snapshot does not match the selected branch id",
         ));
     }
-    authenticate_selected_graph(
+    let semantic_head_commit = authenticate_selected_graph(
         &read,
         global_selector.repository_root,
         branch_selector.branch_snapshot_object_id,
@@ -1798,6 +1807,7 @@ where
         branch_selector,
         repository_root,
         branch_snapshot,
+        semantic_head_commit,
         view_id,
         view_instance_id,
     })
@@ -1829,7 +1839,7 @@ async fn authenticate_selected_graph<R>(
     _branch_snapshot_id: ObjectId,
     repository: RepositoryRootV1,
     branch: BranchSnapshotV1,
-) -> Result<(), StorageError>
+) -> Result<CommitObjectV1, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1904,7 +1914,7 @@ where
         &change,
     )
     .await?;
-    Ok(())
+    Ok(head)
 }
 
 pub(super) async fn load_object_map<R>(

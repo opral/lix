@@ -152,6 +152,24 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
         .collect::<BTreeSet<_>>();
     required_branch_ids.extend(commit_parent_branch_ids.iter().copied());
 
+    // A plain one-branch commit already opens and authenticates the selected
+    // branch snapshot in the publication compiler.  Reading BranchRef here
+    // would acquire the same head a second time; the selected snapshot is the
+    // stronger operation-local authority for this case.  Keep the map-based
+    // path for branch cohorts, explicit branch movement, and ordered history,
+    // where several parent relationships must be resolved before lowering.
+    if commit_parent_branch_ids.len() == 1
+        && required_branch_ids.len() == 1
+        && prepared_writes.intermediate_commits.is_empty()
+        && prepared_writes
+            .first_commit_parent_override_by_branch
+            .is_empty()
+        && prepared_writes.extra_commit_parents_by_branch.is_empty()
+        && prepared_writes.branch_ref_intents.is_empty()
+    {
+        return Ok(BTreeMap::new());
+    }
+
     let branch_ref = BranchRefStoreReader::new(read);
     let mut parent_heads = BTreeMap::new();
     for branch_id in required_branch_ids {
@@ -171,6 +189,26 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
         }
     }
     Ok(parent_heads)
+}
+
+/// Loads the selected branch head through the already-authenticated coherent
+/// view. The selector names the commit object directly; decoding that object
+/// and validating its catalog/topology edges yields the changelog identity
+/// without reopening BranchRef or doing a second head lookup.
+async fn load_authenticated_selected_parent<R>(
+    view: &crate::forktree::CoherentView<R>,
+) -> Result<CommitObjectV1, LixError>
+where
+    R: StorageAdapterRead + Clone,
+{
+    let commit = view.semantic_head_commit().clone();
+    view.validate_commit_topology(
+        view.repository_root().commit_catalog_root,
+        commit.commit_id,
+        &commit,
+    )
+    .await?;
+    Ok(commit)
 }
 
 /// Converts the ordinary prepared transaction cohort into one typed ForkTree
@@ -509,14 +547,20 @@ where
     };
     let state_edit = view.edit_state_tree(state_base, state_mutations).await?;
 
-    let expected_parent = commit_parent_heads
-        .get(&branch_id)
-        .copied()
-        .flatten()
-        .ok_or_else(|| writer_error("branch commit has no selected parent"))?;
-    let selected_parent = load_commit_summary(&view, forktree_commit_id(expected_parent))
-        .await?
-        .ok_or_else(|| writer_error("selected branch parent is absent from CommitCatalog"))?;
+    let selected_parent = match commit_parent_heads.get(&branch_id) {
+        Some(Some(expected_parent)) => {
+            load_commit_summary(&view, forktree_commit_id(*expected_parent))
+                .await?
+                .ok_or_else(|| {
+                    writer_error("selected branch parent is absent from CommitCatalog")
+                })?
+        }
+        Some(None) => return Err(writer_error("branch commit has no selected parent")),
+        None => load_authenticated_selected_parent(&view).await?,
+    };
+    let expected_parent = CommitId::new(uuid::Uuid::from_bytes(
+        *selected_parent.commit_id.as_bytes(),
+    ));
     let (selected_parent_object_id, _) = selected_parent.encode()?;
     if selected_parent_object_id != view.branch_snapshot().semantic_head_commit_object_id {
         return Err(writer_error(
