@@ -392,6 +392,17 @@ where
         super::serving::state_range(self, lower, upper, limit, include_tombstones).await
     }
 
+    /// Resolves disjoint canonical ranges through one retained authenticated
+    /// tree walk. Output slots correspond to input ranges and each slot is in
+    /// intrinsic state-key order.
+    pub(crate) async fn ranges(
+        &self,
+        ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+        include_tombstones: bool,
+    ) -> Result<Vec<Vec<super::serving::VisibleStateRow>>, StorageError> {
+        super::serving::state_ranges(self, ranges, include_tombstones).await
+    }
+
     pub(crate) async fn branch_view(
         &self,
         branch_id: CanonicalBranchId,

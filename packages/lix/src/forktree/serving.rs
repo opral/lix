@@ -22,7 +22,7 @@ use super::state::{
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
     apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
+    scan_bounded_page_on_read, scan_page_on_read, scan_ranges_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE};
 
@@ -3880,6 +3880,42 @@ where
         .collect())
 }
 
+/// Resolves several disjoint canonical state ranges through one retained
+/// authenticated view. Shared ordered-tree paths and semantic member pages
+/// are loaded in batches, while each output slot retains its requested range
+/// and canonical key order.
+pub(crate) async fn state_ranges<R>(
+    view: &CoherentView<R>,
+    ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+    include_tombstones: bool,
+) -> Result<Vec<Vec<VisibleStateRow>>, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let (global_root, local_root) = current_state_roots(view);
+    let rows = state_ranges_on_roots(
+        global_root,
+        local_root,
+        view.retained_read(),
+        ranges,
+        include_tombstones,
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(encoded_key, value, source)| VisibleStateRow {
+                    encoded_key,
+                    value,
+                    source,
+                    view_instance_id: view.view_instance_id(),
+                })
+                .collect()
+        })
+        .collect())
+}
+
 /// The global branch has no branch-local overlay. Bootstrap intentionally
 /// retains the same authenticated state root in the selected global snapshot,
 /// so treating that root as a local branch would relabel global rows and make
@@ -4024,6 +4060,88 @@ where
                 return Ok(output);
             }
         }
+    }
+    Ok(output)
+}
+
+/// Batched sibling of [`state_range_on_roots`] for disjoint exact-prefix
+/// ranges. The tree walk and semantic page resolution are each shared across
+/// the complete request rather than repeated once per primary key.
+pub(crate) async fn state_ranges_on_roots<R>(
+    global_state_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    read: &R,
+    ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+    include_tombstones: bool,
+) -> Result<Vec<Vec<(Vec<u8>, StateValue, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let global = scan_ranges_on_read(global_state_root, "state", ranges, read).await?;
+    let local = match local_state_root {
+        Some(root) => scan_ranges_on_read(root, "state", ranges, read).await?,
+        None => vec![Vec::new(); ranges.len()],
+    };
+
+    let mut selected_groups = Vec::with_capacity(ranges.len());
+    let mut selected_flat = Vec::new();
+    for (global, local) in global.into_iter().zip(local) {
+        let mut global = global.into_iter().peekable();
+        let mut local = local.into_iter().peekable();
+        let start = selected_flat.len();
+        while global.peek().is_some() || local.peek().is_some() {
+            let take_local = match (global.peek(), local.peek()) {
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (Some((global_key, _)), Some((local_key, _))) => local_key <= global_key,
+                (None, None) => break,
+            };
+            let selected = if take_local {
+                let (key, value) = local.next().expect("peeked local state row");
+                if global
+                    .peek()
+                    .is_some_and(|(global_key, _)| *global_key == key)
+                {
+                    global.next();
+                }
+                Some((key, value, StateSource::Branch))
+            } else {
+                let (key, value) = global.next().expect("peeked global state row");
+                Some((key, value, StateSource::Global))
+            };
+            selected_flat.push(selected);
+        }
+        selected_groups.push(start..selected_flat.len());
+    }
+
+    let values = resolve_state_values_on_read(read, &selected_flat, None).await?;
+    let mut output = Vec::with_capacity(selected_groups.len());
+    for group in selected_groups {
+        let mut rows = Vec::with_capacity(group.len());
+        for index in group {
+            let (key, _, source) = selected_flat[index]
+                .as_ref()
+                .ok_or_else(|| corruption("selected state leaf is absent"))?;
+            let (value, resolved_source) = values[index]
+                .clone()
+                .ok_or_else(|| corruption("selected state leaf did not resolve"))?;
+            if *source != resolved_source {
+                return Err(corruption(
+                    "state batch range source changed during resolution",
+                ));
+            }
+            if *source == StateSource::Global && matches!(value.cell, StateCell::Tombstone) {
+                return Err(corruption("global state tree contains a tombstone"));
+            }
+            if value.cell.deleted() && !include_tombstones {
+                continue;
+            }
+            rows.push((key.clone(), value, *source));
+        }
+        output.push(rows);
     }
     Ok(output)
 }

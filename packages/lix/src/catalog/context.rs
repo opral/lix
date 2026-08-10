@@ -10,6 +10,7 @@ use crate::catalog::snapshot::{
 };
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
+use crate::entity_pk::{EntityPk, EntityPkComponents};
 use crate::schema::schema_key_from_definition;
 use crate::state::{StateRow, TransactionStateView};
 
@@ -162,10 +163,23 @@ where
     R: crate::storage_adapter::StorageAdapterRead,
 {
     let schema_domains = domain.schema_catalog_domains();
+    let prefix = crate::forktree::encode_state_entity_prefix(
+        REGISTERED_SCHEMA_KEY,
+        &EntityPk {
+            components: EntityPkComponents::Empty,
+        },
+    );
+    let upper = crate::forktree::exclusive_prefix_upper_bound(&prefix);
     let mut catalog_rows = Vec::with_capacity(schema_domains.len());
     for schema_domain in schema_domains {
         let rows = state
-            .branch_range(schema_domain.branch_id(), None, None, None, false)
+            .branch_range(
+                schema_domain.branch_id(),
+                Some(&prefix),
+                upper.as_deref(),
+                None,
+                false,
+            )
             .await?
             .into_iter()
             .map(catalog_row_from_state)

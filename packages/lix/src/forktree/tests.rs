@@ -3065,6 +3065,34 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
         .await
         .expect("view bounded range");
     assert_eq!(view_range.len(), 2);
+    let exact_ranges = seed.state_keys[..2]
+        .iter()
+        .map(|key| {
+            (
+                key.clone(),
+                super::exclusive_prefix_upper_bound(key)
+                    .expect("canonical state key has a finite successor"),
+            )
+        })
+        .map(|(lower, upper)| (lower, Some(upper)))
+        .collect::<Vec<_>>();
+    let range_slots = view
+        .ranges(&exact_ranges, false)
+        .await
+        .expect("batched exact ranges");
+    assert_eq!(range_slots.len(), 2);
+    assert_eq!(range_slots[0].len(), 1);
+    assert_eq!(range_slots[0][0].source, StateSource::Branch);
+    assert!(
+        range_slots[1].is_empty(),
+        "a local tombstone must suppress the matching global row before visibility"
+    );
+    let tombstone_slots = view
+        .ranges(&exact_ranges, true)
+        .await
+        .expect("tombstone-inclusive batched exact ranges");
+    assert_eq!(tombstone_slots[1].len(), 1);
+    assert!(tombstone_slots[1][0].value.cell.deleted());
     assert!(
         view.range(
             Some(&seed.state_keys[0]),

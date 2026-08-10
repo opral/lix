@@ -906,6 +906,127 @@ where
     Ok(output)
 }
 
+/// Authenticates several disjoint half-open ranges in one ordered-tree walk.
+///
+/// Every internal node shared by two requested ranges is loaded and decoded
+/// once. Results remain grouped by request slot and retain intrinsic tree
+/// order; no caller-side set, scan, or re-sort is required.
+pub(super) async fn scan_ranges_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+    read: &R,
+) -> Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (index, (lower, upper)) in ranges.iter().enumerate() {
+        if upper
+            .as_deref()
+            .is_some_and(|upper| lower.as_slice() > upper)
+        {
+            return Err(corruption("ordered-tree range bounds are inverted"));
+        }
+        if index > 0 {
+            let previous_upper = ranges[index - 1]
+                .1
+                .as_deref()
+                .ok_or_else(|| corruption("unbounded ordered-tree range precedes another range"))?;
+            if previous_upper > lower.as_slice() {
+                return Err(corruption(
+                    "ordered-tree batch ranges overlap or are unordered",
+                ));
+            }
+        }
+    }
+
+    let kind = parse_kind(expected_kind)?;
+    let mut output = vec![Vec::new(); ranges.len()];
+    let mut frontier_order = vec![root];
+    let mut frontier = BTreeMap::<ObjectId, (Option<NodeRef>, Vec<usize>)>::new();
+    frontier.insert(root, (None, (0..ranges.len()).collect()));
+
+    while !frontier_order.is_empty() {
+        let objects = load_objects_many_on_read(read, &frontier_order).await?;
+        let mut next_order = Vec::new();
+        let mut next = BTreeMap::<ObjectId, (Option<NodeRef>, Vec<usize>)>::new();
+        for id in frontier_order {
+            let (expected, slots) = frontier
+                .remove(&id)
+                .ok_or_else(|| corruption("ordered-tree range frontier is inconsistent"))?;
+            let bytes = objects
+                .get(&id)
+                .ok_or_else(|| corruption(format!("ordered-tree object {id} is absent")))?;
+            let node = decode_node(id, bytes)?;
+            validate_loaded_node(id, &node, kind, expected.as_ref())?;
+            match node.body {
+                NodeBody::Leaf(entries) => {
+                    for slot in slots {
+                        let (lower, upper) = &ranges[slot];
+                        let first = entries.partition_point(|entry| entry.key < *lower);
+                        for entry in entries.iter().skip(first) {
+                            if upper
+                                .as_deref()
+                                .is_some_and(|upper| entry.key.as_slice() >= upper)
+                            {
+                                break;
+                            }
+                            output[slot].push((entry.key.clone(), entry.value.clone()));
+                        }
+                    }
+                }
+                NodeBody::Internal(children) => {
+                    for slot in slots {
+                        let (lower, upper) = &ranges[slot];
+                        let first = child_index(&children, lower);
+                        let last = upper
+                            .as_deref()
+                            .map_or(children.len() - 1, |upper| child_index(&children, upper));
+                        for child in children
+                            .iter()
+                            .take(last.saturating_add(1))
+                            .skip(first)
+                            .cloned()
+                        {
+                            match next.entry(child.id) {
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    next_order.push(child.id);
+                                    entry.insert((Some(child), vec![slot]));
+                                }
+                                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                    if entry.get().0.as_ref() != Some(&child) {
+                                        return Err(corruption(
+                                            "ordered-tree batch range has conflicting child edges",
+                                        ));
+                                    }
+                                    if entry.get().1.last().copied() != Some(slot) {
+                                        entry.get_mut().1.push(slot);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        frontier_order = next_order;
+        frontier = next;
+    }
+
+    if output.iter().any(|rows| {
+        rows.windows(2)
+            .any(|pair| pair[0].0.as_slice() >= pair[1].0.as_slice())
+    }) {
+        return Err(corruption(
+            "ordered-tree batch range is not globally ordered",
+        ));
+    }
+    Ok(output)
+}
+
 /// Returns the state keys whose authenticated leaf value differs between two
 /// ordered-tree roots.
 ///

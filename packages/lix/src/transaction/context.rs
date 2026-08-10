@@ -1393,25 +1393,17 @@ where
             .await?;
             let opening_transaction_state_view =
                 TransactionStateView::new(opening_state_view.clone(), Vec::new())?;
-            let (sql_schema_catalog, tracked_schema_catalog) = {
-                let sql_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_state(
-                        &opening_transaction_state_view,
-                        &Domain::schema_catalog(active_branch_id.clone(), true),
-                    )
-                    .await?;
-                // SQL planning needs the untracked-visible catalog, while
-                // normal tracked mutations normalize against the tracked
-                // catalog. Both are compiled from authenticated rows in the
-                // opening ForkTree view and cached by their content fingerprint.
-                let tracked_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_state(
-                        &opening_transaction_state_view,
-                        &Domain::schema_catalog(active_branch_id.clone(), false),
-                    )
-                    .await?;
-                (sql_schema_catalog, tracked_schema_catalog)
-            };
+            // Untracked state is no longer a public or durable lane. SQL
+            // planning and tracked mutation normalization therefore consume
+            // the same authenticated schema catalog instead of compiling two
+            // synthetic visibility variants from the same retained roots.
+            let sql_schema_catalog = catalog_context
+                .compiled_catalog_for_transaction_state(
+                    &opening_transaction_state_view,
+                    &Domain::schema_catalog(active_branch_id.clone(), false),
+                )
+                .await?;
+            let tracked_schema_catalog = Arc::clone(&sql_schema_catalog);
             let opening_selector_fence =
                 load_forktree_selector_fence(&read, &active_branch_id).await?;
             let branch_reader = BranchRefStoreReader::new(&read);
@@ -1455,10 +1447,6 @@ where
         };
         drop(read);
         let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
-        schema_resolver.remember_compiled_catalog(
-            &Domain::schema_catalog(active_branch_id.clone(), true),
-            Arc::clone(&sql_schema_catalog),
-        );
         schema_resolver.remember_compiled_catalog(
             &Domain::schema_catalog(active_branch_id.clone(), false),
             tracked_schema_catalog,

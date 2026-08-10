@@ -4238,11 +4238,13 @@ async fn scan_entity_candidates_for_pks(
 async fn scan_native_entity_ranges(
     ctx: &mut impl SqlWriteExecutionContext,
     schema_key: &str,
-    entity_pks: Vec<EntityPk>,
+    mut entity_pks: Vec<EntityPk>,
     include_tombstones: bool,
     branch_ids: &[String],
 ) -> Result<NativeStateBatch, LixError> {
     let mut rows = Vec::new();
+    entity_pks.sort();
+    entity_pks.dedup();
     let branch_ids = if branch_ids.is_empty() {
         vec![ctx.active_branch_id().to_owned()]
     } else {
@@ -4250,9 +4252,22 @@ async fn scan_native_entity_ranges(
     };
     for branch_id in &branch_ids {
         if entity_pks.is_empty() {
+            let lower = crate::forktree::encode_state_entity_prefix(
+                schema_key,
+                &EntityPk {
+                    components: crate::entity_pk::EntityPkComponents::Empty,
+                },
+            );
+            let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
             let native = ctx
                 .state_view()
-                .branch_range(branch_id, None, None, None, include_tombstones)
+                .branch_range(
+                    branch_id,
+                    Some(&lower),
+                    upper.as_deref(),
+                    None,
+                    include_tombstones,
+                )
                 .await?;
             for row in native {
                 let row = NativeStateRow::from_state_row(row, branch_id)?;
@@ -4261,19 +4276,19 @@ async fn scan_native_entity_ranges(
                 }
             }
         } else {
-            for entity_pk in &entity_pks {
-                let bounds =
-                    crate::forktree::encode_state_entity_prefix_bounds(schema_key, entity_pk);
-                let native = ctx
-                    .state_view()
-                    .branch_range(
-                        branch_id,
-                        Some(bounds.lower.as_slice()),
-                        bounds.upper.as_deref(),
-                        None,
-                        include_tombstones,
-                    )
-                    .await?;
+            let ranges = entity_pks
+                .iter()
+                .map(|entity_pk| {
+                    let bounds =
+                        crate::forktree::encode_state_entity_prefix_bounds(schema_key, entity_pk);
+                    (bounds.lower, bounds.upper)
+                })
+                .collect::<Vec<_>>();
+            for native in ctx
+                .state_view()
+                .branch_ranges(branch_id, &ranges, include_tombstones)
+                .await?
+            {
                 rows.extend(
                     native
                         .into_iter()
