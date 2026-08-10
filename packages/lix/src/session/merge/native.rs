@@ -221,7 +221,29 @@ pub(crate) fn plan_merge(target: &MergeDiff, source: &MergeDiff) -> Result<Merge
                 source_index += 1;
             }
             Ordering::Equal => {
-                if !same_final_state(target_entry, source_entry, target, source) {
+                let target_unchanged = same_state(
+                    target_entry.before.as_ref(),
+                    target_entry.after.as_ref(),
+                    target,
+                    source,
+                );
+                let source_unchanged = same_state(
+                    source_entry.before.as_ref(),
+                    source_entry.after.as_ref(),
+                    target,
+                    source,
+                );
+                if target_unchanged && !source_unchanged {
+                    plan.picks.push(source_pick(source_entry, source_index)?);
+                } else if !target_unchanged
+                    && !source_unchanged
+                    && !same_state(
+                        target_entry.after.as_ref(),
+                        source_entry.after.as_ref(),
+                        target,
+                        source,
+                    )
+                {
                     plan.conflicts.push(MergeConflict {
                         identity: target_entry.identity.clone(),
                         target: target_entry.clone(),
@@ -281,17 +303,17 @@ fn source_pick(entry: &MergeDiffEntry, source_index: usize) -> Result<MergePick,
     })
 }
 
-fn same_final_state(
-    target: &MergeDiffEntry,
-    source: &MergeDiffEntry,
+fn same_state(
+    left: Option<&MergeRow>,
+    right: Option<&MergeRow>,
     target_diff: &MergeDiff,
     source_diff: &MergeDiff,
 ) -> bool {
-    match (target.after.as_ref(), source.after.as_ref()) {
+    match (left, right) {
         (None, None) => true,
-        (Some(target), Some(source)) if target.deleted && source.deleted => true,
-        (Some(target), Some(source)) if !target.deleted && !source.deleted => {
-            row_payload_eq(target, source, target_diff, source_diff)
+        (Some(left), Some(right)) if left.deleted && right.deleted => true,
+        (Some(left), Some(right)) if !left.deleted && !right.deleted => {
+            row_payload_eq(left, right, target_diff, source_diff)
         }
         _ => false,
     }
