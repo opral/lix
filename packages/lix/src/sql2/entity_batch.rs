@@ -4,7 +4,6 @@
 //! module keeps `StateRow` and the native untracked row as the only row shapes
 //! before Arrow/DataFusion takes ownership.
 
-use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::future::Future;
 
@@ -519,6 +518,7 @@ pub(crate) fn schema_bounds(
     Ok((Some(lower), upper))
 }
 
+#[cfg(test)]
 pub(crate) fn tracked_slot(row: &EntityStateSlot) -> Option<&StateRow> {
     match row {
         EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => Some(row),
@@ -541,19 +541,12 @@ pub(crate) fn slot_snapshot(row: &EntityStateSlot) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn row_snapshot(row: &StateRow) -> Option<&str> {
     match &row.value.cell {
         StateCell::Value(value) => Some(value.as_ref()),
         StateCell::Null | StateCell::Tombstone => None,
     }
-}
-
-pub(crate) fn project_snapshot(row: &StateRow) -> Option<Bytes> {
-    row_snapshot(row).map(|value| Bytes::copy_from_slice(value.as_bytes()))
-}
-
-pub(crate) fn project_pk(row: &StateRow) -> Result<EntityPk, LixError> {
-    Ok(decode_state_key(&row.key)?.entity_pk)
 }
 
 #[cfg(test)]
