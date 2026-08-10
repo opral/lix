@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 mod descriptor_path;
 mod keys;
 mod path_index;
@@ -86,6 +88,35 @@ impl FilesystemStateRows {
     }
 }
 
+/// Merges tracked and untracked physical lanes into the one public filesystem
+/// projection. The key is the canonical state identity plus the requested
+/// public branch. Untracked rows are expected after tracked rows and therefore
+/// shadow them, including with a tombstone. Callers that build a visibility
+/// surface pass `false`; path-index builders pass `true` so the tombstone can
+/// suppress the lower tracked row before index construction.
+pub(crate) fn merge_filesystem_state_rows(
+    rows: impl IntoIterator<Item = FilesystemStateRow>,
+    include_tombstones: bool,
+) -> FilesystemStateRows {
+    let mut merged = BTreeMap::new();
+    for row in rows {
+        let key = (
+            crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                entity_pk: &row.entity_pk,
+            }),
+            row.branch_id.clone(),
+        );
+        merged.insert(key, row);
+    }
+    let mut rows = merged.into_values().collect::<Vec<_>>();
+    if !include_tombstones {
+        rows.retain(|row| !row.deleted);
+    }
+    FilesystemStateRows::from_rows(rows)
+}
+
 #[cfg(test)]
 pub(crate) struct FilesystemStateRowsBuilder(Vec<FilesystemStateRow>);
 
@@ -129,7 +160,11 @@ impl From<Vec<FilesystemStateRow>> for FilesystemStateRows {
 }
 
 impl FilesystemStateRow {
-    fn from_state_row(row: StateRow, branch_id: &str, untracked: bool) -> Result<Self, LixError> {
+    pub(crate) fn from_state_row(
+        row: StateRow,
+        branch_id: &str,
+        untracked: bool,
+    ) -> Result<Self, LixError> {
         let key = crate::forktree::decode_state_key(&row.key)?;
         let deleted = row.value.cell.deleted();
         let snapshot_content = match &row.value.cell {
@@ -153,7 +188,7 @@ impl FilesystemStateRow {
         })
     }
 
-    fn from_untracked_state_row(row: UntrackedStateRow) -> Result<Self, LixError> {
+    pub(crate) fn from_untracked_state_row(row: UntrackedStateRow) -> Result<Self, LixError> {
         let snapshot_content = match &row.value.cell {
             crate::forktree::StateCell::Value(value) => Some(value.clone()),
             crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,

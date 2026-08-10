@@ -6,6 +6,7 @@
 //! trait or a compatibility request/batch vocabulary.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::LixError;
@@ -351,10 +352,11 @@ where
             .collect())
     }
 
-    /// Resolves untracked points for an explicitly selected branch through
-    /// this view's retained read. The branch selector is borrowed from the
-    /// operation owner; no storage read is reacquired.
-    pub(crate) async fn branch_untracked_points(
+    /// Resolves exact untracked keys for an explicitly selected branch using
+    /// this view's retained read. The branch view is borrowed from the same
+    /// authenticated coherent read; it does not refresh selectors or acquire
+    /// another storage read.
+    pub(crate) async fn untracked_points_for_branch(
         &self,
         branch_id: &str,
         state_keys: &[Vec<u8>],
@@ -462,10 +464,11 @@ where
             .collect())
     }
 
-    /// Bounded variant of the untracked overlay scan for an explicit branch
-    /// selector. Global rows are merged once with the requested branch and
-    /// branch tombstones shadow global rows before visibility and LIMIT.
-    pub(crate) async fn branch_untracked_overlay_range(
+    /// Scans the bounded untracked overlay for an explicitly selected branch.
+    /// The local and global owner ranges are merged by logical state key so a
+    /// local row (including a tombstone) masks the global row before the
+    /// caller's limit is applied.
+    pub(crate) async fn untracked_overlay_branch_range_for_branch(
         &self,
         branch_id: &str,
         lower: Option<&[u8]>,
@@ -473,48 +476,52 @@ where
         limit: Option<usize>,
         include_tombstones: bool,
     ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        let branch_id = canonical_branch_id(branch_id)?;
-        let global_id = CanonicalBranchId::from_bytes(
-            *uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
-                .expect("GLOBAL_BRANCH_ID must be a UUID")
-                .as_bytes(),
-        );
-        let branch = self.view.branch_view(branch_id).await?;
-        let mut rows = std::collections::BTreeMap::new();
-        let insert = |rows: &mut std::collections::BTreeMap<Vec<u8>, UntrackedStateRow>,
-                      owner: CanonicalBranchId,
-                      key: StateKey,
-                      value: UntrackedValue| {
-            let encoded = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            });
-            rows.insert(encoded, UntrackedStateRow { owner, key, value });
-        };
-        if branch_id == global_id {
-            for (key, value) in branch
-                .scan_untracked_branch_range(lower, upper, None)
-                .await?
-            {
-                insert(&mut rows, global_id, key, value);
-            }
-        } else {
-            let global = branch.branch_view(global_id).await?;
-            for (key, value) in global
-                .scan_untracked_branch_range(lower, upper, None)
-                .await?
-            {
-                insert(&mut rows, global_id, key, value);
-            }
-            for (key, value) in branch
-                .scan_untracked_branch_range(lower, upper, None)
-                .await?
-            {
-                insert(&mut rows, branch_id, key, value);
-            }
+        if limit == Some(0) {
+            return Ok(Vec::new());
         }
-        Ok(rows
+        let branch_id = canonical_branch_id(branch_id)?;
+        let global_id = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
+        let branch_view = self.view.branch_view(branch_id).await?;
+        let local = branch_view
+            .scan_untracked_branch_range(lower, upper, None)
+            .await?
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    UntrackedStateRow {
+                        owner: branch_id,
+                        key,
+                        value,
+                    },
+                )
+            });
+        let global = if branch_id == global_id {
+            Vec::new()
+        } else {
+            self.view
+                .branch_view(global_id)
+                .await?
+                .scan_untracked_branch_range(lower, upper, None)
+                .await?
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        UntrackedStateRow {
+                            owner: global_id,
+                            key,
+                            value,
+                        },
+                    )
+                })
+                .collect()
+        };
+        let mut merged = BTreeMap::<StateKey, UntrackedStateRow>::new();
+        for (key, row) in global.into_iter().chain(local) {
+            merged.insert(key, row);
+        }
+        Ok(merged
             .into_values()
             .filter(|row| include_tombstones || !row.value.cell.deleted())
             .take(limit.unwrap_or(usize::MAX))
@@ -854,6 +861,29 @@ where
         Ok(output)
     }
 
+    /// Resolves exact untracked keys for another branch through the same
+    /// transaction-owned retained read. Staged rows are applied only when
+    /// the requested branch is the transaction's branch; other branches use
+    /// their authenticated committed overlay.
+    pub(crate) async fn untracked_points_for_branch(
+        &self,
+        branch_id: &str,
+        state_keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
+        if self.committed.branch_id_matches(branch_id)? {
+            return self.untracked_points(state_keys, include_tombstones).await;
+        }
+        let rows = self
+            .committed
+            .untracked_points_for_branch(branch_id, state_keys)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.filter(|row| include_tombstones || !row.value.cell.deleted()))
+            .collect())
+    }
+
     /// Resolves one bounded untracked branch range through the retained
     /// ForkTree view and merges the ordered staged overlay. The caller must
     /// supply a schema/entity prefix range; this method never widens it to a
@@ -996,7 +1026,11 @@ where
             .collect())
     }
 
-    pub(crate) async fn branch_untracked_overlay_range(
+    /// Resolves one bounded untracked overlay range for an explicit branch,
+    /// retaining the transaction's staged overlay when that branch is the
+    /// transaction branch and otherwise using only the committed retained
+    /// view. The merge remains bounded to the requested range.
+    pub(crate) async fn untracked_overlay_branch_range_for_branch(
         &self,
         branch_id: &str,
         lower: Option<&[u8]>,
@@ -1004,14 +1038,52 @@ where
         limit: Option<usize>,
         include_tombstones: bool,
     ) -> Result<Vec<UntrackedStateRow>, LixError> {
-        if self.committed.branch_id_matches(branch_id)? {
-            return self
-                .untracked_overlay_range(lower, upper, limit, include_tombstones)
-                .await;
+        if limit == Some(0) {
+            return Ok(Vec::new());
         }
-        self.committed
-            .branch_untracked_overlay_range(branch_id, lower, upper, limit, include_tombstones)
-            .await
+        let target = canonical_branch_id(branch_id)?;
+        let global = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
+        let committed = self
+            .committed
+            .untracked_overlay_branch_range_for_branch(branch_id, lower, upper, None, true)
+            .await?;
+        let mut merged = BTreeMap::<StateKey, UntrackedStateRow>::new();
+        for row in committed {
+            merged.insert(row.key.clone(), row);
+        }
+        if self.committed.branch_id_matches(branch_id)? {
+            for staged in &self.staged_untracked {
+                if staged.owner != target && staged.owner != global {
+                    continue;
+                }
+                let encoded = crate::forktree::encode_untracked_key(
+                    staged.owner,
+                    crate::forktree::StateKeyRef {
+                        schema_key: &staged.key.schema_key,
+                        file_id: staged.key.file_id.as_deref(),
+                        entity_pk: &staged.key.entity_pk,
+                    },
+                );
+                if lower.is_some_and(|bound| encoded.as_slice() < bound)
+                    || upper.is_some_and(|bound| encoded.as_slice() >= bound)
+                {
+                    continue;
+                }
+                merged.insert(
+                    staged.key.clone(),
+                    UntrackedStateRow {
+                        owner: staged.owner,
+                        key: staged.key.clone(),
+                        value: staged.value.clone(),
+                    },
+                );
+            }
+        }
+        Ok(merged
+            .into_values()
+            .filter(|row| include_tombstones || !row.value.cell.deleted())
+            .take(limit.unwrap_or(usize::MAX))
+            .collect())
     }
 }
 

@@ -136,7 +136,7 @@ where
             let untracked = if request.filter.untracked == Some(false) {
                 Vec::new()
             } else {
-                view.branch_untracked_overlay_range(
+                view.untracked_overlay_branch_range_for_branch(
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
@@ -180,7 +180,7 @@ where
             let untracked = if request.filter.untracked == Some(false) {
                 Vec::new()
             } else {
-                view.branch_untracked_overlay_range(
+                view.untracked_overlay_branch_range_for_branch(
                     &branch_id,
                     lower.as_deref(),
                     upper.as_deref(),
@@ -371,7 +371,7 @@ where
         }
         if request.untracked != Some(false) {
             let branch_rows = view
-                .branch_untracked_points(&branch_id, &branch_keys)
+                .untracked_points_for_branch(&branch_id, &branch_keys)
                 .await?;
             for (index, row) in indices.into_iter().zip(branch_rows) {
                 untracked[index] = row;
@@ -418,7 +418,7 @@ where
         }
         if request.untracked != Some(false) {
             let branch_rows = view
-                .branch_untracked_points(&branch_id, &branch_keys)
+                .untracked_points_for_branch(&branch_id, &branch_keys, request.include_tombstones)
                 .await?;
             for (index, row) in indices.into_iter().zip(branch_rows) {
                 untracked[index] = row;

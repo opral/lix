@@ -44,7 +44,7 @@ use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
     defaultable_text_insert_value, insert_column_is_omitted,
 };
-use crate::state::{ForkTreeStateView, StateRow, StateRowSource, TransactionStateView};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView, UntrackedStateRow};
 use crate::storage_adapter::StorageAdapterRead;
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteRow;
@@ -348,6 +348,35 @@ where
                 .collect()),
         }
     }
+
+    async fn untracked_overlay_branch_range(
+        &self,
+        branch_id: &str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<UntrackedStateRow>, LixError> {
+        match self {
+            Self::Committed(state) => {
+                state
+                    .untracked_overlay_branch_range_for_branch(
+                        // Keep tombstones until the tracked and untracked
+                        // lanes have been merged. A local untracked
+                        // tombstone must shadow a tracked value rather than
+                        // allowing the lower lane to resurrect it.
+                        branch_id, lower, upper, limit, true,
+                    )
+                    .await
+            }
+            Self::Transaction(state) => {
+                state
+                    .untracked_overlay_branch_range_for_branch(branch_id, lower, upper, limit, true)
+                    .await
+            }
+            #[cfg(test)]
+            Self::Fixture(_) => Ok(Vec::new()),
+        }
+    }
 }
 
 /// Stable public identity for a directory post-image. By-branch surfaces need
@@ -376,19 +405,15 @@ fn resolve_directory_branch_rows(
     limit: Option<usize>,
 ) -> Vec<(String, StateRow)> {
     // A branch view includes the authenticated global overlay. Deduplicate
-    // those repeated global rows while retaining one row per selected branch
-    // for branch-local values. The final limit is applied only after this
-    // visibility/ownership resolution.
+    // only duplicate acquisition of the same public (requested branch,
+    // identity) row: public by-branch semantics intentionally expand global
+    // rows into every selected branch, including the raw global branch row
+    // when it is selected.
     let mut deduplicated = BTreeMap::new();
     for (requested_branch_id, row) in rows {
-        let output_branch_id = if row.source == StateRowSource::Global {
-            GLOBAL_BRANCH_ID.to_owned()
-        } else {
-            requested_branch_id
-        };
         deduplicated.insert(
-            (row.key.clone(), output_branch_id.clone()),
-            (output_branch_id, row),
+            (row.key.clone(), requested_branch_id.clone()),
+            (requested_branch_id, row),
         );
     }
     let mut rows = deduplicated.into_values().collect::<Vec<_>>();
@@ -398,11 +423,29 @@ fn resolve_directory_branch_rows(
     rows
 }
 
+fn resolve_directory_filesystem_rows(
+    rows: Vec<FilesystemStateRow>,
+    limit: Option<usize>,
+) -> FilesystemStateRows {
+    // The tracked lane is inserted first and the untracked lane second, so an
+    // untracked value or tombstone owns the visible key. The shared merge
+    // keeps that tombstone until after shadowing, then removes it from the
+    // public directory projection.
+    if let Some(limit) = limit {
+        let mut rows = crate::filesystem::merge_filesystem_state_rows(rows, false)
+            .into_iter()
+            .collect::<Vec<_>>();
+        rows.truncate(limit);
+        return FilesystemStateRows::from_rows(rows);
+    }
+    crate::filesystem::merge_filesystem_state_rows(rows, false)
+}
+
 impl<R> LixDirectorySpec<R>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    async fn load_rows(&self, request: &DirectoryScanRequest) -> Result<Vec<(String, StateRow)>> {
+    async fn load_rows(&self, request: &DirectoryScanRequest) -> Result<FilesystemStateRows> {
         let branch_ids = if request.filter.branch_ids.is_empty() {
             vec![self.state_branch_id.clone()]
         } else {
@@ -421,35 +464,84 @@ where
                     &last,
                 ));
                 rows.extend(
-                    self.state
-                        .branch_range(&branch_id, Some(&lower), upper.as_deref(), None, false)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?
-                        .into_iter()
-                        .map(|row| (branch_id.clone(), row)),
+                    FilesystemStateRows::from_view_rows(
+                        self.state
+                            .branch_range(&branch_id, Some(&lower), upper.as_deref(), None, false)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                        &branch_id,
+                        false,
+                    )
+                    .map_err(lix_error_to_datafusion_error)?,
                 );
+                let mut untracked_rows = FilesystemStateRows::from_untracked_view_rows(
+                    self.state
+                        .untracked_overlay_branch_range(
+                            &branch_id,
+                            Some(&lower),
+                            upper.as_deref(),
+                            None,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?,
+                )
+                .map_err(lix_error_to_datafusion_error)?
+                .into_iter()
+                .collect::<Vec<_>>();
+                for row in &mut untracked_rows {
+                    if row.global() {
+                        row.branch_id = branch_id.clone();
+                    }
+                }
+                rows.extend(untracked_rows);
             } else {
                 for entity_pk in &request.filter.entity_pks {
                     let bounds = encode_state_entity_prefix_bounds(DIRECTORY_SCHEMA_KEY, entity_pk);
                     rows.extend(
+                        FilesystemStateRows::from_view_rows(
+                            self.state
+                                .branch_range(
+                                    &branch_id,
+                                    Some(&bounds.lower),
+                                    bounds.upper.as_deref(),
+                                    None,
+                                    false,
+                                )
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?,
+                            &branch_id,
+                            false,
+                        )
+                        .map_err(lix_error_to_datafusion_error)?,
+                    );
+                    let mut untracked_rows = FilesystemStateRows::from_untracked_view_rows(
                         self.state
-                            .branch_range(
+                            .untracked_overlay_branch_range(
                                 &branch_id,
                                 Some(&bounds.lower),
                                 bounds.upper.as_deref(),
                                 None,
-                                false,
                             )
                             .await
-                            .map_err(lix_error_to_datafusion_error)?
-                            .into_iter()
-                            .map(|row| (branch_id.clone(), row)),
-                    );
+                            .map_err(lix_error_to_datafusion_error)?,
+                    )
+                    .map_err(lix_error_to_datafusion_error)?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                    for row in &mut untracked_rows {
+                        if row.global() {
+                            row.branch_id = branch_id.clone();
+                        }
+                    }
+                    rows.extend(untracked_rows);
                 }
             }
         }
 
-        Ok(resolve_directory_branch_rows(rows, request.limit))
+        Ok(resolve_directory_filesystem_rows(
+            rows.into_iter().collect(),
+            request.limit,
+        ))
     }
     async fn indexed_path_matches(
         &self,
@@ -2090,17 +2182,9 @@ fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
 
 fn lix_directory_record_batch_with_branch_ids(
     schema: &SchemaRef,
-    rows: Vec<(String, StateRow)>,
+    rows: FilesystemStateRows,
 ) -> Result<RecordBatch, LixError> {
-    let mut filesystem_rows = Vec::with_capacity(rows.len());
-    for (branch_id, row) in rows {
-        filesystem_rows
-            .extend(FilesystemStateRows::from_view_rows(vec![row], &branch_id, false)?.into_iter());
-    }
-    lix_directory_record_batch_from_filesystem_rows(
-        schema,
-        FilesystemStateRows::from_rows(filesystem_rows),
-    )
+    lix_directory_record_batch_from_filesystem_rows(schema, rows)
 }
 
 fn lix_directory_record_batch_from_filesystem_rows(
@@ -2640,7 +2724,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_by_branch_deduplicates_global_overlay_before_limit() {
+    fn directory_by_branch_expands_global_overlay_before_limit() {
         let branch_one = "01920000-0000-7000-8000-0000000000a1";
         let branch_two = "01920000-0000-7000-8000-0000000000a2";
         let rows = super::resolve_directory_branch_rows(
@@ -2666,10 +2750,49 @@ mod tests {
         );
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, super::GLOBAL_BRANCH_ID);
+        assert_eq!(rows[0].0, branch_one);
         assert_eq!(rows[0].1.key, vec![1]);
-        assert_eq!(rows[1].0, branch_one);
-        assert_eq!(rows[1].1.key, vec![2]);
+        assert_eq!(rows[1].0, branch_two);
+        assert_eq!(rows[1].1.key, vec![1]);
+    }
+
+    #[test]
+    fn directory_visible_rows_untracked_value_and_tombstone_shadow_tracked() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let entity_id = "01920000-0000-7000-8000-0000000000d3";
+        let tracked = live_filesystem_row(
+            entity_id,
+            super::DIRECTORY_SCHEMA_KEY,
+            None,
+            branch_id,
+            r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"tracked"}"#,
+        );
+        let mut untracked = live_filesystem_row(
+            entity_id,
+            super::DIRECTORY_SCHEMA_KEY,
+            None,
+            branch_id,
+            r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"untracked"}"#,
+        );
+        untracked.untracked = true;
+
+        let visible = super::resolve_directory_filesystem_rows(
+            vec![tracked.clone(), untracked.clone()],
+            None,
+        );
+        assert_eq!(visible.len(), 1);
+        assert!(visible.row(0).untracked());
+        assert!(
+            visible
+                .row(0)
+                .snapshot_content()
+                .is_some_and(|content| content.contains("untracked"))
+        );
+
+        untracked.deleted = true;
+        untracked.snapshot_content = None;
+        let masked = super::resolve_directory_filesystem_rows(vec![tracked, untracked], None);
+        assert!(masked.is_empty());
     }
 
     fn eq_filter(column_name: &str, value: &str) -> Expr {
