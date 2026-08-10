@@ -84,9 +84,9 @@ impl DecodedNode {
 /// publication plan; the future transaction owner may copy the authenticated
 /// objects into its existing PreparedPublication.
 #[derive(Clone, Debug)]
-pub(crate) struct BlobMerkleTreeBuild {
-    pub(crate) manifest: BlobManifestV1,
-    pub(crate) objects: ImmutableObjectSet,
+pub(super) struct BlobMerkleTreeBuild {
+    pub(super) manifest: BlobManifestV1,
+    pub(super) objects: ImmutableObjectSet,
 }
 
 #[derive(Debug)]
@@ -113,24 +113,17 @@ struct BlobMerkleProofStepV1 {
 /// and one authenticated sibling root per proof level. It intentionally has no
 /// storage handle, cache, or writer capability.
 #[derive(Clone, Debug)]
-pub(crate) struct BlobMerkleProofV1 {
-    pub(crate) manifest: BlobManifestV1,
-    pub(crate) requested_range: Range<u64>,
+pub(super) struct BlobMerkleProofV1 {
+    manifest: BlobManifestV1,
+    requested_range: Range<u64>,
     state_binding: [u8; 32],
     paths: Vec<BlobMerkleProofPathV1>,
     objects: ImmutableObjectSet,
 }
 
 impl BlobMerkleProofV1 {
-    pub(crate) fn manifest(&self) -> BlobManifestV1 {
-        self.manifest
-    }
-
-    pub(crate) fn requested_range(&self) -> Range<u64> {
-        self.requested_range.clone()
-    }
-
-    pub(crate) fn object_count(&self) -> usize {
+    #[cfg(test)]
+    fn object_count(&self) -> usize {
         self.objects.iter().count()
     }
 }
@@ -139,7 +132,7 @@ impl BlobMerkleProofV1 {
 /// Merkle content identity: it is derived from a domain-separated envelope
 /// containing the root ObjectId, logical length, fixed-chunk geometry, leaf
 /// count, and tree height. No flat whole-content BlobId calculation is used.
-pub(crate) fn build_blob_merkle_tree(
+pub(super) fn build_blob_merkle_tree(
     chunks: &[BlobChunkV1],
 ) -> Result<BlobMerkleTreeBuild, StorageError> {
     if chunks.is_empty() || (chunks.len() != 1 && chunks.iter().any(|chunk| chunk.bytes.is_empty()))
@@ -180,7 +173,7 @@ pub(crate) fn build_blob_merkle_tree(
 /// Builds the canonical leaf/internal closure from already authenticated
 /// upload chunks. Chunk payload objects remain owned by the upload receipt and
 /// are not copied into memory a second time.
-pub(crate) fn build_blob_merkle_tree_from_chunk_claims(
+pub(super) fn build_blob_merkle_tree_from_chunk_claims(
     logical_bytes: u64,
     chunks: &[(BlobChunkRefV1, [u8; 32])],
 ) -> Result<BlobMerkleTreeBuild, StorageError> {
@@ -238,7 +231,7 @@ pub(crate) fn build_blob_merkle_tree_from_chunk_claims(
 /// chunks whose bytes or fixed-width positions changed are encoded. Existing
 /// leaf/internal ObjectIds are removed from the returned object set, so the
 /// caller publishes only the new chunk and path-copy closure.
-pub(crate) async fn build_blob_merkle_edit_successor<R>(
+pub(super) async fn build_blob_merkle_edit_successor<R>(
     read: &R,
     manifest: BlobManifestV1,
     payload: &[u8],
@@ -516,7 +509,7 @@ pub(crate) fn canonical_blob_id_for_content(content: &[u8]) -> Result<BlobId, St
 /// intentionally test-only so small corruption controls do not need to carry
 /// a 1 MiB allocation merely to exercise manifest encoding.
 #[cfg(test)]
-pub(crate) fn single_leaf_manifest_for_test(
+pub(super) fn single_leaf_manifest_for_test(
     chunk: &BlobChunkV1,
 ) -> Result<(BlobManifestV1, ObjectId, Bytes), StorageError> {
     if chunk.bytes.is_empty() {
@@ -539,7 +532,7 @@ pub(crate) fn single_leaf_manifest_for_test(
 
 /// Loads an exact ordinal proof from one retained storage read. Only selected
 /// leaves, their chunk objects, and sibling proof nodes are retained.
-pub(crate) async fn load_blob_merkle_range_proof<R>(
+pub(super) async fn load_blob_merkle_range_proof<R>(
     read: &R,
     manifest: BlobManifestV1,
     state_key: &StateKey,
@@ -651,7 +644,7 @@ where
     Ok(bytes)
 }
 
-pub(crate) fn leaf_range_for_bytes(
+pub(super) fn leaf_range_for_bytes(
     manifest: &BlobManifestV1,
     requested: Range<u64>,
 ) -> Result<Range<u64>, StorageError> {
@@ -665,7 +658,7 @@ pub(crate) fn leaf_range_for_bytes(
     Ok(requested.start / chunk_bytes..requested.end.div_ceil(chunk_bytes))
 }
 
-pub(crate) fn materialize_blob_merkle_range(
+pub(super) fn materialize_blob_merkle_range(
     proof: &BlobMerkleProofV1,
     state_key: &StateKey,
     manifest: BlobManifestV1,
@@ -703,7 +696,8 @@ pub(crate) fn materialize_blob_merkle_range(
 /// Creates a proof for an exact half-open range of leaf ordinals. The proof
 /// contains O(K log N) tree objects for K requested leaves and never copies an
 /// unrelated leaf payload.
-pub(crate) fn prove_blob_merkle_range(
+#[cfg(test)]
+fn prove_blob_merkle_range(
     build: &BlobMerkleTreeBuild,
     state_key: &StateKey,
     requested_range: Range<u64>,
@@ -751,7 +745,7 @@ pub(crate) fn prove_blob_merkle_range(
 /// Verifies the exact StateKey-bound range proof and every requested child
 /// chunk. No unrelated subtree payload is required; sibling node bytes remain
 /// authenticated by their canonical ObjectIds and parent reconstruction.
-pub(crate) fn verify_blob_merkle_range(
+fn verify_blob_merkle_range(
     proof: &BlobMerkleProofV1,
     state_key: &StateKey,
     expected_manifest: BlobManifestV1,
@@ -877,7 +871,8 @@ pub(crate) fn verify_blob_merkle_range(
 /// and reducing each changed leaf through the authenticated sibling summaries.
 /// The caller supplies changed chunk bytes, but no caller-supplied identity is
 /// accepted; each replacement is encoded and hashed before reduction.
-pub(crate) fn derive_blob_merkle_successor_id(
+#[cfg(test)]
+fn derive_blob_merkle_successor_id(
     proof: &BlobMerkleProofV1,
     state_key: &StateKey,
     expected_manifest: BlobManifestV1,
@@ -898,7 +893,7 @@ pub(crate) fn derive_blob_merkle_successor_id(
 /// Builds only changed chunks/leaves and path-copied internal nodes for a
 /// fixed-width successor. Unchanged subtrees remain authenticated sibling
 /// edges and are never materialized or republished.
-pub(crate) fn build_blob_merkle_successor(
+pub(super) fn build_blob_merkle_successor(
     proof: &BlobMerkleProofV1,
     state_key: &StateKey,
     expected_manifest: BlobManifestV1,
