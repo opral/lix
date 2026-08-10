@@ -12,10 +12,7 @@ use crate::common::{
     ExecuteStatementMetadata, RequestBlobSpliceProvenance, SharedStr, validate_row_metadata,
 };
 use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateScanRequest,
-    MaterializedLiveStateBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-};
+use crate::forktree::StateCell;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -30,6 +27,7 @@ use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
+use crate::state::{StateRow, StateRowSource};
 use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
     CertifiedRawWriteBatchPreparation, CompleteCollectionReplacementProof, PreparedRowFacts,
@@ -41,6 +39,129 @@ use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 use crate::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 
 use super::SqlWriteResult;
+
+#[derive(Clone, Debug, Default)]
+struct NativeStateBatch {
+    rows: Vec<NativeStateRow>,
+}
+
+impl NativeStateBatch {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+    fn iter(&self) -> impl Iterator<Item = &NativeStateRow> {
+        self.rows.iter()
+    }
+    fn row(&self, index: usize) -> NativeStateRowRef<'_> {
+        NativeStateRowRef(&self.rows[index])
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NativeStateRow {
+    entity_pk: EntityPk,
+    schema_key: String,
+    file_id: Option<String>,
+    snapshot_content: Option<SharedStr>,
+    metadata: Option<SharedStr>,
+    created_at: crate::common::LixTimestamp,
+    updated_at: crate::common::LixTimestamp,
+    global: bool,
+    change_id: Option<crate::changelog::ChangeId>,
+    commit_id: Option<CommitId>,
+    branch_id: String,
+    untracked: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NativeStateRowRef<'a>(&'a NativeStateRow);
+
+impl NativeStateRow {
+    fn from_state_row(row: StateRow, branch_id: &str) -> Result<Self, LixError> {
+        let key = crate::forktree::decode_state_key(&row.key)?;
+        let snapshot_content = match row.value.cell {
+            StateCell::Value(value) => Some(value),
+            StateCell::Null | StateCell::Tombstone => None,
+        };
+        Ok(Self {
+            entity_pk: key.entity_pk,
+            schema_key: key.schema_key,
+            file_id: key.file_id,
+            snapshot_content,
+            metadata: row.value.metadata,
+            created_at: row.value.created_at,
+            updated_at: row.value.updated_at,
+            global: row.source == StateRowSource::Global,
+            change_id: Some(row.value.change_id),
+            commit_id: Some(row.value.commit_id),
+            branch_id: branch_id.to_owned(),
+            untracked: false,
+        })
+    }
+
+    fn from_untracked(row: crate::state::UntrackedStateRow) -> Self {
+        let snapshot_content = match row.value.cell {
+            StateCell::Value(value) => Some(value),
+            StateCell::Null | StateCell::Tombstone => None,
+        };
+        Self {
+            entity_pk: row.key.entity_pk,
+            schema_key: row.key.schema_key,
+            file_id: row.key.file_id,
+            snapshot_content,
+            metadata: row.value.metadata,
+            created_at: row.value.created_at,
+            updated_at: row.value.updated_at,
+            global: row.owner.to_string() == crate::GLOBAL_BRANCH_ID,
+            change_id: None,
+            commit_id: None,
+            branch_id: row.owner.to_string(),
+            untracked: true,
+        }
+    }
+}
+
+impl<'a> NativeStateRowRef<'a> {
+    fn entity_pk(self) -> &'a EntityPk {
+        &self.0.entity_pk
+    }
+    fn schema_key(self) -> &'a str {
+        &self.0.schema_key
+    }
+    fn file_id(self) -> Option<&'a str> {
+        self.0.file_id.as_deref()
+    }
+    fn snapshot_content(self) -> Option<&'a str> {
+        self.0.snapshot_content.as_deref().map(SharedStr::as_str)
+    }
+    fn metadata(self) -> Option<&'a str> {
+        self.0.metadata.as_deref().map(SharedStr::as_str)
+    }
+    fn created_at(self) -> crate::common::LixTimestamp {
+        self.0.created_at
+    }
+    fn updated_at(self) -> crate::common::LixTimestamp {
+        self.0.updated_at
+    }
+    fn global(self) -> bool {
+        self.0.global
+    }
+    fn change_id(self) -> Option<crate::changelog::ChangeId> {
+        self.0.change_id
+    }
+    fn commit_id(self) -> Option<CommitId> {
+        self.0.commit_id
+    }
+    fn untracked(self) -> bool {
+        self.0.untracked
+    }
+    fn branch_id(self) -> &'a str {
+        &self.0.branch_id
+    }
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -209,7 +330,7 @@ impl<'a> EntityInsertParameterBatch<'a> {
 /// per logical statement, while parsing, binding, and transaction staging
 /// happen once for the homogeneous batch.
 pub(crate) async fn try_execute_entity_insert_parameter_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &RecordBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -223,7 +344,7 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
 }
 
 pub(crate) async fn try_execute_entity_insert_prepared_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &PreparedDmlParameterBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -240,7 +361,7 @@ pub(crate) async fn try_execute_entity_insert_prepared_batch(
 /// This keeps Git replay on the same production parameter-page contract while
 /// preserving its explicit marker barrier in the surrounding transaction.
 pub(crate) async fn try_execute_file_prepared_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &PreparedDmlParameterBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -301,7 +422,7 @@ pub(crate) async fn try_execute_file_prepared_batch(
 }
 
 pub(crate) async fn try_execute_entity_insert_value_batch<'a>(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_rows: &'a [&'a [Value]],
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -315,7 +436,7 @@ pub(crate) async fn try_execute_entity_insert_value_batch<'a>(
 }
 
 async fn try_execute_entity_insert_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: EntityInsertParameterBatch<'_>,
     allow_generic_fallback: bool,
@@ -492,7 +613,7 @@ async fn try_execute_entity_insert_batch(
 }
 
 async fn collection_is_certifiably_empty(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     schema_key: &str,
 ) -> Result<bool, LixError> {
     let branch_id = ctx.active_branch_id().to_string();
@@ -516,7 +637,7 @@ async fn collection_is_certifiably_empty(
 /// repeated identities in statement order and lowers the resulting unique,
 /// identity-sorted replacements in one physical scan/stage operation.
 pub(crate) async fn try_execute_entity_update_value_batch<'a>(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_rows: &'a [&'a [Value]],
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -529,7 +650,7 @@ pub(crate) async fn try_execute_entity_update_value_batch<'a>(
 }
 
 pub(crate) async fn try_execute_entity_update_parameter_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &RecordBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -542,7 +663,7 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
 }
 
 async fn try_execute_entity_update_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: EntityInsertParameterBatch<'_>,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -821,7 +942,7 @@ async fn try_execute_entity_update_batch(
 }
 
 pub(crate) async fn try_execute_entity_update_prepared_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &PreparedDmlParameterBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -859,7 +980,7 @@ fn parameter_batch_row_values(
 /// the last statement supplies the staged replacement. The canonical write
 /// batch itself remains identity-sorted and contains one row per identity.
 async fn try_execute_direct_path_value_replacement_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: EntityInsertParameterBatch<'_>,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -1118,7 +1239,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         });
     }
     let candidates = if certified_generation_identity {
-        MaterializedLiveStateBatch::default()
+        NativeStateBatch::default()
     } else {
         let candidates =
             scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.to_vec(), true)
@@ -1408,8 +1529,8 @@ fn direct_replacement_text_columns<'a>(
 
 #[derive(Clone, Copy)]
 enum EntityLiveRowRef<'a> {
-    Owned(&'a MaterializedLiveStateRow),
-    Batch(MaterializedLiveStateRowRef<'a>),
+    Owned(&'a NativeStateRow),
+    Batch(NativeStateRowRef<'a>),
 }
 
 impl<'a> EntityLiveRowRef<'a> {
@@ -1490,15 +1611,6 @@ impl<'a> EntityLiveRowRef<'a> {
         }
     }
 
-    fn durable_predecessor(
-        self,
-    ) -> Option<&'a crate::live_state::CertifiedCurrentStatePredecessor> {
-        match self {
-            Self::Owned(_) => None,
-            Self::Batch(row) => row.durable_predecessor(),
-        }
-    }
-
     fn branch_id(self) -> &'a str {
         match self {
             Self::Owned(row) => row.branch_id.as_ref(),
@@ -1507,14 +1619,14 @@ impl<'a> EntityLiveRowRef<'a> {
     }
 }
 
-impl<'a> From<&'a MaterializedLiveStateRow> for EntityLiveRowRef<'a> {
-    fn from(row: &'a MaterializedLiveStateRow) -> Self {
+impl<'a> From<&'a NativeStateRow> for EntityLiveRowRef<'a> {
+    fn from(row: &'a NativeStateRow) -> Self {
         Self::Owned(row)
     }
 }
 
-impl<'a> From<MaterializedLiveStateRowRef<'a>> for EntityLiveRowRef<'a> {
-    fn from(row: MaterializedLiveStateRowRef<'a>) -> Self {
+impl<'a> From<NativeStateRowRef<'a>> for EntityLiveRowRef<'a> {
+    fn from(row: NativeStateRowRef<'a>) -> Self {
         Self::Batch(row)
     }
 }
@@ -2015,7 +2127,7 @@ fn append_direct_path_value_replacement_prepared_row(
         },
     );
     let row_index = rows.len() - 1;
-    rows.set_durable_predecessor(row_index, candidate.durable_predecessor().cloned());
+    rows.set_durable_predecessor(row_index, None);
     Ok(())
 }
 
@@ -2064,7 +2176,7 @@ fn with_parameter_batch_statement_index(mut error: LixError, statement_index: us
 }
 
 pub(crate) async fn try_execute_bound_public_write(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     params: &[Value],
     metadata: &ExecuteStatementMetadata,
@@ -2144,7 +2256,7 @@ struct FastFileContentUpdateShape {
 }
 
 async fn execute_file_content_update(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     metadata: &ExecuteStatementMetadata,
     shape: &FastFileContentUpdateShape,
@@ -2272,7 +2384,7 @@ fn fast_file_blob_expr_supported(expr: &BoundExpr) -> bool {
 }
 
 async fn execute_entity_write(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     surface: &EntityWriteSurface,
     params: &[Value],
@@ -2346,7 +2458,7 @@ async fn execute_entity_write(
 }
 
 async fn entity_delete_collection(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
 ) -> Result<Option<SqlWriteResult>, LixError> {
     use crate::collection_generation::{CollectionScopeRef, collection_delete_stage_row};
@@ -2570,7 +2682,7 @@ mod active_branch_commit_id_reference_tests {
 }
 
 async fn load_active_branch_commit_id(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
 ) -> Result<CommitId, LixError> {
     let active_branch_id = ctx.active_branch_id().to_string();
     ctx.load_branch_head(&active_branch_id)
@@ -2594,7 +2706,7 @@ struct FastFilePathWriteShape {
 }
 
 async fn execute_file_path_write(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     params: &[Value],
     metadata: &ExecuteStatementMetadata,
@@ -2880,7 +2992,7 @@ fn eval_fast_file_metadata(
 }
 
 async fn entity_insert(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
@@ -2900,7 +3012,7 @@ async fn entity_insert(
 }
 
 async fn entity_upsert(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
@@ -2955,7 +3067,7 @@ async fn entity_upsert(
 }
 
 fn entity_insert_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
@@ -2996,7 +3108,7 @@ fn entity_insert_batch(
 }
 
 async fn entity_update(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
@@ -3046,7 +3158,7 @@ async fn entity_update(
 /// statement ordering and transaction-overlay semantics; only ordinary
 /// tracked, branch-local, unfiled rows without metadata take the certificate.
 async fn try_execute_direct_path_value_replacement(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
@@ -3089,7 +3201,7 @@ impl PreparedPathValueReplacementProgram {
 }
 
 pub(crate) fn prepare_path_value_replacement_program_from_logical(
-    ctx: &dyn SqlWriteExecutionContext,
+    ctx: &impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
 ) -> Option<PreparedPathValueReplacementProgram> {
     let BoundWriteTarget::Entity(surface) = &plan.bound.target else {
@@ -3106,7 +3218,7 @@ pub(crate) fn prepare_path_value_replacement_program_from_logical(
 }
 
 pub(crate) fn prepare_path_value_replacement_program(
-    ctx: &dyn SqlWriteExecutionContext,
+    ctx: &impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
 ) -> Option<PreparedPathValueReplacementProgram> {
@@ -3154,7 +3266,7 @@ pub(crate) fn prepare_path_value_replacement_program(
 }
 
 pub(crate) async fn execute_prepared_path_value_replacement(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     program: &PreparedPathValueReplacementProgram,
     params: &[Value],
 ) -> Result<SqlWriteResult, LixError> {
@@ -3181,24 +3293,19 @@ pub(crate) async fn execute_prepared_path_value_replacement(
 }
 
 pub(crate) async fn prepare_path_value_replacement_row(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     program: &PreparedPathValueReplacementProgram,
     params: &[Value],
 ) -> Result<Option<PreparedPathValueReplacementRow>, LixError> {
     let primary_key = program.primary_key(params)?;
     let entity_pk = EntityPk::single(primary_key.to_owned());
-    let candidates = ctx
-        .scan_live_state_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![program.schema_key.clone()],
-                entity_pks: vec![entity_pk.clone()],
-                branch_ids: vec![ctx.active_branch_id().to_owned()],
-                include_tombstones: false,
-                ..LiveStateFilter::default()
-            },
-            ..LiveStateScanRequest::default()
-        })
-        .await?;
+    let candidates = scan_native_entity_ranges(
+        ctx,
+        program.schema_key.as_str(),
+        vec![entity_pk.clone()],
+        false,
+    )
+    .await?;
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -3294,7 +3401,7 @@ pub(crate) fn append_path_value_replacement_snapshot(
 /// matches the existing DELETE path's all-or-error behavior while avoiding a
 /// second lookup through the transaction overlay.
 async fn stage_entity_rows_with_postimage_returning(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
@@ -3347,7 +3454,7 @@ async fn stage_entity_rows_with_postimage_returning(
 fn entity_postimage_returning_rows(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
     write_rows: &RawWriteBatch,
@@ -3393,7 +3500,7 @@ fn transaction_json_returning_value(
 async fn entity_staged_postimage_returning_rows(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
     write_rows: &RawWriteBatch,
@@ -3471,7 +3578,7 @@ fn entity_staged_returning_identity(
     ))
 }
 
-fn entity_live_returning_identity(row: MaterializedLiveStateRowRef<'_>) -> EntityReturningIdentity {
+fn entity_live_returning_identity(row: NativeStateRowRef<'_>) -> EntityReturningIdentity {
     (
         row.entity_pk().clone(),
         row.file_id().map(ToOwned::to_owned),
@@ -3503,7 +3610,7 @@ fn entity_returning_result(
 }
 
 fn update_assignments_preserve_constraints(
-    ctx: &dyn SqlWriteExecutionContext,
+    ctx: &impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
 ) -> bool {
@@ -3549,7 +3656,7 @@ fn assigned_columns_preserve_constraints(
 
 fn append_entity_update_row<'a>(
     rows: &mut RawWriteBatch,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     candidate: impl Into<EntityLiveRowRef<'a>>,
@@ -3623,7 +3730,7 @@ fn append_entity_update_row<'a>(
 }
 
 async fn entity_delete(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
@@ -3696,7 +3803,7 @@ fn entity_returning_row(
     returning: &crate::sql2::bind::write::BoundReturning,
     context: &EntityEvalContext<'_>,
     spec: &EntitySurfaceSpec,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Vec<Value>, LixError> {
@@ -3720,7 +3827,7 @@ fn entity_returning_value(
     expr: &BoundExpr,
     context: &EntityEvalContext<'_>,
     spec: &EntitySurfaceSpec,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Value, LixError> {
@@ -3796,7 +3903,7 @@ fn visible_entity_column<'a>(
 
 fn append_entity_conflict_update_row<'a>(
     rows: &mut RawWriteBatch,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
     candidate: impl Into<EntityLiveRowRef<'a>>,
     insert_row: RawWriteRowRef<'_>,
@@ -3868,7 +3975,7 @@ fn append_entity_conflict_update_row<'a>(
 }
 
 async fn stage_rows(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     mode: TransactionWriteMode,
     rows: RawWriteBatch,
 ) -> Result<u64, LixError> {
@@ -3960,8 +4067,8 @@ fn insert_row_entity_pk(
 fn find_conflict_candidate<'a>(
     insert_row: RawWriteRowRef<'_>,
     inserted_entity_pk: &EntityPk,
-    candidates: &'a MaterializedLiveStateBatch,
-) -> Option<MaterializedLiveStateRowRef<'a>> {
+    candidates: &'a NativeStateBatch,
+) -> Option<NativeStateRowRef<'a>> {
     candidates.iter().find(|candidate| {
         candidate_matches_insert_identity(*candidate, insert_row, inserted_entity_pk)
     })
@@ -3980,15 +4087,13 @@ fn candidate_matches_insert_identity<'a>(
 }
 
 async fn scan_entity_conflict_candidates(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
     insert_rows: &RawWriteBatch,
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    let mut branch_ids = std::collections::BTreeSet::new();
+) -> Result<NativeStateBatch, LixError> {
     let mut entity_pks = std::collections::BTreeSet::new();
     let mut file_ids = std::collections::BTreeSet::new();
     for row in insert_rows.iter() {
-        branch_ids.insert(row.branch_id.clone());
         entity_pks.insert(insert_row_entity_pk(row, spec)?);
         file_ids.insert(row.file_id.cloned());
     }
@@ -4002,75 +4107,114 @@ async fn scan_entity_conflict_candidates(
         .collect::<Vec<_>>();
 
     // Retention is an attribute of the one canonical live identity, not part
-    // of SQL conflict identity. A tracked INSERT therefore conflicts with an
-    // existing untracked row (and vice versa); `DO UPDATE` then preserves the
-    // existing row's retention through `append_entity_replace_row_from_live`.
-    ctx.scan_live_state_batch(&LiveStateScanRequest {
-        filter: LiveStateFilter {
-            schema_keys: vec![spec.schema_key.clone()],
-            entity_pks: entity_pks.into_iter().collect(),
-            branch_ids: branch_ids.into_iter().map(Into::into).collect(),
-            file_ids,
-            include_tombstones: false,
-            ..LiveStateFilter::default()
-        },
-        ..LiveStateScanRequest::default()
-    })
-    .await
+    // of SQL conflict identity. Resolve exact entity prefixes through the
+    // transaction's retained native view, then apply SQL identity predicates.
+    let mut candidates = scan_native_entity_ranges(
+        ctx,
+        spec.schema_key.as_str(),
+        entity_pks.into_iter().collect(),
+        false,
+    )
+    .await?;
+    candidates.rows.retain(|row| {
+        file_ids.iter().any(|file_id| match file_id {
+            NullableKeyFilter::Null => row.file_id.is_none(),
+            NullableKeyFilter::Value(file_id) => row.file_id.as_deref() == Some(file_id.as_str()),
+            NullableKeyFilter::Any => true,
+        })
+    });
+    Ok(candidates)
 }
 
 async fn scan_entity_candidates(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    let branch_ids = scan_branch_ids(&plan.bound.branch_scope)?;
-    let mut request = LiveStateScanRequest {
-        filter: LiveStateFilter {
-            schema_keys: vec![spec.schema_key.clone()],
-            branch_ids,
-            include_tombstones: false,
-            ..LiveStateFilter::default()
-        },
-        ..LiveStateScanRequest::default()
-    };
-    if let Some(entity_pks) =
-        bound_entity_pks_from_primary_key_predicate(spec, &plan.bound.predicate, params)
-    {
-        if entity_pks.is_empty() {
-            request.filter.rows = LiveStateRowFilter::None;
+) -> Result<NativeStateBatch, LixError> {
+    let _ = scan_branch_ids(&plan.bound.branch_scope)?;
+    let entity_pks =
+        bound_entity_pks_from_primary_key_predicate(spec, &plan.bound.predicate, params);
+    let mut rows = match entity_pks {
+        Some(entity_pks) => {
+            scan_native_entity_ranges(ctx, spec.schema_key.as_str(), entity_pks, false).await?
         }
-        request.filter.entity_pks = entity_pks;
-    }
-    ctx.scan_live_state_batch(&request).await
+        None => scan_native_entity_ranges(ctx, spec.schema_key.as_str(), Vec::new(), false).await?,
+    };
+    rows.rows.retain(|row| row.schema_key == spec.schema_key);
+    Ok(rows)
 }
 
 async fn scan_entity_candidates_for_pks(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     entity_pks: Vec<EntityPk>,
     metadata_only: bool,
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    ctx.scan_live_state_batch(&LiveStateScanRequest {
-        filter: LiveStateFilter {
-            schema_keys: vec![spec.schema_key.clone()],
-            entity_pks,
-            branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
-            include_tombstones: false,
-            ..LiveStateFilter::default()
-        },
-        projection: if metadata_only {
-            LiveStateProjection {
-                columns: vec!["metadata".to_string()],
+) -> Result<NativeStateBatch, LixError> {
+    let _ = (scan_branch_ids(&plan.bound.branch_scope)?, metadata_only);
+    let mut rows =
+        scan_native_entity_ranges(ctx, spec.schema_key.as_str(), entity_pks, false).await?;
+    rows.rows.retain(|row| row.schema_key == spec.schema_key);
+    Ok(rows)
+}
+
+async fn scan_native_entity_ranges(
+    ctx: &mut impl SqlWriteExecutionContext,
+    schema_key: &str,
+    entity_pks: Vec<EntityPk>,
+    include_tombstones: bool,
+) -> Result<NativeStateBatch, LixError> {
+    let mut rows = Vec::new();
+    if entity_pks.is_empty() {
+        let native = ctx
+            .state_view()
+            .range(None, None, None, include_tombstones)
+            .await
+            .map_err(|error| LixError::unknown(error.to_string()))?;
+        for row in native {
+            let row = NativeStateRow::from_state_row(row, ctx.active_branch_id())?;
+            if row.schema_key == schema_key {
+                rows.push(row);
             }
-        } else {
-            LiveStateProjection::default()
-        },
-        ..LiveStateScanRequest::default()
-    })
-    .await
+        }
+    } else {
+        for entity_pk in entity_pks {
+            let bounds = crate::forktree::encode_state_entity_prefix_bounds(schema_key, &entity_pk);
+            let native = ctx
+                .state_view()
+                .range(
+                    Some(bounds.lower.as_slice()),
+                    bounds.upper.as_deref(),
+                    None,
+                    include_tombstones,
+                )
+                .await
+                .map_err(|error| LixError::unknown(error.to_string()))?;
+            rows.extend(
+                native
+                    .into_iter()
+                    .map(|row| NativeStateRow::from_state_row(row, ctx.active_branch_id()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let encoded = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                schema_key,
+                file_id: None,
+                entity_pk: &entity_pk,
+            });
+            if let Some(row) = ctx
+                .state_view()
+                .untracked_points(std::slice::from_ref(&encoded), false)
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+            {
+                rows.push(NativeStateRow::from_untracked(row));
+            }
+        }
+    }
+    Ok(NativeStateBatch { rows })
 }
 
 fn bound_entity_pks_from_primary_key_predicate(
@@ -4417,7 +4561,7 @@ struct CertifiedInsertInput<'a> {
 }
 
 fn certified_entity_insert_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
@@ -4443,7 +4587,7 @@ fn certified_entity_insert_batch(
 }
 
 fn certified_entity_insert_parameter_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
@@ -4548,7 +4692,7 @@ fn append_canonical_json_string(output: &mut Vec<u8>, value: &str) -> Result<(),
 }
 
 fn certified_direct_parameter_insert_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
@@ -4906,7 +5050,7 @@ fn certified_direct_parameter_insert_batch(
 }
 
 fn certified_direct_path_value_insert_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
     row: &[BoundExpr],
@@ -5056,7 +5200,7 @@ fn certified_direct_path_value_insert_batch(
 }
 
 fn certified_entity_insert_rows<'a>(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
@@ -5394,7 +5538,7 @@ fn certified_entity_insert_rows<'a>(
 
 fn append_entity_insert_row(
     rows: &mut RawWriteBatch,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
@@ -5572,7 +5716,7 @@ fn reject_projected_global_write<'a>(
 
 fn append_entity_replace_row_from_live<'a>(
     rows: &mut RawWriteBatch,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
     row: impl Into<EntityLiveRowRef<'a>>,
     snapshot: Option<JsonValue>,
@@ -5862,7 +6006,7 @@ impl<'a> EntityEvalContext<'a> {
 }
 
 fn entity_spec(
-    ctx: &dyn SqlWriteExecutionContext,
+    ctx: &impl SqlWriteExecutionContext,
     schema_key: &str,
 ) -> Result<EntitySurfaceSpec, LixError> {
     ctx.public_catalog()?
@@ -5990,7 +6134,7 @@ fn entity_eval_value_from_cast_scalar(
 fn eval_expr(
     expr: &BoundExpr,
     context: &EntityEvalContext<'_>,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<JsonValue, LixError> {
@@ -6001,7 +6145,7 @@ fn eval_expr(
 fn eval_expr_value(
     expr: &BoundExpr,
     context: &EntityEvalContext<'_>,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<EntityEvalValue, LixError> {
@@ -6116,7 +6260,7 @@ fn predicate_matches(
     predicate: &BoundPredicate,
     context: &EntityEvalContext<'_>,
     spec: &EntitySurfaceSpec,
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<bool, LixError> {

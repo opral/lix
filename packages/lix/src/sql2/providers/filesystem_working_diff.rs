@@ -66,7 +66,7 @@ struct FilesystemWorkingDiffSpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for FilesystemWorkingDiffSpec<S>
+impl<S> TableSpec<S> for FilesystemWorkingDiffSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {

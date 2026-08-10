@@ -16,13 +16,13 @@ use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::TrackedStateFilter;
 use crate::tracked_state::encode_diff_id;
 use crate::{LixError, NullableKeyFilter};
 
 use super::checkpoint::filter_conjuncts;
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
+use super::history_util::StateFilter;
 use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
 pub(crate) fn register_diff_function<S>(
@@ -95,7 +95,7 @@ struct DiffSpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for DiffSpec<S>
+impl<S> TableSpec<S> for DiffSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -227,7 +227,7 @@ where
 
 #[derive(Clone, Debug)]
 struct DiffRoute {
-    filter: TrackedStateFilter,
+    filter: StateFilter,
     contradictory: bool,
 }
 
@@ -248,7 +248,7 @@ impl DiffRoute {
             .collect::<Vec<_>>();
         contradictory |= explicit_entity_filter && entity_pks.is_empty();
         Self {
-            filter: TrackedStateFilter {
+            filter: StateFilter {
                 schema_keys: schema_keys.unwrap_or_default(),
                 entity_pks,
                 file_ids: file_ids
@@ -263,7 +263,7 @@ impl DiffRoute {
     }
 }
 
-fn diff_row_matches(row: &HistoricalStateRow, filter: &TrackedStateFilter) -> bool {
+fn diff_row_matches(row: &HistoricalStateRow, filter: &StateFilter) -> bool {
     (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
         && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
         && (filter.file_ids.is_empty()

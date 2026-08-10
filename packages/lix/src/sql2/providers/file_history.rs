@@ -23,11 +23,10 @@ use crate::forktree::ForkTreeReadFacade;
 use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
 };
-use crate::tracked_state::TrackedStateFilter;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
-    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
+    ObservedStateOrdinal, ObservedStateRows, StateFilter, entity_pk_json_array,
 };
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 use crate::sql2::SqlChangelogQuerySource;
@@ -108,7 +107,7 @@ struct LixFileHistorySpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for LixFileHistorySpec<S>
+impl<S> TableSpec<S> for LixFileHistorySpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -496,7 +495,7 @@ struct FileHistoryObservedDescriptorRecord {
     id: String,
     directory_id: Option<String>,
     name: Option<String>,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 #[derive(Debug, Clone)]
@@ -504,7 +503,7 @@ struct FileHistoryObservedDirectoryRecord {
     id: String,
     parent_id: Option<String>,
     name: Option<String>,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 impl DirectoryPathRecord for FileHistoryObservedDirectoryRecord {
@@ -527,19 +526,19 @@ struct FileHistoryObservedBlobRecord {
     blob_hash: Option<String>,
     size_bytes: Option<u64>,
     deleted: bool,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 #[derive(Debug, Clone)]
 struct FileHistoryObservedPluginOwnerRecord {
     file_id: String,
     owner: Option<PluginFileOwner>,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 #[derive(Debug)]
 struct FileHistoryObservedState {
-    rows: ObservedTrackedStateRows,
+    rows: ObservedStateRows,
     descriptors: Vec<FileHistoryObservedDescriptorRecord>,
     directories: Vec<FileHistoryObservedDirectoryRecord>,
     blobs: Vec<FileHistoryObservedBlobRecord>,
@@ -1167,10 +1166,10 @@ where
         scan_file_history_observed_rows(
             historical,
             &observed_commit,
-            TrackedStateFilter {
+            StateFilter {
                 schema_keys: file_history_filesystem_schema_keys(),
                 include_tombstones: true,
-                ..TrackedStateFilter::default()
+                ..StateFilter::default()
             },
         )
         .await?
@@ -1194,14 +1193,14 @@ async fn load_file_history_plugin_owner_rows_at_observed_commit<S>(
     historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     lookup_ids: Option<&FileHistoryLookupIds>,
-) -> Result<ObservedTrackedStateRows, LixError>
+) -> Result<ObservedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
     scan_file_history_observed_rows(
         historical,
         observed_commit_id,
-        TrackedStateFilter {
+        StateFilter {
             schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
             entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
             file_ids: lookup_ids
@@ -1224,7 +1223,7 @@ async fn load_selected_file_history_observed_rows<S>(
     historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     lookup_ids: &FileHistoryLookupIds,
-) -> Result<ObservedTrackedStateRows, LixError>
+) -> Result<ObservedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -1244,7 +1243,7 @@ where
     let mut rows = scan_file_history_observed_rows(
         historical,
         observed_commit_id,
-        TrackedStateFilter {
+        StateFilter {
             schema_keys: vec![
                 FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 BLOB_REF_SCHEMA_KEY.to_string(),
@@ -1279,7 +1278,7 @@ async fn load_file_history_ancestor_directory_rows<S>(
     observed_commit_id: &SharedStr,
     descriptors: &[FileHistoryObservedDescriptorRecord],
     file_ids: Vec<NullableKeyFilter<String>>,
-) -> Result<ObservedTrackedStateRows, LixError>
+) -> Result<ObservedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -1288,7 +1287,7 @@ where
         .filter_map(|descriptor| descriptor.directory_id.clone())
         .collect::<BTreeSet<_>>();
     let mut requested = BTreeSet::new();
-    let mut rows = ObservedTrackedStateRows::default();
+    let mut rows = ObservedStateRows::default();
     while !pending.is_empty() {
         let ids = std::mem::take(&mut pending)
             .into_iter()
@@ -1300,7 +1299,7 @@ where
         let loaded = scan_file_history_observed_rows(
             historical,
             observed_commit_id,
-            TrackedStateFilter {
+            StateFilter {
                 schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
                 entity_pks: ids
                     .iter()
@@ -1335,8 +1334,8 @@ where
 async fn scan_file_history_observed_rows<S>(
     historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
-    filter: TrackedStateFilter,
-) -> Result<ObservedTrackedStateRows, LixError>
+    filter: StateFilter,
+) -> Result<ObservedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -1358,7 +1357,7 @@ where
                 && (filter.include_tombstones || !row.deleted)
         })
         .collect();
-    ObservedTrackedStateRows::from_rows(observed_commit_id.clone(), rows)
+    ObservedStateRows::from_rows(observed_commit_id.clone(), rows)
 }
 
 async fn load_plugin_registry_at_observed_commit<S>(
@@ -1371,7 +1370,7 @@ where
     let rows = scan_file_history_observed_rows(
         historical,
         observed_commit_id,
-        TrackedStateFilter {
+        StateFilter {
             schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
             entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
             file_ids: vec![NullableKeyFilter::Null],
@@ -2155,7 +2154,7 @@ fn parse_file_history_plugin_owners(
 }
 
 fn parse_file_history_observed_descriptors(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<FileHistoryObservedDescriptorRecord>, LixError> {
     rows.iter()
         .filter(|observed| observed.row().schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY)
@@ -2212,7 +2211,7 @@ fn parse_file_history_observed_descriptors(
 }
 
 fn parse_file_history_observed_directories(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<FileHistoryObservedDirectoryRecord>, LixError> {
     rows.iter()
         .filter(|observed| observed.row().schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
@@ -2268,7 +2267,7 @@ fn parse_file_history_observed_directories(
 }
 
 fn parse_file_history_observed_blobs(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<FileHistoryObservedBlobRecord>, LixError> {
     rows.iter()
         .filter(|observed| observed.row().schema_key() == BLOB_REF_SCHEMA_KEY)
@@ -2330,7 +2329,7 @@ fn parse_file_history_observed_blobs(
 }
 
 fn parse_file_history_observed_plugin_owners(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<FileHistoryObservedPluginOwnerRecord>, LixError> {
     rows.iter()
         .filter(|observed| {
@@ -2557,7 +2556,7 @@ mod tests {
     use crate::sql2::change_materialization::MaterializedChange;
     use crate::sql2::history_route::HistoryEntry;
 
-    use super::ObservedTrackedStateRows;
+    use super::ObservedStateRows;
     use super::{
         FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryDirectoryIndex,
         FileHistoryDirectoryRecord, FileHistoryFilesystemContext, FileHistoryLookupIds,
@@ -2729,7 +2728,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        let rows = ObservedTrackedStateRows::from_rows(SharedStr::from_static("commit-0"), rows)
+        let rows = ObservedStateRows::from_rows(SharedStr::from_static("commit-0"), rows)
             .expect("test observed rows");
         FileHistoryObservedState {
             descriptors: parse_file_history_observed_descriptors(&rows).expect("test descriptors"),
@@ -2976,7 +2975,7 @@ mod tests {
     #[test]
     fn authenticated_tombstones_remain_history_rows_but_nulls_fail_closed() {
         let file_id = "01920000-0000-7000-8000-0000000000a2";
-        let descriptor_tombstone = ObservedTrackedStateRows::from_rows(
+        let descriptor_tombstone = ObservedStateRows::from_rows(
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -2992,7 +2991,7 @@ mod tests {
         assert_eq!(descriptor[0].name, None);
 
         let directory_id = "01920000-0000-7000-8000-0000000000b2";
-        let directory_tombstone = ObservedTrackedStateRows::from_rows(
+        let directory_tombstone = ObservedStateRows::from_rows(
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -3007,7 +3006,7 @@ mod tests {
         assert_eq!(directory.len(), 1);
         assert_eq!(directory[0].name, None);
 
-        let blob_tombstone = ObservedTrackedStateRows::from_rows(
+        let blob_tombstone = ObservedStateRows::from_rows(
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::BLOB_REF_SCHEMA_KEY,
@@ -3022,7 +3021,7 @@ mod tests {
         assert_eq!(blob.len(), 1);
         assert_eq!(blob[0].blob_hash, None);
 
-        let owner_tombstone = ObservedTrackedStateRows::from_rows(
+        let owner_tombstone = ObservedStateRows::from_rows(
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::KEY_VALUE_SCHEMA_KEY,
@@ -3037,7 +3036,7 @@ mod tests {
         assert_eq!(owner.len(), 1);
         assert_eq!(owner[0].owner, None);
 
-        let authenticated_null = ObservedTrackedStateRows::from_rows(
+        let authenticated_null = ObservedStateRows::from_rows(
             SharedStr::from_static("commit-0"),
             vec![observed_row(
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -3095,7 +3094,7 @@ mod tests {
         );
         owner_tombstone.snapshot_content = Some("{}".into());
 
-        let rows = ObservedTrackedStateRows::from_rows(
+        let rows = ObservedStateRows::from_rows(
             SharedStr::from_static("commit-0"),
             vec![file_tombstone, directory_tombstone, owner_tombstone],
         )

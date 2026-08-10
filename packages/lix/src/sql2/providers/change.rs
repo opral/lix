@@ -54,7 +54,7 @@ struct ChangeSpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for ChangeSpec<S>
+impl<S> TableSpec<S> for ChangeSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {

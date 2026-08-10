@@ -14,13 +14,13 @@ use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::TrackedStateFilter;
 use crate::tracked_state::encode_diff_id;
 use crate::{LixError, NullableKeyFilter};
 
 use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
+use super::history_util::StateFilter;
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 use crate::sql2::error::lix_error_to_datafusion_error;
 
@@ -55,7 +55,7 @@ struct WorkingDiffSpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for WorkingDiffSpec<S>
+impl<S> TableSpec<S> for WorkingDiffSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -201,7 +201,7 @@ where
 #[derive(Clone, Debug)]
 struct WorkingDiffRoute {
     branch_ids: FileIdConstraint,
-    filter: TrackedStateFilter,
+    filter: StateFilter,
     contradictory: bool,
 }
 
@@ -235,7 +235,7 @@ impl WorkingDiffRoute {
 
         Ok(Self {
             branch_ids,
-            filter: TrackedStateFilter {
+            filter: StateFilter {
                 schema_keys: schema_keys.unwrap_or_default(),
                 entity_pks,
                 file_ids: file_ids
@@ -250,7 +250,7 @@ impl WorkingDiffRoute {
     }
 }
 
-fn diff_row_matches(row: &HistoricalStateRow, filter: &TrackedStateFilter) -> bool {
+fn diff_row_matches(row: &HistoricalStateRow, filter: &StateFilter) -> bool {
     (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
         && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
         && (filter.file_ids.is_empty()

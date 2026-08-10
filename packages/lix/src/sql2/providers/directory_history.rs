@@ -38,9 +38,7 @@ use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::history_util::{
-    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
-};
+use super::history_util::{ObservedStateOrdinal, ObservedStateRows, entity_pk_json_array};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -76,7 +74,7 @@ struct LixDirectoryHistorySpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for LixDirectoryHistorySpec<S>
+impl<S> TableSpec<S> for LixDirectoryHistorySpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -179,7 +177,7 @@ impl DirectoryPathRecord for DirectoryHistoryRecord {
 
 #[derive(Debug)]
 struct DirectoryHistoryObservedState {
-    rows: ObservedTrackedStateRows,
+    rows: ObservedStateRows,
     descriptors: Vec<DirectoryHistoryObservedRecord>,
 }
 
@@ -188,7 +186,7 @@ struct DirectoryHistoryObservedRecord {
     id: String,
     parent_id: Option<String>,
     name: Option<String>,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 impl DirectoryPathRecord for DirectoryHistoryObservedRecord {
@@ -410,10 +408,8 @@ where
             .into_iter()
             .filter(|row| row.key.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
             .collect();
-        let rows = ObservedTrackedStateRows::from_rows(
-            SharedStr::from(observed_commit_id.as_str()),
-            batch,
-        )?;
+        let rows =
+            ObservedStateRows::from_rows(SharedStr::from(observed_commit_id.as_str()), batch)?;
         let descriptors = parse_directory_history_observed_records(&rows)?;
         states.insert(
             observed_commit_id,
@@ -424,7 +420,7 @@ where
 }
 
 fn parse_directory_history_observed_records(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<DirectoryHistoryObservedRecord>, LixError> {
     rows.iter()
         .filter(|observed| observed.row().schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
