@@ -3,13 +3,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lix::CreateBranchOptions;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
     MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError, StorageRead,
     StorageWrite, WriteOptions,
 };
+use lix::{CreateBranchOptions, ExecuteBatchStatement, Value};
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const UNTRACKED_RACE_BRANCH_ID: &str = "01930000-0000-7000-8000-000000000018";
@@ -227,6 +227,66 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
         serde_json::json!("own")
     );
     transaction.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn execute_batch_preserves_order_params_metadata_and_atomic_errors() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let results = session
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                sql: "SELECT $1 AS ordinal".to_owned(),
+                params: vec![Value::Integer(7)],
+                label: None,
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT $1 AS ordinal".to_owned(),
+                params: vec![Value::Integer(11)],
+                label: None,
+            },
+        ])
+        .await
+        .expect("ordered parameter batch should execute");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].statement_index(), Some(0));
+    assert_eq!(results[0].rows()[0].get::<i64>("ordinal"), Ok(7));
+    assert_eq!(results[1].statement_index(), Some(1));
+    assert_eq!(results[1].rows()[0].get::<i64>("ordinal"), Ok(11));
+
+    let error = session
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ('batch-atomic', 'written')"
+                    .to_owned(),
+                params: Vec::new(),
+                label: None,
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT * FROM relation_that_does_not_exist".to_owned(),
+                params: Vec::new(),
+                label: None,
+            },
+        ])
+        .await
+        .expect_err("an invalid statement must abort the whole batch");
+    assert_eq!(error.code, "LIX_TABLE_NOT_FOUND");
+
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('batch-atomic', 'after')",
+            &[],
+        )
+        .await
+        .expect("a failed batch must not publish an earlier staged write");
 }
 
 simulation_test!(
