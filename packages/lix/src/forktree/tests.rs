@@ -90,6 +90,35 @@ fn branch_ref_timestamp_is_authenticated_and_round_trips() {
     assert_ne!(first_id, second_id);
 }
 
+#[test]
+fn checkpoint_baseline_target_corruption_fails_closed() {
+    let target = SnapshotTargetV1 {
+        role: SnapshotRole::CheckpointBaseline,
+        selector_id: SnapshotSelectorId::from_bytes(raw_id(0x71)),
+        branch_id: CanonicalBranchId::from_bytes(raw_id(0x72)),
+        branch_snapshot_object_id: content_id(0x73),
+        semantic_commit_object_id: content_id(0x74),
+    };
+    let (target_id, bytes) = target.encode().expect("baseline target should encode");
+
+    let mut corrupted_bytes = bytes.to_vec();
+    let last = corrupted_bytes
+        .last_mut()
+        .expect("encoded target should not be empty");
+    *last ^= 1;
+    assert!(
+        SnapshotTargetV1::decode(target_id, &corrupted_bytes).is_err(),
+        "mutating a baseline target body must fail its authenticated object check"
+    );
+
+    let mut corrupted_id = *target_id.as_bytes();
+    corrupted_id[0] ^= 1;
+    assert!(
+        SnapshotTargetV1::decode(ObjectId::from_bytes(corrupted_id), &bytes).is_err(),
+        "substituting a baseline target object ID must fail closed"
+    );
+}
+
 async fn commit_publication_for_test<S>(
     publication: PreparedPublication,
     storage: &S,
@@ -5139,7 +5168,10 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
         .await
         .expect("role view");
     let mut roles = PreparedPublication::from_global_epoch(&view).expect("roles");
-    for (index, role) in [SnapshotRole::Recovery].into_iter().enumerate() {
+    for (index, role) in [SnapshotRole::Recovery, SnapshotRole::CheckpointBaseline]
+        .into_iter()
+        .enumerate()
+    {
         let selector_id = SnapshotSelectorId::from_bytes(raw_id(index as u8 + 2));
         roles
             .publish_current_snapshot_pin(&view, role, selector_id, SelectorExpectation::Absent)
@@ -5152,7 +5184,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, target_id).await);
 
-    for retired_role in [3_u8, 4, 5] {
+    for retired_role in [4_u8, 5] {
         assert!(
             SnapshotRole::decode(retired_role).is_err(),
             "retired snapshot role {retired_role} must fail closed"

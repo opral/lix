@@ -199,6 +199,103 @@ simulation_test!(
 );
 
 simulation_test!(
+    create_branch_from_nonroot_head_has_a_valid_checkpoint_baseline,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('nonroot-branch-key', 'source')",
+            &[],
+        )
+        .await
+        .expect("non-root source write should succeed");
+        let source_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("source head should load")
+            .expect("source head should exist");
+
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-000000000005".to_string()),
+                name: "From non-root".to_string(),
+                from_commit_id: Some(source_head),
+            })
+            .await
+            .expect("branch should be created from the non-root head");
+        let branch = main.wrap_session(
+            engine
+                .open_session(&branch.id)
+                .await
+                .expect("non-root branch session should open"),
+            &engine,
+        );
+        assert_key_value(&branch, "nonroot-branch-key", Some("\"source\"")).await;
+        branch
+            .create_checkpoint()
+            .await
+            .expect("a new branch must use an actual first-parent checkpoint baseline");
+    }
+);
+
+simulation_test!(
+    rewound_branch_head_does_not_use_a_non_ancestor_checkpoint_baseline,
+    |sim| async move {
+        let (engine, main, branch) = create_draft_from_main(&sim).await;
+        branch
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('rewind-baseline-key', 'one')",
+                &[],
+            )
+            .await
+            .expect("first branch write should succeed");
+        let first_head = engine
+            .load_branch_head_commit_id("01930000-0000-7000-8000-000000000001")
+            .await
+            .expect("first branch head should load")
+            .expect("first branch head should exist");
+        branch
+            .create_checkpoint()
+            .await
+            .expect("first branch checkpoint should succeed");
+        branch
+            .execute(
+                "UPDATE lix_key_value SET value = 'two' WHERE key = 'rewind-baseline-key'",
+                &[],
+            )
+            .await
+            .expect("second branch write should succeed");
+
+        main.execute(
+            &format!(
+                "UPDATE lix_branch SET commit_id = '{first_head}' \
+                 WHERE id = '01930000-0000-7000-8000-000000000001'"
+            ),
+            &[],
+        )
+        .await
+        .expect("rewinding a branch without local untracked state should succeed");
+        let rewound = main.wrap_session(
+            engine
+                .open_session("01930000-0000-7000-8000-000000000001")
+                .await
+                .expect("rewound branch session should open"),
+            &engine,
+        );
+        rewound
+            .create_checkpoint()
+            .await
+            .expect("checkpoint lookup must reject a non-ancestor baseline and recover safely");
+    }
+);
+
+simulation_test!(
     create_branch_rejects_missing_explicit_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;

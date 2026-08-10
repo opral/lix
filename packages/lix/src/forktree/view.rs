@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
+use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
@@ -16,7 +17,8 @@ use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
     BlobChunkV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry,
     ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, branch_selector_key, global_selector_key,
+    RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
+    branch_selector_key, global_selector_key, snapshot_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 
@@ -156,6 +158,17 @@ where
             &self.read,
         )
         .await
+    }
+
+    pub(crate) async fn load_state_value_at_commit(
+        &self,
+        commit_id: crate::changelog::CommitId,
+        key: &[u8],
+        include_tombstone: bool,
+    ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, crate::LixError>
+    {
+        super::serving::load_state_value_at_commit(&self.read, commit_id, key, include_tombstone)
+            .await
     }
 
     /// Scans the authenticated untracked overlay owned by this branch. An
@@ -1523,11 +1536,161 @@ where
         Ok(checkpoints)
     }
 
+    async fn latest_checkpoint_from_baseline(
+        &self,
+        head: crate::changelog::CommitId,
+        branch_id: &str,
+    ) -> Result<Option<crate::changelog::CommitId>, crate::LixError> {
+        let branch_view = self.branch(branch_id).await?;
+        let branch_uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+            crate::LixError::new(
+                crate::LixError::CODE_INVALID_PARAM,
+                format!("checkpoint branch_id must be a canonical UUID: {error}"),
+            )
+        })?;
+        let canonical_branch = CanonicalBranchId::from_bytes(*branch_uuid.as_bytes());
+        let selector_id = SnapshotSelectorId::from_bytes(*canonical_branch.as_bytes());
+        let key = snapshot_selector_key(SnapshotRole::CheckpointBaseline, selector_id);
+        let Some(raw_selector) = branch_view.load_selector_value(&key).await? else {
+            return Ok(None);
+        };
+        let selector = SnapshotSelectorV1::decode(&raw_selector).map_err(LixError::from)?;
+        if selector.role != SnapshotRole::CheckpointBaseline || selector.selector_id != selector_id
+        {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "checkpoint baseline selector identity is inconsistent",
+            ));
+        }
+        let target_bytes = branch_view
+            .load_object_bytes(selector.target_object_id)
+            .await
+            .map_err(LixError::from)?;
+        let target = SnapshotTargetV1::decode(selector.target_object_id, &target_bytes)
+            .map_err(LixError::from)?;
+        if target.role != SnapshotRole::CheckpointBaseline
+            || target.selector_id != selector_id
+            || target.branch_id != canonical_branch
+        {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "checkpoint baseline target identity is inconsistent",
+            ));
+        }
+        let snapshot_bytes = branch_view
+            .load_object_bytes(target.branch_snapshot_object_id)
+            .await
+            .map_err(LixError::from)?;
+        let snapshot = BranchSnapshotV1::decode(target.branch_snapshot_object_id, &snapshot_bytes)
+            .map_err(LixError::from)?;
+        if snapshot.branch_id != canonical_branch {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "checkpoint baseline branch snapshot identity is inconsistent",
+            ));
+        }
+        let commit_bytes = branch_view
+            .load_object_bytes(target.semantic_commit_object_id)
+            .await
+            .map_err(LixError::from)?;
+        let commit = CommitObjectV1::decode(target.semantic_commit_object_id, &commit_bytes)
+            .map_err(LixError::from)?;
+        let baseline_commit_id =
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*commit.commit_id.as_bytes()));
+        let catalog_value = branch_view
+            .lookup_tree_value(
+                branch_view.repository_root().commit_catalog_root,
+                "commit",
+                commit.commit_id.as_bytes(),
+            )
+            .await
+            .map_err(LixError::from)?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "checkpoint baseline CommitCatalog entry is absent",
+                )
+            })?;
+        let catalog_entry = CommitCatalogEntry::decode(&catalog_value).map_err(LixError::from)?;
+        if catalog_entry.commit_object_id != target.semantic_commit_object_id {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "checkpoint baseline CommitCatalog identity is inconsistent",
+            ));
+        }
+        let canonical_commit = super::serving::load_commit_summary(&branch_view, commit.commit_id)
+            .await?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "checkpoint baseline commit is absent",
+                )
+            })?;
+        if canonical_commit != commit {
+            return Err(crate::LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "checkpoint baseline commit object is not catalog-authenticated",
+            ));
+        }
+        if snapshot.semantic_head_commit_object_id != target.semantic_commit_object_id
+            || snapshot.local_state_root != commit.local_state_root
+            || snapshot.historical_global_state_root != commit.global_state_root
+        {
+            return Err(crate::LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "checkpoint baseline snapshot does not match its commit",
+            ));
+        }
+
+        let mut current_id = head;
+        let mut visited = HashSet::new();
+        loop {
+            if current_id == baseline_commit_id {
+                return Ok(Some(baseline_commit_id));
+            }
+            if !visited.insert(current_id) {
+                return Err(crate::LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "cycle encountered while checking checkpoint baseline ancestry",
+                ));
+            }
+            let current = super::serving::load_commit_summary(
+                &branch_view,
+                CommitId::from_bytes(*current_id.as_uuid().as_bytes()),
+            )
+            .await?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "requested checkpoint head is absent",
+                )
+            })?;
+            let Some(parent_object_id) = current.parent_commit_object_ids.first() else {
+                return Ok(None);
+            };
+            let parent_bytes = branch_view
+                .load_object_bytes(*parent_object_id)
+                .await
+                .map_err(LixError::from)?;
+            let parent =
+                CommitObjectV1::decode(*parent_object_id, &parent_bytes).map_err(LixError::from)?;
+            current_id = crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+                *parent.commit_id.as_bytes(),
+            ));
+        }
+    }
+
     pub(crate) async fn latest_checkpoint_for_branch(
         &self,
         head: crate::changelog::CommitId,
         branch_id: &str,
     ) -> Result<Option<crate::changelog::CommitId>, crate::LixError> {
+        if let Some(commit_id) = self
+            .latest_checkpoint_from_baseline(head, branch_id)
+            .await?
+        {
+            return Ok(Some(commit_id));
+        }
         Ok(self
             .checkpoint_history_from_head(head, branch_id)
             .await?

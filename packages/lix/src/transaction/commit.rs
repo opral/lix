@@ -23,13 +23,17 @@ use crate::transaction::staging::{
 use crate::transaction::types::PreparedStateRowRef;
 
 use crate::forktree::{
-    BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
-    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef, StateKey,
-    StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
-    UntrackedValueRef, encode_state_key, encode_state_value, load_commit, load_commit_summary,
-    open_coherent_view_on_read, select_historical_commit_member, state_points,
+    AuthenticatedCommitClosureCache, BranchSnapshotV1, BranchStateTransition, CanonicalBranchId,
+    ChangeCatalogEntry, ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1,
+    CommitCatalogEntry, CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1,
+    CommitObjectV1, ForkTreeReadFacade, ObjectId, OrderedBranchHistoryTransition,
+    PreparedPublication, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
+    StateCellRef, StateKey, StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation,
+    StateValueRef, UntrackedValueRef, encode_state_key, encode_state_value,
+    load_change_catalog_entries_on_view, load_commit, load_commit_summary,
+    open_coherent_view_on_read,
+    select_historical_commit_member_from_authenticated_source_with_cache, snapshot_selector_key,
+    state_points, state_points_on_read,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -845,11 +849,20 @@ where
                         ),
                     )
                 })?;
+            let source_branch_id = uuid::Uuid::from_bytes(*view.branch_id().as_bytes()).to_string();
+            let baseline_commit_id = ForkTreeReadFacade::new(view.retained_read().clone())
+                .latest_checkpoint_for_branch(source_head, &source_branch_id)
+                .await?
+                .ok_or_else(|| writer_error("branch creation source has no checkpoint baseline"))?;
+            let baseline_commit = load_commit(view, forktree_commit_id(baseline_commit_id))
+                .await?
+                .ok_or_else(|| writer_error("branch creation checkpoint baseline is absent"))?;
             publication
                 .publish_new_branch_selector(
                     view,
                     branch_id,
                     &source_commit,
+                    &baseline_commit,
                     forktree_change_id(intent.change_id),
                     intent.updated_at,
                 )
@@ -938,6 +951,12 @@ enum PendingStateMutation {
         tombstone: bool,
         blob_manifest_object_ids: Vec<ObjectId>,
     },
+}
+
+struct AuthenticatedSourceCommit {
+    object_id: ObjectId,
+    commit: CommitObjectV1,
+    members: Vec<CommitMemberV1>,
 }
 
 async fn prepare_ordered_single_branch_history<R>(
@@ -1057,6 +1076,12 @@ where
     }
 
     let mut touched_presence = BTreeMap::<Vec<u8>, bool>::new();
+    // Selected checkpoint members commonly refer to a small number of source
+    // commits (often one large seed commit). Authenticate each source commit
+    // and its complete member-page closure once per retained operation, then
+    // keep the per-member catalog/payload checks below intact.
+    let mut authenticated_sources = BTreeMap::<CommitId, AuthenticatedSourceCommit>::new();
+    let mut authenticated_commit_closures = AuthenticatedCommitClosureCache::default();
     // Fresh identities are the only new catalog members in ordered history;
     // selected historical members already own catalog entries. Build the
     // unique authenticated key set before any fresh object is encoded.
@@ -1080,6 +1105,125 @@ where
             .branch_ref_change_id,
     ));
     let catalog_order = canonical_change_order(&catalog_change_ids)?;
+
+    // Resolve every existence decision against the sequence roots in one
+    // authenticated batch. Selected source roots are grouped below by their
+    // already-authenticated source commit, so no row reopens a tree path.
+    let mut sequence_keys = BTreeSet::<Vec<u8>>::new();
+    for row in prepared.state_rows.iter().filter(|row| !row.untracked) {
+        sequence_keys.insert(encode_state_key(StateKeyRef {
+            schema_key: row.schema_key.as_str(),
+            file_id: row.file_id.map(|value| value.as_str()),
+            entity_pk: row.entity_pk,
+        }));
+    }
+    for draft in &drafts {
+        for batch in &draft.selected_change_batches {
+            for selected in batch.iter() {
+                sequence_keys.insert(encode_state_key(StateKeyRef {
+                    schema_key: selected.schema_key(),
+                    file_id: selected.file_id(),
+                    entity_pk: selected.entity_pk(),
+                }));
+            }
+        }
+    }
+    let sequence_keys = sequence_keys.into_iter().collect::<Vec<_>>();
+    let sequence_values = state_points_on_read(
+        sequence_global_root,
+        Some(sequence_local_root),
+        &sequence_keys,
+        true,
+        view.retained_read(),
+    )
+    .await?;
+    let sequence_values = sequence_keys
+        .into_iter()
+        .zip(sequence_values)
+        .collect::<BTreeMap<_, _>>();
+
+    // Preload each distinct selected source commit once. `load_commit` is the
+    // full retained-commit validator; reusing only its successful result is
+    // safe because this map cannot outlive the current publication operation.
+    for draft in &drafts {
+        for batch in &draft.selected_change_batches {
+            for selected in batch.iter() {
+                if staged_ids.contains(&selected.source_commit_id) {
+                    return Err(writer_error(
+                        "selected history cannot source an uncommitted commit from the same batch",
+                    ));
+                }
+                if authenticated_sources.contains_key(&selected.source_commit_id) {
+                    continue;
+                }
+                let source = load_commit(view, forktree_commit_id(selected.source_commit_id))
+                    .await?
+                    .ok_or_else(|| {
+                        writer_error("selected source commit is absent from CommitCatalog")
+                    })?;
+                let (object_id, _) = source.encode()?;
+                let members = view.load_commit_members(&source).await?;
+                authenticated_commit_closures.seed(object_id, &source, &members);
+                authenticated_sources.insert(
+                    selected.source_commit_id,
+                    AuthenticatedSourceCommit {
+                        object_id,
+                        commit: source,
+                        members,
+                    },
+                );
+            }
+        }
+    }
+    let mut source_keys = BTreeMap::<CommitId, BTreeSet<Vec<u8>>>::new();
+    for draft in &drafts {
+        for batch in &draft.selected_change_batches {
+            for selected in batch.iter() {
+                source_keys
+                    .entry(selected.source_commit_id)
+                    .or_default()
+                    .insert(encode_state_key(StateKeyRef {
+                        schema_key: selected.schema_key(),
+                        file_id: selected.file_id(),
+                        entity_pk: selected.entity_pk(),
+                    }));
+            }
+        }
+    }
+    let mut selected_source_values = BTreeMap::<
+        CommitId,
+        BTreeMap<Vec<u8>, Option<(crate::forktree::StateValue, StateSource)>>,
+    >::new();
+    for (source_id, keys) in source_keys {
+        let source = authenticated_sources
+            .get(&source_id)
+            .ok_or_else(|| writer_error("selected source commit cache entry is absent"))?;
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        let values = state_points_on_read(
+            source.commit.global_state_root,
+            Some(source.commit.local_state_root),
+            &keys,
+            true,
+            view.retained_read(),
+        )
+        .await?;
+        selected_source_values.insert(source_id, keys.into_iter().zip(values).collect());
+    }
+
+    let selected_change_ids = drafts
+        .iter()
+        .flat_map(|draft| {
+            draft.selected_change_batches.iter().flat_map(|batch| {
+                batch
+                    .iter()
+                    .map(|selected| forktree_change_id(selected.change_id))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let selected_change_ids = selected_change_ids.into_iter().collect::<Vec<_>>();
+    let selected_catalog_entries =
+        load_change_catalog_entries_on_view(view, &selected_change_ids).await?;
+    authenticated_commit_closures.seed_change_catalog_entries(selected_catalog_entries);
 
     let mut contents = Vec::with_capacity(drafts.len());
     for draft in drafts {
@@ -1162,10 +1306,9 @@ where
 
             let existed = match touched_presence.get(&key) {
                 Some(existed) => *existed,
-                None => view
-                    .state_point_at_roots(sequence_global_root, sequence_local_root, &key, true)
-                    .await?
-                    .as_ref()
+                None => sequence_values
+                    .get(&key)
+                    .and_then(Option::as_ref)
                     .is_some_and(|(_, source)| row.global || *source == StateSource::Branch),
             };
             let mutation = if row.global && row.snapshot.is_none() {
@@ -1200,12 +1343,24 @@ where
                         "selected history cannot source an uncommitted commit from the same batch",
                     ));
                 }
-                let (member, source_commit, source_change) = select_historical_commit_member(
-                    view,
-                    forktree_commit_id(selected.source_commit_id),
-                    forktree_change_id(selected.change_id),
-                )
-                .await?;
+                let source = authenticated_sources
+                    .get(&selected.source_commit_id)
+                    .ok_or_else(|| writer_error("selected source commit cache entry is absent"))?;
+                let (member, source_commit, source_change) =
+                    select_historical_commit_member_from_authenticated_source_with_cache(
+                        view,
+                        source.object_id,
+                        &source.commit,
+                        &source.members,
+                        forktree_change_id(selected.change_id),
+                        &mut authenticated_commit_closures,
+                    )
+                    .await?;
+                let Some((_source_commit_object_id, _source_ordinal)) = member.source() else {
+                    return Err(writer_error(
+                        "selected history member lost its authenticated source edge",
+                    ));
+                };
                 max_selected_source_generation = Some(
                     max_selected_source_generation.map_or(source_commit.generation, |generation| {
                         generation.max(source_commit.generation)
@@ -1227,24 +1382,14 @@ where
                         "selected history identity or lifecycle differs from its Change payload",
                     ));
                 }
-                let (source_value, source_domain) = view
-                    .state_point_at_roots(
-                        source_commit.global_state_root,
-                        source_commit.local_state_root,
-                        &identity,
-                        true,
-                    )
-                    .await?
+                let (source_value, source_domain) = selected_source_values
+                    .get(&selected.source_commit_id)
+                    .and_then(|values| values.get(&identity))
+                    .and_then(Option::as_ref)
+                    .cloned()
                     .ok_or_else(|| writer_error("selected history source state row is absent"))?;
                 let selected_global = source_domain == StateSource::Global;
-                let sequence_value = view
-                    .state_point_at_roots(
-                        sequence_global_root,
-                        sequence_local_root,
-                        &identity,
-                        true,
-                    )
-                    .await?;
+                let sequence_value = sequence_values.get(&identity).cloned().flatten();
                 let sequence_semantically_absent = sequence_value
                     .as_ref()
                     .is_none_or(|(value, _)| value.cell.deleted());
@@ -1502,6 +1647,38 @@ where
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
     };
+    let final_branch_snapshot = BranchSnapshotV1 {
+        branch_id: view.branch_id(),
+        local_state_root: final_local_state_root,
+        semantic_head_commit_object_id: final_commit_object_id,
+        latest_ref_change_object_id: Some(ref_object_id),
+        historical_global_state_root: final_global_state_root,
+    };
+    let (final_branch_snapshot_object_id, _) = final_branch_snapshot.encode()?;
+    for checkpoint in &prepared.checkpoint_publications {
+        // Empty checkpoints still advance the authenticated checkpoint
+        // baseline.  Otherwise the next empty checkpoint would compare its
+        // head with the prior non-empty baseline, incorrectly rotating the
+        // recovery selector and eventually dropping the retained interval.
+        let (checkpoint_object_id, _) = staged_commits
+            .get(&checkpoint.checkpoint_commit_id)
+            .ok_or_else(|| writer_error("checkpoint baseline commit was not staged"))?;
+        let selector_id = SnapshotSelectorId::from_bytes(*view.branch_id().as_bytes());
+        let selector_key = snapshot_selector_key(SnapshotRole::CheckpointBaseline, selector_id);
+        let expected = view
+            .load_selector_value(&selector_key)
+            .await?
+            .map(SelectorExpectation::Equals)
+            .unwrap_or(SelectorExpectation::Absent);
+        publication.publish_snapshot_pin_to_commit(
+            SnapshotRole::CheckpointBaseline,
+            selector_id,
+            view.branch_id(),
+            final_branch_snapshot_object_id,
+            *checkpoint_object_id,
+            expected,
+        )?;
+    }
     let transition = OrderedBranchHistoryTransition {
         state_edits,
         state_domain_global: state_domain.unwrap_or(false),
@@ -1510,13 +1687,7 @@ where
         semantic_commits,
         fresh_changes: Vec::new(),
         branch_ref_change,
-        branch_snapshot: BranchSnapshotV1 {
-            branch_id: view.branch_id(),
-            local_state_root: final_local_state_root,
-            semantic_head_commit_object_id: final_commit_object_id,
-            latest_ref_change_object_id: Some(ref_object_id),
-            historical_global_state_root: final_global_state_root,
-        },
+        branch_snapshot: final_branch_snapshot,
         repository_root,
     };
     publication

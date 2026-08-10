@@ -215,6 +215,59 @@ simulation_test!(
 );
 
 simulation_test!(
+    checkpoint_preserves_global_to_branch_override_entries,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let global = sim.wrap_session(
+            engine
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        global
+            .execute(
+                "INSERT INTO lix_key_value \
+                 (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('global-branch-checkpoint-key', 'global', true, false)",
+                &[],
+            )
+            .await
+            .expect("global row should publish");
+
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value \
+                 (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('global-branch-checkpoint-key', 'branch', false, false)",
+                &[],
+            )
+            .await
+            .expect("branch override should publish");
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT value FROM lix_key_value \
+                 WHERE key = 'global-branch-checkpoint-key'",
+            )
+            .await,
+            vec![vec![Value::Json(json!("branch"))]]
+        );
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint must retain a Global-to-Branch override");
+    }
+);
+
+simulation_test!(
     working_diff_reports_net_tracked_adds_and_removals_after_a_revert,
     |sim| async move {
         let engine = sim.boot_engine().await;

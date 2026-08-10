@@ -8970,6 +8970,7 @@ mod tests {
                     &initial_view,
                     branch,
                     &source_commit,
+                    &source_commit,
                     crate::forktree::ChangeId::from_bytes([0x5b; 16]),
                     LixTimestamp::expect_parse("fixture branch timestamp", "2026-04-23T00:00:00Z"),
                 )

@@ -12,10 +12,10 @@ use super::blob::{AuthenticatedBlobRef, CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeObjectV1, CommitObjectV1, GlobalSelectorV1, RepositoryRootV1,
-    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
-    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
-    upload_selector_key,
+    ChangeCatalogOwner, ChangeObjectV1, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
+    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
+    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
+    snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, StateTreeEdit};
@@ -474,6 +474,7 @@ impl PreparedPublication {
         view: &CoherentView<R>,
         branch_id: super::model::CanonicalBranchId,
         source_commit: &CommitObjectV1,
+        baseline_commit: &CommitObjectV1,
         change_id: super::model::ChangeId,
         updated_at: crate::common::LixTimestamp,
     ) -> Result<ObjectId, StorageError>
@@ -522,6 +523,15 @@ impl PreparedPublication {
             historical_global_state_root: source_commit.global_state_root,
         };
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
+        let (baseline_commit_object_id, _) = baseline_commit.encode()?;
+        let baseline_snapshot = BranchSnapshotV1 {
+            branch_id,
+            local_state_root: baseline_commit.local_state_root,
+            semantic_head_commit_object_id: baseline_commit_object_id,
+            latest_ref_change_object_id: None,
+            historical_global_state_root: baseline_commit.global_state_root,
+        };
+        let baseline_snapshot_id = self.stage_branch_snapshot(baseline_snapshot)?;
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
         self.stage_catalog_edit(change_catalog_edit)?;
         self.stage_repository_root(RepositoryRootV1 {
@@ -535,6 +545,14 @@ impl PreparedPublication {
                 branch_snapshot_object_id: snapshot_id,
                 selector_generation: 1,
             },
+            SelectorExpectation::Absent,
+        )?;
+        self.publish_snapshot_pin_to_commit(
+            super::model::SnapshotRole::CheckpointBaseline,
+            super::model::SnapshotSelectorId::from_bytes(*branch_id.as_bytes()),
+            branch_id,
+            baseline_snapshot_id,
+            baseline_commit_object_id,
             SelectorExpectation::Absent,
         )?;
         Ok(snapshot_id)
@@ -555,6 +573,24 @@ impl PreparedPublication {
         R: StorageAdapterRead,
     {
         let Some(next_commit) = next_commit else {
+            let baseline_key = super::model::snapshot_selector_key(
+                super::model::SnapshotRole::CheckpointBaseline,
+                super::model::SnapshotSelectorId::from_bytes(*view.branch_id().as_bytes()),
+            );
+            if let Some(raw_baseline) = view.load_selector_value(&baseline_key).await? {
+                let baseline = SnapshotSelectorV1::decode(&raw_baseline)?;
+                if baseline.role != super::model::SnapshotRole::CheckpointBaseline
+                    || baseline.selector_id
+                        != super::model::SnapshotSelectorId::from_bytes(
+                            *view.branch_id().as_bytes(),
+                        )
+                {
+                    return Err(corruption(
+                        "checkpoint baseline selector identity does not match its branch",
+                    ));
+                }
+                self.delete_snapshot_selector(baseline, raw_baseline)?;
+            }
             return self.delete_branch_selector(
                 view.branch_selector(),
                 view.raw_branch_selector().clone(),
@@ -1097,16 +1133,15 @@ impl PreparedPublication {
 
     /// Pins the exact selected branch snapshot/head under any retained-root
     /// role without letting a caller supply an unrelated object edge.
-    pub(crate) fn publish_current_snapshot_pin<R>(
+    pub(crate) fn publish_snapshot_pin_to_commit(
         &mut self,
-        view: &CoherentView<R>,
         role: super::model::SnapshotRole,
         selector_id: super::model::SnapshotSelectorId,
+        branch_id: super::model::CanonicalBranchId,
+        branch_snapshot_object_id: ObjectId,
+        semantic_commit_object_id: ObjectId,
         expected: SelectorExpectation,
-    ) -> Result<ObjectId, StorageError>
-    where
-        R: StorageAdapterRead,
-    {
+    ) -> Result<ObjectId, StorageError> {
         let selector_generation = match &expected {
             SelectorExpectation::Absent => 1,
             SelectorExpectation::Equals(raw_selector) => {
@@ -1125,9 +1160,9 @@ impl PreparedPublication {
         let target = SnapshotTargetV1 {
             role,
             selector_id,
-            branch_id: view.branch_id(),
-            branch_snapshot_object_id: view.branch_selector().branch_snapshot_object_id,
-            semantic_commit_object_id: view.branch_snapshot().semantic_head_commit_object_id,
+            branch_id,
+            branch_snapshot_object_id,
+            semantic_commit_object_id,
         };
         let target_id = self.stage_snapshot_target(target)?;
         self.put_snapshot_selector(
@@ -1140,6 +1175,26 @@ impl PreparedPublication {
             expected,
         )?;
         Ok(target_id)
+    }
+
+    pub(crate) fn publish_current_snapshot_pin<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        role: super::model::SnapshotRole,
+        selector_id: super::model::SnapshotSelectorId,
+        expected: SelectorExpectation,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        self.publish_snapshot_pin_to_commit(
+            role,
+            selector_id,
+            view.branch_id(),
+            view.branch_selector().branch_snapshot_object_id,
+            view.branch_snapshot().semantic_head_commit_object_id,
+            expected,
+        )
     }
 
     #[cfg(test)]
@@ -1485,6 +1540,28 @@ impl PreparedPublication {
             ));
         }
 
+        // Selected-member authority stays inside this ForkTree publication.
+        // A caller may batch source reads, but it cannot hand the writer a
+        // forgeable membership set and ask the writer to trust it. Install
+        // only validated source closures in this operation-local cache, then
+        // validate each selected member against the target and source edges.
+        let selected_change_ids = semantic_commits
+            .iter()
+            .flat_map(|commit| {
+                commit
+                    .members
+                    .iter()
+                    .filter(|member| member.source().is_some())
+                    .map(CommitMemberV1::change_id)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut selected_closures = super::serving::AuthenticatedCommitClosureCache::default();
+        selected_closures.seed_change_catalog_entries(
+            super::serving::load_change_catalog_entries_on_view(view, &selected_change_ids).await?,
+        );
+
         let is_global = state_domain_global;
         let first_parent_object_id = semantic_commits
             .first()
@@ -1603,26 +1680,40 @@ impl PreparedPublication {
                             ));
                         }
                     }
-                    Some(_) => {
-                        let raw_entry = view
-                            .lookup_tree_value(
-                                view.repository_root().change_catalog_root,
-                                "change",
-                                change_id.as_bytes(),
-                            )
-                            .await?
+                    Some((source_commit_object_id, source_ordinal)) => {
+                        let change_entry = selected_closures
+                            .change_catalog_entry(change_id)
                             .ok_or_else(|| {
-                                corruption("selected history member has no ChangeCatalog owner")
+                                corruption("selected history ChangeCatalog entry is absent")
                             })?;
-                        view.validate_member_catalog_owner(
+                        let (_, source_members) =
+                            super::serving::load_authenticated_commit_member_closure(
+                                view.retained_read(),
+                                view.repository_root().commit_catalog_root,
+                                source_commit_object_id,
+                                &mut selected_closures,
+                            )
+                            .await?;
+                        super::serving::validate_member_catalog_owner_with_authenticated_closure(
+                            view.retained_read(),
                             view.repository_root().commit_catalog_root,
                             commit_object_id,
                             commit.generation,
                             ordinal,
                             member.clone(),
-                            super::model::ChangeCatalogEntry::decode(&raw_entry)?,
+                            change_entry,
+                            &mut selected_closures,
                         )
                         .await?;
+                        if source_members
+                            .get(source_ordinal as usize)
+                            .map(CommitMemberV1::change_id)
+                            != Some(change_id)
+                        {
+                            return Err(corruption(
+                                "selected history source ordinal does not match ChangeId",
+                            ));
+                        }
                     }
                 }
             }

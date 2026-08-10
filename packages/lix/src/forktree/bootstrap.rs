@@ -28,7 +28,9 @@ use crate::storage_adapter::{
 use super::model::{
     BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
     ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1,
-    CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
+    CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId,
+    SnapshotSelectorV1, SnapshotTargetV1, branch_selector_key, global_selector_key,
+    snapshot_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::state::{
@@ -385,7 +387,24 @@ where
         .insert(main_snapshot_id, main_snapshot_bytes)
         .map_err(LixError::from)?;
 
-    let mut writes = StorageWriteSet::with_capacity(objects.iter().count() + 5, 3);
+    for (branch_id, snapshot_id) in [
+        (global_branch, global_snapshot_id),
+        (main_branch_id, main_snapshot_id),
+    ] {
+        let target = SnapshotTargetV1 {
+            role: SnapshotRole::CheckpointBaseline,
+            selector_id: SnapshotSelectorId::from_bytes(*branch_id.as_bytes()),
+            branch_id,
+            branch_snapshot_object_id: snapshot_id,
+            semantic_commit_object_id: commit_object_id,
+        };
+        let (target_id, target_bytes) = target.encode().map_err(LixError::from)?;
+        objects
+            .insert(target_id, target_bytes)
+            .map_err(LixError::from)?;
+    }
+
+    let mut writes = StorageWriteSet::with_capacity(objects.iter().count() + 7, 7);
     for (id, bytes) in objects.iter() {
         writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
     }
@@ -418,6 +437,30 @@ where
             BranchSelectorV1 {
                 branch_id,
                 branch_snapshot_object_id: snapshot_id,
+                selector_generation: 1,
+            }
+            .encode()
+            .map_err(LixError::from)?
+            .to_vec(),
+        );
+        let selector_id = SnapshotSelectorId::from_bytes(*branch_id.as_bytes());
+        let target_id = SnapshotTargetV1 {
+            role: SnapshotRole::CheckpointBaseline,
+            selector_id,
+            branch_id,
+            branch_snapshot_object_id: snapshot_id,
+            semantic_commit_object_id: commit_object_id,
+        }
+        .encode()
+        .map_err(LixError::from)?
+        .0;
+        writes.put(
+            SELECTOR_SPACE,
+            snapshot_selector_key(SnapshotRole::CheckpointBaseline, selector_id).to_vec(),
+            SnapshotSelectorV1 {
+                role: SnapshotRole::CheckpointBaseline,
+                selector_id,
+                target_object_id: target_id,
                 selector_generation: 1,
             }
             .encode()

@@ -51,10 +51,8 @@ where
                     };
                     let historical = transaction.forktree_read_facade();
                     let previous_checkpoint_commit_id = historical
-                        .checkpoint_history_from_head(head_commit_id, &branch_id)
+                        .latest_checkpoint_for_branch(head_commit_id, &branch_id)
                         .await?
-                        .into_iter()
-                        .next()
                         .ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
@@ -62,8 +60,7 @@ where
                                     "branch '{branch_id}' has no checkpoint baseline in its first-parent history"
                                 ),
                             )
-                        })?
-                        .commit_id;
+                        })?;
                     let interval_has_commits =
                         head_commit_id != previous_checkpoint_commit_id;
                     let selected_changes = {
@@ -104,16 +101,17 @@ where
                             StagedCommitChangeBatchBuilder::with_capacity(entries.len());
                         let mut source_membership_exact = true;
                         for entry in entries.into_iter().filter(|entry| {
-                            entry
+                            (entry
                                 .before
                                 .as_ref()
-                                .or(entry.after.as_ref())
-                                .is_some_and(|value| {
-                                    value.source == StateSource::Branch
-                                        && entry.key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
-                                        && entry.key.schema_key
-                                            != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
-                                })
+                                .is_some_and(|value| value.source == StateSource::Branch)
+                                || entry
+                                    .after
+                                    .as_ref()
+                                    .is_some_and(|value| value.source == StateSource::Branch))
+                                && entry.key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
+                                && entry.key.schema_key
+                                    != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
                         }) {
                             let row = entry.after.ok_or_else(|| {
                                 LixError::new(
