@@ -51,10 +51,8 @@ where
                     };
                     let historical = transaction.forktree_read_facade();
                     let previous_checkpoint_commit_id = historical
-                        .checkpoint_history_from_head(head_commit_id, &branch_id)
+                        .latest_checkpoint_for_branch(head_commit_id, &branch_id)
                         .await?
-                        .into_iter()
-                        .next()
                         .ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
@@ -62,8 +60,7 @@ where
                                     "branch '{branch_id}' has no checkpoint baseline in its first-parent history"
                                 ),
                             )
-                        })?
-                        .commit_id;
+                        })?;
                     let interval_has_commits =
                         head_commit_id != previous_checkpoint_commit_id;
                     let selected_changes = {
