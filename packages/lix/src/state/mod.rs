@@ -9,7 +9,10 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::LixError;
-use crate::forktree::{ForkTreeReadFacade, StateCell, StateSource, StateValue, VisibleStateRow};
+use crate::forktree::{
+    CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKey, StateSource, StateValue,
+    UntrackedValue, VisibleStateRow,
+};
 use crate::storage::StorageError;
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -19,6 +22,15 @@ pub(crate) struct StateRow {
     pub(crate) key: Vec<u8>,
     pub(crate) value: StateValue,
     pub(crate) source: StateRowSource,
+}
+
+/// One authenticated untracked row, retaining the owner branch identity so a
+/// consumer cannot republish a global value as branch-local state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UntrackedStateRow {
+    pub(crate) owner: CanonicalBranchId,
+    pub(crate) key: StateKey,
+    pub(crate) value: UntrackedValue,
 }
 
 impl StateRow {
@@ -56,6 +68,21 @@ pub(crate) enum StateRowSource {
 pub(crate) struct StagedStateRow {
     pub(crate) key: Vec<u8>,
     pub(crate) value: StateValue,
+}
+
+/// A staged untracked cell. The owner is explicit because untracked overlay
+/// resolution must preserve branch-over-global precedence and tombstones.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StagedUntrackedStateRow {
+    pub(crate) owner: CanonicalBranchId,
+    pub(crate) key: StateKey,
+    pub(crate) value: UntrackedValue,
+}
+
+impl StagedUntrackedStateRow {
+    pub(crate) fn new(owner: CanonicalBranchId, key: StateKey, value: UntrackedValue) -> Self {
+        Self { owner, key, value }
+    }
 }
 
 impl StagedStateRow {
@@ -118,6 +145,52 @@ where
             .await
             .map(|rows| rows.into_iter().map(StateRow::from_committed).collect())
     }
+
+    /// Resolves exact untracked state keys through the same retained view.
+    /// Returned slots preserve request order and duplicates, while each
+    /// result retains the authenticated local/global owner.
+    pub(crate) async fn untracked_points(
+        &self,
+        state_keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
+        Ok(self
+            .view
+            .load_untracked_overlay_points(state_keys)
+            .await?
+            .into_iter()
+            .map(|row| row.map(|(owner, key, value)| UntrackedStateRow { owner, key, value }))
+            .collect())
+    }
+
+    /// Scans the authenticated untracked local/global overlay through the
+    /// retained view and keeps the owner attached to every result.
+    pub(crate) async fn untracked_overlay_rows(&self) -> Result<Vec<UntrackedStateRow>, LixError> {
+        Ok(self
+            .view
+            .scan_untracked_overlay_rows()
+            .await?
+            .into_iter()
+            .map(|(owner, key, value)| UntrackedStateRow { owner, key, value })
+            .collect())
+    }
+
+    /// Scans one authenticated branch's untracked key range without opening
+    /// another read or traversing unrelated owners.
+    pub(crate) async fn untracked_branch_range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<UntrackedStateRow>, LixError> {
+        let owner = self.view.branch_id();
+        Ok(self
+            .view
+            .scan_untracked_branch_range(lower, upper, limit)
+            .await?
+            .into_iter()
+            .map(|(key, value)| UntrackedStateRow { owner, key, value })
+            .collect())
+    }
 }
 
 /// One transaction's committed retained view plus an ordered staged overlay.
@@ -127,6 +200,7 @@ where
 pub(crate) struct TransactionStateView<R> {
     committed: ForkTreeStateView<R>,
     staged: Vec<StagedStateRow>,
+    staged_untracked: Vec<StagedUntrackedStateRow>,
 }
 
 impl<R> TransactionStateView<R>
@@ -143,7 +217,35 @@ where
                 "staged state rows are not strictly ordered",
             ));
         }
-        Ok(Self { committed, staged })
+        Ok(Self {
+            committed,
+            staged,
+            staged_untracked: Vec::new(),
+        })
+    }
+
+    /// Constructs a transaction view with explicitly owned staged untracked
+    /// cells. The untracked overlay is kept ordered and linear just like the
+    /// tracked staged rows; no full-key map is introduced.
+    pub(crate) fn new_with_untracked(
+        committed: ForkTreeStateView<R>,
+        staged: Vec<StagedStateRow>,
+        staged_untracked: Vec<StagedUntrackedStateRow>,
+    ) -> Result<Self, LixError> {
+        let view = Self::new(committed, staged)?;
+        if staged_untracked
+            .windows(2)
+            .any(|rows| rows[0].key >= rows[1].key)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "staged untracked state rows are not strictly ordered",
+            ));
+        }
+        Ok(Self {
+            staged_untracked,
+            ..view
+        })
     }
 
     /// Resolves every requested key before applying visibility. A staged
@@ -246,6 +348,40 @@ where
                     break;
                 }
             }
+        }
+        Ok(output)
+    }
+
+    /// Resolves untracked exact points with staged rows taking precedence.
+    /// A staged tombstone suppresses the committed local/global answer even
+    /// when the caller omits tombstones from its result projection.
+    pub(crate) async fn untracked_points(
+        &self,
+        state_keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
+        let committed = self.committed.untracked_points(state_keys).await?;
+        let mut output = Vec::with_capacity(state_keys.len());
+        for (key, committed_row) in state_keys.iter().zip(committed) {
+            let decoded_key = crate::forktree::decode_state_key(key)?;
+            let staged = self
+                .staged_untracked
+                .iter()
+                .find(|row| row.key == decoded_key);
+            let row = staged
+                .map(|row| {
+                    if !include_tombstones && row.value.cell.deleted() {
+                        None
+                    } else {
+                        Some(UntrackedStateRow {
+                            owner: row.owner,
+                            key: row.key.clone(),
+                            value: row.value.clone(),
+                        })
+                    }
+                })
+                .unwrap_or(committed_row);
+            output.push(row);
         }
         Ok(output)
     }
