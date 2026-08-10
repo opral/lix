@@ -2039,37 +2039,6 @@ where
     }
 }
 
-async fn authenticated_commit_is_ancestor<R>(
-    read: &R,
-    commit_catalog_root: ObjectId,
-    endpoint_commit_object_id: ObjectId,
-    target_commit_object_id: ObjectId,
-    closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
-) -> Result<bool, StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let mut pending = vec![endpoint_commit_object_id];
-    let mut visited = BTreeSet::new();
-    while let Some(commit_object_id) = pending.pop() {
-        if !visited.insert(commit_object_id) {
-            continue;
-        }
-        if commit_object_id == target_commit_object_id {
-            return Ok(true);
-        }
-        let (commit, _) = load_authenticated_commit_member_closure(
-            read,
-            commit_catalog_root,
-            commit_object_id,
-            closures,
-        )
-        .await?;
-        pending.extend(commit.parent_commit_object_ids);
-    }
-    Ok(false)
-}
-
 async fn validate_member_catalog_owner_with_commit_cache<R>(
     read: &R,
     commit_catalog_root: ObjectId,
@@ -2527,6 +2496,7 @@ where
                     page,
                     value_ref.page_ordinal,
                     member,
+                    encoded_key,
                     *source,
                     endpoint_members.as_deref(),
                     endpoint_commit.as_ref(),
@@ -2627,6 +2597,7 @@ async fn validate_historical_state_page_member<R>(
     page: &super::model::CommitChangePageV2,
     page_ordinal: u32,
     member: &CommitMemberV1,
+    encoded_key: &[u8],
     source: StateSource,
     endpoint_members: Option<&[CommitMemberV1]>,
     endpoint_commit: Option<&CommitObjectV1>,
@@ -2734,23 +2705,30 @@ where
             StateSource::Global => target_commit.global_state_root,
             StateSource::Branch => target_commit.local_state_root,
         };
-        let endpoint_root_is_unchanged = endpoint_root == Some(target_root);
-        let endpoint_ancestor = authenticated_commit_is_ancestor(
-            read,
-            auth.commit_catalog_root,
-            auth.endpoint_commit_object_id,
-            target_commit_object_id,
-            member_closures,
-        )
-        .await?;
-        // The selected page reference was obtained from this authenticated
-        // endpoint root. An unchanged root binds it directly; when a merge
-        // changes other rows in the same root, the same endpoint-root lookup
-        // plus authenticated ancestry binds the unchanged page member.
-        if !endpoint_root_is_unchanged && !endpoint_ancestor {
+        let Some(endpoint_root) = endpoint_root else {
             return Err(corruption(
                 "historical state page member is neither endpoint-selected nor endpoint-root-bound",
             ));
+        };
+        if endpoint_root != target_root {
+            // An ancestor member is acceptable only when the endpoint's
+            // authenticated state root still points at this exact page and
+            // ordinal. Parent ancestry alone does not bind a state value to
+            // the selected endpoint and would permit a valid ancestor page
+            // to be grafted into a changed root.
+            let endpoint_value = lookup_on_read(endpoint_root, "state", encoded_key, read)
+                .await?
+                .ok_or_else(|| {
+                    corruption("historical state member is absent from endpoint state root")
+                })?;
+            let endpoint_ref = decode_state_value_storage(&endpoint_value)?;
+            if endpoint_ref.page_object_id != page_object_id
+                || endpoint_ref.page_ordinal != page_ordinal
+            {
+                return Err(corruption(
+                    "historical state page member is not bound to endpoint state root",
+                ));
+            }
         }
     }
     let value = lookup_on_read(
