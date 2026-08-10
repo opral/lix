@@ -332,6 +332,12 @@ where
         include_tombstones: bool,
     ) -> Result<Vec<Option<StateRow>>, LixError> {
         let branch_id = canonical_branch_id(branch_id)?;
+        if self.view.branch_id() == branch_id {
+            return self
+                .points(keys, include_tombstones)
+                .await
+                .map_err(LixError::from);
+        }
         self.view
             .branch_view(branch_id)
             .await?
@@ -392,6 +398,9 @@ where
         state_keys: &[Vec<u8>],
     ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
         let branch_id = canonical_branch_id(branch_id)?;
+        if self.view.branch_id() == branch_id {
+            return self.untracked_points(state_keys).await;
+        }
         Ok(self
             .view
             .branch_view(branch_id)
