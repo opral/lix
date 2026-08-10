@@ -594,12 +594,13 @@ where
             writer_error(format!("transaction branch identity is invalid: {error}"))
         })?,
         file_id: None,
-        snapshot: JsonSlot::from_json(
-            &serde_json::json!({
+        snapshot: JsonSlot::Inline(
+            serde_json::json!({
                 "branch_id": branch_id,
                 "commit_id": commit_id.to_string(),
             })
-            .to_string(),
+            .to_string()
+            .into(),
         ),
         metadata: JsonSlot::None,
         created_at: change_refs.created_at,
@@ -1468,12 +1469,13 @@ where
             writer_error(format!("transaction branch identity is invalid: {error}"))
         })?,
         file_id: None,
-        snapshot: JsonSlot::from_json(
-            &serde_json::json!({
+        snapshot: JsonSlot::Inline(
+            serde_json::json!({
                 "branch_id": branch_id,
                 "commit_id": final_content.draft.commit_id.to_string(),
             })
-            .to_string(),
+            .to_string()
+            .into(),
         ),
         metadata: JsonSlot::None,
         created_at: final_content.draft.created_at,

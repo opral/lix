@@ -1515,13 +1515,6 @@ where
         match slot {
             crate::json_store::JsonSlot::None => Ok(None),
             crate::json_store::JsonSlot::Inline(value) => Ok(Some(value.to_string())),
-            crate::json_store::JsonSlot::Ref(json_ref) => {
-                let _ = json_ref;
-                Err(crate::LixError::new(
-                    crate::LixError::CODE_STORAGE_ERROR,
-                    "ForkTree change snapshot contains a legacy JSON side-plane reference",
-                ))
-            }
             crate::json_store::JsonSlot::ForkTreeObject(object_id) => {
                 let id = ObjectId::from_bytes(*object_id);
                 let bytes = load_object_bytes(&self.read, id).await?;

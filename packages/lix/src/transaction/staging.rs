@@ -99,7 +99,6 @@ pub(crate) struct ImmutableMutationJournalChunk {
     identity_offsets: Arc<[(u32, u32)]>,
     snapshot_arena: Bytes,
     snapshot_offsets: Arc<[(u32, u32)]>,
-    large_snapshot_refs: Arc<[(u32, crate::json_store::JsonRef)]>,
     durable_predecessors: Option<Arc<[CertifiedStatePredecessor]>>,
     timestamp: LixTimestamp,
 }
@@ -114,7 +113,6 @@ impl PartialEq for ImmutableMutationJournalChunk {
             && self.identity_offsets == other.identity_offsets
             && self.snapshot_arena == other.snapshot_arena
             && self.snapshot_offsets == other.snapshot_offsets
-            && self.large_snapshot_refs == other.large_snapshot_refs
             && self.timestamp == other.timestamp
             && self.durable_predecessors.as_ref().map(|values| {
                 values
@@ -287,20 +285,6 @@ impl ImmutableMutationJournalChunk {
                 "immutable mutation journal offsets do not cover the arena",
             ));
         }
-        let large_snapshot_refs = offsets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &(start, end))| {
-                let bytes = &snapshot_arena[start as usize..end as usize];
-                (bytes.len() > crate::json_store::JSON_INLINE_MAX_BYTES).then(|| {
-                    (
-                        u32::try_from(index)
-                            .expect("immutable mutation chunk row ordinal fits u32"),
-                        crate::json_store::JsonRef::for_content(bytes),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
         Ok(Self {
             schema_plan_id,
             schema_key,
@@ -310,7 +294,6 @@ impl ImmutableMutationJournalChunk {
             identity_offsets,
             snapshot_arena: Bytes::from(snapshot_arena),
             snapshot_offsets: offsets.into(),
-            large_snapshot_refs: large_snapshot_refs.into(),
             durable_predecessors: durable_predecessors.map(Into::into),
             timestamp,
         })
@@ -358,20 +341,6 @@ impl ImmutableMutationJournalChunk {
         let (start, end) = self.snapshot_offsets[index];
         std::str::from_utf8(&self.snapshot_arena[start as usize..end as usize])
             .expect("validated immutable mutation journal UTF-8")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn snapshot_slot(&self, index: usize) -> crate::json_store::JsonSlotRef<'_> {
-        let snapshot = self.snapshot(index);
-        if snapshot.len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
-            return crate::json_store::JsonSlotRef::Inline(snapshot);
-        }
-        let index = u32::try_from(index).expect("immutable mutation chunk row ordinal fits u32");
-        let position = self
-            .large_snapshot_refs
-            .binary_search_by_key(&index, |(ordinal, _)| *ordinal)
-            .expect("large immutable mutation snapshot has a content ref");
-        crate::json_store::JsonSlotRef::Ref(&self.large_snapshot_refs[position].1)
     }
 
     pub(crate) fn schema_key(&self) -> &str {

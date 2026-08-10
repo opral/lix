@@ -15,7 +15,6 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
 use crate::forktree::StateKey;
-use crate::json_store::JsonRef;
 use crate::state::CertifiedStatePredecessor;
 use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use bytes::Bytes;
@@ -396,7 +395,7 @@ impl<'de> Deserialize<'de> for TransactionJson {
 ///
 /// External SQL/provider code must parse any textual JSON before constructing
 /// this type. The transaction receives `TransactionJson`, applies schema
-/// defaults and identity derivation, then prepares JSON refs directly in a
+/// defaults and identity derivation, then prepares JSON payloads directly in a
 /// `PreparedStateBatch` without serializing already-normalized JSON again.
 ///
 /// SQL providers stage semantic rows, not final storage rows. INSERT providers
@@ -2167,7 +2166,6 @@ pub(crate) struct TransactionWriteOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct StageJson {
     storage: StageJsonStorage,
-    pub(crate) json_ref: JsonRef,
 }
 
 #[derive(Debug, Clone)]
@@ -2306,17 +2304,11 @@ impl StageJson {
             StageJsonStorage::CanonicalBatch(value) => value.normalized_shared(),
         }
     }
-
-    /// Whether this payload inlines into values instead of the json store.
-    pub(crate) fn is_inline(&self) -> bool {
-        self.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES
-    }
 }
 
 impl PartialEq for StageJson {
     fn eq(&self, other: &Self) -> bool {
         self.normalized() == other.normalized()
-            && (self.is_inline() || other.is_inline() || self.json_ref == other.json_ref)
     }
 }
 
@@ -2327,20 +2319,11 @@ pub(crate) fn stage_json_from_value(
     value: TransactionJson,
     _context: &str,
 ) -> Result<StageJson, LixError> {
-    // Inline values carry their bytes as the authoritative durable payload.
-    // Computing and retaining a content hash for every small row only to
-    // discard it at `JsonSlotRef::Inline` doubled the canonical-byte walk on
-    // bulk inserts. Out-of-band values still require the exact content ref.
-    let json_ref = if value.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
-        JsonRef::default()
-    } else {
-        JsonRef::for_content(value.normalized().as_bytes())
-    };
     let storage = match value.storage {
         TransactionJsonStorage::Decoded { value, normalized } => StageJsonStorage::Owned {
             value: OnceLock::from(value),
             normalized: normalized.into_inner().unwrap_or_else(|| {
-                panic!("transaction JSON was normalized while computing its JSON ref")
+                panic!("transaction JSON was normalized while preparing its canonical bytes")
             }),
         },
         TransactionJsonStorage::Certified { normalized } => StageJsonStorage::Owned {
@@ -2360,7 +2343,7 @@ pub(crate) fn stage_json_from_value(
         }
         TransactionJsonStorage::CanonicalBatch(value) => StageJsonStorage::CanonicalBatch(value),
     };
-    Ok(StageJson { storage, json_ref })
+    Ok(StageJson { storage })
 }
 
 /// Coalesces decoded JSON values into one Arrow-style values column plus one
@@ -5084,6 +5067,7 @@ mod tests {
             r#"{"path":"/a","value":{"nested":true}}"#.into(),
         );
         assert!(transaction_json.row_content_certified());
+        let expected_normalized = transaction_json.normalized().to_owned();
 
         let staged = stage_json_from_value(transaction_json, "certified test row")
             .expect("certified JSON should prepare");
@@ -5091,28 +5075,22 @@ mod tests {
             staged.value(),
             &serde_json::json!({"path": "/a", "value": {"nested": true}})
         );
-        assert_eq!(
-            staged.json_ref,
-            JsonRef::default(),
-            "inline JSON must not pay for an unused content hash"
-        );
+        assert_eq!(staged.normalized(), expected_normalized);
     }
 
     #[test]
-    fn out_of_band_json_retains_its_content_hash() {
+    fn large_certified_json_retains_canonical_bytes_without_side_plane_hashing() {
         let normalized = format!(
             r#"{{"value":"{}"}}"#,
             "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES)
         );
-        let expected = JsonRef::for_content(normalized.as_bytes());
         let staged = stage_json_from_value(
             TransactionJson::from_certified_normalized_row_content(normalized.into()),
-            "large certified test row",
+            "large certified row",
         )
         .expect("large certified JSON should prepare");
 
-        assert!(!staged.is_inline());
-        assert_eq!(staged.json_ref, expected);
+        assert!(staged.normalized().len() > crate::json_store::JSON_INLINE_MAX_BYTES);
     }
 
     #[test]

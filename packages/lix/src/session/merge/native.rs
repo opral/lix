@@ -493,7 +493,7 @@ mod tests {
     fn both_sides_same_final_value_is_convergent_noop() {
         let target_change = ChangeId::for_test_label("target");
         let source_change = ChangeId::for_test_label("source");
-        let same_snapshot = JsonSlot::from_json("{\"value\":\"same\"}");
+        let same_snapshot = JsonSlot::Inline(r#"{"value":"same"}"#.into());
         let target = diff_with_payloads(
             vec![entry(
                 "entity-a",
@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn live_payload_comparison_only_reads_intersecting_changed_identity() {
-        let same = JsonSlot::from_json("{\"same\":true}");
+        let same = JsonSlot::Inline(r#"{"same":true}"#.into());
         let target = diff_with_payloads(
             vec![entry(
                 "entity-a",

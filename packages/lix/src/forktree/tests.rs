@@ -169,7 +169,7 @@ fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
 }
 
 #[tokio::test]
-async fn forktree_json_object_materializes_and_rejects_side_plane_or_corruption() {
+async fn forktree_json_object_materializes_and_rejects_corruption() {
     let value = format!(
         r#"{{"large":"{}"}}"#,
         "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES + 1)
@@ -200,13 +200,6 @@ async fn forktree_json_object_materializes_and_rejects_side_plane_or_corruption(
             .await
             .expect("authenticated JSON object"),
         Some(value)
-    );
-    let legacy = crate::json_store::JsonSlot::Ref(crate::json_store::JsonRef::for_content(
-        b"legacy side plane",
-    ));
-    assert!(
-        facade.load_json_slot(&legacy).await.is_err(),
-        "legacy JSON_SPACE references must never fall back"
     );
     drop(facade);
 

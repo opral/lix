@@ -400,12 +400,6 @@ pub(crate) fn decode_forktree_commit_payload(bytes: &[u8]) -> Result<CommitRecor
 /// standalone RefChange object. ChangeId remains in the authenticated object
 /// envelope and is reconstructed only after the envelope has authenticated.
 pub(crate) fn encode_forktree_change_payload(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
-    if matches!(record.snapshot, JsonSlot::Ref(_)) || matches!(record.metadata, JsonSlot::Ref(_)) {
-        return Err(LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "ForkTree change payload cannot encode a legacy JSON side-plane reference",
-        ));
-    }
     crate::storage_codec::encode(
         "ForkTree change semantic payload",
         &ChangeRecordRef {
@@ -440,12 +434,6 @@ pub(crate) fn decode_forktree_change_payload(
         created_at: view.created_at,
         origin_key: view.origin_key,
     };
-    if matches!(record.snapshot, JsonSlot::Ref(_)) || matches!(record.metadata, JsonSlot::Ref(_)) {
-        return Err(LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "ForkTree change payload contains a legacy JSON side-plane reference",
-        ));
-    }
     Ok(record)
 }
 

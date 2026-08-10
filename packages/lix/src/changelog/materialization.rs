@@ -1,13 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-#[cfg(test)]
-use bytes::Bytes;
-
 use crate::LixError;
 use crate::common::SharedStr;
 use crate::forktree::ForkTreeReadFacade;
-#[cfg(test)]
-use crate::json_store::JsonRef;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::{ChangeId, ChangeRecord};
@@ -159,52 +154,6 @@ where
 }
 
 #[cfg(test)]
-enum MaterializedJsonSlot {
-    Loaded(usize),
-}
-
-#[cfg(test)]
-fn materialized_json_string(
-    slot: MaterializedJsonSlot,
-    json_refs: &[JsonRef],
-    json_values: &mut [Option<Bytes>],
-) -> Result<Option<SharedStr>, LixError> {
-    let index = match slot {
-        MaterializedJsonSlot::Loaded(index) => index,
-    };
-    let json_ref = json_refs.get(index).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "change materialization lost JSON ref index",
-        )
-    })?;
-    let bytes = json_values
-        .get_mut(index)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "change materialization lost JSON value index",
-            )
-        })?
-        .take()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "change materialization is missing JSON payload '{}'",
-                    json_ref.to_hex()
-                ),
-            )
-        })?;
-    SharedStr::from_utf8(bytes).map(Some).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("materialized ChangeRecord JSON payload is not UTF-8: {error}"),
-        )
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::changelog::ChangeLoadBatch;
@@ -302,29 +251,5 @@ mod tests {
                 .schema_key,
             second.schema_key
         );
-    }
-
-    #[test]
-    fn materialized_json_string_consumes_owned_payload_bytes() {
-        let json = Bytes::from_static(br#"{"value":1}"#);
-        let json_ref = JsonRef::for_content(&json);
-        let source_ptr = json.as_ptr();
-        let mut json_values = vec![Some(json)];
-
-        let materialized = materialized_json_string(
-            MaterializedJsonSlot::Loaded(0),
-            &[json_ref],
-            &mut json_values,
-        )
-        .expect("json should materialize");
-
-        let materialized = materialized.expect("materialized JSON");
-        assert_eq!(materialized, r#"{"value":1}"#);
-        assert_eq!(
-            materialized.as_bytes().as_ptr(),
-            source_ptr,
-            "materialization must retain the JSON-store buffer"
-        );
-        assert!(json_values[0].is_none());
     }
 }

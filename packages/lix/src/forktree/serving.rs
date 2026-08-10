@@ -2594,8 +2594,7 @@ where
                 StateCell::Null
             }
             crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
-            crate::json_store::JsonSlot::Ref(_)
-            | crate::json_store::JsonSlot::ForkTreeObject(_) => {
+            crate::json_store::JsonSlot::ForkTreeObject(_) => {
                 return Err(corruption(
                     "state value page contains an out-of-page JSON reference",
                 ));
@@ -2604,8 +2603,7 @@ where
         let metadata = match record.metadata {
             crate::json_store::JsonSlot::None => None,
             crate::json_store::JsonSlot::Inline(value) => Some(value),
-            crate::json_store::JsonSlot::Ref(_)
-            | crate::json_store::JsonSlot::ForkTreeObject(_) => {
+            crate::json_store::JsonSlot::ForkTreeObject(_) => {
                 return Err(corruption("state value page contains out-of-page metadata"));
             }
         };
