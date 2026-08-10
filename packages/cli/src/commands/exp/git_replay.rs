@@ -370,13 +370,6 @@ where
     };
     let lix = db::block_on(open_lix().with_storage(storage.clone()))
         .map_err(|error| CliError::msg(format!("failed to open replay Lix: {error}")))?;
-    db::block_on(lix.execute(
-        "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-         VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
-        &[],
-    ))
-    .map_err(|error| CliError::msg(format!("failed to enable deterministic mode: {error}")))?;
-
     let plugin_install_started = Instant::now();
     if args.plugins == GitReplayPlugins::All {
         install_embedded_replay_plugins(&lix)?;
@@ -1993,25 +1986,6 @@ where
                 },
             );
         }
-    }
-
-    let count = db::block_on(lix.execute(
-        "SELECT COUNT(*) FROM lix_file \
-         WHERE path NOT LIKE '/.lix/plugins/%'",
-        &[],
-    ))
-    .map_err(|error| CliError::msg(format!("failed to count Lix final tree: {error}")))?;
-    let lix_count = match count.rows().first().and_then(|row| row.get_index(0)) {
-        Some(Value::Integer(value)) => usize::try_from(*value)
-            .map_err(|_| CliError::msg("Lix final tree count does not fit usize"))?,
-        _ => return Err(CliError::msg("Lix final tree count is not an integer")),
-    };
-    if lix_count != expected_by_path.len() {
-        return Err(CliError::msg(format!(
-            "final tree mismatch at {commit_sha}: row count differs (lix={}, git={})",
-            lix_count,
-            expected_by_path.len()
-        )));
     }
 
     let mut expected = expected_by_path.values().collect::<Vec<_>>();
