@@ -78,7 +78,7 @@ struct EntityHistorySpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for EntityHistorySpec<S>
+impl<S> TableSpec<S> for EntityHistorySpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {

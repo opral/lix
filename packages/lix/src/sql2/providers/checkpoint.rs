@@ -49,7 +49,7 @@ struct CheckpointSpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for CheckpointSpec<S>
+impl<S> TableSpec<S> for CheckpointSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {

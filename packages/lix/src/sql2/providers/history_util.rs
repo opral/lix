@@ -1,6 +1,17 @@
 use crate::LixError;
 use crate::common::SharedStr;
 use crate::forktree::{HistoricalStateRow, StateKey};
+use crate::{NullableKeyFilter, entity_pk::EntityPk};
+
+/// Native filter for historical ForkTree rows. This is local to the history
+/// providers and carries no reader/request or materialized-batch vocabulary.
+#[derive(Clone, Debug, Default)]
+pub(super) struct StateFilter {
+    pub(super) schema_keys: Vec<String>,
+    pub(super) entity_pks: Vec<EntityPk>,
+    pub(super) file_ids: Vec<NullableKeyFilter>,
+    pub(super) include_tombstones: bool,
+}
 
 /// Project a single-string history entity pk as the canonical JSON array
 /// text exposed by the `lixcol_entity_pk` column.
@@ -12,20 +23,20 @@ pub(super) fn entity_pk_json_array(entity_pk: &str) -> Result<String, LixError> 
     })
 }
 
-/// Compact address of one row retained by [`ObservedTrackedStateRows`].
+/// Compact address of one row retained by [`ObservedStateRows`].
 ///
 /// File history can assemble one observed state from several point scans
 /// (descriptors, ancestors, plugin rows). Keeping two ordinals per parsed
 /// record avoids expanding each materialized batch into the legacy owned row
 /// DTO while still allowing all source arenas to be released together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ObservedTrackedStateOrdinal {
+pub(super) struct ObservedStateOrdinal {
     batch: u32,
     row: u32,
 }
 
 #[derive(Debug)]
-struct ObservedTrackedStateBatch {
+struct ObservedStateBatch {
     observed_commit_id: SharedStr,
     rows: Vec<HistoricalStateRow>,
 }
@@ -36,12 +47,12 @@ struct ObservedTrackedStateBatch {
 /// Every physical scan retains that same view, and parsed provider records
 /// retain only compact ordinals into `batches`.
 #[derive(Debug, Default)]
-pub(super) struct ObservedTrackedStateRows {
-    batches: Vec<ObservedTrackedStateBatch>,
-    ordinals: Vec<ObservedTrackedStateOrdinal>,
+pub(super) struct ObservedStateRows {
+    batches: Vec<ObservedStateBatch>,
+    ordinals: Vec<ObservedStateOrdinal>,
 }
 
-impl ObservedTrackedStateRows {
+impl ObservedStateRows {
     pub(super) fn from_rows(
         observed_commit_id: SharedStr,
         rows: Vec<HistoricalStateRow>,
@@ -71,11 +82,11 @@ impl ObservedTrackedStateRows {
         })?;
         self.ordinals.reserve(row_count);
         self.ordinals
-            .extend((0..row_count).map(|row| ObservedTrackedStateOrdinal {
+            .extend((0..row_count).map(|row| ObservedStateOrdinal {
                 batch,
                 row: u32::try_from(row).expect("historical row count was checked above"),
             }));
-        self.batches.push(ObservedTrackedStateBatch {
+        self.batches.push(ObservedStateBatch {
             observed_commit_id,
             rows,
         });
@@ -108,7 +119,7 @@ impl ObservedTrackedStateRows {
         self.ordinals.reserve(other.ordinals.len());
         self.ordinals
             .extend(other.ordinals.into_iter().map(|ordinal| {
-                ObservedTrackedStateOrdinal {
+                ObservedStateOrdinal {
                     batch: ordinal
                         .batch
                         .checked_add(batch_offset)
@@ -120,22 +131,19 @@ impl ObservedTrackedStateRows {
         Ok(())
     }
 
-    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = ObservedTrackedStateRowRef<'_>> {
+    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = ObservedStateRowRef<'_>> {
         self.ordinals
             .iter()
             .copied()
             .map(|ordinal| self.row(ordinal))
     }
 
-    pub(super) fn row(
-        &self,
-        ordinal: ObservedTrackedStateOrdinal,
-    ) -> ObservedTrackedStateRowRef<'_> {
+    pub(super) fn row(&self, ordinal: ObservedStateOrdinal) -> ObservedStateRowRef<'_> {
         let batch = self
             .batches
             .get(ordinal.batch as usize)
             .expect("historical SQL batch ordinal belongs to its owner");
-        ObservedTrackedStateRowRef {
+        ObservedStateRowRef {
             observed_commit_id: batch.observed_commit_id.as_str(),
             row: batch
                 .rows
@@ -160,13 +168,13 @@ impl ObservedTrackedStateRows {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ObservedTrackedStateRowRef<'a> {
+pub(super) struct ObservedStateRowRef<'a> {
     observed_commit_id: &'a str,
     row: &'a HistoricalStateRow,
-    ordinal: ObservedTrackedStateOrdinal,
+    ordinal: ObservedStateOrdinal,
 }
 
-impl<'a> ObservedTrackedStateRowRef<'a> {
+impl<'a> ObservedStateRowRef<'a> {
     pub(super) fn observed_commit_id(self) -> &'a str {
         self.observed_commit_id
     }
@@ -175,7 +183,7 @@ impl<'a> ObservedTrackedStateRowRef<'a> {
         HistoricalStateRowRef { row: self.row }
     }
 
-    pub(super) fn ordinal(self) -> ObservedTrackedStateOrdinal {
+    pub(super) fn ordinal(self) -> ObservedStateOrdinal {
         self.ordinal
     }
 }
