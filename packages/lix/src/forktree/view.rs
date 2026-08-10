@@ -894,7 +894,7 @@ where
                 .await
                 .map_err(|error| match error {
                     StorageError::Corruption(message)
-                        if message == "requested branch selector is absent" =>
+                        if message.ends_with("requested branch selector is absent") =>
                     {
                         crate::LixError::branch_not_found(
                             branch_id.to_owned(),
