@@ -205,11 +205,9 @@ where
                     format!("merge state row lost change payload '{}'", state.change_id),
                 )
             })?;
-            // ForkTree change payloads own their canonical JSON inline, while
-            // `JsonSlot::from_json` selects the retired side-plane `Ref` shape
-            // for values larger than the legacy inline threshold. Authenticate
-            // the canonical bytes and lifecycle directly instead of comparing
-            // those two storage representations.
+            // ForkTree change payloads own their canonical JSON inline or in
+            // an authenticated ForkTree object. Authenticate the canonical
+            // bytes and lifecycle directly instead of comparing storage planes.
             let snapshot_matches = match (&record.snapshot, &state.cell) {
                 (crate::json_store::JsonSlot::None, crate::forktree::StateCell::Tombstone) => true,
                 (crate::json_store::JsonSlot::Inline(value), crate::forktree::StateCell::Null) => {

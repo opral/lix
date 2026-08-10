@@ -782,7 +782,7 @@ pub(crate) fn canonical_commit_change(record: &CommitRecord) -> CommitGraphChang
             .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+        snapshot: crate::json_store::JsonSlot::Inline(snapshot_content.into()),
         metadata: crate::json_store::JsonSlot::None,
         created_at: record.created_at,
         origin_key: None,
