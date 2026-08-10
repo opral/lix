@@ -791,7 +791,21 @@ where
                         format!("branch id must be a canonical UUID: {error}"),
                     )
                 })?;
-                if let Some(head) = branch_ref.load_head(&id).await? {
+                let head = branch_ref.load_head(&id).await.map_err(|error| {
+                    let LixError {
+                        code,
+                        message,
+                        hint,
+                        details,
+                    } = error;
+                    LixError {
+                        code,
+                        message: format!("failed to load branch ref for '{id}': {message}"),
+                        hint,
+                        details,
+                    }
+                })?;
+                if let Some(head) = head {
                     heads.push(head);
                 }
             }
@@ -1729,37 +1743,35 @@ mod tests {
 
     #[tokio::test]
     async fn batch_head_read_still_rejects_a_malformed_selected_ref() {
+        let selected_branch_id = "01920000-0000-7000-8000-0000000000b1";
         let state = BranchState::<FixtureRead>::Fixture(vec![
             descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
-            descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
+            descriptor_row(selected_branch_id, "Branch B"),
             descriptor_row("01920000-0000-7000-8000-0000000000c1", "Branch C"),
         ]);
         let branch_ref = Arc::new(CountingBranchRefReader {
             heads: vec![
                 head("01920000-0000-7000-8000-0000000000a1"),
-                head("01920000-0000-7000-8000-0000000000b1"),
+                head(selected_branch_id),
                 head("01920000-0000-7000-8000-0000000000c1"),
             ],
             point_reads: AtomicUsize::new(0),
             scans: AtomicUsize::new(0),
-            scan_error: Some(LixError::new(
-                LixError::CODE_UNKNOWN,
-                "a branch ref is malformed",
-            )),
-            point_error_branch: Some("01920000-0000-7000-8000-0000000000b1".to_string()),
+            scan_error: None,
+            point_error_branch: Some(selected_branch_id.to_string()),
         });
 
-        let error = load_branch_rows(&state, branch_ref.clone())
-            .await
-            .unwrap_err();
+        let error = load_branch_rows_scoped(
+            &state,
+            branch_ref.clone(),
+            BranchDescriptorScope::Ids(BTreeSet::from([selected_branch_id.to_string()])),
+        )
+        .await
+        .unwrap_err();
 
-        assert!(
-            error
-                .message
-                .contains("01920000-0000-7000-8000-0000000000b1")
-        );
-        assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
-        assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 0);
+        assert!(error.message.contains(selected_branch_id));
+        assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 0);
+        assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
