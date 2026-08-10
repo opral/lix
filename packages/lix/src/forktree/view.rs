@@ -1116,6 +1116,15 @@ where
         super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
     }
 
+    pub(crate) async fn scan_state_rows_at_commit_range(
+        &self,
+        commit_id: crate::changelog::CommitId,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
+        super::serving::scan_state_rows_at_commit_range(&self.read, commit_id, lower, upper).await
+    }
+
     /// Diffs two authenticated historical state roots through this facade's
     /// retained read. The neutral result is the sole source for checkpoint
     /// and working-diff projections; callers may filter and project it but

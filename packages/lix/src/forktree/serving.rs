@@ -2151,14 +2151,25 @@ where
 /// Loads the complete authenticated state overlay for one historical commit.
 /// A missing commit/catalog/root is an error; an absent key is represented by
 /// the absence of a row in the returned ordered stream.
-pub(crate) async fn scan_state_rows_at_commit<R>(
+async fn load_historical_commit_state_roots<R>(
     read: &R,
     commit_id: crate::changelog::CommitId,
-) -> Result<Vec<HistoricalStateRow>, crate::LixError>
+) -> Result<(ObjectId, ObjectId), crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
     let repository = load_repository_root(read).await?;
+    load_historical_commit_state_roots_from_repository(read, &repository, commit_id).await
+}
+
+async fn load_historical_commit_state_roots_from_repository<R>(
+    read: &R,
+    repository: &RepositoryRootV1,
+    commit_id: crate::changelog::CommitId,
+) -> Result<(ObjectId, ObjectId), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     let catalog_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
     let entry =
         load_required_commit_catalog_entry(read, repository.commit_catalog_root, catalog_id)
@@ -2183,16 +2194,12 @@ where
         &commit,
     )
     .await?;
-    let rows = state_range_on_roots(
-        commit.global_state_root,
-        Some(commit.local_state_root),
-        read,
-        None,
-        None,
-        None,
-        true,
-    )
-    .await?;
+    Ok((commit.global_state_root, commit.local_state_root))
+}
+
+fn historical_state_rows_from_range(
+    rows: Vec<(Vec<u8>, StateValue, StateSource)>,
+) -> Result<Vec<HistoricalStateRow>, crate::LixError> {
     rows.into_iter()
         .map(|(encoded_key, value, source)| {
             let key = decode_state_key(&encoded_key)?;
@@ -2215,6 +2222,89 @@ where
             })
         })
         .collect()
+}
+
+pub(crate) async fn scan_state_rows_at_commit<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+) -> Result<Vec<HistoricalStateRow>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let (global_state_root, local_state_root) =
+        load_historical_commit_state_roots(read, commit_id).await?;
+    let rows = state_range_on_roots(
+        global_state_root,
+        Some(local_state_root),
+        read,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await?;
+    historical_state_rows_from_range(rows)
+}
+
+/// Loads only one authenticated state-key range for a historical commit. The
+/// commit envelope, catalog back-edge, retained roots, and every returned leaf
+/// are validated identically to the complete scan; the range merely prevents
+/// unrelated state subtrees from being visited.
+pub(crate) async fn scan_state_rows_at_commit_range<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+) -> Result<Vec<HistoricalStateRow>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let (global_state_root, local_state_root) =
+        load_historical_commit_state_roots(read, commit_id).await?;
+    let rows = state_range_on_roots(
+        global_state_root,
+        Some(local_state_root),
+        read,
+        Some(lower),
+        upper,
+        None,
+        true,
+    )
+    .await?;
+    historical_state_rows_from_range(rows)
+}
+
+/// Loads several authenticated state ranges for one historical commit while
+/// authenticating the commit/catalog/root envelope only once. Each range is
+/// still independently bounded and resolved against the same retained read.
+pub(crate) async fn scan_state_rows_at_commit_ranges<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+    ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+) -> Result<Vec<HistoricalStateRow>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (global_state_root, local_state_root) =
+        load_historical_commit_state_roots(read, commit_id).await?;
+    let mut output = Vec::new();
+    for (lower, upper) in ranges {
+        let rows = state_range_on_roots(
+            global_state_root,
+            Some(local_state_root),
+            read,
+            Some(lower),
+            upper.as_deref(),
+            None,
+            true,
+        )
+        .await?;
+        output.extend(historical_state_rows_from_range(rows)?);
+    }
+    Ok(output)
 }
 
 pub(crate) async fn edit_state_tree<R>(

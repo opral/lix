@@ -19,7 +19,7 @@ use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::forktree::ForkTreeReadFacade;
+use crate::forktree::{ForkTreeReadFacade, encode_state_entity_prefix_bounds};
 use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
 };
@@ -1100,23 +1100,28 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let lookup_ids = lookup_ids.cloned();
-    let (event_entries, context_entries) =
-        load_file_history_entry_sets(event_route, context_route, move |route| {
-            let commit_graph = Arc::clone(&commit_graph);
-            let query_source = query_source.clone();
-            let lookup_ids = lookup_ids.clone();
-            async move {
-                load_file_history_filesystem_entries(
-                    commit_graph,
-                    query_source,
-                    &route,
-                    lookup_ids.as_ref(),
-                    metadata_projection,
-                )
-                .await
-            }
-        })
-        .await?;
+    let context_entries = load_file_history_filesystem_entries(
+        Arc::clone(&commit_graph),
+        query_source.clone(),
+        context_route,
+        lookup_ids.as_ref(),
+        metadata_projection,
+        None,
+    )
+    .await?;
+    let directory_seed_ids = parse_file_history_directories(&context_entries)?
+        .into_iter()
+        .map(|directory| directory.id)
+        .collect::<BTreeSet<_>>();
+    let event_entries = load_file_history_filesystem_entries(
+        commit_graph,
+        query_source,
+        event_route,
+        lookup_ids.as_ref(),
+        metadata_projection,
+        Some(&directory_seed_ids),
+    )
+    .await?;
 
     Ok(FileHistoryFilesystemContext {
         event_descriptors: parse_file_history_descriptors(&event_entries)?,
@@ -1340,7 +1345,26 @@ where
     S: StorageAdapterRead,
 {
     let commit_id = CommitId::parse_lix(observed_commit_id, "file history observed commit")?;
-    let rows = historical.scan_state_rows_at_commit(commit_id).await?;
+    let rows = if !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
+        let mut rows = Vec::new();
+        for schema_key in &filter.schema_keys {
+            for entity_pk in &filter.entity_pks {
+                let bounds = encode_state_entity_prefix_bounds(schema_key, entity_pk);
+                rows.extend(
+                    historical
+                        .scan_state_rows_at_commit_range(
+                            commit_id,
+                            &bounds.lower,
+                            bounds.upper.as_deref(),
+                        )
+                        .await?,
+                );
+            }
+        }
+        rows
+    } else {
+        historical.scan_state_rows_at_commit(commit_id).await?
+    };
     let rows = rows
         .into_iter()
         .filter(|row| {
@@ -1416,6 +1440,7 @@ async fn load_file_history_filesystem_entries<S>(
     route: &HistoryRoute,
     lookup_ids: Option<&FileHistoryLookupIds>,
     metadata_projection: HistoryMetadataProjection,
+    directory_seed_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<HistoryEntry>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -1451,23 +1476,98 @@ where
         metadata_projection,
     )
     .await?;
-    // Directory changes can rename or move a selected file. Their entity keys
-    // are unrelated to the public file ID, so retain the complete directory
-    // history and let `file_history_events` join only relevant directories.
-    let directories = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
-        },
-        commit_graph,
-        query_source,
-        route,
-        vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-        metadata_projection,
-    )
-    .await?;
-    entries.extend(directories);
+    // Directory changes can rename or move a selected file, but only its
+    // authenticated descriptor ancestors can affect that file. Derive those
+    // directory IDs from the selected descriptor history and walk their
+    // authenticated parent chain. The old route scanned every directory in
+    // every reachable commit, which violated the point-history bound.
+    let mut pending_directory_ids = match directory_seed_ids {
+        Some(directory_seed_ids) => directory_seed_ids.clone(),
+        None => directory_ids_from_file_history_descriptors(&entries)?,
+    };
+    let mut requested_directory_ids = BTreeSet::new();
+    while !pending_directory_ids.is_empty() {
+        let directory_ids = std::mem::take(&mut pending_directory_ids)
+            .into_iter()
+            .filter(|directory_id| requested_directory_ids.insert(directory_id.clone()))
+            .collect::<Vec<_>>();
+        if directory_ids.is_empty() {
+            break;
+        }
+        let directory_route = file_history_directory_route(route, &directory_ids)?;
+        let directories = load_history_entries(
+            HistoryViewDescriptor {
+                view_name: "lix_file_history",
+                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
+            },
+            Arc::clone(&commit_graph),
+            query_source.clone(),
+            &directory_route,
+            vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+            metadata_projection,
+        )
+        .await?;
+        pending_directory_ids.extend(
+            parse_file_history_directories(&directories)?
+                .into_iter()
+                .filter_map(|directory| directory.parent_id),
+        );
+        entries.extend(directories);
+    }
     Ok(entries)
+}
+
+fn directory_ids_from_file_history_descriptors(
+    entries: &[HistoryEntry],
+) -> Result<BTreeSet<String>, LixError> {
+    let mut directory_ids = BTreeSet::new();
+    for descriptor in parse_file_history_descriptors(entries)? {
+        let Some(snapshot) = descriptor.entry.change.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot =
+            serde_json::from_str::<FileDescriptorSnapshot>(snapshot).map_err(|error| {
+                invalid_file_history_state(format!(
+                    "invalid selected file descriptor history snapshot JSON: {error}"
+                ))
+            })?;
+        if let Some(directory_id) = snapshot.directory_id {
+            directory_ids.insert(directory_id);
+        }
+    }
+    Ok(directory_ids)
+}
+
+fn file_history_directory_route(
+    route: &HistoryRoute,
+    directory_ids: &[String],
+) -> Result<HistoryRoute, LixError> {
+    let mut route = route.clone();
+    route.file_ids.clear();
+    route.entity_pks = directory_ids
+        .iter()
+        .map(|directory_id| {
+            let entity_pk = EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("file history directory ID must be a canonical UUID: {error}"),
+                )
+            })?;
+            entity_pk.as_json_array_text()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    route.resolved_entity_pks = directory_ids
+        .iter()
+        .map(|directory_id| {
+            EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("file history directory ID must be a canonical UUID: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(route)
 }
 
 fn file_history_descriptor_blob_route(
@@ -1475,6 +1575,7 @@ fn file_history_descriptor_blob_route(
     lookup_ids: &FileHistoryLookupIds,
 ) -> Result<HistoryRoute, LixError> {
     let mut route = route.clone();
+    route.file_ids = lookup_ids.0.iter().cloned().collect();
     route.entity_pks = lookup_ids.entity_pks()?;
     route.resolved_entity_pks = lookup_ids
         .0
