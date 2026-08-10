@@ -3385,7 +3385,14 @@ impl StorageWrite for SlateDBWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             if space.value_semantics() == ValueSemantics::Immutable {
-                let put_entries = entries.entries.len() as u64;
+                // Acquire the operation's write fence before materializing
+                // immutable segments. The segment is content-addressed by
+                // its authenticated member identities, so filtering already
+                // visible immutable values after packing would otherwise
+                // upload an entire replacement segment before the idempotent
+                // check can discard its existing locators.
+                self.serialize_publication().await?;
+                let mut put_entries = 0_u64;
                 let mut segment_writer = ImmutableSegmentWriter::default();
                 let mut written_bytes = 0_u64;
                 let staged_entries = entries
@@ -3415,7 +3422,6 @@ impl StorageWrite for SlateDBWrite {
                 for ((physical_key, value), visible) in
                     staged_entries.into_iter().zip(visible_values)
                 {
-                    written_bytes = written_bytes.saturating_add(value.len() as u64);
                     if let Some(existing) = visible {
                         if existing != value {
                             return Err(StorageError::Corruption(
@@ -3433,9 +3439,12 @@ impl StorageWrite for SlateDBWrite {
                         }
                         continue;
                     }
+                    let value_len = value.len() as u64;
                     self.immutable_values
                         .insert(physical_key.clone(), value.clone());
                     segment_writer.insert(physical_key, value)?;
+                    put_entries = put_entries.saturating_add(1);
+                    written_bytes = written_bytes.saturating_add(value_len);
                 }
                 let immutable_segments = segment_writer.finish(|_| true)?;
                 let immutable_locators = immutable_segments
