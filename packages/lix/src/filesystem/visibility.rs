@@ -31,8 +31,11 @@ impl VisibleFilesystem {
     where
         R: crate::storage_adapter::StorageAdapterRead,
     {
-        let rows = state.range(None, None, None, true).await?;
-        let rows = FilesystemStateRows::from_view_rows(rows, branch_id, false)?;
+        let tracked_rows = state.range(None, None, None, true).await?;
+        let mut rows = FilesystemStateRows::from_view_rows(tracked_rows, branch_id, false)?;
+        rows.extend(FilesystemStateRows::from_untracked_view_rows(
+            state.untracked_overlay_rows().await?,
+        )?);
         Self::from_state_rows(&rows)
     }
 

@@ -1009,8 +1009,11 @@ where
             "filesystem path index cannot acquire multiple branch views in one operation",
         ));
     }
-    let rows = state.range(None, None, None, true).await?;
-    let rows = FilesystemStateRows::from_view_rows(rows, branch_id, false)?;
+    let tracked_rows = state.range(None, None, None, true).await?;
+    let mut rows = FilesystemStateRows::from_view_rows(tracked_rows, branch_id, false)?;
+    rows.extend(FilesystemStateRows::from_untracked_view_rows(
+        state.untracked_overlay_rows().await?,
+    )?);
     #[cfg(test)]
     {
         FULL_REBUILD_BUILDS.fetch_add(1, Ordering::SeqCst);

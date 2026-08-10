@@ -10,7 +10,7 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::state::{StateRow, StateRowSource};
+use crate::state::{StateRow, StateRowSource, UntrackedStateRow};
 
 /// Filesystem-owned projection of one authenticated state cell. This is a
 /// descriptor projection, not a generic state reader or a second storage
@@ -51,6 +51,13 @@ impl FilesystemStateRows {
             .map(Self)
     }
 
+    pub(crate) fn from_untracked_view_rows(rows: Vec<UntrackedStateRow>) -> Result<Self, LixError> {
+        rows.into_iter()
+            .map(FilesystemStateRow::from_untracked_state_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
@@ -65,6 +72,10 @@ impl FilesystemStateRows {
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &FilesystemStateRow> {
         self.0.iter()
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
     }
 }
 
@@ -117,6 +128,30 @@ impl FilesystemStateRow {
             commit_id: Some(row.value.commit_id),
             untracked,
             branch_id: branch_id.to_owned(),
+        })
+    }
+
+    fn from_untracked_state_row(row: UntrackedStateRow) -> Result<Self, LixError> {
+        let snapshot_content = match &row.value.cell {
+            crate::forktree::StateCell::Value(value) => Some(value.clone()),
+            crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
+        };
+        let global_branch = uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .expect("GLOBAL_BRANCH_ID must be canonical");
+        Ok(Self {
+            entity_pk: row.key.entity_pk,
+            schema_key: row.key.schema_key,
+            file_id: row.key.file_id,
+            snapshot_content,
+            metadata: row.value.metadata,
+            deleted: row.value.cell.deleted(),
+            created_at: row.value.created_at,
+            updated_at: row.value.updated_at,
+            global: row.owner.as_bytes() == global_branch.as_bytes(),
+            change_id: None,
+            commit_id: None,
+            untracked: true,
+            branch_id: uuid::Uuid::from_bytes(*row.owner.as_bytes()).to_string(),
         })
     }
 
