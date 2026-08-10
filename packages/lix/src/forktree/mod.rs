@@ -43,6 +43,7 @@ pub(crate) use serving::{
     load_change_records, load_commit, load_commit_member_records, load_commit_records,
     load_commit_summary, put_change_catalog_entries, put_commit_catalog_entries,
     scan_change_records, scan_commit_records, scan_commit_topologies,
+    scan_state_rows_at_commit_range, scan_state_rows_at_commit_ranges,
     select_historical_commit_member, state_point, state_point_on_read, state_points,
     state_points_on_read, state_range,
 };

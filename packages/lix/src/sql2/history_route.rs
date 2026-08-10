@@ -11,6 +11,7 @@ use crate::LixError;
 use crate::changelog::{ChangeId, ChangeRecord, CommitId};
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
+use crate::forktree::encode_state_entity_prefix_bounds;
 
 use super::SqlChangelogQuerySource;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
@@ -209,6 +210,59 @@ impl HistoryRoute {
         }
         true
     }
+}
+
+fn certified_state_ranges(
+    request: &CommitGraphChangeHistoryRequest,
+    entries: &[crate::commit_graph::CommitGraphChangeHistoryEntry],
+    observed_commit_id: CommitId,
+) -> Option<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    if request.schema_keys.is_empty() {
+        return None;
+    }
+    let schema_keys = request
+        .schema_keys
+        .iter()
+        .filter(|schema_key| schema_key.as_str() != "lix_commit")
+        .collect::<Vec<_>>();
+    if schema_keys.is_empty() {
+        return Some(Vec::new());
+    }
+    let entries = entries
+        .iter()
+        .filter(|entry| entry.observed_commit_id == observed_commit_id)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Some(Vec::new());
+    }
+    let entity_pks = if request.entity_pks.is_empty() {
+        entries
+            .iter()
+            .filter(|entry| {
+                schema_keys
+                    .iter()
+                    .any(|key| *key == &entry.change.schema_key)
+            })
+            .map(|entry| entry.change.entity_pk.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        request.entity_pks.clone()
+    };
+    if entity_pks.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut ranges = Vec::new();
+    for schema_key in schema_keys {
+        for entity_pk in &entity_pks {
+            let bounds = encode_state_entity_prefix_bounds(schema_key, entity_pk);
+            ranges.push((bounds.lower, bounds.upper));
+        }
+    }
+    ranges.sort();
+    ranges.dedup();
+    Some(ranges)
 }
 
 /// Commit-graph history entry enriched with commit metadata needed by SQL
@@ -416,7 +470,7 @@ where
     for as_of_commit_id in as_of_commit_ids {
         let as_of_commit_id =
             CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
-        let (entries, reachable_by_id) = {
+        let (entries, reachable_by_id, certified_commit_ids) = {
             let mut guard = commit_graph.lock().await;
             let history = guard
                 .change_history_from_commit(&as_of_commit_id, &request)
@@ -429,57 +483,85 @@ where
             let reachable_nodes = history.reachable_nodes;
             let mut reachable_by_id = BTreeMap::new();
             if !reachable_nodes.is_empty() {
-                let commit_ids = reachable_nodes
+                let certified_commit_ids = history
+                    .entries
                     .iter()
-                    .map(|reachable| reachable.commit.commit_id)
+                    .map(|entry| entry.observed_commit_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
                     .collect::<Vec<_>>();
-                let records = guard.load_commit_records(&commit_ids).await?;
-                if records.len() != commit_ids.len() {
+                let authenticated_ids = if request.schema_keys.is_empty() {
+                    reachable_nodes
+                        .iter()
+                        .map(|reachable| reachable.commit.commit_id)
+                        .collect::<Vec<_>>()
+                } else {
+                    certified_commit_ids.clone()
+                };
+                let records = guard.load_commit_records(&authenticated_ids).await?;
+                if records.len() != authenticated_ids.len() {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         "history commit record batch length does not match reachable commit IDs",
                     ));
                 }
-                for (index, reachable) in reachable_nodes.iter().enumerate() {
-                    let record = records.get(index).and_then(Option::as_ref).ok_or_else(|| {
-                        LixError::new(
+                let mut records_by_id = BTreeMap::new();
+                for (commit_id, record) in authenticated_ids.into_iter().zip(records) {
+                    let Some(record) = record else {
+                        return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
                             format!(
                                 "history commit '{}' is missing its authenticated record",
-                                reachable.commit.commit_id
+                                commit_id
                             ),
-                        )
-                    })?;
-                    if record.commit_id != reachable.commit.commit_id {
+                        ));
+                    };
+                    if record.commit_id != commit_id {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
                             format!(
                                 "history commit metadata identity mismatch for '{}'",
-                                reachable.commit.commit_id
+                                commit_id
                             ),
                         ));
                     }
-                    let created_at = if metadata_projection.commit_created_at {
-                        record.created_at.to_string()
-                    } else {
-                        String::new()
-                    };
+                    records_by_id.insert(commit_id, record);
+                }
+                for reachable in reachable_nodes.iter() {
+                    let record = records_by_id.get(&reachable.commit.commit_id);
+                    let created_at = record
+                        .filter(|_| metadata_projection.commit_created_at)
+                        .map_or_else(String::new, |record| record.created_at.to_string());
                     reachable_by_id.insert(
                         reachable.commit.commit_id,
-                        (reachable.depth, created_at, Some(record.account_id.clone())),
+                        (
+                            reachable.depth,
+                            created_at,
+                            record.map(|record| record.account_id.clone()),
+                        ),
                     );
                 }
+                (history.entries, reachable_by_id, certified_commit_ids)
+            } else {
+                (history.entries, reachable_by_id, Vec::new())
             }
-            (history.entries, reachable_by_id)
         };
-
         // A compacting checkpoint may carry selected Change members whose
         // authenticated source commit is not on the checkpoint's first-parent
         // walk.  Keep that existing member/source edge as the only additional
         // provenance closure; do not treat an arbitrary state-row commit ID as
         // reachable merely because it is present in a state root.
         let mut member_sources_by_change = BTreeMap::<ChangeId, AuthenticatedMemberSource>::new();
-        for (owner_commit_id, (owner_depth, _, _)) in &reachable_by_id {
+        for owner_commit_id in &certified_commit_ids {
+            let owner_depth = reachable_by_id
+                .get(owner_commit_id)
+                .map(|(depth, _, _)| *depth)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("certified commit '{owner_commit_id}' is not reachable"),
+                    )
+                })?;
             let members = forktree_reader
                 .load_commit_member_sources(*owner_commit_id)
                 .await?
@@ -507,17 +589,17 @@ where
                         change_id,
                         AuthenticatedMemberSource {
                             source_commit_id,
-                            owner_depth: *owner_depth,
+                            owner_depth,
                             record,
                         },
                     );
                 }
             }
         }
-
-        for entry in entries {
+        for entry in &entries {
             let change =
-                materialize_located_history_change(&mut forktree_reader, entry.change).await?;
+                materialize_located_history_change(&mut forktree_reader, entry.change.clone())
+                    .await?;
             let commit_created_at = if metadata_projection.commit_created_at {
                 Some(
                     reachable_by_id
@@ -545,15 +627,6 @@ where
                 depth: entry.depth,
             });
         }
-
-        let certified_commit_ids = reachable_by_id
-            .iter()
-            .filter(|(_, (depth, _, _))| {
-                request.min_depth.is_none_or(|minimum| *depth >= minimum)
-                    && request.max_depth.is_none_or(|maximum| *depth <= maximum)
-            })
-            .map(|(commit_id, _)| *commit_id)
-            .collect::<Vec<_>>();
         let mut existing_change_ids = rows
             .iter()
             .map(|entry| entry.change.id.clone())
@@ -565,9 +638,29 @@ where
                     format!("certified commit '{certified_commit_id}' is not reachable"),
                 ));
             }
-            let certified_rows = forktree_reader
-                .scan_state_rows_at_commit(certified_commit_id)
-                .await?;
+            let certified_ranges = certified_state_ranges(&request, &entries, certified_commit_id);
+            let certified_rows = match certified_ranges.as_deref() {
+                None => {
+                    forktree_reader
+                        .scan_state_rows_at_commit(certified_commit_id)
+                        .await?
+                }
+                Some(ranges) => {
+                    let mut rows = Vec::new();
+                    for (lower, upper) in ranges {
+                        rows.extend(
+                            forktree_reader
+                                .scan_state_rows_at_commit_range(
+                                    certified_commit_id,
+                                    lower,
+                                    upper.as_deref(),
+                                )
+                                .await?,
+                        );
+                    }
+                    rows
+                }
+            };
             for row in certified_rows {
                 let (row_depth, row_commit_created_at, account_id) = if let Some(source) =
                     member_sources_by_change.get(&row.change_id)
