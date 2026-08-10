@@ -82,6 +82,8 @@ impl VerifiedRequestBlob {
             suffix_bytes,
             insert,
             validated_result: result.blob.clone(),
+            result_blob_id: crate::forktree::canonical_blob_id_for_content(&result.blob)
+                .map_err(LixError::from)?,
         };
         Ok((result, provenance))
     }
@@ -111,6 +113,9 @@ pub struct RequestBlobSpliceProvenance {
     /// the constructor. Metadata cannot be transplanted onto different result
     /// bytes without forcing the ordinary full-diff path.
     validated_result: Blob,
+    /// Canonical Merkle identity of the same validated result bytes. The
+    /// write owner may consume this once without rebuilding the Merkle tree.
+    result_blob_id: crate::binary_cas::BlobId,
 }
 
 impl RequestBlobSpliceProvenance {
@@ -166,6 +171,8 @@ impl RequestBlobSpliceProvenance {
             suffix_bytes,
             insert,
             validated_result: result.clone(),
+            result_blob_id: crate::forktree::canonical_blob_id_for_content(result)
+                .map_err(LixError::from)?,
         })
     }
 
@@ -201,6 +208,10 @@ impl RequestBlobSpliceProvenance {
     pub(crate) fn matches_result(&self, result: &[u8]) -> bool {
         self.validated_result.len() == result.len()
             && self.validated_result.as_ptr() == result.as_ptr()
+    }
+
+    pub(crate) fn result_blob_id(&self) -> crate::binary_cas::BlobId {
+        self.result_blob_id
     }
 
     #[cfg(test)]
@@ -350,6 +361,10 @@ mod tests {
         assert_eq!(result.blob(), &expected);
         assert!(provenance.matches_result(result.blob()));
         assert_eq!(provenance.validated_result.as_ptr(), result.blob().as_ptr());
+        assert_eq!(
+            provenance.result_blob_id(),
+            crate::binary_cas::BlobId::from_canonical_content(result.blob())
+        );
         assert_eq!(provenance.insert.as_ptr(), insert_ptr);
     }
 

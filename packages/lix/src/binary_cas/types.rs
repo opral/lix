@@ -129,6 +129,12 @@ impl BlobPayload {
         Self { bytes, hash }
     }
 
+    pub(crate) fn from_bytes_with_hash(bytes: impl Into<crate::Blob>, hash: BlobId) -> Self {
+        let bytes = bytes.into();
+        let hash = (!bytes.is_empty()).then_some(hash);
+        Self { bytes, hash }
+    }
+
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
