@@ -325,6 +325,50 @@ where
         Ok(output)
     }
 
+    /// Loads one untracked row from exactly the owner selected by the caller.
+    /// This deliberately does not apply the local-over-global overlay: the
+    /// selected owner is part of the authenticated filesystem row identity,
+    /// and probing the sibling owner here would permit a same-key substitution.
+    pub(crate) async fn load_untracked_owner_point(
+        &self,
+        owner: CanonicalBranchId,
+        state_key: &[u8],
+    ) -> Result<Option<(super::state::StateKey, super::state::UntrackedValue)>, crate::LixError>
+    {
+        let decoded = super::state::decode_state_key(state_key)?;
+        let encoded = super::state::encode_untracked_key(
+            owner,
+            super::state::StateKeyRef {
+                schema_key: &decoded.schema_key,
+                file_id: decoded.file_id.as_deref(),
+                entity_pk: &decoded.entity_pk,
+            },
+        );
+        let loaded = self
+            .read
+            .get_many(&[GetManyRequest {
+                space: super::state::UNTRACKED_ROW_SPACE,
+                keys: &[Key(encoded.into())],
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            }])
+            .await?;
+        let Some(projected) = loaded.values.into_iter().next().flatten() else {
+            return Ok(None);
+        };
+        let ProjectedValue::FullValue(bytes) = projected else {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "ForkTree exact untracked owner lookup returned key-only data",
+            ));
+        };
+        Ok(Some((
+            decoded,
+            super::state::decode_untracked_value(&bytes)?,
+        )))
+    }
+
     async fn scan_untracked_rows_for_scope(
         &self,
         include_global_overlay: bool,

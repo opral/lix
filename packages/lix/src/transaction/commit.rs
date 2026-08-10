@@ -1524,6 +1524,13 @@ where
 {
     let mut manifests = PreparedBlobManifestMap::new();
     for write in &prepared.file_content_writes {
+        // Empty content is a deliberate BlobRef tombstone (or an empty
+        // insert with no BlobRef row). It has no final manifest owner to
+        // validate; non-empty payloads remain required to match their final
+        // coalesced authenticated BlobRef below.
+        if write.is_empty() {
+            continue;
+        }
         let manifest = if let Some(receipt) = write.prepared_cas_receipt() {
             ObjectId::from_bytes(receipt.manifest_object_id)
         } else if let Some(payload) = write.inline_payload() {
@@ -1628,7 +1635,82 @@ where
         // write-your-own-writes fail before publication.
         manifests.insert(key, prepared_manifest);
     }
+    validate_final_prepared_blob_manifests(prepared, &manifests)?;
     Ok(manifests)
+}
+
+fn validate_final_prepared_blob_manifests(
+    prepared: &PreparedWriteSet,
+    manifests: &PreparedBlobManifestMap,
+) -> Result<(), LixError> {
+    let mut final_owners = BTreeMap::new();
+    for row in prepared.state_rows.iter() {
+        if row.schema_key.as_str() != "lix_binary_blob_ref" {
+            continue;
+        }
+        let file_id = row
+            .file_id
+            .ok_or_else(|| writer_error("blob-ref state row has no file identity"))?;
+        let key = (
+            row.branch_id.to_string(),
+            file_id.to_string(),
+            row.global,
+            row.untracked,
+        );
+        if !manifests.contains_key(&key) {
+            continue;
+        }
+        let snapshot = row.snapshot.ok_or_else(|| {
+            writer_error("final blob-ref owner has no authenticated semantic snapshot")
+        })?;
+        let value: serde_json::Value =
+            serde_json::from_str(snapshot.normalized()).map_err(|error| {
+                writer_error(format!(
+                    "final blob-ref owner snapshot is malformed: {error}"
+                ))
+            })?;
+        let blob_id = value
+            .get("blob_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| writer_error("final blob-ref owner has no blob_hash"))
+            .and_then(crate::binary_cas::BlobId::from_hex)?;
+        let logical_bytes = value
+            .get("size_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| writer_error("final blob-ref owner has no size_bytes"))?;
+        if final_owners
+            .insert(key.clone(), (blob_id, logical_bytes))
+            .is_some()
+        {
+            return Err(writer_error(
+                "prepared blob writes contain duplicate final owner rows",
+            ));
+        }
+    }
+
+    for (key, manifest) in manifests {
+        let (blob_id, logical_bytes) = final_owners.get(key).copied().ok_or_else(|| {
+            writer_error(
+                "ordered file content writes have no matching final coalesced BlobRef owner",
+            )
+        })?;
+        validate_final_manifest_owner(*manifest, blob_id, logical_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_final_manifest_owner(
+    manifest: PreparedBlobManifest,
+    final_blob_id: crate::binary_cas::BlobId,
+    final_logical_bytes: u64,
+) -> Result<(), LixError> {
+    if manifest.canonical_blob_id != final_blob_id || manifest.logical_bytes != final_logical_bytes
+    {
+        return Err(writer_error(
+            "final coalesced BlobRef owner does not match its authenticated manifest",
+        ));
+    }
+    Ok(())
 }
 
 fn blob_manifest_object_ids_for_row(
@@ -1952,6 +2034,41 @@ mod intent_tests {
         assert_eq!(
             classify_publication_intent(&writes, None).expect("inline payload intent"),
             PublicationIntent::Noop
+        );
+    }
+
+    #[test]
+    fn ordered_insert_then_update_uses_final_manifest_and_rejects_mismatch() {
+        let key = (
+            crate::GLOBAL_BRANCH_ID.to_owned(),
+            "01920000-0000-7000-8000-000000000551".to_owned(),
+            false,
+            false,
+        );
+        let first = PreparedBlobManifest {
+            object_id: ObjectId::from_bytes([0x11; 32]),
+            canonical_blob_id: crate::binary_cas::BlobId::from_bytes([0x21; 32]),
+            logical_bytes: 3,
+        };
+        let final_manifest = PreparedBlobManifest {
+            object_id: ObjectId::from_bytes([0x12; 32]),
+            canonical_blob_id: crate::binary_cas::BlobId::from_bytes([0x22; 32]),
+            logical_bytes: 7,
+        };
+        let mut manifests = PreparedBlobManifestMap::new();
+        manifests.insert(key.clone(), first);
+        manifests.insert(key.clone(), final_manifest);
+        let selected = manifests.get(&key).copied().expect("final manifest");
+        assert_eq!(selected.object_id, final_manifest.object_id);
+        validate_final_manifest_owner(
+            selected,
+            final_manifest.canonical_blob_id,
+            final_manifest.logical_bytes,
+        )
+        .expect("ordered update should match the final coalesced BlobRef");
+        assert!(
+            validate_final_manifest_owner(selected, first.canonical_blob_id, first.logical_bytes,)
+                .is_err()
         );
     }
 

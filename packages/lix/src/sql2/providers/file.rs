@@ -647,8 +647,6 @@ where
                 }),
                 row.schema_key.clone(),
                 row.branch_id.clone(),
-                row.global,
-                row.untracked,
             );
             deduplicated.insert(key, row);
         }
@@ -704,45 +702,52 @@ where
         &self,
         request: &FileExactBatchPlan,
     ) -> Result<Vec<Option<FilesystemStateRow>>, LixError> {
-        let mut groups = BTreeMap::<(String, bool), Vec<(usize, Vec<u8>)>>::new();
+        let mut groups = BTreeMap::<String, Vec<(usize, Vec<u8>)>>::new();
         for (index, row) in request.rows.iter().enumerate() {
-            groups
-                .entry((row.branch_id.clone(), request.untracked == Some(true)))
-                .or_default()
-                .push((
-                    index,
-                    crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                        schema_key: &row.schema_key,
-                        file_id: row.file_id.as_deref(),
-                        entity_pk: &row.entity_pk,
-                    }),
-                ));
+            groups.entry(row.branch_id.clone()).or_default().push((
+                index,
+                crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                }),
+            ));
         }
         let mut output = (0..request.rows.len()).map(|_| None).collect::<Vec<_>>();
-        for ((branch_id, untracked), slots) in groups {
+        for (branch_id, slots) in groups {
             let keys = slots.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-            if untracked {
-                let rows = self
-                    .untracked_points_for_branch(&branch_id, &keys, request.include_tombstones)
-                    .await?;
-                for ((slot, _), row) in slots.into_iter().zip(rows) {
-                    output[slot] = row
-                        .map(FilesystemStateRow::from_untracked_state_row)
-                        .transpose()?;
-                    if let Some(row) = output[slot].as_mut() {
-                        if row.global {
-                            row.branch_id = branch_id.clone();
-                        }
-                    }
-                }
+            let include_overlay_tombstones =
+                request.include_tombstones || request.untracked.is_none();
+            let tracked = if request.untracked != Some(true) {
+                Some(
+                    self.points_for_branch(&branch_id, &keys, include_overlay_tombstones)
+                        .await?,
+                )
             } else {
-                let rows = self
-                    .points_for_branch(&branch_id, &keys, request.include_tombstones)
-                    .await?;
-                for ((slot, _), row) in slots.into_iter().zip(rows) {
-                    output[slot] = row
-                        .map(|row| FilesystemStateRow::from_state_row(row, &branch_id, false))
-                        .transpose()?;
+                None
+            };
+            let untracked = if request.untracked != Some(false) {
+                Some(
+                    self.untracked_points_for_branch(&branch_id, &keys, include_overlay_tombstones)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            for (ordinal, (slot, _)) in slots.into_iter().enumerate() {
+                if let Some(row) = untracked.as_ref().and_then(|rows| rows[ordinal].clone()) {
+                    let mut row = FilesystemStateRow::from_untracked_state_row(row)?;
+                    if row.global {
+                        row.branch_id = branch_id.clone();
+                    }
+                    output[slot] = if row.deleted && !request.include_tombstones {
+                        None
+                    } else {
+                        Some(row)
+                    };
+                } else if let Some(row) = tracked.as_ref().and_then(|rows| rows[ordinal].clone()) {
+                    output[slot] =
+                        Some(FilesystemStateRow::from_state_row(row, &branch_id, false)?);
                 }
             }
         }
@@ -6518,15 +6523,24 @@ async fn load_authenticated_blob_ranges_for_files(
         if let Some(row) = blob_rows.get(&key) {
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
+                let live = live_rows.row(row.live);
                 keys.push(key);
-                requests.push((row.state_key.clone(), range.clone()));
+                requests.push((
+                    crate::forktree::AuthenticatedBlobStateKey {
+                        state_key: row.state_key.clone(),
+                        branch_id: parse_blob_scope_branch_id(live.branch_id())?,
+                        global: live.global(),
+                        untracked: live.untracked(),
+                    },
+                    range.clone(),
+                ));
             }
             *remaining += 1;
         }
     }
     if !keys.is_empty() {
         let values = authenticated_blob_reader
-            .load_ranges_for_rows(&requests)
+            .load_ranges_for_scoped_rows(&requests)
             .await?
             .into_vec();
         if values.len() != keys.len() {
@@ -6565,15 +6579,21 @@ async fn load_authenticated_blob_bytes_for_files(
         if let Some(row) = blob_rows.get(&key) {
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
+                let live = live_rows.row(row.live);
                 keys.push(key);
-                rows.push(row.state_key.clone());
+                rows.push(crate::forktree::AuthenticatedBlobStateKey {
+                    state_key: row.state_key.clone(),
+                    branch_id: parse_blob_scope_branch_id(live.branch_id())?,
+                    global: live.global(),
+                    untracked: live.untracked(),
+                });
             }
             *remaining += 1;
         }
     }
     if !keys.is_empty() {
         let values = authenticated_blob_reader
-            .load_bytes_for_rows(&rows)
+            .load_bytes_for_scoped_rows(&rows)
             .await?
             .into_vec();
         if values.len() != keys.len() {
@@ -6633,8 +6653,14 @@ where
                 if let Some(bytes) = staged {
                     bytes_by_key.insert(key.clone(), Some(bytes));
                 } else {
+                    let live = live_rows.row(row.live);
                     keys.push(key);
-                    rows.push(row.state_key.clone());
+                    rows.push(crate::forktree::AuthenticatedBlobStateKey {
+                        state_key: row.state_key.clone(),
+                        branch_id: parse_blob_scope_branch_id(live.branch_id())?,
+                        global: live.global(),
+                        untracked: live.untracked(),
+                    });
                 }
             }
             *remaining += 1;
@@ -6642,7 +6668,7 @@ where
     }
     if !keys.is_empty() {
         let values = authenticated_blob_reader
-            .load_bytes_for_rows(&rows)
+            .load_bytes_for_scoped_rows(&rows)
             .await?
             .into_vec();
         if values.len() != keys.len() {
@@ -6661,6 +6687,20 @@ where
         bytes_by_key,
         remaining_by_key,
     })
+}
+
+fn parse_blob_scope_branch_id(
+    branch_id: &str,
+) -> Result<crate::forktree::CanonicalBranchId, LixError> {
+    let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("BlobRef owner branch ID must be a UUID: {error}"),
+        )
+    })?;
+    Ok(crate::forktree::CanonicalBranchId::from_bytes(
+        *uuid.as_bytes(),
+    ))
 }
 
 #[cfg(test)]
@@ -10209,6 +10249,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_blob_batch_untracked_overlay_masks_tracked_owner() {
+        let file_id = "01920000-0000-7000-8000-0000000000c1";
+        let branch_id = "01920000-0000-7000-8000-0000000000b1";
+        let tracked_data = b"tracked";
+        let untracked_data = b"untracked";
+        let tracked = live_blob_ref_row(
+            file_id,
+            branch_id,
+            file_id,
+            &BlobId::from_canonical_content(tracked_data).to_hex(),
+            tracked_data.len(),
+        );
+        let mut untracked = live_blob_ref_row(
+            file_id,
+            branch_id,
+            file_id,
+            &BlobId::from_canonical_content(untracked_data).to_hex(),
+            untracked_data.len(),
+        );
+        untracked.untracked = true;
+        let entity_pk = crate::entity_pk::EntityPk::uuid_from_canonical(file_id)
+            .expect("blob-ref fixture entity key");
+        let request = FileExactBatchPlan {
+            rows: vec![super::FileExactKeyPlan {
+                branch_id: branch_id.to_owned(),
+                schema_key: super::BLOB_REF_SCHEMA_KEY.to_owned(),
+                entity_pk: entity_pk.clone(),
+                file_id: Some(file_id.to_owned()),
+            }],
+            untracked: None,
+            ..FileExactBatchPlan::default()
+        };
+        let view = FileStateView::test_rows(vec![tracked, untracked.clone()]);
+        let rows = view
+            .load_exact_batch(&request)
+            .await
+            .expect("exact overlay should load both native lanes");
+        let selected = rows[0].as_ref().expect("untracked value should be visible");
+        assert!(selected.untracked);
+        assert!(selected.snapshot_content.as_ref().is_some_and(|snapshot| {
+            snapshot.contains(&BlobId::from_canonical_content(untracked_data).to_hex())
+        }));
+
+        untracked.deleted = true;
+        untracked.snapshot_content = None;
+        let view = FileStateView::test_rows(vec![
+            live_blob_ref_row(
+                file_id,
+                branch_id,
+                file_id,
+                &BlobId::from_canonical_content(tracked_data).to_hex(),
+                tracked_data.len(),
+            ),
+            untracked,
+        ]);
+        let rows = view
+            .load_exact_batch(&request)
+            .await
+            .expect("exact tombstone overlay should load both native lanes");
+        assert!(
+            rows[0].is_none(),
+            "untracked tombstone must suppress tracked owner"
+        );
+    }
+
+    #[tokio::test]
     async fn exact_id_manifest_blob_projection_binds_duplicate_blob_ids_per_state_key() {
         let (rows, first, second) = duplicate_blob_owner_rows();
         let prepared = super::prepare_lix_file_rows(rows, &super::FilePathPredicate::All)
@@ -10877,6 +10983,35 @@ mod tests {
             }
             Ok(BlobRangeBytesBatch::new(entries))
         }
+
+        async fn load_bytes_for_scoped_rows(
+            &self,
+            rows: &[crate::forktree::AuthenticatedBlobStateKey],
+        ) -> Result<BlobBytesBatch, LixError> {
+            self.load_bytes_for_rows(
+                &rows
+                    .iter()
+                    .map(|row| row.state_key.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
+
+        async fn load_ranges_for_scoped_rows(
+            &self,
+            requests: &[(
+                crate::forktree::AuthenticatedBlobStateKey,
+                std::ops::Range<u64>,
+            )],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            self.load_ranges_for_rows(
+                &requests
+                    .iter()
+                    .map(|(row, range)| (row.state_key.clone(), range.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
     }
 
     #[async_trait]
@@ -10905,6 +11040,35 @@ mod tests {
             _requests: &[(StateKey, std::ops::Range<u64>)],
         ) -> Result<BlobRangeBytesBatch, LixError> {
             Ok(BlobRangeBytesBatch::new(Vec::new()))
+        }
+
+        async fn load_bytes_for_scoped_rows(
+            &self,
+            rows: &[crate::forktree::AuthenticatedBlobStateKey],
+        ) -> Result<BlobBytesBatch, LixError> {
+            self.load_bytes_for_rows(
+                &rows
+                    .iter()
+                    .map(|row| row.state_key.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
+
+        async fn load_ranges_for_scoped_rows(
+            &self,
+            requests: &[(
+                crate::forktree::AuthenticatedBlobStateKey,
+                std::ops::Range<u64>,
+            )],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            self.load_ranges_for_rows(
+                &requests
+                    .iter()
+                    .map(|(row, range)| (row.state_key.clone(), range.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .await
         }
     }
 
@@ -10940,6 +11104,35 @@ mod tests {
             _requests: &[(StateKey, std::ops::Range<u64>)],
         ) -> Result<BlobRangeBytesBatch, LixError> {
             Ok(BlobRangeBytesBatch::new(Vec::new()))
+        }
+
+        async fn load_bytes_for_scoped_rows(
+            &self,
+            rows: &[crate::forktree::AuthenticatedBlobStateKey],
+        ) -> Result<BlobBytesBatch, LixError> {
+            self.load_bytes_for_rows(
+                &rows
+                    .iter()
+                    .map(|row| row.state_key.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
+
+        async fn load_ranges_for_scoped_rows(
+            &self,
+            requests: &[(
+                crate::forktree::AuthenticatedBlobStateKey,
+                std::ops::Range<u64>,
+            )],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            self.load_ranges_for_rows(
+                &requests
+                    .iter()
+                    .map(|(row, range)| (row.state_key.clone(), range.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .await
         }
     }
 
