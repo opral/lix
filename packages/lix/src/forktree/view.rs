@@ -1398,7 +1398,7 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, false).await
+        diff_branch_state_rows_between_commits_on_read(&self.read, before, after).await
     }
 
     /// Returns authenticated state-write identity changes separately from
@@ -1599,6 +1599,114 @@ where
             changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
         })
         .collect())
+}
+
+/// Diffs the authenticated branch-local roots and resolves only the changed
+/// keys against both complete global/local overlays. The structural diff is
+/// the discovery authority; exact point batches provide the endpoint values,
+/// so a local add/remove still reveals or re-masks its global fallback without
+/// scanning either historical state tree.
+async fn diff_branch_state_rows_between_commits_on_read<R>(
+    read: &R,
+    before: crate::changelog::CommitId,
+    after: crate::changelog::CommitId,
+) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let (before_global_root, before_local_root) =
+        super::serving::authenticate_historical_state_roots(read, before).await?;
+    let (after_global_root, after_local_root) =
+        super::serving::authenticate_historical_state_roots(read, after).await?;
+
+    // Equal local roots are normally a zero-key fast path. Validate the
+    // shared root once first so an equal-but-corrupt root cannot be mistaken
+    // for an authenticated empty diff.
+    if before_local_root == after_local_root {
+        super::tree::validate_root_on_read(before_local_root, "state", read).await?;
+    }
+    let changed_keys =
+        super::tree::diff_roots(Some(before_local_root), Some(after_local_root), read).await?;
+    if changed_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let encoded_keys = changed_keys
+        .iter()
+        .map(|key| {
+            super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let before_values = super::serving::state_points_on_read(
+        before_global_root,
+        Some(before_local_root),
+        &encoded_keys,
+        true,
+        read,
+    )
+    .await?;
+    let after_values = super::serving::state_points_on_read(
+        after_global_root,
+        Some(after_local_root),
+        &encoded_keys,
+        true,
+        read,
+    )
+    .await?;
+    let before_rows = historical_state_rows_from_points(&encoded_keys, before_values)?;
+    let after_rows = historical_state_rows_from_points(&encoded_keys, after_values)?;
+
+    Ok(before_rows
+        .into_iter()
+        .zip(after_rows)
+        .filter_map(|(before, after)| {
+            historical_state_payloads_differ(before.as_ref(), after.as_ref())
+                .then_some(super::state::HistoricalStateDiffEntry { before, after })
+        })
+        .collect())
+}
+
+fn historical_state_rows_from_points(
+    encoded_keys: &[Vec<u8>],
+    values: Vec<Option<(super::state::StateValue, super::serving::StateSource)>>,
+) -> Result<Vec<Option<super::state::HistoricalStateRow>>, crate::LixError> {
+    if encoded_keys.len() != values.len() {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            "state point batch returned a different number of slots than requested",
+        ));
+    }
+    encoded_keys
+        .iter()
+        .zip(values)
+        .map(|(encoded_key, value)| {
+            let Some((value, source)) = value else {
+                return Ok(None);
+            };
+            let key = super::state::decode_state_key(encoded_key)?;
+            let (snapshot_content, deleted) = match value.cell {
+                super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+                super::state::StateCell::Null => (None, false),
+                super::state::StateCell::Tombstone => (None, true),
+            };
+            Ok(Some(super::state::HistoricalStateRow {
+                key,
+                global: source == super::serving::StateSource::Global,
+                snapshot_content,
+                metadata: value.metadata,
+                deleted,
+                blob_manifest_object_ids: value.blob_manifest_object_ids,
+                created_at: value.created_at,
+                updated_at: value.updated_at,
+                change_id: value.change_id,
+                commit_id: value.commit_id,
+            }))
+        })
+        .collect()
 }
 
 fn historical_state_payloads_differ(
