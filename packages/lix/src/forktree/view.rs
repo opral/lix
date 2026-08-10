@@ -544,13 +544,6 @@ where
         super::tree::lookup_on_read(root, expected_kind, key, &self.read).await
     }
 
-    pub(crate) async fn load_commit_members(
-        &self,
-        commit: &CommitObjectV1,
-    ) -> Result<Vec<super::model::CommitMemberV1>, StorageError> {
-        super::serving::load_commit_members(&self.read, commit).await
-    }
-
     pub(crate) async fn scan_tree_page(
         &self,
         root: ObjectId,
@@ -560,27 +553,6 @@ where
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         super::tree::scan_page_on_read(root, expected_kind, start_after, page_size, &self.read)
             .await
-    }
-
-    pub(crate) async fn validate_member_catalog_owner(
-        &self,
-        commit_catalog_root: ObjectId,
-        target_commit_object_id: ObjectId,
-        target_generation: u64,
-        target_ordinal: usize,
-        member: super::model::CommitMemberV1,
-        entry: ChangeCatalogEntry,
-    ) -> Result<(), StorageError> {
-        super::serving::validate_member_catalog_owner(
-            &self.read,
-            commit_catalog_root,
-            target_commit_object_id,
-            target_generation,
-            target_ordinal,
-            member,
-            entry,
-        )
-        .await
     }
 
     pub(crate) async fn validate_retained_commit(

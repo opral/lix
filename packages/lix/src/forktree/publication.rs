@@ -18,7 +18,7 @@ use super::model::{
     upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::serving::{CatalogTreeEdit, StateTreeEdit};
+use super::serving::{CatalogTreeEdit, SelectedHistoricalMemberBatch, StateTreeEdit};
 use super::state::{
     StateKey, StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
     encode_untracked_value,
@@ -60,6 +60,7 @@ pub(crate) struct OrderedBranchHistoryTransition {
     pub(crate) branch_ref_change: ChangeObjectV1,
     pub(crate) branch_snapshot: BranchSnapshotV1,
     pub(crate) repository_root: RepositoryRootV1,
+    pub(crate) selected_history: SelectedHistoricalMemberBatch,
 }
 
 /// One prepared atomic publication. It always exact-CASes and rotates the
@@ -1437,6 +1438,7 @@ impl PreparedPublication {
             branch_ref_change,
             branch_snapshot,
             repository_root,
+            mut selected_history,
         } = transition;
         let mut member_pages = Vec::new();
         for commit in &mut semantic_commits {
@@ -1604,29 +1606,16 @@ impl PreparedPublication {
                         }
                     }
                     Some(_) => {
-                        let raw_entry = view
-                            .lookup_tree_value(
-                                view.repository_root().change_catalog_root,
-                                "change",
-                                change_id.as_bytes(),
-                            )
-                            .await?
-                            .ok_or_else(|| {
-                                corruption("selected history member has no ChangeCatalog owner")
-                            })?;
-                        view.validate_member_catalog_owner(
-                            view.repository_root().commit_catalog_root,
-                            commit_object_id,
+                        selected_history.consume_proof(
+                            view.view_instance_id(),
                             commit.generation,
-                            ordinal,
-                            member.clone(),
-                            super::model::ChangeCatalogEntry::decode(&raw_entry)?,
-                        )
-                        .await?;
+                            member,
+                        )?;
                     }
                 }
             }
         }
+        selected_history.finish_proof(view.view_instance_id())?;
 
         let final_commit = semantic_commits.last().expect("nonempty checked");
         let (final_commit_object_id, _) = final_commit.encode()?;

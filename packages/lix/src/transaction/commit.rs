@@ -25,11 +25,12 @@ use crate::transaction::types::PreparedStateRowRef;
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
-    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef, StateKey,
-    StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
-    UntrackedValueRef, encode_state_key, encode_state_value, load_commit, load_commit_summary,
-    open_coherent_view_on_read, select_historical_commit_member, state_points,
+    CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1,
+    HistoricalMemberSelection, ObjectId, OrderedBranchHistoryTransition, PreparedPublication,
+    RepositoryRootV1, SelectedHistoricalMember, StateCellRef, StateKey, StateKeyRef,
+    StateMutationAudit, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
+    encode_state_key, encode_state_value, load_commit, load_commit_summary,
+    open_coherent_view_on_read, select_historical_commit_members, state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -1034,11 +1035,32 @@ where
         .and_then(|draft| draft.parent_commit_ids.first())
         .copied()
         .ok_or_else(|| writer_error("ordered history first draft has no parent"))?;
-    let sequence_parent = load_commit(view, forktree_commit_id(sequence_parent_id))
-        .await?
-        .ok_or_else(|| writer_error("ordered history first parent is absent"))?;
+    let selected_requests = drafts
+        .iter()
+        .flat_map(|draft| &draft.selected_change_batches)
+        .flat_map(crate::transaction::types::StagedCommitChangeBatch::iter)
+        .map(|selected| {
+            HistoricalMemberSelection::new(
+                forktree_commit_id(selected.source_commit_id),
+                forktree_change_id(selected.change_id),
+                encode_state_key(StateKeyRef {
+                    schema_key: selected.schema_key(),
+                    file_id: selected.file_id(),
+                    entity_pk: selected.entity_pk(),
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut selected_batch = select_historical_commit_members(
+        view,
+        forktree_commit_id(sequence_parent_id),
+        &selected_requests,
+    )
+    .await?;
+    let sequence_parent = selected_batch.sequence_parent().clone();
     let sequence_global_root = sequence_parent.global_state_root;
     let sequence_local_root = sequence_parent.local_state_root;
+    let mut selected_members = selected_batch.take_selected().into_iter();
 
     let mut state_domain = prepared
         .state_rows
@@ -1200,12 +1222,16 @@ where
                         "selected history cannot source an uncommitted commit from the same batch",
                     ));
                 }
-                let (member, source_commit, source_change) = select_historical_commit_member(
-                    view,
-                    forktree_commit_id(selected.source_commit_id),
-                    forktree_change_id(selected.change_id),
-                )
-                .await?;
+                let SelectedHistoricalMember {
+                    member,
+                    source_commit,
+                    source_change,
+                    source_state: source_value,
+                    source_domain,
+                    sequence_state: sequence_value,
+                } = selected_members.next().ok_or_else(|| {
+                    writer_error("ordered history selected-member batch is incomplete")
+                })?;
                 max_selected_source_generation = Some(
                     max_selected_source_generation.map_or(source_commit.generation, |generation| {
                         generation.max(source_commit.generation)
@@ -1227,24 +1253,7 @@ where
                         "selected history identity or lifecycle differs from its Change payload",
                     ));
                 }
-                let (source_value, source_domain) = view
-                    .state_point_at_roots(
-                        source_commit.global_state_root,
-                        source_commit.local_state_root,
-                        &identity,
-                        true,
-                    )
-                    .await?
-                    .ok_or_else(|| writer_error("selected history source state row is absent"))?;
                 let selected_global = source_domain == StateSource::Global;
-                let sequence_value = view
-                    .state_point_at_roots(
-                        sequence_global_root,
-                        sequence_local_root,
-                        &identity,
-                        true,
-                    )
-                    .await?;
                 let sequence_semantically_absent = sequence_value
                     .as_ref()
                     .is_none_or(|(value, _)| value.cell.deleted());
@@ -1338,6 +1347,11 @@ where
             member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
             max_selected_source_generation,
         });
+    }
+    if selected_members.next().is_some() {
+        return Err(writer_error(
+            "ordered history selected-member batch has trailing rows",
+        ));
     }
 
     let global = state_domain.unwrap_or(false);
@@ -1518,6 +1532,7 @@ where
             historical_global_state_root: final_global_state_root,
         },
         repository_root,
+        selected_history: selected_batch,
     };
     publication
         .publish_ordered_branch_history(view, transition)

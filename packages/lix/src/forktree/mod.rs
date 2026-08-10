@@ -38,11 +38,12 @@ pub(crate) use publication::{
 };
 pub(crate) use reachability::{GcBudget, GcStepStatus, advance_gc};
 pub(crate) use serving::{
-    CommitTopology, CommitTopologyReader, StateMutationAudit, StateSource, StateTreeMutation,
-    VisibleStateRow, edit_state_tree, load_branch_heads_with_metadata, load_change_records,
-    load_commit, load_commit_member_records, load_commit_records, load_commit_summary,
-    put_change_catalog_entries, put_commit_catalog_entries, scan_change_records,
-    select_historical_commit_member, state_point, state_points, state_points_on_read, state_range,
+    CommitTopology, CommitTopologyReader, HistoricalMemberSelection, SelectedHistoricalMember,
+    StateMutationAudit, StateSource, StateTreeMutation, VisibleStateRow, edit_state_tree,
+    load_branch_heads_with_metadata, load_change_records, load_commit, load_commit_member_records,
+    load_commit_records, load_commit_summary, put_change_catalog_entries,
+    put_commit_catalog_entries, scan_change_records, select_historical_commit_members, state_point,
+    state_points, state_points_on_read, state_range,
 };
 pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
