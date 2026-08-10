@@ -1795,6 +1795,110 @@ where
 
 type AuthenticatedCommitMemberClosure = (CommitObjectV1, Arc<[CommitMemberV1]>);
 
+#[derive(Default)]
+pub(super) struct StaleMemberAuthCache {
+    commits: BTreeMap<ObjectId, CommitObjectV1>,
+    members: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), (CommitMemberV1, u32)>,
+}
+
+async fn load_stale_commit<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<CommitObjectV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(commit) = cache.commits.get(&commit_object_id) {
+        return Ok(commit.clone());
+    }
+    let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+    let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+    validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, &commit).await?;
+    validate_commit_topology(read, commit_catalog_root, commit.commit_id, &commit)
+        .await
+        .map_err(|error| corruption(error.to_string()))?;
+    validate_root_on_read(commit.global_state_root, "state", read).await?;
+    validate_root_on_read(commit.local_state_root, "state", read).await?;
+    cache.commits.insert(commit_object_id, commit.clone());
+    Ok(commit)
+}
+
+/// Resolves one authenticated member through a commit's visible state root.
+/// The commit envelope/catalog/topology bind both roots, the exact state key
+/// selects the authenticated page, and that page binds ordinal and ChangeId.
+/// No complete historical member closure is loaded.
+async fn load_stale_member_at_key<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    state_key: &[u8],
+    expected_change_id: ChangeId,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<(CommitObjectV1, CommitMemberV1, u32), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let cache_key = (
+        commit_object_id,
+        state_key.to_vec(),
+        expected_change_id.as_bytes().to_vec(),
+    );
+    let commit = load_stale_commit(read, commit_catalog_root, commit_object_id, cache).await?;
+    if let Some(member) = cache.members.get(&cache_key) {
+        return Ok((commit, member.0.clone(), member.1));
+    }
+    for (root, expected_global) in [
+        (commit.local_state_root, false),
+        (commit.global_state_root, true),
+    ] {
+        let Some(encoded) = lookup_on_read(root, "state", state_key, read).await? else {
+            continue;
+        };
+        let value_ref = decode_state_value_storage(&encoded)?;
+        let page_bytes = super::view::load_object_bytes(read, value_ref.page_object_id).await?;
+        let page = super::model::CommitChangePageV2::decode(value_ref.page_object_id, &page_bytes)?;
+        if page.commit_id != commit.commit_id
+            || !commit
+                .member_page_object_ids
+                .contains(&value_ref.page_object_id)
+        {
+            return Err(corruption(
+                "authenticated source state page is not owned by its Commit",
+            ));
+        }
+        let page_ordinal = usize::try_from(value_ref.page_ordinal)
+            .map_err(|_| corruption("authenticated source page ordinal overflows usize"))?;
+        let member = page
+            .members
+            .get(page_ordinal)
+            .cloned()
+            .ok_or_else(|| corruption("authenticated source state page ordinal is absent"))?;
+        if member.change_id() != expected_change_id {
+            continue;
+        }
+        if let CommitMemberV1::Introduced { global, .. } = &member
+            && *global != expected_global
+        {
+            return Err(corruption(
+                "authenticated source state scope differs from its member",
+            ));
+        }
+        let member_ordinal = page
+            .start_ordinal
+            .checked_add(value_ref.page_ordinal)
+            .ok_or_else(|| corruption("authenticated source member ordinal overflows u32"))?;
+        cache
+            .members
+            .insert(cache_key, (member.clone(), member_ordinal));
+        return Ok((commit, member, member_ordinal));
+    }
+    Err(corruption(
+        "authenticated source state key does not contain its expected ChangeId",
+    ))
+}
+
 async fn load_authenticated_commit_member_closure<R>(
     read: &R,
     commit_catalog_root: ObjectId,
@@ -1979,15 +2083,98 @@ where
     Ok(())
 }
 
+async fn validate_member_catalog_owner_with_stale_cache<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+    state_key: &[u8],
+    member: &CommitMemberV1,
+    entry: ChangeCatalogEntry,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let canonical_owner = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            let (_introduction_commit, introduction_member, introduction_ordinal) =
+                load_stale_member_at_key(
+                    read,
+                    commit_catalog_root,
+                    commit_object_id,
+                    state_key,
+                    member.change_id(),
+                    cache,
+                )
+                .await?;
+            if introduction_member.change_id() != member.change_id()
+                || introduction_member.source().is_some()
+                || introduction_ordinal != ordinal
+            {
+                return Err(corruption(
+                    "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                ));
+            }
+            (commit_object_id, ordinal)
+        }
+        ChangeCatalogOwner::BranchRef { .. } => {
+            return Err(corruption(
+                "semantic commit member resolves to a branch-ref catalog owner",
+            ));
+        }
+    };
+    match member.source() {
+        None => {
+            let target_ordinal = u32::try_from(target_ordinal)
+                .map_err(|_| corruption("commit member ordinal exceeds u32"))?;
+            if canonical_owner != (target_commit_object_id, target_ordinal) {
+                return Err(corruption(
+                    "introduced membership is not the canonical ChangeCatalog owner",
+                ));
+            }
+        }
+        Some((source_commit_object_id, source_ordinal)) => {
+            let (source_commit, source_member, source_member_ordinal) = load_stale_member_at_key(
+                read,
+                commit_catalog_root,
+                source_commit_object_id,
+                state_key,
+                member.change_id(),
+                cache,
+            )
+            .await?;
+            if source_commit.generation >= target_generation {
+                return Err(corruption(
+                    "selected membership source generation is not earlier than its target",
+                ));
+            }
+            if source_member.change_id() != member.change_id()
+                || source_member_ordinal != source_ordinal
+            {
+                return Err(corruption(
+                    "selected membership source commit/ordinal back-edge is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn resolve_semantic_member_with_stale_auth<R>(
     read: &R,
     member: &CommitMemberV1,
+    state_key: &[u8],
     target_commit_object_id: ObjectId,
     target_generation: u64,
     target_ordinal: usize,
     commit_catalog_root: ObjectId,
     change_catalog_root: ObjectId,
-    closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
+    cache: &mut StaleMemberAuthCache,
 ) -> Result<ResolvedSemanticMember, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
@@ -2013,15 +2200,16 @@ where
         .await?
         .ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
-        validate_member_catalog_owner_with_commit_cache(
+        validate_member_catalog_owner_with_stale_cache(
             read,
             commit_catalog_root,
             owner,
             generation,
             ordinal,
+            state_key,
             &current,
             entry,
-            closures,
+            cache,
         )
         .await?;
 
@@ -2059,18 +2247,22 @@ where
                     ));
                 }
                 selected_created_at.get_or_insert(created_at);
-                let (source_commit, source_members) = load_authenticated_commit_member_closure(
-                    read,
-                    commit_catalog_root,
-                    source_commit_object_id,
-                    closures,
-                )
-                .await?;
-                let source_ordinal = source_ordinal as usize;
-                current = source_members
-                    .get(source_ordinal)
-                    .cloned()
-                    .ok_or_else(|| corruption("selected member source ordinal is absent"))?;
+                let (source_commit, source_member, source_member_ordinal) =
+                    load_stale_member_at_key(
+                        read,
+                        commit_catalog_root,
+                        source_commit_object_id,
+                        state_key,
+                        expected_change_id,
+                        cache,
+                    )
+                    .await?;
+                if source_member_ordinal != source_ordinal {
+                    return Err(corruption(
+                        "selected member source state ordinal is inconsistent",
+                    ));
+                }
+                current = source_member;
                 if current.change_id() != expected_change_id {
                     return Err(corruption(
                         "selected member source changes its authenticated ChangeId",
@@ -2078,7 +2270,7 @@ where
                 }
                 owner = source_commit_object_id;
                 generation = source_commit.generation;
-                ordinal = source_ordinal;
+                ordinal = source_ordinal as usize;
             }
         }
     }
@@ -2704,7 +2896,7 @@ where
     let summary_cache_key =
         crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*summary.commit_id.as_bytes()));
     let mut summary_cache = BTreeMap::from([(summary_cache_key, summary.clone())]);
-    let mut closures = BTreeMap::new();
+    let mut stale_member_cache = StaleMemberAuthCache::default();
     for (row, value_ref) in selected.iter().zip(refs) {
         let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
             output.push(None);
@@ -2744,12 +2936,13 @@ where
         let resolved = resolve_semantic_member_with_stale_auth(
             read,
             member,
+            encoded_key,
             page_summary.commit_object_id,
             page_summary.generation,
             target_ordinal,
             repository.commit_catalog_root,
             repository.change_catalog_root,
-            &mut closures,
+            &mut stale_member_cache,
         )
         .await?;
         let expected_global = *source == StateSource::Global;
