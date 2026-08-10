@@ -230,10 +230,6 @@ impl CatalogSnapshot {
         self.plans.len()
     }
 
-    pub(crate) fn plans(&self) -> impl Iterator<Item = &SchemaPlan> {
-        self.plans.iter()
-    }
-
     /// Returns the schema definitions represented by this compiled snapshot.
     ///
     /// SQL surface binding needs the authoritative catalog snapshot captured

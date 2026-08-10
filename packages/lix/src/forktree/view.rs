@@ -750,21 +750,6 @@ where
     ) -> Result<CoherentView<&R>, StorageError> {
         open_coherent_view_on_read(&self.read, branch_id).await
     }
-
-    pub(crate) async fn load_change_records(
-        &self,
-        ids: &[crate::changelog::ChangeId],
-    ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError> {
-        super::serving::load_change_records(&self.read, ids).await
-    }
-
-    pub(crate) async fn diff_state_rows_between_commits(
-        &self,
-        before: crate::changelog::CommitId,
-        after: crate::changelog::CommitId,
-    ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        diff_state_rows_between_commits_on_read(&self.read, before, after, true).await
-    }
 }
 
 /// One operation-scoped ForkTree read facade. Branch views borrow the same

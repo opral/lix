@@ -98,22 +98,6 @@ impl CatalogContext {
         self.compiled_catalog_for_rows(&catalog_rows)
     }
 
-    pub(crate) fn compiled_catalog_for_state_rows(
-        &self,
-        catalog_rows: Vec<(Domain, Vec<StateRow>)>,
-    ) -> Result<Arc<CatalogSnapshot>, LixError> {
-        let catalog_rows = CatalogRows {
-            domains: catalog_rows
-                .into_iter()
-                .map(|(domain, rows)| CatalogDomainRows {
-                    domain,
-                    rows: rows.into_iter().map(catalog_row_from_state).collect(),
-                })
-                .collect(),
-        };
-        self.compiled_catalog_for_rows(&catalog_rows)
-    }
-
     fn compiled_catalog_for_rows(
         &self,
         catalog_rows: &CatalogRows,

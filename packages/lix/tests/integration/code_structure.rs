@@ -1254,6 +1254,32 @@ fn production_source_files() -> Vec<(String, String)> {
     files
 }
 
+fn current_retired_authority_residue() -> Vec<(String, String)> {
+    const RETIRED_TOKENS: &[&str] = &[
+        "live_state",
+        "tracked_state",
+        "TrackedState",
+        "TrackedHead",
+        "BranchHeadControl",
+        "StateForeignKeyPlan",
+        "StateDeleteReferencePlan",
+        "lix_state_by_branch",
+        "lix_state_history",
+        "lix_label_assignment",
+    ];
+
+    production_source_files()
+        .into_iter()
+        .flat_map(|(relative_path, source)| {
+            let masked_source = mask_rust_source(&source);
+            RETIRED_TOKENS.iter().filter_map(move |token| {
+                contains_identifier(&masked_source, token)
+                    .then(|| (relative_path.clone(), (*token).to_owned()))
+            })
+        })
+        .collect()
+}
+
 fn source_test_and_bench_rust_files() -> Vec<(String, String)> {
     let mut files = production_source_files();
 
@@ -2443,6 +2469,21 @@ fn rust_modules_do_not_use_path_attributes() {
         violations.is_empty(),
         "Rust modules must not use path attributes; move modules under a normal owner instead.\n\n{}",
         violations.join("\n"),
+    );
+}
+
+#[test]
+fn retired_state_authorities_have_no_production_residue() {
+    let residues = current_retired_authority_residue();
+
+    assert!(
+        residues.is_empty(),
+        "retired live/tracked-state authority names must not re-enter production source;\n\nResidues:\n{}",
+        residues
+            .iter()
+            .map(|(path, token)| format!("{path}: {token}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
 }
 

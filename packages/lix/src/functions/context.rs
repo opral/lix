@@ -2,7 +2,7 @@ use crate::LixError;
 use crate::changelog::ChangeId;
 use crate::common::LixTimestamp;
 use crate::functions::{
-    DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
+    DeterministicFunctionProvider, FunctionProvider, FunctionProviderHandle,
     SystemFunctionProvider, state,
 };
 use crate::state::ForkTreeStateView;

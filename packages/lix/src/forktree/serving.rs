@@ -23,7 +23,7 @@ use super::tree::{
     apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
     scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
 };
-use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
+use super::view::{CoherentView, SELECTOR_SPACE};
 
 const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
@@ -1022,44 +1022,6 @@ where
         requested,
         cache_seeded: cache.resolved.values().cloned().collect(),
     })
-}
-
-pub(crate) async fn scan_commit_topologies<R>(
-    read: &R,
-    start_after: Option<crate::changelog::CommitId>,
-    limit: usize,
-) -> Result<Vec<CommitTopology>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let repository = load_repository_root(read).await?;
-    let start_after = start_after.map(|id| id.as_uuid().as_bytes().to_vec());
-    let rows = scan_page_on_read(
-        repository.commit_catalog_root,
-        "commit",
-        start_after.as_deref(),
-        limit.min(CATALOG_SCAN_PAGE_ROWS),
-        read,
-    )
-    .await?;
-    let mut topologies = Vec::with_capacity(rows.len());
-    for (key, value) in rows {
-        let id = CommitId::from_bytes(
-            key.as_slice()
-                .try_into()
-                .map_err(|_| corruption("CommitCatalog key is not a raw UUID"))?,
-        );
-        let entry = CommitCatalogEntry::decode(&value)?;
-        let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
-        let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
-        topologies.push(
-            validate_commit_topology(read, repository.commit_catalog_root, id, &commit).await?,
-        );
-    }
-    Ok(topologies)
 }
 
 pub(crate) async fn load_change_records<R>(
@@ -2347,39 +2309,6 @@ where
     )
     .await?;
     historical_state_rows_from_range(rows)
-}
-
-/// Loads several authenticated state ranges for one historical commit while
-/// authenticating the commit/catalog/root envelope only once. Each range is
-/// still independently bounded and resolved against the same retained read.
-pub(crate) async fn scan_state_rows_at_commit_ranges<R>(
-    read: &R,
-    commit_id: crate::changelog::CommitId,
-    ranges: &[(Vec<u8>, Option<Vec<u8>>)],
-) -> Result<Vec<HistoricalStateRow>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    if ranges.is_empty() {
-        return Ok(Vec::new());
-    }
-    let (global_state_root, local_state_root) =
-        load_historical_commit_state_roots(read, commit_id).await?;
-    let mut output = Vec::new();
-    for (lower, upper) in ranges {
-        let rows = state_range_on_roots(
-            global_state_root,
-            Some(local_state_root),
-            read,
-            Some(lower),
-            upper.as_deref(),
-            None,
-            true,
-        )
-        .await?;
-        output.extend(historical_state_rows_from_range(rows)?);
-    }
-    Ok(output)
 }
 
 pub(crate) async fn edit_state_tree<R>(
