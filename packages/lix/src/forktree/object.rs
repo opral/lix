@@ -118,6 +118,22 @@ pub(super) fn encode_object(
     Ok((id, bytes))
 }
 
+/// Computes an immutable object identity without retaining the encoded value.
+/// This is used only for transaction-local content identity derivation where
+/// the publication owner will encode and stage the authenticated object later.
+pub(super) fn hash_object_parts(
+    domain: ObjectDomain,
+    parts: impl IntoIterator<Item = impl AsRef<[u8]>>,
+) -> ObjectId {
+    let mut hasher = blake3::Hasher::new_derive_key(OBJECT_HASH_DOMAIN);
+    hasher.update(OBJECT_MAGIC);
+    hasher.update(&(domain as u32).to_be_bytes());
+    for part in parts {
+        hasher.update(part.as_ref());
+    }
+    ObjectId::from_bytes(*hasher.finalize().as_bytes())
+}
+
 pub(super) fn decode_object<'a>(
     expected_id: ObjectId,
     expected_domain: ObjectDomain,

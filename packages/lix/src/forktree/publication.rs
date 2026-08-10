@@ -681,6 +681,56 @@ impl PreparedPublication {
         self.stage_blob_manifest(&build.manifest)
     }
 
+    /// Publishes an inline successor from an authenticated existing BlobRef
+    /// without materializing the base payload. The operation discovers a
+    /// chunk-boundary edit from authenticated Merkle leaf claims, then reuses
+    /// the existing verified path-copy builder. A stale/missing base is an
+    /// error; this method never falls back to an unauthenticated BlobId read.
+    pub(crate) async fn stage_authenticated_inline_blob_edit<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        state_key: &StateKey,
+        payload: &BlobPayload,
+        expected_base: crate::binary_cas::BlobId,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead + Sync,
+    {
+        let reference = view
+            .bind_blob_at_state_key(state_key)
+            .await
+            .map_err(|error| StorageError::Corruption(error.to_string()))?
+            .ok_or_else(|| corruption("authenticated blob edit base owner is absent"))?;
+        if reference.semantic_id() != expected_base {
+            return Err(corruption(
+                "authenticated blob edit base identity changed before publication",
+            ));
+        }
+        let manifest_object_id = reference.manifest_object_id();
+        let manifest_bytes = view.load_object_bytes(manifest_object_id).await?;
+        let manifest = BlobManifestV1::decode(manifest_object_id, &manifest_bytes)?;
+        if manifest.canonical_blob_id != expected_base
+            || manifest.logical_bytes != reference.expected_size()
+        {
+            return Err(corruption(
+                "authenticated blob edit manifest is not bound to its owner",
+            ));
+        }
+        let Some(splice) =
+            super::merkle::derive_blob_edit_splice(view.retained_read(), manifest, payload.bytes())
+                .await?
+        else {
+            if payload.len() as u64 != reference.expected_size() {
+                return Err(corruption(
+                    "authenticated blob edit has inconsistent unchanged length",
+                ));
+            }
+            return Ok(manifest_object_id);
+        };
+        self.stage_verified_inline_blob_edit_bound(view, state_key, payload, splice, reference)
+            .await
+    }
+
     /// Authenticates a fixed-width successor against the exact BlobRef
     /// StateKey selected by `view`, then stages only chunks intersecting the
     /// verified edit. Unchanged chunk references are copied from the
