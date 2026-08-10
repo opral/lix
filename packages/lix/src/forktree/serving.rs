@@ -1859,6 +1859,9 @@ where
     let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
     validate_commit_catalog_identity(read, commit_catalog_root, commit_object_id, &commit).await?;
     let members: Arc<[CommitMemberV1]> = load_commit_members(read, &commit).await?.into();
+    validate_commit_topology(read, commit_catalog_root, commit.commit_id, &commit)
+        .await
+        .map_err(|error| corruption(error.to_string()))?;
     let closure = (commit, members);
     closures.insert(commit_object_id, closure.clone());
     Ok(closure)
@@ -1945,6 +1948,126 @@ where
         payload,
         json_payload_object_ids: Vec::new(),
     })
+}
+
+async fn resolve_semantic_member_with_authenticated_cache<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    member: &CommitMemberV1,
+    binding: HistoricalMemberBinding,
+    closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
+) -> Result<ResolvedSemanticMember, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let expected_change_id = member.change_id();
+    let mut current = member.clone();
+    let mut current_commit_object_id = binding.target_commit_object_id;
+    let mut current_generation = binding.target_generation;
+    let mut current_ordinal = binding.target_ordinal;
+    let mut visited = BTreeSet::new();
+    let mut selected_created_at = None;
+    loop {
+        if current.change_id() != expected_change_id
+            || !visited.insert((current_commit_object_id, current_ordinal))
+        {
+            return Err(corruption(
+                "selected member source is cyclic or changes its ChangeId",
+            ));
+        }
+        let catalog_value = lookup_on_read(
+            change_catalog_root,
+            "change",
+            current.change_id().as_bytes(),
+            read,
+        )
+        .await?
+        .ok_or_else(|| corruption("historical member has no ChangeCatalog owner"))?;
+        let catalog_entry = ChangeCatalogEntry::decode(&catalog_value)?;
+        validate_member_catalog_owner_with_commit_cache(
+            read,
+            commit_catalog_root,
+            current_commit_object_id,
+            current_generation,
+            current_ordinal,
+            &current,
+            catalog_entry,
+            closures,
+        )
+        .await?;
+        match current {
+            CommitMemberV1::Introduced {
+                change_id,
+                payload,
+                global,
+                updated_at,
+                blob_manifest_object_ids,
+            } => {
+                return Ok(ResolvedSemanticMember {
+                    change_id,
+                    payload,
+                    global,
+                    updated_at,
+                    selected_created_at,
+                    blob_manifest_object_ids,
+                });
+            }
+            CommitMemberV1::Selected {
+                source_commit_object_id,
+                source_ordinal,
+                created_at,
+                ..
+            } => {
+                selected_created_at.get_or_insert(created_at);
+                let (source_commit, source_members) = load_authenticated_commit_member_closure(
+                    read,
+                    commit_catalog_root,
+                    source_commit_object_id,
+                    closures,
+                )
+                .await?;
+                current_commit_object_id = source_commit_object_id;
+                current_generation = source_commit.generation;
+                current_ordinal = source_ordinal as usize;
+                current = source_members
+                    .get(current_ordinal)
+                    .cloned()
+                    .ok_or_else(|| corruption("selected member source ordinal is absent"))?;
+            }
+        }
+    }
+}
+
+async fn authenticated_commit_is_ancestor<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    endpoint_commit_object_id: ObjectId,
+    target_commit_object_id: ObjectId,
+    closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
+) -> Result<bool, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut pending = vec![endpoint_commit_object_id];
+    let mut visited = BTreeSet::new();
+    while let Some(commit_object_id) = pending.pop() {
+        if !visited.insert(commit_object_id) {
+            continue;
+        }
+        if commit_object_id == target_commit_object_id {
+            return Ok(true);
+        }
+        let (commit, _) = load_authenticated_commit_member_closure(
+            read,
+            commit_catalog_root,
+            commit_object_id,
+            closures,
+        )
+        .await?;
+        pending.extend(commit.parent_commit_object_ids);
+    }
+    Ok(false)
 }
 
 async fn validate_member_catalog_owner_with_commit_cache<R>(
@@ -2257,8 +2380,6 @@ where
         keys,
         include_tombstone,
         Some(HistoricalStateAuth {
-            endpoint_global_state_root: global_state_root,
-            endpoint_local_state_root: local_state_root,
             commit_catalog_root,
             change_catalog_root,
             endpoint_commit_object_id,
@@ -2270,8 +2391,6 @@ where
 
 #[derive(Clone, Copy)]
 struct HistoricalStateAuth {
-    endpoint_global_state_root: ObjectId,
-    endpoint_local_state_root: Option<ObjectId>,
     commit_catalog_root: ObjectId,
     change_catalog_root: ObjectId,
     endpoint_commit_object_id: ObjectId,
@@ -2371,19 +2490,17 @@ where
     let mut member_closures = BTreeMap::new();
     let mut authenticated_member_closures = BTreeMap::new();
     let mut page_commit_cache = BTreeMap::new();
-    let endpoint_members = if let Some(auth) = historical_auth {
-        Some(
-            load_authenticated_commit_member_closure(
-                read,
-                auth.commit_catalog_root,
-                auth.endpoint_commit_object_id,
-                &mut authenticated_member_closures,
-            )
-            .await?
-            .1,
+    let (endpoint_commit, endpoint_members) = if let Some(auth) = historical_auth {
+        let closure = load_authenticated_commit_member_closure(
+            read,
+            auth.commit_catalog_root,
+            auth.endpoint_commit_object_id,
+            &mut authenticated_member_closures,
         )
+        .await?;
+        (Some(closure.0), Some(closure.1))
     } else {
-        None
+        (None, None)
     };
     for (row, value_ref) in selected.iter().zip(refs) {
         let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
@@ -2397,23 +2514,38 @@ where
             .members
             .get(value_ref.page_ordinal as usize)
             .ok_or_else(|| corruption("state value page ordinal is absent"))?;
-        if let Some(auth) = historical_auth {
-            validate_historical_state_page_member(
+        let historical_binding = if let Some(auth) = historical_auth {
+            Some(
+                validate_historical_state_page_member(
+                    read,
+                    auth,
+                    value_ref.page_object_id,
+                    page,
+                    value_ref.page_ordinal,
+                    member,
+                    endpoint_members.as_deref(),
+                    endpoint_commit.as_ref(),
+                    &mut page_commit_cache,
+                    &mut authenticated_member_closures,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let resolved = if let (Some(auth), Some(binding)) = (historical_auth, historical_binding) {
+            resolve_semantic_member_with_authenticated_cache(
                 read,
-                auth,
-                value_ref.page_object_id,
-                page,
-                value_ref.page_ordinal,
+                auth.commit_catalog_root,
+                auth.change_catalog_root,
                 member,
-                *source,
-                endpoint_members.as_deref(),
-                &mut page_commit_cache,
+                binding,
                 &mut authenticated_member_closures,
             )
-            .await?;
-        }
-        let resolved =
-            resolve_semantic_member_with_cache(read, member, &mut member_closures).await?;
+            .await?
+        } else {
+            resolve_semantic_member_with_cache(read, member, &mut member_closures).await?
+        };
         let expected_global = *source == StateSource::Global;
         if resolved.global != expected_global {
             return Err(corruption(
@@ -2476,6 +2608,13 @@ where
     Ok(output)
 }
 
+#[derive(Clone, Copy)]
+struct HistoricalMemberBinding {
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+}
+
 async fn validate_historical_state_page_member<R>(
     read: &R,
     auth: HistoricalStateAuth,
@@ -2483,11 +2622,11 @@ async fn validate_historical_state_page_member<R>(
     page: &super::model::CommitChangePageV2,
     page_ordinal: u32,
     member: &CommitMemberV1,
-    source: StateSource,
     endpoint_members: Option<&[CommitMemberV1]>,
+    endpoint_commit: Option<&CommitObjectV1>,
     page_commits: &mut BTreeMap<CommitId, (ObjectId, CommitObjectV1)>,
     member_closures: &mut BTreeMap<ObjectId, AuthenticatedCommitMemberClosure>,
-) -> Result<(), StorageError>
+) -> Result<HistoricalMemberBinding, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -2546,6 +2685,8 @@ where
     }
     let endpoint_members = endpoint_members
         .ok_or_else(|| corruption("historical state endpoint membership is absent"))?;
+    let endpoint_commit =
+        endpoint_commit.ok_or_else(|| corruption("historical state endpoint commit is absent"))?;
     let mut endpoint_matches = endpoint_members
         .iter()
         .filter(|candidate| candidate.change_id() == member.change_id());
@@ -2556,17 +2697,12 @@ where
         ));
     }
     if target_commit_object_id == auth.endpoint_commit_object_id {
-        let endpoint_member = endpoint_member.ok_or_else(|| {
+        endpoint_member.ok_or_else(|| {
             corruption("historical state page member is absent from endpoint commit")
         })?;
         if endpoint_members.get(target_ordinal as usize) != Some(member) {
             return Err(corruption(
                 "historical state page member is not bound to the endpoint commit ordinal",
-            ));
-        }
-        if !matches!(endpoint_member, CommitMemberV1::Introduced { .. }) {
-            return Err(corruption(
-                "endpoint commit member is not an introduced state member",
             ));
         }
     } else if let Some(endpoint_member) = endpoint_member {
@@ -2583,20 +2719,18 @@ where
                 "historical state page member is not an authenticated endpoint selection",
             ));
         }
-    } else {
-        let target_root = match source {
-            StateSource::Global => target_commit.global_state_root,
-            StateSource::Branch => target_commit.local_state_root,
-        };
-        let endpoint_root = match source {
-            StateSource::Global => Some(auth.endpoint_global_state_root),
-            StateSource::Branch => auth.endpoint_local_state_root,
-        };
-        if endpoint_root != Some(target_root) {
-            return Err(corruption(
-                "historical state page member is neither endpoint-selected nor root-bound",
-            ));
-        }
+    } else if !authenticated_commit_is_ancestor(
+        read,
+        auth.commit_catalog_root,
+        auth.endpoint_commit_object_id,
+        target_commit_object_id,
+        member_closures,
+    )
+    .await?
+    {
+        return Err(corruption(
+            "historical state page member is neither endpoint-selected nor an endpoint ancestor",
+        ));
     }
     let value = lookup_on_read(
         auth.change_catalog_root,
@@ -2607,6 +2741,28 @@ where
     .await?
     .ok_or_else(|| corruption("historical state member has no ChangeCatalog owner"))?;
     let entry = ChangeCatalogEntry::decode(&value)?;
+    if target_commit_object_id != auth.endpoint_commit_object_id {
+        if let Some(endpoint_member) = endpoint_members
+            .iter()
+            .find(|candidate| candidate.change_id() == member.change_id())
+        {
+            let endpoint_ordinal = endpoint_members
+                .iter()
+                .position(|candidate| candidate.change_id() == member.change_id())
+                .ok_or_else(|| corruption("endpoint member ordinal is absent"))?;
+            validate_member_catalog_owner_with_commit_cache(
+                read,
+                auth.commit_catalog_root,
+                auth.endpoint_commit_object_id,
+                endpoint_commit.generation,
+                endpoint_ordinal,
+                endpoint_member,
+                entry,
+                member_closures,
+            )
+            .await?;
+        }
+    }
     match member {
         CommitMemberV1::Introduced { .. } => match entry.owner {
             ChangeCatalogOwner::CommitMember {
@@ -2633,7 +2789,12 @@ where
             )
             .await
         }
-    }
+    }?;
+    Ok(HistoricalMemberBinding {
+        target_commit_object_id,
+        target_generation: target_commit.generation,
+        target_ordinal: target_ordinal as usize,
+    })
 }
 
 pub(crate) async fn state_range<R>(
