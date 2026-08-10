@@ -2965,7 +2965,7 @@ impl TransactionWriteBuffer {
 }
 
 #[cfg(test)]
-mod tests {
+mod staging_semantics_tests {
     use super::*;
 
     use crate::common::LixTimestamp;
@@ -3938,7 +3938,7 @@ fn remove_row_from_commit_change_refs(
 }
 
 #[cfg(test)]
-mod tests {
+mod transaction_overlay_tests {
     use super::*;
 
     const ACTIVE_BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000b1";
