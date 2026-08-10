@@ -88,11 +88,61 @@ impl PreparedPublication {
         R: StorageAdapterRead,
     {
         let mut publication = Self::from_global_epoch(view)?;
-        publication.expect_selector(
+        publication.fence_branch_view(view)?;
+        Ok(publication)
+    }
+
+    /// Adds the exact selector fence for another branch participating in the
+    /// same transaction. All branch views are still derived from the one
+    /// retained read/global epoch; this only widens the atomic CAS set and
+    /// never creates a second publication or state authority.
+    pub(crate) fn fence_branch_view<R>(
+        &mut self,
+        view: &CoherentView<R>,
+    ) -> Result<(), StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        if self.expected_global.as_ref() != view.raw_global_selector().as_ref() {
+            return Err(corruption(
+                "branch selector fence was derived from another global view",
+            ));
+        }
+        self.expect_selector(
             branch_selector_key(view.branch_id()),
             SelectorExpectation::Equals(view.raw_branch_selector().clone()),
-        )?;
-        Ok(publication)
+        )
+    }
+
+    pub(crate) fn current_repository_root(&self) -> RepositoryRootV1 {
+        self.next_repository_root
+            .expect("prepared publication has an authenticated repository root")
+    }
+
+    pub(crate) async fn put_commit_catalog_entries<R>(
+        &self,
+        view: &CoherentView<R>,
+        root: ObjectId,
+        entries: &[(super::model::CommitId, super::model::CommitCatalogEntry)],
+    ) -> Result<super::serving::CatalogTreeEdit, StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        let overlay = view.object_overlay(&self.object_puts);
+        super::serving::put_commit_catalog_entries(root, entries, &overlay).await
+    }
+
+    pub(crate) async fn put_change_catalog_entries<R>(
+        &self,
+        view: &CoherentView<R>,
+        root: ObjectId,
+        entries: &[(super::model::ChangeId, super::model::ChangeCatalogEntry)],
+    ) -> Result<super::serving::CatalogTreeEdit, StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        let overlay = view.object_overlay(&self.object_puts);
+        super::serving::put_change_catalog_entries(root, entries, &overlay).await
     }
 
     /// Starts a receipt/GC publication whose only repository-wide read fence
@@ -1172,20 +1222,21 @@ impl PreparedPublication {
                 "state transition branch snapshot has another branch ID",
             ));
         }
+        let current_repository_root = self.current_repository_root();
         let is_global = repository_root.global_state_root == state_edit.root
             && branch_snapshot.local_state_root == view.branch_snapshot().local_state_root
             && branch_snapshot.historical_global_state_root == state_edit.root;
         let is_branch_local = branch_snapshot.local_state_root == state_edit.root
-            && repository_root.global_state_root == view.repository_root().global_state_root
+            && repository_root.global_state_root == current_repository_root.global_state_root
             && branch_snapshot.historical_global_state_root
-                == view.repository_root().global_state_root;
+                == current_repository_root.global_state_root;
         if is_global == is_branch_local {
             return Err(corruption(
                 "state edit must install at exactly one global or branch-local root",
             ));
         }
         let expected_state_base = if is_global {
-            view.repository_root().global_state_root
+            current_repository_root.global_state_root
         } else {
             view.branch_snapshot().local_state_root
         };
@@ -1216,8 +1267,8 @@ impl PreparedPublication {
                 "semantic commit does not authenticate the selected state roots",
             ));
         }
-        if commit_catalog_edit.base_root != view.repository_root().commit_catalog_root
-            || change_catalog_edit.base_root != view.repository_root().change_catalog_root
+        if commit_catalog_edit.base_root != current_repository_root.commit_catalog_root
+            || change_catalog_edit.base_root != current_repository_root.change_catalog_root
             || repository_root.commit_catalog_root != commit_catalog_edit.root
             || repository_root.change_catalog_root != change_catalog_edit.root
             || commit_catalog_edit

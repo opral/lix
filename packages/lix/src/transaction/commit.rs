@@ -191,6 +191,17 @@ where
     R: StorageAdapterRead + Clone,
 {
     let intent = classify_publication_intent(&prepared_writes, runtime_checkpoint)?;
+    if publication_owner_branch_ids(&prepared_writes, runtime_checkpoint.is_some()).len() > 1 {
+        return Box::pin(prepare_batched_forktree_publication(
+            active_account_id,
+            commit_parent_heads,
+            runtime_checkpoint,
+            read,
+            prepared_writes,
+            pending_publication,
+        ))
+        .await;
+    }
     let PublicationIntent::Ordinary {
         branch_id: publication_branch_id,
         semantic_commit,
@@ -201,11 +212,20 @@ where
             None => PreparedForkTreePlan::Noop,
         });
     };
-    let branch_id = sole_publication_branch(&prepared_writes, runtime_checkpoint.is_some())?;
-    let view = open_coherent_view_on_read(read, publication_branch_id).await?;
+    let branch_id = uuid::Uuid::from_bytes(*publication_branch_id.as_bytes()).to_string();
+    let view = open_coherent_view_on_read(read.clone(), publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
     if let Some(pending) = pending_publication {
         publication.merge_from(pending)?;
+    }
+    for owner_branch_id in
+        publication_owner_branch_ids(&prepared_writes, runtime_checkpoint.is_some())
+    {
+        let owner_branch_id = canonical_branch_id(&owner_branch_id)?;
+        if owner_branch_id != publication_branch_id {
+            let owner_view = open_coherent_view_on_read(read.clone(), owner_branch_id).await?;
+            publication.fence_branch_view(&owner_view)?;
+        }
     }
     let prepared_blob_manifests =
         prepared_blob_manifest_ids(&mut publication, &view, &prepared_writes).await?;
@@ -240,11 +260,11 @@ where
             file_id: row.file_id.map(|value| value.as_str()),
             entity_pk: row.entity_pk,
         };
-        let untracked_owner = if row.global {
-            canonical_branch_id(crate::GLOBAL_BRANCH_ID)?
+        let untracked_owner = canonical_branch_id(if row.global {
+            crate::GLOBAL_BRANCH_ID
         } else {
-            publication_branch_id
-        };
+            row.branch_id.as_str()
+        })?;
         let canonical_snapshot = canonical_snapshot_for_row(
             row,
             &prepared_blob_manifests,
@@ -531,10 +551,11 @@ where
         .iter()
         .map(CommitMemberV1::change_id)
         .collect::<Vec<_>>();
+    let current_repository_root = publication.current_repository_root();
     let global_state_root = if global {
         state_edit.root
     } else {
-        view.repository_root().global_state_root
+        current_repository_root.global_state_root
     };
     let local_state_root = if global {
         view.branch_snapshot().local_state_root
@@ -596,9 +617,10 @@ where
     let (ref_object_id, _) = ref_change.encode()?;
     let changes = vec![ref_change];
 
-    let commit_catalog_edit = view
+    let commit_catalog_edit = publication
         .put_commit_catalog_entries(
-            view.repository_root().commit_catalog_root,
+            &view,
+            current_repository_root.commit_catalog_root,
             &[(
                 (forktree_commit_id(commit_id)),
                 CommitCatalogEntry { commit_object_id },
@@ -631,11 +653,19 @@ where
             ));
         }
     }
-    let change_catalog_edit = view
-        .put_change_catalog_entries(view.repository_root().change_catalog_root, &change_entries)
+    let change_catalog_edit = publication
+        .put_change_catalog_entries(
+            &view,
+            current_repository_root.change_catalog_root,
+            &change_entries,
+        )
         .await?;
     let repository_root = RepositoryRootV1 {
-        global_state_root,
+        global_state_root: if global {
+            state_edit.root
+        } else {
+            current_repository_root.global_state_root
+        },
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
     };
@@ -663,6 +693,116 @@ where
         &branch_ref_intents,
     )
     .await
+}
+
+async fn prepare_batched_forktree_publication<R>(
+    active_account_id: &str,
+    commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
+    runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
+    read: R,
+    prepared_writes: PreparedWriteSet,
+    pending_publication: Option<PreparedPublication>,
+) -> Result<PreparedForkTreePlan, LixError>
+where
+    R: StorageAdapterRead + Clone,
+{
+    let branch_ids = publication_owner_branch_ids(&prepared_writes, runtime_checkpoint.is_some())
+        .into_iter()
+        .collect::<Vec<_>>();
+    if branch_ids.len() < 2 {
+        return Err(writer_error(
+            "batched ForkTree publication was requested without multiple owners",
+        ));
+    }
+    if prepared_writes
+        .intermediate_commits
+        .iter()
+        .any(|commit| !branch_ids.contains(&commit.branch_id))
+    {
+        return Err(writer_error(
+            "batched ForkTree publication contains an unknown intermediate branch",
+        ));
+    }
+
+    let mut pending_publication = pending_publication;
+    for (index, branch_id) in branch_ids.iter().enumerate() {
+        let branch_writes = prepared_writes_for_branch(&prepared_writes, branch_id);
+        let plan = Box::pin(prepare_forktree_publication_with_parent_heads(
+            active_account_id,
+            commit_parent_heads,
+            (index == 0).then_some(runtime_checkpoint).flatten(),
+            read.clone(),
+            branch_writes,
+            pending_publication,
+        ))
+        .await?;
+        pending_publication = match plan {
+            PreparedForkTreePlan::Noop => {
+                return Err(writer_error(
+                    "batched ForkTree publication contains an owner with no native work",
+                ));
+            }
+            PreparedForkTreePlan::Publication(publication) => Some(publication),
+        };
+    }
+    pending_publication
+        .map(PreparedForkTreePlan::Publication)
+        .ok_or_else(|| writer_error("batched ForkTree publication produced no plan"))
+}
+
+fn prepared_writes_for_branch(prepared: &PreparedWriteSet, branch_id: &str) -> PreparedWriteSet {
+    PreparedWriteSet {
+        state_rows: prepared.state_rows.for_publication_branch(branch_id),
+        insert_selection: prepared.insert_selection.clone(),
+        commit_change_refs_by_branch: prepared
+            .commit_change_refs_by_branch
+            .iter()
+            .filter(|(owner, _)| owner.as_str() == branch_id)
+            .map(|(owner, refs)| (owner.clone(), refs.clone()))
+            .collect(),
+        first_commit_parent_override_by_branch: prepared
+            .first_commit_parent_override_by_branch
+            .iter()
+            .filter(|(owner, _)| owner.as_str() == branch_id)
+            .map(|(owner, parent)| (owner.clone(), *parent))
+            .collect(),
+        checkpoint_publications: prepared
+            .checkpoint_publications
+            .iter()
+            .filter(|checkpoint| checkpoint.recovery_ref.branch_id == branch_id)
+            .cloned()
+            .collect(),
+        extra_commit_parents_by_branch: prepared
+            .extra_commit_parents_by_branch
+            .iter()
+            .filter(|(owner, _)| owner.as_str() == branch_id)
+            .map(|(owner, parents)| (owner.clone(), parents.clone()))
+            .collect(),
+        intermediate_commits: prepared
+            .intermediate_commits
+            .iter()
+            .filter(|commit| commit.branch_id == branch_id)
+            .cloned()
+            .collect(),
+        file_content_writes: prepared
+            .file_content_writes
+            .iter()
+            .filter(|write| write.branch_id == branch_id)
+            .cloned()
+            .collect(),
+        branch_ref_intents: prepared
+            .branch_ref_intents
+            .iter()
+            .filter(|intent| intent.branch_id == branch_id)
+            .cloned()
+            .collect(),
+        historical_blob_manifest_edges: prepared
+            .historical_blob_manifest_edges
+            .iter()
+            .filter(|((owner, _), _)| owner == branch_id)
+            .map(|(key, edges)| (key.clone(), edges.clone()))
+            .collect(),
+    }
 }
 
 async fn append_branch_ref_intents<R>(
@@ -1498,7 +1638,16 @@ fn classify_publication_intent(
         };
     }
 
-    let branch_id = sole_publication_branch(prepared, runtime_checkpoint.is_some())?;
+    let allow_multi_branch_untracked = !has_commit_intent
+        && !prepared.state_rows.is_empty()
+        && prepared.state_rows.iter().all(|row| row.untracked);
+    let allow_multi_branch_publication =
+        publication_owner_branch_ids(prepared, runtime_checkpoint.is_some()).len() > 1;
+    let branch_id = sole_publication_branch(
+        prepared,
+        runtime_checkpoint.is_some(),
+        allow_multi_branch_untracked || allow_multi_branch_publication,
+    )?;
     Ok(PublicationIntent::Ordinary {
         branch_id: canonical_branch_id(&branch_id)?,
         semantic_commit: has_commit_intent,
@@ -1827,34 +1976,57 @@ fn canonical_snapshot_for_row<'a>(
 fn sole_publication_branch(
     prepared: &PreparedWriteSet,
     runtime_checkpoint_present: bool,
+    allow_multi_branch_untracked: bool,
 ) -> Result<String, LixError> {
+    let mut branches = publication_owner_branch_ids(prepared, runtime_checkpoint_present);
+    let branch = branches
+        .iter()
+        .find(|branch_id| branch_id.as_str() != crate::GLOBAL_BRANCH_ID)
+        .cloned()
+        .or_else(|| branches.iter().next().cloned())
+        .ok_or_else(|| writer_error("prepared publication has no branch owner"))?;
+    branches.remove(&branch);
+    if !branches.is_empty() && !allow_multi_branch_untracked {
+        return Err(writer_error(
+            "multi-branch transaction requires the batched ForkTree publication slice",
+        ));
+    }
+    Ok(branch.to_string())
+}
+
+fn publication_owner_branch_ids(
+    prepared: &PreparedWriteSet,
+    runtime_checkpoint_present: bool,
+) -> BTreeSet<String> {
     let mut branches = prepared
         .state_rows
         .iter()
-        .map(|row| row.branch_id.as_str())
+        .map(|row| {
+            if row.untracked && row.global {
+                crate::GLOBAL_BRANCH_ID.to_owned()
+            } else {
+                row.branch_id.to_string()
+            }
+        })
         .chain(
             prepared
-                .commit_change_refs_by_branch
-                .keys()
-                .map(String::as_str),
+                .file_content_writes
+                .iter()
+                .map(|write| write.branch_id.clone()),
         )
-        .chain(
-            prepared
-                .extra_commit_parents_by_branch
-                .keys()
-                .map(String::as_str),
-        )
+        .chain(prepared.commit_change_refs_by_branch.keys().cloned())
+        .chain(prepared.extra_commit_parents_by_branch.keys().cloned())
         .chain(
             prepared
                 .first_commit_parent_override_by_branch
                 .keys()
-                .map(String::as_str),
+                .cloned(),
         )
         .chain(
             prepared
                 .intermediate_commits
                 .iter()
-                .map(|commit| commit.branch_id.as_str()),
+                .map(|commit| commit.branch_id.clone()),
         )
         .collect::<BTreeSet<_>>();
     if branches.is_empty() {
@@ -1862,21 +2034,13 @@ fn sole_publication_branch(
             prepared
                 .branch_ref_intents
                 .iter()
-                .map(|intent| intent.branch_id.as_str()),
+                .map(|intent| intent.branch_id.clone()),
         );
     }
     if branches.is_empty() && runtime_checkpoint_present {
-        branches.insert(crate::GLOBAL_BRANCH_ID);
+        branches.insert(crate::GLOBAL_BRANCH_ID.to_owned());
     }
-    let branch = branches
-        .pop_first()
-        .ok_or_else(|| writer_error("prepared publication has no branch owner"))?;
-    if !branches.is_empty() {
-        return Err(writer_error(
-            "multi-branch transaction requires the batched ForkTree publication slice",
-        ));
-    }
-    Ok(branch.to_string())
+    branches
 }
 
 fn deterministic_sequence_snapshot(highest_seen: i64) -> Result<String, LixError> {

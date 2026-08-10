@@ -3011,6 +3011,45 @@ impl PreparedStateBatch {
         }
     }
 
+    /// Copies only the rows owned by one native ForkTree publication lane.
+    /// This is a bounded branch partition used while composing one atomic
+    /// multi-branch publication; it retains row order and all authenticated
+    /// row facts without introducing a second materialized state authority.
+    pub(crate) fn for_publication_branch(&self, branch_id: &str) -> Self {
+        let mut rows = Self::with_capacity(self.len());
+        for row in self.iter().filter(|row| {
+            let owner = if row.untracked && row.global {
+                crate::GLOBAL_BRANCH_ID
+            } else {
+                row.branch_id.as_str()
+            };
+            owner == branch_id
+        }) {
+            rows.push_parts_with_change_addressability(
+                row.schema_plan_id,
+                row.facts,
+                row.entity_pk.clone(),
+                row.schema_key.clone(),
+                row.file_id.cloned(),
+                row.snapshot.cloned(),
+                row.metadata.cloned(),
+                row.origin.cloned(),
+                row.origin_key,
+                row.created_at,
+                row.updated_at,
+                row.global,
+                row.change_id,
+                row.addressable_change_id,
+                row.commit_id,
+                row.untracked,
+                row.branch_id.clone(),
+            );
+            let index = rows.len() - 1;
+            rows.set_durable_predecessor(index, row.durable_predecessor.cloned());
+        }
+        rows
+    }
+
     pub(crate) fn row(&self, index: usize) -> PreparedStateRowRef<'_> {
         self.get(index)
             .expect("prepared state batch row ordinal is in bounds")
