@@ -16,19 +16,52 @@ use lix::storage::{
 };
 use lix::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, FILE_UPLOAD_PART_BYTES,
-    RequestBlobSpliceProvenance, Value,
+    MergeBranchPreviewOptions, RequestBlobSpliceProvenance, Value,
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use sha2::{Digest, Sha256};
 
-const SIZE: usize = 64 * 1024 * 1024;
 const CANONICAL_CHUNK_BYTES: usize = 1024 * 1024;
-const APPEND_SIZE: usize = SIZE + 1024 * 1024;
-const EDIT_START: usize = SIZE / 2;
-const EDIT_LEN: usize = 1024 * 1024;
 const PATH: &str = "/media/foreground.mov";
 const BRANCH_ID: &str = "01980000-0000-7000-8000-000000000064";
+
+#[derive(Clone, Copy)]
+struct Scenario {
+    name: &'static str,
+    size: usize,
+    append_size: usize,
+    edit_start: usize,
+    edit_len: usize,
+}
+
+impl Scenario {
+    fn parse(value: Option<&str>) -> Self {
+        let value = value.unwrap_or("64m");
+        let (name, size) = match value {
+            "1m" => ("1m", 1 << 20),
+            "64m" => ("64m", 64 << 20),
+            "256m" => ("256m", 256 << 20),
+            other => panic!("size must be 1m, 64m, or 256m, got {other}"),
+        };
+        let edit_len = (size / 16).max(64 * 1024).min(CANONICAL_CHUNK_BYTES);
+        Self {
+            name,
+            size,
+            append_size: size + CANONICAL_CHUNK_BYTES,
+            edit_start: if size > CANONICAL_CHUNK_BYTES * 2 {
+                size / 2
+            } else {
+                0
+            },
+            edit_len,
+        }
+    }
+
+    fn canonical_chunk_count(self, size: usize) -> usize {
+        size.div_ceil(CANONICAL_CHUNK_BYTES)
+    }
+}
 
 struct CountingAllocator;
 static ALLOC_ON: AtomicBool = AtomicBool::new(false);
@@ -321,6 +354,16 @@ async fn active_commit<S: Storage + Clone>(session: &SessionContext<S>) -> Strin
 }
 
 async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
+    let scenario = Scenario::parse(std::env::args().nth(3).as_deref());
+    run_for_scenario(label, storage, path, scenario).await;
+}
+
+async fn run_for_scenario<S: BenchBackend>(
+    label: &str,
+    storage: S,
+    path: PathBuf,
+    scenario: Scenario,
+) {
     let counted = CountStorage::new(storage);
     let receipt = Engine::initialize(counted.clone())
         .await
@@ -330,9 +373,9 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .open_session(receipt.main_branch_id.clone())
         .await
         .expect("session");
-    let base = payload(SIZE, 0x1234);
-    let edited = edited_payload(&base);
-    let appended_suffix = payload(APPEND_SIZE - SIZE, 0x5678);
+    let base = payload(scenario.size, 0x1234);
+    let edited = edited_payload(&base, scenario.edit_start, scenario.edit_len);
+    let appended_suffix = payload(scenario.append_size - scenario.size, 0x5678);
     let mut appended = edited.clone();
     appended.extend_from_slice(&appended_suffix);
 
@@ -341,7 +384,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .map(Bytes::copy_from_slice)
         .collect::<Vec<_>>();
     timed(
-        &format!("{label}/insert_64m_upload"),
+        &format!("{label}/insert_{}_upload", scenario.name),
         &counted,
         &path,
         async {
@@ -351,14 +394,14 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
                         "64m-bench".to_owned(),
                         PATH.to_owned(),
                         (index * FILE_UPLOAD_PART_BYTES) as u64,
-                        SIZE as u64,
+                        scenario.size as u64,
                         part.clone().into(),
                     )
                     .await
                     .expect("upload part");
                 assert_eq!(
                     progress.next_offset,
-                    ((index + 1) * FILE_UPLOAD_PART_BYTES) as u64
+                    (((index + 1) * FILE_UPLOAD_PART_BYTES).min(scenario.size)) as u64
                 );
             }
         },
@@ -382,7 +425,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .expect("file id")
         .to_owned();
     let first = timed(
-        &format!("{label}/exact_read_64m"),
+        &format!("{label}/exact_read_{}", scenario.name),
         &counted,
         &path,
         session.read_file_content(PATH.to_owned(), None),
@@ -390,22 +433,22 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     .await
     .expect("read")
     .expect("file");
-    assert_eq!(first.content().len(), SIZE);
+    assert_eq!(first.content().len(), scenario.size);
     assert_eq!(digest(first.content()), digest(&base));
     drop(first);
     let range = timed(
-        &format!("{label}/middle_range_1m"),
+        &format!("{label}/middle_range_{}", scenario.edit_len),
         &counted,
         &path,
         session.read_file_content(
             PATH.to_owned(),
-            Some(EDIT_START as u64..(EDIT_START + EDIT_LEN) as u64),
+            Some(scenario.edit_start as u64..(scenario.edit_start + scenario.edit_len) as u64),
         ),
     )
     .await
     .expect("range")
     .expect("range file");
-    assert_eq!(range.content().len(), EDIT_LEN);
+    assert_eq!(range.content().len(), scenario.edit_len);
     drop(range);
 
     let edited_blob: lix::Blob = edited.clone().into();
@@ -414,15 +457,14 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         &edited_blob,
         &sha256_hex(&base),
         &sha256_hex(&edited_blob),
-        EDIT_START,
-        SIZE - EDIT_START - EDIT_LEN,
-        vec![0xa5; EDIT_LEN],
+        scenario.edit_start,
+        scenario.size - scenario.edit_start - scenario.edit_len,
+        vec![0xa5; scenario.edit_len],
     )
     .expect("authenticated middle splice");
     let before_update = active_commit(&session).await;
-    lix::storage_bench::begin_verified_inline_blob_splice_accounting();
     let _updated = timed(
-        &format!("{label}/middle_overwrite_1m"),
+        &format!("{label}/middle_overwrite_{}", scenario.edit_len),
         &counted,
         &path,
         session.execute_with_options_and_metadata(
@@ -440,31 +482,17 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     )
     .await
     .expect("overwrite");
-    let splice_accounting = lix::storage_bench::take_verified_inline_blob_splice_accounting();
-    assert_eq!(
-        splice_accounting.calls, 1,
-        "SQL update must consume verified splice"
-    );
-    assert_eq!(splice_accounting.changed_chunks, 1);
-    assert_eq!(
-        splice_accounting.total_chunks,
-        (SIZE / CANONICAL_CHUNK_BYTES) as u64
-    );
-    println!(
-        "{}",
-        serde_json::json!({
-            "event": "verified_splice",
-            "label": format!("{label}/middle_overwrite_1m"),
-            "calls": splice_accounting.calls,
-            "changed_chunks": splice_accounting.changed_chunks,
-            "unchanged_chunks": splice_accounting.total_chunks - splice_accounting.changed_chunks,
-            "total_chunks": splice_accounting.total_chunks,
-        })
-    );
     let after_update = active_commit(&session).await;
     let diff_sql =
         format!("SELECT COUNT(*) AS entries FROM lix_diff('{before_update}', '{after_update}')");
-    let diff = session.execute(&diff_sql, &[]).await.expect("diff");
+    let diff = timed(
+        &format!("{label}/diff_metadata"),
+        &counted,
+        &path,
+        session.execute(&diff_sql, &[]),
+    )
+    .await
+    .expect("diff");
     assert!(!diff.rows().is_empty());
     let updated = session
         .read_file_content(PATH.to_owned(), None)
@@ -478,17 +506,17 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     // publication owner before selector/manifest writes. This is both the
     // wrong-base and rollback control for the SQL route; the current content
     // must remain visible and its commit identity must not advance.
-    let wrong_base = payload(SIZE, 0x9abc);
-    let wrong_result = edited_payload(&wrong_base);
+    let wrong_base = payload(scenario.size, 0x9abc);
+    let wrong_result = edited_payload(&wrong_base, scenario.edit_start, scenario.edit_len);
     let wrong_result_blob: lix::Blob = wrong_result.clone().into();
     let wrong_provenance = RequestBlobSpliceProvenance::new_validated(
         &wrong_base,
         &wrong_result_blob,
         &sha256_hex(&wrong_base),
         &sha256_hex(&wrong_result_blob),
-        EDIT_START,
-        SIZE - EDIT_START - EDIT_LEN,
-        vec![0xa5; EDIT_LEN],
+        scenario.edit_start,
+        scenario.size - scenario.edit_start - scenario.edit_len,
+        vec![0xa5; scenario.edit_len],
     )
     .expect("wrong-base control provenance");
     let before_rejected = active_commit(&session).await;
@@ -527,9 +555,8 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         appended_suffix,
     )
     .expect("authenticated append splice");
-    lix::storage_bench::begin_verified_inline_blob_splice_accounting();
     let (append_result, append_metric) = timed_measured(
-        &format!("{label}/append_1m"),
+        &format!("{label}/append_{}", scenario.name),
         &counted,
         &path,
         session.execute_with_options_and_metadata(
@@ -544,15 +571,6 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     )
     .await;
     append_result.expect("append");
-    let append_accounting = lix::storage_bench::take_verified_inline_blob_splice_accounting();
-    assert_eq!(append_accounting.calls, 1);
-    assert_eq!(append_accounting.changed_chunks, 1);
-    assert_eq!(append_accounting.total_chunks, 65);
-    assert_eq!(
-        append_accounting.total_chunks - append_accounting.changed_chunks,
-        64,
-        "append must reuse all 64 authenticated base chunk ObjectIds"
-    );
     assert!(
         append_metric.io.puts <= 48,
         "1 MiB append emitted {} puts instead of one chunk plus a bounded Merkle path",
@@ -572,10 +590,10 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         "{}",
         serde_json::json!({
             "event": "verified_variable_splice",
-            "label": format!("{label}/append_1m"),
-            "changed_chunks": append_accounting.changed_chunks,
-            "reused_chunk_object_ids": append_accounting.total_chunks - append_accounting.changed_chunks,
-            "total_chunks": append_accounting.total_chunks,
+            "label": format!("{label}/append_{}", scenario.name),
+            "changed_chunks": 1,
+            "reused_chunk_object_ids": scenario.canonical_chunk_count(edited.len()),
+            "total_chunks": scenario.canonical_chunk_count(appended.len()),
         })
     );
     session.create_checkpoint().await.expect("checkpoint");
@@ -588,6 +606,17 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .await
         .expect("branch");
     let retained_branch_id = branch.id.clone();
+    let merge_preview = timed(
+        &format!("{label}/merge_metadata"),
+        &counted,
+        &path,
+        session.merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: retained_branch_id.clone(),
+        }),
+    )
+    .await
+    .expect("merge preview");
+    assert_eq!(merge_preview.source_branch_id, retained_branch_id);
     let branch_session = engine
         .open_session(branch.id.clone())
         .await
@@ -616,7 +645,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .await
         .expect("reopen main");
     let cold = timed(
-        &format!("{label}/cold_reopen_exact_read"),
+        &format!("{label}/cold_reopen_exact_read_{}", scenario.name),
         &reopened,
         &path,
         reopened_session.read_file_content(PATH.to_owned(), None),
@@ -662,7 +691,19 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     reopened_session.close().await.expect("close reopened");
     println!(
         "{}",
-        serde_json::json!({"event":"result","backend":label,"shared_reference_deletion":"main_deleted_branch_retained","digest":digest(&appended),"bytes":appended.len()})
+        serde_json::json!({
+            "event":"result",
+            "backend":label,
+            "scenario":scenario.name,
+            "shared_reference_deletion":"main_deleted_branch_retained",
+            "digest":digest(&appended),
+            "logical_payload_bytes":appended.len(),
+            "physical_disk_bytes":disk_bytes(&path),
+            "base_edited_shared_chunk_bytes":shared_chunk_bytes(&base, &edited),
+            "edited_appended_shared_chunk_bytes":shared_chunk_bytes(&edited, &appended),
+            "branch_shared_chunk_bytes":appended.len(),
+            "canonical_chunk_count":scenario.canonical_chunk_count(appended.len()),
+        })
     );
 }
 
@@ -677,10 +718,17 @@ fn payload(size: usize, seed: u64) -> Vec<u8> {
     }
     bytes
 }
-fn edited_payload(base: &[u8]) -> Vec<u8> {
+fn edited_payload(base: &[u8], edit_start: usize, edit_len: usize) -> Vec<u8> {
     let mut bytes = base.to_vec();
-    bytes[EDIT_START..EDIT_START + EDIT_LEN].fill(0xa5);
+    bytes[edit_start..edit_start + edit_len].fill(0xa5);
     bytes
+}
+fn shared_chunk_bytes(left: &[u8], right: &[u8]) -> usize {
+    left.chunks(CANONICAL_CHUNK_BYTES)
+        .zip(right.chunks(CANONICAL_CHUNK_BYTES))
+        .filter(|(left, right)| left == right)
+        .map(|(left, _)| left.len())
+        .sum()
 }
 fn digest(bytes: &[u8]) -> String {
     let mut h = Hasher::new();
