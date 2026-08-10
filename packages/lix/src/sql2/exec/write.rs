@@ -77,7 +77,7 @@ pub(crate) fn write_plan_requires_post_stage_returning_checkpoint(plan: &SqlLogi
 
 #[cfg(test)]
 pub(crate) async fn create_write_logical_plan(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
     let statement = crate::sql2::parse::parse_statement(sql)?;
@@ -87,7 +87,7 @@ pub(crate) async fn create_write_logical_plan(
 #[expect(clippy::needless_pass_by_ref_mut)]
 #[cfg(test)]
 async fn create_write_logical_plan_from_parsed(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
     let visible_schemas = ctx.list_visible_schemas()?;
@@ -117,7 +117,7 @@ pub(crate) fn create_write_logical_plan_from_template(
 
 #[cfg(test)]
 pub(crate) async fn execute_write_logical_plan(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
 ) -> Result<u64, LixError> {
@@ -128,7 +128,7 @@ pub(crate) async fn execute_write_logical_plan(
 
 #[cfg(test)]
 pub(crate) async fn execute_write_logical_plan_result(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
 ) -> Result<SqlWriteResult, LixError> {
@@ -142,7 +142,7 @@ pub(crate) async fn execute_write_logical_plan_result(
 }
 
 pub(crate) async fn execute_write_logical_plan_result_with_metadata(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
     metadata: &ExecuteStatementMetadata,
@@ -341,7 +341,7 @@ fn scalar_parameter_value(scalar: ScalarValue, is_json: bool) -> Result<Value, L
 /// `None` means the logical statements are not independent and must retain
 /// public `executeBatch`'s sequential execution semantics.
 pub(crate) async fn execute_write_logical_plan_parameter_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     parameter_batch: &RecordBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -369,7 +369,7 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
 }
 
 pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &SqlLogicalPlan,
     parameter_batch: &PreparedDmlParameterBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -413,7 +413,7 @@ pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
 }
 
 pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: &SqlLogicalPlan,
     parameter_rows: &'a [&'a [Value]],
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
@@ -448,7 +448,7 @@ pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
 
 #[cfg(test)]
 pub(crate) async fn execute_write_logical_plan_with_mode(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
     mode: WriteExecutorMode,
@@ -460,7 +460,7 @@ pub(crate) async fn execute_write_logical_plan_with_mode(
 
 #[cfg(test)]
 pub(crate) async fn execute_write_logical_plan_with_mode_result(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
     mode: WriteExecutorMode,
@@ -472,7 +472,7 @@ pub(crate) async fn execute_write_logical_plan_with_mode_result(
 
 #[cfg(test)]
 pub(crate) async fn execute_write_logical_plan_with_mode_and_trace(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
     mode: WriteExecutorMode,
@@ -484,7 +484,7 @@ pub(crate) async fn execute_write_logical_plan_with_mode_and_trace(
 
 #[cfg(test)]
 pub(crate) async fn execute_write_logical_plan_with_mode_and_trace_result(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
     mode: WriteExecutorMode,
@@ -512,7 +512,7 @@ enum WriteExecutorModeInner {
 }
 
 async fn execute_write_logical_plan_with_mode_inner(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    ctx: &mut impl SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
     metadata: &ExecuteStatementMetadata,

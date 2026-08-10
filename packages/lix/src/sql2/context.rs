@@ -305,7 +305,7 @@ where
     ptr: Arc<SqlWriteContextPtr<R>>,
     gate: Arc<Mutex<()>>,
     explicit_insert_columns: Option<Arc<BTreeSet<String>>>,
-    write_targets: Option<Arc<super::providers::WriteTargetRegistry>>,
+    write_targets: Option<Arc<super::providers::WriteTargetRegistry<R>>>,
 }
 
 struct SqlWriteContextPtr<R>(NonNull<dyn SqlWriteExecutionContext<ReadStore = R>>)
@@ -340,7 +340,9 @@ where
             ptr: Arc::new(SqlWriteContextPtr(ptr)),
             gate: Arc::new(Mutex::new(())),
             explicit_insert_columns: None,
-            write_targets: Some(Arc::new(super::providers::WriteTargetRegistry::default())),
+            write_targets: Some(Arc::new(
+                super::providers::WriteTargetRegistry::<R>::default(),
+            )),
         }
     }
 
@@ -362,7 +364,7 @@ where
 
     pub(crate) fn write_targets(
         &self,
-    ) -> Result<Arc<super::providers::WriteTargetRegistry>, LixError> {
+    ) -> Result<Arc<super::providers::WriteTargetRegistry<R>>, LixError> {
         self.write_targets.clone().ok_or_else(|| {
             LixError::unknown("physical SQL write target cannot own a write-target registry")
         })

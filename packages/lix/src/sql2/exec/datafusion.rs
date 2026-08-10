@@ -64,6 +64,7 @@ use crate::sql2::{
     CachedReadPlan, PhysicalReadPlanCacheKey, SqlExecutionContext, SqlPlanningCache,
     SqlWriteExecutionContext,
 };
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
 
@@ -552,13 +553,16 @@ fn statement_has_table_function(statement: &DataFusionStatement) -> bool {
     visitor.0
 }
 
-pub(crate) async fn execute_transaction_read_statement_from_parsed(
+pub(crate) async fn execute_transaction_read_statement_from_parsed<R>(
     read_ctx: &impl SqlExecutionContext,
-    write_ctx: &mut dyn SqlWriteExecutionContext,
+    write_ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     sql: &str,
     statement: DataFusionStatement,
     params: &[Value],
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<SqlQueryResult, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
     let planning_environment = read_ctx.sql_planning_environment().await?;
@@ -579,13 +583,16 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     result
 }
 
-async fn create_transaction_read_logical_plan_from_parsed(
+async fn create_transaction_read_logical_plan_from_parsed<R>(
     read_ctx: &impl SqlExecutionContext,
-    write_ctx: &mut dyn SqlWriteExecutionContext,
+    write_ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     sql: &str,
     mut statement: DataFusionStatement,
     params: &[Value],
-) -> Result<SqlLogicalPlan, LixError> {
+) -> Result<SqlLogicalPlan, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     crate::sql2::bind_read_statement(sql, &statement)?;
     let parameter_names = statement_parameter_names(&statement)?;
     let expected_parameter_count = expected_positional_parameter_count(&parameter_names)?;
@@ -1522,11 +1529,14 @@ fn retain_columnar_result(fields: &[Field], batches: &[RecordBatch]) -> bool {
         >= COLUMNAR_CELL_THRESHOLD
 }
 
-pub(crate) async fn execute_datafusion_write_logical_plan(
-    ctx: &mut dyn SqlWriteExecutionContext,
+pub(crate) async fn execute_datafusion_write_logical_plan<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     plan: &LogicalWritePlan,
     params: &[Value],
-) -> Result<SqlWriteResult, LixError> {
+) -> Result<SqlWriteResult, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     validate_bound_write_input(plan, params)?;
     let table_name = write_target_table_name(plan)?;
     let provider_selection = write_provider_selection(plan, &table_name);
@@ -3544,7 +3554,7 @@ mod tests {
     }
 
     async fn execute_write_sql(
-        ctx: &mut dyn SqlWriteExecutionContext,
+        ctx: &mut impl SqlWriteExecutionContext,
         sql: &str,
         params: &[Value],
     ) -> Result<crate::SqlQueryResult, LixError> {
@@ -3558,7 +3568,7 @@ mod tests {
     }
 
     async fn execute_write_sql_trace(
-        ctx: &mut dyn SqlWriteExecutionContext,
+        ctx: &mut impl SqlWriteExecutionContext,
         sql: &str,
         params: &[Value],
         mode: WriteExecutorMode,
