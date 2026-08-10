@@ -2254,36 +2254,74 @@ fn entity_slot_column_array(
             ))
         })?
         .column_type;
-    let values = snapshots
+    let values = slots
         .iter()
-        .map(|snapshot| snapshot.as_ref().and_then(|value| value.get(column_name)))
-        .collect::<Vec<_>>();
+        .zip(snapshots.iter())
+        .map(|(slot, snapshot)| {
+            if let Some(value) = snapshot
+                .as_ref()
+                .and_then(|value| value.get(column_name))
+                .cloned()
+            {
+                Ok(Some(value))
+            } else {
+                entity_primary_key_value(spec, column_name, slot)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     let array: ArrayRef = match column_type {
         EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
             values
                 .iter()
-                .map(|value| entity_json_text_value(*value, column_type))
+                .map(|value| entity_json_text_value(value.as_ref(), column_type))
                 .collect::<Result<Vec<_>>>()?,
         )),
         EntityColumnType::Integer => Arc::new(Int64Array::from(
             values
                 .iter()
-                .map(|value| entity_i64_value(*value, &spec.schema_key, column_name))
+                .map(|value| entity_i64_value(value.as_ref(), &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )),
         EntityColumnType::Number => Arc::new(Float64Array::from(
             values
                 .iter()
-                .map(|value| entity_f64_value(*value, &spec.schema_key, column_name))
+                .map(|value| entity_f64_value(value.as_ref(), &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )),
         EntityColumnType::Boolean => Arc::new(BooleanArray::from_iter(
             values
                 .iter()
-                .map(|value| value.and_then(JsonValue::as_bool)),
+                .map(|value| value.as_ref().and_then(JsonValue::as_bool)),
         )),
     };
     Ok(array)
+}
+
+/// Certified state snapshots may encode a primary-key component only in the
+/// canonical StateKey (for example, the compact `path`/`value` shape used by
+/// `lix_key_value`). Reconstruct that visible column from the already loaded
+/// key rather than emitting a null into a non-nullable Arrow field.
+fn entity_primary_key_value(
+    spec: &EntitySurfaceSpec,
+    column_name: &str,
+    slot: &EntityStateSlot,
+) -> Result<Option<JsonValue>> {
+    let Some(component_index) = spec
+        .primary_key_paths
+        .iter()
+        .position(|path| path.len() == 1 && path.first().is_some_and(|name| name == column_name))
+    else {
+        return Ok(None);
+    };
+    let key = slot_state_key(slot).map_err(lix_error_to_datafusion_error)?;
+    let values = key
+        .entity_pk
+        .as_json_array_value()
+        .map_err(lix_error_to_datafusion_error)?;
+    Ok(values
+        .as_array()
+        .and_then(|values| values.get(component_index))
+        .cloned())
 }
 
 fn slot_state_key(slot: &EntityStateSlot) -> Result<crate::forktree::StateKey, LixError> {

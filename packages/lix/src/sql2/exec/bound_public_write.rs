@@ -3224,6 +3224,7 @@ pub(crate) struct PreparedPathValueReplacementProgram {
 pub(crate) struct PreparedPathValueReplacementRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) snapshot: TransactionJson,
+    pub(crate) created_at: crate::common::LixTimestamp,
 }
 
 impl PreparedPathValueReplacementProgram {
@@ -3311,22 +3312,23 @@ pub(crate) async fn execute_prepared_path_value_replacement(
     let Some(row) = prepare_path_value_replacement_row(ctx, program, params).await? else {
         return Ok(SqlWriteResult::affected(0));
     };
-    let rows = CertifiedParameterReplacementBatch::new(
-        vec![row.entity_pk],
-        vec![row.snapshot],
+    let mut rows = RawWriteBatch::with_capacity(1);
+    rows.push_parts(
+        Some(row.entity_pk),
         program.schema_key.as_str().into(),
+        None,
+        Some(row.snapshot),
+        None,
+        None,
+        Some(row.created_at.to_string().into()),
+        None,
+        false,
+        None,
+        None,
+        false,
         ctx.active_branch_id().into(),
-        CertifiedRawWriteBatchPreparation {
-            schema_plan_id: program.schema_plan_id,
-            facts: PreparedRowFacts {
-                row_content_validated: true,
-                requires_transaction_validation: false,
-            },
-            tracked_keys_strictly_ordered: true,
-            complete_collection_replacement: None,
-        },
-    )?;
-    ctx.stage_certified_parameter_batch_replace(rows).await?;
+    );
+    ctx.stage_parameter_batch_replace(rows).await?;
     Ok(SqlWriteResult::affected(1))
 }
 
@@ -3366,7 +3368,9 @@ pub(crate) async fn prepare_path_value_replacement_row(
         ));
     }
 
-    prepare_path_value_replacement_row_known_live(program, params).map(Some)
+    let mut prepared = prepare_path_value_replacement_row_known_live(program, params)?;
+    prepared.created_at = candidate.created_at();
+    Ok(Some(prepared))
 }
 
 pub(crate) fn prepare_path_value_replacement_row_known_live(
@@ -3385,6 +3389,10 @@ pub(crate) fn prepare_path_value_replacement_row_known_live(
     Ok(PreparedPathValueReplacementRow {
         entity_pk,
         snapshot,
+        created_at: crate::common::LixTimestamp::expect_parse(
+            "prepared path replacement created_at",
+            "1970-01-01T00:00:00.000Z",
+        ),
     })
 }
 
@@ -5791,7 +5799,7 @@ fn append_entity_replace_row_from_live<'a>(
         snapshot,
         metadata,
         None,
-        None,
+        Some(row.created_at().to_string().into()),
         None,
         row.global(),
         None,
