@@ -249,7 +249,7 @@ where
     fn branch_id(&self) -> Option<String> {
         match self {
             Self::Committed(view) => Some(view.branch_id().to_string()),
-            Self::Transaction(_) => None,
+            Self::Transaction(view) => Some(view.branch_id()),
             #[cfg(test)]
             Self::TestNative { .. } => None,
         }

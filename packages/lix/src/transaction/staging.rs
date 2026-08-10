@@ -3936,3 +3936,135 @@ fn remove_row_from_commit_change_refs(
         change_refs_by_branch.remove(row.branch_id.as_str());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACTIVE_BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000b1";
+
+    fn prepared_row(
+        branch_id: &str,
+        schema_key: &str,
+        value: Option<serde_json::Value>,
+        global: bool,
+        untracked: bool,
+    ) -> TestPreparedStateRow {
+        let timestamp = LixTimestamp::expect_parse("test timestamp", "2026-08-10T00:00:00.000Z");
+        TestPreparedStateRow {
+            schema_plan_id: SchemaPlanId::for_test(0),
+            facts: PreparedRowFacts::default(),
+            entity_pk: EntityPk::single("row"),
+            schema_key: schema_key.into(),
+            file_id: None,
+            snapshot: value.map(|value| {
+                stage_json_from_value(
+                    TransactionJson::from_value_for_test(value),
+                    "transaction overlay test",
+                )
+                .expect("test JSON should stage")
+            }),
+            metadata: None,
+            origin: None,
+            origin_key: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            global,
+            change_id: Some(ChangeId::for_test_label("staged-change")),
+            commit_id: None,
+            untracked,
+            branch_id: branch_id.into(),
+        }
+    }
+
+    fn buffer_with_rows(rows: Vec<TestPreparedStateRow>) -> TransactionWriteBuffer {
+        let buffer = TransactionWriteBuffer::new(FunctionProviderHandle::system());
+        *buffer
+            .rows
+            .lock()
+            .expect("test staged rows lock should not be poisoned") =
+            StagedPreparedRows::AppendOnly {
+                rows: PreparedStateBatch::from_test_rows(rows),
+                insert_selection: PreparedInsertSelection::new(),
+                last_key: None,
+            };
+        buffer
+    }
+
+    #[test]
+    fn state_overlay_rows_preserves_owner_and_tombstone_semantics() {
+        let buffer = buffer_with_rows(vec![
+            prepared_row(
+                GLOBAL_BRANCH_ID,
+                "tracked_schema",
+                Some(serde_json::json!({"value": "global"})),
+                true,
+                false,
+            ),
+            prepared_row(
+                ACTIVE_BRANCH_ID,
+                "tracked_schema",
+                Some(serde_json::json!({"value": "local"})),
+                false,
+                false,
+            ),
+            prepared_row(ACTIVE_BRANCH_ID, "untracked_schema", None, false, true),
+            prepared_row(
+                "01920000-0000-7000-8000-0000000000b2",
+                "ignored_schema",
+                Some(serde_json::json!({"value": "ignored"})),
+                false,
+                false,
+            ),
+        ]);
+
+        let (tracked, untracked) = buffer
+            .state_overlay_rows(ACTIVE_BRANCH_ID)
+            .expect("native staging overlay should project");
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(untracked.len(), 1);
+
+        let tracked_key = crate::forktree::decode_state_key(&tracked[0].key)
+            .expect("tracked overlay key should be canonical");
+        assert_eq!(tracked_key.schema_key, "tracked_schema");
+        match &tracked[0].value.cell {
+            StateCell::Value(value) => assert!(value.contains("local")),
+            other => panic!("expected local tracked value, got {other:?}"),
+        }
+        assert!(matches!(untracked[0].value.cell, StateCell::Tombstone));
+        assert_eq!(
+            untracked[0].owner.as_bytes(),
+            CanonicalBranchId::from_bytes(
+                *uuid::Uuid::parse_str(ACTIVE_BRANCH_ID)
+                    .expect("active test branch should be valid")
+                    .as_bytes(),
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn staged_collection_probe_is_scoped_to_branch_schema_and_file() {
+        let buffer = buffer_with_rows(vec![prepared_row(
+            ACTIVE_BRANCH_ID,
+            "lix_collection_generation",
+            Some(serde_json::json!({"live_count": 1})),
+            false,
+            false,
+        )]);
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: "lix_collection_generation",
+            file_id: None,
+        };
+        assert!(
+            buffer
+                .has_staged_collection_rows(ACTIVE_BRANCH_ID, scope)
+                .expect("collection probe should read staged rows")
+        );
+        assert!(
+            !buffer
+                .has_staged_collection_rows(GLOBAL_BRANCH_ID, scope)
+                .expect("collection probe should preserve branch scope")
+        );
+    }
+}

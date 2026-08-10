@@ -699,6 +699,10 @@ where
         Self::new_with_untracked(self.committed.clone(), staged, staged_untracked)
     }
 
+    pub(crate) fn branch_id(&self) -> String {
+        self.committed.branch_id()
+    }
+
     /// Resolves every requested key before applying visibility. A staged
     /// tombstone masks a committed value even when tombstones are omitted
     /// from the returned slots; duplicate request slots retain their order.
