@@ -489,6 +489,10 @@ where
     let preview = preview_measure.value.expect("plugin preview");
     let preview_phases = collector.take_ms();
     assert!(
+        preview_phases.contains_key("lix.perf.merge_historical_open"),
+        "plugin conflicts must authenticate all three historical views"
+    );
+    assert!(
         preview.conflicts.is_empty(),
         "plugin-owned conflicts must be resolver-owned: {:?}",
         preview.conflicts
@@ -522,6 +526,10 @@ where
     })
     .await;
     let merge_phases = collector.take_ms();
+    assert!(
+        merge_phases.contains_key("lix.perf.merge_historical_open"),
+        "plugin conflicts must authenticate all three historical views"
+    );
     let receipt = merge_measure
         .value
         .expect("all-plugin merge should resolve");
@@ -775,6 +783,10 @@ where
         .value
         .expect("merge preview should return a receipt");
     let preview_phases = collector.take_ms();
+    assert!(
+        !preview_phases.contains_key("lix.perf.merge_historical_open"),
+        "clean divergent preview must not open historical conflict views"
+    );
     assert_eq!(
         read_rows(&lix).await,
         target_before_preview,
@@ -808,6 +820,10 @@ where
     })
     .await;
     let merge_phases = collector.take_ms();
+    assert!(
+        !merge_phases.contains_key("lix.perf.merge_historical_open"),
+        "clean divergent merge must not open historical conflict views"
+    );
     let mut merge_outcome = "conflict".to_owned();
     let mut merge_parents = 0usize;
     match expected {
@@ -961,6 +977,9 @@ where
     );
 
     let final_rows = read_rows(&lix).await;
+    let final_rows_digest = rows_digest(&final_rows);
+    let final_main_head = branch_head(&lix, &main_branch_id).await;
+    let final_source_head = branch_head(&lix, SOURCE_BRANCH_ID).await;
     let storage_bytes_after = directory_bytes(&db_path);
     let fanout_branch_ids = (0..cfg.branches.saturating_sub(1))
         .map(|index| format!("01920000-0000-7000-8000-{:012x}", 0xc000 + index))
@@ -1112,6 +1131,9 @@ where
             "repeated_merge_idempotent": true,
             "historical_diff_model": true,
             "historical_diff_rows": observed_diff.len(),
+            "visible_rows_digest": final_rows_digest,
+            "main_head": final_main_head,
+            "source_head": final_source_head,
         },
         "outcome": merge_outcome,
     });
@@ -1551,6 +1573,17 @@ where
             )
         })
         .collect()
+}
+
+fn rows_digest(rows: &BTreeMap<String, String>) -> String {
+    let mut digest = Sha256::new();
+    for (id, value) in rows {
+        digest.update(id.as_bytes());
+        digest.update([0]);
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 async fn commit_parent_count<StorageImpl>(lix: &Lix<StorageImpl>, commit_id: &str) -> usize

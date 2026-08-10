@@ -182,13 +182,17 @@ where
                 )
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_analysis"))
                 .await?;
-                let historical = if analysis.conflict_batch().is_some() {
+                let historical = if analysis.has_actual_conflicts() {
                     Some(MergeHistoricalState::open(&facade, &analysis).await?)
                 } else {
                     None
                 };
                 let derived_blob_files = async {
-                    derived_plugin_blob_conflicts(historical.as_ref(), &analysis).await
+                    if analysis.has_actual_conflicts() {
+                        derived_plugin_blob_conflicts(historical.as_ref(), &analysis).await
+                    } else {
+                        Ok(DerivedPluginConflictIndex::default())
+                    }
                 }
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_derived_blob_detection"))
                 .await?;
@@ -196,7 +200,9 @@ where
                 let resolvable_plugin_conflicts =
                     resolvable_plugin_conflict_keys(&analysis, &derived_blob_files);
 
-                let plugin_resolution_stats = if analysis.outcome == MergeOutcome::MergeCommitted {
+                let plugin_resolution_stats = if analysis.outcome == MergeOutcome::MergeCommitted
+                    && analysis.has_actual_conflicts()
+                {
                     let plugin_conflict_groups = async {
                         plugin_merge_conflict_groups(
                             historical.as_ref().ok_or_else(|| {
@@ -319,18 +325,24 @@ where
                 "lix.perf.merge_analysis"
             ))
             .await?;
-            let historical = if analysis.conflict_batch().is_some() {
+            let has_actual_conflicts = analysis.has_actual_conflicts();
+            let historical = if has_actual_conflicts {
                 Some(MergeHistoricalState::open(&facade, &analysis).await?)
             } else {
                 None
             };
-            let derived_blob_files =
-                async { derived_plugin_blob_conflicts(historical.as_ref(), &analysis).await }
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.merge_derived_blob_detection"
-                    ))
-                    .await?;
+            let derived_blob_files = async {
+                if has_actual_conflicts {
+                    derived_plugin_blob_conflicts(historical.as_ref(), &analysis).await
+                } else {
+                    Ok(DerivedPluginConflictIndex::default())
+                }
+            }
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_derived_blob_detection"
+            ))
+            .await?;
 
             if analysis.outcome == MergeOutcome::AlreadyUpToDate {
                 return Ok(MergeBranchReceipt {
@@ -400,81 +412,86 @@ where
                 )?);
             }
 
-            let plugin_conflict_groups = async {
-                plugin_merge_conflict_groups(
-                    historical.as_ref().ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "plugin conflict analysis omitted historical commit views",
-                        )
-                    })?,
-                    &analysis,
-                    &derived_blob_files,
-                    &resolvable_plugin_conflicts,
-                )
-                .await
-            }
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_plugin_conflict_inputs"
-            ))
-            .await?;
-            let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
-            let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
-                transaction,
-                plugin_conflict_groups,
-                &semantic_branch_id,
-            )
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_plugin_conflict_resolve"
-            ))
-            .await?;
-
-            let plugin_resolution_stats = async {
-                plugin_resolution_change_stats(
-                    &historical
-                        .as_ref()
-                        .ok_or_else(|| {
+            let (plugin_resolution_stats, semantic_rows) = if has_actual_conflicts {
+                let plugin_conflict_groups = async {
+                    plugin_merge_conflict_groups(
+                        historical.as_ref().ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
-                                "plugin resolution omitted historical commit views",
+                                "plugin conflict analysis omitted historical commit views",
                             )
-                        })?
-                        .target,
-                    &resolved_plugin_rows,
-                )
-                .await
-            }
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_plugin_resolution_stats"
-            ))
-            .await?;
-
-            let semantic_rows = async {
-                materialized_plugin_merge_rows(
-                    &historical
-                        .as_ref()
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                "plugin materialization omitted historical commit views",
-                            )
-                        })?
-                        .source,
-                    &analysis,
-                    &derived_blob_files,
+                        })?,
+                        &analysis,
+                        &derived_blob_files,
+                        &resolvable_plugin_conflicts,
+                    )
+                    .await
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_plugin_conflict_inputs"
+                ))
+                .await?;
+                let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
+                let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
+                    transaction,
+                    plugin_conflict_groups,
                     &semantic_branch_id,
-                    resolved_plugin_rows,
                 )
-                .await
-            }
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_materialized_rows"
-            ))
-            .await?;
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_plugin_conflict_resolve"
+                ))
+                .await?;
+
+                let plugin_resolution_stats = async {
+                    plugin_resolution_change_stats(
+                        &historical
+                            .as_ref()
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "plugin resolution omitted historical commit views",
+                                )
+                            })?
+                            .target,
+                        &resolved_plugin_rows,
+                    )
+                    .await
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_plugin_resolution_stats"
+                ))
+                .await?;
+
+                let semantic_rows = async {
+                    materialized_plugin_merge_rows(
+                        &historical
+                            .as_ref()
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "plugin materialization omitted historical commit views",
+                                )
+                            })?
+                            .source,
+                        &analysis,
+                        &derived_blob_files,
+                        &semantic_branch_id,
+                        resolved_plugin_rows,
+                    )
+                    .await
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_materialized_rows"
+                ))
+                .await?;
+                (plugin_resolution_stats, semantic_rows)
+            } else {
+                (MergeChangeStats::default(), RawWriteBatch::default())
+            };
             if !semantic_rows.is_empty() {
                 transaction
                     .stage_write(TransactionWrite::Rows {
@@ -567,20 +584,24 @@ where
         facade: &'a ForkTreeReadFacade<R>,
         analysis: &super::analysis::MergeAnalysis,
     ) -> Result<Self, LixError> {
-        let base = facade
-            .historical_state_view(&analysis.commits.base_commit_id.to_string())
-            .await?;
-        let target = facade
-            .historical_state_view(&analysis.commits.target_commit_id.to_string())
-            .await?;
-        let source = facade
-            .historical_state_view(&analysis.commits.source_commit_id.to_string())
-            .await?;
-        Ok(Self {
-            base,
-            target,
-            source,
-        })
+        async {
+            let base = facade
+                .historical_state_view(&analysis.commits.base_commit_id.to_string())
+                .await?;
+            let target = facade
+                .historical_state_view(&analysis.commits.target_commit_id.to_string())
+                .await?;
+            let source = facade
+                .historical_state_view(&analysis.commits.source_commit_id.to_string())
+                .await?;
+            Ok(Self {
+                base,
+                target,
+                source,
+            })
+        }
+        .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_historical_open"))
+        .await
     }
 }
 

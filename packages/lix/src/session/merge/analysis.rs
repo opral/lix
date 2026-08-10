@@ -41,6 +41,11 @@ impl MergeAnalysis {
     pub(crate) fn conflict_batch(&self) -> Option<MergeConflictBatch<'_>> {
         self.merge_plan.as_ref().map(MergeConflictBatch::from_plan)
     }
+
+    pub(crate) fn has_actual_conflicts(&self) -> bool {
+        self.conflict_batch()
+            .is_some_and(|batch| batch.iter().next().is_some())
+    }
 }
 
 pub(crate) async fn analyze<S>(
