@@ -4116,7 +4116,12 @@ where
         }
     }
 
-    stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
+    let mode = if conflict == FastLixFilePathWriteConflict::None {
+        TransactionWriteMode::Insert
+    } else {
+        TransactionWriteMode::Replace
+    };
+    stage_lix_file_fast_batch(ctx, mode, staged).await
 }
 
 #[derive(Debug, Clone, Copy, Default)]
