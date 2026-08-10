@@ -3075,7 +3075,7 @@ mod staging_semantics_tests {
     use crate::common::LixTimestamp;
     use crate::forktree::{
         ForkTreeReadFacade, StateCell, StateKey, StateKeyRef, StateValue, UntrackedValue,
-        encode_state_key,
+        encode_state_entity_prefix, encode_state_key, exclusive_prefix_upper_bound,
     };
     use crate::storage::{Memory, MemoryRead};
     use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageReadOptions};
@@ -3213,6 +3213,25 @@ mod staging_semantics_tests {
             file_id: None,
             entity_pk: &entity_pk,
         })
+    }
+
+    fn native_untracked_key(schema_key: &str, entity: &str) -> StateKey {
+        StateKey {
+            schema_key: schema_key.to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single(entity),
+        }
+    }
+
+    fn native_untracked_value(cell: StateCell) -> UntrackedValue {
+        UntrackedValue {
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.001Z"),
+            cell,
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        }
     }
 
     async fn empty_committed_view() -> ForkTreeStateView<TestRead> {
@@ -3664,6 +3683,98 @@ mod staging_semantics_tests {
             .expect("tombstone-inclusive untracked point should resolve");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].as_ref().expect("owner retained").owner, owner);
+    }
+
+    #[tokio::test]
+    async fn native_staged_untracked_range_uses_canonical_schema_bounds() {
+        let committed = empty_committed_view().await;
+        let owner = CanonicalBranchId::from_bytes(
+            *uuid::Uuid::parse_str(TEST_GLOBAL)
+                .expect("global branch UUID")
+                .as_bytes(),
+        );
+        let in_schema = native_untracked_key("app.range", "inside");
+        let outside_schema = native_untracked_key("zzz.other", "outside");
+        let prefix = encode_state_entity_prefix(
+            "app.range",
+            &EntityPk {
+                components: crate::entity_pk::EntityPkComponents::Empty,
+            },
+        );
+        let upper = exclusive_prefix_upper_bound(&prefix);
+        let view = TransactionStateView::new_with_untracked(
+            committed,
+            Vec::new(),
+            vec![
+                StagedUntrackedStateRow::new(
+                    owner,
+                    in_schema.clone(),
+                    native_untracked_value(StateCell::Value("inside".into())),
+                ),
+                StagedUntrackedStateRow::new(
+                    owner,
+                    outside_schema,
+                    native_untracked_value(StateCell::Value("outside".into())),
+                ),
+            ],
+        )
+        .expect("staged rows are canonical-key ordered");
+
+        let rows = view
+            .untracked_branch_range(Some(&prefix), upper.as_deref(), None)
+            .await
+            .expect("canonical schema-prefix range should resolve");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, in_schema);
+    }
+
+    #[tokio::test]
+    async fn native_staged_untracked_range_filters_tombstones_before_limit() {
+        let committed = empty_committed_view().await;
+        let owner = CanonicalBranchId::from_bytes(
+            *uuid::Uuid::parse_str(TEST_GLOBAL)
+                .expect("global branch UUID")
+                .as_bytes(),
+        );
+        let tombstone = native_untracked_key("app.tombstones", "a");
+        let visible = native_untracked_key("app.tombstones", "b");
+        let prefix = encode_state_entity_prefix(
+            "app.tombstones",
+            &EntityPk {
+                components: crate::entity_pk::EntityPkComponents::Empty,
+            },
+        );
+        let upper = exclusive_prefix_upper_bound(&prefix);
+        let view = TransactionStateView::new_with_untracked(
+            committed,
+            Vec::new(),
+            vec![
+                StagedUntrackedStateRow::new(
+                    owner,
+                    tombstone,
+                    native_untracked_value(StateCell::Tombstone),
+                ),
+                StagedUntrackedStateRow::new(
+                    owner,
+                    visible.clone(),
+                    native_untracked_value(StateCell::Value("visible".into())),
+                ),
+            ],
+        )
+        .expect("staged rows are canonical-key ordered");
+
+        let rows = view
+            .untracked_overlay_branch_range_for_branch(
+                TEST_GLOBAL,
+                Some(&prefix),
+                upper.as_deref(),
+                Some(1),
+                false,
+            )
+            .await
+            .expect("tombstone-inclusive range should resolve before filtering");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, visible);
     }
 
     #[tokio::test]

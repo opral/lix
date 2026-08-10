@@ -645,6 +645,85 @@ fn merge_sorted_state_keys(left: Vec<StateKey>, right: Vec<StateKey>) -> Vec<Sta
     merged
 }
 
+fn canonical_untracked_state_key(key: &StateKey) -> Vec<u8> {
+    crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+        schema_key: &key.schema_key,
+        file_id: key.file_id.as_deref(),
+        entity_pk: &key.entity_pk,
+    })
+}
+
+fn state_key_in_range(key: &StateKey, lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
+    let encoded = canonical_untracked_state_key(key);
+    lower.is_none_or(|bound| encoded.as_slice() >= bound)
+        && upper.is_none_or(|bound| encoded.as_slice() < bound)
+}
+
+fn merge_untracked_owner_rows(
+    global: Vec<UntrackedStateRow>,
+    local: Vec<UntrackedStateRow>,
+) -> Vec<UntrackedStateRow> {
+    let mut global = global.into_iter().peekable();
+    let mut local = local.into_iter().peekable();
+    let mut merged = Vec::new();
+    loop {
+        match (global.peek(), local.peek()) {
+            (None, None) => break,
+            (Some(_), None) => merged.push(global.next().expect("peeked global row")),
+            (None, Some(_)) => merged.push(local.next().expect("peeked local row")),
+            (Some(global_row), Some(local_row)) => match global_row.key.cmp(&local_row.key) {
+                Ordering::Less => merged.push(global.next().expect("peeked global row")),
+                Ordering::Greater => merged.push(local.next().expect("peeked local row")),
+                // A local row, including a tombstone, masks the global row.
+                Ordering::Equal => {
+                    global.next();
+                    merged.push(local.next().expect("peeked local row"));
+                }
+            },
+        }
+    }
+    merged
+}
+
+/// Applies staged owner rows to a committed effective local/global overlay.
+/// The committed input has already resolved its own local-over-global choice;
+/// this merge retains a committed local row when only a staged global row is
+/// present, while still allowing staged local rows to replace it. This keeps
+/// exact points and ranges on the same owner-aware precedence rule.
+fn merge_untracked_overlay_rows(
+    committed: Vec<UntrackedStateRow>,
+    staged_global: Vec<UntrackedStateRow>,
+    staged_local: Vec<UntrackedStateRow>,
+    local_owner: CanonicalBranchId,
+) -> Vec<UntrackedStateRow> {
+    let staged = merge_untracked_owner_rows(staged_global, staged_local);
+    let mut committed = committed.into_iter().peekable();
+    let mut staged = staged.into_iter().peekable();
+    let mut merged = Vec::new();
+    loop {
+        match (committed.peek(), staged.peek()) {
+            (None, None) => break,
+            (Some(_), None) => merged.push(committed.next().expect("peeked committed row")),
+            (None, Some(_)) => merged.push(staged.next().expect("peeked staged row")),
+            (Some(committed_row), Some(staged_row)) => match committed_row.key.cmp(&staged_row.key)
+            {
+                Ordering::Less => merged.push(committed.next().expect("peeked committed row")),
+                Ordering::Greater => merged.push(staged.next().expect("peeked staged row")),
+                Ordering::Equal => {
+                    let committed_row = committed.next().expect("peeked committed row");
+                    let staged_row = staged.next().expect("peeked staged row");
+                    if staged_row.owner == local_owner || committed_row.owner != local_owner {
+                        merged.push(staged_row);
+                    } else {
+                        merged.push(committed_row);
+                    }
+                }
+            },
+        }
+    }
+    merged
+}
+
 /// One transaction's committed retained view plus an ordered staged overlay.
 /// Staged rows are validated once at construction; points and ranges use
 /// linear overlay merges and never materialize a full-key map.
@@ -785,6 +864,23 @@ where
         R: Clone,
     {
         Self::new_with_untracked(self.committed.clone(), staged, staged_untracked)
+    }
+
+    fn staged_untracked_rows_for_owner(
+        &self,
+        owner: CanonicalBranchId,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Vec<UntrackedStateRow> {
+        self.staged_untracked
+            .iter()
+            .filter(|row| row.owner == owner && state_key_in_range(&row.key, lower, upper))
+            .map(|row| UntrackedStateRow {
+                owner: row.owner,
+                key: row.key.clone(),
+                value: row.value.clone(),
+            })
+            .collect()
     }
 
     /// Resolves every requested key before applying visibility. A staged
@@ -941,19 +1037,15 @@ where
         let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
         for (key, committed_row) in state_keys.iter().zip(committed) {
             let decoded_key = crate::forktree::decode_state_key(key)?;
-            let staged = self
+            let staged_local = self
                 .staged_untracked
                 .iter()
-                .find(|row| row.owner == active_owner && row.key == decoded_key)
-                .or_else(|| {
-                    (active_owner != global_owner)
-                        .then(|| {
-                            self.staged_untracked
-                                .iter()
-                                .find(|row| row.owner == global_owner && row.key == decoded_key)
-                        })
-                        .flatten()
-                });
+                .find(|row| row.owner == active_owner && row.key == decoded_key);
+            let staged_global = (active_owner != global_owner).then(|| {
+                self.staged_untracked
+                    .iter()
+                    .find(|row| row.owner == global_owner && row.key == decoded_key)
+            });
             // Direct native views may be constructed with an authenticated
             // owner that is neither the transaction branch nor GLOBAL (for
             // example, a branch-scoped test view).  The exact point request
@@ -961,24 +1053,38 @@ where
             // instead of silently filtering the slot.  Transaction-owned
             // overlays still contain only active/global rows because their
             // staging projection enforces that boundary before construction.
-            let staged = staged.or_else(|| {
+            let staged_other = || {
                 self.staged_untracked
                     .iter()
                     .find(|row| row.key == decoded_key)
-            });
-            let row = staged
-                .map(|row| {
-                    if !include_tombstones && row.value.cell.deleted() {
-                        None
-                    } else {
-                        Some(UntrackedStateRow {
-                            owner: row.owner,
-                            key: row.key.clone(),
-                            value: row.value.clone(),
-                        })
-                    }
+            };
+            let row = if let Some(row) = staged_local {
+                Some(UntrackedStateRow {
+                    owner: row.owner,
+                    key: row.key.clone(),
+                    value: row.value.clone(),
                 })
-                .unwrap_or(committed_row);
+            } else if committed_row
+                .as_ref()
+                .is_some_and(|row| row.owner == active_owner)
+            {
+                committed_row
+            } else if let Some(row) = staged_global.flatten() {
+                Some(UntrackedStateRow {
+                    owner: row.owner,
+                    key: row.key.clone(),
+                    value: row.value.clone(),
+                })
+            } else {
+                staged_other()
+                    .map(|row| UntrackedStateRow {
+                        owner: row.owner,
+                        key: row.key.clone(),
+                        value: row.value.clone(),
+                    })
+                    .or(committed_row)
+            };
+            let row = row.filter(|row| include_tombstones || !row.value.cell.deleted());
             output.push(row);
         }
         Ok(output)
@@ -1014,62 +1120,18 @@ where
         let committed = self.committed.untracked_overlay_rows().await?;
         let active_owner = canonical_branch_id(self.committed.branch_id().as_str())?;
         let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
-        let encode = |owner: CanonicalBranchId, key: &StateKey| {
-            crate::forktree::encode_untracked_key(
-                owner,
-                crate::forktree::StateKeyRef {
-                    schema_key: &key.schema_key,
-                    file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
-                },
-            )
+        let staged_global = self.staged_untracked_rows_for_owner(global_owner, None, None);
+        let staged_local = if active_owner == global_owner {
+            Vec::new()
+        } else {
+            self.staged_untracked_rows_for_owner(active_owner, None, None)
         };
-        let mut rows = committed
-            .into_iter()
-            .filter(|row| row.owner == active_owner || row.owner == global_owner)
-            .map(|row| {
-                (
-                    encode(row.owner, &row.key),
-                    false,
-                    row.owner,
-                    row.key,
-                    row.value,
-                )
-            })
-            .collect::<Vec<_>>();
-        rows.extend(
-            self.staged_untracked
-                .iter()
-                .filter(|row| row.owner == active_owner || row.owner == global_owner)
-                .map(|row| {
-                    (
-                        encode(row.owner, &row.key),
-                        true,
-                        row.owner,
-                        row.key.clone(),
-                        row.value.clone(),
-                    )
-                }),
-        );
-        rows.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
-        let mut output = Vec::with_capacity(rows.len());
-        for (encoded, is_staged, owner, key, value) in rows {
-            let same_key = output
-                .last()
-                .is_some_and(|row: &UntrackedStateRow| encode(row.owner, &row.key) == encoded);
-            if same_key {
-                if is_staged {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "duplicate staged untracked state identity",
-                    ));
-                }
-                // The staged row for this exact owner/key was emitted first.
-                continue;
-            }
-            output.push(UntrackedStateRow { owner, key, value });
-        }
-        Ok(output)
+        Ok(merge_untracked_overlay_rows(
+            committed,
+            staged_global,
+            staged_local,
+            active_owner,
+        ))
     }
 
     /// Resolves one bounded untracked branch range through the retained
@@ -1091,74 +1153,14 @@ where
             .await?;
         let owner = uuid::Uuid::parse_str(&self.committed.branch_id())
             .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?;
-        let encode = |owner: CanonicalBranchId, key: &StateKey| {
-            crate::forktree::encode_untracked_key(
-                owner,
-                crate::forktree::StateKeyRef {
-                    schema_key: &key.schema_key,
-                    file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
-                },
-            )
-        };
-        let staged = self
-            .staged_untracked
-            .iter()
-            .filter(|row| row.owner == CanonicalBranchId::from_bytes(*owner.as_bytes()))
-            .filter(|row| {
-                let key = encode(row.owner, &row.key);
-                lower.is_none_or(|bound| key.as_slice() >= bound)
-                    && upper.is_none_or(|bound| key.as_slice() < bound)
-            })
-            .map(|row| {
-                (
-                    encode(row.owner, &row.key),
-                    UntrackedStateRow {
-                        owner: row.owner,
-                        key: row.key.clone(),
-                        value: row.value.clone(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut committed_index = 0;
-        let mut staged_index = 0;
-        let mut output = Vec::new();
-        while committed_index < committed.len() || staged_index < staged.len() {
-            let committed_key = committed
-                .get(committed_index)
-                .map(|row| encode(row.owner, &row.key));
-            let staged_key = staged.get(staged_index).map(|(key, _)| key.clone());
-            let choice = match (committed_key.as_deref(), staged_key.as_deref()) {
-                (None, None) => break,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(_), None) => Ordering::Less,
-                (Some(left), Some(right)) => left.cmp(right),
-            };
-            let row = match choice {
-                Ordering::Less => {
-                    let row = committed[committed_index].clone();
-                    committed_index += 1;
-                    row
-                }
-                Ordering::Equal => {
-                    committed_index += 1;
-                    let row = staged[staged_index].1.clone();
-                    staged_index += 1;
-                    row
-                }
-                Ordering::Greater => {
-                    let row = staged[staged_index].1.clone();
-                    staged_index += 1;
-                    row
-                }
-            };
-            output.push(row);
-            if limit.is_some_and(|bound| output.len() >= bound) {
-                break;
-            }
-        }
-        Ok(output)
+        let owner = CanonicalBranchId::from_bytes(*owner.as_bytes());
+        let staged = self.staged_untracked_rows_for_owner(owner, lower, upper);
+        Ok(
+            merge_untracked_overlay_rows(committed, Vec::new(), staged, owner)
+                .into_iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .collect(),
+        )
     }
 
     /// Resolves the global+branch untracked range through the committed
@@ -1176,42 +1178,21 @@ where
             .committed
             .untracked_overlay_range(lower, upper, None, true)
             .await?;
-        let mut rows = committed
-            .into_iter()
-            .map(|row| {
-                let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                    schema_key: &row.key.schema_key,
-                    file_id: row.key.file_id.as_deref(),
-                    entity_pk: &row.key.entity_pk,
-                });
-                (key, row)
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        for staged in &self.staged_untracked {
-            let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
-                schema_key: &staged.key.schema_key,
-                file_id: staged.key.file_id.as_deref(),
-                entity_pk: &staged.key.entity_pk,
-            });
-            if lower.is_some_and(|bound| key.as_slice() < bound)
-                || upper.is_some_and(|bound| key.as_slice() >= bound)
-            {
-                continue;
-            }
-            rows.insert(
-                key,
-                UntrackedStateRow {
-                    owner: staged.owner,
-                    key: staged.key.clone(),
-                    value: staged.value.clone(),
-                },
-            );
-        }
-        Ok(rows
-            .into_values()
-            .filter(|row| include_tombstones || !row.value.cell.deleted())
-            .take(limit.unwrap_or(usize::MAX))
-            .collect())
+        let active_owner = canonical_branch_id(self.committed.branch_id().as_str())?;
+        let global_owner = canonical_branch_id(crate::GLOBAL_BRANCH_ID)?;
+        let staged_global = self.staged_untracked_rows_for_owner(global_owner, lower, upper);
+        let staged_local = if active_owner == global_owner {
+            Vec::new()
+        } else {
+            self.staged_untracked_rows_for_owner(active_owner, lower, upper)
+        };
+        Ok(
+            merge_untracked_overlay_rows(committed, staged_global, staged_local, active_owner)
+                .into_iter()
+                .filter(|row| include_tombstones || !row.value.cell.deleted())
+                .take(limit.unwrap_or(usize::MAX))
+                .collect(),
+        )
     }
 
     /// Resolves one bounded untracked overlay range for an explicit branch,
@@ -1235,43 +1216,28 @@ where
             .committed
             .untracked_overlay_branch_range_for_branch(branch_id, lower, upper, None, true)
             .await?;
-        let mut merged = BTreeMap::<StateKey, UntrackedStateRow>::new();
-        for row in committed {
-            merged.insert(row.key.clone(), row);
-        }
-        if self.committed.branch_id_matches(branch_id)? {
-            for staged in &self.staged_untracked {
-                if staged.owner != target && staged.owner != global {
-                    continue;
-                }
-                let encoded = crate::forktree::encode_untracked_key(
-                    staged.owner,
-                    crate::forktree::StateKeyRef {
-                        schema_key: &staged.key.schema_key,
-                        file_id: staged.key.file_id.as_deref(),
-                        entity_pk: &staged.key.entity_pk,
-                    },
-                );
-                if lower.is_some_and(|bound| encoded.as_slice() < bound)
-                    || upper.is_some_and(|bound| encoded.as_slice() >= bound)
-                {
-                    continue;
-                }
-                merged.insert(
-                    staged.key.clone(),
-                    UntrackedStateRow {
-                        owner: staged.owner,
-                        key: staged.key.clone(),
-                        value: staged.value.clone(),
-                    },
-                );
+        let (staged_global, staged_local) = if self.committed.branch_id_matches(branch_id)? {
+            if target == global {
+                (
+                    Vec::new(),
+                    self.staged_untracked_rows_for_owner(target, lower, upper),
+                )
+            } else {
+                (
+                    self.staged_untracked_rows_for_owner(global, lower, upper),
+                    self.staged_untracked_rows_for_owner(target, lower, upper),
+                )
             }
-        }
-        Ok(merged
-            .into_values()
-            .filter(|row| include_tombstones || !row.value.cell.deleted())
-            .take(limit.unwrap_or(usize::MAX))
-            .collect())
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(
+            merge_untracked_overlay_rows(committed, staged_global, staged_local, target)
+                .into_iter()
+                .filter(|row| include_tombstones || !row.value.cell.deleted())
+                .take(limit.unwrap_or(usize::MAX))
+                .collect(),
+        )
     }
 }
 
@@ -1288,5 +1254,68 @@ fn visible_staged_row(row: &StagedStateRow, include_tombstones: bool) -> Option<
         None
     } else {
         Some(StateRow::from_staged(row))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_row(owner: CanonicalBranchId, value: &str) -> UntrackedStateRow {
+        UntrackedStateRow {
+            owner,
+            key: StateKey {
+                schema_key: "app.overlay".into(),
+                file_id: None,
+                entity_pk: EntityPk::single("same"),
+            },
+            value: UntrackedValue {
+                created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
+                updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.001Z"),
+                cell: StateCell::Value(value.into()),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn staged_global_does_not_mask_committed_local() {
+        let local = CanonicalBranchId::from_bytes([1; 16]);
+        let global = CanonicalBranchId::from_bytes([2; 16]);
+        let merged = merge_untracked_overlay_rows(
+            vec![test_row(local, "committed-local")],
+            vec![test_row(global, "staged-global")],
+            Vec::new(),
+            local,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].owner, local);
+        assert_eq!(
+            merged[0].value.cell,
+            StateCell::Value("committed-local".into())
+        );
+    }
+
+    #[test]
+    fn staged_local_wins_over_staged_global_and_tombstone_masks() {
+        let local = CanonicalBranchId::from_bytes([1; 16]);
+        let global = CanonicalBranchId::from_bytes([2; 16]);
+        let merged = merge_untracked_overlay_rows(
+            Vec::new(),
+            vec![test_row(global, "staged-global")],
+            vec![UntrackedStateRow {
+                value: UntrackedValue {
+                    cell: StateCell::Tombstone,
+                    ..test_row(local, "unused").value
+                },
+                ..test_row(local, "unused")
+            }],
+            local,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].owner, local);
+        assert!(merged[0].value.cell.deleted());
     }
 }
