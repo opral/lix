@@ -10,6 +10,7 @@ use crate::catalog::snapshot::{
 };
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
+use crate::entity_pk::{EntityPk, EntityPkComponents};
 use crate::schema::schema_key_from_definition;
 use crate::state::{StateRow, TransactionStateView};
 
@@ -124,8 +125,7 @@ impl CatalogRows {
     fn iter(&self) -> impl Iterator<Item = (&Domain, &CatalogRow)> {
         self.domains.iter().flat_map(|domain_rows| {
             domain_rows.rows.iter().filter_map(move |row| {
-                row_belongs_to_schema_catalog_domain(row, &domain_rows.domain)
-                    .then_some((&domain_rows.domain, row))
+                row_belongs_to_schema_catalog_domain(row).then_some((&domain_rows.domain, row))
             })
         })
     }
@@ -161,11 +161,24 @@ async fn scan_transaction_catalog_rows<R>(
 where
     R: crate::storage_adapter::StorageAdapterRead,
 {
+    let lower = crate::forktree::encode_state_entity_prefix(
+        REGISTERED_SCHEMA_KEY,
+        &EntityPk {
+            components: EntityPkComponents::Empty,
+        },
+    );
+    let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
     let schema_domains = domain.schema_catalog_domains();
     let mut catalog_rows = Vec::with_capacity(schema_domains.len());
     for schema_domain in schema_domains {
         let rows = state
-            .branch_range(schema_domain.branch_id(), None, None, None, false)
+            .branch_range(
+                schema_domain.branch_id(),
+                Some(&lower),
+                upper.as_deref(),
+                None,
+                false,
+            )
             .await?
             .into_iter()
             .map(catalog_row_from_state)
@@ -196,7 +209,7 @@ fn facts_from_catalog_rows(catalog_rows: &CatalogRows) -> Result<Vec<SchemaCatal
     Ok(facts)
 }
 
-fn row_belongs_to_schema_catalog_domain(row: &CatalogRow, domain: &Domain) -> bool {
+fn row_belongs_to_schema_catalog_domain(row: &CatalogRow) -> bool {
     row.key.schema_key == REGISTERED_SCHEMA_KEY
         && row.key.file_id.is_none()
         && row.snapshot_content.is_some()
