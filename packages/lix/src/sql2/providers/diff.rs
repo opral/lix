@@ -188,6 +188,13 @@ where
                         {
                             continue;
                         }
+                        if before
+                            .as_ref()
+                            .zip(after.as_ref())
+                            .is_some_and(|(before, after)| same_authenticated_state(before, after))
+                        {
+                            continue;
+                        }
                         let kind = match (before.as_ref(), after.as_ref()) {
                             (None, Some(_)) => "added",
                             (Some(_), None) => "removed",
@@ -223,6 +230,21 @@ where
             ),
         })
     }
+}
+
+/// State-page placement is authenticated provenance, not part of a row's
+/// semantic identity. In particular, a merge may republish an unchanged
+/// source member into a new commit page while preserving its ChangeId and
+/// payload. Such a row must not appear as a public diff modification.
+fn same_authenticated_state(before: &HistoricalStateRow, after: &HistoricalStateRow) -> bool {
+    before.key == after.key
+        && before.change_id == after.change_id
+        && before.created_at == after.created_at
+        && before.updated_at == after.updated_at
+        && before.snapshot_content == after.snapshot_content
+        && before.metadata == after.metadata
+        && before.deleted == after.deleted
+        && before.blob_manifest_object_ids == after.blob_manifest_object_ids
 }
 
 #[derive(Clone, Debug)]

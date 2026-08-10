@@ -1,4 +1,4 @@
-use lix::{LixError, Value};
+use lix::{CreateBranchOptions, LixError, MergeBranchOptions, MergeBranchPreviewOptions, Value};
 use serde_json::json;
 
 use super::select_rows;
@@ -213,6 +213,216 @@ simulation_test!(
             .expect("head after empty selection should load")
             .expect("head after empty selection should exist");
         assert_eq!(head_after_empty, head_before_empty);
+    }
+);
+
+simulation_test!(
+    historical_diff_exposes_distinct_change_ids_for_modified_row,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+                   VALUES (
+                     lix_json('{"x-lix-key":"change_id_regression","x-lix-primary-key":["/id"],"type":"object","required":["id","value"],"properties":{"id":{"type":"string"},"value":{"type":"string"}},"additionalProperties":false}'),
+                     false,
+                     false
+                   )"#,
+                &[],
+            )
+            .await
+            .expect("regression schema should register");
+
+        session
+            .execute(
+                "INSERT INTO change_id_regression (id, value) VALUES \
+                 ('change-id-regression', 'before'), \
+                 ('second-row', 'before'), \
+                 ('stable-row', 'stable')",
+                &[],
+            )
+            .await
+            .expect("initial row should commit");
+        let before = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("pre-update head should load")
+            .expect("pre-update head should exist");
+        session
+            .create_branch(CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-000000000099".to_string()),
+                name: "ChangeId regression branch".to_string(),
+                from_commit_id: Some(before.to_string()),
+            })
+            .await
+            .expect("branch snapshot should succeed");
+
+        let mut update_transaction = session
+            .begin_transaction()
+            .await
+            .expect("update transaction should begin");
+        update_transaction
+            .execute(
+                "INSERT INTO change_id_regression (id, value) VALUES \
+                 ('change-id-regression', 'after'), \
+                 ('second-row', 'after') \
+                 ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("updated rows should stage");
+        update_transaction
+            .commit()
+            .await
+            .expect("updated rows should commit");
+        let after = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("post-update head should load")
+            .expect("post-update head should exist");
+
+        let rows = select_rows(
+            &session,
+            &format!(
+                "SELECT diff_type, before_change_id, after_change_id \
+                 FROM lix_diff('{before}', '{after}') \
+                 WHERE schema_key = 'change_id_regression' \
+                   AND entity_pk = lix_json('[\"change-id-regression\"]')"
+            ),
+        )
+        .await;
+        assert_eq!(rows.len(), 1, "one modified row should be visible");
+        assert_eq!(rows[0][0], Value::Text("modified".to_string()));
+        let (before_change_id, after_change_id) = match (&rows[0][1], &rows[0][2]) {
+            (Value::Text(before), Value::Text(after)) => (before, after),
+            values => panic!("modified diff must expose two change IDs, got {values:?}"),
+        };
+        assert!(!before_change_id.is_empty());
+        assert!(!after_change_id.is_empty());
+        assert_ne!(
+            before_change_id, after_change_id,
+            "an update must publish a new authenticated ChangeId"
+        );
+    }
+);
+
+simulation_test!(
+    historical_diff_ignores_page_provenance_when_change_identity_is_unchanged,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            &[Value::Text(
+                json!({
+                    "x-lix-key": "change_id_branch_regression",
+                    "x-lix-primary-key": ["/id"],
+                    "type": "object",
+                    "required": ["id", "value"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "value": {"type": "string"}
+                    },
+                    "additionalProperties": false
+                })
+                .to_string(),
+            )],
+        )
+        .await
+        .expect("register regression schema");
+        main.execute(
+            "INSERT INTO change_id_branch_regression (id, value) VALUES \
+             ('row-0', 'base-0'), ('row-1', 'base-1'), ('row-2', 'base-2')",
+            &[],
+        )
+        .await
+        .expect("seed branch regression rows");
+        let base = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("base head should load")
+            .expect("base head should exist")
+            .to_string();
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-000000000199".to_owned()),
+                name: "ChangeId branch regression".to_owned(),
+                from_commit_id: Some(base.clone()),
+            })
+            .await
+            .expect("create source branch");
+        let source = sim.wrap_session(
+            engine
+                .open_session(branch.id.clone())
+                .await
+                .expect("source session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO change_id_branch_regression (id, value) VALUES \
+             ('row-0', 'target-0'), ('row-1', 'target-1') \
+             ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+            &[],
+        )
+        .await
+        .expect("target update should commit");
+        source
+            .execute(
+                "INSERT INTO change_id_branch_regression (id, value) VALUES ('row-2', 'source-2') \
+                 ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("source update should commit");
+
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: branch.id.clone(),
+            })
+            .await
+            .expect("merge preview should succeed");
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: branch.id,
+        })
+        .await
+        .expect("merge should succeed");
+
+        let rows = select_rows(
+            &main,
+            &format!(
+                "SELECT entity_pk, diff_type, before_change_id, after_change_id \
+                 FROM lix_diff('{base}', '{}') \
+                 WHERE schema_key = 'change_id_branch_regression' ORDER BY entity_pk",
+                preview.target_head_commit_id
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "only target-edited rows belong to the target diff"
+        );
+        for row in rows {
+            assert_eq!(row[1], Value::Text("modified".to_owned()));
+            let (Value::Text(before), Value::Text(after)) = (&row[2], &row[3]) else {
+                panic!("modified rows must expose two ChangeIds: {row:?}");
+            };
+            assert_ne!(before, after, "modified rows must have distinct ChangeIds");
+        }
     }
 );
 
