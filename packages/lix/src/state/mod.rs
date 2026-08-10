@@ -795,19 +795,6 @@ where
             .await
     }
 
-    pub(crate) async fn branch_untracked_points(
-        &self,
-        branch_id: &str,
-        state_keys: &[Vec<u8>],
-    ) -> Result<Vec<Option<UntrackedStateRow>>, LixError> {
-        if self.committed.branch_id_matches(branch_id)? {
-            return self.untracked_points(state_keys, true).await;
-        }
-        self.committed
-            .branch_untracked_points(branch_id, state_keys)
-            .await
-    }
-
     pub(crate) async fn branch_range(
         &self,
         branch_id: &str,
