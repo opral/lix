@@ -594,6 +594,12 @@ impl<R> WriteTargetRegistry<R>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn new() -> Self {
+        Self {
+            targets: Mutex::new(BTreeMap::new()),
+        }
+    }
+
     fn register(&self, name: &str, target: Arc<SpecWriteTarget<R>>) -> Result<(), LixError> {
         let mut targets = self.targets.lock().map_err(|_| {
             LixError::unknown("SQL physical write-target registry lock was poisoned")
@@ -1633,7 +1639,9 @@ mod scan_source_tests {
     }
 
     #[async_trait]
-    impl TableSpec<crate::storage::MemoryRead> for CountingSpec {
+    impl TableSpec<crate::storage_adapter::StorageAdapterReadScope<crate::storage::MemoryRead>>
+        for CountingSpec
+    {
         fn table_name(&self) -> &str {
             "counted"
         }

@@ -296,7 +296,7 @@ where
                 branch::register_lix_branch_read_provider(
                     session,
                     &surface.name,
-                    ctx.state_view(),
+                    ctx.state_view().clone(),
                     Arc::clone(&branch_ref),
                 )
                 .await?;
@@ -398,7 +398,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.state_view(),
+                    ctx.state_view().clone(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.authenticated_blob_reader()?,
@@ -412,7 +412,7 @@ where
                 file::register_lix_file_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.state_view(),
+                    ctx.state_view().clone(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.authenticated_blob_reader()?,
@@ -438,7 +438,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.state_view(),
+                    ctx.state_view().clone(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -449,7 +449,8 @@ where
                 directory::register_lix_directory_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.state_view(),
+                    ctx.active_branch_id(),
+                    ctx.state_view().clone(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -482,8 +483,7 @@ where
     entity::register_entity_providers(
         session,
         ctx.active_branch_id(),
-        ctx.state_view(),
-        None,
+        ctx.state_view().clone(),
         Arc::clone(&branch_ref),
         (needs_entity_history
             || catalog.surfaces().any(|surface| {
