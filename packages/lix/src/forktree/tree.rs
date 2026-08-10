@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -903,6 +904,522 @@ where
         return Err(corruption("ordered-tree range is not globally ordered"));
     }
     Ok(output)
+}
+
+/// Returns the state keys whose authenticated leaf value differs between two
+/// ordered-tree roots.
+///
+/// The comparison is native to the content-addressed state tree. Equal node
+/// object IDs skip the complete subtree. Otherwise, internal children are
+/// aligned by their authenticated max-key ranges and only overlapping ranges
+/// are compared; a range present on one side is compared with an empty side.
+/// Leaves use a sorted two-pointer comparison. The returned keys retain the
+/// encoded state-tree order, which is the canonical order for this primitive.
+///
+/// The traversal loads each distinct node at most once per invocation and
+/// validates every reused node against each parent edge before it is used.
+/// It does not resolve state-page or semantic-change objects: this is a
+/// structural state-root diff only.
+pub(crate) async fn diff_roots<R>(
+    left_root: Option<ObjectId>,
+    right_root: Option<ObjectId>,
+    read: &R,
+) -> Result<Vec<super::state::StateKey>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut cache = BTreeMap::<ObjectId, Arc<Node>>::new();
+    let mut frontier = vec![DiffTask {
+        left: root_diff_side(left_root),
+        right: root_diff_side(right_root),
+        span: DiffSpan::unbounded(),
+    }];
+    let mut changed_encoded_keys = Vec::new();
+
+    while let Some(task) = frontier.pop() {
+        if same_diff_object(&task.left, &task.right) {
+            continue;
+        }
+        let left = load_diff_side(task.left, read, &mut cache).await?;
+        let right = load_diff_side(task.right, read, &mut cache).await?;
+        if same_diff_object(&left, &right) {
+            continue;
+        }
+
+        let mut next = Vec::new();
+        match (&left, &right) {
+            (DiffSide::Empty, DiffSide::Empty) => {}
+            (DiffSide::Loaded { node: left, .. }, DiffSide::Loaded { node: right, .. }) => {
+                match (&left.body, &right.body) {
+                    (NodeBody::Leaf(left), NodeBody::Leaf(right)) => append_leaf_diffs(
+                        Some(left),
+                        Some(right),
+                        &task.span,
+                        &mut changed_encoded_keys,
+                    ),
+                    (NodeBody::Internal(left), NodeBody::Internal(right)) => {
+                        enqueue_internal_pair(left, right, &task.span, &mut next);
+                    }
+                    (NodeBody::Internal(left), NodeBody::Leaf(right)) => {
+                        enqueue_internal_leaf(left, &right, &task.span, false, &mut next);
+                    }
+                    (NodeBody::Leaf(left), NodeBody::Internal(right)) => {
+                        enqueue_internal_leaf(right, &left, &task.span, true, &mut next);
+                    }
+                }
+            }
+            (DiffSide::Loaded { node, .. }, DiffSide::Empty) => match &node.body {
+                NodeBody::Leaf(entries) => {
+                    append_leaf_diffs(Some(entries), None, &task.span, &mut changed_encoded_keys)
+                }
+                NodeBody::Internal(children) => {
+                    enqueue_internal_empty(children, &task.span, false, &mut next)
+                }
+            },
+            (DiffSide::Empty, DiffSide::Loaded { node, .. }) => match &node.body {
+                NodeBody::Leaf(entries) => {
+                    append_leaf_diffs(None, Some(entries), &task.span, &mut changed_encoded_keys)
+                }
+                NodeBody::Internal(children) => {
+                    enqueue_internal_empty(children, &task.span, true, &mut next)
+                }
+            },
+            (DiffSide::Leaf { entries }, DiffSide::Empty) => {
+                append_leaf_diffs(Some(entries), None, &task.span, &mut changed_encoded_keys)
+            }
+            (DiffSide::Empty, DiffSide::Leaf { entries }) => {
+                append_leaf_diffs(None, Some(entries), &task.span, &mut changed_encoded_keys)
+            }
+            (DiffSide::Leaf { entries: left }, DiffSide::Leaf { entries: right }) => {
+                append_leaf_diffs(
+                    Some(left),
+                    Some(right),
+                    &task.span,
+                    &mut changed_encoded_keys,
+                )
+            }
+            (DiffSide::Loaded { node, .. }, DiffSide::Leaf { entries }) => match &node.body {
+                NodeBody::Leaf(left) => append_leaf_diffs(
+                    Some(left),
+                    Some(entries),
+                    &task.span,
+                    &mut changed_encoded_keys,
+                ),
+                NodeBody::Internal(left) => {
+                    enqueue_internal_leaf(left, entries, &task.span, false, &mut next)
+                }
+            },
+            (DiffSide::Leaf { entries }, DiffSide::Loaded { node, .. }) => match &node.body {
+                NodeBody::Leaf(right) => append_leaf_diffs(
+                    Some(entries),
+                    Some(right),
+                    &task.span,
+                    &mut changed_encoded_keys,
+                ),
+                NodeBody::Internal(right) => {
+                    enqueue_internal_leaf(right, entries, &task.span, true, &mut next)
+                }
+            },
+            _ => unreachable!("diff side resolution leaves no unresolved node refs"),
+        }
+        frontier.extend(next.into_iter().rev());
+    }
+
+    if changed_encoded_keys
+        .windows(2)
+        .any(|pair| pair[0].as_slice() >= pair[1].as_slice())
+    {
+        return Err(corruption(
+            "state-root diff emitted duplicate or out-of-order keys",
+        ));
+    }
+    changed_encoded_keys
+        .into_iter()
+        .map(|key| {
+            super::state::decode_state_key(&key)
+                .map_err(|error| corruption(format!("state-root diff key is invalid: {error}")))
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct DiffTask {
+    left: DiffSide,
+    right: DiffSide,
+    span: DiffSpan,
+}
+
+#[derive(Clone)]
+enum DiffSide {
+    Empty,
+    Leaf {
+        entries: Arc<Vec<LeafEntry>>,
+    },
+    Ref {
+        id: ObjectId,
+        expected: Option<NodeRef>,
+    },
+    Loaded {
+        id: ObjectId,
+        node: Arc<Node>,
+    },
+}
+
+#[derive(Clone, Default)]
+struct DiffSpan {
+    lower_exclusive: Option<Vec<u8>>,
+    upper_inclusive: Option<Vec<u8>>,
+}
+
+impl DiffSpan {
+    fn unbounded() -> Self {
+        Self::default()
+    }
+
+    fn valid(&self) -> bool {
+        self.lower_exclusive
+            .as_ref()
+            .zip(self.upper_inclusive.as_ref())
+            .is_none_or(|(lower, upper)| lower < upper)
+    }
+}
+
+fn root_diff_side(root: Option<ObjectId>) -> DiffSide {
+    root.map_or(DiffSide::Empty, |id| DiffSide::Ref { id, expected: None })
+}
+
+fn same_diff_object(left: &DiffSide, right: &DiffSide) -> bool {
+    match (left, right) {
+        (
+            DiffSide::Ref {
+                id: left,
+                expected: left_expected,
+            },
+            DiffSide::Ref {
+                id: right,
+                expected: right_expected,
+            },
+        ) => left == right && left_expected == right_expected,
+        (DiffSide::Loaded { id: left, .. }, DiffSide::Loaded { id: right, .. }) => left == right,
+        (
+            DiffSide::Ref {
+                id: left,
+                expected: None,
+            },
+            DiffSide::Loaded { id: right, .. },
+        )
+        | (
+            DiffSide::Loaded { id: left, .. },
+            DiffSide::Ref {
+                id: right,
+                expected: None,
+            },
+        ) => left == right,
+        _ => false,
+    }
+}
+
+async fn load_diff_side<R>(
+    side: DiffSide,
+    read: &R,
+    cache: &mut BTreeMap<ObjectId, Arc<Node>>,
+) -> Result<DiffSide, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let DiffSide::Ref { id, expected } = side else {
+        return Ok(side);
+    };
+    if id == ObjectId::ZERO {
+        return Err(corruption("state-root diff references a zero root object"));
+    }
+    let node = match cache.get(&id) {
+        Some(node) => Arc::clone(node),
+        None => {
+            let node = Arc::new(decode_node(id, &load_object_on_read(read, id).await?)?);
+            cache.insert(id, Arc::clone(&node));
+            node
+        }
+    };
+    validate_loaded_node(id, &node, TreeKind::State, expected.as_ref())?;
+    Ok(DiffSide::Loaded { id, node })
+}
+
+fn append_leaf_diffs(
+    left: Option<&[LeafEntry]>,
+    right: Option<&[LeafEntry]>,
+    span: &DiffSpan,
+    output: &mut Vec<Vec<u8>>,
+) {
+    let left = left.unwrap_or_default();
+    let right = right.unwrap_or_default();
+    let mut left_index = first_leaf_index(left, span.lower_exclusive.as_deref());
+    let mut right_index = first_leaf_index(right, span.lower_exclusive.as_deref());
+    while left_index < left.len() || right_index < right.len() {
+        let left_key = left.get(left_index).map(|entry| entry.key.as_slice());
+        let right_key = right.get(right_index).map(|entry| entry.key.as_slice());
+        match (left_key, right_key) {
+            (Some(left_key), Some(right_key)) if left_key == right_key => {
+                if left[left_index].value != right[right_index].value
+                    && key_in_diff_span(left_key, span)
+                {
+                    output.push(left[left_index].key.clone());
+                }
+                left_index += 1;
+                right_index += 1;
+            }
+            (Some(left_key), Some(right_key)) if left_key < right_key => {
+                if key_in_diff_span(left_key, span) {
+                    output.push(left[left_index].key.clone());
+                }
+                left_index += 1;
+            }
+            (Some(_), Some(right_key)) => {
+                if key_in_diff_span(right_key, span) {
+                    output.push(right[right_index].key.clone());
+                }
+                right_index += 1;
+            }
+            (Some(left_key), None) => {
+                if key_in_diff_span(left_key, span) {
+                    output.push(left[left_index].key.clone());
+                }
+                left_index += 1;
+            }
+            (None, Some(right_key)) => {
+                if key_in_diff_span(right_key, span) {
+                    output.push(right[right_index].key.clone());
+                }
+                right_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+}
+
+fn first_leaf_index(entries: &[LeafEntry], lower_exclusive: Option<&[u8]>) -> usize {
+    lower_exclusive.map_or(0, |lower| {
+        entries.partition_point(|entry| entry.key.as_slice() <= lower)
+    })
+}
+
+fn key_in_diff_span(key: &[u8], span: &DiffSpan) -> bool {
+    span.lower_exclusive
+        .as_deref()
+        .is_none_or(|lower| key > lower)
+        && span
+            .upper_inclusive
+            .as_deref()
+            .is_none_or(|upper| key <= upper)
+}
+
+fn enqueue_internal_empty(
+    children: &[NodeRef],
+    span: &DiffSpan,
+    empty_on_left: bool,
+    output: &mut Vec<DiffTask>,
+) {
+    for (child_span, child) in internal_segments(children, span) {
+        let (left, right) = if empty_on_left {
+            (DiffSide::Empty, child)
+        } else {
+            (child, DiffSide::Empty)
+        };
+        output.push(DiffTask {
+            left,
+            right,
+            span: child_span,
+        });
+    }
+}
+
+fn enqueue_internal_leaf(
+    internal: &[NodeRef],
+    leaf: &[LeafEntry],
+    span: &DiffSpan,
+    leaf_on_left: bool,
+    output: &mut Vec<DiffTask>,
+) {
+    let leaf = Arc::new(leaf.to_vec());
+    for (child_span, child) in internal_segments(internal, span) {
+        let (left, right) = if leaf_on_left {
+            (
+                DiffSide::Leaf {
+                    entries: Arc::clone(&leaf),
+                },
+                child,
+            )
+        } else {
+            (
+                child,
+                DiffSide::Leaf {
+                    entries: Arc::clone(&leaf),
+                },
+            )
+        };
+        output.push(DiffTask {
+            left,
+            right,
+            span: child_span,
+        });
+    }
+}
+
+fn enqueue_internal_pair(
+    left: &[NodeRef],
+    right: &[NodeRef],
+    span: &DiffSpan,
+    output: &mut Vec<DiffTask>,
+) {
+    let mut left = internal_segments(left, span);
+    let mut right = internal_segments(right, span);
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while left_index < left.len() || right_index < right.len() {
+        match (left.get(left_index), right.get(right_index)) {
+            (Some((left_span, left_side)), Some((right_span, right_side)))
+                if span_before_or_at(
+                    left_span.upper_inclusive.as_deref(),
+                    right_span.lower_exclusive.as_deref(),
+                ) =>
+            {
+                output.push(DiffTask {
+                    left: left_side.clone(),
+                    right: DiffSide::Empty,
+                    span: left_span.clone(),
+                });
+                left_index += 1;
+            }
+            (Some((left_span, left_side)), Some((right_span, right_side)))
+                if span_before_or_at(
+                    right_span.upper_inclusive.as_deref(),
+                    left_span.lower_exclusive.as_deref(),
+                ) =>
+            {
+                output.push(DiffTask {
+                    left: DiffSide::Empty,
+                    right: right_side.clone(),
+                    span: right_span.clone(),
+                });
+                right_index += 1;
+            }
+            (Some((left_span, left_side)), Some((right_span, right_side))) => {
+                let overlap = intersect_diff_spans(left_span, right_span);
+                if overlap.valid() {
+                    output.push(DiffTask {
+                        left: left_side.clone(),
+                        right: right_side.clone(),
+                        span: overlap,
+                    });
+                }
+                match left_span
+                    .upper_inclusive
+                    .as_deref()
+                    .cmp(&right_span.upper_inclusive.as_deref())
+                {
+                    std::cmp::Ordering::Less => {
+                        left_index += 1;
+                        right[right_index].0.lower_exclusive = left_span.upper_inclusive.clone();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        right_index += 1;
+                        left[left_index].0.lower_exclusive = right_span.upper_inclusive.clone();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        left_index += 1;
+                        right_index += 1;
+                    }
+                }
+            }
+            (Some((left_span, left_side)), None) => {
+                output.push(DiffTask {
+                    left: left_side.clone(),
+                    right: DiffSide::Empty,
+                    span: left_span.clone(),
+                });
+                left_index += 1;
+            }
+            (None, Some((right_span, right_side))) => {
+                output.push(DiffTask {
+                    left: DiffSide::Empty,
+                    right: right_side.clone(),
+                    span: right_span.clone(),
+                });
+                right_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+}
+
+fn internal_segments(children: &[NodeRef], parent: &DiffSpan) -> Vec<(DiffSpan, DiffSide)> {
+    let mut segments = Vec::with_capacity(children.len());
+    let mut previous_max = None;
+    for child in children {
+        let lower = max_diff_lower(parent.lower_exclusive.as_deref(), previous_max.as_deref());
+        let upper = min_diff_upper(
+            parent.upper_inclusive.as_deref(),
+            Some(child.max_key.as_slice()),
+        );
+        let child_span = DiffSpan {
+            lower_exclusive: lower,
+            upper_inclusive: upper,
+        };
+        if child_span.valid() {
+            segments.push((
+                child_span,
+                DiffSide::Ref {
+                    id: child.id,
+                    expected: Some(child.clone()),
+                },
+            ));
+        }
+        previous_max = Some(child.max_key.clone());
+        if parent
+            .upper_inclusive
+            .as_deref()
+            .is_some_and(|upper| child.max_key.as_slice() >= upper)
+        {
+            break;
+        }
+    }
+    segments
+}
+
+fn intersect_diff_spans(left: &DiffSpan, right: &DiffSpan) -> DiffSpan {
+    DiffSpan {
+        lower_exclusive: max_diff_lower(
+            left.lower_exclusive.as_deref(),
+            right.lower_exclusive.as_deref(),
+        ),
+        upper_inclusive: min_diff_upper(
+            left.upper_inclusive.as_deref(),
+            right.upper_inclusive.as_deref(),
+        ),
+    }
+}
+
+fn max_diff_lower(left: Option<&[u8]>, right: Option<&[u8]>) -> Option<Vec<u8>> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value.to_vec()),
+        (Some(left), Some(right)) => Some(left.max(right).to_vec()),
+    }
+}
+
+fn min_diff_upper(left: Option<&[u8]>, right: Option<&[u8]>) -> Option<Vec<u8>> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value.to_vec()),
+        (Some(left), Some(right)) => Some(left.min(right).to_vec()),
+    }
+}
+
+fn span_before_or_at(upper: Option<&[u8]>, lower: Option<&[u8]>) -> bool {
+    match (upper, lower) {
+        (Some(upper), Some(lower)) => upper <= lower,
+        _ => false,
+    }
 }
 
 pub(super) fn insert_receipt_part(
