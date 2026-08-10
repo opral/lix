@@ -2048,6 +2048,11 @@ where
             .cloned()
             .ok_or_else(|| corruption("authenticated source state page ordinal is absent"))?;
         if member.change_id() != expected_change_id {
+            if !expected_global {
+                return Err(corruption(
+                    "authenticated local source state member has an unexpected ChangeId",
+                ));
+            }
             continue;
         }
         if let CommitMemberV1::Introduced { global, .. } = &member

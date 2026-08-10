@@ -455,12 +455,31 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
             .expect("seed commit"),
     )
     .expect("decode seed commit");
-    let member = seed_commit_members(&seed)
-        .into_iter()
-        .next()
-        .expect("seed semantic member");
-    let state_key = seed.state_keys[0].clone();
+    let members = seed_commit_members(&seed);
+    let hidden_global_member = members[0].clone();
+    let hidden_global_state_key = seed.state_keys[0].clone();
+    let member = members[2].clone();
+    let state_key = seed.state_keys[2].clone();
     let repository = view.repository_root();
+    let mut hidden_global_closures =
+        super::serving::StaleMemberAuthCache::new(view.view_instance_id());
+    assert!(
+        super::serving::resolve_semantic_member_with_stale_auth(
+            view.test_storage_read(),
+            view.view_instance_id(),
+            &hidden_global_member,
+            &hidden_global_state_key,
+            seed.commit_object_id,
+            commit.generation,
+            0,
+            repository.commit_catalog_root,
+            repository.change_catalog_root,
+            &mut hidden_global_closures,
+        )
+        .await
+        .is_err(),
+        "a present local member with another ChangeId must not fall through to a matching global member"
+    );
     let mut closures = super::serving::StaleMemberAuthCache::new(view.view_instance_id());
     super::serving::resolve_semantic_member_with_stale_auth(
         view.test_storage_read(),
@@ -469,7 +488,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
         &state_key,
         seed.commit_object_id,
         commit.generation,
-        0,
+        2,
         repository.commit_catalog_root,
         repository.change_catalog_root,
         &mut closures,
@@ -490,7 +509,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
             &state_key,
             seed.commit_object_id,
             commit.generation,
-            0,
+            2,
             repository.commit_catalog_root,
             repository.change_catalog_root,
             &mut cross_view_member_cache,
@@ -568,7 +587,7 @@ async fn stale_selected_leaf_requires_catalog_owner_source_and_page_identity() {
             &state_key,
             seed.commit_object_id,
             commit.generation,
-            0,
+            2,
             repository.commit_catalog_root,
             empty_change_catalog.root.object_id,
             &mut missing_catalog_closures,
