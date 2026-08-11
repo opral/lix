@@ -2488,6 +2488,18 @@ fn collect_binary_cas_json_owners(
     }
 }
 
+/// One registered storage space, looked up by its registry name.
+///
+/// Tools that issue their own point reads need the physical space without
+/// re-declaring its id, which would be a second authority for the registry.
+#[must_use]
+pub fn storage_space_by_name(space_name: &str) -> crate::storage_adapter::StorageSpace {
+    *native_storage_spaces()
+        .iter()
+        .find(|space| space.name == space_name)
+        .expect("space name should exist")
+}
+
 /// Per-row (key, value bytes) inventory of one space.
 ///
 /// Equivalence tests compare these inventories byte-for-byte, so the scan
@@ -2496,10 +2508,7 @@ pub async fn space_inventory<R>(read: &R, space_name: &str) -> Vec<(Vec<u8>, Vec
 where
     R: StorageAdapterRead,
 {
-    let space = *native_storage_spaces()
-        .iter()
-        .find(|space| space.name == space_name)
-        .expect("space name should exist");
+    let space = storage_space_by_name(space_name);
     scan_layout_entries(read, space)
         .await
         .iter()
