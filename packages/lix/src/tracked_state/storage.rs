@@ -12006,11 +12006,24 @@ pub(crate) struct TrackedStateChunkOverlay {
     /// bytes by construction and re-writing it is a no-op the backend cannot
     /// elide for a mutable space.
     known_durable: HashSet<[u8; TRACKED_STATE_HASH_BYTES]>,
+    /// Explicit commit-root rebuild is the repair path for a damaged chunk, so
+    /// it must rewrite every node it derives. A present key proves the digest
+    /// is addressed, not that the stored bytes still hash to it.
+    rewrite_durable: bool,
 }
 
 impl TrackedStateChunkOverlay {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Overlay for the explicit rebuild path, which repairs corrupt chunks by
+    /// rewriting them and therefore never skips a durable digest.
+    pub(crate) fn repairing() -> Self {
+        Self {
+            rewrite_durable: true,
+            ..Self::default()
+        }
     }
 
     /// Records which of `hashes` are already durable, using one presence-only
@@ -12020,6 +12033,9 @@ impl TrackedStateChunkOverlay {
         store: &(impl StorageAdapterRead + ?Sized),
         hashes: impl IntoIterator<Item = [u8; TRACKED_STATE_HASH_BYTES]>,
     ) -> Result<(), LixError> {
+        if self.rewrite_durable {
+            return Ok(());
+        }
         let candidates = hashes
             .into_iter()
             .filter(|hash| !self.known_durable.contains(hash))
