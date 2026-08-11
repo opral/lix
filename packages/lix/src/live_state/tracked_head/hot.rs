@@ -9745,6 +9745,21 @@ fn packed_working_diff_version(
     }
 }
 
+/// Counts which of the two working-diff read paths served a request, so the
+/// public-surface equivalence test can prove it exercised both instead of
+/// silently comparing one path against itself.
+#[cfg(test)]
+pub(crate) static WORKING_DIFF_PATH_HITS: WorkingDiffPathHits = WorkingDiffPathHits {
+    index_scan: std::sync::atomic::AtomicUsize::new(0),
+    finite_bypass: std::sync::atomic::AtomicUsize::new(0),
+};
+
+#[cfg(test)]
+pub(crate) struct WorkingDiffPathHits {
+    pub(crate) index_scan: std::sync::atomic::AtomicUsize,
+    pub(crate) finite_bypass: std::sync::atomic::AtomicUsize,
+}
+
 /// Resolves a checkpoint diff from row-local first-before images. Broad diffs
 /// enumerate the sparse dirty-key index; finite PK queries read only the
 /// primary rows that can answer the request.
@@ -9772,6 +9787,10 @@ async fn hot_working_diff_entries(
         .await;
     }
 
+    #[cfg(test)]
+    WORKING_DIFF_PATH_HITS
+        .index_scan
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
     let range = StoragePrefix {
         bytes: Bytes::from(scope.clone()),
@@ -9898,6 +9917,33 @@ async fn hot_working_diff_entries(
             let Ok(after) = decode_head_value(&after) else {
                 return Ok(None);
             };
+            // Not a classification, an inconsistency guard — and deliberately
+            // stricter than the finite bypass, which merely skips an untracked
+            // or absent primary row (`finite_working_diff_versions`).
+            //
+            // The two are equivalent because the populations differ. This loop
+            // only visits identities the sparse `HOT_DIFF` index already
+            // asserts are dirty against this checkpoint, and a dirty identity
+            // always has a tracked primary row in this generation:
+            //
+            // * `HOT_DIFF` keys are only written for `!delta.untracked`
+            //   deltas, both incrementally and from the file cascade.
+            // * A primary row is physically removed only by
+            //   `CurrentStateDelta::physically_deletes` — `untracked &&
+            //   deleted`. A tracked delete writes a tombstone that keeps its
+            //   baseline, so a dirty row cannot vanish.
+            // * `reject_retention_change` forbids flipping retention while any
+            //   physical member exists, so a dirty tracked row cannot be
+            //   overwritten by an untracked one.
+            // * The scope prefix contains the checkpoint and the generation, so
+            //   a `Clean` baseline or a foreign checkpoint owner cannot appear
+            //   under the scope the epoch names.
+            //
+            // The finite bypass instead reads *all* primary rows matching a
+            // finite identity filter, where clean, untracked, and absent rows
+            // are the normal case and skipping them is the classification. It
+            // never sees this population, so keep the strict guard here rather
+            // than relaxing it to match.
             if after.untracked {
                 return Ok(None);
             }
@@ -9949,6 +9995,10 @@ async fn hot_working_diff_entries_for_finite_filter(
     generation: CommitId,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    #[cfg(test)]
+    WORKING_DIFF_PATH_HITS
+        .finite_bypass
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rows = hot_scan_entries(store, branch_id, generation, filter, None, None)
         .await?
         .expect("unbounded HOT scan cannot exhaust a byte budget");
@@ -9993,6 +10043,21 @@ async fn hot_working_diff_entries_for_finite_filter(
     }
 }
 
+/// Classifies one primary `HOT_ROW` value for the finite bypass.
+///
+/// `None` means "this scope cannot answer, replay canonically"; `Some(None)`
+/// means "this row contributes no diff entry".
+///
+/// Skipping an untracked, clean, or foreign-checkpoint row here is not the
+/// same decision the index-driven path makes for the same predicates — that
+/// path fails closed. Both are correct because they classify different
+/// populations: this one sees every primary row matching a finite identity
+/// filter, where untracked/clean/absent rows are ordinary and not dirty, while
+/// the index-driven path only ever sees identities `HOT_DIFF` already asserts
+/// are dirty, where those same states would be corruption. See the equivalence
+/// argument in `hot_working_diff_entries`; the reachable-state proof is
+/// exercised end to end by
+/// `working_diff_finite_bypass_and_index_scan_agree_on_every_row_state`.
 fn finite_working_diff_versions(
     bytes: &Bytes,
     checkpoint_commit_id: CommitId,
@@ -10698,8 +10763,18 @@ fn encode_hot_diff_key_parts(
 /// `hot_scan_entries` already owns a file-first prefix route, so a
 /// `schema_key + file_id` working-diff read could enumerate primary rows the
 /// way the finite bypass does. That trades O(dirty rows in the branch) for
-/// O(live rows in the file) and still owes a soundness argument for rows that
-/// leave `HOT_ROW` entirely (untracked deletes), so it is not implemented.
+/// O(live rows in the file). It is still not implemented *for the working
+/// diff*, because a diff must also see identities whose current authority is a
+/// packed current base published inside this checkpoint window, and those
+/// contribute exactly the whole-commit coverage groups described above.
+///
+/// The ordinary **entity** surface has no such obligation and does take that
+/// route: `lixcol_file_id` is an exact provider constraint that lands in
+/// `LiveStateFilter::file_ids`, and every authority the live-state merge reads
+/// — `HOT_ROW`, the packed current base, the certified entity batches, and the
+/// root current base — filters on it, two of them with their own file-scoped
+/// seek. Rows that never had a branch-local `HOT_ROW` are therefore still
+/// returned by the other three legs.
 fn append_hot_diff_key_parts(
     key_bytes: &mut Vec<u8>,
     scope: &[u8],
