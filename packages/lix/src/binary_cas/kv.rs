@@ -43,7 +43,6 @@ const CAS_RECLAIM_CHUNK_PAGE_ROWS: usize = 1;
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
-pub(crate) const BINARY_CAS_CHUNK_PRESENCE_NAMESPACE: &str = "binary_cas.chunk_presence";
 pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
@@ -52,10 +51,6 @@ pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::m
 );
 pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace =
     StorageSpace::immutable(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
-pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0005_0004),
-    BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
-);
 pub(in crate::binary_cas) async fn load_mutation_epoch(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<(u64, Option<Bytes>), LixError> {
@@ -177,7 +172,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
     // mutation. The caller commits one atomic write set, but keeping a failed
     // plan empty also prevents accidental reuse of partially staged sweep
     // work after corruption is reported.
-    verify_live_chunk_presence(store, &live_chunks).await?;
+    verify_live_chunk_payloads(store, &live_chunks).await?;
 
     let mut manifest_cursor = store
         .begin_scan(
@@ -306,40 +301,6 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                         "binary CAS reclaimed byte count overflowed",
                     )
                 })?;
-        }
-        if !page.has_more {
-            break;
-        }
-    }
-
-    let mut presence_cursor = store
-        .begin_scan(
-            BINARY_CAS_CHUNK_PRESENCE_SPACE,
-            StorageKeyRange {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    loop {
-        let page = presence_cursor
-            .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
-            let chunk_hash =
-                ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_STORAGE_ERROR,
-                        "binary CAS chunk-presence key is not a 32-byte chunk hash",
-                    )
-                })?);
-            if !live_chunks.contains_key(&chunk_hash) {
-                writes.delete(BINARY_CAS_CHUNK_PRESENCE_SPACE, entry.key);
-            }
         }
         if !page.has_more {
             break;
@@ -605,7 +566,7 @@ fn decode_manifest_chunk_key(key: &StorageKey) -> Result<(BlobId, u64), LixError
     Ok((blob_id, ordinal))
 }
 
-async fn verify_live_chunk_presence(
+async fn verify_live_chunk_payloads(
     store: &(impl StorageAdapterRead + ?Sized),
     live_chunks: &BTreeMap<ChunkHash, u64>,
 ) -> Result<(), LixError> {
@@ -636,24 +597,6 @@ async fn verify_live_chunk_presence(
             *hash,
         )?;
 
-        let presence_result =
-            PointReadPlan::new(BINARY_CAS_CHUNK_PRESENCE_SPACE, std::slice::from_ref(&key))
-                .materialize(
-                    store,
-                    StorageGetOptions {
-                        projection: StorageCoreProjection::KeyOnly,
-                    },
-                )
-                .await?;
-        if presence_result.value.first().is_none_or(Option::is_none) {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                format!(
-                    "live binary CAS chunk '{}' is missing its presence row",
-                    hash.to_hex()
-                ),
-            ));
-        }
     }
     Ok(())
 }
@@ -818,16 +761,6 @@ pub(crate) fn stage_chunk(
     uncompressed_len: u64,
     payload: &[u8],
 ) {
-    // The storage API's key-only projection still has to materialize a value
-    // on backends without an exact exists primitive. Keep an empty marker in
-    // a separate space so content-addressed dedupe never reads chunk payloads
-    // merely to prove that their hash is present. The marker and payload are
-    // staged in the same canonical write set and become visible atomically.
-    writes.put(
-        BINARY_CAS_CHUNK_PRESENCE_SPACE,
-        key(chunk_key(chunk_hash)),
-        value(Vec::new()),
-    );
     writes.put(
         BINARY_CAS_CHUNK_SPACE,
         key(chunk_key(chunk_hash)),
@@ -2448,7 +2381,12 @@ async fn chunk_keys_exist(
     keys: Vec<StorageKey>,
 ) -> Result<Vec<bool>, LixError> {
     let started = Instant::now();
-    let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_PRESENCE_SPACE, keys)
+    // A key-only probe against the payload space is the single authority for
+    // "does this chunk exist". Neither adapter reads the payload to answer it:
+    // SlateDB keeps only a locator in the LSM and hydrates the object-store
+    // segment for full-value projections alone, and RocksDB answers from the
+    // immutable column family's index without materializing the value.
+    let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_SPACE, keys)
         .materialize(
             store,
             StorageGetOptions {
@@ -2703,7 +2641,6 @@ mod tests {
         manifest_scan_calls: AtomicUsize,
         manifest_get_many_calls: AtomicUsize,
         chunk_get_many_calls: AtomicUsize,
-        presence_get_many_calls: AtomicUsize,
         chunk_keys_requested: AtomicUsize,
         completed_manifest_hashes: Mutex<Vec<BlobId>>,
     }
@@ -2720,7 +2657,6 @@ mod tests {
                 manifest_scan_calls: AtomicUsize::new(0),
                 manifest_get_many_calls: AtomicUsize::new(0),
                 chunk_get_many_calls: AtomicUsize::new(0),
-                presence_get_many_calls: AtomicUsize::new(0),
                 chunk_keys_requested: AtomicUsize::new(0),
                 completed_manifest_hashes: Mutex::new(Vec::new()),
             }
@@ -2752,9 +2688,6 @@ mod tests {
                     self.chunk_get_many_calls.fetch_add(1, Ordering::Relaxed);
                     self.chunk_keys_requested
                         .fetch_add(request.keys.len(), Ordering::Relaxed);
-                }
-                if request.space == BINARY_CAS_CHUNK_PRESENCE_SPACE {
-                    self.presence_get_many_calls.fetch_add(1, Ordering::Relaxed);
                 }
             }
             self.inner.get_many(requests).await

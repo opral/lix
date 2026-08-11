@@ -1791,9 +1791,8 @@ where
 /// Current file images and binary/unclassified values remain ordinary CAS
 /// payloads. Superseded payloads eligible for the catch-all WASM text plugin
 /// are reconstructible from semantic history and may be removed. Dependency
-/// traversal retains shared chunks, chunk manifests, delta bases, and presence
-/// rows, so the result does not count unreachable manifest bytes as payload
-/// savings.
+/// traversal retains shared chunks, chunk manifests, and delta bases, so the
+/// result does not count unreachable manifest bytes as payload savings.
 pub async fn current_image_cas_oracle_accounting<R>(
     read: &R,
 ) -> Result<CurrentImageCasOracleAccounting, crate::LixError>
@@ -1849,8 +1848,6 @@ where
     let manifest_chunk_entries =
         scan_layout_entries(read, crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE).await;
     let chunk_entries = scan_layout_entries(read, crate::binary_cas::BINARY_CAS_CHUNK_SPACE).await;
-    let presence_entries =
-        scan_layout_entries(read, crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE).await;
 
     let mut manifest_chunks = std::collections::BTreeMap::<
         crate::binary_cas::BlobId,
@@ -1929,24 +1926,14 @@ where
             retained_chunk_bytes += storage_entry_bytes(entry);
         }
     }
-    let mut retained_presence_bytes = 0u64;
-    for entry in &presence_entries {
-        let hash = hash_from_key_prefix(&entry.key.0, "chunk presence")?;
-        if retained_chunks.contains(&hash) {
-            retained_presence_bytes += storage_entry_bytes(entry);
-        }
-    }
     let current_cas_row_bytes = manifest_entries
         .iter()
         .chain(manifest_chunk_entries.iter())
         .chain(chunk_entries.iter())
-        .chain(presence_entries.iter())
         .map(storage_entry_bytes)
         .sum::<u64>();
-    let retained_cas_row_bytes = retained_manifest_bytes
-        + retained_manifest_chunk_bytes
-        + retained_chunk_bytes
-        + retained_presence_bytes;
+    let retained_cas_row_bytes =
+        retained_manifest_bytes + retained_manifest_chunk_bytes + retained_chunk_bytes;
     Ok(CurrentImageCasOracleAccounting {
         current_file_images: current_file_hashes.len() as u64,
         retained_manifests: retained_blobs.len() as u64,
@@ -2282,7 +2269,6 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
         crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
         crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
         crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
         crate::changelog::COMMIT_SPACE,
         crate::changelog::CHANGE_SPACE,

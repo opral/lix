@@ -21,8 +21,7 @@ pub(crate) use context::{BinaryCasContext, BlobDataReader};
 pub(crate) use kv::load_bytes_many;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use kv::{
-    BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
-    BINARY_CAS_MANIFEST_SPACE,
+    BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
 };
 pub(crate) use types::{
     BlobBytesBatch, BlobChunkReceipt, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,

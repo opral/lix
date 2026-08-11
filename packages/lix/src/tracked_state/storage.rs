@@ -12962,7 +12962,7 @@ mod tests {
 
     use crate::LixError;
     use crate::binary_cas::{
-        BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
+        BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
         BINARY_CAS_MANIFEST_SPACE,
     };
     use crate::branch::BRANCH_HEAD_CONTROL_SPACE;
@@ -17004,7 +17004,6 @@ mod tests {
             crate::tracked_state::scoped_range::SCOPED_RANGE_NODE_SPACE,
             BINARY_CAS_MANIFEST_SPACE,
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
-            BINARY_CAS_CHUNK_PRESENCE_SPACE,
             BINARY_CAS_CHUNK_SPACE,
             COMMIT_SPACE,
             CHANGE_SPACE,
