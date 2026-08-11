@@ -1255,9 +1255,6 @@ where
     if !reclaimed_semantic_commits.is_empty() {
         writes.seal_changelog_gc();
     }
-    let reclaimed_generation_rows = 0_u64;
-    let reclaimed_standalone_changes = BTreeSet::<ChangeId>::new();
-
 
     preconditions.extend(staged_preconditions);
     Ok(RepositoryGcPlan {
@@ -1282,8 +1279,11 @@ where
         },
         sweep: RepositoryGcSweep {
             tracked_commit_roots: reclaimed_commits.into_iter().collect(),
-            standalone_changes: reclaimed_standalone_changes.into_iter().collect(),
-            reclaimed_generation_rows,
+            // Superseded branch-ref facts and stale serving generations are
+            // retired by the publication that supersedes them, in that same
+            // write set. A sweep has no such debt left to report.
+            standalone_changes: Vec::new(),
+            reclaimed_generation_rows: 0,
             binary_cas,
         },
         profile: RepositoryGcProfile {

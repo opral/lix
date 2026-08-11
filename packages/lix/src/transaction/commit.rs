@@ -758,7 +758,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
     let mut root_backed_branch_publications = BTreeSet::new();
-    let mut retired_generation_rows = 0_u64;
     let published_branch_controls = stage_branch_head_control_publications(
         read,
         &mut writes,
@@ -772,10 +771,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut preconditions,
         &branch_control_observations,
         &mut root_backed_branch_publications,
-        &mut retired_generation_rows,
     )
     .await?;
-    let _ = retired_generation_rows;
     // The binary-CAS publication fence used to ride along with the reachability
     // delta writer. It is an authenticated root-publication fence in its own
     // right, so it stages here even when the transition only revives an
@@ -5145,7 +5142,6 @@ async fn stage_branch_head_control_publications(
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
-    retired_generation_rows: &mut u64,
 ) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
     if let Some(branch_id) = branch_checkpoint_bridges
@@ -5289,15 +5285,8 @@ async fn stage_branch_head_control_publications(
                 }) {
                     continue;
                 }
-                *retired_generation_rows = retired_generation_rows.saturating_add(
-                    crate::live_state::stage_retire_hot_generation(
-                        read,
-                        writes,
-                        branch_id,
-                        generation,
-                    )
-                    .await?,
-                );
+                crate::live_state::stage_retire_hot_generation(read, writes, branch_id, generation)
+                    .await?;
             }
             if desired.is_none_or(|new_control| new_control.ref_change_id != old_control.ref_change_id)
             {
@@ -6699,7 +6688,6 @@ mod tests {
         let mut writes = storage.new_write_set();
         let mut preconditions = Vec::new();
         let mut root_backed = BTreeSet::new();
-        let mut retired_generation_rows = 0_u64;
         let controls = stage_branch_head_control_publications(
             &read,
             &mut writes,
@@ -6719,7 +6707,6 @@ mod tests {
                 },
             )]),
             &mut root_backed,
-            &mut retired_generation_rows,
         )
         .await
         .expect("branch owner should stage checkpoint serving context");
@@ -6730,7 +6717,6 @@ mod tests {
         assert_eq!(control.head_commit_id, recovered_head);
         assert_eq!(control.working_diff_checkpoint_commit_id, Some(checkpoint));
         assert!(root_backed.contains(branch_id));
-        assert_eq!(retired_generation_rows, 0);
         drop(read);
         storage
             .commit_write_set(
