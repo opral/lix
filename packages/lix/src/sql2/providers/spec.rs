@@ -1624,14 +1624,15 @@ mod scan_source_tests {
         session
             .register_table("counted", Arc::new(SpecTableProvider::new(spec)))
             .expect("counted test table should register");
-        let dataframe = session
-            .sql(
+        let plan = session
+            .state()
+            .create_logical_plan(
                 "WITH reused AS (SELECT value FROM counted) \
                  SELECT value FROM reused UNION ALL SELECT value FROM reused",
             )
             .await
             .expect("CTE should plan");
-        let batches = crate::sql2::runtime::collect_dataframe(dataframe, None)
+        let batches = crate::sql2::runtime::collect_plan(&session.state(), plan, None)
             .await
             .expect("CTE should execute");
         let values = batches

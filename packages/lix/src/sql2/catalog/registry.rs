@@ -47,14 +47,22 @@ impl PublicCatalog {
     /// complete `lix_*` namespace, so only trusted bootstrap schemas can add
     /// Lix-owned surfaces to this catalog.
     pub(crate) fn fixed_system() -> &'static Self {
-        static FIXED_SYSTEM_CATALOG: OnceLock<PublicCatalog> = OnceLock::new();
+        Self::fixed_system_shared()
+    }
+
+    /// The same immutable catalog behind an `Arc` so per-statement provider
+    /// registration can share it instead of deep-copying two `BTreeMap`s.
+    pub(crate) fn fixed_system_shared() -> &'static Arc<Self> {
+        static FIXED_SYSTEM_CATALOG: OnceLock<Arc<PublicCatalog>> = OnceLock::new();
         FIXED_SYSTEM_CATALOG.get_or_init(|| {
             let schemas = crate::schema::seed_schema_definitions()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            Self::from_visible_schemas(&schemas)
-                .expect("compile-time Lix schemas must form a valid SQL catalog")
+            Arc::new(
+                Self::from_visible_schemas(&schemas)
+                    .expect("compile-time Lix schemas must form a valid SQL catalog"),
+            )
         })
     }
 
