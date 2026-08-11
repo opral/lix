@@ -2155,3 +2155,174 @@ async fn assert_empty_merge_commit(
         "empty merge commit should preserve target/source ancestry"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: root-backed generations must not lose the working-diff baseline.
+// ---------------------------------------------------------------------------
+
+simulation_test!(
+    working_diff_first_branch_edit_of_existing_row_is_modified,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-baseline', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-baseline'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+
+        let rows = draft
+            .execute(
+                "SELECT diff_type, before_change_id, after_change_id \
+                 FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"branch-baseline\"]')",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(rows.len(), 1, "the edited row must appear in the working diff");
+        let values = rows.rows()[0].values().to_vec();
+        assert!(
+            matches!(&values[1], Value::Text(_)),
+            "the first branch-local edit of a checkpointed row must carry a before image, got {values:?}"
+        );
+        assert_eq!(
+            values[0],
+            Value::Text("modified".to_string()),
+            "the first branch-local edit of a checkpointed row must classify as modified, got {values:?}"
+        );
+    }
+);
+
+simulation_test!(
+    revert_of_first_branch_edit_restores_the_checkpoint_value,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-revert', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-revert'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+
+        draft
+            .execute(
+                "INSERT INTO lix_revert (diff_id) \
+                 SELECT diff_id FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"branch-revert\"]')",
+                &[],
+            )
+            .await
+            .expect("revert should succeed");
+
+        assert_key_value(&draft, "branch-revert", Some("\"before\"")).await;
+    }
+);
+
+simulation_test!(
+    working_diff_first_edit_after_merge_of_existing_row_is_modified,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-baseline', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('merge-unrelated', 'draft')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+
+        main.create_checkpoint()
+            .await
+            .expect("target checkpoint should succeed");
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("merge should succeed");
+
+        main.execute(
+            "UPDATE lix_key_value SET value = 'after' WHERE key = 'merge-baseline'",
+            &[],
+        )
+        .await
+        .expect("first post-merge edit should succeed");
+
+        let rows = main
+            .execute(
+                "SELECT diff_type, before_change_id \
+                 FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"merge-baseline\"]')",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(rows.len(), 1, "the edited row must appear in the working diff");
+        let values = rows.rows()[0].values().to_vec();
+        assert!(
+            matches!(&values[1], Value::Text(_)),
+            "the first post-merge edit of a checkpointed row must carry a before image, got {values:?}"
+        );
+        assert_eq!(
+            values[0],
+            Value::Text("modified".to_string()),
+            "the first post-merge edit of a checkpointed row must classify as modified, got {values:?}"
+        );
+    }
+);
