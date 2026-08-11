@@ -142,13 +142,16 @@ async fn run<StorageImpl>(
         .expect("open working-diff file-scope session");
 
     register_schema(&session).await;
+    // Rows per file stays FIXED and the file count grows with the dirty
+    // target. Holding the file width constant is what makes the probe file's
+    // cost independent of the dirty-set size, which is the whole question.
+    let bulk_rows_needed = dirty_target.saturating_sub(PROBE_DIRTY_ROWS);
+    let files = files.max(1 + bulk_rows_needed.div_ceil(rows_per_file));
     let file_ids = (0..files).map(file_id).collect::<Vec<_>>();
     seed_files(&session, &file_ids).await;
     // Every dirty row must exist before the checkpoint so the working diff is
     // a pure "modified" set with a stable returned-row count.
-    let bulk_files = files.saturating_sub(1);
-    let bulk_rows_needed = dirty_target.saturating_sub(PROBE_DIRTY_ROWS);
-    let bulk_rows_per_file = bulk_rows_needed.div_ceil(bulk_files.max(1)).max(rows_per_file);
+    let bulk_rows_per_file = rows_per_file;
     seed_rows(&session, &file_ids, bulk_rows_per_file).await;
 
     session
