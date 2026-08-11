@@ -182,7 +182,6 @@ pub(crate) struct HistoryEntry {
 pub(crate) const HISTORY_COL_ENTITY_PK: &str = "lixcol_entity_pk";
 pub(crate) const HISTORY_COL_SCHEMA_KEY: &str = "lixcol_schema_key";
 pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
-pub(crate) const HISTORY_COL_SNAPSHOT_CONTENT: &str = "lixcol_snapshot_content";
 pub(crate) const HISTORY_COL_METADATA: &str = "lixcol_metadata";
 pub(crate) const HISTORY_COL_CHANGE_ID: &str = "lixcol_change_id";
 pub(crate) const HISTORY_COL_CHANGE_CREATED_AT: &str = "lixcol_change_created_at";

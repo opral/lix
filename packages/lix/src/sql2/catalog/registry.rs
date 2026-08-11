@@ -17,8 +17,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
     HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
-    HISTORY_COL_SOURCE_CHANGES,
+    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
 };
 #[cfg(test)]
 use crate::sql2::providers::filesystem_working_diff_schema;
@@ -652,7 +651,6 @@ fn entity_system_columns(
         entity_pk,
         PublicColumn::public_read_only("lixcol_schema_key", false),
         PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
-        PublicColumn::hidden("lixcol_snapshot_content", true),
         PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
         PublicColumn::public_read_only("lixcol_created_at", false),
         PublicColumn::public_read_only("lixcol_updated_at", false),
@@ -672,7 +670,6 @@ fn entity_history_system_columns() -> Vec<PublicColumn> {
         (HISTORY_COL_ENTITY_PK, false),
         (HISTORY_COL_SCHEMA_KEY, false),
         (HISTORY_COL_FILE_ID, true),
-        (HISTORY_COL_SNAPSHOT_CONTENT, true),
         (HISTORY_COL_METADATA, true),
         (HISTORY_COL_CHANGE_ID, false),
         (HISTORY_COL_CHANGE_CREATED_AT, false),
@@ -784,5 +781,37 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("trusted bootstrap schemas own the reserved lix_* namespace");
+    }
+
+    #[test]
+    fn catalog_never_exposes_raw_snapshot_content() {
+        let mut schemas = crate::schema::seed_schema_definitions()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        schemas.push(json!({
+            "x-lix-key": "app_task",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
+        }));
+        let catalog = PublicCatalog::from_visible_schemas(&schemas)
+            .expect("bootstrap and application schemas should build a catalog");
+
+        for surface in catalog.surfaces() {
+            assert!(
+                surface
+                    .columns
+                    .iter()
+                    .all(|column| column.name != "lixcol_snapshot_content"),
+                "{} must not expose raw snapshot content",
+                surface.name
+            );
+        }
     }
 }

@@ -324,7 +324,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
 
     let projected = lix
         .execute(
-            "SELECT title, done, meta, lixcol_snapshot_content FROM crm_task WHERE id = $1",
+            "SELECT title, done, meta FROM crm_task WHERE id = $1",
             &[Value::Text("task-1".to_string())],
         )
         .await
@@ -1898,22 +1898,6 @@ fn assert_crm_task_projection(result: &lix::ExecuteResult) {
             .and_then(|value| value.as_array())
             .map(Vec::len),
         Some(2)
-    );
-
-    let snapshot = row.get::<Value>("lixcol_snapshot_content").unwrap();
-    let Value::Json(snapshot) = snapshot else {
-        panic!("expected snapshot JSON value, got {snapshot:?}");
-    };
-    assert_eq!(
-        snapshot.get("id").and_then(|value| value.as_str()),
-        Some("task-1")
-    );
-    assert_eq!(
-        snapshot
-            .get("meta")
-            .and_then(|value| value.get("priority"))
-            .and_then(|value| value.as_str()),
-        Some("high")
     );
 
     let missing = row

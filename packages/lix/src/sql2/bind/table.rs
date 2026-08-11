@@ -359,7 +359,7 @@ mod tests {
             PublicSurfaceKind::EntityHistory { .. }
         ));
         assert!(require_public_column(&table, "lixcol_entity_pk").is_ok());
-        assert!(require_public_column(&table, "lixcol_snapshot_content").is_ok());
+        assert!(require_public_column(&table, "lixcol_snapshot_content").is_err());
     }
 
     #[test]

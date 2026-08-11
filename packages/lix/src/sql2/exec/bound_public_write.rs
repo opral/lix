@@ -6705,10 +6705,7 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &EntitySurfaceSpec) -> bool {
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => {
             spec.visible_column(&column.name)
                 .is_some_and(|column| column.column_type == EntityColumnType::Json)
-                || matches!(
-                    column.name.as_str(),
-                    "lixcol_entity_pk" | "lixcol_metadata" | "lixcol_snapshot_content"
-                )
+                || matches!(column.name.as_str(), "lixcol_entity_pk" | "lixcol_metadata")
         }
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
         BoundExpr::Function { name, .. } => matches!(name.as_str(), "lix_json" | "lix_json_get"),

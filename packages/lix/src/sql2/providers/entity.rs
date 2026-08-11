@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 #[cfg(test)]
@@ -21,6 +21,7 @@ use serde_json::Value as JsonValue;
 
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
+use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
 #[cfg(test)]
 use crate::live_state::MaterializedLiveStateRow;
@@ -418,6 +419,7 @@ impl EntitySpec {
         reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
         let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
         let batch_projection = EntityBatchProjection::for_request(&request);
+        let update_snapshots = Arc::new(Mutex::new(BTreeMap::new()));
         let source = row_source(
             (
                 Arc::clone(&self.spec),
@@ -426,13 +428,23 @@ impl EntitySpec {
                 request,
                 row_filters,
                 batch_projection,
+                Arc::clone(&update_snapshots),
             ),
-            |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
+            |(
+                spec,
+                live_state,
+                schema,
+                request,
+                row_filters,
+                batch_projection,
+                update_snapshots,
+            )| async move {
                 let rows = live_state
                     .scan_batch(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
                 let filtered = apply_entity_batch_filters(rows, &row_filters)?;
+                capture_entity_update_snapshots(&filtered.rows, &update_snapshots)?;
                 entity_record_batch_with_parsed(
                     &spec,
                     schema,
@@ -454,6 +466,7 @@ impl EntitySpec {
                 let assignments = assignments.clone();
                 let returning = returning.clone();
                 let returning_spec = returning_spec.clone();
+                let update_snapshots = Arc::clone(&update_snapshots);
                 async move {
                     let keys = returning
                         .as_ref()
@@ -473,6 +486,7 @@ impl EntitySpec {
                         &assignment_values,
                         spec.as_ref(),
                         &branch_binding,
+                        &update_snapshots,
                     )?;
                     let count = u64::try_from(rows.len()).map_err(|_| {
                         DataFusionError::Execution("UPDATE row count overflow".to_string())
@@ -504,6 +518,46 @@ impl EntitySpec {
 struct EntityReturningKey {
     entity_pk: EntityPk,
     branch_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct EntityUpdateSnapshotKey {
+    entity_pk: EntityPk,
+    branch_id: String,
+}
+
+type EntityUpdateSnapshots = Arc<Mutex<BTreeMap<EntityUpdateSnapshotKey, SharedStr>>>;
+
+fn capture_entity_update_snapshots(
+    rows: &MaterializedLiveStateBatch,
+    snapshots: &EntityUpdateSnapshots,
+) -> Result<()> {
+    let mut captured = BTreeMap::new();
+    for row in rows.iter() {
+        let snapshot = row.snapshot_content().cloned().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "UPDATE entity surface source row for schema '{}' has no snapshot",
+                row.schema_key()
+            ))
+        })?;
+        let key = EntityUpdateSnapshotKey {
+            entity_pk: row.entity_pk().clone(),
+            branch_id: if row.global() {
+                GLOBAL_BRANCH_ID.to_string()
+            } else {
+                row.branch_id().to_string()
+            },
+        };
+        if captured.insert(key, snapshot).is_some() {
+            return Err(DataFusionError::Execution(
+                "UPDATE entity surface source contains duplicate row identity".to_string(),
+            ));
+        }
+    }
+    *snapshots.lock().map_err(|_| {
+        DataFusionError::Execution("UPDATE entity snapshot handoff is poisoned".to_string())
+    })? = captured;
+    Ok(())
 }
 
 #[async_trait]
@@ -1426,7 +1480,11 @@ fn entity_update_stage_rows_from_batch(
     assignment_values: &UpdateAssignmentValues,
     spec: &EntitySurfaceSpec,
     branch_binding: &BranchBinding,
+    update_snapshots: &EntityUpdateSnapshots,
 ) -> Result<RawWriteBatch> {
+    let update_snapshots = update_snapshots.lock().map_err(|_| {
+        DataFusionError::Execution("UPDATE entity snapshot handoff is poisoned".to_string())
+    })?;
     let mut rows = RawWriteBatch::with_capacity(batch.num_rows());
     for row_index in 0..batch.num_rows() {
         let global =
@@ -1469,15 +1527,20 @@ fn entity_update_stage_rows_from_batch(
                 "UPDATE entity surface has invalid lixcol_entity_pk: {error}"
             ))
         })?;
-        let mut snapshot = parse_snapshot_value(&required_string_value(
-            batch,
-            row_index,
-            "lixcol_snapshot_content",
-            "UPDATE entity surface",
-        )?)
-        .map_err(|error| {
+        let snapshot_content = update_snapshots
+            .get(&EntityUpdateSnapshotKey {
+                entity_pk: entity_pk.clone(),
+                branch_id: branch_id.clone(),
+            })
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "UPDATE entity surface is missing its source snapshot for schema '{}'",
+                    spec.schema_key
+                ))
+            })?;
+        let mut snapshot = parse_snapshot_value(snapshot_content.as_ref()).map_err(|error| {
             DataFusionError::Execution(format!(
-                "UPDATE entity surface has invalid lixcol_snapshot_content: {error}"
+                "UPDATE entity surface source snapshot is invalid: {error}"
             ))
         })?;
         let object = snapshot.as_object_mut().ok_or_else(|| {
@@ -2910,10 +2973,6 @@ fn entity_system_column_array(
         "file_id" => {
             Arc::new(StringArray::from_iter(rows.iter().map(|row| row.file_id()))) as ArrayRef
         }
-        "snapshot_content" => Arc::new(StringArray::from_iter(
-            rows.iter()
-                .map(|row| row.snapshot_content().map(AsRef::<str>::as_ref)),
-        )) as ArrayRef,
         "metadata" => Arc::new(StringArray::from_iter(rows.iter().map(|row| {
             row.metadata()
                 .map(AsRef::<str>::as_ref)

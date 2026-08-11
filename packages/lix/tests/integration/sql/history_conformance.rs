@@ -150,7 +150,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
 
     let typed_rows = select_rows(
         &session,
-        "SELECT id, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
+        "SELECT id, value, lixcol_entity_pk, lixcol_depth \
              FROM engine_history_conformance_history() \
                WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
              ORDER BY lixcol_depth",
@@ -163,7 +163,6 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
             Value::Null,
             Value::Null,
             Value::Json(serde_json::json!(["history-conformance-entity"])),
-            Value::Null,
             Value::Integer(0),
         ]
     );
@@ -199,7 +198,7 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT key, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
+            "SELECT key, value, lixcol_entity_pk, lixcol_depth \
              FROM lix_key_value_history() \
                WHERE key = 'history-pk-backfill' \
              ORDER BY lixcol_depth",
@@ -213,17 +212,12 @@ simulation_test!(
                     Value::Text("history-pk-backfill".to_string()),
                     Value::Null,
                     Value::Json(serde_json::json!(["history-pk-backfill"])),
-                    Value::Null,
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
                     Value::Json(serde_json::json!("one")),
                     Value::Json(serde_json::json!(["history-pk-backfill"])),
-                    Value::Json(serde_json::json!({
-                        "key": "history-pk-backfill",
-                        "value": "one"
-                    })),
                     Value::Integer(1),
                 ],
             ]
@@ -276,7 +270,7 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT namespace, id, value, lixcol_snapshot_content, lixcol_depth \
+            "SELECT namespace, id, value, lixcol_depth \
              FROM engine_history_composite_pk_history() \
                WHERE namespace = 'messages' \
                AND id = '7' \
@@ -291,18 +285,12 @@ simulation_test!(
                     Value::Text("messages".to_string()),
                     Value::Text("7".to_string()),
                     Value::Null,
-                    Value::Null,
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("messages".to_string()),
                     Value::Text("7".to_string()),
                     Value::Text("one".to_string()),
-                    Value::Json(serde_json::json!({
-                        "namespace": "messages",
-                        "id": "7",
-                        "value": "one"
-                    })),
                     Value::Integer(1),
                 ],
             ]
@@ -355,7 +343,7 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT identity, value, lixcol_snapshot_content, lixcol_depth \
+            "SELECT identity, value, lixcol_depth \
              FROM engine_history_nested_pk_history() \
                WHERE lix_json_get_text(identity, 'tenant') = 'acme' \
                AND lix_json_get_text(identity, 'id') = '7' \
@@ -372,7 +360,6 @@ simulation_test!(
                         "id": "7"
                     })),
                     Value::Null,
-                    Value::Null,
                     Value::Integer(0),
                 ],
                 vec![
@@ -381,13 +368,6 @@ simulation_test!(
                         "id": "7"
                     })),
                     Value::Text("one".to_string()),
-                    Value::Json(serde_json::json!({
-                        "identity": {
-                            "tenant": "acme",
-                            "id": "7"
-                        },
-                        "value": "one"
-                    })),
                     Value::Integer(1),
                 ],
             ]
@@ -557,7 +537,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT h.lixcol_snapshot_content \
+                    "SELECT h.value \
                      FROM lix_key_value_history('{first_commit_id}') AS h \
                      JOIN lix_key_value AS active \
                        ON h.key = active.key \
@@ -571,19 +551,15 @@ simulation_test!(
             result
                 .rows()
                 .iter()
-                .map(|row| row
-                    .get::<Value>("lixcol_snapshot_content")
-                    .expect("lixcol_snapshot_content"))
+                .map(|row| row.get::<Value>("value").expect("value"))
                 .collect::<Vec<_>>(),
-            vec![Value::Json(
-                json!({"key": "history-join-anchor", "value": "one"})
-            )]
+            vec![Value::Json(json!("one"))]
         );
 
         let nullable_side = session
             .execute(
                 &format!(
-                    "SELECT h.lixcol_snapshot_content \
+                    "SELECT h.value \
                      FROM lix_branch AS b \
                      LEFT JOIN lix_key_value_history('{first_commit_id}') AS h \
                        ON h.key = 'history-join-anchor' \
@@ -599,15 +575,13 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![Value::Json(
-                json!({"key": "history-join-anchor", "value": "one"})
-            ),]]
+            vec![vec![Value::Json(json!("one")),]]
         );
 
         let right_nullable_side = session
             .execute(
                 &format!(
-                    "SELECT h.lixcol_snapshot_content \
+                    "SELECT h.value \
                      FROM lix_key_value_history('{first_commit_id}') AS h \
                      RIGHT JOIN lix_branch AS b \
                        ON h.key = 'history-join-anchor' \
@@ -623,15 +597,13 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![Value::Json(
-                json!({"key": "history-join-anchor", "value": "one"})
-            ),]]
+            vec![vec![Value::Json(json!("one")),]]
         );
 
         let semi_join = session
             .execute(
                 &format!(
-                    "SELECT h.lixcol_snapshot_content \
+                    "SELECT h.value \
                      FROM lix_key_value_history('{first_commit_id}') AS h \
                      LEFT SEMI JOIN lix_branch AS b \
                        ON true \
@@ -647,9 +619,7 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![Value::Json(
-                json!({"key": "history-join-anchor", "value": "one"})
-            ),]]
+            vec![vec![Value::Json(json!("one")),]]
         );
 
         let projected = session
@@ -657,7 +627,7 @@ simulation_test!(
                 &format!(
                     "SELECT projected.snapshot \
                      FROM (\
-                       SELECT key, lixcol_snapshot_content AS snapshot \
+                       SELECT key, value AS snapshot \
                        FROM lix_key_value_history('{first_commit_id}')\
                      ) AS projected \
                      WHERE projected.key = 'history-join-anchor'"
@@ -672,9 +642,7 @@ simulation_test!(
                 .iter()
                 .map(|row| row.get::<Value>("snapshot").expect("snapshot"))
                 .collect::<Vec<_>>(),
-            vec![Value::Json(
-                json!({"key": "history-join-anchor", "value": "one"})
-            )]
+            vec![Value::Json(json!("one"))]
         );
     }
 );
@@ -790,11 +758,11 @@ simulation_test!(
         let in_rows = select_rows(
             &session,
             &format!(
-                "SELECT '{first_commit_id}' AS anchor, lixcol_depth, lixcol_snapshot_content \
+                "SELECT '{first_commit_id}' AS anchor, lixcol_depth, value \
                  FROM lix_key_value_history('{first_commit_id}') \
                  WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
                  UNION ALL \
-                 SELECT '{second_commit_id}' AS anchor, lixcol_depth, lixcol_snapshot_content \
+                 SELECT '{second_commit_id}' AS anchor, lixcol_depth, value \
                  FROM lix_key_value_history('{second_commit_id}') \
                  WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
                  ORDER BY anchor"
@@ -807,12 +775,12 @@ simulation_test!(
                 vec![
                     Value::Text(first_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Json(json!({"key": "history-multi-start", "value": "one"})),
+                    Value::Json(json!("one")),
                 ],
                 vec![
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Json(json!({"key": "history-multi-start", "value": "two"})),
+                    Value::Json(json!("two")),
                 ],
             ],
             "multiple history function calls can be unioned"

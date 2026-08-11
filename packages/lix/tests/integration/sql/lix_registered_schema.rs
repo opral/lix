@@ -2408,7 +2408,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT title, rank, lixcol_snapshot_content \
+                "SELECT title, rank \
                  FROM engine_optional_update_schema \
                  WHERE id = 'row-1'",
                 &[],
@@ -2417,11 +2417,7 @@ simulation_test!(
             .expect("typed entity query should succeed");
         assert_rows_eq(
             result,
-            vec![vec![
-                Value::Text("after".to_string()),
-                Value::Null,
-                Value::Json(json!({"id": "row-1", "title": "after"})),
-            ]],
+            vec![vec![Value::Text("after".to_string()), Value::Null]],
         );
 
         let error = session
