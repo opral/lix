@@ -45,6 +45,8 @@ const DEFAULT_SCENARIOS: &[&str] = &[
     "branches_10",
     "branches_100",
     "branches_10_1row",
+    "branches_2_disjoint_1pct",
+    "branches_2_identical_1pct",
     "merge_1pct",
     "delete_gc_1pct",
 ];

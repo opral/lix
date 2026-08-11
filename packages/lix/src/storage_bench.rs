@@ -948,6 +948,7 @@ pub struct RepositoryGcBenchResult {
     pub key_shared_buffers: usize,
     pub key_shared_bytes: usize,
     pub key_shared_capacity: usize,
+    pub reclaimed_generation_rows: u64,
     pub root_discovery_us: u64,
     pub changelog_us: u64,
     pub tracked_root_stage_us: u64,
@@ -1199,6 +1200,7 @@ where
         key_shared_buffers: arena.key_shared_buffers,
         key_shared_bytes: arena.key_shared_bytes,
         key_shared_capacity: arena.key_shared_capacity,
+        reclaimed_generation_rows: plan.sweep.reclaimed_generation_rows,
         root_discovery_us: plan.profile.root_discovery_us,
         changelog_us: plan.profile.changelog_us,
         tracked_root_stage_us: plan.profile.tracked_root_stage_us,
@@ -1210,6 +1212,7 @@ where
 pub struct RepositoryGcCommitBenchResult {
     pub staged_deletes: u64,
     pub swept_commits: usize,
+    pub reclaimed_generation_rows: u64,
     pub reclaimed_manifest_rows: usize,
     pub reclaimed_manifest_chunk_rows: usize,
     pub reclaimed_chunk_rows: usize,
@@ -1262,6 +1265,7 @@ where
             Ok(_) => {
                 return Ok(RepositoryGcCommitBenchResult {
                     staged_deletes: stats.staged_deletes,
+                    reclaimed_generation_rows: plan.sweep.reclaimed_generation_rows,
                     swept_commits: plan
                         .changelog
                         .sweep
@@ -2975,9 +2979,17 @@ mod tests {
         // row; the other ten change deletes are retired branch-ref facts.
         assert_eq!(first.deleted_semantic_change_rows, 20);
         assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
+        // The deleted branch also strands the whole serving generation it was
+        // reading from. No live branch control can select it again, so the
+        // same pass retires it: ten commits of ten rows, plus the generation's
+        // collection control and root current base.
+        assert_eq!(first.reclaimed_generation_rows, 102);
         assert_eq!(
             first.delete_counts_by_space,
             vec![
+                (crate::live_state::HOT_ROW_SPACE.id.0, 100), // stranded serving rows
+                (crate::live_state::HOT_COLLECTION_CONTROL_SPACE.id.0, 1), // its collection control
+                (crate::live_state::ROOT_CURRENT_BASE_SPACE.id.0, 1), // its root current base
                 (
                     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
                         .id
@@ -2990,8 +3002,8 @@ mod tests {
                         .0,
                     10,
                 ), // mutation inventory authority
-                (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 20), // projection and branch-ref changes
+                (crate::changelog::COMMIT_SPACE.id.0, 10),    // branch-only commit projections
+                (crate::changelog::CHANGE_SPACE.id.0, 20),    // projection and branch-ref changes
                 (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
             ]
         );
@@ -3004,17 +3016,44 @@ mod tests {
             first.staged_deletes
         );
         assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
-        // GC also stages the mandatory binary-CAS epoch key. Its put shares the
-        // key arena with the UUID-keyed delete descriptors. Since the revision
-        // singletons were consolidated into one space, the epoch's *logical* key
-        // is a single byte (`b"b"`) and the 4-byte space id is prepended at the
-        // physical layer, so derive the width from the constant rather than
-        // restating it.
-        const EPOCH_KEY_BYTES: usize = crate::storage_adapter::REVISION_KEY_BINARY_CAS_EPOCH.len();
+        // GC also stages the mandatory binary-CAS reclamation key. Its put
+        // shares the key arena with the UUID-keyed delete descriptors. Since the
+        // revision singletons were consolidated into one space, the reclamation
+        // token's *logical* key is a single byte (`b"b"`) and the 4-byte space
+        // id is prepended at the physical layer, so derive the width from the
+        // constant rather than restating it.
+        const FENCE_KEY_BYTES: usize =
+            crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        assert_eq!(
-            first.key_shared_bytes,
-            first.staged_deletes as usize * 16 + EPOCH_KEY_BYTES
+        // Canonical-record deletes are UUID keyed, so each descriptor is
+        // exactly 16 bytes. Generation-scoped serving rows are keyed by
+        // `(branch, generation, schema, entity, file)` and are wider, so assert
+        // the UUID-keyed floor instead of restating that key layout here.
+        let uuid_keyed_deletes = first
+            .delete_counts_by_space
+            .iter()
+            .filter(|(space, _)| {
+                [
+                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                        .id
+                        .0,
+                    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
+                        .id
+                        .0,
+                    crate::changelog::COMMIT_SPACE.id.0,
+                    crate::changelog::CHANGE_SPACE.id.0,
+                    crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0,
+                ]
+                .contains(space)
+            })
+            .map(|(_, count)| *count)
+            .sum::<usize>();
+        let generation_keyed_deletes = first.staged_deletes as usize - uuid_keyed_deletes;
+        assert_eq!(generation_keyed_deletes, 102);
+        assert!(
+            first.key_shared_bytes
+                > uuid_keyed_deletes * 16 + generation_keyed_deletes * 16 + FENCE_KEY_BYTES,
+            "generation-scoped delete keys must be wider than a bare UUID"
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);

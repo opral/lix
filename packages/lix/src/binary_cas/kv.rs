@@ -16,8 +16,9 @@ use crate::binary_cas::{
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
 use crate::storage_adapter::{
-    PointReadPlan, REVISION_KEY_BINARY_CAS_EPOCH, REVISION_SPACE, StorageAdapterRead, StorageSpace,
-    StorageWriteSet, load_revision, revision_key,
+    PointReadPlan, REVISION_KEY_BINARY_CAS_PUBLICATION, REVISION_KEY_BINARY_CAS_RECLAMATION,
+    REVISION_SPACE, StorageAdapterRead, StorageSpace, StorageWriteSet, load_revision,
+    load_revisions, revision_key,
 };
 use crate::storage_adapter::{
     StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange,
@@ -56,46 +57,18 @@ pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::m
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
 );
-pub(in crate::binary_cas) async fn load_mutation_epoch(
-    store: &(impl StorageAdapterRead + ?Sized),
-) -> Result<(u64, Option<Bytes>), LixError> {
-    let value = load_revision(store, REVISION_KEY_BINARY_CAS_EPOCH).await?;
-    let Some(value) = value else {
-        return Ok((0, None));
-    };
-    if value.len() != 8 {
-        return Err(LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "binary CAS mutation epoch has an invalid width",
-        ));
+fn fresh_revision_token() -> StorageValue {
+    StorageValue {
+        bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
     }
-    Ok((
-        u64::from_be_bytes(value.as_ref().try_into().expect("checked epoch width")),
-        Some(value),
-    ))
 }
 
-pub(in crate::binary_cas) fn stage_mutation_epoch(
-    writes: &mut StorageWriteSet,
-    preconditions: &mut Vec<StoragePrecondition>,
-    current: u64,
+fn unchanged_revision_precondition(
+    key: &'static [u8],
     token: Option<Bytes>,
-) -> Result<(), LixError> {
-    let next = current.checked_add(1).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "binary CAS mutation epoch exhausted",
-        )
-    })?;
-    let key = revision_key(REVISION_KEY_BINARY_CAS_EPOCH);
-    writes.put(
-        REVISION_SPACE,
-        key.clone(),
-        StorageValue {
-            bytes: Bytes::copy_from_slice(&next.to_be_bytes()),
-        },
-    );
-    preconditions.push(match token {
+) -> StoragePrecondition {
+    let key = revision_key(key);
+    match token {
         Some(expected) => StoragePrecondition::KeyValueEquals {
             space: REVISION_SPACE,
             key,
@@ -105,7 +78,58 @@ pub(in crate::binary_cas) fn stage_mutation_epoch(
             space: REVISION_SPACE,
             key,
         },
-    });
+    }
+}
+
+pub(in crate::binary_cas) async fn stage_publication_fence(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<(), LixError> {
+    let reclamation = load_revision(store, REVISION_KEY_BINARY_CAS_RECLAMATION).await?;
+    // A fresh token, not a counter increment: two publishers planned from the
+    // same snapshot must both be able to commit, so neither can hold a
+    // compare-and-set on this row. Uniqueness is what a sweep's equality
+    // precondition needs, and blind counter increments would let a second
+    // publisher restore the value a sweep already observed.
+    writes.put(
+        REVISION_SPACE,
+        revision_key(REVISION_KEY_BINARY_CAS_PUBLICATION),
+        fresh_revision_token(),
+    );
+    preconditions.push(unchanged_revision_precondition(
+        REVISION_KEY_BINARY_CAS_RECLAMATION,
+        reclamation,
+    ));
+    Ok(())
+}
+
+pub(in crate::binary_cas) async fn stage_reclamation_fence(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<(), LixError> {
+    let [publication, reclamation] = load_revisions(
+        store,
+        [
+            REVISION_KEY_BINARY_CAS_PUBLICATION,
+            REVISION_KEY_BINARY_CAS_RECLAMATION,
+        ],
+    )
+    .await?;
+    writes.put(
+        REVISION_SPACE,
+        revision_key(REVISION_KEY_BINARY_CAS_RECLAMATION),
+        fresh_revision_token(),
+    );
+    preconditions.push(unchanged_revision_precondition(
+        REVISION_KEY_BINARY_CAS_PUBLICATION,
+        publication,
+    ));
+    preconditions.push(unchanged_revision_precondition(
+        REVISION_KEY_BINARY_CAS_RECLAMATION,
+        reclamation,
+    ));
     Ok(())
 }
 
@@ -2898,34 +2922,132 @@ mod tests {
         StorageScanCursor, StorageWriteOptions, StorageWriteSet,
     };
 
-    #[tokio::test]
-    async fn corrupt_mutation_epoch_fails_publication_closed() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut corrupt = storage.new_write_set();
-        corrupt.put(
-            REVISION_SPACE,
-            revision_key(REVISION_KEY_BINARY_CAS_EPOCH),
-            StorageValue {
-                bytes: Bytes::from_static(b"bad"),
-            },
-        );
-        storage
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("corrupt epoch fixture should commit");
+    async fn stage_publication_fence_only(
+        storage: &StorageAdapter<Memory>,
+    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("corrupt epoch read should open");
+            .expect("publication fence read should open");
         let mut writes = storage.new_write_set();
         let mut preconditions = Vec::new();
-        let error = crate::binary_cas::stage_mutation_epoch(&read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_publication_fence(&read, &mut writes, &mut preconditions)
             .await
-            .expect_err("corrupt epoch must reject publication");
-        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
-        assert!(error.message.contains("invalid width"));
-        assert!(writes.is_empty());
-        assert!(preconditions.is_empty());
+            .expect("publication fence should stage");
+        (writes, preconditions)
+    }
+
+    /// Publishers are independent of each other: content-addressed payload rows
+    /// have no read-modify-write aggregate, so two publications planned from one
+    /// snapshot must both commit. A compare-and-set here is what made unrelated
+    /// concurrent writers collide with `LIX_TRANSACTION_CONFLICT`.
+    #[tokio::test]
+    async fn concurrent_publication_fences_planned_from_one_snapshot_both_commit() {
+        let storage = StorageAdapter::new(Memory::new());
+        let (first_writes, first_preconditions) = stage_publication_fence_only(&storage).await;
+        let (second_writes, second_preconditions) = stage_publication_fence_only(&storage).await;
+        storage
+            .commit_write_set(
+                first_writes,
+                StorageWriteOptions {
+                    preconditions: first_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("first publication fence should commit");
+        storage
+            .commit_write_set(
+                second_writes,
+                StorageWriteOptions {
+                    preconditions: second_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("a concurrent publication must not invalidate another publication");
+    }
+
+    /// The publication token must change on every publication, or a sweep that
+    /// observed a value could see that same value restored and commit a plan
+    /// that predates the publication.
+    #[tokio::test]
+    async fn every_publication_rewrites_the_publication_token() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut seen = HashSet::new();
+        for _ in 0..4 {
+            let (writes, preconditions) = stage_publication_fence_only(&storage).await;
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("publication fence should commit");
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("publication token read should open");
+            let token = load_revision(&read, REVISION_KEY_BINARY_CAS_PUBLICATION)
+                .await
+                .expect("publication token should load")
+                .expect("publication token should be present");
+            assert!(
+                seen.insert(token),
+                "each publication must write a distinct publication token"
+            );
+        }
+    }
+
+    /// Two sweeps planned from one snapshot must still be mutually exclusive:
+    /// each deletes rows the other assumed present.
+    #[tokio::test]
+    async fn concurrent_reclamation_fences_planned_from_one_snapshot_conflict() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut staged = Vec::new();
+        for _ in 0..2 {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("reclamation fence read should open");
+            let mut writes = storage.new_write_set();
+            let mut preconditions = Vec::new();
+            crate::binary_cas::stage_cas_reclamation_fence(&read, &mut writes, &mut preconditions)
+                .await
+                .expect("reclamation fence should stage");
+            staged.push((writes, preconditions));
+        }
+        let (second_writes, second_preconditions) = staged.pop().expect("two sweeps were staged");
+        let (first_writes, first_preconditions) = staged.pop().expect("two sweeps were staged");
+        storage
+            .commit_write_set(
+                first_writes,
+                StorageWriteOptions {
+                    preconditions: first_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("first sweep should win the reclamation fence");
+        let error = storage
+            .commit_write_set(
+                second_writes,
+                StorageWriteOptions {
+                    preconditions: second_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("a stale sweep must lose the reclamation fence");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                StorageError::PreconditionFailed(_)
+            )
+        ));
     }
 
     struct DelayedManifestScanRead<R> {

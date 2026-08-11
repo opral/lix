@@ -10608,9 +10608,9 @@ mod tests {
         .await
         .expect("ordinary race CAS sweep should stage");
         assert_eq!(swept.reclaimed_chunk_rows, 1);
-        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_reclamation_fence(read, &mut writes, &mut preconditions)
             .await
-            .expect("ordinary race sweep epoch should stage");
+            .expect("ordinary race sweep fence should stage");
         (writes, preconditions)
     }
 
