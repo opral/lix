@@ -680,7 +680,15 @@ mod tests {
         // The point write keeps the compact current-state certificate,
         // publishes its authenticated branch/control and reachability state,
         // and rotates the mandatory binary-CAS publication/reclamation epoch.
-        assert_eq!(point_update.staged_puts, 12, "{point_update:?}");
+        // Thirteen staged puts against eleven spaces: every revision the
+        // commit rotates (binary-CAS epoch, tracked mutation fence, storage
+        // mutation token) is one key in the single revision space, so the
+        // adapter's own mutation token is staged here instead of being an
+        // extra trailing batch, and the commit issues eleven storage put
+        // batches where the scattered layout issued thirteen.
+        assert_eq!(point_update.staged_puts, 13, "{point_update:?}");
+        assert_eq!(point_update.touched_spaces, 11, "{point_update:?}");
+        assert_eq!(point_update.put_batches, 11, "{point_update:?}");
 
         // A sparse overlay deliberately invalidates the complete-generation
         // digest, so use a fresh fixture to exercise exact bulk replacement
