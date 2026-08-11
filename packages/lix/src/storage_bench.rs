@@ -521,6 +521,9 @@ pub(crate) fn record_root_replay_available_root_probe(hit: bool) {
     }
 }
 
+/// Retained so the base and candidate arms of an A/B expose the same
+/// accounting surface; the bounded availability proof performs no stagings.
+#[allow(dead_code)]
 pub(crate) fn record_root_replay_proof_staging() {
     ROOT_REPLAY_PROOF_STAGINGS.fetch_add(1, Ordering::Relaxed);
 }

@@ -195,6 +195,26 @@ where
     Ok(plans)
 }
 
+/// Resolves the durable root a replay may resume from.
+///
+/// The commit-state manifest is the single immutable authority for a commit's
+/// tracked-state root: it is sealed atomically with the commit, keyed by that
+/// commit id, and never rewritten. `rebuild_commit_root_at_inner` already
+/// treats a rebuild that disagrees with it as a hard error rather than a
+/// repair, so the manifest — not a replay of the changelog — is what makes a
+/// root canonical. Availability therefore has exactly two obligations:
+///
+/// 1. the root pointer is live (`load_snapshot_commit_root` also proves the
+///    commit itself exists in the changelog, so an orphaned manifest cannot
+///    authorize a resume), and
+/// 2. the content-addressed chunk closure it names is physically readable, so
+///    a damaged root is never resumed from and explicit repair stays total.
+///
+/// This proof is bounded by the size of the addressed tree. It deliberately
+/// does **not** recurse through the ancestry: ordinary commits are rootless
+/// bounded-replay layouts by design, so an ancestry-wide proof can only ever
+/// succeed by reaching genesis, which makes every interval closure replay the
+/// entire history.
 async fn load_available_root<S>(
     store: &S,
     commit_id: &str,
@@ -202,62 +222,13 @@ async fn load_available_root<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    // Build the ancestry proof iteratively. The former boxed async recursion
-    // retained one large future frame per ancestor and could overflow the test
-    // worker stack even for otherwise valid publication paths.
-    let mut chain = Vec::new();
-    let mut current_commit_id = commit_id.to_string();
-    let mut seen = HashSet::new();
-    loop {
-        if !seen.insert(current_commit_id.clone()) {
-            return Ok(None);
-        }
-        let Some(metadata) = storage::load_snapshot_commit_root(store, &current_commit_id).await?
-        else {
-            return Ok(None);
-        };
-        if !commit_root_tree_is_readable(store, &metadata).await? {
-            return Ok(None);
-        }
-        let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
-        let parent_commit_id = plan.parent_commit_id;
-        chain.push((metadata, plan));
-        let Some(parent_commit_id) = parent_commit_id else {
-            break;
-        };
-        current_commit_id = parent_commit_id.to_string();
+    let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
+        return Ok(None);
+    };
+    if !commit_root_tree_is_readable(store, &metadata).await? {
+        return Ok(None);
     }
-
-    let target_root_id = chain
-        .first()
-        .expect("available-root proof contains its requested commit")
-        .0
-        .root_id
-        .clone();
-    let mut canonical_parent = None;
-    for (metadata, plan) in chain.iter().rev() {
-        match (plan.parent_commit_id, canonical_parent.as_ref()) {
-            (Some(parent_commit_id), Some(parent_root_id)) => match metadata.parent_roots.first() {
-                Some(parent)
-                    if parent.commit_id == parent_commit_id
-                        && &parent.root_id == parent_root_id => {}
-                _ => return Ok(None),
-            },
-            (None, None) if metadata.parent_roots.is_empty() => {}
-            _ => return Ok(None),
-        }
-        let mut scratch_writes = StorageWriteSet::new();
-        let context = TrackedStateContext::new();
-        let mut writer = context.writer(store, &mut scratch_writes);
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_root_replay_proof_staging();
-        let report = stage_rebuild_plan_with_writer(&mut writer, plan).await?;
-        if report.root_id != metadata.root_id {
-            return Ok(None);
-        }
-        canonical_parent = Some(metadata.root_id.clone());
-    }
-    Ok(Some(target_root_id))
+    Ok(Some(metadata.root_id))
 }
 
 async fn commit_root_tree_is_readable<S>(
