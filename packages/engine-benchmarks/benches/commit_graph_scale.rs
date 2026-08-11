@@ -43,6 +43,9 @@ async fn run() {
             "legacy_reachable_nodes",
             CommitGraphBenchMode::LegacyReachableNodes,
         ),
+        ("history_full", CommitGraphBenchMode::HistoryFull),
+        ("history_depth0", CommitGraphBenchMode::HistoryDepth0),
+        ("history_limit10", CommitGraphBenchMode::HistoryLimit10),
     ] {
         if mode_filter.is_some_and(|filter| filter != name) {
             continue;

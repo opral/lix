@@ -1285,6 +1285,7 @@ where
             route,
             file_history_filesystem_schema_keys(),
             metadata_projection,
+            None,
         )
         .await;
     };
@@ -1303,6 +1304,7 @@ where
             BLOB_REF_SCHEMA_KEY.to_string(),
         ],
         metadata_projection,
+        None,
     )
     .await?;
     // Directory changes can rename or move a selected file. Their entity keys
@@ -1318,6 +1320,7 @@ where
         route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
         metadata_projection,
+        None,
     )
     .await?;
     entries.extend(directories);
@@ -1381,6 +1384,7 @@ where
                     &route,
                     schema_keys,
                     metadata_projection,
+                    None,
                 )
                 .await
             }
@@ -1416,6 +1420,7 @@ where
         &owner_route,
         vec![KEY_VALUE_SCHEMA_KEY.to_string()],
         metadata_projection,
+        None,
     )
     .await?;
     parse_file_history_plugin_owners(&entries)
@@ -1614,6 +1619,7 @@ where
         &registry_route,
         vec![KEY_VALUE_SCHEMA_KEY.to_string()],
         metadata_projection,
+        None,
     )
     .await?;
 
