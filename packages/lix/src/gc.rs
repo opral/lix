@@ -1088,9 +1088,9 @@ struct DerivedRetirementCandidates {
 /// Walks refs → commits, which is the only reachability implementation this
 /// collector has.
 ///
-/// A commit whose canonical projection is gone bounds the walk: earlier sweeps
-/// delete projections only in ancestor-closed order, so everything beyond such
-/// a commit is already fully reclaimed.
+/// A commit whose canonical projection is gone bounds the walk: a projection is
+/// deleted only once that commit owns no physical state, so nothing reclaimable
+/// can hide beyond one.
 async fn derive_retirement_candidates<S>(
     store: &S,
     roots: &BTreeSet<CommitId>,
@@ -1261,36 +1261,20 @@ where
     crate::binary_cas::stage_cas_reclamation_fence(&store, writes, &mut staged_preconditions)
         .await?;
 
-    // Retire the derived candidates. Physical retirement is per-commit and
-    // needs no ordering: dropping a commit's delta segment does not change what
-    // the next sweep can reach, so a pinned commit no longer delays a younger
-    // one behind it.
+    // Retire the derived candidates. Nothing here is ordered: a candidate that
+    // is still pinned only holds back itself. That is the whole point of
+    // deriving instead of consuming a queue — the ledger froze at its head, so
+    // one permanently-live root (genesis is always one: engine-bootstrap rows
+    // authored at init stay live and keep naming it) stopped every younger
+    // candidate behind it forever.
     //
-    // Semantic retirement is different, and this is the one ordering rule the
-    // derived design has: deleting a canonical commit projection is what moves
-    // the derivation frontier, so a projection may only go when every parent is
-    // already gone or goes in the same sweep. Without that rule a retained
-    // parent behind a retired child would become unreachable from the refs and
-    // could never be reclaimed.
+    // The one coupling that must survive is between the two planes. Deleting a
+    // commit projection is what bounds the next derivation, so a projection may
+    // only go once that commit owns no physical state. Otherwise a commit could
+    // lose its record while keeping its delta segment, and the walk would stop
+    // short of state nothing can reach any more.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
-    let mut retirable_projection = BTreeSet::new();
-    for commit_id in candidates.ordered.iter().copied() {
-        let parents_released = candidates
-            .parents
-            .get(&commit_id)
-            .into_iter()
-            .flatten()
-            .all(|parent| {
-                !candidates.parents.contains_key(parent)
-                    || retirable_projection.contains(parent)
-            });
-        if parents_released
-            && retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
-        {
-            retirable_projection.insert(commit_id);
-        }
-    }
     let physical_candidates = candidates
         .ordered
         .iter()
@@ -1302,8 +1286,10 @@ where
     // kept alive by history alone.
     let physical_manifests =
         crate::tracked_state::load_commit_state_manifests(&store, &physical_candidates).await?;
+    let mut physically_empty = BTreeSet::new();
     for (commit_id, manifest) in physical_candidates.iter().copied().zip(physical_manifests) {
         if manifest.is_none() {
+            physically_empty.insert(commit_id);
             continue;
         }
         if reclaimed_commits.insert(commit_id) {
@@ -1318,10 +1304,15 @@ where
                 },
             )
             .await?;
+            physically_empty.insert(commit_id);
         }
     }
     for commit_id in candidates.ordered.iter().copied() {
-        if retirable_projection.contains(&commit_id) && reclaimed_semantic_commits.insert(commit_id)
+        if !physically_empty.contains(&commit_id) {
+            continue;
+        }
+        if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
+            && reclaimed_semantic_commits.insert(commit_id)
         {
             crate::changelog::stage_delete_commit_projection(&store, writes, commit_id).await?;
         }
@@ -2235,7 +2226,7 @@ mod tests {
     use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StoragePrecondition, StorageReadOptions, StorageSpace, StorageValue,
+        StorageKey, StorageReadOptions, StorageSpace, StorageValue,
         StorageWriteOptions, StorageWriteSet,
     };
     use crate::tracked_state::{
@@ -2363,7 +2354,7 @@ mod tests {
         active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
 
         let control_ref = ChangeId::for_test_label("rootless-serving-control");
-        let old_control = replay_branch_control(old_root.commit_id, control_ref, timestamp);
+        let _old_control = replay_branch_control(old_root.commit_id, control_ref, timestamp);
         let serving_generation = CommitId::for_test_label("rootless-serving-generation");
         let mut active_control = replay_branch_control(active.commit_id, control_ref, timestamp);
         active_control.tracked_generation = serving_generation;
@@ -2854,10 +2845,10 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("selected-owner-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
-        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        let _released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
         stage_branch_head_control(&mut writes, "main", checkpoint_control)
             .expect("checkpoint control should stage");
         persist_replay_closure_fixture(
@@ -3032,10 +3023,10 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("scoped-owner-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
-        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        let _released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
         stage_branch_head_control(&mut writes, "main", checkpoint_control)
             .expect("scoped owner checkpoint control should stage");
         persist_replay_closure_fixture(
@@ -3223,12 +3214,12 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("native-row-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let mut checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
         let serving_generation = CommitId::for_test_label("native-row-serving-generation");
         checkpoint_control.tracked_generation = serving_generation;
-        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        let _released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3552,7 +3543,7 @@ mod tests {
             current_state_scoped_ranges: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
-        let owner_control = replay_branch_control(owner, retired_ref, timestamp);
+        let _owner_control = replay_branch_control(owner, retired_ref, timestamp);
         let active_control = replay_branch_control(active, active_ref, timestamp);
         let mut writes = storage.new_write_set();
         stage_branch_head_control(&mut writes, "main", active_control)
@@ -4183,6 +4174,88 @@ mod tests {
             .into_vec()[0]
             .is_some();
         assert_eq!(present, expected);
+    }
+
+    /// The derivation replaces `gc.reachability_delta.v1`: it must recover the
+    /// same `old_root` candidates the ledger used to store, in parents-before-
+    /// children order, and it must stop where a canonical projection is gone.
+    #[tokio::test]
+    async fn derived_candidates_walk_refs_and_stop_at_the_reclaimed_frontier() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("derived candidate timestamp", "2026-01-01T00:00:00Z");
+        let root = replay_commit_record("derived-candidate-root", 0, None, timestamp);
+        let middle = replay_commit_record(
+            "derived-candidate-middle",
+            1,
+            Some(root.commit_id),
+            timestamp,
+        );
+        let head = replay_commit_record(
+            "derived-candidate-head",
+            2,
+            Some(middle.commit_id),
+            timestamp,
+        );
+        persist_replay_closure_fixture(
+            &storage,
+            storage.new_write_set(),
+            &[root.clone(), middle.clone(), head.clone()],
+            &[],
+        )
+        .await;
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("derived candidate read should open"),
+        );
+        let derived =
+            derive_retirement_candidates(&read, &BTreeSet::from([head.commit_id]))
+                .await
+                .expect("candidates should derive from the commit graph alone");
+        assert_eq!(
+            derived.ordered,
+            vec![root.commit_id, middle.commit_id, head.commit_id],
+            "candidates must be ordered parents before children"
+        );
+        assert_eq!(
+            derived.parents.get(&head.commit_id),
+            Some(&vec![middle.commit_id])
+        );
+        drop(read);
+
+        // Deleting the middle projection is what a completed sweep does. The
+        // next derivation must stop there instead of re-proposing a commit
+        // whose canonical record is already gone.
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("frontier read should open"),
+        );
+        let mut writes = storage.new_write_set();
+        crate::changelog::stage_delete_commit_projection(&read, &mut writes, middle.commit_id)
+            .await
+            .expect("middle projection should retire");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("frontier retirement should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("post-frontier read should open"),
+        );
+        let derived =
+            derive_retirement_candidates(&read, &BTreeSet::from([head.commit_id]))
+                .await
+                .expect("candidates should derive after the frontier moved");
+        assert_eq!(derived.ordered, vec![head.commit_id]);
     }
 
     #[test]
