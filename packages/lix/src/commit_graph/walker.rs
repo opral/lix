@@ -21,7 +21,24 @@ where
     S: StorageAdapterRead,
 {
     let mut loader = NodeTraversalLoader::new(reader);
-    loader.walk(head_commit_id).await
+    loader.walk(head_commit_id, None).await
+}
+
+/// Walks only the reachable prefix whose nearest depth is at most `max_depth`.
+///
+/// History queries with an explicit depth ceiling must not validate or load
+/// ancestry they cannot return. The unbounded graph API above keeps its full
+/// reachability contract; this private variant is the bounded history route.
+pub(crate) async fn walk_reachable_nodes_through_depth<S>(
+    reader: &mut CommitGraphStoreReader<S>,
+    head_commit_id: &CommitId,
+    max_depth: u32,
+) -> Result<Vec<ReachableCommitGraphNode>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut loader = NodeTraversalLoader::new(reader);
+    loader.walk(head_commit_id, Some(max_depth)).await
 }
 
 /// Returns the best common ancestors shared by two commit heads.
@@ -143,11 +160,18 @@ where
     async fn walk(
         &mut self,
         head_commit_id: &CommitId,
+        max_depth: Option<u32>,
     ) -> Result<Vec<ReachableCommitGraphNode>, LixError> {
         let mut visiting = BTreeSet::new();
         let mut nearest_depths = BTreeMap::new();
-        self.walk_commit(head_commit_id, 0, &mut visiting, &mut nearest_depths)
-            .await?;
+        self.walk_commit(
+            head_commit_id,
+            0,
+            max_depth,
+            &mut visiting,
+            &mut nearest_depths,
+        )
+        .await?;
         let mut commits = Vec::with_capacity(nearest_depths.len());
         for (commit_id, depth) in nearest_depths {
             commits.push(ReachableCommitGraphNode {
@@ -167,6 +191,7 @@ where
         &mut self,
         commit_id: &CommitId,
         depth: u32,
+        max_depth: Option<u32>,
         visiting: &mut BTreeSet<CommitId>,
         nearest_depths: &mut BTreeMap<CommitId, u32>,
     ) -> Result<(), LixError> {
@@ -200,6 +225,20 @@ where
 
             let commit = self.load_node(&frame.commit_id).await?;
             nearest_depths.insert(frame.commit_id, frame.depth);
+
+            if max_depth.is_some_and(|max_depth| frame.depth >= max_depth) {
+                if let Some(parent_commit_id) = commit
+                    .parent_commit_ids
+                    .iter()
+                    .find(|parent_commit_id| visiting.contains(parent_commit_id))
+                {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("commit_graph cycle detected at commit '{parent_commit_id}'"),
+                    ));
+                }
+                continue;
+            }
 
             visiting.insert(frame.commit_id);
             stack.push(TraversalFrame {
@@ -571,6 +610,192 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_reachable_nodes_match_unbounded_prefix_for_a_diamond() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
+                commit_change("commit-right-change", "commit-right", &[], &["commit-root"]),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &[],
+                    &["commit-left", "commit-right"],
+                ),
+            ],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let head = commit_id("commit-head");
+        let full = reader
+            .reachable_nodes(&head)
+            .await
+            .expect("full diamond should load");
+        for max_depth in [0, 1, 2] {
+            let bounded = super::walk_reachable_nodes_through_depth(&mut reader, &head, max_depth)
+                .await
+                .expect("bounded diamond should load");
+            let expected = full
+                .iter()
+                .filter(|reachable| reachable.depth <= max_depth)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(bounded, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_reachable_nodes_match_unbounded_prefix_for_linear_history() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change(
+                    "commit-parent-change",
+                    "commit-parent",
+                    &[],
+                    &["commit-root"],
+                ),
+                commit_change("commit-head-change", "commit-head", &[], &["commit-parent"]),
+            ],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let head = commit_id("commit-head");
+        let full = reader
+            .reachable_nodes(&head)
+            .await
+            .expect("full linear history should load");
+        for max_depth in [0, 1, 2] {
+            let bounded = super::walk_reachable_nodes_through_depth(&mut reader, &head, max_depth)
+                .await
+                .expect("bounded linear history should load");
+            let expected = full
+                .iter()
+                .filter(|reachable| reachable.depth <= max_depth)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(bounded, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_reachable_nodes_validate_only_parents_inside_the_frontier() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change(
+                    "commit-parent-change",
+                    "commit-parent",
+                    &[],
+                    &["commit-root"],
+                ),
+                commit_change("commit-head-change", "commit-head", &[], &["commit-parent"]),
+            ],
+        )
+        .await;
+        let root = commit_id("commit-root");
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            crate::changelog::COMMIT_SPACE,
+            StorageKey(Bytes::copy_from_slice(root.as_uuid().as_bytes())),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("old ancestry corruption should stage");
+
+        let head = commit_id("commit-head");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let bounded = super::walk_reachable_nodes_through_depth(&mut reader, &head, 1)
+            .await
+            .expect("parent below the frontier must not load");
+        assert_eq!(bounded.len(), 2);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = super::walk_reachable_nodes_through_depth(&mut reader, &head, 2)
+            .await
+            .expect_err("missing parent inside the frontier must fail");
+        assert!(error.message.contains(&root.to_string()));
+    }
+
+    #[tokio::test]
+    async fn bounded_reachable_nodes_reject_cycles_closed_at_the_frontier() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[commit_change("commit-root-change", "commit-root", &[], &[])],
+        )
+        .await;
+        let root = commit_id("commit-root");
+        let left = commit_id("commit-cycle-left");
+        let right = commit_id("commit-cycle-right");
+        let record = |commit_id, change_label: &str, parents| CommitRecord {
+            format_version: 3,
+            commit_id,
+            generation: 2,
+            parent_commit_ids: parents,
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
+            change_id: ChangeId::for_test_label(change_label),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+        };
+        let records = [
+            record(left, "commit-cycle-left-change", vec![right, root]),
+            record(right, "commit-cycle-right-change", vec![left, root]),
+        ];
+        let mut writes = storage.new_write_set();
+        for record in records {
+            writes.put(
+                crate::changelog::COMMIT_SPACE,
+                StorageKey(Bytes::copy_from_slice(
+                    record.commit_id.as_uuid().as_bytes(),
+                )),
+                crate::changelog::encode_commit_record(&record)
+                    .expect("cyclic record should encode"),
+            );
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("cycle should persist");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = super::walk_reachable_nodes_through_depth(&mut reader, &left, 1)
+            .await
+            .expect_err("cycle closed at the frontier must fail");
+        assert!(error.message.contains("cycle detected"));
     }
 
     #[tokio::test]

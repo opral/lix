@@ -14,7 +14,9 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitRecord,
     CommitScanRequest,
 };
-use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_nodes};
+use crate::commit_graph::walker::{
+    best_common_ancestors, walk_reachable_nodes, walk_reachable_nodes_through_depth,
+};
 use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
     CommitGraphHistory, CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
@@ -419,7 +421,11 @@ where
         start_commit_id: &CommitId,
         request: &CommitGraphChangeHistoryRequest,
     ) -> Result<CommitGraphHistory, LixError> {
-        let nodes = self.reachable_nodes(start_commit_id).await?;
+        let nodes = if let Some(max_depth) = request.max_depth {
+            Arc::from(walk_reachable_nodes_through_depth(self, start_commit_id, max_depth).await?)
+        } else {
+            self.reachable_nodes(start_commit_id).await?
+        };
         let member_schema_keys = request
             .schema_keys
             .iter()
@@ -737,6 +743,7 @@ mod tests {
     #[derive(Clone)]
     struct CountingMemoryRead {
         inner: MemoryRead,
+        commit_get_many_keys: Arc<AtomicUsize>,
         change_get_many_calls: Arc<AtomicUsize>,
         member_segment_get_many_calls: Arc<AtomicUsize>,
         commit_state_manifest_get_many_calls: Arc<AtomicUsize>,
@@ -747,6 +754,14 @@ mod tests {
             &self,
             requests: &[crate::storage::GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
+            self.commit_get_many_keys.fetch_add(
+                requests
+                    .iter()
+                    .filter(|request| request.space == crate::changelog::COMMIT_SPACE)
+                    .map(|request| request.keys.len())
+                    .sum::<usize>(),
+                Ordering::Relaxed,
+            );
             if requests
                 .iter()
                 .any(|request| request.space == crate::changelog::CHANGE_SPACE)
@@ -1068,6 +1083,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn depth_bounded_history_does_not_load_ancestry_below_its_frontier() {
+        let memory = Memory::new();
+        let storage = StorageAdapter::new(memory.clone());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change(
+                    "commit-parent-change",
+                    "commit-parent",
+                    &[],
+                    &["commit-root"],
+                ),
+                commit_change("commit-head-change", "commit-head", &[], &["commit-parent"]),
+            ],
+        )
+        .await;
+
+        let commit_get_many_keys = Arc::new(AtomicUsize::new(0));
+        let read = memory
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader =
+            CommitGraphContext::new().reader(StorageAdapterReadScope::new(CountingMemoryRead {
+                inner: read,
+                commit_get_many_keys: Arc::clone(&commit_get_many_keys),
+                change_get_many_calls: Arc::new(AtomicUsize::new(0)),
+                member_segment_get_many_calls: Arc::new(AtomicUsize::new(0)),
+                commit_state_manifest_get_many_calls: Arc::new(AtomicUsize::new(0)),
+            }));
+        let history = reader
+            .change_history_from_commit(
+                &commit_id("commit-head"),
+                &CommitGraphChangeHistoryRequest {
+                    schema_keys: vec![super::COMMIT_SCHEMA_KEY.to_string()],
+                    max_depth: Some(0),
+                    include_tombstones: true,
+                    ..CommitGraphChangeHistoryRequest::default()
+                },
+            )
+            .await
+            .expect("bounded history should resolve");
+
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.reachable_nodes.len(), 1);
+        assert_eq!(history.reachable_nodes[0].depth, 0);
+        assert_eq!(
+            commit_get_many_keys.load(Ordering::Relaxed),
+            1,
+            "depth zero history must load only its anchor commit",
+        );
+    }
+
+    #[tokio::test]
     async fn change_history_reuses_canonical_changes_across_requests() {
         let memory = Memory::new();
         let storage = StorageAdapter::new(memory.clone());
@@ -1096,6 +1166,7 @@ mod tests {
         let graph = CommitGraphContext::new();
         let mut reader = graph.reader(StorageAdapterReadScope::new(CountingMemoryRead {
             inner: read,
+            commit_get_many_keys: Arc::new(AtomicUsize::new(0)),
             change_get_many_calls: Arc::clone(&change_get_many_calls),
             member_segment_get_many_calls,
             commit_state_manifest_get_many_calls: Arc::new(AtomicUsize::new(0)),
@@ -1334,6 +1405,7 @@ mod tests {
         let mut reader =
             CommitGraphContext::new().reader(StorageAdapterReadScope::new(CountingMemoryRead {
                 inner: read,
+                commit_get_many_keys: Arc::new(AtomicUsize::new(0)),
                 change_get_many_calls: Arc::new(AtomicUsize::new(0)),
                 member_segment_get_many_calls: Arc::clone(&member_segment_get_many_calls),
                 commit_state_manifest_get_many_calls: Arc::clone(
