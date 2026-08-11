@@ -66,6 +66,11 @@ path = "examples/space_growth.rs"
 required-features = ["storage-benches"]
 
 [[example]]
+name = "expv_blind_space_growth"
+path = "examples/expv_blind_space_growth.rs"
+required-features = ["storage-benches"]
+
+[[example]]
 name = "delta_segment_duplication"
 path = "examples/delta_segment_duplication.rs"
 required-features = ["storage-benches"]

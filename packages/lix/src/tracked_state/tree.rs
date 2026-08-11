@@ -388,7 +388,7 @@ impl TrackedStateTree {
                     })?;
                 let chunk_bytes = chunks.data.len();
                 let chunks = chunks.finish();
-                overlay.stage_chunks(writes, &chunks);
+                overlay.stage_chunks(store, writes, &chunks).await?;
                 return Ok(TrackedStateApplyResult {
                     root_id: TrackedStateRootId::new(root.child_hash),
                     row_count: 0,
@@ -489,7 +489,7 @@ impl TrackedStateTree {
         };
         let chunk_bytes = chunks.data.len();
         let chunks = chunks.finish();
-        overlay.stage_chunks(writes, &chunks);
+        overlay.stage_chunks(store, writes, &chunks).await?;
         Ok(TrackedStateApplyResult {
             root_id,
             row_count,
@@ -934,7 +934,7 @@ impl TrackedStateTree {
 
         let built = assembler.finish(self)?;
         let result = self
-            .persist_built_tree(writes, overlay, built, commit_id)
+            .persist_built_tree(store, writes, overlay, built, commit_id)
             .await?;
         Ok((result, cascaded_rows))
     }
@@ -1241,12 +1241,13 @@ impl TrackedStateTree {
 
     async fn persist_built_tree(
         &self,
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         built: BuiltTree,
         _commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
-        overlay.stage_chunks(writes, &built.chunks);
+        overlay.stage_chunks(store, writes, &built.chunks).await?;
         Ok(TrackedStateApplyResult {
             root_id: built.root_id,
             row_count: built.row_count,

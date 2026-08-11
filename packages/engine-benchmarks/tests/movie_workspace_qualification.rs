@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use std::panic::AssertUnwindSafe;
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use futures_util::future::join_all;
 use futures_util::stream::{self, BoxStream};
 use lix::FILE_UPLOAD_PART_BYTES;
@@ -62,22 +64,127 @@ async fn slatedb_resumes_media_upload_after_engine_restart() {
     finish_restart_upload(storage).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "release qualification benchmark"]
-async fn rocksdb_movie_workspace_interference() {
-    let _qualification_guard = QUALIFICATION_LOCK.lock().await;
-    let temp = tempfile::tempdir().expect("create RocksDB movie fixture");
-    let storage = RocksDB::open(temp.path().join("database")).expect("open RocksDB fixture");
-    qualify("rocksdb", storage).await;
+/// The qualification models a desktop editor: a small fixed worker pool that
+/// media ingest, project saves and playback all share. `LIX_MOVIE_WORKER_THREADS`
+/// exists only so an investigation can separate executor starvation from engine
+/// latency; the qualification itself always runs the four-thread profile.
+fn qualification_runtime() -> tokio::runtime::Runtime {
+    let worker_threads = std::env::var("LIX_MOVIE_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("build movie qualification runtime")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "release qualification benchmark"]
-async fn slatedb_movie_workspace_interference() {
-    let _qualification_guard = QUALIFICATION_LOCK.lock().await;
-    let temp = tempfile::tempdir().expect("create SlateDB movie fixture");
-    let storage = SlateDB::open(temp.path().join("database")).expect("open SlateDB fixture");
-    qualify("slatedb", storage).await;
+fn rocksdb_movie_workspace_interference() {
+    qualification_runtime().block_on(async {
+        let _qualification_guard = QUALIFICATION_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("create RocksDB movie fixture");
+        let storage = RocksDB::open(temp.path().join("database")).expect("open RocksDB fixture");
+        // Settled bytes are part of the measurement, so they are reported even
+        // when an assertion above them fails — otherwise an arm that trips a
+        // structural assertion silently contributes no byte number.
+        let outcome = AssertUnwindSafe(qualify("rocksdb", storage.clone()))
+            .catch_unwind()
+            .await;
+        storage.flush().expect("flush RocksDB fixture");
+        report_settled_bytes("rocksdb", temp.path());
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}
+
+#[test]
+#[ignore = "release qualification benchmark"]
+fn slatedb_movie_workspace_interference() {
+    qualification_runtime().block_on(async {
+        let _qualification_guard = QUALIFICATION_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("create SlateDB movie fixture");
+        let storage = SlateDB::open(temp.path().join("database")).expect("open SlateDB fixture");
+        let outcome = AssertUnwindSafe(qualify("slatedb", storage.clone()))
+            .catch_unwind()
+            .await;
+        storage.flush().await.expect("flush SlateDB fixture");
+        report_settled_bytes("slatedb", temp.path());
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}
+
+/// Bytes the workload leaves on disk once the writer has flushed. Reported
+/// per top-level directory so an arm comparison can separate LSM state from
+/// the immutable value segments that carry the media payload.
+fn report_settled_bytes(backend: &str, root: &std::path::Path) {
+    fn directory_bytes(path: &std::path::Path) -> u64 {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if metadata.is_file() {
+            return metadata.len();
+        }
+        if !metadata.is_dir() {
+            return 0;
+        }
+        std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .map(|entry| match entry {
+                        Ok(entry) => directory_bytes(&entry.path()),
+                        Err(_) => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    let database = root.join("database");
+    let mut breakdown = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(database.join("db")) {
+        let mut named = entries
+            .filter_map(Result::ok)
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    directory_bytes(&entry.path()),
+                )
+            })
+            .collect::<Vec<_>>();
+        named.sort();
+        breakdown = named;
+    }
+    println!(
+        "movie_settled_bytes,backend={backend},total_bytes={},{}",
+        directory_bytes(&database),
+        breakdown
+            .iter()
+            .map(|(name, bytes)| format!("{name}_bytes={bytes}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+}
+
+/// Null control for the playback assertions: identical schedule, sessions and
+/// fixture, with the concurrent 512 MiB ingest removed. Whatever scheduling
+/// jitter this run shows is the floor below which a playback deadline cannot
+/// be attributed to ingest interference.
+#[test]
+#[ignore = "playback null control"]
+fn slatedb_movie_workspace_playback_control() {
+    qualification_runtime().block_on(async {
+        let _qualification_guard = QUALIFICATION_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("create SlateDB control fixture");
+        let storage = SlateDB::open(temp.path().join("database")).expect("open SlateDB fixture");
+        let part_concurrency = upload_concurrency();
+        qualify_case("slatedb-control", storage, part_concurrency, None, None, false).await;
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -187,20 +294,24 @@ async fn qualify_delayed_slatedb(latency_ms: u64, upload_concurrency: usize) -> 
         upload_concurrency,
         Some((delayed, Duration::from_millis(latency_ms))),
         Some(counters),
+        true,
     )
     .await
+}
+
+fn upload_concurrency() -> usize {
+    std::env::var("LIX_MOVIE_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=4).contains(value))
+        .unwrap_or(4)
 }
 
 async fn qualify<S>(backend: &str, storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let part_concurrency = std::env::var("LIX_MOVIE_UPLOAD_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=4).contains(value))
-        .unwrap_or(4);
-    qualify_case(backend, storage, part_concurrency, None, None).await;
+    qualify_case(backend, storage, upload_concurrency(), None, None, true).await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -218,6 +329,7 @@ async fn qualify_case<S>(
     part_concurrency: usize,
     artificial_latency: Option<(LatencyObjectStore, Duration)>,
     io_counters: Option<SlateDBIoCounters>,
+    run_ingest: bool,
 ) -> Qualification
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -255,6 +367,7 @@ where
         PROXY_BYTES,
         1,
         part_concurrency,
+        None,
     )
     .await;
     if let Some((store, latency)) = &artificial_latency {
@@ -291,25 +404,74 @@ where
     );
 
     let started = tokio::time::Instant::now();
+    // Independent runtime watchdog: an empty task that only sleeps. Any gap it
+    // records is executor-level, because it touches neither storage nor a lock.
+    let watchdog_worst = Arc::new(AtomicU64::new(0));
+    let watchdog = std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE")
+        .is_some()
+        .then(|| {
+            let worst = watchdog_worst.clone();
+            tokio::spawn(async move {
+                let tick = Duration::from_millis(5);
+                let mut next = started + tick;
+                loop {
+                    tokio::time::sleep_until(next).await;
+                    let gap = (tokio::time::Instant::now() - next).as_micros() as u64;
+                    let elapsed_ms = (next - started).as_millis() as u64;
+                    let packed = (gap << 20) | elapsed_ms.min((1 << 20) - 1);
+                    worst.fetch_max(packed, Ordering::Relaxed);
+                    next += tick;
+                }
+            })
+        });
+    // Ingest, project saves and the two proxy streams are four independent
+    // actors in the workload this qualification claims to model, so each one
+    // gets its own task. Driving them as branches of a single `tokio::join!`
+    // future put all four on one task: a slow write in any branch could not
+    // overlap a playback read, and the resulting delay was scored against the
+    // playback deadline even though the read itself had not started.
     let ingest_started = Instant::now();
-    let ingest_future = async {
-        upload(
-            &ingest,
-            "concurrent-ingest",
-            "/media/import.mov",
-            INGEST_BYTES,
-            2,
-            part_concurrency,
-        )
-        .await;
+    let ingest_task = tokio::spawn(async move {
+        if run_ingest {
+            upload(
+                &ingest,
+                "concurrent-ingest",
+                "/media/import.mov",
+                INGEST_BYTES,
+                2,
+                part_concurrency,
+                std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE")
+                    .is_some()
+                    .then_some(started),
+            )
+            .await;
+        }
         ingest_started.elapsed()
-    };
-    let save_future = project_saves(saver, started);
-    let first_playback = playback(first_reader, started, 0);
-    let second_playback = playback(second_reader, started, PROXY_BYTES as u64 / 2);
-    let (ingest_elapsed, mut save_latencies, first_late, second_late) =
-        tokio::join!(ingest_future, save_future, first_playback, second_playback);
+    });
+    let save_task = tokio::spawn(project_saves(saver, started));
+    let first_task = tokio::spawn(playback(first_reader, started, 0, 1));
+    let second_task = tokio::spawn(playback(
+        second_reader,
+        started,
+        PROXY_BYTES as u64 / 2,
+        2,
+    ));
+    let (ingest_elapsed, mut save_latencies, first_late, second_late) = tokio::join!(
+        async { ingest_task.await.expect("ingest task") },
+        async { save_task.await.expect("project save task") },
+        async { first_task.await.expect("first playback task") },
+        async { second_task.await.expect("second playback task") },
+    );
 
+    if let Some(watchdog) = watchdog {
+        watchdog.abort();
+        let packed = watchdog_worst.load(Ordering::Relaxed);
+        println!(
+            "movie_runtime_watchdog,worst_gap_ms={:.3},at_ms={}",
+            (packed >> 20) as f64 / 1000.0,
+            packed & ((1 << 20) - 1),
+        );
+    }
     save_latencies.sort_unstable();
     let save_p95 = save_latencies[save_latencies.len() * 95 / 100];
     let ingest_mib_s = INGEST_BYTES as f64 / (1024.0 * 1024.0) / ingest_elapsed.as_secs_f64();
@@ -339,14 +501,16 @@ where
         io.cache_filesystem_removes,
         io.writer_gate_wait_nanos as f64 / 1_000_000.0,
     );
-    assert!(save_p95 < Duration::from_millis(500));
-    assert_eq!(first_late, 0, "first 100 Mbit/s stream fell behind");
-    assert_eq!(second_late, 0, "second 100 Mbit/s stream fell behind");
-    assert_eq!(structural.temporary_manifest_leaf_rows, 32);
-    assert_eq!(structural.legacy_equivalent_chunk_rows, 512);
-    assert_eq!(row_reduction, 16.0);
-    assert_eq!(projected_chunk_rows / projected_leaf_rows, 16);
-    assert!(structural.chunk_payload_hash_bytes >= INGEST_BYTES as u64);
+    if run_ingest {
+        assert!(save_p95 < Duration::from_millis(500));
+        assert_eq!(first_late, 0, "first 100 Mbit/s stream fell behind");
+        assert_eq!(second_late, 0, "second 100 Mbit/s stream fell behind");
+        assert_eq!(structural.temporary_manifest_leaf_rows, 32);
+        assert_eq!(structural.legacy_equivalent_chunk_rows, 512);
+        assert_eq!(row_reduction, 16.0);
+        assert_eq!(projected_chunk_rows / projected_leaf_rows, 16);
+        assert!(structural.chunk_payload_hash_bytes >= INGEST_BYTES as u64);
+    }
     Qualification {
         ingest_mib_s,
         save_p95,
@@ -421,6 +585,7 @@ async fn upload<S>(
     total_bytes: usize,
     seed: u64,
     part_concurrency: usize,
+    schedule_start: Option<tokio::time::Instant>,
 ) where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -448,6 +613,12 @@ async fn upload<S>(
             .max()
             .expect("upload window contains a part");
         assert_eq!(acknowledged, window_end as u64);
+        if let Some(schedule_start) = schedule_start {
+            println!(
+                "movie_upload_window,upload_id={upload_id},window_end={window_end},at_ms={:.3}",
+                (tokio::time::Instant::now() - schedule_start).as_secs_f64() * 1000.0,
+            );
+        }
         window_start = window_end;
     }
 }
@@ -456,15 +627,24 @@ async fn playback<S>(
     session: Arc<SessionContext<S>>,
     schedule_start: tokio::time::Instant,
     initial_offset: u64,
+    stream: usize,
 ) -> usize
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let trace = std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE").is_some();
+    let samples = std::env::var("LIX_MOVIE_STREAM_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(STREAM_SAMPLES);
     let mut late = 0;
-    for sample in 0..STREAM_SAMPLES {
+    let mut read_latencies = Vec::with_capacity(samples);
+    for sample in 0..samples {
         let deadline = schedule_start + PLAYBACK_READ_AHEAD + STREAM_PERIOD * (sample as u32 + 1);
         let offset = (initial_offset + sample as u64 * STREAM_READ_BYTES)
             % (PROXY_BYTES as u64 - STREAM_READ_BYTES);
+        let read_started = tokio::time::Instant::now();
         let read = session
             .read_file_content(
                 "/media/proxy.mov".to_owned(),
@@ -473,13 +653,42 @@ where
             .await
             .expect("read proxy range")
             .expect("proxy exists");
+        let finished = tokio::time::Instant::now();
+        let read_elapsed = finished - read_started;
+        read_latencies.push(read_elapsed);
         assert_eq!(read.content().len(), STREAM_READ_BYTES as usize);
-        if tokio::time::Instant::now() > deadline {
+        let is_late = finished > deadline;
+        if trace {
+            println!(
+                "movie_playback_sample,stream={stream},sample={sample},offset={offset},read_ms={:.3},slack_ms={:.3},late={is_late}",
+                read_elapsed.as_secs_f64() * 1000.0,
+                if is_late {
+                    -((finished - deadline).as_secs_f64() * 1000.0)
+                } else {
+                    (deadline - finished).as_secs_f64() * 1000.0
+                },
+            );
+        }
+        if is_late {
             late += 1;
         } else {
             tokio::time::sleep_until(deadline).await;
         }
     }
+    let mut sorted = read_latencies.clone();
+    sorted.sort_unstable();
+    let pick = |num: usize| sorted[(sorted.len() * num / 100).min(sorted.len() - 1)];
+    println!(
+        "movie_playback_latency,stream={stream},samples={},late={late},read_min_ms={:.3},read_p50_ms={:.3},read_p90_ms={:.3},read_p95_ms={:.3},read_p99_ms={:.3},read_max_ms={:.3},budget_ms={:.3}",
+        sorted.len(),
+        sorted[0].as_secs_f64() * 1000.0,
+        pick(50).as_secs_f64() * 1000.0,
+        pick(90).as_secs_f64() * 1000.0,
+        pick(95).as_secs_f64() * 1000.0,
+        pick(99).as_secs_f64() * 1000.0,
+        sorted[sorted.len() - 1].as_secs_f64() * 1000.0,
+        STREAM_PERIOD.as_secs_f64() * 1000.0,
+    );
     late
 }
 
@@ -490,9 +699,12 @@ async fn project_saves<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let trace = std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE").is_some();
     let mut timings = Vec::with_capacity(SAVE_SAMPLES);
     for sample in 0..SAVE_SAMPLES {
-        tokio::time::sleep_until(schedule_start + STREAM_PERIOD * sample as u32).await;
+        let scheduled = schedule_start + STREAM_PERIOD * sample as u32;
+        tokio::time::sleep_until(scheduled).await;
+        let wake_delay = tokio::time::Instant::now() - scheduled;
         let payload = format!(
             "{{\"timelineRevision\":{sample},\"playhead\":{}}}",
             sample * 24
@@ -502,7 +714,16 @@ where
             .upsert_file_content("/project/edit.json".to_owned(), payload.into_bytes().into())
             .await
             .expect("save project file");
-        timings.push(started.elapsed());
+        let elapsed = started.elapsed();
+        if trace {
+            println!(
+                "movie_save_sample,sample={sample},at_ms={:.3},wake_delay_ms={:.3},save_ms={:.3}",
+                (scheduled - schedule_start).as_secs_f64() * 1000.0,
+                wake_delay.as_secs_f64() * 1000.0,
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+        timings.push(elapsed);
     }
     timings
 }
