@@ -424,7 +424,9 @@ async fn create_logical_plan_in_session_from_parsed(
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
 
-    let physical_plan_cacheable = cacheable_statement && !logical_plan_has_scalar_function(&plan);
+    let physical_plan_cacheable = cacheable_statement
+        && !logical_plan_has_scalar_function(&plan)
+        && !logical_plan_has_subquery_expression(&plan);
     if physical_plan_cacheable && let Some((cache, catalog)) = &session.planning_environment {
         cache.remember_read_plan(
             sql,
@@ -507,6 +509,43 @@ async fn rebind_cached_read_plan(
     })
     .map(|transformed| transformed.data)
     .map_err(datafusion_error_to_lix_error)
+}
+
+/// Reports whether any expression in `plan` carries a nested subquery plan.
+///
+/// `LogicalPlan`'s tree traversal walks plan inputs only; the plans hidden
+/// inside `Expr::ScalarSubquery`, `Expr::InSubquery` and `Expr::Exists` are
+/// invisible to it. `detach_cached_read_plan` therefore cannot swap their
+/// `TableScan` sources for placeholders, so caching such a plan would park
+/// live snapshot-bound providers in an engine-lifetime LRU: the read scope
+/// then fails `finish()` with leaked handles, and a later cache hit would
+/// execute against a storage read that has already been released.
+///
+/// Planning-cache participation is an optimization, so the safe answer is to
+/// keep these statements out of the cache entirely rather than grow a second
+/// subquery-aware rewrite path that has to stay in sync with `detach`/`rebind`.
+fn logical_plan_has_subquery_expression(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        for expression in node.expressions() {
+            let _ = expression.apply(|expression| {
+                if matches!(
+                    expression,
+                    Expr::ScalarSubquery(_) | Expr::InSubquery(_) | Expr::Exists(_)
+                ) {
+                    found = true;
+                    Ok(TreeNodeRecursion::Stop)
+                } else {
+                    Ok(TreeNodeRecursion::Continue)
+                }
+            });
+            if found {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 fn logical_plan_has_scalar_function(plan: &LogicalPlan) -> bool {
