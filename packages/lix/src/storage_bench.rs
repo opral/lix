@@ -1832,6 +1832,12 @@ pub struct CommitDeltaSegmentSimilarity {
     pub min_differing_bytes: u64,
     /// Byte length of the pair that produced `min_differing_bytes`.
     pub min_differing_pair_len: u64,
+    /// Shared leading bytes of the pair that produced `min_differing_bytes`.
+    pub min_differing_pair_common_prefix: u64,
+    /// Shared trailing bytes of the same pair. A long shared suffix next to a
+    /// short shared prefix is the signature of a small identity header in front
+    /// of otherwise identical content.
+    pub min_differing_pair_common_suffix: u64,
     /// Whether any pair was compared at all.
     pub compared_any: bool,
 }
@@ -1892,6 +1898,17 @@ where
                 if differing < similarity.min_differing_bytes {
                     similarity.min_differing_bytes = differing;
                     similarity.min_differing_pair_len = left.len() as u64;
+                    similarity.min_differing_pair_common_prefix = left
+                        .iter()
+                        .zip(right.iter())
+                        .take_while(|(left, right)| left == right)
+                        .count() as u64;
+                    similarity.min_differing_pair_common_suffix = left
+                        .iter()
+                        .rev()
+                        .zip(right.iter().rev())
+                        .take_while(|(left, right)| left == right)
+                        .count() as u64;
                 }
             }
         }

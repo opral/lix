@@ -240,7 +240,8 @@ segment_rows={},segment_value_bytes={},segment_distinct={},segment_dup_rows={},\
 segment_dup_bytes={},segment_dup_pct={:.3},segment_max_occurrences={},\
 segment_share_of_settled_pct={:.2},\
 sim_distinct={},sim_same_length={},sim_pairs={},sim_near_identical={},\
-sim_min_differing_bytes={},sim_min_pair_len={}",
+sim_min_differing_bytes={},sim_min_pair_len={},sim_min_pair_common_prefix={},\
+sim_min_pair_common_suffix={}",
         directory_bytes(directory),
         percent(duplicate_bytes, settled_value_bytes),
         segment.rows,
@@ -257,6 +258,8 @@ sim_min_differing_bytes={},sim_min_pair_len={}",
         similarity.near_identical_pairs,
         similarity.min_differing_bytes,
         similarity.min_differing_pair_len,
+        similarity.min_differing_pair_common_prefix,
+        similarity.min_differing_pair_common_suffix,
     );
 
     let mut by_bytes: Vec<&StorageValueDuplication> = duplication
