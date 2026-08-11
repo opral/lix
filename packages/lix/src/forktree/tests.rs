@@ -4358,7 +4358,11 @@ async fn zero_edge_commit_change_pages_reopen_at_member_count_boundary() {
             metadata: b"zero-edge-page-reopen".to_vec(),
         };
         let pages = commit.prepare_member_pages().expect("zero-edge pages");
-        assert_eq!(pages.len(), if count == 256 { 1 } else { 2 });
+        assert_eq!(
+            pages.len(),
+            1,
+            "inline member count must not be confused with object-edge count"
+        );
         let (commit_object_id, commit_bytes) = commit.encode().expect("commit envelope");
 
         let storage = CrashStorage::new();
@@ -7674,32 +7678,57 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
         assert_eq!(loaded.len(), count);
     }
 
-    for count in [256usize, 257] {
-        let members = (0..count).map(zero_edge_page_member).collect::<Vec<_>>();
+    for count in [256usize, 257, 100_000] {
+        let members = (0..count)
+            .map(|index| {
+                if count == 100_000 {
+                    let mut change_raw = [0_u8; 16];
+                    change_raw[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+                    change_raw[15] = 1;
+                    CommitMemberV1::introduced(
+                        ChangeId::from_bytes(change_raw),
+                        vec![b'x'; 256],
+                        false,
+                        LixTimestamp::from_unix_millis_utc_lossy(1),
+                        Vec::new(),
+                    )
+                } else {
+                    zero_edge_page_member(index)
+                }
+            })
+            .collect::<Vec<_>>();
         let pages = CommitChangePageV2::encode_pages(CommitId::from_bytes(raw_id(0xa5)), &members)
             .expect("zero-edge page closure");
-        assert_eq!(pages.objects.len(), if count == 256 { 1 } else { 2 });
+        assert!(
+            pages.objects.len() + 2 <= 256,
+            "byte-bounded inline pages must fit the commit edge vector"
+        );
         assert_eq!(pages.member_locations.len(), count);
+        let mut next_ordinal = 0_u32;
         for (id, bytes) in pages.objects {
-            assert!(
-                CommitChangePageV2::decode(id, &bytes)
-                    .expect("zero-edge page decodes")
-                    .members
-                    .len()
-                    <= 256
-            );
+            let page = CommitChangePageV2::decode(id, &bytes).expect("zero-edge page decodes");
+            assert_eq!(page.start_ordinal, next_ordinal);
+            next_ordinal += u32::try_from(page.members.len()).expect("bounded test page");
         }
+        assert_eq!(
+            usize::try_from(next_ordinal).expect("test member count"),
+            count
+        );
     }
 
-    assert!(
-        CommitChangePageV2 {
-            commit_id: CommitId::from_bytes(raw_id(0xa6)),
-            start_ordinal: 0,
-            members: (0..257).map(zero_edge_page_member).collect(),
-        }
-        .encode()
-        .is_err(),
-        "a direct oversized zero-edge page must fail before publication"
+    let (zero_edge_page_id, zero_edge_page_bytes) = CommitChangePageV2 {
+        commit_id: CommitId::from_bytes(raw_id(0xa6)),
+        start_ordinal: 0,
+        members: (0..257).map(zero_edge_page_member).collect(),
+    }
+    .encode()
+    .expect("inline members may exceed the independent object-edge budget");
+    assert_eq!(
+        CommitChangePageV2::decode(zero_edge_page_id, &zero_edge_page_bytes)
+            .expect("large inline page decodes")
+            .members
+            .len(),
+        257
     );
 
     let members = (0..255).map(page_member).collect::<Vec<_>>();

@@ -456,7 +456,10 @@ impl CommitChangePageV2 {
         let commit_id = CommitId::from_bytes(body.fixed()?);
         let start_ordinal = body.u32()?;
         let count = body.usize("commit member page count")?;
-        if count == 0 || count > AUTHENTICATED_EDGE_PAGE_ENTRIES || count > body.remaining() / 17 {
+        // Members are inline authenticated payload, not outgoing object edges.
+        // Bound their count by the already byte-bounded body while keeping the
+        // independent object-edge budget in `validate` below.
+        if count == 0 || count > body.remaining() / 17 {
             return Err(corruption(
                 "commit member page count exceeds its encoded body",
             ));
@@ -478,11 +481,6 @@ impl CommitChangePageV2 {
     fn validate(&self) -> Result<(), StorageError> {
         if self.members.is_empty() {
             return Err(corruption("commit member page must not be empty"));
-        }
-        if self.members.len() > AUTHENTICATED_EDGE_PAGE_ENTRIES {
-            return Err(corruption(
-                "commit member page exceeds its authenticated member bound",
-            ));
         }
         let member_edges = self
             .members
@@ -524,12 +522,11 @@ impl CommitChangePageV2 {
                 member_locations: Vec::new(),
             });
         }
-        let mut chunks = Vec::<(u32, Vec<CommitMemberV1>)>::new();
-        let mut start = 0usize;
-        let mut current = Vec::new();
-        let mut current_edges = 0usize;
-        let mut current_bytes = 0usize;
-        for member in members.iter().cloned() {
+        let max_page_objects = AUTHENTICATED_EDGE_PAGE_ENTRIES.saturating_sub(2);
+        let mut member_sizes = Vec::with_capacity(members.len());
+        let mut total_member_bytes = 0usize;
+        let mut max_member_bytes = 0usize;
+        for member in members {
             member.validate()?;
             let member_edges = member.authenticated_edge_count();
             if member_edges > COMMIT_MEMBER_PAGE_EDGE_BUDGET {
@@ -541,14 +538,38 @@ impl CommitChangePageV2 {
             if member_bytes > COMMIT_CHANGE_PAGE_MAX_BYTES {
                 return Err(corruption("one commit member exceeds the page byte bound"));
             }
+            total_member_bytes = total_member_bytes
+                .checked_add(member_bytes)
+                .ok_or_else(|| corruption("commit member byte count overflowed"))?;
+            max_member_bytes = max_member_bytes.max(member_bytes);
+            member_sizes.push(member_bytes);
+        }
+        // Keep ordinary commits at the sparse-read-friendly 64 KiB target.
+        // Only a commit that would overflow the authenticated page-ID vector
+        // widens pages to the minimum target needed to keep that vector bound.
+        // Sequential packing may leave up to one largest member of slack per
+        // page, so include that slack when deriving the bounded page target.
+        let required_page_payload = total_member_bytes
+            .div_ceil(max_page_objects)
+            .saturating_add(max_member_bytes);
+        let page_target_bytes = COMMIT_CHANGE_PAGE_TARGET_BYTES
+            .max(required_page_payload.saturating_add(128))
+            .min(COMMIT_CHANGE_PAGE_MAX_BYTES);
+
+        let mut chunks = Vec::<(u32, Vec<CommitMemberV1>)>::new();
+        let mut start = 0usize;
+        let mut current = Vec::new();
+        let mut current_edges = 0usize;
+        let mut current_bytes = 0usize;
+        for (member, member_bytes) in members.iter().cloned().zip(member_sizes) {
+            let member_edges = member.authenticated_edge_count();
             if !current.is_empty()
-                && (current.len() == AUTHENTICATED_EDGE_PAGE_ENTRIES
-                    || current_edges
-                        .checked_add(member_edges)
-                        .is_none_or(|edges| edges > COMMIT_MEMBER_PAGE_EDGE_BUDGET)
-                    || current_bytes.checked_add(member_bytes).is_none_or(|bytes| {
-                        bytes > COMMIT_CHANGE_PAGE_TARGET_BYTES.saturating_sub(128)
-                    }))
+                && (current_edges
+                    .checked_add(member_edges)
+                    .is_none_or(|edges| edges > COMMIT_MEMBER_PAGE_EDGE_BUDGET)
+                    || current_bytes
+                        .checked_add(member_bytes)
+                        .is_none_or(|bytes| bytes > page_target_bytes.saturating_sub(128)))
             {
                 chunks.push((
                     u32::try_from(start)
