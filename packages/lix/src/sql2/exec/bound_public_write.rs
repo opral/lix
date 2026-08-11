@@ -1251,6 +1251,7 @@ async fn try_execute_direct_path_value_replacement_batch(
     };
     let mut snapshot_offsets = Vec::with_capacity(replacement_capacity);
     let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
+    let mut replacement_predecessors = Vec::with_capacity(replacement_capacity);
     let mut affected_by_statement =
         (!certified_generation_identity).then(|| vec![0_u64; row_count]);
     let mut candidate_index = 0;
@@ -1306,6 +1307,16 @@ async fn try_execute_direct_path_value_replacement_batch(
         normalized.push(b'}');
         snapshot_offsets.push((start, normalized.len()));
         replacement_entity_pks.push(entity_pk.clone());
+        replacement_predecessors.push(
+            (!certified_generation_identity)
+                .then(|| {
+                    candidates
+                        .row(candidate_index)
+                        .durable_predecessor()
+                        .cloned()
+                })
+                .flatten(),
+        );
         if let Some(ordinals) = &sorted_statement_ordinals {
             for &affected_statement in &ordinals[first_statement_index..=last_statement_index] {
                 if let Some(affected_by_statement) = &mut affected_by_statement {
@@ -1323,7 +1334,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         let normalized_len = normalized.len();
         let snapshots =
             TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-        let rows = CertifiedParameterReplacementBatch::new(
+        let mut rows = CertifiedParameterReplacementBatch::new(
             replacement_entity_pks,
             snapshots,
             spec.schema_key.as_str().into(),
@@ -1348,6 +1359,9 @@ async fn try_execute_direct_path_value_replacement_batch(
                     .flatten(),
             },
         )?;
+        for (index, predecessor) in replacement_predecessors.into_iter().enumerate() {
+            rows.set_durable_predecessor(index, predecessor);
+        }
         ctx.stage_certified_parameter_batch_replace(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
