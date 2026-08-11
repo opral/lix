@@ -3630,11 +3630,16 @@ mod tests {
         let audit = super::audit_repository_gc_standalone_refs(&read)
             .await
             .expect("standalone audit should consume the same closure");
+        // With the publication ledger gone the audit no longer has a stored
+        // `old_control` to attribute a superseded ref change to. A branch-ref
+        // change that no live control claims is simply unclassified: the
+        // publication that supersedes it now deletes it in the same write set,
+        // so a surviving one is a fixture artefact, not deferred GC debt.
         assert_eq!(
             audit,
             vec![format!(
-                "{}:retired_delta_old_control:history_dependency_pin:old_root={owner}",
-                retired_ref
+                "{retired_ref}:unclassified_no_live_control:schema=authority_gc:account={}:origin=none",
+                crate::ANONYMOUS_ACCOUNT_ID
             )]
         );
     }

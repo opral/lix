@@ -5279,10 +5279,18 @@ async fn stage_branch_head_control_publications(
         // control. Once it moves, nothing can ever read them again, so there is
         // nothing to defer and nothing for a publication ledger to remember.
         if let Some(old_control) = observation.control.as_ref() {
-            for generation in [
-                old_control.tracked_generation,
-                old_control.untracked_generation,
-            ] {
+            // A deletion tears its own current generation down through the
+            // branch-lifecycle path; retiring it again here would stage the
+            // same key twice in one write set.
+            for generation in desired
+                .map(|_| {
+                    vec![
+                        old_control.tracked_generation,
+                        old_control.untracked_generation,
+                    ]
+                })
+                .unwrap_or_default()
+            {
                 if desired.is_some_and(|new_control| {
                     new_control.tracked_generation == generation
                         || new_control.untracked_generation == generation
@@ -7872,7 +7880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rootless_branch_delete_defers_checkpoint_cleanup_through_gc_and_reopen() {
+    async fn rootless_branch_delete_reclaims_its_checkpoint_prefix_and_survives_reopen() {
         let backend = Memory::new();
         crate::engine::Engine::initialize(backend.clone())
             .await
@@ -7957,9 +7965,9 @@ mod tests {
                 blob_hash,
             )
             .await
-            .expect("retained rootless checkpoint should load")
-            .is_some(),
-            "foreground branch deletion must leave checkpoint reclamation to GC"
+            .expect("retired rootless checkpoint should load")
+            .is_none(),
+            "branch deletion reclaims its own checkpoint prefix in the same write set"
         );
         drop(retained_read);
 

@@ -672,14 +672,15 @@ mod tests {
         let point_update = fixture.update_one_by_pk_accounting().await;
         assert_eq!(point_update.logical_rows, 1);
         // The point write keeps the compact current-state certificate,
-        // publishes its authenticated branch/control and reachability state,
-        // and rotates the mandatory binary-CAS publication/reclamation epoch.
-        // The write set touches eleven spaces, not twelve: the binary-CAS
-        // epoch and the tracked mutation fence are now two keys in the one
-        // revision space rather than two separate spaces.
-        assert_eq!(point_update.staged_puts, 12, "{point_update:?}");
-        assert_eq!(point_update.touched_spaces, 11, "{point_update:?}");
-        assert_eq!(point_update.put_batches, 11, "{point_update:?}");
+        // publishes its authenticated branch control, and rotates the mandatory
+        // binary-CAS publication/reclamation epoch. It touches nine spaces, not
+        // eleven: the binary-CAS epoch and the tracked mutation fence are two
+        // keys in the one revision space, and the retirement candidates a
+        // sweep needs are now derived from the commit graph instead of being
+        // published into a reachability delta row plus its queue control.
+        assert_eq!(point_update.staged_puts, 10, "{point_update:?}");
+        assert_eq!(point_update.touched_spaces, 9, "{point_update:?}");
+        assert_eq!(point_update.put_batches, 9, "{point_update:?}");
 
         // A sparse overlay deliberately invalidates the complete-generation
         // digest, so use a fresh fixture to exercise exact bulk replacement
