@@ -279,6 +279,7 @@ impl StorageWriteSet {
             ),
             exclusive_range_deletes: Vec::new(),
             deferred_final_puts: Vec::new(),
+            key_absent_preconditions: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }
