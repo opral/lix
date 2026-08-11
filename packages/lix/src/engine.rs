@@ -716,6 +716,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn predecessor_v64_direct_change_id_leaf_protocol_is_rejected() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"myers-first-parent-jump.v64"[..],
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("V64 protocol marker should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("V64 packed-history repositories must fail closed");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
     async fn predecessor_v15_protocol_is_rejected() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())

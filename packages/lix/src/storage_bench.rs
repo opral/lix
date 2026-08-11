@@ -63,6 +63,10 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -399,6 +403,20 @@ pub struct CrudCurrentStateScopedRangeAccounting {
     pub sealed_manifest_loads: u64,
     pub replay_manifest_loads: u64,
     pub ordered_delta_fallbacks: u64,
+    pub commit_delta_direct_segments: u64,
+    pub commit_delta_direct_rows: u64,
+    pub commit_delta_generic_segments: u64,
+    pub commit_delta_generic_rows: u64,
+}
+
+pub(crate) fn record_commit_delta_leaf_layout(rows: usize, direct: bool) {
+    let (segments, encoded_rows) = if direct {
+        (&COMMIT_DELTA_DIRECT_SEGMENTS, &COMMIT_DELTA_DIRECT_ROWS)
+    } else {
+        (&COMMIT_DELTA_GENERIC_SEGMENTS, &COMMIT_DELTA_GENERIC_ROWS)
+    };
+    segments.fetch_add(1, Ordering::Relaxed);
+    encoded_rows.fetch_add(rows as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn record_crud_current_state_scoped_range_attempt() {
@@ -433,6 +451,10 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_segments: COMMIT_DELTA_DIRECT_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_rows: COMMIT_DELTA_DIRECT_ROWS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_segments: COMMIT_DELTA_GENERIC_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_rows: COMMIT_DELTA_GENERIC_ROWS.swap(0, Ordering::Relaxed),
     }
 }
 
