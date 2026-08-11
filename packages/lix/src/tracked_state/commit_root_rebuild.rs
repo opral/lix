@@ -378,8 +378,9 @@ where
 /// commit-delta authority remains the source of every mutation, while only the
 /// terminal root is needed as the parent of the publication being assembled.
 /// Applying the latest authenticated delta for each key once changes replay
-/// from O(H * D * log N) frontier rewrites to O(H * D + U * log N), where U is
-/// the number of unique keys in the interval.
+/// from O(H * D * log N) frontier rewrites to
+/// O(H * D * log U + U * log N), where U is the number of unique keys in the
+/// interval.
 ///
 /// File-descriptor deletion has ordered cascade semantics, so those uncommon
 /// intervals stay on the canonical sequential algorithm.
@@ -412,14 +413,26 @@ where
     let mut terminal_by_key = BTreeMap::<TrackedStateKey, CommitRootRebuildDelta>::new();
     for plan in plans.iter().rev() {
         for delta in &plan.deltas {
-            terminal_by_key.insert(
-                TrackedStateKey {
-                    schema_key: delta.schema_key.clone(),
-                    file_id: delta.file_id.clone(),
-                    entity_pk: delta.entity_pk.clone(),
-                },
-                delta.clone(),
-            );
+            let key = TrackedStateKey {
+                schema_key: delta.schema_key.clone(),
+                file_id: delta.file_id.clone(),
+                entity_pk: delta.entity_pk.clone(),
+            };
+            match terminal_by_key.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(delta.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let created_at = entry.get().created_at;
+                    let mut terminal = delta.clone();
+                    // Sequential replay preserves the first visible lifecycle
+                    // timestamp across every later update, tombstone, and
+                    // reinsert. The durable base, when present, may replace it
+                    // once more inside the canonical root writer.
+                    terminal.created_at = created_at;
+                    entry.insert(terminal);
+                }
+            }
         }
     }
     let deltas = terminal_by_key
@@ -448,4 +461,175 @@ where
 
 fn first_parent_commit_id(commit: &CommitRecord) -> Option<CommitId> {
     commit.parent_commit_ids.first().copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::LixTimestamp;
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
+
+    fn delta(
+        key: &str,
+        commit: &str,
+        created_millis: i64,
+        updated_millis: i64,
+        deleted: bool,
+    ) -> CommitRootRebuildDelta {
+        CommitRootRebuildDelta {
+            schema_key: "test_entity".to_owned(),
+            file_id: None,
+            entity_pk: EntityPk::single(key),
+            change_id: ChangeId::for_test_label(&format!("{commit}-{key}")),
+            commit_id: CommitId::for_test_label(commit),
+            deleted,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(created_millis),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(updated_millis),
+        }
+    }
+
+    fn plan(
+        commit: &str,
+        parent: Option<&str>,
+        deltas: Vec<CommitRootRebuildDelta>,
+    ) -> CommitRootRebuildPlan {
+        CommitRootRebuildPlan {
+            commit_id: CommitId::for_test_label(commit),
+            parent_commit_id: parent.map(CommitId::for_test_label),
+            deltas,
+        }
+    }
+
+    async fn sequential_and_collapsed_roots(
+        plans: &[CommitRootRebuildPlan],
+    ) -> (TrackedStateRootId, TrackedStateRootId) {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("test read should open");
+        let context = TrackedStateContext::new();
+
+        let mut sequential_writes = StorageWriteSet::new();
+        let mut sequential = context.writer(&read, &mut sequential_writes);
+        let mut sequential_report = None;
+        for plan in plans.iter().rev() {
+            sequential_report = Some(
+                stage_rebuild_plan_with_writer(&mut sequential, plan)
+                    .await
+                    .expect("sequential replay should stage"),
+            );
+        }
+
+        let mut collapsed_writes = StorageWriteSet::new();
+        let mut collapsed = context.writer(&read, &mut collapsed_writes);
+        let collapsed_report = try_stage_collapsed_rebuild_plans_with_writer(&mut collapsed, plans)
+            .await
+            .expect("collapsed replay should validate")
+            .expect("multi-plan ordinary replay should collapse");
+        (
+            sequential_report
+                .expect("sequential replay has a root")
+                .root_id,
+            collapsed_report.root_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn collapsed_replay_matches_sequential_lifecycle_roots() {
+        for terminal in [
+            delta("row", "second-update", 20, 20, false),
+            delta("row", "second-delete", 20, 20, true),
+        ] {
+            let plans = vec![
+                plan("second", Some("first"), vec![terminal]),
+                plan("first", None, vec![delta("row", "first", 10, 10, false)]),
+            ];
+            let (sequential, collapsed) = sequential_and_collapsed_roots(&plans).await;
+            assert_eq!(collapsed, sequential);
+        }
+
+        let plans = vec![
+            plan(
+                "third",
+                Some("second"),
+                vec![delta("row", "third", 30, 30, false)],
+            ),
+            plan(
+                "second",
+                Some("first"),
+                vec![delta("row", "second", 20, 20, true)],
+            ),
+            plan("first", None, vec![delta("row", "first", 10, 10, false)]),
+        ];
+        let (sequential, collapsed) = sequential_and_collapsed_roots(&plans).await;
+        assert_eq!(collapsed, sequential);
+    }
+
+    #[tokio::test]
+    async fn shared_rootless_suffixes_stage_independent_terminal_and_child_roots() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("test read should open");
+        let context = TrackedStateContext::new();
+        let mut writes = StorageWriteSet::new();
+        let mut writer = context.writer(&read, &mut writes);
+        let suffix = vec![
+            plan(
+                "suffix-new",
+                Some("suffix-old"),
+                vec![delta("shared-new", "suffix-new", 20, 20, false)],
+            ),
+            plan(
+                "suffix-old",
+                None,
+                vec![delta("shared-old", "suffix-old", 10, 10, false)],
+            ),
+        ];
+        let mut left = vec![plan(
+            "left",
+            Some("suffix-new"),
+            vec![delta("left", "left", 30, 30, false)],
+        )];
+        left.extend(suffix.clone());
+        let mut right = vec![plan(
+            "right",
+            Some("suffix-new"),
+            vec![delta("right", "right", 30, 30, false)],
+        )];
+        right.extend(suffix);
+
+        let left_report = try_stage_collapsed_rebuild_plans_with_writer(&mut writer, &left)
+            .await
+            .expect("left collapse should validate")
+            .expect("left collapse should stage");
+        let right_report = try_stage_collapsed_rebuild_plans_with_writer(&mut writer, &right)
+            .await
+            .expect("right collapse should validate")
+            .expect("right collapse should stage");
+        assert_ne!(left_report.root_id, right_report.root_id);
+
+        for (parent, child) in [("left", "left-child"), ("right", "right-child")] {
+            let child_delta = delta(child, child, 40, 40, false);
+            writer
+                .stage_commit_root(
+                    &CommitId::for_test_label(child).to_string(),
+                    Some(&CommitId::for_test_label(parent).to_string()),
+                    [TrackedStateDeltaRef {
+                        schema_key: &child_delta.schema_key,
+                        file_id: child_delta.file_id.as_deref(),
+                        entity_pk: &child_delta.entity_pk,
+                        change_id: child_delta.change_id,
+                        commit_id: child_delta.commit_id,
+                        deleted: child_delta.deleted,
+                        created_at: child_delta.created_at,
+                        updated_at: child_delta.updated_at,
+                    }],
+                )
+                .await
+                .expect("child should use its independently staged parent root");
+        }
+    }
 }
