@@ -427,6 +427,7 @@ async fn idempotency_payload_scenario(samples: &[usize], blob_bytes: usize, retu
             &usage(&fixture.storage).await,
         );
     }
+    fixture.flush();
 }
 
 /// Resumable-upload receipts. `keep` leaves every uploaded file live; `delete`
@@ -481,13 +482,24 @@ async fn uploads_scenario(samples: &[usize], bytes_per_upload: usize, delete: bo
 struct Fixture {
     storage: RocksDB,
     session: Arc<SessionContext<RocksDB>>,
-    _directory: tempfile::TempDir,
+    _directory: Option<tempfile::TempDir>,
 }
 
 impl Fixture {
+    /// Logical accounting is the default answer, so the fixture normally lives
+    /// in a temporary directory. Setting `LIX_EXPV_DIR` keeps the backend files
+    /// at a fixed path instead, which is what turns a logical byte curve into a
+    /// physical one (`flush`, then measure the directory).
     async fn open() -> Self {
-        let directory = tempfile::tempdir().expect("create RocksDB directory");
-        let storage = RocksDB::open(directory.path()).expect("open RocksDB");
+        let (directory, path) = match std::env::var_os("LIX_EXPV_DIR") {
+            Some(path) => (None, std::path::PathBuf::from(path)),
+            None => {
+                let directory = tempfile::tempdir().expect("create RocksDB directory");
+                let path = directory.path().to_path_buf();
+                (Some(directory), path)
+            }
+        };
+        let storage = RocksDB::open(&path).expect("open RocksDB");
         Engine::initialize(storage.clone())
             .await
             .expect("initialize repository");
@@ -501,6 +513,10 @@ impl Fixture {
             session: Arc::new(session),
             _directory: directory,
         }
+    }
+
+    fn flush(&self) {
+        self.storage.flush().expect("flush RocksDB");
     }
 }
 
