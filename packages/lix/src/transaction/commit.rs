@@ -5753,7 +5753,10 @@ async fn stage_tracked_roots(
             .await?
             .is_some()
         {
-            staged_rebuild_plan_ids.extend(plans.iter().map(|plan| plan.commit_id));
+            // A collapsed replay stages only its terminal root. Intermediate
+            // plan IDs remain unstaged so another rebuild parent sharing this
+            // suffix can independently collapse against immutable authority.
+            staged_rebuild_plan_ids.insert(plans[0].commit_id);
             continue;
         }
         for plan in plans.iter().rev() {
