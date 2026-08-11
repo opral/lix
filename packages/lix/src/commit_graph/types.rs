@@ -30,6 +30,8 @@ pub(crate) struct CommitGraphNode {
     pub(crate) account_id: String,
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
+    pub(crate) first_parent_jump_commit_id: CommitId,
+    pub(crate) first_parent_jump_span: u64,
     pub(crate) created_at: LixTimestamp,
 }
 

@@ -527,8 +527,9 @@ where
             "merge-base benchmark ancestry must be positive",
         ));
     }
-    let mut records = Vec::new();
-    let mut generations = std::collections::HashMap::new();
+    let mut records = Vec::<crate::changelog::CommitRecord>::new();
+    let mut generations = std::collections::HashMap::<crate::changelog::CommitId, u64>::new();
+    let mut record_indices = std::collections::HashMap::<crate::changelog::CommitId, usize>::new();
     let scenario_name = match scenario {
         MergeBaseBenchScenario::EqualHeads => "equal",
         MergeBaseBenchScenario::AncestorDescendant => "ancestor",
@@ -552,11 +553,23 @@ where
             .max()
             .map_or(0, |generation| generation.saturating_add(1));
         let commit_id = crate::changelog::CommitId::for_test_label(&label);
+        let parent = parents
+            .as_slice()
+            .first()
+            .and_then(|parent_id| record_indices.get(parent_id))
+            .map(|index| &records[*index]);
+        let parent_jump = parent
+            .and_then(|parent| record_indices.get(&parent.first_parent_jump_commit_id))
+            .map(|index| &records[*index]);
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation,
             parent_commit_ids: parents,
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -565,6 +578,7 @@ where
             ),
         });
         generations.insert(commit_id, generation);
+        record_indices.insert(commit_id, records.len() - 1);
         Ok(commit_id)
     };
 
