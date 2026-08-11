@@ -1061,11 +1061,13 @@ where
                 ]
             }),
     );
+    let mut history_dependencies = control_reachability.history_dependencies;
+    history_dependencies.extend(collect_ref_reachable_commit_ids(store, &chronology_roots).await?);
     load_authenticated_serving_dependency_closure(
         store,
         chronology_roots,
         control_reachability.serving_dependencies,
-        control_reachability.history_dependencies,
+        history_dependencies,
     )
     .await
 }
@@ -1092,6 +1094,38 @@ where
 /// live root at the head — genesis always is one, because engine-bootstrap rows
 /// authored at init stay live and keep naming it — froze every younger
 /// candidate behind it forever. Here a pinned candidate holds back only itself.
+/// Every commit reachable from the authenticated roots through canonical parent
+/// links.
+///
+/// This is the reachability the public history surfaces actually read: a
+/// `_history()` query walks the commit graph, so a projection on that chain is
+/// load-bearing no matter how far below the serving checkpoint it sits. The
+/// ledger expressed the same retention by pinning every checkpoint commit it
+/// had ever seen, forever, in a row it could never consume. Walking refs states
+/// it directly, costs one commit-record read per reachable commit, and shrinks
+/// as compaction shortens the chain.
+async fn collect_ref_reachable_commit_ids<S>(
+    store: &S,
+    roots: &BTreeSet<CommitId>,
+) -> Result<BTreeSet<CommitId>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let mut graph = CommitGraphContext::new().reader(store);
+    let mut reachable = BTreeSet::new();
+    let mut pending = roots.iter().copied().collect::<Vec<_>>();
+    while let Some(commit_id) = pending.pop() {
+        if !reachable.insert(commit_id) {
+            continue;
+        }
+        let Some(node) = graph.load_node(&commit_id).await? else {
+            continue;
+        };
+        pending.extend(node.parent_commit_ids.iter().copied());
+    }
+    Ok(reachable)
+}
+
 async fn derive_retirement_candidates<S>(store: &S) -> Result<Vec<CommitId>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
