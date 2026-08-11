@@ -140,6 +140,33 @@ impl TransactionJson {
         let invalid_arena = |message| LixError::new(LixError::CODE_INVALID_PARAM, message);
         let arena = SharedStr::from_utf8(Bytes::from(normalized))
             .map_err(|_| invalid_arena("certified transaction JSON arena is not UTF-8"))?;
+        Self::from_certified_row_content_shared_arena(arena, offsets)
+    }
+
+    /// Constructs certified row content from a UTF-8 arena assembled from
+    /// already-valid string fragments by an engine-owned producer.
+    ///
+    /// Offsets remain checked for full, contiguous coverage and UTF-8 scalar
+    /// boundaries. Only the redundant complete-buffer validation pass is
+    /// skipped.
+    /// # Safety
+    ///
+    /// `normalized` must contain valid UTF-8. Offset coverage and character
+    /// boundaries are still checked before any row view is constructed.
+    pub(crate) unsafe fn from_validated_certified_row_content_arena(
+        normalized: Vec<u8>,
+        offsets: Vec<(usize, usize)>,
+    ) -> Result<Vec<Self>, LixError> {
+        // SAFETY: upheld by the caller contract above.
+        let arena = unsafe { SharedStr::from_utf8_unchecked(Bytes::from(normalized)) };
+        Self::from_certified_row_content_shared_arena(arena, offsets)
+    }
+
+    fn from_certified_row_content_shared_arena(
+        arena: SharedStr,
+        offsets: Vec<(usize, usize)>,
+    ) -> Result<Vec<Self>, LixError> {
+        let invalid_arena = |message| LixError::new(LixError::CODE_INVALID_PARAM, message);
         let arena_len = u32::try_from(arena.len())
             .map_err(|_| invalid_arena("certified transaction JSON arena exceeds u32"))?;
         let mut previous_end = 0_u32;
@@ -2547,13 +2574,10 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
             *slots[position] = Some(TransactionJson::from_canonical_batch(row));
         }
     } else {
+        // SAFETY: every uncached row was written by serde_json and every
+        // cached row came from a previously validated TransactionJson.
         let normalized =
-            SharedStr::from_utf8(Bytes::from(normalized.into_bytes())).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!("{context} canonical JSON batch is not UTF-8"),
-                )
-            })?;
+            unsafe { SharedStr::from_utf8_unchecked(Bytes::from(normalized.into_bytes())) };
         for ((position, value), (start, end)) in positions.into_iter().zip(values).zip(offsets) {
             let normalized = normalized
                 .slice(start as usize..end as usize)
@@ -3694,8 +3718,9 @@ impl PreparedStateBatch {
             for (_, value) in &normalized {
                 arena.extend_from_slice(value.as_bytes());
             }
-            let arena = SharedStr::from_utf8(Bytes::from(arena))
-                .expect("validated canonical JSON arena remains UTF-8");
+            // SAFETY: this arena is the concatenation of validated SharedStr
+            // values and therefore remains UTF-8.
+            let arena = unsafe { SharedStr::from_utf8_unchecked(Bytes::from(arena)) };
             let mut offset = 0usize;
             for (_, value) in &mut normalized {
                 let end = offset + value.len();
