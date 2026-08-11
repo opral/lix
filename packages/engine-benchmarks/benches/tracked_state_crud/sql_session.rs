@@ -29,6 +29,33 @@ const GENERAL_AGGREGATE_SQL: &str = "SELECT COUNT(*) AS rows, MIN(path) AS first
     FROM json_pointer WHERE path IS NOT NULL";
 type SharedParameterBatch = PreparedDmlParameterBatch;
 
+/// Folds one public cell into an accumulator, reading the whole payload.
+///
+/// Every variant is walked byte by byte so a value that only *looks*
+/// materialized — a lazily decoded string, a JSON payload that still has to be
+/// realized, a blob that has not been copied yet — has to pay its real cost
+/// inside the timing window. The result is returned so nothing can be dropped
+/// as dead code.
+fn fold_value(accumulator: u64, value: &Value) -> u64 {
+    fn fold_bytes(mut accumulator: u64, tag: u8, bytes: &[u8]) -> u64 {
+        accumulator = accumulator.rotate_left(5) ^ u64::from(tag);
+        for byte in bytes {
+            accumulator = accumulator.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(*byte);
+        }
+        accumulator
+    }
+
+    match value {
+        Value::Null => fold_bytes(accumulator, 0, &[]),
+        Value::Boolean(value) => fold_bytes(accumulator, 1, &[u8::from(*value)]),
+        Value::Integer(value) => fold_bytes(accumulator, 2, &value.to_le_bytes()),
+        Value::Real(value) => fold_bytes(accumulator, 3, &value.to_bits().to_le_bytes()),
+        Value::Text(value) => fold_bytes(accumulator, 4, value.as_bytes()),
+        Value::Json(value) => fold_bytes(accumulator, 5, value.as_bytes()),
+        Value::Blob(value) => fold_bytes(accumulator, 6, value.as_bytes()),
+    }
+}
+
 fn empty_parameter_batch() -> SharedParameterBatch {
     PreparedDmlParameterBatch::from_rows(std::iter::empty::<Vec<Value>>())
         .expect("empty prepared parameter batch is valid")
@@ -535,6 +562,14 @@ impl SqlFixture {
         }
     }
 
+    pub(crate) async fn read_all_rows_consumed(&self) -> u64 {
+        match self {
+            Self::RocksDB(fixture) => fixture.read_all_rows_consumed().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_all_rows_consumed().await,
+        }
+    }
+
     pub(crate) async fn read_many_by_pk(&self) -> usize {
         match self {
             Self::RocksDB(fixture) => fixture.read_many_by_pk().await,
@@ -1011,6 +1046,30 @@ where
 
     async fn read_all_result(&self) -> ExecuteResult {
         execute(&self.session, &self.select_all_sql).await
+    }
+
+    /// `read_all` stops at `ExecuteResult::len()`. That does force row
+    /// materialization, but nothing ever looks *inside* a row, so per-cell
+    /// consumer costs stay unmeasured and a change that defers work past
+    /// result construction could still show a win here. This variant walks
+    /// every row and every cell and folds each one into an accumulator, so
+    /// no deferred per-cell work can hide behind the timing window.
+    async fn read_all_rows_consumed(&self) -> u64 {
+        let result = self.read_all_result().await;
+        assert_eq!(result.len(), self.visible_row_count);
+        let columns = result.columns().len();
+        let mut consumed = 0_u64;
+        let mut cells = 0_usize;
+        for row in result.rows() {
+            let values = row.values();
+            assert_eq!(values.len(), columns);
+            for value in values {
+                consumed = fold_value(consumed, value);
+                cells += 1;
+            }
+        }
+        assert_eq!(cells, self.visible_row_count * columns);
+        std::hint::black_box(consumed)
     }
 
     async fn read_many_by_pk(&self) -> usize {

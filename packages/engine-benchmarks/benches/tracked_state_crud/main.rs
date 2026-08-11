@@ -1289,6 +1289,16 @@ fn bench_sql_session(
             BatchSize::LargeInput,
         );
     });
+    group.bench_function(
+        format!("read_all_rows_consumed/{}", row_label(rows.len())),
+        |b| {
+            b.iter_batched_ref(
+                || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
+                |fixture| black_box(runtime.block_on(fixture.read_all_rows_consumed())),
+                BatchSize::LargeInput,
+            );
+        },
+    );
     group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),

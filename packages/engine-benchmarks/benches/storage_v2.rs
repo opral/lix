@@ -2008,7 +2008,7 @@ where
         .await?;
 
     loop {
-        let chunk = cursor.next_page(lix::storage::MAX_SCAN_PAGE_ROWS).await?;
+        let chunk = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
         let has_more = chunk.has_more;
         entries.extend(chunk.entries);
 
