@@ -1578,7 +1578,12 @@ mod tests {
                 panic!("manifest leaf scan must return values");
             };
             let leaf = decode_upload_manifest_leaf(&value).expect("decode manifest leaf");
-            assert_eq!(leaf.chunks.len(), FILE_UPLOAD_PART_BYTES / (1024 * 1024));
+            assert!(!leaf.chunks.is_empty());
+            assert_eq!(
+                leaf.chunks.iter().map(|chunk| chunk.size_bytes).sum::<u64>(),
+                FILE_UPLOAD_PART_BYTES as u64,
+                "a part's content-defined chunks must tile the part exactly"
+            );
         }
         drop(cursor);
         drop(read);
