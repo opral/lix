@@ -3028,19 +3028,11 @@ fn finite_query_float(value: f64) -> Result<Value, LixError> {
 
 fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Value, LixError> {
     if field.is_some_and(field_is_json) {
-        return serde_json::from_str::<serde_json::Value>(&value)
-            .map(Value::Json)
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_INVALID_JSON",
-                    format!(
-                        "column '{}' is marked as JSON but contains invalid JSON: {error}",
-                        field
-                            .map(|field| field.name().as_str())
-                            .unwrap_or("<unknown>")
-                    ),
-                )
-            });
+        // The write boundary canonicalizes every JSON payload before it reaches
+        // storage, and the projection decoder copies those bytes into Arrow
+        // verbatim. Re-parsing here only rebuilt a DOM that was immediately
+        // re-serialized, so the bytes are retained directly instead.
+        return Ok(Value::Json(crate::Json::from_canonical_text(value)));
     }
     Ok(Value::Text(value))
 }
@@ -5303,7 +5295,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("A".to_string()));
         assert_eq!(rows[0][1], Value::Integer(7));
-        assert_eq!(rows[0][2], Value::Json(json!(["entity-history"])));
+        assert_eq!(rows[0][2], Value::Json(json!(["entity-history"]).into()));
         assert!(matches!(rows[0][3], Value::Integer(_)));
     }
 
@@ -6565,7 +6557,7 @@ mod tests {
             &[
                 Value::Text("/multi/param-a.md".to_string()),
                 Value::Blob(b"param-a".to_vec().into()),
-                Value::Json(json!({"source": "json-param"})),
+                Value::Json(json!({"source": "json-param"}).into()),
                 Value::Text("/multi/param-b.md".to_string()),
                 Value::Blob(b"param-b".to_vec().into()),
                 Value::Text(r#"{"source":"text-param"}"#.to_string()),
@@ -6637,7 +6629,7 @@ mod tests {
         let params = [
             Value::Text("/docs/existing.md".to_string()),
             Value::Blob(b"updated".to_vec().into()),
-            Value::Json(json!({"source": "upload"})),
+            Value::Json(json!({"source": "upload"}).into()),
         ];
 
         let (fast_result, fast_path) =
@@ -6709,7 +6701,7 @@ mod tests {
             &[
                 Value::Text("/invalid.md".to_string()),
                 Value::Blob(b"content".to_vec().into()),
-                Value::Json(json!(["not", "an", "object"])),
+                Value::Json(json!(["not", "an", "object"]).into()),
             ],
             WriteExecutorMode::ForceFast,
         )
@@ -7556,7 +7548,7 @@ mod tests {
         let sql = "UPDATE lix_file SET content = $1, lixcol_metadata = $2 WHERE id = $3";
         let params = [
             Value::Blob(b"parameterized".to_vec().into()),
-            Value::Json(serde_json::json!({"source": "git"})),
+            Value::Json(serde_json::json!({"source": "git"}).into()),
             Value::Text("01920000-0000-7000-8000-0000000000d2".to_string()),
         ];
 
@@ -8287,7 +8279,7 @@ mod tests {
                 assert_eq!(result.columns, vec!["value", "lixcol_entity_pk"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
-                assert_eq!(result.rows[0][1], Value::Json(json!(["entity-a"])));
+                assert_eq!(result.rows[0][1], Value::Json(json!(["entity-a"]).into()));
             })
         });
     }

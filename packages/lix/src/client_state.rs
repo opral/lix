@@ -112,7 +112,7 @@ where
                 SET_SQL,
                 &[
                     Value::Text(physical_key(key)?),
-                    Value::Json(value),
+                    Value::Json(value.into()),
                     Value::Text(GLOBAL_BRANCH_ID.to_string()),
                 ],
             )
@@ -162,7 +162,7 @@ fn value_to_json(value: &Value) -> Result<JsonValue, LixError> {
                 )
             }),
         Value::Text(value) => Ok(JsonValue::String(value.clone())),
-        Value::Json(value) => Ok(value.clone()),
+        Value::Json(value) => Ok(value.to_value()),
         Value::Blob(_) => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "client state value was a blob instead of JSON",

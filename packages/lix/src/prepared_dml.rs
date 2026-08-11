@@ -283,7 +283,7 @@ mod tests {
             Value::Integer(7),
             Value::Real(1.5),
             Value::Text("text".to_string()),
-            Value::Json(serde_json::json!({"ok": true})),
+            Value::Json(serde_json::json!({"ok": true}).into()),
             Value::Blob(Blob::from(vec![1_u8, 2, 3])),
         ]])
         .expect("rectangular parameter batch");

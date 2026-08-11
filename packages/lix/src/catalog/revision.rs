@@ -159,7 +159,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema \
                  (value, lixcol_global, lixcol_untracked) VALUES ($1, false, true)",
-                &[Value::Json(test_schema("rolled_back_schema", false))],
+                &[Value::Json(test_schema("rolled_back_schema", false).into())],
             )
             .await
             .expect("rolled-back schema should stage");
@@ -194,7 +194,7 @@ mod tests {
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
                  WHERE lixcol_entity_pk = lix_json('[\"tracked_revision_probe\"]')",
-                &[Value::Json(test_schema("tracked_revision_probe", true))],
+                &[Value::Json(test_schema("tracked_revision_probe", true).into())],
             )
             .await
             .expect("compatible tracked schema amendment should commit");
@@ -441,7 +441,7 @@ mod tests {
              (value, lixcol_global, lixcol_untracked) VALUES ($1, false, {untracked})"
         );
         session
-            .execute(&sql, &[Value::Json(test_schema(schema_key, false))])
+            .execute(&sql, &[Value::Json(test_schema(schema_key, false).into())])
             .await
             .expect("schema registration should commit");
     }

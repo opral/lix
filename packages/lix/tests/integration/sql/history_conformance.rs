@@ -162,7 +162,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
         vec![
             Value::Null,
             Value::Null,
-            Value::Json(serde_json::json!(["history-conformance-entity"])),
+            Value::Json(serde_json::json!(["history-conformance-entity"]).into()),
             Value::Null,
             Value::Integer(0),
         ]
@@ -212,18 +212,18 @@ simulation_test!(
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
                     Value::Null,
-                    Value::Json(serde_json::json!(["history-pk-backfill"])),
+                    Value::Json(serde_json::json!(["history-pk-backfill"]).into()),
                     Value::Null,
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
-                    Value::Json(serde_json::json!("one")),
-                    Value::Json(serde_json::json!(["history-pk-backfill"])),
+                    Value::Json(serde_json::json!("one").into()),
+                    Value::Json(serde_json::json!(["history-pk-backfill"]).into()),
                     Value::Json(serde_json::json!({
                         "key": "history-pk-backfill",
                         "value": "one"
-                    })),
+                    }).into()),
                     Value::Integer(1),
                 ],
             ]
@@ -302,7 +302,7 @@ simulation_test!(
                         "namespace": "messages",
                         "id": "7",
                         "value": "one"
-                    })),
+                    }).into()),
                     Value::Integer(1),
                 ],
             ]
@@ -370,7 +370,7 @@ simulation_test!(
                     Value::Json(serde_json::json!({
                         "tenant": "acme",
                         "id": "7"
-                    })),
+                    }).into()),
                     Value::Null,
                     Value::Null,
                     Value::Integer(0),
@@ -379,7 +379,7 @@ simulation_test!(
                     Value::Json(serde_json::json!({
                         "tenant": "acme",
                         "id": "7"
-                    })),
+                    }).into()),
                     Value::Text("one".to_string()),
                     Value::Json(serde_json::json!({
                         "identity": {
@@ -387,7 +387,7 @@ simulation_test!(
                             "id": "7"
                         },
                         "value": "one"
-                    })),
+                    }).into()),
                     Value::Integer(1),
                 ],
             ]
@@ -455,7 +455,7 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Json(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"])),
+                Value::Json(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"]).into()),
                 Value::Boolean(true),
                 Value::Integer(0),
             ]]
@@ -514,7 +514,7 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Json(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"])),
+                Value::Json(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"]).into()),
                 Value::Boolean(true),
                 Value::Integer(0),
             ]]
@@ -577,7 +577,7 @@ simulation_test!(
                 .collect::<Vec<_>>(),
             vec![Value::Json(
                 json!({"key": "history-join-anchor", "value": "one"})
-            )]
+            .into())]
         );
 
         let nullable_side = session
@@ -601,7 +601,7 @@ simulation_test!(
                 .collect::<Vec<_>>(),
             vec![vec![Value::Json(
                 json!({"key": "history-join-anchor", "value": "one"})
-            ),]]
+            .into()),]]
         );
 
         let right_nullable_side = session
@@ -625,7 +625,7 @@ simulation_test!(
                 .collect::<Vec<_>>(),
             vec![vec![Value::Json(
                 json!({"key": "history-join-anchor", "value": "one"})
-            ),]]
+            .into()),]]
         );
 
         let semi_join = session
@@ -649,7 +649,7 @@ simulation_test!(
                 .collect::<Vec<_>>(),
             vec![vec![Value::Json(
                 json!({"key": "history-join-anchor", "value": "one"})
-            ),]]
+            .into()),]]
         );
 
         let projected = session
@@ -674,7 +674,7 @@ simulation_test!(
                 .collect::<Vec<_>>(),
             vec![Value::Json(
                 json!({"key": "history-join-anchor", "value": "one"})
-            )]
+            .into())]
         );
     }
 );
@@ -807,12 +807,12 @@ simulation_test!(
                 vec![
                     Value::Text(first_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Json(json!({"key": "history-multi-start", "value": "one"})),
+                    Value::Json(json!({"key": "history-multi-start", "value": "one"}).into()),
                 ],
                 vec![
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Json(json!({"key": "history-multi-start", "value": "two"})),
+                    Value::Json(json!({"key": "history-multi-start", "value": "two"}).into()),
                 ],
             ],
             "multiple history function calls can be unioned"

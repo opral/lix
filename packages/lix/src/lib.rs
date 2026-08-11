@@ -116,7 +116,7 @@ pub use schema::{
 };
 
 pub use common::LixError;
-pub use common::{Blob, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
+pub use common::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};

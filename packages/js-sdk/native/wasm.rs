@@ -750,7 +750,7 @@ impl TryFrom<&Value> for LixValueDto {
             }
             Value::Real(_) => return Err(invalid_param("cannot encode non-finite real value")),
             Value::Text(value) => ("text", Some(serde_json::json!(value)), None),
-            Value::Json(value) => ("json", Some(value.clone()), None),
+            Value::Json(value) => ("json", Some(value.to_value()), None),
             Value::Blob(value) => ("blob", None, Some(ByteBuf::from(value.to_vec()))),
         };
         Ok(Self {

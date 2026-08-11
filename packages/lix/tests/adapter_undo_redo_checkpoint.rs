@@ -22,7 +22,7 @@ where
         .and_then(|row| row.get::<Value>("value").ok())
         .and_then(|value| match value {
             Value::Text(value) => Some(value),
-            Value::Json(value) => value.as_str().map(ToOwned::to_owned),
+            Value::Json(value) => value.as_json_string(),
             _ => None,
         })
 }

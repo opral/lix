@@ -36,7 +36,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
                 "INSERT INTO bundle (id, declarations) VALUES ($1, $2)",
                 &[
                     Value::Text(bundle.to_string()),
-                    Value::Json(serde_json::json!([])),
+                    Value::Json(serde_json::json!([]).into()),
                 ],
             )
             .await
@@ -132,7 +132,7 @@ async fn insert_message_variant(session: &SessionContext, message_id: &str, bund
                 Value::Text(message_id.to_string()),
                 Value::Text(bundle_id.to_string()),
                 Value::Text("locale".to_string()),
-                Value::Json(serde_json::json!([])),
+                Value::Json(serde_json::json!([]).into()),
             ],
         )
         .await
@@ -143,8 +143,8 @@ async fn insert_message_variant(session: &SessionContext, message_id: &str, bund
             &[
                 Value::Text(format!("{message_id}-0")),
                 Value::Text(message_id.to_string()),
-                Value::Json(serde_json::json!([])),
-                Value::Json(serde_json::json!([])),
+                Value::Json(serde_json::json!([]).into()),
+                Value::Json(serde_json::json!([]).into()),
             ],
         )
         .await
