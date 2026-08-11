@@ -3024,6 +3024,12 @@ fn fill_batch_window(
             ),
         ));
     }
+    if window.is_empty() {
+        // An empty batch still has to pass the arity check above, but it owns
+        // no arena cells, and a stride starting past the end of an empty
+        // window is not a valid slice range.
+        return Ok(());
+    }
     for (column_index, array) in batch.columns().iter().enumerate() {
         let cursor = column_cursor(result_fields.get(column_index), array.as_ref())?;
         cursor.fill_column(window, width, column_index)?;
