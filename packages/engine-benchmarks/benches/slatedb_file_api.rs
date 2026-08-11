@@ -1467,7 +1467,7 @@ fn file_bytes(index: usize) -> Vec<u8> {
 }
 
 fn file_metadata() -> Value {
-    Value::Json(json!({ "size": FILE_SIZE_BYTES }))
+    Value::Json(json!({ "size": FILE_SIZE_BYTES }).into())
 }
 
 fn upload_file_bytes(version: u64) -> Vec<u8> {
@@ -1494,10 +1494,13 @@ fn seed_upload_batch_size() -> usize {
 }
 
 fn upload_file_metadata(version: u64) -> Value {
-    Value::Json(json!({
-        "bench_version": version,
-        "size": FILE_SIZE_BYTES,
-    }))
+    Value::Json(
+        json!({
+            "bench_version": version,
+            "size": FILE_SIZE_BYTES,
+        })
+        .into(),
+    )
 }
 
 fn object_store_handle(object_store: &Arc<DelayedObjectStore>) -> Arc<dyn ObjectStore> {

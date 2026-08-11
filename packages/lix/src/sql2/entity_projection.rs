@@ -602,7 +602,7 @@ mod tests {
             arrow_rows[0],
             vec![
                 Value::Text("line\nquote: \"".to_string()),
-                Value::Json(json!({"a": "value", "z": [true, null]})),
+                Value::Json(json!({"a": "value", "z": [true, null]}).into()),
                 Value::Integer(7),
                 Value::Real(4.5),
                 Value::Boolean(true),

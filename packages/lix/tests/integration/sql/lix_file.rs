@@ -2836,7 +2836,7 @@ simulation_test!(
                 &[
                     Value::Text("/equal-metadata.bin".to_string()),
                     Value::Blob(b"before".to_vec().into()),
-                    Value::Json(metadata.clone()),
+                    Value::Json(metadata.clone().into()),
                 ],
             )
             .await
@@ -2858,7 +2858,7 @@ simulation_test!(
                 &[
                     Value::Text("/equal-metadata.bin".to_string()),
                     Value::Blob(b"after".to_vec().into()),
-                    Value::Json(metadata.clone()),
+                    Value::Json(metadata.clone().into()),
                 ],
             )
             .await
@@ -2878,7 +2878,7 @@ simulation_test!(
             .expect("updated file should load");
         assert_eq!(
             current.rows()[0].values(),
-            &[Value::Blob(b"after".to_vec().into()), Value::Json(metadata),]
+            &[Value::Blob(b"after".to_vec().into()), Value::Json(metadata.into()),]
         );
         assert_eq!(
             file_descriptor_event_count(&session, &commit_id, file_id).await,
@@ -2909,7 +2909,7 @@ simulation_test!(
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
                     Value::Blob(b"one".to_vec().into()),
-                    Value::Json(json!({"version": 1})),
+                    Value::Json(json!({"version": 1}).into()),
                 ],
             )
             .await
@@ -2931,7 +2931,7 @@ simulation_test!(
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
                     Value::Blob(b"two".to_vec().into()),
-                    Value::Json(json!({"version": 2})),
+                    Value::Json(json!({"version": 2}).into()),
                 ],
             )
             .await
@@ -3027,6 +3027,7 @@ async fn file_descriptor_event_count(
     else {
         panic!("file history source changes should be JSON");
     };
+    let source_changes = source_changes.to_value();
     source_changes
         .as_array()
         .expect("file history source changes should be an array")

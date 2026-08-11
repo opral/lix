@@ -2846,8 +2846,9 @@ fn eval_fast_file_metadata(
             Some(Value::Null) => return Ok(None),
             Some(Value::Text(value)) => parse_row_metadata_value(value, "lix_file")?,
             Some(Value::Json(value)) => {
-                validate_row_metadata(value, "lix_file")?;
-                value.clone()
+                let value = value.to_value();
+                validate_row_metadata(&value, "lix_file")?;
+                value
             }
             Some(_) => {
                 return Err(LixError::new(
@@ -3789,7 +3790,7 @@ fn entity_returning_value(
                 Value::Null
             }
             EntityEvalValue::SqlText(value) => Value::Text(value),
-            EntityEvalValue::Json(value) => Value::Json(value),
+            EntityEvalValue::Json(value) => Value::Json(value.into()),
         });
     }
     if let Some(column) = visible_entity_column(expr, spec) {
@@ -3816,7 +3817,7 @@ fn entity_returning_value(
             .or_else(|| value.as_f64().map(Value::Real))
             .unwrap_or_else(|| Value::Text(value.to_string())),
         EntityEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
-            Value::Json(value)
+            Value::Json(value.into())
         }
     })
 }
@@ -7003,7 +7004,7 @@ fn value_json(value: &Value) -> JsonValue {
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         Value::Text(value) => JsonValue::String(value.clone()),
-        Value::Json(value) => value.clone(),
+        Value::Json(value) => value.to_value(),
         Value::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
         }

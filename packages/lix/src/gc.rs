@@ -6898,7 +6898,7 @@ mod tests {
             )
             .await
             .expect("live untracked value should remain readable after GC");
-        assert_eq!(visible.rows()[0].values(), &[Value::Json(new_value)]);
+        assert_eq!(visible.rows()[0].values(), &[Value::Json(new_value.into())]);
     }
 
     #[tokio::test]
@@ -7310,7 +7310,7 @@ mod tests {
             )
             .await
             .expect("tracked owner should remain readable");
-        assert_eq!(tracked.rows()[0].values(), &[Value::Json(shared_value)]);
+        assert_eq!(tracked.rows()[0].values(), &[Value::Json(shared_value.into())]);
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use crate::{LixError, LixNotice, SqlQueryResult, Value};
+use crate::{Json, LixError, LixNotice, SqlQueryResult, Value};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,7 @@ pub enum WireValue {
     Int { value: i64 },
     Float { value: f64 },
     Text { value: String },
-    Json { value: serde_json::Value },
+    Json { value: Json },
     Blob { base64: String },
 }
 
@@ -134,7 +134,7 @@ mod tests {
             Value::Integer(42),
             Value::Real(1.5),
             Value::Text("hello".to_string()),
-            Value::Json(json!({"hello": "world"})),
+            Value::Json(json!({"hello": "world"}).into()),
             Value::Blob(vec![1, 2, 3].into()),
         ];
 
@@ -185,7 +185,7 @@ mod tests {
                     value: "hello".to_string(),
                 },
                 WireValue::Json {
-                    value: json!({"hello": "world"}),
+                    value: json!({"hello": "world"}).into(),
                 },
                 WireValue::Blob {
                     base64: "AQI=".to_string(),

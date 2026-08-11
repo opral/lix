@@ -501,7 +501,7 @@ async fn seed_state_rows(lix: &Lix<SlateDB>) {
                     "ordinal": index,
                     "label": format!("state row {index:05}"),
                     "active": true,
-                })),
+                }).into()),
             ],
         })
         .collect::<Vec<_>>();
@@ -990,7 +990,7 @@ async fn update_state_row(lix: &Lix<SlateDB>, revision: u64) {
                 "ordinal": 5_000,
                 "revision": revision,
                 "active": revision.is_multiple_of(2),
-            })),
+            }).into()),
             Value::Text(STATE_UPDATE_KEY.to_string()),
         ],
     )

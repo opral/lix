@@ -1400,7 +1400,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("6469722d-7061-8468-8d6d-657461000000".to_string()),
-                Value::Json(json!({"version": 2})),
+                Value::Json(json!({"version": 2}).into()),
             ]],
         );
     }
@@ -1599,7 +1599,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("6469722d-676c-8f62-816c-2d7061746800".to_string()),
-                Value::Json(json!({"version": 2})),
+                Value::Json(json!({"version": 2}).into()),
                 Value::Boolean(true),
                 Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             ]],

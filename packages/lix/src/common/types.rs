@@ -324,6 +324,135 @@ impl<'de> serde::Deserialize<'de> for SharedStr {
     }
 }
 
+/// Canonical JSON text carried by a SQL value.
+///
+/// Every JSON payload the engine accepts is normalized to serde_json's stable
+/// compact form at the write boundary, and the entity projection decoder hands
+/// those exact bytes to Arrow as UTF-8. A JSON result column is therefore
+/// already the byte string a caller receives, so `Json` retains the bytes
+/// instead of rebuilding a `serde_json::Value` DOM for every row on every scan.
+#[derive(Clone)]
+pub struct Json(SharedStr);
+
+impl Json {
+    /// Retains canonical JSON text without re-validating it.
+    ///
+    /// Only engine-produced text may take this constructor. Public input is
+    /// canonicalized before it reaches storage, so re-parsing on read would
+    /// only re-prove what the write boundary already proved.
+    pub fn from_canonical_text(text: impl Into<SharedStr>) -> Self {
+        Self(text.into())
+    }
+
+    /// Parses arbitrary JSON text into canonical form.
+    pub fn parse(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str::<serde_json::Value>(text).map(Self::from)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub fn as_shared_str(&self) -> &SharedStr {
+        &self.0
+    }
+
+    pub fn into_shared_str(self) -> SharedStr {
+        self.0
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0.as_str() == "null"
+    }
+
+    /// Returns the decoded string when this payload is a JSON string.
+    pub fn as_json_string(&self) -> Option<String> {
+        match self.to_value() {
+            serde_json::Value::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Materializes the DOM for callers that must inspect JSON structure.
+    ///
+    /// This is the opt-in cost. Row plumbing, the wire encoder, and the JS
+    /// bridges all stay on the text representation and never call it.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::from_str(self.0.as_str())
+            .expect("canonical JSON text retained by Json is valid JSON")
+    }
+}
+
+impl From<serde_json::Value> for Json {
+    fn from(value: serde_json::Value) -> Self {
+        Self(SharedStr::from(value.to_string()))
+    }
+}
+
+impl From<&serde_json::Value> for Json {
+    fn from(value: &serde_json::Value) -> Self {
+        Self(SharedStr::from(value.to_string()))
+    }
+}
+
+impl From<Json> for serde_json::Value {
+    fn from(value: Json) -> Self {
+        value.to_value()
+    }
+}
+
+impl PartialEq for Json {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Json {}
+
+impl PartialEq<serde_json::Value> for Json {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        &self.to_value() == other
+    }
+}
+
+impl fmt::Debug for Json {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Json({})", self.0.as_str())
+    }
+}
+
+impl fmt::Display for Json {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0.as_str())
+    }
+}
+
+impl serde::Serialize for Json {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // `RawValue` emits the retained bytes verbatim, so the wire encoding is
+        // identical to what re-serializing the DOM produced.
+        serde_json::value::RawValue::from_string(self.0.as_str().to_owned())
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Json {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde_json::Value::deserialize(deserializer).map(Self::from)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
@@ -331,7 +460,7 @@ pub enum Value {
     Integer(i64),
     Real(f64),
     Text(String),
-    Json(serde_json::Value),
+    Json(Json),
     Blob(Blob),
 }
 

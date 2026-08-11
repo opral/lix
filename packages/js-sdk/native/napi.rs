@@ -1803,7 +1803,7 @@ impl TryFrom<LixValue> for Value {
                         LixError::new(LixError::CODE_INVALID_PARAM, "text value must be a string")
                     })?,
             )),
-            "json" => Ok(Self::Json(value.value.unwrap_or(serde_json::Value::Null))),
+            "json" => Ok(Self::Json(value.value.unwrap_or(serde_json::Value::Null).into())),
             "blob" => {
                 let bytes = value.blob.ok_or_else(|| {
                     LixError::new(
@@ -1861,7 +1861,7 @@ impl TryFrom<&Value> for LixValue {
             }),
             Value::Json(value) => Ok(Self {
                 kind: "json".to_string(),
-                value: Some(value.clone()),
+                value: Some(value.to_value()),
                 blob: None,
             }),
             Value::Blob(value) => Ok(Self {
