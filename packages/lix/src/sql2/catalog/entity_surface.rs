@@ -10,7 +10,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
     HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT,
+    HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY,
 };
 use crate::sql2::result_metadata::{json_field, mark_json_field};
 
@@ -418,7 +418,6 @@ pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
             json_field(HISTORY_COL_ENTITY_PK, false),
             Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
             Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
-            json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
             json_field(HISTORY_COL_METADATA, true),
             Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
             Field::new(HISTORY_COL_CHANGE_CREATED_AT, DataType::Utf8, false),
@@ -435,7 +434,6 @@ pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
         json_field("lixcol_entity_pk", true),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
-        json_field("lixcol_snapshot_content", true),
         json_field("lixcol_metadata", true),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
