@@ -7,19 +7,22 @@ use std::time::Instant;
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::ScanArgs;
-use datafusion::common::{DataFusionError, internal_err};
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DataFusionError, TableReference, internal_err};
 use datafusion::dataframe::DataFrame;
-use datafusion::datasource::source_as_provider;
+use datafusion::datasource::empty::EmptyTable;
+use datafusion::datasource::{provider_as_source, source_as_provider};
 use datafusion::error::Result;
 use datafusion::execution::SessionState;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{LogicalPlan, TableSource};
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, EmissionType};
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::limit::LimitStream;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -30,7 +33,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use tokio::sync::OnceCell;
 
 use crate::catalog::CatalogFingerprint;
-use crate::sql2::{PhysicalReadPlanCacheKey, SqlPlanningCache};
+use crate::sql2::{CachedPhysicalRead, PhysicalReadPlanCacheKey, SqlPlanningCache};
 
 use super::providers::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 
@@ -43,10 +46,12 @@ pub(crate) async fn collect_dataframe(
     dataframe: DataFrame,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Vec<RecordBatch>> {
-    let task_ctx = Arc::new(dataframe.task_ctx());
+    let (state, logical_plan) = dataframe.into_parts();
+    let task_ctx = execution_task_context(&state);
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan = create_or_rebind_physical_plan(dataframe, physical_planning_cache).await?;
+    let plan =
+        create_or_rebind_physical_plan(&state, logical_plan, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -77,10 +82,12 @@ pub(crate) async fn stream_dataframe(
     dataframe: DataFrame,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<SendableRecordBatchStream> {
-    let task_ctx = Arc::new(dataframe.task_ctx());
+    let (state, logical_plan) = dataframe.into_parts();
+    let task_ctx = execution_task_context(&state);
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan = create_or_rebind_physical_plan(dataframe, physical_planning_cache).await?;
+    let plan =
+        create_or_rebind_physical_plan(&state, logical_plan, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -92,25 +99,54 @@ pub(crate) async fn stream_dataframe(
     stream_adapted_input_plan(plan, task_ctx)
 }
 
+/// Builds the execution context for one statement without copying the session
+/// function registries.
+///
+/// `TaskContext`'s registries exist for plan deserialization. Physical
+/// expressions already own an `Arc` to every function they call, and Lix never
+/// resolves a function by name during execution, so cloning several hundred
+/// `String` keys per query would be pure overhead.
+fn execution_task_context(state: &SessionState) -> Arc<TaskContext> {
+    Arc::new(TaskContext::new(
+        None,
+        state.session_id().to_string(),
+        state.config().clone(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        Arc::clone(state.runtime_env()),
+    ))
+}
+
 async fn create_or_rebind_physical_plan(
-    dataframe: DataFrame,
+    state: &SessionState,
+    logical_plan: LogicalPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let Some((cache, key)) = physical_planning_cache else {
-        return dataframe.create_physical_plan().await;
+        return state.create_physical_plan(&logical_plan).await;
     };
-    let Some(template) = cache.physical_read_plan(&key) else {
-        let plan = dataframe.create_physical_plan().await?;
-        if let Some(template) = detach_physical_plan_template(Arc::clone(&plan)) {
-            cache.remember_physical_read_plan(key, template);
+    let Some(cached) = cache.physical_read_plan(&key) else {
+        let optimized = state.optimize(&logical_plan)?;
+        let plan = state
+            .query_planner()
+            .create_physical_plan(&optimized, state)
+            .await?;
+        if let Some(template) = detach_physical_plan_template(Arc::clone(&plan))
+            && let Some(optimized) = detach_logical_plan_sources(optimized)
+        {
+            cache.remember_physical_read_plan(key, CachedPhysicalRead { optimized, template });
         }
         return Ok(plan);
     };
 
-    let (state, logical_plan) = dataframe.into_parts();
-    let optimized = state.optimize(&logical_plan)?;
-    if let Some(replacements) = plan_current_spec_scans(&optimized, &state).await?
-        && let Some(plan) = rebind_physical_plan_template(template, replacements)
+    // Warm path. The optimized plan is reused verbatim, so DataFusion's
+    // analyzer and logical optimizer never run again for this statement shape;
+    // only the snapshot-bound table sources are grafted back on.
+    if let Some(optimized) = rebind_logical_plan_sources(&cached.optimized, &logical_plan)
+        && let Some(replacements) = plan_current_spec_scans(&optimized, state).await?
+        && let Some(plan) =
+            rebind_physical_plan_template(Arc::clone(&cached.template), replacements)
     {
         return Ok(plan);
     }
@@ -119,10 +155,68 @@ async fn create_or_rebind_physical_plan(
     // invalidates the detached template before execution. Fall back to the
     // ordinary DataFusion planner for this statement and evict the stale entry.
     cache.forget_physical_read_plan(&key);
+    let optimized = state.optimize(&logical_plan)?;
     state
         .query_planner()
-        .create_physical_plan(&optimized, &state)
+        .create_physical_plan(&optimized, state)
         .await
+}
+
+/// Replaces every table source with an empty stand-in of the same schema.
+///
+/// Cached plans must not retain a provider bound to the storage snapshot that
+/// planned them.
+fn detach_logical_plan_sources(plan: LogicalPlan) -> Option<LogicalPlan> {
+    plan.transform_up(|node| {
+        let LogicalPlan::TableScan(mut scan) = node else {
+            return Ok(Transformed::no(node));
+        };
+        scan.source = provider_as_source(Arc::new(EmptyTable::new(scan.source.schema())));
+        Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+    })
+    .map(|transformed| transformed.data)
+    .ok()
+}
+
+/// Grafts the current snapshot's table sources onto a cached optimized plan.
+///
+/// Sources are taken from the freshly bound plan for the same statement, which
+/// already resolved them against the live read session. A cached plan that
+/// references a table the current plan does not provide is treated as stale.
+fn rebind_logical_plan_sources(
+    cached: &LogicalPlan,
+    current: &LogicalPlan,
+) -> Option<LogicalPlan> {
+    let mut sources: HashMap<TableReference, Arc<dyn TableSource>> = HashMap::new();
+    collect_logical_table_sources(current, &mut sources);
+    cached
+        .clone()
+        .transform_up(|node| {
+            let LogicalPlan::TableScan(mut scan) = node else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(source) = sources.get(&scan.table_name) else {
+                return internal_err!("cached SQL plan provider is unavailable");
+            };
+            scan.source = Arc::clone(source);
+            Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+        })
+        .map(|transformed| transformed.data)
+        .ok()
+}
+
+fn collect_logical_table_sources(
+    plan: &LogicalPlan,
+    sources: &mut HashMap<TableReference, Arc<dyn TableSource>>,
+) {
+    if let LogicalPlan::TableScan(scan) = plan {
+        sources
+            .entry(scan.table_name.clone())
+            .or_insert_with(|| Arc::clone(&scan.source));
+    }
+    for input in plan.inputs() {
+        collect_logical_table_sources(input, sources);
+    }
 }
 
 fn collect_logical_table_scans(
@@ -167,14 +261,29 @@ async fn plan_current_spec_scans(
     Ok(Some(replacements))
 }
 
+/// Operators a reusable template may contain.
+///
+/// Every entry must rebuild into a fresh operator that carries no state from a
+/// prior execution. `SortExec` qualifies only without a fetch: a top-k sort
+/// owns a shared dynamic filter that its ordinary clone deliberately keeps
+/// alive, so it is rejected rather than rebuilt.
+fn template_operator_is_reusable(plan: &dyn ExecutionPlan) -> bool {
+    match plan.name() {
+        "ProjectionExec" | "HashJoinExec" | "FilterExec" | "CooperativeExec"
+        | "CoalesceBatchesExec" | "CoalescePartitionsExec" | "SortPreservingMergeExec" => true,
+        "SortExec" => plan
+            .as_any()
+            .downcast_ref::<SortExec>()
+            .is_some_and(|sort| sort.fetch().is_none()),
+        _ => false,
+    }
+}
+
 fn detach_physical_plan_template(plan: Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     if let Some(scan) = plan.as_any().downcast_ref::<SpecScanExec>() {
         return Some(Arc::new(DetachedSpecScanExec::new(scan)));
     }
-    if !matches!(
-        plan.name(),
-        "ProjectionExec" | "HashJoinExec" | "FilterExec" | "CooperativeExec"
-    ) {
+    if !template_operator_is_reusable(plan.as_ref()) {
         return None;
     }
     let children = plan
@@ -229,6 +338,20 @@ fn rebuild_template_node(
             .reset_state()
             .build_exec()
             .ok();
+    }
+    if let Some(sort) = plan.as_any().downcast_ref::<SortExec>() {
+        // `SortExec::with_new_children` clones the operator, which shares its
+        // metrics set and top-k dynamic filter with the template. Build a fresh
+        // sort instead; `template_operator_is_reusable` already excluded the
+        // fetch variants that own a dynamic filter.
+        if sort.fetch().is_some() {
+            return None;
+        }
+        let [child] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).ok()?;
+        return Some(Arc::new(
+            SortExec::new(sort.expr().clone(), child)
+                .with_preserve_partitioning(sort.preserve_partitioning()),
+        ));
     }
     plan.with_new_children(children).ok()
 }
