@@ -490,6 +490,22 @@ fn encode_stored_json_payload(encoded_json: &TestStoredJson) -> Vec<u8> {
     encoded_json.stored_bytes.clone()
 }
 
+/// Decodes one stored JSON row back to its exact JSON text.
+///
+/// The audit tooling needs this to recompute the row's content address from
+/// the bytes on disk, independently of any in-memory ref.
+#[cfg(feature = "storage-benches")]
+pub(crate) fn decode_stored_json(bytes: &[u8]) -> Result<Bytes, LixError> {
+    let stored_payload = decode_stored_json_payload(Bytes::copy_from_slice(bytes))?;
+    match stored_payload.codec {
+        JsonCodec::Raw => Ok(stored_payload.data),
+        JsonCodec::Zstd => {
+            decode_json_zstd_payload(&stored_payload.data, stored_payload.uncompressed_len, "audit")
+                .map(Bytes::from)
+        }
+    }
+}
+
 #[expect(clippy::cast_possible_truncation)]
 fn decode_stored_json_payload(bytes: Bytes) -> Result<StoredJsonPayload, LixError> {
     if bytes.len() < STORED_JSON_HEADER_LEN {

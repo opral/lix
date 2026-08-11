@@ -680,7 +680,12 @@ mod tests {
         // The point write keeps the compact current-state certificate,
         // publishes its authenticated branch/control and reachability state,
         // and rotates the mandatory binary-CAS publication/reclamation epoch.
+        // The write set touches eleven spaces, not twelve: the binary-CAS
+        // epoch and the tracked mutation fence are now two keys in the one
+        // revision space rather than two separate spaces.
         assert_eq!(point_update.staged_puts, 12, "{point_update:?}");
+        assert_eq!(point_update.touched_spaces, 11, "{point_update:?}");
+        assert_eq!(point_update.put_batches, 11, "{point_update:?}");
 
         // A sparse overlay deliberately invalidates the complete-generation
         // digest, so use a fresh fixture to exercise exact bulk replacement

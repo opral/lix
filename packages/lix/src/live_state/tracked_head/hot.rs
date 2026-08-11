@@ -9745,6 +9745,21 @@ fn packed_working_diff_version(
     }
 }
 
+/// Counts which of the two working-diff read paths served a request, so the
+/// public-surface equivalence test can prove it exercised both instead of
+/// silently comparing one path against itself.
+#[cfg(test)]
+pub(crate) static WORKING_DIFF_PATH_HITS: WorkingDiffPathHits = WorkingDiffPathHits {
+    index_scan: std::sync::atomic::AtomicUsize::new(0),
+    finite_bypass: std::sync::atomic::AtomicUsize::new(0),
+};
+
+#[cfg(test)]
+pub(crate) struct WorkingDiffPathHits {
+    pub(crate) index_scan: std::sync::atomic::AtomicUsize,
+    pub(crate) finite_bypass: std::sync::atomic::AtomicUsize,
+}
+
 /// Resolves a checkpoint diff from row-local first-before images. Broad diffs
 /// enumerate the sparse dirty-key index; finite PK queries read only the
 /// primary rows that can answer the request.
@@ -9772,6 +9787,10 @@ async fn hot_working_diff_entries(
         .await;
     }
 
+    #[cfg(test)]
+    WORKING_DIFF_PATH_HITS
+        .index_scan
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
     let range = StoragePrefix {
         bytes: Bytes::from(scope.clone()),
@@ -9898,6 +9917,33 @@ async fn hot_working_diff_entries(
             let Ok(after) = decode_head_value(&after) else {
                 return Ok(None);
             };
+            // Not a classification, an inconsistency guard — and deliberately
+            // stricter than the finite bypass, which merely skips an untracked
+            // or absent primary row (`finite_working_diff_versions`).
+            //
+            // The two are equivalent because the populations differ. This loop
+            // only visits identities the sparse `HOT_DIFF` index already
+            // asserts are dirty against this checkpoint, and a dirty identity
+            // always has a tracked primary row in this generation:
+            //
+            // * `HOT_DIFF` keys are only written for `!delta.untracked`
+            //   deltas, both incrementally and from the file cascade.
+            // * A primary row is physically removed only by
+            //   `CurrentStateDelta::physically_deletes` — `untracked &&
+            //   deleted`. A tracked delete writes a tombstone that keeps its
+            //   baseline, so a dirty row cannot vanish.
+            // * `reject_retention_change` forbids flipping retention while any
+            //   physical member exists, so a dirty tracked row cannot be
+            //   overwritten by an untracked one.
+            // * The scope prefix contains the checkpoint and the generation, so
+            //   a `Clean` baseline or a foreign checkpoint owner cannot appear
+            //   under the scope the epoch names.
+            //
+            // The finite bypass instead reads *all* primary rows matching a
+            // finite identity filter, where clean, untracked, and absent rows
+            // are the normal case and skipping them is the classification. It
+            // never sees this population, so keep the strict guard here rather
+            // than relaxing it to match.
             if after.untracked {
                 return Ok(None);
             }
@@ -9949,6 +9995,10 @@ async fn hot_working_diff_entries_for_finite_filter(
     generation: CommitId,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    #[cfg(test)]
+    WORKING_DIFF_PATH_HITS
+        .finite_bypass
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rows = hot_scan_entries(store, branch_id, generation, filter, None, None)
         .await?
         .expect("unbounded HOT scan cannot exhaust a byte budget");
@@ -9993,6 +10043,21 @@ async fn hot_working_diff_entries_for_finite_filter(
     }
 }
 
+/// Classifies one primary `HOT_ROW` value for the finite bypass.
+///
+/// `None` means "this scope cannot answer, replay canonically"; `Some(None)`
+/// means "this row contributes no diff entry".
+///
+/// Skipping an untracked, clean, or foreign-checkpoint row here is not the
+/// same decision the index-driven path makes for the same predicates — that
+/// path fails closed. Both are correct because they classify different
+/// populations: this one sees every primary row matching a finite identity
+/// filter, where untracked/clean/absent rows are ordinary and not dirty, while
+/// the index-driven path only ever sees identities `HOT_DIFF` already asserts
+/// are dirty, where those same states would be corruption. See the equivalence
+/// argument in `hot_working_diff_entries`; the reachable-state proof is
+/// exercised end to end by
+/// `working_diff_finite_bypass_and_index_scan_agree_on_every_row_state`.
 fn finite_working_diff_versions(
     bytes: &Bytes,
     checkpoint_commit_id: CommitId,
@@ -10633,6 +10698,83 @@ fn encode_hot_diff_key_parts(
     key
 }
 
+/// Appends one dirty-row identity as a `HOT_DIFF` key (also used verbatim as
+/// the identity's coverage group key).
+///
+/// The component order after the scope — `schema_key ++ entity_pk ++ file_id`
+/// — deliberately does not mirror `HOT_ROW`'s `schema_key ++ file_id ++
+/// entity_pk`, and aligning them would buy nothing: no reader ever
+/// prefix-seeks `HOT_DIFF` below its `(branch, checkpoint, generation)`
+/// scope.
+///
+/// - `hot_working_diff_entries` must enumerate the entire scope to
+///   reconstruct the [`WorkingDiffIndexCoverage`] count/XOR proof before the
+///   sparse index may be trusted, so even file- or schema-filtered diff
+///   queries visit every entry and filter in memory. A sub-scope seek can
+///   never satisfy the proof.
+/// - Finite (schema + entity) diff queries bypass this space entirely and
+///   read the `working_diff_baseline` inline on primary `HOT_ROW` rows.
+/// - Batches of `HOT_DIFF_PACK_MIN_IDENTITIES` or more identities are packed
+///   into segments keyed by `scope ++ digest`; the identity components leave
+///   the key for the segment value altogether.
+///
+/// The order is not arbitrary in one respect: it is exactly
+/// `compare_hot_deltas`, the order a publication's deltas are already sorted
+/// in, so the segment packer can append identity suffixes without a second
+/// sort. It is otherwise a load-bearing input to the coverage hash: every
+/// writer, the segment visitor, and the stored epoch coverage must produce
+/// these bytes identically. Change it only for a reason, and only everywhere
+/// at once.
+///
+/// # Why the proof is not partitioned
+///
+/// [`WorkingDiffIndexCoverage`] is a monoid — `group_count` is additive and
+/// `group_key_xor` is commutative — so it looks like it could be maintained
+/// per `file_id`, composed back into the scope proof, and a
+/// `scope ++ file_id` seek made legal. Two independent facts block that:
+///
+/// - **Not every coverage group is an identity.** A packed current base
+///   contributes exactly one group key naming a *commit*
+///   (`hot_scope_prefix ++ new_head`, see the collection-replacement writer),
+///   standing for a whole schema collection whose members span every file and
+///   are only recoverable through `load_commit_delta_members_with_payloads`
+///   at read time. Attributing it to file partitions means expanding it per
+///   member on the write path — reinstating the per-identity coverage cost
+///   the manifest exists to remove.
+/// - **A partition-keyed segment is not a packed segment.** A segment batches
+///   whatever identities one publication produced, in `compare_hot_deltas`
+///   order — which is this key's `schema_key ++ entity_pk ++ file_id`, so
+///   `file_id` is the *last* discriminator and identities of one file are
+///   scattered through the batch. Moving the partition ahead of the digest
+///   forces the packer to re-sort and split each publication by `file_id`, so
+///   a bulk edit spread over many files emits one segment per file — each
+///   re-paying the scope and a 32-byte digest — and most publications stop
+///   reaching `HOT_DIFF_PACK_MIN_IDENTITIES` per partition at all.
+///
+/// Measured consequence of leaving the proof scope-global (rocksdb,
+/// hetzner-cpx62-II, `working_diff_file_scope`, 9 reps, four dirty rows in the
+/// probed file): `WHERE file_id = ?` costs 0.61 ms at 1k total dirty rows and
+/// 51.6 ms at 100k — linear in the dirty set, flat in the answer — while the
+/// finite `schema_key + entity_pk + file_id` shape that bypasses this space
+/// stays at ~0.5 ms across the same range.
+///
+/// The route that would remove that scan does not need this space at all:
+/// `HOT_ROW` is already keyed `schema_key ++ file_id ++ entity_pk` and
+/// `hot_scan_entries` already owns a file-first prefix route, so a
+/// `schema_key + file_id` working-diff read could enumerate primary rows the
+/// way the finite bypass does. That trades O(dirty rows in the branch) for
+/// O(live rows in the file). It is still not implemented *for the working
+/// diff*, because a diff must also see identities whose current authority is a
+/// packed current base published inside this checkpoint window, and those
+/// contribute exactly the whole-commit coverage groups described above.
+///
+/// The ordinary **entity** surface has no such obligation and does take that
+/// route: `lixcol_file_id` is an exact provider constraint that lands in
+/// `LiveStateFilter::file_ids`, and every authority the live-state merge reads
+/// — `HOT_ROW`, the packed current base, the certified entity batches, and the
+/// root current base — filters on it, two of them with their own file-scoped
+/// seek. Rows that never had a branch-local `HOT_ROW` are therefore still
+/// returned by the other three legs.
 fn append_hot_diff_key_parts(
     key_bytes: &mut Vec<u8>,
     scope: &[u8],
@@ -11167,6 +11309,76 @@ fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8;
             refs.insert(*json_ref.as_hash_array());
         }
     }
+}
+
+/// Every serving plane whose key begins with `(branch_id, generation)`.
+///
+/// These are derived caches of one branch generation, so a generation that no
+/// live branch control selects is exactly one contiguous key range per space.
+/// Content-addressed planes (the certified entity batches) are deliberately
+/// absent: their rows are shared across generations and are reclaimed by
+/// content reachability, not by scope.
+const GENERATION_SCOPED_SPACES: &[StorageSpace] = &[
+    HOT_ROW_SPACE,
+    HOT_FILE_SPACE,
+    HOT_COLLECTION_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE,
+    PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    ROOT_CURRENT_BASE_SPACE,
+];
+
+/// The `(branch_id, generation)` key prefix that scopes every derived serving
+/// plane. Exposed for GC census assertions.
+#[cfg(test)]
+pub(crate) fn hot_generation_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
+    encode_scope_prefix(branch_id, generation)
+}
+
+/// Retires every derived serving row of one branch generation.
+///
+/// The caller proves the generation is unreachable from the live branch
+/// controls; this stages the deletes. Work is bounded by the rows actually
+/// reclaimed — each space is entered at the generation's key prefix, never
+/// scanned whole — so a repository sweep costs what its garbage costs.
+pub(crate) async fn stage_retire_hot_generation<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+) -> Result<u64, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let prefix = StoragePrefix {
+        bytes: Bytes::from(encode_scope_prefix(branch_id, generation)),
+    };
+    let mut deleted = 0_u64;
+    for space in GENERATION_SCOPED_SPACES {
+        let mut cursor = store
+            .begin_scan(
+                *space,
+                prefix.to_range()?,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await?;
+        loop {
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await?;
+            for entry in page.entries {
+                writes.delete(*space, entry.key);
+                deleted = deleted.saturating_add(1);
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]

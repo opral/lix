@@ -140,6 +140,33 @@ impl TransactionJson {
         let invalid_arena = |message| LixError::new(LixError::CODE_INVALID_PARAM, message);
         let arena = SharedStr::from_utf8(Bytes::from(normalized))
             .map_err(|_| invalid_arena("certified transaction JSON arena is not UTF-8"))?;
+        Self::from_certified_row_content_shared_arena(arena, offsets)
+    }
+
+    /// Constructs certified row content from a UTF-8 arena assembled from
+    /// already-valid string fragments by an engine-owned producer.
+    ///
+    /// Offsets remain checked for full, contiguous coverage and UTF-8 scalar
+    /// boundaries. Only the redundant complete-buffer validation pass is
+    /// skipped.
+    /// # Safety
+    ///
+    /// `normalized` must contain valid UTF-8. Offset coverage and character
+    /// boundaries are still checked before any row view is constructed.
+    pub(crate) unsafe fn from_validated_certified_row_content_arena(
+        normalized: Vec<u8>,
+        offsets: Vec<(usize, usize)>,
+    ) -> Result<Vec<Self>, LixError> {
+        // SAFETY: upheld by the caller contract above.
+        let arena = unsafe { SharedStr::from_utf8_unchecked(Bytes::from(normalized)) };
+        Self::from_certified_row_content_shared_arena(arena, offsets)
+    }
+
+    fn from_certified_row_content_shared_arena(
+        arena: SharedStr,
+        offsets: Vec<(usize, usize)>,
+    ) -> Result<Vec<Self>, LixError> {
+        let invalid_arena = |message| LixError::new(LixError::CODE_INVALID_PARAM, message);
         let arena_len = u32::try_from(arena.len())
             .map_err(|_| invalid_arena("certified transaction JSON arena exceeds u32"))?;
         let mut previous_end = 0_u32;
@@ -559,6 +586,7 @@ impl TypedMutationJournalBatch {
 pub(crate) struct CertifiedParameterBatch {
     entity_pks: Vec<EntityPk>,
     snapshots: Vec<TransactionJson>,
+    durable_predecessors: Vec<Option<CertifiedCurrentStatePredecessor>>,
     schema_key: SharedStr,
     branch_id: SharedStr,
     untracked: bool,
@@ -605,6 +633,9 @@ impl CertifiedParameterBatch {
             ));
         }
         Ok(Self {
+            durable_predecessors: std::iter::repeat_with(|| None)
+                .take(entity_pks.len())
+                .collect(),
             entity_pks,
             snapshots,
             schema_key,
@@ -639,15 +670,27 @@ impl CertifiedParameterBatch {
         self.untracked
     }
 
+    pub(crate) fn set_durable_predecessor(
+        &mut self,
+        index: usize,
+        value: Option<CertifiedCurrentStatePredecessor>,
+    ) {
+        self.durable_predecessors[index] = value;
+    }
+
     pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
-        RawWriteBatch::from_certified_parameter_rows(
+        let mut rows = RawWriteBatch::from_certified_parameter_rows(
             self.entity_pks,
             self.snapshots,
             self.schema_key,
             self.branch_id,
             self.untracked,
             self.certificate,
-        )
+        )?;
+        for (index, predecessor) in self.durable_predecessors.into_iter().enumerate() {
+            rows.set_durable_predecessor(index, predecessor);
+        }
+        Ok(rows)
     }
 
     pub(crate) fn into_dense_prepared(
@@ -666,6 +709,7 @@ impl CertifiedParameterBatch {
         let Self {
             entity_pks,
             snapshots,
+            durable_predecessors,
             schema_key,
             branch_id,
             untracked,
@@ -673,6 +717,22 @@ impl CertifiedParameterBatch {
             entity_columnar,
         } = self;
         let row_count = entity_pks.len();
+        let predecessor_count = durable_predecessors
+            .iter()
+            .filter(|value| value.is_some())
+            .count();
+        let dense_durable_predecessors = if predecessor_count == row_count && row_count != 0 {
+            Some(
+                durable_predecessors
+                    .iter()
+                    .cloned()
+                    .map(|value| value.expect("every certified predecessor is present"))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        } else {
+            None
+        };
         let (mut strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
             (vec![schema_key], 0_u32, 0_u32)
         } else {
@@ -707,7 +767,7 @@ impl CertifiedParameterBatch {
                 )
             })
             .collect();
-        Ok(PreparedStateBatch {
+        let mut prepared = PreparedStateBatch {
             slots: Vec::new(),
             dense_certified_parameter: Some(DenseCertifiedParameterSlots {
                 len: row_count,
@@ -721,6 +781,7 @@ impl CertifiedParameterBatch {
                 untracked,
                 direct_change_ids: None,
                 entity_columnar,
+                durable_predecessors: dense_durable_predecessors,
             }),
             entity_pks,
             strings,
@@ -733,7 +794,13 @@ impl CertifiedParameterBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             complete_collection_replacement: certificate.complete_collection_replacement,
-        })
+        };
+        if predecessor_count != 0 && predecessor_count != row_count {
+            for (index, predecessor) in durable_predecessors.into_iter().enumerate() {
+                prepared.set_durable_predecessor(index, predecessor);
+            }
+        }
+        Ok(prepared)
     }
 }
 
@@ -2547,13 +2614,10 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
             *slots[position] = Some(TransactionJson::from_canonical_batch(row));
         }
     } else {
+        // SAFETY: every uncached row was written by serde_json and every
+        // cached row came from a previously validated TransactionJson.
         let normalized =
-            SharedStr::from_utf8(Bytes::from(normalized.into_bytes())).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!("{context} canonical JSON batch is not UTF-8"),
-                )
-            })?;
+            unsafe { SharedStr::from_utf8_unchecked(Bytes::from(normalized.into_bytes())) };
         for ((position, value), (start, end)) in positions.into_iter().zip(values).zip(offsets) {
             let normalized = normalized
                 .slice(start as usize..end as usize)
@@ -2813,6 +2877,10 @@ struct DenseCertifiedParameterSlots {
     /// Frontend-built row groups over the same certified typed columns.
     /// Topology-changing operations drop this derived accelerator.
     entity_columnar: Option<crate::sql2::EncodedEntityRowGroups>,
+    /// Exact authenticated predecessor evidence is row-aligned with the
+    /// certified identity column. Ordinary replacement batches therefore
+    /// retain their compact representation through publication.
+    durable_predecessors: Option<Arc<[CertifiedCurrentStatePredecessor]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3090,7 +3158,10 @@ impl PreparedStateBatch {
                 commit_id: dense.commit_id,
                 untracked: dense.untracked,
                 branch_id: &self.strings[dense.branch_id as usize],
-                durable_predecessor: None,
+                durable_predecessor: dense
+                    .durable_predecessors
+                    .as_ref()
+                    .map(|values| &values[index]),
             });
         }
         let slot = *self.slots.get(index)?;
@@ -3273,6 +3344,12 @@ impl PreparedStateBatch {
         for row_index in 0..dense.len {
             let ordinal = u32::try_from(row_index)
                 .expect("dense certified parameter row ordinal must fit u32");
+            let durable_predecessor = dense.durable_predecessors.as_ref().map(|values| {
+                let index = u32::try_from(self.durable_predecessors.len())
+                    .expect("prepared durable predecessor column must fit u32");
+                self.durable_predecessors.push(values[row_index].clone());
+                index
+            });
             self.slots.push(PreparedStateSlot {
                 schema_plan_id: dense.schema_plan_id,
                 facts: dense.facts,
@@ -3298,7 +3375,7 @@ impl PreparedStateBatch {
                 commit_id: dense.commit_id,
                 untracked: false,
                 branch_id: dense.branch_id,
-                durable_predecessor: None,
+                durable_predecessor,
             });
         }
     }
@@ -3347,6 +3424,8 @@ impl PreparedStateBatch {
                     && right.direct_change_ids.is_none()
                     && left.entity_columnar.is_none()
                     && right.entity_columnar.is_none()
+                    && left.durable_predecessors.is_none()
+                    && right.durable_predecessors.is_none()
                     && self.durable_predecessors.is_empty()
                     && other.durable_predecessors.is_empty()
                     && self.origins.is_empty()
@@ -3694,8 +3773,9 @@ impl PreparedStateBatch {
             for (_, value) in &normalized {
                 arena.extend_from_slice(value.as_bytes());
             }
-            let arena = SharedStr::from_utf8(Bytes::from(arena))
-                .expect("validated canonical JSON arena remains UTF-8");
+            // SAFETY: this arena is the concatenation of validated SharedStr
+            // values and therefore remains UTF-8.
+            let arena = unsafe { SharedStr::from_utf8_unchecked(Bytes::from(arena)) };
             let mut offset = 0usize;
             for (_, value) in &mut normalized {
                 let end = offset + value.len();
@@ -4553,6 +4633,70 @@ mod tests {
         assert_eq!(prepared.complete_collection_replacement_proof(), None);
         assert!(!prepared.certified_tracked_keys_strictly_ordered());
         assert_eq!(prepared.row(0).entity_pk, &EntityPk::single("a"));
+    }
+
+    #[test]
+    fn certified_replacement_keeps_authenticated_predecessors_dense_and_through_expansion() {
+        let snapshots = [r#"{"id":"a"}"#, r#"{"id":"b"}"#]
+            .into_iter()
+            .map(|value| {
+                TransactionJson::from_certified_shared_normalized_row_content(value.into())
+            })
+            .collect::<Vec<_>>();
+        let mut rows = CertifiedParameterReplacementBatch::new(
+            vec![EntityPk::single("a"), EntityPk::single("b")],
+            snapshots,
+            "dense_replacement".into(),
+            "main".into(),
+            CertifiedRawWriteBatchPreparation {
+                schema_plan_id: SchemaPlanId::for_test(10),
+                facts: PreparedRowFacts {
+                    row_content_validated: true,
+                    requires_transaction_validation: false,
+                },
+                tracked_keys_strictly_ordered: true,
+                complete_collection_replacement: None,
+            },
+        )
+        .expect("certified replacement should construct");
+        rows.set_durable_predecessor(
+            0,
+            Some(CertifiedCurrentStatePredecessor::Encoded(
+                Bytes::from_static(b"predecessor-a"),
+            )),
+        );
+        rows.set_durable_predecessor(
+            1,
+            Some(CertifiedCurrentStatePredecessor::Encoded(
+                Bytes::from_static(b"predecessor-b"),
+            )),
+        );
+
+        let mut prepared = rows
+            .into_dense_prepared(
+                None,
+                LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z"),
+            )
+            .expect("certified replacement should prepare");
+        assert!(prepared.is_dense_certified_parameter());
+        assert!(matches!(
+            prepared.row(1).durable_predecessor,
+            Some(CertifiedCurrentStatePredecessor::Encoded(bytes))
+                if bytes.as_ref() == b"predecessor-b"
+        ));
+
+        prepared.set_requires_transaction_validation(0, true);
+        assert!(!prepared.is_dense_certified_parameter());
+        assert!(matches!(
+            prepared.row(0).durable_predecessor,
+            Some(CertifiedCurrentStatePredecessor::Encoded(bytes))
+                if bytes.as_ref() == b"predecessor-a"
+        ));
+        assert!(matches!(
+            prepared.row(1).durable_predecessor,
+            Some(CertifiedCurrentStatePredecessor::Encoded(bytes))
+                if bytes.as_ref() == b"predecessor-b"
+        ));
     }
 
     #[test]
@@ -5538,6 +5682,37 @@ mod tests {
                 .expect("snapshot")
                 .retains_decoded_value_for_tests()
         }));
+    }
+
+    #[test]
+    fn certified_transaction_arena_preserves_utf8_and_offset_validation() {
+        assert!(
+            TransactionJson::from_certified_row_content_arena(vec![0xff], vec![(0, 1)]).is_err(),
+            "the fallible constructor must reject invalid producer bytes"
+        );
+
+        let normalized = "é".as_bytes().to_vec();
+        let split_offsets = vec![(0, 1), (1, normalized.len())];
+        assert!(
+            TransactionJson::from_certified_row_content_arena(
+                normalized.clone(),
+                split_offsets.clone(),
+            )
+            .is_err(),
+            "the fallible constructor must reject offsets inside a UTF-8 scalar"
+        );
+        // SAFETY: the complete arena is valid UTF-8. This intentionally gives
+        // the trusted constructor bad offsets to verify it still checks them.
+        assert!(
+            unsafe {
+                TransactionJson::from_validated_certified_row_content_arena(
+                    normalized,
+                    split_offsets,
+                )
+            }
+            .is_err(),
+            "the trusted constructor must retain UTF-8 boundary checks"
+        );
     }
 
     #[test]

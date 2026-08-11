@@ -5,12 +5,15 @@
 )]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::{Bound, Deref, Range};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::changelog::ChangeRecordProjection;
-use crate::changelog::{ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest};
+use crate::changelog::{
+    COMMIT_SPACE, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest, CommitRecord,
+    commit_key,
+};
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
@@ -97,8 +100,11 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // payload-less certified-reference encoding is intentionally rejected. The
 // version also binds ordered mutation parts to the canonical 512-row geometry;
 // LXCD14 is intentionally rejected rather than read through a compatibility
+// decoder. Version 16 permits direct-address leaves to reconstruct the exact
+// per-row ChangeId from one shared commit id and the first packed ordinal.
+// LXCD15 is deliberately rejected rather than read through a compatibility
 // decoder.
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD15";
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD16";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
@@ -3665,8 +3671,91 @@ pub(crate) async fn load_point_replay_commit_state(
         },
     ];
     let mut values = exact_get_many(store, &requests).await?.values.into_iter();
-    let header = values.next().flatten().and_then(full_value_bytes);
-    let inventory = values.next().flatten().and_then(full_value_bytes);
+    decode_point_replay_commit_state_values(
+        commit_id,
+        values.next().flatten(),
+        values.next().flatten(),
+    )
+}
+
+/// Co-loads the semantic commit record and its physical replay authority.
+///
+/// State reconstruction needs both independent authorities for every replayed
+/// commit. Keeping them in one adapter batch preserves that separation while
+/// avoiding a second backend round trip per first-parent step.
+pub(crate) async fn load_commit_record_and_point_replay_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<
+    (
+        Option<CommitRecord>,
+        Option<AuthenticatedReplayCommitStateManifest>,
+    ),
+    LixError,
+> {
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_replay_manifest_load();
+    let commit_keys = [StorageKey(Bytes::from(commit_key(commit_id)))];
+    let header_keys = [StorageKey(Bytes::from(commit_state_manifest_key(
+        commit_id,
+    )))];
+    let inventory_keys = [StorageKey(Bytes::from(commit_mutation_inventory_key(
+        commit_id,
+    )))];
+    let requests = [
+        StorageGetManyRequest {
+            space: COMMIT_SPACE,
+            keys: &commit_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            keys: &header_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+            keys: &inventory_keys,
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
+    let record = values
+        .next()
+        .flatten()
+        .and_then(full_value_bytes)
+        .map(|bytes| storage_codec::decode::<CommitRecord>("commit record", &bytes))
+        .transpose()?;
+    if let Some(record) = record.as_ref()
+        && record.commit_id != commit_id
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "changelog commit key for commit '{commit_id}' contains record for '{}'",
+                record.commit_id
+            ),
+        ));
+    }
+    if record.is_none() {
+        return Ok((None, None));
+    }
+    let state = decode_point_replay_commit_state_values(
+        commit_id,
+        values.next().flatten(),
+        values.next().flatten(),
+    )?;
+    debug_assert!(values.next().is_none());
+    Ok((record, state))
+}
+
+fn decode_point_replay_commit_state_values(
+    commit_id: CommitId,
+    header: Option<StorageProjectedValue>,
+    inventory: Option<StorageProjectedValue>,
+) -> Result<Option<AuthenticatedReplayCommitStateManifest>, LixError> {
+    let header = header.and_then(full_value_bytes);
+    let inventory = inventory.and_then(full_value_bytes);
     let (header, inventory) = match (header, inventory) {
         (None, None) => return Ok(None),
         (Some(header), Some(inventory)) => (header, inventory),
@@ -10355,6 +10444,191 @@ pub(crate) async fn stage_delete_commit_state_manifest_for_gc(
     Ok(())
 }
 
+/// The content-addressed nodes and parts that are still reachable from the
+/// repository's live root closure.
+///
+/// Every tracked-state plane below is content addressed and therefore shared
+/// between commits, so a retired commit may only drop a node the live closure
+/// does not also name.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetainedPhysicalState<'a> {
+    pub(crate) mutation_nodes: &'a BTreeSet<[u8; 32]>,
+    pub(crate) scoped_nodes: &'a BTreeSet<[u8; 32]>,
+    pub(crate) native_parts: &'a BTreeSet<[u8; 32]>,
+}
+
+/// Retires every physical tracked-state row owned by one unreachable commit.
+///
+/// GC proves unreachability from refs and hands the proof here; the layout of
+/// mutation directories, scoped-range trees, and native current-state parts —
+/// and therefore which keys a retirement touches — stays inside the module
+/// that writes them.
+pub(crate) async fn stage_retire_commit_physical_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    retained: RetainedPhysicalState<'_>,
+) -> Result<(), LixError> {
+    let manifest = load_commit_state_manifest(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("retired GC root '{commit_id}' has no authenticated manifest"),
+            )
+        })?;
+    let retired_root = load_commit_mutation_directory_roots(store, &[commit_id])
+        .await?
+        .into_iter()
+        .next()
+        .flatten();
+    if let Some(root) = retired_root {
+        let nodes = crate::tracked_state::collect_mutation_directory_node_ids(store, &root).await?;
+        for node_id in nodes.difference(retained.mutation_nodes) {
+            writes.delete(
+                crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+                key(node_id.to_vec()),
+            );
+        }
+    }
+    if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
+        let reachable = crate::tracked_state::validate_scoped_range_trees(
+            store,
+            std::slice::from_ref(&root.tree),
+        )
+        .await?;
+        for node_id in reachable.node_ids.difference(retained.scoped_nodes) {
+            writes.delete(
+                crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+                key(node_id.to_vec()),
+            );
+        }
+        for part in reachable.parts {
+            let descriptor =
+                crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
+            if descriptor.source_kind == 1
+                && !retained.native_parts.contains(&descriptor.content_digest)
+            {
+                writes.delete(
+                    crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+                    key(descriptor.content_digest.to_vec()),
+                );
+                writes.delete(
+                    crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+                    key(descriptor.payload_refs_digest.to_vec()),
+                );
+            }
+        }
+    }
+    stage_delete_commit_state_manifest_for_gc(store, writes, commit_id, &manifest).await
+}
+
+/// Loads the owning commit ids of every native current-state data part named by
+/// `digests`, proving each payload is still physically present.
+///
+/// A scoped-range descriptor is authority for the digest, but not proof that
+/// the immutable payload still exists; treating a missing payload as an empty
+/// live set would silently turn corruption into deletion, so this fails closed.
+pub(crate) async fn load_native_current_state_part_owners(
+    store: &(impl StorageAdapterRead + ?Sized),
+    digests: &BTreeSet<[u8; 32]>,
+) -> Result<BTreeSet<CommitId>, LixError> {
+    if digests.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let keys = digests
+        .iter()
+        .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
+        .collect::<Vec<_>>();
+    let loaded = PointReadPlan::new(crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut commit_ids = BTreeSet::new();
+    for (digest, value) in digests.iter().zip(loaded.value) {
+        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "live current-state directory references a missing native data part",
+            ));
+        };
+        commit_ids.extend(
+            crate::tracked_state::decode_current_state_data_part_commit_ids(digest, &bytes)?,
+        );
+    }
+    Ok(commit_ids)
+}
+
+/// Sweeps every content-addressed tracked-state plane down to a repository-wide
+/// live closure.
+///
+/// This is the whole-repository counterpart to
+/// [`stage_retire_commit_physical_state`]: it discovers rows by scanning rather
+/// than from a retirement proof, so it is reserved for the offline oracle that
+/// cross-checks incremental GC.
+#[cfg(test)]
+pub(crate) async fn stage_sweep_unreachable_content_nodes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    retained: RetainedPhysicalState<'_>,
+) -> Result<(), LixError> {
+    for (space, live) in [
+        (
+            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+            retained.scoped_nodes,
+        ),
+        (
+            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+            retained.mutation_nodes,
+        ),
+        (
+            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+            retained.native_parts,
+        ),
+        (
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            retained.native_parts,
+        ),
+    ] {
+        let range = StorageKeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        };
+        let mut cursor = store
+            .begin_scan(
+                space,
+                range,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await?;
+        loop {
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await?;
+            for entry in page.entries {
+                let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "content-addressed space '{}' contains a malformed key",
+                            space.name
+                        ),
+                    )
+                })?;
+                if !live.contains(&node_id) {
+                    writes.delete(space, entry.key);
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn scan_full_space(
     store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
@@ -11088,6 +11362,11 @@ fn encode_commit_delta_segment_layout(
 ) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     debug_assert_eq!(entries.len(), payloads.len());
     let leaf = encode_leaf_node_refs(entries);
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_leaf_layout(
+        entries.len(),
+        crate::tracked_state::codec::leaf_uses_direct_address_layout(&leaf),
+    );
     let authored_inline = payloads.iter().all(|payload| {
         payload.authored
             && matches!(payload.snapshot, crate::json_store::JsonSlotRef::Inline(_))
@@ -11932,11 +12211,66 @@ pub(crate) fn debug_verify_chunk_hash(
 #[derive(Debug, Default)]
 pub(crate) struct TrackedStateChunkOverlay {
     chunks: HashMap<[u8; TRACKED_STATE_HASH_BYTES], Bytes>,
+    /// Chunk digests this writer has proven are already durable at its read
+    /// snapshot. The space is content-addressed, so a present key is the same
+    /// bytes by construction and re-writing it is a no-op the backend cannot
+    /// elide for a mutable space.
+    known_durable: HashSet<[u8; TRACKED_STATE_HASH_BYTES]>,
+    /// Explicit commit-root rebuild is the repair path for a damaged chunk, so
+    /// it must rewrite every node it derives. A present key proves the digest
+    /// is addressed, not that the stored bytes still hash to it.
+    rewrite_durable: bool,
 }
 
 impl TrackedStateChunkOverlay {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Overlay for the explicit rebuild path, which repairs corrupt chunks by
+    /// rewriting them and therefore never skips a durable digest.
+    pub(crate) fn repairing() -> Self {
+        Self {
+            rewrite_durable: true,
+            ..Self::default()
+        }
+    }
+
+    /// Records which of `hashes` are already durable, using one presence-only
+    /// batched point read. Digests already proven durable are not probed again.
+    async fn probe_durable_digests(
+        &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        hashes: impl IntoIterator<Item = [u8; TRACKED_STATE_HASH_BYTES]>,
+    ) -> Result<(), LixError> {
+        if self.rewrite_durable {
+            return Ok(());
+        }
+        let candidates = hashes
+            .into_iter()
+            .filter(|hash| !self.known_durable.contains(hash))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let keys = candidates
+            .iter()
+            .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+            .collect::<Vec<_>>();
+        let requests = [StorageGetManyRequest {
+            space: TRACKED_STATE_TREE_CHUNK_SPACE,
+            keys: &keys,
+            opts: StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        }];
+        let result = exact_get_many(store, &requests).await?;
+        for (hash, value) in candidates.into_iter().zip(result.values) {
+            if value.is_some() {
+                self.known_durable.insert(hash);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn staged_chunk(&self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) -> Option<&[u8]> {
@@ -11947,12 +12281,24 @@ impl TrackedStateChunkOverlay {
         self.chunks.keys().copied()
     }
 
-    pub(crate) fn stage_selected_chunks(
-        &self,
+    pub(crate) async fn stage_selected_chunks(
+        &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         hashes: impl IntoIterator<Item = [u8; TRACKED_STATE_HASH_BYTES]>,
     ) -> Result<(), LixError> {
+        let hashes = hashes.into_iter().collect::<Vec<_>>();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        // Transient chunks live only in the overlay, so the durable probe must
+        // run against the digests themselves rather than the staged-chunk map.
+        self.probe_durable_digests(store, hashes.iter().copied())
+            .await?;
         for hash in hashes {
+            if self.known_durable.contains(&hash) {
+                continue;
+            }
             let bytes = self.chunks.get(&hash).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -11974,25 +12320,46 @@ impl TrackedStateChunkOverlay {
         self.chunks.get(hash).cloned()
     }
 
-    pub(crate) fn stage_chunks(
+    /// Stages the chunks this rewrite produced, skipping any digest already
+    /// durable at the writer's read snapshot.
+    ///
+    /// The tracked-state tree is content-addressed, so an existing key is
+    /// necessarily the same bytes. A mutable storage space has no
+    /// already-present skip of its own (RocksDB's lives behind
+    /// `ValueSemantics::Immutable`; SlateDB's mutable path writes straight into
+    /// its overlay), so without this filter a root rewrite that re-derives an
+    /// ancestor's nodes pays the full write-set, WAL, memtable and compaction
+    /// cost for bytes that are already on disk.
+    pub(crate) async fn stage_chunks(
         &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         chunks: &PendingChunkBatch,
-    ) {
+    ) -> Result<(), LixError> {
         if chunks.is_empty() {
-            return;
+            return Ok(());
         }
+        self.probe_durable_digests(store, chunks.chunks().iter().map(|chunk| chunk.hash))
+            .await?;
         let mut key_arena =
             Vec::with_capacity(chunks.len().saturating_mul(TRACKED_STATE_HASH_BYTES));
         let mut puts = Vec::with_capacity(chunks.len());
         for chunk in chunks.chunks() {
+            // Overlay residency is independent of staging: an in-flight rewrite
+            // still reads a durable-skipped node through the overlay.
+            self.chunks.insert(chunk.hash, chunks.chunk_data(*chunk));
+            if self.known_durable.contains(&chunk.hash) {
+                continue;
+            }
             let key_start = key_arena.len();
             key_arena.extend_from_slice(&chunk.hash);
             puts.push(EncodedPut {
                 key: BufferRange::new(key_start, TRACKED_STATE_HASH_BYTES),
                 value: BufferRange::new(chunk.data_start, chunk.data_len),
             });
-            self.chunks.insert(chunk.hash, chunks.chunk_data(*chunk));
+        }
+        if puts.is_empty() {
+            return Ok(());
         }
         let batch = EncodedMutationBatch::try_new(
             Bytes::from(key_arena),
@@ -12002,6 +12369,7 @@ impl TrackedStateChunkOverlay {
         )
         .expect("tracked-state chunk batch descriptors must match their arenas");
         writes.stage_content_addressed_encoded_batch(TRACKED_STATE_TREE_CHUNK_SPACE, batch);
+        Ok(())
     }
 }
 
@@ -12952,7 +13320,6 @@ fn validate_compact_replacement_inventory(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
@@ -12961,22 +13328,9 @@ mod tests {
     use bytes::Bytes;
 
     use crate::LixError;
-    use crate::binary_cas::{
-        BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        BINARY_CAS_MANIFEST_SPACE,
-    };
-    use crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-    use crate::changelog::{
-        CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, CommitId, CommitRecord,
-    };
+    use crate::changelog::{COMMIT_SPACE, ChangeId, CommitId, CommitRecord};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
-    use crate::gc::{CHECKPOINT_GC_STATE_SPACE, CHECKPOINT_RECOVERY_REF_SPACE};
-    use crate::init::REPOSITORY_PROTOCOL_SPACE;
-    use crate::json_store::{UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, store::JSON_SPACE};
-    use crate::live_state::{
-        HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
-    };
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageReadOptions, StorageSpace, StorageWriteOptions,
         StorageWriteSet,
@@ -12998,8 +13352,8 @@ mod tests {
         COMMIT_DELTA_FORMAT_MAGIC, COMMIT_STATE_MANIFEST_FORMAT_MAGIC, CommitDeltaChangeLocator,
         CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
         DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
-        TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, columnar_identity_row_map,
+        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TrackedStateChunkOverlay,
+        columnar_identity_row_map,
         decode_commit_delta_with_payloads, decode_encoded_commit_state_manifest,
         decode_stored_commit_state_authority, encode_commit_delta_segment,
         encode_commit_delta_segment_with_payloads, encode_commit_delta_segment_with_raw_sidecar,
@@ -13259,6 +13613,7 @@ mod tests {
 
     struct ManifestCountingRead<R> {
         inner: R,
+        get_many_calls: std::sync::Arc<AtomicUsize>,
         manifest_requests: std::sync::Arc<AtomicUsize>,
         inventory_requests: std::sync::Arc<AtomicUsize>,
         directory_requests: std::sync::Arc<AtomicUsize>,
@@ -13278,6 +13633,7 @@ mod tests {
         ) -> impl Future<
             Output = Result<crate::storage::GetManyResult, crate::storage::StorageError>,
         > + Send {
+            self.get_many_calls.fetch_add(1, Ordering::Relaxed);
             for request in requests {
                 if request.space == super::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE {
                     self.manifest_requests.fetch_add(1, Ordering::Relaxed);
@@ -13329,10 +13685,12 @@ mod tests {
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
         let record = CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             change_id: ChangeId::for_test_label(&format!("{commit_id}:fixture-commit")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
@@ -13648,20 +14006,6 @@ mod tests {
             origin_key,
             base_coordinate: None,
             authored: true,
-        }
-    }
-
-    #[test]
-    fn packed_history_spaces_do_not_span_the_live_state_key_range() {
-        const FIRST_LIVE_STATE_SPACE: [u8; 4] = 0x0004_001b_u32.to_be_bytes();
-        for space in [
-            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        ] {
-            assert!(
-                space.physical_prefix() < FIRST_LIVE_STATE_SPACE,
-                "{space} would make packed-history SSTs overlap live-state keys"
-            );
         }
     }
 
@@ -14065,6 +14409,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("routed point read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -15312,8 +15657,12 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn large_chunk_batch_stages_two_shared_arenas() {
+    #[tokio::test]
+    async fn large_chunk_batch_stages_two_shared_arenas() {
+        let store = StorageAdapter::new(Memory::new())
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open empty snapshot");
         let chunk_count = 4_096;
         let mut data_arena = Vec::with_capacity(chunk_count * 64);
         let mut descriptors = Vec::with_capacity(chunk_count);
@@ -15330,7 +15679,10 @@ mod tests {
         let chunks = PendingChunkBatch::from_parts(Bytes::from(data_arena), descriptors);
         let mut writes = StorageWriteSet::new();
         let mut overlay = TrackedStateChunkOverlay::new();
-        overlay.stage_chunks(&mut writes, &chunks);
+        overlay
+            .stage_chunks(&store, &mut writes, &chunks)
+            .await
+            .expect("stage chunks against an empty durable store");
 
         let arena = writes.arena_stats();
         assert_eq!(arena.put_descriptors, chunk_count);
@@ -16370,6 +16722,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn point_replay_coloads_commit_and_state_authorities_in_one_batch() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("co-loaded-point-replay");
+        let mutations = CommitStateMutationInventory::default();
+        let mut writes = storage.new_write_set();
+        stage_fixture_manifest(&mut writes, commit_id, &mutations)
+            .expect("commit and physical authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("co-load fixture should commit");
+
+        let get_many_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let inventory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let read = ManifestCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("co-load read should open"),
+            get_many_calls: std::sync::Arc::clone(&get_many_calls),
+            manifest_requests: std::sync::Arc::clone(&manifest_requests),
+            inventory_requests: std::sync::Arc::clone(&inventory_requests),
+            directory_requests: std::sync::Arc::new(AtomicUsize::new(0)),
+        };
+        let (record, state) = super::load_commit_record_and_point_replay_state(&read, commit_id)
+            .await
+            .expect("co-loaded authorities should decode");
+
+        assert_eq!(
+            record.expect("semantic commit should exist").commit_id,
+            commit_id
+        );
+        assert_eq!(
+            state.expect("physical state should exist").commit_id,
+            commit_id
+        );
+        assert_eq!(get_many_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn shallow_point_replay_reads_one_immutable_physical_authority() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("one-read-shallow-point-replay");
@@ -16399,6 +16794,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("point read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -16469,6 +16865,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("bounded point read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -16529,6 +16926,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("bounded membership read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -16987,44 +17385,6 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn native_storage_space_ids_are_unique_across_owner_layouts() {
-        let spaces = [
-            REPOSITORY_PROTOCOL_SPACE,
-            BRANCH_HEAD_CONTROL_SPACE,
-            HOT_ROW_SPACE,
-            HOT_FILE_SPACE,
-            HOT_DIFF_SPACE,
-            TRACKED_WORKING_DIFF_MARKER_SPACE,
-            JSON_SPACE,
-            UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-            TRACKED_STATE_TREE_CHUNK_SPACE,
-            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-            crate::tracked_state::scoped_range::SCOPED_RANGE_NODE_SPACE,
-            BINARY_CAS_MANIFEST_SPACE,
-            BINARY_CAS_MANIFEST_CHUNK_SPACE,
-            BINARY_CAS_CHUNK_PRESENCE_SPACE,
-            BINARY_CAS_CHUNK_SPACE,
-            COMMIT_SPACE,
-            CHANGE_SPACE,
-            COMMIT_CHANGE_ID_SPACE,
-            CHECKPOINT_RECOVERY_REF_SPACE,
-            CHECKPOINT_GC_STATE_SPACE,
-        ];
-        let mut seen = BTreeMap::new();
-        for space in spaces {
-            assert_eq!(
-                seen.insert(space.id, space.name),
-                None,
-                "storage space id {:?} is reused by {} and {}",
-                space.id,
-                seen.get(&space.id).copied().unwrap_or(space.name),
-                space.name
-            );
-        }
-    }
-
     fn commit_state_manifest_fixture() -> CommitStateManifest {
         let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x018f_ffff_1234_7000_8000_0000_ffff_ffff,
@@ -17240,6 +17600,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("topology read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -17493,6 +17854,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),

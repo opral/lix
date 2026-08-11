@@ -17,7 +17,6 @@ use crate::changelog::{
     ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
     CommitRecord, CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
 };
-use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
@@ -163,6 +162,7 @@ pub(crate) async fn commit_prepared_writes(
         crate::ANONYMOUS_ACCOUNT_ID,
         &commit_parent_heads,
         read,
+        &BTreeMap::new(),
         prepared_writes,
     )
     .await
@@ -178,6 +178,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     active_account_id: &str,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
+    branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
     Box::pin(validate_active_account_and_account_rows(
@@ -576,6 +577,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         }
     }
 
+    let checkpoint_commit_ids = prepared_writes
+        .checkpoint_publications
+        .iter()
+        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
+        .collect::<BTreeSet<_>>();
     let staged_delta_index = Box::pin(stage_tracked_commit_delta_index(
         read,
         &mut writes,
@@ -590,6 +596,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &insert_selection,
         &replacement_generations,
         &ordered_replacements,
+        &checkpoint_commit_ids,
     ))
     .await?;
 
@@ -764,12 +771,12 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &staged_hot_heads.controls,
-        &staged_hot_heads.tracked_snapshots,
         &state_rows,
         &engine_rows,
         &explicit_branch_targets,
         &insert_selection,
         &prepared_writes.checkpoint_publications,
+        branch_checkpoint_bridges,
         &mut preconditions,
         &branch_control_observations,
         &mut root_backed_branch_publications,
@@ -1188,6 +1195,8 @@ async fn stage_changelog_commits(
         })
         .await?;
     let mut generations = BTreeMap::new();
+    let mut first_parent_jumps = BTreeMap::new();
+    let mut topology_records = BTreeMap::new();
     let mut rootless_depths = BTreeMap::new();
     let mut rootless_rows = BTreeMap::new();
     let mut rootless_bytes = BTreeMap::new();
@@ -1219,6 +1228,14 @@ async fn stage_changelog_commits(
             ));
         }
         generations.insert(*commit_id, record.generation);
+        first_parent_jumps.insert(
+            *commit_id,
+            (
+                record.first_parent_jump_commit_id,
+                record.first_parent_jump_span,
+            ),
+        );
+        topology_records.insert(*commit_id, record.clone());
         let replay_debt = published.replay_debt();
         rootless_depths.insert(*commit_id, replay_debt.depth);
         rootless_rows.insert(*commit_id, replay_debt.rows);
@@ -1257,6 +1274,53 @@ async fn stage_changelog_commits(
                     .checked_add(1)
                     .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
             })?;
+        let parent_record = match commit.parent_commit_ids.as_slice() {
+            [parent_commit_id] => Some(
+                topology_records
+                    .get(parent_commit_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("commit '{commit_id}' has missing parent jump metadata"),
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+        if let Some(parent) = &parent_record
+            && !topology_records.contains_key(&parent.first_parent_jump_commit_id)
+        {
+            let jump_id = parent.first_parent_jump_commit_id;
+            let loaded = ChangelogContext::new()
+                .reader(&mut *read)
+                .load_commits(ChangelogCommitLoadRequest {
+                    commit_ids: std::slice::from_ref(&jump_id),
+                })
+                .await?;
+            let jump = loaded
+                .into_iter()
+                .next()
+                .and_then(|(_, record)| record)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("commit '{commit_id}' has a missing jump target '{jump_id}'"),
+                    )
+                })?;
+            topology_records.insert(jump_id, jump);
+        }
+        let parent_jump_record = parent_record.as_ref().map(|parent| {
+            topology_records
+                .get(&parent.first_parent_jump_commit_id)
+                .expect("loaded parent jump target")
+        });
+        let first_parent_jump = crate::changelog::next_first_parent_jump(
+            commit_id,
+            &commit.parent_commit_ids,
+            parent_record.as_ref(),
+            parent_jump_record,
+        )?;
         let selected_as_new_rootless = rootless_commit_ids.contains(&commit_id);
         let commit_delta_rows = tracked_row_indices_by_commit
             .get(&commit_id)
@@ -1384,6 +1448,21 @@ async fn stage_changelog_commits(
         rootless_rows.insert(commit_id, cumulative_rootless_rows);
         rootless_bytes.insert(commit_id, cumulative_rootless_bytes);
         generations.insert(commit_id, generation);
+        first_parent_jumps.insert(commit_id, first_parent_jump);
+        topology_records.insert(
+            commit_id,
+            CommitRecord {
+                format_version: 3,
+                commit_id,
+                generation,
+                parent_commit_ids: commit.parent_commit_ids.clone(),
+                first_parent_jump_commit_id: first_parent_jump.0,
+                first_parent_jump_span: first_parent_jump.1,
+                change_id: commit.change_id,
+                account_id: active_account_id.to_string(),
+                created_at: commit.created_at,
+            },
+        );
         for child in children.get(&commit_id).into_iter().flatten() {
             let remaining = staged_parent_count
                 .get_mut(child)
@@ -1442,10 +1521,12 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
+            first_parent_jump_commit_id: first_parent_jumps[&commit_row.commit_id].0,
+            first_parent_jump_span: first_parent_jumps[&commit_row.commit_id].1,
             change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
@@ -2048,6 +2129,7 @@ async fn stage_tracked_commit_delta_index(
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
+    checkpoint_commit_ids: &BTreeSet<CommitId>,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
@@ -2331,10 +2413,9 @@ async fn stage_tracked_commit_delta_index(
                 "lix.perf.commit_delta_selected_sources"
             );
         }
-        let is_checkpoint_commit = state_row_indices.iter().any(|&row_index| {
-            state_rows.row(row_index).schema_key.as_str() == CHECKPOINT_MARKER_SCHEMA_KEY
-        });
+        let is_checkpoint_commit = checkpoint_commit_ids.contains(&root.commit_id);
         let selected_source_alias = if certified_root_rows.is_empty()
+            && !state_row_indices.is_empty()
             && is_checkpoint_commit
             && selected_members_by_source.len() == 1
         {
@@ -2935,7 +3016,6 @@ fn select_new_rootless_ordered_commits(
 
 struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
-    tracked_snapshots: BTreeMap<CommitId, HotTrackedSnapshot>,
     deferred_fresh_hot_plans: Vec<crate::live_state::DeferredFreshHotPlan>,
 }
 
@@ -3104,7 +3184,8 @@ async fn build_lifecycle_tracked_snapshots(
                 ));
             }
             Some(parent_commit_id) => {
-                load_persisted_lifecycle_tracked_snapshot(read, parent_commit_id).await?
+                load_persisted_lifecycle_tracked_snapshot(read, &root.branch_id, parent_commit_id)
+                    .await?
             }
         };
         let row_indices = tracked_row_indices_by_commit
@@ -3163,6 +3244,7 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 async fn load_persisted_lifecycle_tracked_snapshot(
     read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
     commit_id: CommitId,
 ) -> Result<BTreeMap<TrackedStateKey, MaterializedTrackedStateRow>, LixError> {
     let rows = TrackedStateContext::new()
@@ -3182,6 +3264,10 @@ async fn load_persisted_lifecycle_tracked_snapshot(
         .into_rows();
     Ok(rows
         .into_iter()
+        .filter(|row| {
+            branch_id == crate::GLOBAL_BRANCH_ID
+                || row.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+        })
         .map(|row| {
             let key = TrackedStateKey {
                 schema_key: row.schema_key.clone(),
@@ -4482,7 +4568,6 @@ async fn stage_tracked_head(
     }
     Ok(StagedHotHeads {
         controls,
-        tracked_snapshots,
         deferred_fresh_hot_plans,
     })
 }
@@ -4902,6 +4987,45 @@ fn insert_direct_branch_control(
     Ok(())
 }
 
+fn bind_branch_checkpoint_bridge(
+    branch_id: &str,
+    target: &ExplicitBranchHeadTarget,
+    existing: Option<BranchHeadControl>,
+    control: &mut BranchHeadControl,
+    bridge: &crate::gc::CheckpointRecoveryRef,
+) -> Result<TrackedWorkingDiffEpoch, LixError> {
+    let Some(target_head) = target.head_commit_id else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("checkpoint ancestry bridge cannot delete branch '{branch_id}'"),
+        ));
+    };
+    if bridge.branch_id != branch_id
+        || existing.is_some()
+        || bridge.recovered_head_commit_id != target_head
+        || control.head_commit_id != target_head
+        || bridge.checkpoint_commit_id == target_head
+        || !bridge.interval_has_commits
+        // New branches provisionally start their private working-diff epoch at
+        // the exact root they were created from. A pending authenticated
+        // checkpoint bridge may replace only that default cursor; an absent
+        // or arbitrary preexisting baseline is a different authority and
+        // must fail closed.
+        || control.working_diff_checkpoint_commit_id != Some(target_head)
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("branch '{branch_id}' has an invalid checkpoint ancestry bridge"),
+        ));
+    }
+    control.working_diff_checkpoint_commit_id = Some(bridge.checkpoint_commit_id);
+    Ok(TrackedWorkingDiffEpoch {
+        checkpoint_commit_id: bridge.checkpoint_commit_id,
+        generation: control.tracked_generation,
+        coverage: WorkingDiffIndexCoverage::default(),
+    })
+}
+
 /// Publishes every current-state branch control under an exact-byte CAS token.
 ///
 /// Normal tracked commits arrive as `normal_controls`, built from the same
@@ -4918,8 +5042,10 @@ async fn stage_root_backed_branch_publication(
     head_commit_id: CommitId,
     target: &ExplicitBranchHeadTarget,
     previous_control: Option<BranchHeadControl>,
+    stage_initial_working_diff_epoch: bool,
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
+    insert_selection: &PreparedInsertSelection,
 ) -> Result<BranchHeadControl, LixError> {
     let generation = lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
     let tracked_head = TrackedHeadContext::new();
@@ -4928,16 +5054,39 @@ async fn stage_root_backed_branch_publication(
         generation,
         head_commit_id,
     );
+    if stage_initial_working_diff_epoch {
+        stage_tracked_working_diff_epoch(
+            writes,
+            branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: head_commit_id,
+                generation,
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )?;
+    }
     let mut control = BranchHeadControl {
         head_commit_id,
         tracked_generation: generation,
         untracked_generation: previous_control
             .map(|control| control.untracked_generation)
             .unwrap_or(generation),
-        current_state_revision: previous_control
-            .map_or(0, |control| control.current_state_revision),
-        working_diff_checkpoint_commit_id: None,
-        created_at: target.created_at,
+        current_state_revision: match previous_control {
+            None => 0,
+            // An explicit move of an existing head is a new current-state
+            // revision for every reader holding the previous one.
+            Some(control) => next_current_state_revision(control.current_state_revision)?,
+        },
+        // A branch is born at a complete authenticated root. Its private
+        // working interval therefore starts at that exact head; no logical
+        // checkpoint entity or history scan is needed to recover the cursor.
+        // Explicit lifecycle moves of an existing branch instead keep that
+        // branch's own compaction baseline.
+        working_diff_checkpoint_commit_id: match previous_control {
+            None => Some(head_commit_id),
+            Some(control) => control.working_diff_checkpoint_commit_id,
+        },
+        created_at: previous_control.map_or(target.created_at, |control| control.created_at),
         updated_at: target.updated_at,
         ref_change_id: target.ref_change_id,
         // Root reads answer schema presence directly. Keep the bloom
@@ -4960,11 +5109,34 @@ async fn stage_root_backed_branch_publication(
         )
         .collect::<Result<Vec<_>, _>>()?;
     if !untracked_deltas.is_empty() {
-        let next_generation = untracked_lifecycle_generation(
-            branch_id,
-            control.untracked_generation,
-            next_current_state_revision(control.current_state_revision)?,
-        );
+        // A new branch has not consumed its revision yet; an existing branch
+        // already advanced one above for this same publication.
+        let revision = match previous_control {
+            None => next_current_state_revision(control.current_state_revision)?,
+            Some(_) => control.current_state_revision,
+        };
+        let absence_guards = if insert_selection.is_empty() {
+            BTreeSet::new()
+        } else {
+            state_rows
+                .iter()
+                .enumerate()
+                .filter(|(row_index, row)| {
+                    row.untracked
+                        && row.branch_id.as_str() == branch_id
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                        && row.snapshot.is_some()
+                        && insert_selection.contains(*row_index)
+                })
+                .map(|(_, row)| TrackedStateKey {
+                    schema_key: row.schema_key.to_string(),
+                    file_id: row.file_id.map(ToString::to_string),
+                    entity_pk: row.entity_pk.clone(),
+                })
+                .collect()
+        };
+        let next_generation =
+            untracked_lifecycle_generation(branch_id, control.untracked_generation, revision);
         tracked_head
             .writer(read, writes)
             .stage_untracked_generation(
@@ -4972,12 +5144,11 @@ async fn stage_root_backed_branch_publication(
                 control.untracked_generation,
                 next_generation,
                 &untracked_deltas,
-                &BTreeSet::new(),
+                &absence_guards,
             )
             .await?;
         control.untracked_generation = next_generation;
-        control.current_state_revision =
-            next_current_state_revision(control.current_state_revision)?;
+        control.current_state_revision = revision;
     }
     Ok(control)
 }
@@ -4987,23 +5158,34 @@ async fn stage_branch_head_control_publications(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     normal_controls: &BTreeMap<String, BranchHeadControl>,
-    tracked_snapshots: &BTreeMap<CommitId, HotTrackedSnapshot>,
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     insert_selection: &PreparedInsertSelection,
     checkpoint_publications: &[crate::gc::CheckpointPublication],
+    branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
     root_reachability_deltas: &mut Vec<crate::gc::RootReachabilityDelta>,
 ) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
+    if let Some(branch_id) = branch_checkpoint_bridges
+        .keys()
+        .find(|branch_id| checkpoint_epochs.contains_key(*branch_id))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "branch '{branch_id}' cannot publish a checkpoint and an ancestry bridge together"
+            ),
+        ));
+    }
     let mut publications = normal_controls
         .iter()
         .map(|(branch_id, control)| (branch_id.clone(), Some(*control)))
         .collect::<BTreeMap<String, Option<BranchHeadControl>>>();
-    let tracked_head = TrackedHeadContext::new();
+    let mut consumed_checkpoint_bridges = BTreeSet::new();
     for (branch_id, target) in explicit_branch_targets {
         if publications.contains_key(branch_id) {
             return Err(LixError::new(
@@ -5024,141 +5206,58 @@ async fn stage_branch_head_control_publications(
                 )
             })?
             .control;
-        let desired = match target.head_commit_id {
+        let mut desired = match target.head_commit_id {
             None => None,
             Some(head_commit_id) => {
-                if existing.is_none() {
-                    let control = Box::pin(stage_root_backed_branch_publication(
-                        read,
-                        writes,
-                        branch_id,
-                        head_commit_id,
-                        target,
-                        existing,
-                        state_rows,
-                        engine_rows,
-                    ))
-                    .await?;
-                    root_backed_branch_publications.insert(branch_id.clone());
-                    Some(control)
-                } else {
-                    let tracked = if let Some(snapshot) = tracked_snapshots.get(&head_commit_id) {
-                        snapshot.clone()
-                    } else {
-                        let rows =
-                            load_persisted_lifecycle_tracked_snapshot(read, head_commit_id).await?;
-                        HotTrackedSnapshot::from_materialized_rows(rows.into_values().collect())?
-                    };
-                    let mut untracked_deltas = state_rows
-                        .iter()
-                        .filter(|row| {
-                            row.untracked
-                                && row.branch_id.as_str() == branch_id
-                                && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                        })
-                        .map(current_state_delta_from_state_row)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    untracked_deltas.extend(
-                        engine_rows
-                            .iter()
-                            .filter(|row| row.branch_id == *branch_id)
-                            .map(current_state_delta_from_engine_row),
-                    );
-                    let absence_guards = if insert_selection.is_empty() {
-                        BTreeSet::new()
-                    } else {
-                        state_rows
-                            .iter()
-                            .enumerate()
-                            .filter(|(row_index, row)| {
-                                row.untracked
-                                    && row.branch_id.as_str() == branch_id
-                                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                                    && row.snapshot.is_some()
-                                    && insert_selection.contains(*row_index)
-                            })
-                            .map(|(_, row)| TrackedStateKey {
-                                schema_key: row.schema_key.to_string(),
-                                file_id: row.file_id.map(ToString::to_string),
-                                entity_pk: row.entity_pk.clone(),
-                            })
-                            .collect()
-                    };
-                    let generation =
-                        lifecycle_generation(&branch_id, head_commit_id, target.ref_change_id);
-                    let mut coverage = WorkingDiffIndexCoverage::default();
-                    let (_, schema_keys) = tracked_head
-                        .writer(read, writes)
-                        .stage_complete_current_state_with_working_diff(
-                            &branch_id,
-                            generation,
-                            tracked,
-                            existing.map(|control| control.tracked_generation),
-                            &[],
-                            &[],
-                            &absence_guards,
-                            None,
-                            &mut coverage,
-                        )
-                        .await?;
-                    let mut control = BranchHeadControl {
-                        head_commit_id,
-                        tracked_generation: generation,
-                        untracked_generation: existing
-                            .expect("existing lifecycle publication was handled above")
-                            .untracked_generation,
-                        current_state_revision: match existing {
-                            Some(control) => control
-                                .current_state_revision
-                                .checked_add(1)
-                                .ok_or_else(|| {
-                                    LixError::new(
-                                        LixError::CODE_INTERNAL_ERROR,
-                                        "branch current-state revision overflowed",
-                                    )
-                                })?,
-                            None => 0,
-                        },
-                        working_diff_checkpoint_commit_id: None,
-                        created_at: existing
-                            .map_or(target.created_at, |control| control.created_at),
-                        updated_at: target.updated_at,
-                        ref_change_id: target.ref_change_id,
-                        schema_presence_bloom: existing
-                            .expect("existing lifecycle publication was handled above")
-                            .schema_presence_bloom,
-                    };
-                    if !untracked_deltas.is_empty() {
-                        let previous_untracked_generation = control.untracked_generation;
-                        let next_revision = control.current_state_revision;
-                        let next_untracked_generation = untracked_lifecycle_generation(
-                            &branch_id,
-                            previous_untracked_generation,
-                            next_revision,
-                        );
-                        tracked_head
-                            .writer(read, writes)
-                            .stage_untracked_generation(
-                                &branch_id,
-                                previous_untracked_generation,
-                                next_untracked_generation,
-                                &untracked_deltas,
-                                &absence_guards,
-                            )
-                            .await?;
-                        control.untracked_generation = next_untracked_generation;
-                    }
-                    control.note_schemas(
-                        schema_keys
-                            .iter()
-                            .map(String::as_str)
-                            .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
-                    );
-                    Some(control)
-                }
+                // Every explicit head move publishes one immutable tracked
+                // root reference. The head commit is already authoritative for
+                // every tracked identity, so materializing a branch-local copy
+                // of the whole working set would only restate it.
+                let control = Box::pin(stage_root_backed_branch_publication(
+                    read,
+                    writes,
+                    branch_id,
+                    head_commit_id,
+                    target,
+                    existing,
+                    existing.is_none() && !branch_checkpoint_bridges.contains_key(branch_id),
+                    state_rows,
+                    engine_rows,
+                    insert_selection,
+                ))
+                .await?;
+                root_backed_branch_publications.insert(branch_id.clone());
+                Some(control)
             }
         };
+        if let Some(bridge) = branch_checkpoint_bridges.get(branch_id) {
+            let control = desired.as_mut().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "checkpoint ancestry bridge has no branch publication for '{branch_id}'"
+                    ),
+                )
+            })?;
+            let epoch =
+                bind_branch_checkpoint_bridge(branch_id, target, existing, control, bridge)?;
+            stage_tracked_working_diff_epoch(writes, branch_id, epoch)?;
+            crate::gc::stage_recovery_ref_rotation(writes, bridge)?;
+            consumed_checkpoint_bridges.insert(branch_id.clone());
+        }
         publications.insert(branch_id.clone(), desired);
+    }
+    if consumed_checkpoint_bridges.len() != branch_checkpoint_bridges.len() {
+        let branch_id = branch_checkpoint_bridges
+            .keys()
+            .find(|branch_id| !consumed_checkpoint_bridges.contains(*branch_id))
+            .expect("bridge count differs only when one branch was not consumed");
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "checkpoint ancestry bridge has no explicit branch publication for '{branch_id}'"
+            ),
+        ));
     }
 
     if publications.is_empty() {
@@ -5216,7 +5315,10 @@ async fn stage_branch_head_control_publications(
         }
         match desired {
             Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
-            None => stage_delete_branch_head_control(writes, branch_id)?,
+            None => {
+                stage_delete_branch_head_control(writes, branch_id)?;
+                crate::gc::stage_delete_recovery_ref(writes, branch_id)?;
+            }
         }
     }
     Ok(publications
@@ -5622,6 +5724,23 @@ async fn stage_tracked_roots(
             true,
         )
         .await?;
+        let all_new = plans
+            .iter()
+            .all(|plan| !staged_rebuild_plan_ids.contains(&plan.commit_id));
+        if all_new
+            && crate::tracked_state::try_stage_collapsed_rebuild_plans_with_writer(
+                &mut tracked_writer,
+                &plans,
+            )
+            .await?
+            .is_some()
+        {
+            // A collapsed replay stages only its terminal root. Intermediate
+            // plan IDs remain unstaged so another rebuild parent sharing this
+            // suffix can independently collapse against immutable authority.
+            staged_rebuild_plan_ids.insert(plans[0].commit_id);
+            continue;
+        }
         for plan in plans.iter().rev() {
             if staged_rebuild_plan_ids.insert(plan.commit_id) {
                 crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
@@ -6516,7 +6635,7 @@ fn account_has_changes_error(account_id: &str) -> LixError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -6551,6 +6670,157 @@ mod tests {
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    #[tokio::test]
+    async fn branch_creation_owner_publishes_checkpoint_serving_context() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut seed = storage.new_write_set();
+        crate::gc::stage_reachability_queue_seed(&mut seed)
+            .expect("reachability queue should seed");
+        storage
+            .commit_write_set(seed, StorageWriteOptions::default())
+            .await
+            .expect("reachability queue seed should commit");
+
+        let branch_id = "01960000-0000-7000-8000-0000000000b1";
+        let recovered_head = commit_id("branch-bridge-recovered-head");
+        let checkpoint = commit_id("branch-bridge-checkpoint");
+        let target = ExplicitBranchHeadTarget {
+            head_commit_id: Some(recovered_head),
+            ref_change_id: change_id("branch-bridge-ref-change"),
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+        };
+        let bridge = crate::gc::CheckpointRecoveryRef {
+            branch_id: branch_id.to_owned(),
+            recovered_head_commit_id: recovered_head,
+            checkpoint_commit_id: checkpoint,
+            interval_has_commits: true,
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch publication read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let mut root_backed = BTreeSet::new();
+        let mut reachability_deltas = Vec::new();
+        let controls = stage_branch_head_control_publications(
+            &read,
+            &mut writes,
+            &BTreeMap::new(),
+            &PreparedStateBatch::new(),
+            &[],
+            &BTreeMap::from([(branch_id.to_owned(), target)]),
+            &PreparedInsertSelection::new(),
+            &[],
+            &BTreeMap::from([(branch_id.to_owned(), bridge.clone())]),
+            &mut preconditions,
+            &BTreeMap::from([(
+                branch_id.to_owned(),
+                BranchHeadControlObservation {
+                    control: None,
+                    raw_token: None,
+                },
+            )]),
+            &mut root_backed,
+            &mut reachability_deltas,
+        )
+        .await
+        .expect("branch owner should stage checkpoint serving context");
+        let control = controls
+            .get(branch_id)
+            .copied()
+            .expect("created branch should have a complete control");
+        assert_eq!(control.head_commit_id, recovered_head);
+        assert_eq!(control.working_diff_checkpoint_commit_id, Some(checkpoint));
+        assert!(root_backed.contains(branch_id));
+        assert_eq!(reachability_deltas.len(), 1);
+        assert_eq!(reachability_deltas[0].old_root, None);
+        assert_eq!(reachability_deltas[0].new_root, Some(recovered_head));
+        assert_eq!(reachability_deltas[0].new_control, Some(control));
+        crate::gc::stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            &reachability_deltas,
+            &[],
+            &mut preconditions,
+        )
+        .await
+        .expect("branch publication should stage the exact queue fence");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("branch serving context should publish atomically");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch serving verification read should open");
+        let persisted = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .expect("created branch control should load")
+            .expect("created branch control should exist");
+        assert_eq!(persisted, control);
+        let epoch = TrackedHeadContext::new()
+            .reader(&read)
+            .working_diff_epoch(branch_id)
+            .await
+            .expect("branch working-diff epoch should load")
+            .expect("branch working-diff epoch should exist");
+        assert_eq!(epoch.checkpoint_commit_id, checkpoint);
+        assert_eq!(epoch.generation, control.tracked_generation);
+        assert_eq!(
+            crate::gc::resolve_checkpoint_branch_parent(
+                &read,
+                branch_id,
+                recovered_head,
+                control.working_diff_checkpoint_commit_id,
+            )
+            .await
+            .expect("branch serving context should validate"),
+            Some(checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_checkpoint_without_complete_hot_control_still_fails() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("checkpoint validation read should open");
+        let mut writes = storage.new_write_set();
+        let checkpoint = commit_id("missing-hot-checkpoint");
+        let error = stage_checkpoint_working_diff_epochs(
+            &read,
+            &mut writes,
+            &[crate::gc::CheckpointPublication {
+                recovery_ref: crate::gc::CheckpointRecoveryRef {
+                    branch_id: "01960000-0000-7000-8000-0000000000b2".to_owned(),
+                    recovered_head_commit_id: commit_id("missing-hot-recovered-head"),
+                    checkpoint_commit_id: checkpoint,
+                    interval_has_commits: true,
+                },
+                gc_state: crate::gc::CheckpointGcState::default(),
+            }],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect_err("real checkpoint publication without complete HOT control must fail");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("has no complete hot control"));
     }
 
     #[test]
@@ -7161,6 +7431,7 @@ mod tests {
             &PreparedInsertSelection::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeSet::new(),
         )
         .await
         .expect("mixed certified delta should stage");
@@ -10337,9 +10608,9 @@ mod tests {
         .await
         .expect("ordinary race CAS sweep should stage");
         assert_eq!(swept.reclaimed_chunk_rows, 1);
-        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_reclamation_fence(read, &mut writes, &mut preconditions)
             .await
-            .expect("ordinary race sweep epoch should stage");
+            .expect("ordinary race sweep fence should stage");
         (writes, preconditions)
     }
 

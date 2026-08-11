@@ -63,6 +63,10 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -399,6 +403,20 @@ pub struct CrudCurrentStateScopedRangeAccounting {
     pub sealed_manifest_loads: u64,
     pub replay_manifest_loads: u64,
     pub ordered_delta_fallbacks: u64,
+    pub commit_delta_direct_segments: u64,
+    pub commit_delta_direct_rows: u64,
+    pub commit_delta_generic_segments: u64,
+    pub commit_delta_generic_rows: u64,
+}
+
+pub(crate) fn record_commit_delta_leaf_layout(rows: usize, direct: bool) {
+    let (segments, encoded_rows) = if direct {
+        (&COMMIT_DELTA_DIRECT_SEGMENTS, &COMMIT_DELTA_DIRECT_ROWS)
+    } else {
+        (&COMMIT_DELTA_GENERIC_SEGMENTS, &COMMIT_DELTA_GENERIC_ROWS)
+    };
+    segments.fetch_add(1, Ordering::Relaxed);
+    encoded_rows.fetch_add(rows as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn record_crud_current_state_scoped_range_attempt() {
@@ -433,6 +451,10 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_segments: COMMIT_DELTA_DIRECT_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_rows: COMMIT_DELTA_DIRECT_ROWS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_segments: COMMIT_DELTA_GENERIC_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_rows: COMMIT_DELTA_GENERIC_ROWS.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -476,7 +498,19 @@ pub enum CommitGraphBenchMode {
     LegacyAllNodes,
     ReachableNodes,
     LegacyReachableNodes,
+    /// Whole reachable history for one member schema.
+    HistoryFull,
+    /// History restricted to the head commit (`lixcol_depth = 0`).
+    HistoryDepth0,
+    /// History for a bounded row demand (`LIMIT 10`).
+    HistoryLimit10,
 }
+
+/// Row demand a bounded history benchmark mode asks for.
+const COMMIT_GRAPH_BENCH_HISTORY_LIMIT: usize = 10;
+
+/// Schema key that [`seed_commit_graph_members_for_bench`] writes per commit.
+const COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY: &str = "commit_graph_bench_member";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CommitGraphBenchResult {
@@ -527,8 +561,9 @@ where
             "merge-base benchmark ancestry must be positive",
         ));
     }
-    let mut records = Vec::new();
-    let mut generations = std::collections::HashMap::new();
+    let mut records = Vec::<crate::changelog::CommitRecord>::new();
+    let mut generations = std::collections::HashMap::<crate::changelog::CommitId, u64>::new();
+    let mut record_indices = std::collections::HashMap::<crate::changelog::CommitId, usize>::new();
     let scenario_name = match scenario {
         MergeBaseBenchScenario::EqualHeads => "equal",
         MergeBaseBenchScenario::AncestorDescendant => "ancestor",
@@ -552,11 +587,23 @@ where
             .max()
             .map_or(0, |generation| generation.saturating_add(1));
         let commit_id = crate::changelog::CommitId::for_test_label(&label);
+        let parent = parents
+            .as_slice()
+            .first()
+            .and_then(|parent_id| record_indices.get(parent_id))
+            .map(|index| &records[*index]);
+        let parent_jump = parent
+            .and_then(|parent| record_indices.get(&parent.first_parent_jump_commit_id))
+            .map(|index| &records[*index]);
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation,
             parent_commit_ids: parents,
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -565,6 +612,7 @@ where
             ),
         });
         generations.insert(commit_id, generation);
+        record_indices.insert(commit_id, records.len() - 1);
         Ok(commit_id)
     };
 
@@ -694,28 +742,19 @@ where
         reader.merge_base(&left, &right).await?
     };
     let mut reader = crate::tracked_state::TrackedStateContext::new().reader(&read);
-    let target_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            left_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
-    let source_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            right_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
+    let analysis = crate::session::analyze_merge_for_bench(
+        &mut reader,
+        crate::session::MergeCommitsForBench {
+            base_commit_id: base,
+            target_commit_id: left,
+            source_commit_id: right,
+        },
+    )
+    .await?;
     Ok(MergePreparationBenchResult {
-        base_commit_id: base.to_string(),
-        target_entries,
-        source_entries,
+        base_commit_id: analysis.commits.base_commit_id.to_string(),
+        target_entries: analysis.target_diff.entries.len(),
+        source_entries: analysis.source_diff.entries.len(),
     })
 }
 
@@ -737,6 +776,36 @@ where
     let mut reader = crate::commit_graph::CommitGraphContext::new().reader(read);
     let head_commit_id =
         crate::changelog::CommitId::parse_lix(head_commit_id, "commit graph benchmark head")?;
+    if let Some((max_depth, limit)) = match mode {
+        CommitGraphBenchMode::HistoryFull => Some((None, None)),
+        CommitGraphBenchMode::HistoryDepth0 => Some((Some(0), None)),
+        CommitGraphBenchMode::HistoryLimit10 => {
+            Some((None, Some(COMMIT_GRAPH_BENCH_HISTORY_LIMIT)))
+        }
+        _ => None,
+    } {
+        let history = reader
+            .change_history_from_commit(
+                &head_commit_id,
+                &crate::commit_graph::CommitGraphChangeHistoryRequest {
+                    entity_pks: Vec::new(),
+                    schema_keys: vec![COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY.to_string()],
+                    file_ids: Vec::new(),
+                    min_depth: None,
+                    max_depth,
+                    include_tombstones: true,
+                    limit,
+                },
+            )
+            .await?;
+        let entries = history.entries.len();
+        std::hint::black_box(history);
+        return Ok(CommitGraphBenchResult {
+            nodes: 0,
+            edges: 0,
+            member_changes: entries,
+        });
+    }
     let nodes = match mode {
         CommitGraphBenchMode::AllNodes | CommitGraphBenchMode::LegacyAllNodes => {
             reader.all_nodes().await?
@@ -747,6 +816,9 @@ where
             .iter()
             .map(|reachable| reachable.commit.clone())
             .collect(),
+        CommitGraphBenchMode::HistoryFull
+        | CommitGraphBenchMode::HistoryDepth0
+        | CommitGraphBenchMode::HistoryLimit10 => unreachable!("history modes returned above"),
     };
     let node_count = nodes.len();
     let edges = crate::commit_graph::commit_edges(&nodes).len();
@@ -825,7 +897,7 @@ where
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
                 delta: crate::tracked_state::TrackedStateDeltaRef {
-                    schema_key: "commit_graph_bench_member",
+                    schema_key: COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY,
                     file_id: None,
                     entity_pk: &entity_pk,
                     change_id: crate::changelog::ChangeId::for_test_label(&format!(
@@ -876,6 +948,7 @@ pub struct RepositoryGcBenchResult {
     pub key_shared_buffers: usize,
     pub key_shared_bytes: usize,
     pub key_shared_capacity: usize,
+    pub reclaimed_generation_rows: u64,
     pub root_discovery_us: u64,
     pub changelog_us: u64,
     pub tracked_root_stage_us: u64,
@@ -1127,6 +1200,7 @@ where
         key_shared_buffers: arena.key_shared_buffers,
         key_shared_bytes: arena.key_shared_bytes,
         key_shared_capacity: arena.key_shared_capacity,
+        reclaimed_generation_rows: plan.sweep.reclaimed_generation_rows,
         root_discovery_us: plan.profile.root_discovery_us,
         changelog_us: plan.profile.changelog_us,
         tracked_root_stage_us: plan.profile.tracked_root_stage_us,
@@ -1138,6 +1212,7 @@ where
 pub struct RepositoryGcCommitBenchResult {
     pub staged_deletes: u64,
     pub swept_commits: usize,
+    pub reclaimed_generation_rows: u64,
     pub reclaimed_manifest_rows: usize,
     pub reclaimed_manifest_chunk_rows: usize,
     pub reclaimed_chunk_rows: usize,
@@ -1190,6 +1265,7 @@ where
             Ok(_) => {
                 return Ok(RepositoryGcCommitBenchResult {
                     staged_deletes: stats.staged_deletes,
+                    reclaimed_generation_rows: plan.sweep.reclaimed_generation_rows,
                     swept_commits: plan
                         .changelog
                         .sweep
@@ -1655,6 +1731,252 @@ where
         accounting.push(scan_layout_space(read, *space).await);
     }
     accounting
+}
+
+/// Exact value-level duplication for one storage space.
+///
+/// `duplicate_value_bytes` is what a perfect content-addressed store would not
+/// have had to write: for every distinct value byte string that occurs `n`
+/// times, `(n - 1) * len`. It is an upper bound on the win from content
+/// addressing that plane, because it ignores whatever indirection a real
+/// content-addressed layout would have to add.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageValueDuplication {
+    pub space_id: u32,
+    pub space: &'static str,
+    pub rows: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+    /// Distinct value byte strings in the space.
+    pub distinct_values: u64,
+    /// Rows whose value byte string also occurs on at least one other row.
+    pub duplicate_rows: u64,
+    pub duplicate_value_bytes: u64,
+    /// Largest number of rows sharing one value byte string.
+    pub max_occurrences: u64,
+}
+
+impl StorageValueDuplication {
+    /// Share of the space's value bytes a perfect CAS would have elided.
+    pub fn duplicate_fraction(&self) -> f64 {
+        if self.value_bytes == 0 {
+            0.0
+        } else {
+            self.duplicate_value_bytes as f64 / self.value_bytes as f64
+        }
+    }
+}
+
+/// Byte-exact duplication for every native storage space.
+pub async fn space_value_duplication<R>(read: &R) -> Vec<StorageValueDuplication>
+where
+    R: StorageAdapterRead,
+{
+    let mut accounting = Vec::with_capacity(native_storage_spaces().len());
+    for space in native_storage_spaces() {
+        accounting.push(scan_space_value_duplication(read, *space).await);
+    }
+    accounting
+}
+
+async fn scan_space_value_duplication<R>(
+    read: &R,
+    space: crate::storage_adapter::StorageSpace,
+) -> StorageValueDuplication
+where
+    R: StorageAdapterRead,
+{
+    let mut accounting = StorageValueDuplication {
+        space_id: space.id.0,
+        space: space.name,
+        ..StorageValueDuplication::default()
+    };
+    let mut occurrences = std::collections::HashMap::<[u8; 32], (u64, u64)>::new();
+    for entry in scan_layout_entries(read, space).await {
+        accounting.rows += 1;
+        accounting.key_bytes += entry.key.0.len() as u64 + 4;
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            continue;
+        };
+        accounting.value_bytes += value.len() as u64;
+        let digest = *blake3::hash(&value).as_bytes();
+        let slot = occurrences.entry(digest).or_insert((0, value.len() as u64));
+        slot.0 += 1;
+    }
+    accounting.distinct_values = occurrences.len() as u64;
+    for (count, len) in occurrences.into_values() {
+        accounting.max_occurrences = accounting.max_occurrences.max(count);
+        if count > 1 {
+            accounting.duplicate_rows += count - 1;
+            accounting.duplicate_value_bytes += (count - 1) * len;
+        }
+    }
+    accounting
+}
+
+/// Nearest-neighbour analysis of the commit-delta segment plane.
+///
+/// Byte-exact duplication answers "would a naive CAS dedup this". This answers
+/// the follow-up: when two segments are *not* byte-identical, how far apart are
+/// they? Two equal-length segments differing in a handful of bytes mean the
+/// payload carries per-commit identity (commit id, timestamps) that a redesign
+/// could hoist out; two segments differing in most of their bytes mean the
+/// content genuinely differs and no format change would help.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitDeltaSegmentSimilarity {
+    pub segments: u64,
+    pub distinct_values: u64,
+    /// Distinct values that share their byte length with another distinct value.
+    pub same_length_distinct_values: u64,
+    /// Compared pairs of equal-length distinct values.
+    pub compared_pairs: u64,
+    /// Pairs differing in at most 1% of their bytes.
+    pub near_identical_pairs: u64,
+    /// Smallest positive byte-difference count over all compared pairs.
+    pub min_differing_bytes: u64,
+    /// Byte length of the pair that produced `min_differing_bytes`.
+    pub min_differing_pair_len: u64,
+    /// Shared leading bytes of the pair that produced `min_differing_bytes`.
+    pub min_differing_pair_common_prefix: u64,
+    /// Shared trailing bytes of the same pair. A long shared suffix next to a
+    /// short shared prefix is the signature of a small identity header in front
+    /// of otherwise identical content.
+    pub min_differing_pair_common_suffix: u64,
+    /// Whether any pair was compared at all.
+    pub compared_any: bool,
+    /// Segments that a content-addressed plane could have elided *if* the
+    /// format also hoisted per-commit identity out of the payload. Two segments
+    /// count as content-equal when they share a byte length and their differing
+    /// bytes all fall inside one window of at most
+    /// `SEGMENT_IDENTITY_WINDOW_BYTES`.
+    pub identity_normalized_duplicate_segments: u64,
+    pub identity_normalized_duplicate_bytes: u64,
+    /// Content-equivalence classes with more than one member.
+    pub identity_normalized_shared_classes: u64,
+}
+
+/// Cap on distinct same-length values compared pairwise per length bucket.
+const SEGMENT_SIMILARITY_BUCKET_CAP: usize = 128;
+/// How much per-segment identity a redesigned payload is allowed to hoist out.
+/// The LXCD16 direct leaf carries a 16-byte commit id, a 4-byte packed base and
+/// a small timestamp-tail dictionary; 128 bytes is a generous allowance for all
+/// of it, so this over-counts rather than under-counts the achievable win.
+const SEGMENT_IDENTITY_WINDOW_BYTES: usize = 128;
+
+pub async fn commit_delta_segment_similarity<R>(read: &R) -> CommitDeltaSegmentSimilarity
+where
+    R: StorageAdapterRead,
+{
+    let mut distinct = std::collections::HashMap::<[u8; 32], (Bytes, u64)>::new();
+    let mut segments = 0u64;
+    for entry in scan_layout_entries(
+        read,
+        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    )
+    .await
+    {
+        segments += 1;
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            continue;
+        };
+        let slot = distinct
+            .entry(*blake3::hash(&value).as_bytes())
+            .or_insert((value, 0));
+        slot.1 += 1;
+    }
+
+    let mut buckets = std::collections::BTreeMap::<usize, Vec<(Bytes, u64)>>::new();
+    for (value, occurrences) in distinct.into_values() {
+        buckets
+            .entry(value.len())
+            .or_default()
+            .push((value, occurrences));
+    }
+
+    let mut similarity = CommitDeltaSegmentSimilarity {
+        segments,
+        min_differing_bytes: u64::MAX,
+        ..CommitDeltaSegmentSimilarity::default()
+    };
+    for values in buckets.values() {
+        similarity.distinct_values += values.len() as u64;
+        if values.len() < 2 {
+            continue;
+        }
+        similarity.same_length_distinct_values += values.len() as u64;
+        let window = &values[..values.len().min(SEGMENT_SIMILARITY_BUCKET_CAP)];
+        // Union-find over "content-equal once identity is hoisted out".
+        let mut class = (0..window.len()).collect::<Vec<_>>();
+        for (index, (left, _)) in window.iter().enumerate() {
+            for (offset, (right, _)) in window[index + 1..].iter().enumerate() {
+                let differing = left
+                    .iter()
+                    .zip(right.iter())
+                    .filter(|(left, right)| left != right)
+                    .count() as u64;
+                similarity.compared_pairs += 1;
+                similarity.compared_any = true;
+                if differing * 100 <= left.len() as u64 {
+                    similarity.near_identical_pairs += 1;
+                }
+                let common_prefix = left
+                    .iter()
+                    .zip(right.iter())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                let common_suffix = left
+                    .iter()
+                    .rev()
+                    .zip(right.iter().rev())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                if differing > 0
+                    && common_prefix + common_suffix + SEGMENT_IDENTITY_WINDOW_BYTES >= left.len()
+                {
+                    union(&mut class, index, index + 1 + offset);
+                }
+                if differing < similarity.min_differing_bytes {
+                    similarity.min_differing_bytes = differing;
+                    similarity.min_differing_pair_len = left.len() as u64;
+                    similarity.min_differing_pair_common_prefix = common_prefix as u64;
+                    similarity.min_differing_pair_common_suffix = common_suffix as u64;
+                }
+            }
+        }
+        let mut members = std::collections::BTreeMap::<usize, (u64, u64)>::new();
+        for (index, (value, occurrences)) in window.iter().enumerate() {
+            let root = find(&mut class, index);
+            let slot = members.entry(root).or_insert((0, value.len() as u64));
+            slot.0 += occurrences;
+        }
+        for (occurrences, len) in members.into_values() {
+            if occurrences > 1 {
+                similarity.identity_normalized_shared_classes += 1;
+                similarity.identity_normalized_duplicate_segments += occurrences - 1;
+                similarity.identity_normalized_duplicate_bytes += (occurrences - 1) * len;
+            }
+        }
+    }
+    if !similarity.compared_any {
+        similarity.min_differing_bytes = 0;
+    }
+    similarity
+}
+
+fn find(class: &mut [usize], mut index: usize) -> usize {
+    while class[index] != index {
+        class[index] = class[class[index]];
+        index = class[index];
+    }
+    index
+}
+
+fn union(class: &mut [usize], left: usize, right: usize) {
+    let left = find(class, left);
+    let right = find(class, right);
+    if left != right {
+        class[right] = left;
+    }
 }
 
 pub async fn binary_manifest_layout_accounting<R>(
@@ -2170,6 +2492,18 @@ fn collect_binary_cas_json_owners(
     }
 }
 
+/// One registered storage space, looked up by its registry name.
+///
+/// Tools that issue their own point reads need the physical space without
+/// re-declaring its id, which would be a second authority for the registry.
+#[must_use]
+pub fn storage_space_by_name(space_name: &str) -> crate::storage_adapter::StorageSpace {
+    *native_storage_spaces()
+        .iter()
+        .find(|space| space.name == space_name)
+        .expect("space name should exist")
+}
+
 /// Per-row (key, value bytes) inventory of one space.
 ///
 /// Equivalence tests compare these inventories byte-for-byte, so the scan
@@ -2178,10 +2512,7 @@ pub async fn space_inventory<R>(read: &R, space_name: &str) -> Vec<(Vec<u8>, Vec
 where
     R: StorageAdapterRead,
 {
-    let space = *native_storage_spaces()
-        .iter()
-        .find(|space| space.name == space_name)
-        .expect("space name should exist");
+    let space = storage_space_by_name(space_name);
     scan_layout_entries(read, space)
         .await
         .iter()
@@ -2208,41 +2539,110 @@ pub fn layout_space_catalog() -> Vec<(u32, &'static str)> {
         .collect()
 }
 
+/// Every registered storage space, in physical key order.
+///
+/// Layout accounting derives from the one registry so a newly added space
+/// appears in every layout report without a second list to maintain.
 fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
-    &[
-        crate::init::REPOSITORY_PROTOCOL_SPACE,
-        crate::branch::BRANCH_HEAD_CONTROL_SPACE,
-        crate::live_state::HOT_ROW_SPACE,
-        crate::live_state::HOT_FILE_SPACE,
-        crate::live_state::HOT_DIFF_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_SPACE,
-        crate::live_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        crate::live_state::ROOT_CURRENT_BASE_SPACE,
-        crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
-        crate::transaction::plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE,
-        crate::json_store::store::JSON_SPACE,
-        crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-        crate::gc::GC_TREE_SWEEP_EPOCH_SPACE,
-        crate::gc::GC_TREE_SWEEP_MARK_SPACE,
-        crate::gc::GC_TREE_SWEEP_CURSOR_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
-        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-        crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
-        crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
-        crate::changelog::COMMIT_SPACE,
-        crate::changelog::CHANGE_SPACE,
-        crate::changelog::COMMIT_CHANGE_ID_SPACE,
-    ]
+    crate::storage_spaces::ALL_STORAGE_SPACES
+}
+
+/// How a storage space derives its key from the bytes it stores.
+///
+/// Content addressing is what makes identical payloads cost one row instead
+/// of many. The rule is stated once here so an audit can prove the invariant
+/// rather than assume it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentAddressRule {
+    /// The key carries an identity (commit id, entity path, ordinal) that is
+    /// independent of the value bytes. Equal payloads under distinct keys are
+    /// stored twice by construction.
+    NotContentAddressed,
+    /// `key == blake3(value)`.
+    Blake3Value,
+    /// `key == blake3::derive_key(context, value)`.
+    Blake3KeyedValue(&'static str),
+    /// `key == blake3(chunk payload)` after the stored chunk envelope is
+    /// decoded.
+    BinaryCasChunkPayload,
+    /// `key == blake3(json text)` after the stored JSON envelope is decoded.
+    JsonStorePayload,
+    /// The key is a content address, but its payload lives in another space:
+    /// this space stores keys only. Nothing here can be verified against the
+    /// row's own (empty) value.
+    ContentAddressedKeyOnlyMirror,
+}
+
+/// The content-address rule for one physical space id.
+#[must_use]
+pub fn content_address_rule(space_id: u32) -> ContentAddressRule {
+    match space_id {
+        // tracked_state.tree_chunk
+        0x0004_0001 => ContentAddressRule::Blake3Value,
+        // tracked_state.commit_mutation_directory_node.v1
+        0x0004_002d => {
+            ContentAddressRule::Blake3KeyedValue("lix commit mutation directory node v1")
+        }
+        // tracked_state.current_state_data_part.v1
+        0x0004_002f => {
+            ContentAddressRule::Blake3KeyedValue("lix native current-state data part v1")
+        }
+        // tracked_state.current_state_data_part_refs.v1
+        0x0004_0030 => {
+            ContentAddressRule::Blake3KeyedValue("lix native current-state data part refs v1")
+        }
+        // tracked_state.scoped_range.v3
+        0x0004_0032 => {
+            ContentAddressRule::Blake3KeyedValue("lix scoped current-state range node v3")
+        }
+        // binary_cas.chunk
+        0x0005_0003 => ContentAddressRule::BinaryCasChunkPayload,
+        // json_store.json
+        0x0002_0001 => ContentAddressRule::JsonStorePayload,
+        // json_store.untracked_reclaim_candidate.v1
+        0x0002_0002 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
+        // binary_cas.chunk_presence
+        0x0005_0004 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
+        _ => ContentAddressRule::NotContentAddressed,
+    }
+}
+
+/// Recomputes the content address one row *should* have from the bytes it
+/// stores.
+///
+/// `Ok(None)` means the space is not content-addressed (or stores keys only),
+/// so there is nothing to check. `Ok(Some(digest))` must equal the row key.
+pub fn recompute_content_address(
+    space_id: u32,
+    value: &[u8],
+) -> Result<Option<[u8; 32]>, crate::LixError> {
+    Ok(match content_address_rule(space_id) {
+        ContentAddressRule::NotContentAddressed
+        | ContentAddressRule::ContentAddressedKeyOnlyMirror => None,
+        ContentAddressRule::Blake3Value => Some(*blake3::hash(value).as_bytes()),
+        ContentAddressRule::Blake3KeyedValue(context) => Some(
+            *blake3::Hasher::new_derive_key(context)
+                .update(value)
+                .finalize()
+                .as_bytes(),
+        ),
+        ContentAddressRule::BinaryCasChunkPayload => {
+            let (_codec, _len, payload) = crate::binary_cas::decode_binary_cas_chunk(value)?;
+            Some(*blake3::hash(payload).as_bytes())
+        }
+        ContentAddressRule::JsonStorePayload => {
+            let json = crate::json_store::store::decode_stored_json(value)?;
+            Some(*blake3::hash(&json).as_bytes())
+        }
+    })
+}
+
+/// Decodes one `binary_cas.manifest_chunk` row into the chunk it references
+/// and that chunk's logical size.
+pub fn decode_binary_cas_chunk_reference(
+    value: &[u8],
+) -> Result<([u8; 32], u64), crate::LixError> {
+    crate::binary_cas::decode_binary_cas_manifest_chunk(value)
 }
 
 async fn scan_layout_space<R>(
@@ -2579,9 +2979,17 @@ mod tests {
         // row; the other ten change deletes are retired branch-ref facts.
         assert_eq!(first.deleted_semantic_change_rows, 20);
         assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
+        // The deleted branch also strands the whole serving generation it was
+        // reading from. No live branch control can select it again, so the
+        // same pass retires it: ten commits of ten rows, plus the generation's
+        // collection control and root current base.
+        assert_eq!(first.reclaimed_generation_rows, 102);
         assert_eq!(
             first.delete_counts_by_space,
             vec![
+                (crate::live_state::HOT_ROW_SPACE.id.0, 100), // stranded serving rows
+                (crate::live_state::HOT_COLLECTION_CONTROL_SPACE.id.0, 1), // its collection control
+                (crate::live_state::ROOT_CURRENT_BASE_SPACE.id.0, 1), // its root current base
                 (
                     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
                         .id
@@ -2594,8 +3002,8 @@ mod tests {
                         .0,
                     10,
                 ), // mutation inventory authority
-                (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 20), // projection and branch-ref changes
+                (crate::changelog::COMMIT_SPACE.id.0, 10),    // branch-only commit projections
+                (crate::changelog::CHANGE_SPACE.id.0, 20),    // projection and branch-ref changes
                 (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
             ]
         );
@@ -2608,12 +3016,44 @@ mod tests {
             first.staged_deletes
         );
         assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
-        // GC also stages the mandatory five-byte binary-CAS epoch key. Its
-        // put shares the key arena with the UUID-keyed delete descriptors.
+        // GC also stages the mandatory binary-CAS reclamation key. Its put
+        // shares the key arena with the UUID-keyed delete descriptors. Since the
+        // revision singletons were consolidated into one space, the reclamation
+        // token's *logical* key is a single byte (`b"b"`) and the 4-byte space
+        // id is prepended at the physical layer, so derive the width from the
+        // constant rather than restating it.
+        const FENCE_KEY_BYTES: usize =
+            crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        assert_eq!(
-            first.key_shared_bytes,
-            first.staged_deletes as usize * 16 + 5
+        // Canonical-record deletes are UUID keyed, so each descriptor is
+        // exactly 16 bytes. Generation-scoped serving rows are keyed by
+        // `(branch, generation, schema, entity, file)` and are wider, so assert
+        // the UUID-keyed floor instead of restating that key layout here.
+        let uuid_keyed_deletes = first
+            .delete_counts_by_space
+            .iter()
+            .filter(|(space, _)| {
+                [
+                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                        .id
+                        .0,
+                    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
+                        .id
+                        .0,
+                    crate::changelog::COMMIT_SPACE.id.0,
+                    crate::changelog::CHANGE_SPACE.id.0,
+                    crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0,
+                ]
+                .contains(space)
+            })
+            .map(|(_, count)| *count)
+            .sum::<usize>();
+        let generation_keyed_deletes = first.staged_deletes as usize - uuid_keyed_deletes;
+        assert_eq!(generation_keyed_deletes, 102);
+        assert!(
+            first.key_shared_bytes
+                > uuid_keyed_deletes * 16 + generation_keyed_deletes * 16 + FENCE_KEY_BYTES,
+            "generation-scoped delete keys must be wider than a bare UUID"
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);

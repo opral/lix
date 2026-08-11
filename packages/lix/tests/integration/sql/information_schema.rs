@@ -554,9 +554,9 @@ simulation_test!(
                 ("json_value", Some("JSON")) => (
                     Value::Text("{\"phase\":\"insert\"}".to_string()),
                     Value::Text("{\"phase\":\"insert\"}".to_string()),
-                    Value::Json(serde_json::json!({"phase": "insert"})),
+                    Value::Json(serde_json::json!({"phase": "insert"}).into()),
                     Value::Text("{\"phase\":\"update\"}".to_string()),
-                    Value::Json(serde_json::json!({"phase": "update"})),
+                    Value::Json(serde_json::json!({"phase": "update"}).into()),
                 ),
                 ("content", None) => (
                     Value::Text("before".to_string()),
@@ -1255,7 +1255,7 @@ simulation_test!(
                 .expect("updated row should be readable"),
             vec![vec![
                 Value::Text("fresh".to_string()),
-                Value::Json(serde_json::json!(["same"])),
+                Value::Json(serde_json::json!(["same"]).into()),
             ]],
         );
 
@@ -1453,7 +1453,7 @@ simulation_test!(
                 )
                 .await
                 .expect("DELETE RETURNING should match SELECT null semantics"),
-            vec![vec![Value::Null, Value::Json(serde_json::Value::Null)]],
+            vec![vec![Value::Null, Value::Json(serde_json::Value::Null.into())]],
         );
     }
 );

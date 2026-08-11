@@ -601,11 +601,11 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
         vec![
             vec![
                 Value::Text("batch-rs-a".to_string()),
-                Value::Json("first".into()),
+                Value::Json(serde_json::json!("first").into()),
             ],
             vec![
                 Value::Text("batch-rs-b".to_string()),
-                Value::Json("second".into()),
+                Value::Json(serde_json::json!("second").into()),
             ],
         ]
     );
@@ -1889,6 +1889,7 @@ fn assert_crm_task_projection(result: &lix::ExecuteResult) {
     let Value::Json(meta) = meta else {
         panic!("expected meta JSON value, got {meta:?}");
     };
+    let meta = meta.to_value();
     assert_eq!(
         meta.get("priority").and_then(|value| value.as_str()),
         Some("high")

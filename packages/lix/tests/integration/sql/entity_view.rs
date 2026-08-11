@@ -61,7 +61,7 @@ simulation_test!(
             .await
             .expect("filter-only payload query should succeed");
 
-        assert_rows_eq(result, vec![vec![Value::Json(json!(["n1"]))]]);
+        assert_rows_eq(result, vec![vec![Value::Json(json!(["n1"]).into())]]);
     }
 );
 

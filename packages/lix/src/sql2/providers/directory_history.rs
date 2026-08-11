@@ -255,6 +255,7 @@ where
         &event_route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
         metadata_projection,
+        None,
     )
     .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;

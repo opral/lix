@@ -145,7 +145,7 @@ simulation_test!(
             row_set.rows()[0].values(),
             &[
                 Value::Text("sql2-key".to_string()),
-                Value::Json(json!("sql2-value")),
+                Value::Json(json!("sql2-value").into()),
             ]
         );
     }
@@ -579,7 +579,7 @@ fn assert_single_json(result: ExecuteResult, expected: &str) {
     assert_eq!(row_set.len(), 1);
     let expected_json = serde_json::from_str::<serde_json::Value>(expected)
         .expect("expected JSON value should parse");
-    assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json)]);
+    assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json.into())]);
 }
 
 fn assert_closed(error: lix::LixError) {

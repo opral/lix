@@ -78,6 +78,8 @@ pub(crate) mod storage_adapter;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 pub(crate) mod storage_codec;
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) mod storage_spaces;
 pub mod telemetry;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;
@@ -116,7 +118,7 @@ pub use schema::{
 };
 
 pub use common::LixError;
-pub use common::{Blob, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
+pub use common::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};

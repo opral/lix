@@ -519,7 +519,7 @@ impl TryFromValue for f64 {
 impl TryFromValue for serde_json::Value {
     fn try_from_value(value: &Value) -> Result<Self, LixError> {
         match value {
-            Value::Json(value) => Ok(value.clone()),
+            Value::Json(value) => Ok(value.to_value()),
             other => Err(value_type_error("json", other)),
         }
     }
@@ -1779,7 +1779,7 @@ where
                 if let IdempotencyReceiptResolution::Replay(receipt) =
                     self.resolve_idempotency_receipt(&idempotency).await?
                 {
-                    return Ok(receipt.into_results());
+                    return receipt.into_results();
                 }
                 let result = self
                     .execute_transaction_batch(
@@ -1807,7 +1807,7 @@ where
                                 // callback was bypassed by an ambiguous error.
                                 self.observe_invalidation.bump();
                                 self.file_views.clear();
-                                Ok(receipt.into_results())
+                                receipt.into_results()
                             }
                             Ok(IdempotencyReceiptResolution::Absent) => Err(error),
                             Err(recovery_error) => Err(recovery_error),
@@ -4976,7 +4976,7 @@ mod tests {
         );
         assert_eq!(
             exact.rows()[1].value("lixcol_metadata").unwrap(),
-            &Value::Json(serde_json::json!({"rank": 2}))
+            &Value::Json(serde_json::json!({"rank": 2}).into())
         );
 
         let exact_directories = session
@@ -6790,7 +6790,7 @@ mod tests {
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
                  WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_insert_probe\"]')",
-                &[Value::Json(amended_schema)],
+                &[Value::Json(amended_schema.into())],
             )
             .await
             .expect("compatible schema amendment should stage");
@@ -6901,7 +6901,7 @@ mod tests {
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
                  WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_update_probe\"]')",
-                &[Value::Json(amended_schema)],
+                &[Value::Json(amended_schema.into())],
             )
             .await
             .expect("compatible schema amendment should stage");
@@ -7292,7 +7292,7 @@ mod tests {
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
-                        Value::Json(serde_json::json!({"not": "text"})),
+                        Value::Json(serde_json::json!({"not": "text"}).into()),
                     ],
                 },
                 ExecuteBatchStatement {
@@ -7300,7 +7300,7 @@ mod tests {
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
-                        Value::Json(serde_json::json!({"also": "not text"})),
+                        Value::Json(serde_json::json!({"also": "not text"}).into()),
                     ],
                 },
             ])
@@ -9338,11 +9338,11 @@ mod tests {
                     Value::Text(b.to_string()),
                     Value::Text("/b.txt".to_string()),
                     Value::Blob(b"bravo".to_vec().into()),
-                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"b"})),
+                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"b"}).into()),
                     Value::Text(a.to_string()),
                     Value::Text("/a.txt".to_string()),
                     Value::Blob(b"alpha".to_vec().into()),
-                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"})),
+                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"}).into()),
                 ],
             )
             .await
@@ -9369,7 +9369,7 @@ mod tests {
         );
         assert_eq!(
             result.rows()[0].value("lixcol_metadata").unwrap(),
-            &Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"}))
+            &Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"}).into())
         );
         assert_eq!(result.rows()[1].get::<String>("id").unwrap(), b);
         assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");

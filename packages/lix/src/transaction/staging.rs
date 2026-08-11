@@ -91,9 +91,9 @@ pub(crate) struct ImmutableMutationJournalChunk {
     schema_key: SharedStr,
     branch_id: SharedStr,
     origin_key: Option<SharedStr>,
-    identity_arena: Bytes,
+    identity_arena: SharedStr,
     identity_offsets: Arc<[(u32, u32)]>,
-    snapshot_arena: Bytes,
+    snapshot_arena: SharedStr,
     snapshot_offsets: Arc<[(u32, u32)]>,
     large_snapshot_refs: Arc<[(u32, crate::json_store::JsonRef)]>,
     sealed_replacement_parts: Option<Arc<[crate::tracked_state::EncodedReplacementPart]>>,
@@ -152,18 +152,23 @@ impl ImmutableMutationJournalChunk {
                 "immutable mutation identity arena is misaligned",
             ));
         }
-        let identity_bytes = Bytes::from(identity_arena);
+        let identity_arena = SharedStr::from_utf8(Bytes::from(identity_arena)).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation identity arena is not UTF-8",
+            )
+        })?;
         let mut previous_end = 0usize;
         let mut offsets = Vec::with_capacity(identity_offsets.len());
         let mut previous_identity = None;
         for (start, end) in identity_offsets {
-            if start != previous_end || end < start || end > identity_bytes.len() {
+            if start != previous_end || end < start || end > identity_arena.len() {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "immutable mutation identity offsets are invalid",
                 ));
             }
-            let value = std::str::from_utf8(&identity_bytes[start..end]).map_err(|_| {
+            let value = identity_arena.as_str().get(start..end).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "immutable mutation identity offset splits UTF-8",
@@ -192,7 +197,7 @@ impl ImmutableMutationJournalChunk {
             previous_identity = Some(value);
             previous_end = end;
         }
-        if previous_end != identity_bytes.len() {
+        if previous_end != identity_arena.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "immutable mutation identity offsets do not cover the arena",
@@ -203,7 +208,7 @@ impl ImmutableMutationJournalChunk {
             schema_key,
             branch_id,
             origin_key,
-            identity_bytes,
+            identity_arena,
             offsets.into(),
             snapshot_arena,
             snapshot_offsets,
@@ -218,7 +223,7 @@ impl ImmutableMutationJournalChunk {
         schema_key: SharedStr,
         branch_id: SharedStr,
         origin_key: Option<SharedStr>,
-        identity_arena: Bytes,
+        identity_arena: SharedStr,
         identity_offsets: Arc<[(u32, u32)]>,
         snapshot_arena: Vec<u8>,
         snapshot_offsets: Vec<(usize, usize)>,
@@ -241,13 +246,13 @@ impl ImmutableMutationJournalChunk {
                 "immutable mutation predecessor column is misaligned",
             ));
         }
-        let arena_len = snapshot_arena.len();
-        std::str::from_utf8(&snapshot_arena).map_err(|_| {
+        let snapshot_arena = SharedStr::from_utf8(Bytes::from(snapshot_arena)).map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "immutable mutation journal arena is not UTF-8",
             )
         })?;
+        let arena_len = snapshot_arena.len();
         let mut previous_end = 0usize;
         let mut offsets = Vec::with_capacity(snapshot_offsets.len());
         for (start, end) in snapshot_offsets {
@@ -257,7 +262,7 @@ impl ImmutableMutationJournalChunk {
                     "immutable mutation journal offsets are invalid",
                 ));
             }
-            std::str::from_utf8(&snapshot_arena[start..end]).map_err(|_| {
+            snapshot_arena.as_str().get(start..end).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "immutable mutation journal offset splits UTF-8",
@@ -289,7 +294,7 @@ impl ImmutableMutationJournalChunk {
             .iter()
             .enumerate()
             .filter_map(|(index, &(start, end))| {
-                let bytes = &snapshot_arena[start as usize..end as usize];
+                let bytes = &snapshot_arena.as_bytes()[start as usize..end as usize];
                 (bytes.len() > crate::json_store::JSON_INLINE_MAX_BYTES).then(|| {
                     (
                         u32::try_from(index)
@@ -306,7 +311,7 @@ impl ImmutableMutationJournalChunk {
             origin_key,
             identity_arena,
             identity_offsets,
-            snapshot_arena: Bytes::from(snapshot_arena),
+            snapshot_arena,
             snapshot_offsets: offsets.into(),
             large_snapshot_refs: large_snapshot_refs.into(),
             sealed_replacement_parts: None,
@@ -323,9 +328,9 @@ impl ImmutableMutationJournalChunk {
         self.identity_offsets
             .iter()
             .map(|&(start, end)| {
-                let value = std::str::from_utf8(&self.identity_arena[start as usize..end as usize])
-                    .expect("validated immutable mutation identity UTF-8");
-                let value = SharedStr::from_utf8_slice(self.identity_arena.clone(), value)
+                let value = self
+                    .identity_arena
+                    .slice(start as usize..end as usize)
                     .expect("validated immutable mutation identity remains in its arena");
                 EntityPk::from_validated_shared_string(value)
             })
@@ -349,13 +354,17 @@ impl ImmutableMutationJournalChunk {
 
     fn identity(&self, index: usize) -> &str {
         let (start, end) = self.identity_offsets[index];
-        std::str::from_utf8(&self.identity_arena[start as usize..end as usize])
+        self.identity_arena
+            .as_str()
+            .get(start as usize..end as usize)
             .expect("validated immutable mutation identity UTF-8")
     }
 
     pub(crate) fn snapshot(&self, index: usize) -> &str {
         let (start, end) = self.snapshot_offsets[index];
-        std::str::from_utf8(&self.snapshot_arena[start as usize..end as usize])
+        self.snapshot_arena
+            .as_str()
+            .get(start as usize..end as usize)
             .expect("validated immutable mutation journal UTF-8")
     }
 
@@ -514,7 +523,7 @@ impl ImmutableMutationJournalChunk {
         let mut rows = CertifiedParameterReplacementBatch::new(
             entity_pks.iter().cloned().collect(),
             TransactionJson::from_certified_row_content_arena(
-                self.snapshot_arena.to_vec(),
+                self.snapshot_arena.as_bytes().to_vec(),
                 offsets,
             )?,
             self.schema_key,
@@ -2818,85 +2827,6 @@ impl TransactionWriteBuffer {
         Ok(commit_id)
     }
 
-    pub(crate) fn stage_intermediate_rows(
-        &self,
-        commit_id: CommitId,
-        mut batch: PreparedStateBatch,
-    ) -> Result<(), LixError> {
-        let mut intermediate_commits = self.intermediate_commits.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged intermediate commits lock",
-            )
-        })?;
-        let commit = intermediate_commits
-            .iter_mut()
-            .find(|commit| commit.change_refs.commit_id == commit_id)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("unknown staged intermediate commit '{commit_id}'"),
-                )
-            })?;
-        if batch
-            .iter()
-            .any(|row| row.branch_id.as_str() != commit.branch_id || row.untracked)
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "intermediate commit row has an incompatible branch or durability",
-            ));
-        }
-        for index in 0..batch.len() {
-            batch.set_commit_id(index, Some(commit_id));
-        }
-        let identities = batch
-            .iter()
-            .map(PreparedStateRowIdentity::from)
-            .collect::<Vec<_>>();
-        self.ensure_identity_index(true)?;
-        let mut rows = self.rows.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged writes lock",
-            )
-        })?;
-        let StagedPreparedRows::Indexed {
-            rows,
-            insert_selection,
-            by_identity,
-            by_candidate,
-        } = &mut *rows
-        else {
-            unreachable!("intermediate row staging requires the identity index");
-        };
-        if identities
-            .iter()
-            .any(|identity| by_identity.contains_key(identity))
-        {
-            return Err(LixError::new(
-                LixError::CODE_CONSTRAINT_VIOLATION,
-                "intermediate checkpoint marker overlaps an existing staged row",
-            ));
-        }
-        let start = rows.len();
-        let count = batch.len();
-        insert_selection.reserve_rows(count, false);
-        for _ in 0..count {
-            insert_selection.push_not_insert();
-        }
-        rows.append(batch);
-        for (offset, identity) in identities.into_iter().enumerate() {
-            let index = start + offset;
-            let slot = RowSlot::State(index);
-            let row = rows.row(index);
-            by_candidate.insert(row, slot);
-            by_identity.insert(identity, slot);
-        }
-        commit.change_refs.add_change_count(count);
-        Ok(())
-    }
-
     /// Builds the transaction-local read overlay from currently staged writes.
     pub(crate) fn staging_overlay(self: &Arc<Self>) -> Result<PreparedStateRowOverlay, LixError> {
         Ok(PreparedStateRowOverlay {
@@ -3795,7 +3725,10 @@ fn ordered_mutation_journal_row<'a>(
     chunk
         .identity_offsets
         .binary_search_by(|&(start, end)| {
-            std::str::from_utf8(&chunk.identity_arena[start as usize..end as usize])
+            chunk
+                .identity_arena
+                .as_str()
+                .get(start as usize..end as usize)
                 .expect("validated immutable mutation identity UTF-8")
                 .cmp(entity_pk)
         })
@@ -3809,9 +3742,11 @@ fn push_ordered_mutation_materialized(
     chunk: &ImmutableMutationJournalChunk,
     row_index: usize,
 ) -> Result<usize, LixError> {
-    let snapshot = chunk.snapshot(row_index);
-    let snapshot =
-        SharedStr::from_utf8_slice(chunk.snapshot_arena.clone(), snapshot).ok_or_else(|| {
+    let (snapshot_start, snapshot_end) = chunk.snapshot_offsets[row_index];
+    let snapshot = chunk
+        .snapshot_arena
+        .slice(snapshot_start as usize..snapshot_end as usize)
+        .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "immutable mutation snapshot escaped its shared arena",
@@ -3828,9 +3763,11 @@ fn push_ordered_mutation_materialized(
             .transpose()?
             .unwrap_or_else(|| chunk.timestamp())
     };
-    let identity = chunk.identity(row_index);
-    let identity =
-        SharedStr::from_utf8_slice(chunk.identity_arena.clone(), identity).ok_or_else(|| {
+    let (identity_start, identity_end) = chunk.identity_offsets[row_index];
+    let identity = chunk
+        .identity_arena
+        .slice(identity_start as usize..identity_end as usize)
+        .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "immutable mutation identity escaped its shared arena",
@@ -4490,6 +4427,44 @@ mod tests {
         assert_eq!(chunk.identity(0), "a");
         assert_eq!(chunk.identity(1), "b");
         assert_eq!(chunk.identity_arena.len(), 2);
+    }
+
+    #[test]
+    fn immutable_journal_rejects_invalid_utf8_and_split_offsets() {
+        assert!(
+            ImmutableMutationJournalChunk::try_new_single_string_identities(
+                SchemaPlanId::for_test(0),
+                "schema".into(),
+                "branch".into(),
+                None,
+                vec![0xff],
+                vec![(0, 1)],
+                b"{}".to_vec(),
+                vec![(0, 2)],
+                None,
+                LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
+            )
+            .is_err(),
+            "the journal must reject an invalid identity arena"
+        );
+
+        let snapshots = "é".as_bytes().to_vec();
+        assert!(
+            ImmutableMutationJournalChunk::try_new_single_string_identities(
+                SchemaPlanId::for_test(0),
+                "schema".into(),
+                "branch".into(),
+                None,
+                b"ab".to_vec(),
+                vec![(0, 1), (1, 2)],
+                snapshots,
+                vec![(0, 1), (1, 2)],
+                None,
+                LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
+            )
+            .is_err(),
+            "the journal must reject snapshot offsets inside a UTF-8 scalar"
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
                 "INSERT INTO bundle (id, declarations) VALUES ($1, $2)",
                 &[
                     Value::Text(bundle.to_string()),
-                    Value::Json(serde_json::json!([])),
+                    Value::Json(serde_json::json!([]).into()),
                 ],
             )
             .await
@@ -81,8 +81,8 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
         &Value::Null
     );
 
-    // Unsupported physical shapes remain on the ordinary DataFusion planner,
-    // including aggregates and ordering, and retain exact SQL semantics.
+    // Aggregates remain on the ordinary DataFusion planner and retain exact
+    // SQL semantics.
     for _ in 0..2 {
         let count = session
             .execute("SELECT COUNT(*) AS count FROM bundle", &[])
@@ -92,10 +92,17 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
             count.rows()[0].value("count").expect("count column"),
             &Value::Integer(2)
         );
+    }
+
+    // Ordered reads are the dominant OLTP point-read shape, so their sort
+    // operator is part of the reusable template. A rebuilt sort must never
+    // inherit the previous execution's rows or ordering state, and it must see
+    // rows committed after the template was captured.
+    for _ in 0..2 {
         let ordered = session
             .execute("SELECT id FROM bundle ORDER BY id DESC", &[])
             .await
-            .expect("ordered fallback should execute");
+            .expect("ordered read should execute");
         assert_eq!(
             ordered
                 .rows()
@@ -108,6 +115,47 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
             ]
         );
     }
+    session
+        .execute(
+            "INSERT INTO bundle (id, declarations) VALUES ($1, $2)",
+            &[
+                Value::Text("bundle-3".to_string()),
+                Value::Json(serde_json::json!([]).into()),
+            ],
+        )
+        .await
+        .expect("third bundle should insert");
+    let ordered = session
+        .execute("SELECT id FROM bundle ORDER BY id DESC", &[])
+        .await
+        .expect("ordered read should rebind the current snapshot");
+    assert_eq!(
+        ordered
+            .rows()
+            .iter()
+            .map(|row| row.value("id").expect("id column"))
+            .collect::<Vec<_>>(),
+        vec![
+            &Value::Text("bundle-3".to_string()),
+            &Value::Text("bundle-2".to_string()),
+            &Value::Text("bundle-1".to_string())
+        ]
+    );
+    let limited = session
+        .execute("SELECT id FROM bundle ORDER BY id DESC LIMIT 2", &[])
+        .await
+        .expect("top-k read should execute");
+    assert_eq!(
+        limited
+            .rows()
+            .iter()
+            .map(|row| row.value("id").expect("id column"))
+            .collect::<Vec<_>>(),
+        vec![
+            &Value::Text("bundle-3".to_string()),
+            &Value::Text("bundle-2".to_string())
+        ]
+    );
 
     session.close().await.expect("session should close");
     let reopened = engine
@@ -132,7 +180,7 @@ async fn insert_message_variant(session: &SessionContext, message_id: &str, bund
                 Value::Text(message_id.to_string()),
                 Value::Text(bundle_id.to_string()),
                 Value::Text("locale".to_string()),
-                Value::Json(serde_json::json!([])),
+                Value::Json(serde_json::json!([]).into()),
             ],
         )
         .await
@@ -143,8 +191,8 @@ async fn insert_message_variant(session: &SessionContext, message_id: &str, bund
             &[
                 Value::Text(format!("{message_id}-0")),
                 Value::Text(message_id.to_string()),
-                Value::Json(serde_json::json!([])),
-                Value::Json(serde_json::json!([])),
+                Value::Json(serde_json::json!([]).into()),
+                Value::Json(serde_json::json!([]).into()),
             ],
         )
         .await

@@ -98,6 +98,7 @@ simulation_test!(
         let Value::Json(source_changes) = source_changes else {
             panic!("source_changes should be semantic JSON, got {source_changes:?}");
         };
+        let source_changes = source_changes.to_value();
         assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
         assert_eq!(
             source_changes[0]["schema_key"],
@@ -354,6 +355,7 @@ simulation_test!(
             let Value::Json(source_changes) = &row.values()[4] else {
                 panic!("delete source changes should be JSON");
             };
+            let source_changes = source_changes.to_value();
             let source_changes = source_changes
                 .as_array()
                 .expect("delete source changes should be an array");

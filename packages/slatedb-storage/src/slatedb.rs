@@ -363,31 +363,8 @@ impl ImmutableValueStore {
                         .into_iter()
                         .zip(plan.placements)
                         .map(|((index, requested), fragments)| {
-                            let mut encoded = BytesMut::with_capacity(requested.len());
-                            for (span_index, range) in fragments {
-                                let span = spans
-                                    .get(span_index)
-                                    .and_then(Option::as_ref)
-                                    .ok_or_else(|| {
-                                        StorageError::Corruption(
-                                            "immutable segment read omitted a requested extent"
-                                                .to_string(),
-                                        )
-                                    })?;
-                                if range.end > span.len() {
-                                    return Err(StorageError::Corruption(
-                                        "immutable segment extent is truncated".to_string(),
-                                    ));
-                                }
-                                encoded.extend_from_slice(&span[range]);
-                            }
-                            if encoded.len() != requested.len() {
-                                return Err(StorageError::Corruption(
-                                    "immutable extents did not reconstruct the requested value"
-                                        .to_string(),
-                                ));
-                            }
-                            Ok((index, encoded.freeze()))
+                            materialize_immutable_request(&spans, &requested, &fragments)
+                                .map(|value| (index, value))
                         })
                         .collect::<Result<Vec<_>, StorageError>>()
                 }
@@ -453,6 +430,53 @@ impl ImmutableValueStore {
         }
         Ok(())
     }
+}
+
+fn materialize_immutable_request(
+    spans: &[Option<Bytes>],
+    requested: &Range<usize>,
+    fragments: &[(usize, Range<usize>)],
+) -> Result<Bytes, StorageError> {
+    if let [(span_index, range)] = fragments {
+        let span = spans
+            .get(*span_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                StorageError::Corruption(
+                    "immutable segment read omitted a requested extent".to_string(),
+                )
+            })?;
+        if range.end > span.len() || range.len() != requested.len() {
+            return Err(StorageError::Corruption(
+                "immutable segment extent is truncated".to_string(),
+            ));
+        }
+        return Ok(span.slice(range.clone()));
+    }
+
+    let mut encoded = BytesMut::with_capacity(requested.len());
+    for (span_index, range) in fragments {
+        let span = spans
+            .get(*span_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                StorageError::Corruption(
+                    "immutable segment read omitted a requested extent".to_string(),
+                )
+            })?;
+        if range.end > span.len() {
+            return Err(StorageError::Corruption(
+                "immutable segment extent is truncated".to_string(),
+            ));
+        }
+        encoded.extend_from_slice(&span[range.clone()]);
+    }
+    if encoded.len() != requested.len() {
+        return Err(StorageError::Corruption(
+            "immutable extents did not reconstruct the requested value".to_string(),
+        ));
+    }
+    Ok(encoded.freeze())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3803,15 +3827,35 @@ async fn drain_write_queue(
                     }
                 }
             }
-            db.write_with_options(
-                batch,
-                &SlateDBWriteOptions {
-                    await_durable,
-                    ..SlateDBWriteOptions::default()
-                },
-            )
+            // SlateDB's own `await_durable` write option does not ask for a WAL
+            // flush; it only parks on the WAL buffer's durability watcher, which
+            // fires either when the buffer exceeds `l0_sst_size_bytes` (64 MiB)
+            // or when the periodic `flush_interval` ticker (100 ms) elapses.
+            // Every durable commit under that ceiling therefore paid up to a
+            // full 100 ms tick of pure idle latency for a WAL write that costs
+            // microseconds. Enqueue the batch without waiting, then ask the
+            // batch writer to flush now. The flush message is ordered behind
+            // this batch on the same writer channel, so it carries exactly the
+            // same durability guarantee — the WAL SST is in the object store
+            // before the commit is acknowledged — and one flush covers every
+            // durable write in the drained group, amortizing the barrier
+            // across a concurrent window instead of serializing on the ticker.
+            async {
+                let handle = db
+                    .write_with_options(
+                        batch,
+                        &SlateDBWriteOptions {
+                            await_durable: false,
+                            ..SlateDBWriteOptions::default()
+                        },
+                    )
+                    .await?;
+                if await_durable {
+                    db.flush().await?;
+                }
+                Ok::<_, slatedb::Error>(handle.seqnum())
+            }
             .await
-            .map(|handle| handle.seqnum())
             .map_err(slatedb_error)
             .map_err(commit_outcome_unknown)
         };
@@ -4691,6 +4735,32 @@ mod tests {
         let range = segment.values[0].1.clone();
         let bytes = Bytes::from(segment.frames.into_iter().collect::<PutPayload>());
         (segment.id, bytes, range)
+    }
+
+    #[test]
+    fn single_immutable_extent_reuses_the_fetched_span() {
+        let span = Bytes::from_static(b"0123456789");
+        let expected_ptr = span.slice(2..5).as_ptr();
+        let value = materialize_immutable_request(&[Some(span)], &(100..103), &[(0, 2..5)])
+            .expect("materialize one immutable extent");
+
+        assert_eq!(value, Bytes::from_static(b"234"));
+        assert_eq!(value.as_ptr(), expected_ptr);
+    }
+
+    #[test]
+    fn fragmented_immutable_extents_still_reconstruct_one_value() {
+        let value = materialize_immutable_request(
+            &[
+                Some(Bytes::from_static(b"abc")),
+                Some(Bytes::from_static(b"def")),
+            ],
+            &(100..104),
+            &[(0, 1..3), (1, 0..2)],
+        )
+        .expect("materialize fragmented immutable extents");
+
+        assert_eq!(value, Bytes::from_static(b"bcde"));
     }
 
     #[test]

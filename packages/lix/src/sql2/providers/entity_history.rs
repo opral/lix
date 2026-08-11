@@ -204,6 +204,7 @@ where
         route,
         vec![spec.schema_key.clone()],
         metadata_projection,
+        limit,
     )
     .await?;
     let mut rows = entries

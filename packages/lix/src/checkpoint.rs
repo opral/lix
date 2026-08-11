@@ -1,61 +1,93 @@
-use std::collections::{HashMap, HashSet};
-
 use serde_json::json;
 
-use crate::LixError;
-use crate::changelog::{ChangeRecordProjection, CommitId};
+#[cfg(any(test, feature = "storage-benches"))]
+use std::collections::HashMap;
+
+use crate::branch::BranchHeadControlContext;
+use crate::changelog::CommitId;
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::{ChangelogContext, ChangelogReader, CommitScanRequest};
-use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader};
+#[cfg(any(test, feature = "storage-benches"))]
+use crate::commit_graph::CommitGraphNode;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::{TrackedStateKey, TrackedStateStoreReader};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::{GLOBAL_BRANCH_ID, LixError};
 
-pub(crate) const CHECKPOINT_MARKER_SCHEMA_KEY: &str = "lix_checkpoint_marker";
+pub(crate) const CHECKPOINT_SCHEMA_KEY: &str = "lix_checkpoint";
+
 #[cfg(any(test, feature = "storage-benches"))]
 const CHECKPOINT_RECORD_SCAN_PAGE_SIZE: usize = 1_024;
 
-/// Record-only index used while materializing an unbounded checkpoint history.
-///
-/// Checkpoint commits form a first-parent chain, but following that chain with
-/// point reads turns a K-checkpoint history into K serial storage requests. A
-/// paged record scan trades that N+1 pattern for work linear in retained
-/// commits, which is substantially cheaper for remote LSM-backed storage.
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) type CheckpointCommitRecords = HashMap<CommitId, CommitGraphNode>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CheckpointHistoryEntry {
-    pub(crate) commit_id: CommitId,
-    pub(crate) created_at: String,
-    pub(crate) depth: u32,
+pub(crate) fn checkpoint_snapshot(commit_id: &CommitId) -> String {
+    let commit_id = commit_id.to_string();
+    json!({
+        "id": commit_id.clone(),
+        "commit_id": commit_id,
+    })
+    .to_string()
 }
 
-pub(crate) fn checkpoint_marker_stage_row(branch_id: &str) -> TransactionWriteRow {
+pub(crate) fn checkpoint_stage_row(commit_id: &CommitId, change_id: String) -> TransactionWriteRow {
+    let commit_id = commit_id.to_string();
     TransactionWriteRow {
-        entity_pk: None,
-        schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.into(),
+        entity_pk: Some(
+            EntityPk::uuid_from_canonical(&commit_id)
+                .expect("checkpoint commit ID is a canonical UUID"),
+        ),
+        schema_key: CHECKPOINT_SCHEMA_KEY.into(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
-            "branch_id": branch_id,
+            "id": commit_id.clone(),
+            "commit_id": commit_id,
         }))),
         metadata: None,
         origin: None,
         created_at: None,
         updated_at: None,
-        global: false,
-        change_id: None,
+        global: true,
+        change_id: Some(change_id),
         commit_id: None,
         untracked: false,
-        branch_id: branch_id.into(),
+        branch_id: GLOBAL_BRANCH_ID.into(),
     }
 }
 
-/// Loads the retained commit records in bounded scan pages for checkpoint history.
+/// Loads the private compaction cursor bound to an exact branch head.
 ///
-/// The SQL provider constructs this once for an unbounded checkpoint query and
-/// shares it between branch heads. Bounded `LIMIT` queries retain the smaller
-/// point-walk path below.
+/// Checkpoints are logical global entities. Branch-relative working-diff
+/// baselines are control-plane state and must never be reconstructed by
+/// searching checkpoint entity history.
+pub(crate) async fn checkpoint_commit_id_at_head<S>(
+    store: S,
+    branch_id: &str,
+    head_commit_id: CommitId,
+) -> Result<CommitId, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let control = BranchHeadControlContext::new()
+        .reader(store)
+        .load(branch_id)
+        .await?
+        .ok_or_else(|| LixError::branch_not_found(branch_id, "load checkpoint cursor", "branch"))?;
+    if control.head_commit_id != head_commit_id {
+        return Err(LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            format!("branch '{branch_id}' head changed while loading its checkpoint cursor"),
+        ));
+    }
+    control.working_diff_checkpoint_commit_id.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("branch '{branch_id}' has no checkpoint cursor"),
+        )
+    })
+}
+
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn scan_checkpoint_commit_records<S>(
     store: S,
@@ -84,6 +116,8 @@ where
                     account_id: record.account_id,
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
+                    first_parent_jump_commit_id: record.first_parent_jump_commit_id,
+                    first_parent_jump_span: record.first_parent_jump_span,
                     created_at: record.created_at,
                 },
             );
@@ -95,412 +129,4 @@ where
     }
 
     Ok(records)
-}
-
-/// Resolves the latest checkpoint with one tracked-state point read.
-///
-/// The marker's tracked index value carries the commit that most recently
-/// changed it. Auto-commits do not touch the marker, so this remains stable
-/// until the next checkpoint.
-pub(crate) async fn latest_checkpoint_at_head<S>(
-    tracked: &mut TrackedStateStoreReader<S>,
-    head: &CommitId,
-    branch_id: &str,
-) -> Result<Option<CommitId>, LixError>
-where
-    S: StorageAdapterRead,
-{
-    let rows = tracked
-        .load_projected_batch_at_commit(
-            &head.to_string(),
-            &[TrackedStateKey {
-                schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
-                file_id: None,
-                entity_pk: EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("checkpoint branch_id must be a canonical UUID: {error}"),
-                    )
-                })?,
-            }],
-            &ChangeRecordProjection::from_columns(&["commit_id".to_string()]),
-        )
-        .await?
-        .into_rows();
-    Ok(rows
-        .into_iter()
-        .next()
-        .flatten()
-        .filter(|row| !row.deleted)
-        .map(|row| row.commit_id))
-}
-
-/// Resolves only the latest checkpoint, avoiding a checkpoint-chain walk.
-pub(crate) async fn latest_checkpoint_for_branch<S>(
-    reader: &mut dyn CommitGraphReader,
-    tracked: &mut TrackedStateStoreReader<S>,
-    head: &CommitId,
-    branch_id: &str,
-) -> Result<Option<CommitId>, LixError>
-where
-    S: StorageAdapterRead,
-{
-    if let Some(checkpoint_id) = latest_checkpoint_at_head(tracked, head, branch_id).await? {
-        return Ok(Some(checkpoint_id));
-    }
-    Ok(checkpoint_history_from_head(reader, head)
-        .await?
-        .into_iter()
-        .next()
-        .map(|entry| entry.commit_id))
-}
-
-/// Returns checkpoint history, optionally using a page-scanned commit record map.
-///
-/// The branch marker is an O(1) anchor. Checkpoint commits directly parent the
-/// previous checkpoint, so a supplied record map avoids one storage point read
-/// per historical checkpoint. The map must originate from the same read
-/// snapshot as `reader` and `tracked`.
-pub(crate) async fn checkpoint_history_for_branch<S>(
-    reader: &mut dyn CommitGraphReader,
-    tracked: &mut TrackedStateStoreReader<S>,
-    head: &CommitId,
-    branch_id: &str,
-    limit: Option<usize>,
-    records: Option<&CheckpointCommitRecords>,
-) -> Result<Vec<CheckpointHistoryEntry>, LixError>
-where
-    S: StorageAdapterRead,
-{
-    if limit == Some(0) {
-        return Ok(Vec::new());
-    }
-    if let Some(checkpoint_id) = latest_checkpoint_at_head(tracked, head, branch_id).await? {
-        if let Some(records) = records {
-            if let Some(depth) = first_parent_distance_from_records(records, head, &checkpoint_id)?
-            {
-                return checkpoint_history_from_checkpoint_records(
-                    records,
-                    &checkpoint_id,
-                    depth,
-                    limit,
-                );
-            }
-        } else if let Some(depth) = first_parent_distance(reader, head, &checkpoint_id).await? {
-            return checkpoint_history_from_checkpoint(reader, &checkpoint_id, depth, limit).await;
-        }
-    }
-    let mut checkpoints = checkpoint_history_from_head(reader, head).await?;
-    if let Some(limit) = limit {
-        checkpoints.truncate(limit);
-    }
-    Ok(checkpoints)
-}
-
-fn first_parent_distance_from_records(
-    records: &CheckpointCommitRecords,
-    head: &CommitId,
-    ancestor: &CommitId,
-) -> Result<Option<u32>, LixError> {
-    let mut current = *head;
-    let mut depth = 0_u32;
-    let mut visited = HashSet::new();
-    loop {
-        if current == *ancestor {
-            return Ok(Some(depth));
-        }
-        if !visited.insert(current) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "cycle encountered while finding the latest checkpoint",
-            ));
-        }
-        let Some(commit) = records.get(&current) else {
-            return Ok(None);
-        };
-        let Some(parent) = commit.parent_commit_ids.first().copied() else {
-            return Ok(None);
-        };
-        current = parent;
-        depth = depth.checked_add(1).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "checkpoint history depth overflow",
-            )
-        })?;
-    }
-}
-
-async fn first_parent_distance(
-    reader: &mut dyn CommitGraphReader,
-    head: &CommitId,
-    ancestor: &CommitId,
-) -> Result<Option<u32>, LixError> {
-    let mut current = *head;
-    let mut depth = 0_u32;
-    let mut visited = HashSet::new();
-    loop {
-        if current == *ancestor {
-            return Ok(Some(depth));
-        }
-        if !visited.insert(current) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "cycle encountered while finding the latest checkpoint",
-            ));
-        }
-        let Some(commit) = reader.load_node(&current).await? else {
-            return Ok(None);
-        };
-        let Some(parent) = commit.parent_commit_ids.first().copied() else {
-            return Ok(None);
-        };
-        current = parent;
-        depth = depth.checked_add(1).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "checkpoint history depth overflow",
-            )
-        })?;
-    }
-}
-
-async fn checkpoint_history_from_checkpoint(
-    reader: &mut dyn CommitGraphReader,
-    checkpoint_id: &CommitId,
-    initial_depth: u32,
-    limit: Option<usize>,
-) -> Result<Vec<CheckpointHistoryEntry>, LixError> {
-    let mut checkpoints = Vec::new();
-    let mut current = Some(*checkpoint_id);
-    let mut depth = initial_depth;
-    let mut visited = HashSet::new();
-    while let Some(commit_id) = current {
-        if limit.is_some_and(|limit| checkpoints.len() >= limit) {
-            break;
-        }
-        if !visited.insert(commit_id) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "cycle encountered while walking checkpoint history",
-            ));
-        }
-        let commit = reader.load_node(&commit_id).await?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("checkpoint history references missing commit '{commit_id}'"),
-            )
-        })?;
-        checkpoints.push(CheckpointHistoryEntry {
-            commit_id,
-            created_at: commit.created_at.to_string(),
-            depth,
-        });
-        current = commit.parent_commit_ids.first().copied();
-        depth = depth.checked_add(1).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "checkpoint history depth overflow",
-            )
-        })?;
-    }
-    Ok(checkpoints)
-}
-
-fn checkpoint_history_from_checkpoint_records(
-    records: &CheckpointCommitRecords,
-    checkpoint_id: &CommitId,
-    initial_depth: u32,
-    limit: Option<usize>,
-) -> Result<Vec<CheckpointHistoryEntry>, LixError> {
-    let mut checkpoints = Vec::new();
-    let mut current = Some(*checkpoint_id);
-    let mut depth = initial_depth;
-    let mut visited = HashSet::new();
-    while let Some(commit_id) = current {
-        if limit.is_some_and(|limit| checkpoints.len() >= limit) {
-            break;
-        }
-        if !visited.insert(commit_id) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "cycle encountered while walking checkpoint history",
-            ));
-        }
-        let commit = records.get(&commit_id).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("checkpoint history references missing commit '{commit_id}'"),
-            )
-        })?;
-        checkpoints.push(CheckpointHistoryEntry {
-            commit_id,
-            created_at: commit.created_at.to_string(),
-            depth,
-        });
-        current = commit.parent_commit_ids.first().copied();
-        depth = depth.checked_add(1).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "checkpoint history depth overflow",
-            )
-        })?;
-    }
-    Ok(checkpoints)
-}
-
-/// Returns checkpoints on the first-parent history of `head`, newest first.
-///
-/// The graph root is also an implicit checkpoint. That gives repositories
-/// created before checkpoint markers existed the same useful baseline as new
-/// repositories, whose initial commit carries an explicit marker.
-pub(crate) async fn checkpoint_history_from_head(
-    reader: &mut dyn CommitGraphReader,
-    head: &CommitId,
-) -> Result<Vec<CheckpointHistoryEntry>, LixError> {
-    let marker_commits = reader
-        .change_history_from_commit(
-            head,
-            &CommitGraphChangeHistoryRequest {
-                schema_keys: vec![CHECKPOINT_MARKER_SCHEMA_KEY.to_string()],
-                include_tombstones: true,
-                ..CommitGraphChangeHistoryRequest::default()
-            },
-        )
-        .await?
-        .entries
-        .into_iter()
-        .map(|entry| entry.observed_commit_id)
-        .collect::<HashSet<_>>();
-
-    let mut checkpoints = Vec::new();
-    let mut current = Some(*head);
-    let mut depth = 0_u32;
-    let mut visited = HashSet::new();
-    while let Some(commit_id) = current {
-        if !visited.insert(commit_id) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "cycle encountered while walking checkpoint first-parent history",
-            ));
-        }
-        let commit = reader.load_node(&commit_id).await?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("checkpoint history references missing commit '{commit_id}'"),
-            )
-        })?;
-        let is_root = commit.parent_commit_ids.is_empty();
-        if is_root || marker_commits.contains(&commit_id) {
-            checkpoints.push(CheckpointHistoryEntry {
-                commit_id,
-                created_at: commit.created_at.to_string(),
-                depth,
-            });
-        }
-        current = commit.parent_commit_ids.first().copied();
-        depth = depth.checked_add(1).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "checkpoint history depth overflow",
-            )
-        })?;
-    }
-    Ok(checkpoints)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        checkpoint_history_from_checkpoint_records, first_parent_distance_from_records,
-        scan_checkpoint_commit_records,
-    };
-    use crate::changelog::{
-        ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId, CommitRecord,
-    };
-    use crate::common::LixTimestamp;
-    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
-
-    fn timestamp() -> LixTimestamp {
-        LixTimestamp::expect_parse("checkpoint scan timestamp", "2026-07-24T00:00:00Z")
-    }
-
-    fn commit_record(id: CommitId, generation: u64, parent: Option<CommitId>) -> CommitRecord {
-        CommitRecord {
-            format_version: 2,
-            commit_id: id,
-            generation,
-            parent_commit_ids: parent.into_iter().collect(),
-            change_id: ChangeId::for_test_label(&format!("{id}-change")),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            created_at: timestamp(),
-        }
-    }
-
-    #[tokio::test]
-    async fn checkpoint_record_scan_crosses_pages_and_preserves_first_parent_history() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        let mut append = ChangelogAppend::default();
-        let mut parent = None;
-
-        // 1,025 checkpoint records exceed the changelog's 1,024-record scan
-        // page. Add two auto commits above the latest checkpoint to exercise
-        // the map-backed depth calculation too.
-        for index in 0..1_025 {
-            let commit_id = CommitId::for_test_label(&format!("checkpoint-{index}"));
-            append
-                .commits
-                .push(commit_record(commit_id, index as u64, parent));
-            parent = Some(commit_id);
-        }
-        let latest_checkpoint = parent.expect("fixture should create checkpoints");
-        let first_auto = CommitId::for_test_label("checkpoint-auto-1");
-        let second_auto = CommitId::for_test_label("checkpoint-auto-2");
-        append
-            .commits
-            .push(commit_record(first_auto, 1_025, Some(latest_checkpoint)));
-        append
-            .commits
-            .push(commit_record(second_auto, 1_026, Some(first_auto)));
-
-        ChangelogContext::new()
-            .writer(&mut read, &mut writes)
-            .stage_append(append)
-            .await
-            .expect("fixture append should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("fixture should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let records = scan_checkpoint_commit_records(read)
-            .await
-            .expect("record scan should succeed");
-        assert_eq!(records.len(), 1_027);
-        assert_eq!(
-            first_parent_distance_from_records(&records, &second_auto, &latest_checkpoint)
-                .expect("depth should resolve"),
-            Some(2)
-        );
-
-        let history =
-            checkpoint_history_from_checkpoint_records(&records, &latest_checkpoint, 2, None)
-                .expect("checkpoint history should resolve");
-        assert_eq!(history.len(), 1_025);
-        assert_eq!(history[0].commit_id, latest_checkpoint);
-        assert_eq!(history[0].depth, 2);
-        assert_eq!(
-            history.last().expect("root checkpoint should exist").depth,
-            1_026
-        );
-    }
 }

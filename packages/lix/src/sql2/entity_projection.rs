@@ -439,7 +439,11 @@ mod tests {
     use crate::sql2::exec::datafusion::query_result_from_batches;
     use crate::sql2::result_metadata::mark_json_field;
     use crate::transaction::types::TransactionJson;
-    use crate::{LixError, Value};
+    use crate::{Json, LixError, Value};
+
+    fn lix_json(canonical: &str) -> Json {
+        Json::from_canonical_text(canonical)
+    }
 
     fn spec() -> crate::sql2::catalog::EntitySurfaceSpec {
         derive_entity_surface_spec_from_schema(&json!({
@@ -598,11 +602,15 @@ mod tests {
             .expect("Arrow result values should decode")
             .rows;
 
+        // JSON results carry the stored bytes verbatim. Canonical member order
+        // is owned by `canonicalize_transaction_json_batch` at the write
+        // boundary, so this hand-built raw snapshot keeps its source order
+        // rather than being re-sorted by a decode-side DOM round trip.
         assert_eq!(
             arrow_rows[0],
             vec![
                 Value::Text("line\nquote: \"".to_string()),
-                Value::Json(json!({"a": "value", "z": [true, null]})),
+                Value::Json(lix_json(r#"{"z":[true,null],"a":"value"}"#)),
                 Value::Integer(7),
                 Value::Real(4.5),
                 Value::Boolean(true),

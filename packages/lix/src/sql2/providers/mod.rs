@@ -9,8 +9,8 @@ use crate::LixError;
 use crate::branch::BranchRefReader;
 
 mod branch;
+mod branch_selection;
 mod change;
-mod checkpoint;
 mod columns;
 mod diff;
 mod directory;
@@ -74,23 +74,40 @@ where
     if selection.is_empty() {
         return Ok(());
     }
-    let dynamic_catalog;
     let catalog = if selection.requires_visible_schemas() {
-        dynamic_catalog = ctx.public_catalog().await?;
-        dynamic_catalog.as_ref()
+        ctx.public_catalog().await?
     } else {
-        PublicCatalog::fixed_system()
+        Arc::clone(PublicCatalog::fixed_system_shared())
     };
     register_read_from_catalog(
         session,
         ctx,
         branch_ref,
         active_branch_commit_id,
-        catalog,
+        catalog.as_ref(),
         ReadProviderScope::All,
         selection,
     )
     .await?;
+    register_information_schema(session, selection, catalog)
+}
+
+/// Installs the `information_schema` views only for statements that can reach
+/// them.
+///
+/// `read_provider_selection` widens to [`ProviderSelection::All`] for every
+/// `information_schema`-qualified reference and every `SHOW` form, so a narrowed
+/// selection provably never resolves an information-schema table. Registering
+/// the schema anyway cost one catalog write lock and one `SchemaProvider`
+/// allocation on every ordinary statement.
+fn register_information_schema(
+    session: &SessionContext,
+    selection: &ProviderSelection,
+    catalog: Arc<PublicCatalog>,
+) -> Result<(), LixError> {
+    if !matches!(selection, ProviderSelection::All) {
+        return Ok(());
+    }
     crate::sql2::information_schema::register(session, catalog)
 }
 
@@ -144,11 +161,13 @@ impl ProviderSelection {
 }
 
 pub(crate) fn read_provider_selection(
-    session: &SessionContext,
+    state: &datafusion::execution::session_state::SessionState,
     statements: &[datafusion::sql::parser::Statement],
 ) -> ProviderSelection {
     let mut names = BTreeSet::new();
-    let state = session.state();
+    // Resolving references only reads the SQL parser configuration, so the
+    // statement's pooled session state is used directly instead of cloning the
+    // live one.
     for statement in statements {
         if statement_requires_all_providers(statement) {
             return ProviderSelection::All;
@@ -229,12 +248,13 @@ where
     let needs_history_query_source = catalog.surfaces().any(|surface| {
         scope.includes(surface)
             && selection.includes(surface)
-            && matches!(
-                &surface.kind,
-                PublicSurfaceKind::FileHistory
-                    | PublicSurfaceKind::DirectoryHistory
-                    | PublicSurfaceKind::EntityHistory { .. }
-            )
+            && match &surface.kind {
+                PublicSurfaceKind::FileHistory | PublicSurfaceKind::DirectoryHistory => true,
+                PublicSurfaceKind::EntityHistory { schema_key } => {
+                    schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+                }
+                _ => false,
+            }
     });
     let history_query_source = if needs_history_query_source {
         let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
@@ -256,6 +276,30 @@ where
             )
         })
     };
+    let needs_checkpoint_history = catalog.surfaces().any(|surface| {
+        scope.includes(surface)
+            && selection.includes(surface)
+            && matches!(
+                &surface.kind,
+                PublicSurfaceKind::EntityHistory { schema_key }
+                    if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+            )
+    });
+    let checkpoint_history_query_source = if needs_checkpoint_history {
+        let global_head = branch_ref
+            .load_head_commit_id(crate::GLOBAL_BRANCH_ID)
+            .await?
+            .ok_or_else(|| {
+                LixError::branch_not_found(
+                    crate::GLOBAL_BRANCH_ID,
+                    "register checkpoint history provider",
+                    "global branch",
+                )
+            })?;
+        Some(ctx.history_query_source(global_head.to_string()))
+    } else {
+        None
+    };
     for surface in catalog.surfaces() {
         if !scope.includes(surface) || !selection.includes(surface) {
             continue;
@@ -267,28 +311,6 @@ where
                     &surface.name,
                     ctx.live_state(),
                     Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::Checkpoint => {
-                checkpoint::register_checkpoint_provider(
-                    session,
-                    &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::CheckpointByBranch => {
-                checkpoint::register_checkpoint_provider(
-                    session,
-                    &surface.name,
-                    None,
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
                 )
                 .await?;
             }
@@ -462,11 +484,8 @@ where
         ctx.entity_snapshot_reader(),
         Arc::clone(&branch_ref),
         needs_entity_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
-        if needs_entity_history {
-            Some(history_query_source_for_provider()?)
-        } else {
-            None
-        },
+        history_query_source,
+        checkpoint_history_query_source,
         catalog,
         scope == ReadProviderScope::All,
         selection,
@@ -486,7 +505,7 @@ pub(crate) async fn register_write(
     let catalog = write_ctx.public_catalog()?;
     register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
         .await?;
-    crate::sql2::information_schema::register(session, &catalog)
+    register_information_schema(session, selection, catalog)
 }
 
 pub(crate) async fn register_transaction<C>(
@@ -525,7 +544,7 @@ where
         selection,
     )
     .await?;
-    crate::sql2::information_schema::register(session, &catalog)
+    register_information_schema(session, selection, catalog)
 }
 
 async fn register_write_from_catalog(
@@ -616,8 +635,6 @@ async fn register_write_from_catalog(
                 .await?;
             }
             PublicSurfaceKind::Change
-            | PublicSurfaceKind::Checkpoint
-            | PublicSurfaceKind::CheckpointByBranch
             | PublicSurfaceKind::WorkingDiff
             | PublicSurfaceKind::WorkingDiffByBranch
             | PublicSurfaceKind::FileWorkingDiff
@@ -665,9 +682,9 @@ mod tests {
     };
 
     use super::{
-        ProviderSelection, ReadProviderScope, branch, change, checkpoint, directory,
-        directory_history, entity, file, file_history, filesystem_working_diff, is_write_surface,
-        read_provider_selection, working_diff,
+        ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, entity,
+        file, file_history, filesystem_working_diff, is_write_surface, read_provider_selection,
+        working_diff,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -675,7 +692,7 @@ mod tests {
             .iter()
             .map(|sql| crate::sql2::parse_statement(sql).expect("SQL should parse"))
             .collect::<Vec<_>>();
-        read_provider_selection(&SessionContext::new(), &statements)
+        read_provider_selection(&SessionContext::new().state(), &statements)
     }
 
     fn selected_names(names: &[&str]) -> ProviderSelection {
@@ -825,8 +842,6 @@ mod tests {
             read_only,
             vec![
                 "lix_change",
-                "lix_checkpoint",
-                "lix_checkpoint_by_branch",
                 "lix_directory_history",
                 "lix_directory_working_diff",
                 "lix_directory_working_diff_by_branch",
@@ -854,10 +869,10 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 32, "previous construction count");
+        assert_eq!(all_read + writable.len(), 30, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            22,
+            20,
             "new construction count"
         );
     }
@@ -936,16 +951,6 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_checkpoint",
-            checkpoint::checkpoint_schema(false),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_checkpoint_by_branch",
-            checkpoint::checkpoint_schema(true),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
             "lix_working_diff",
             working_diff::working_diff_schema(false),
         );
@@ -1012,6 +1017,7 @@ mod tests {
                 EmptyCommitGraphReader,
             )))),
             Some(empty_history_query_source().await),
+            None,
             &catalog,
             true,
             &ProviderSelection::All,

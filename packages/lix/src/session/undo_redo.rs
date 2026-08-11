@@ -1,6 +1,6 @@
 use crate::LixError;
 use crate::changelog::{ChangeRecordProjection, CommitId};
-use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
+use crate::checkpoint::CHECKPOINT_SCHEMA_KEY;
 use crate::entity_pk::EntityPk;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
@@ -188,32 +188,33 @@ where
     if record.parent_commit_ids.len() != 1 {
         return Ok(SemanticState::default());
     }
-    let keys = semantic_keys(branch_id)?;
-    let marker_schemas = [
-        CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
-        UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
-    ];
+    if transaction
+        .is_current_checkpoint_commit(branch_id, commit_id)
+        .await?
+    {
+        return Ok(SemanticState::default());
+    }
+    let local_operation_key = semantic_key(branch_id)?;
+    let marker_schemas = [UNDO_REDO_MARKER_SCHEMA_KEY.to_string()];
     let marker_delta = {
         let mut tracked = transaction.tracked_state_reader().await;
         tracked
             .commit_delta_values_for_schemas(commit_id, &marker_schemas)
             .await?
     };
-    let mut has_checkpoint = false;
     let mut has_foreign_operation = false;
     let mut has_local_operation = false;
     for row in marker_delta.iter().filter(|row| !row.value().deleted) {
         let key = row.key_ref();
         match key.schema_key {
-            CHECKPOINT_MARKER_SCHEMA_KEY => has_checkpoint = true,
-            UNDO_REDO_MARKER_SCHEMA_KEY if key.entity_pk == &keys[1].entity_pk => {
+            UNDO_REDO_MARKER_SCHEMA_KEY if key.entity_pk == &local_operation_key.entity_pk => {
                 has_local_operation = true;
             }
             UNDO_REDO_MARKER_SCHEMA_KEY => has_foreign_operation = true,
             _ => {}
         }
     }
-    if has_checkpoint || has_foreign_operation {
+    if has_foreign_operation {
         return Ok(SemanticState::default());
     }
     if !has_local_operation {
@@ -230,25 +231,18 @@ where
     Ok(semantic_state_from_marker(marker, commit_id))
 }
 
-fn semantic_keys(branch_id: &str) -> Result<[TrackedStateKey; 2], LixError> {
+fn semantic_key(branch_id: &str) -> Result<TrackedStateKey, LixError> {
     let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PARAM,
             format!("undo branch id must be a canonical UUID: {error}"),
         )
     })?;
-    Ok([
-        TrackedStateKey {
-            schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
-            file_id: None,
-            entity_pk: branch_pk.clone(),
-        },
-        TrackedStateKey {
-            schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
-            file_id: None,
-            entity_pk: branch_pk,
-        },
-    ])
+    Ok(TrackedStateKey {
+        schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
+        file_id: None,
+        entity_pk: branch_pk,
+    })
 }
 
 async fn semantic_state_for_record<S>(
@@ -270,18 +264,18 @@ where
         return Ok((SemanticState::default(), Vec::new()));
     }
 
-    let keys = semantic_keys(branch_id)?;
-    let delta = load_commit_delta(transaction, commit_id).await?;
-    if delta
-        .iter()
-        .any(|(key, value)| key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY && !value.deleted)
+    if transaction
+        .is_current_checkpoint_commit(branch_id, commit_id)
+        .await?
     {
-        return Ok((SemanticState::default(), delta));
+        return Ok((SemanticState::default(), Vec::new()));
     }
+    let local_operation_key = semantic_key(branch_id)?;
+    let delta = load_commit_delta(transaction, commit_id).await?;
     let operation_marker = delta
         .iter()
         .find(|(key, value)| key.schema_key == UNDO_REDO_MARKER_SCHEMA_KEY && !value.deleted);
-    let Some((operation_key, _)) = operation_marker else {
+    let Some((operation_marker_key, _)) = operation_marker else {
         return Ok((
             SemanticState {
                 undo_top: Some(commit_id),
@@ -292,7 +286,7 @@ where
             delta,
         ));
     };
-    if operation_key != &keys[1] {
+    if operation_marker_key != &local_operation_key {
         return Ok((SemanticState::default(), delta));
     }
     let rows = {
@@ -300,7 +294,7 @@ where
         tracked
             .load_projected_batch_at_commit(
                 &commit_id.to_string(),
-                &keys[1..],
+                std::slice::from_ref(&local_operation_key),
                 &ChangeRecordProjection::from_columns(&[
                     "commit_id".to_string(),
                     "snapshot_content".to_string(),
@@ -492,8 +486,7 @@ where
     let keys = keys
         .into_iter()
         .filter(|key| {
-            key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
-                && key.schema_key != UNDO_REDO_MARKER_SCHEMA_KEY
+            key.schema_key != CHECKPOINT_SCHEMA_KEY && key.schema_key != UNDO_REDO_MARKER_SCHEMA_KEY
         })
         .collect::<Vec<_>>();
     transaction
@@ -571,8 +564,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value as JsonValue;
-
     use super::{load_commit_delta, load_node, only_parent};
     use crate::engine::Engine;
     use crate::sql2::SqlWriteExecutionContext;
@@ -612,7 +603,7 @@ mod tests {
             .and_then(|row| row.get::<Value>("value").ok())
             .and_then(|value| match value {
                 Value::Text(value) => Some(value),
-                Value::Json(JsonValue::String(value)) => Some(value),
+                Value::Json(value) => value.as_json_string(),
                 _ => None,
             })
     }

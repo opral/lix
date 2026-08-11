@@ -727,7 +727,9 @@ impl TryFrom<LixValueDto> for Value {
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .map(Self::Text)
                 .ok_or_else(|| invalid_param("text value must be a string")),
-            "json" => Ok(Self::Json(value.value.unwrap_or(serde_json::Value::Null))),
+            "json" => Ok(Self::Json(
+                value.value.unwrap_or(serde_json::Value::Null).into(),
+            )),
             "blob" => value
                 .blob
                 .map(|bytes| Self::Blob(bytes.into_vec().into()))
@@ -750,7 +752,7 @@ impl TryFrom<&Value> for LixValueDto {
             }
             Value::Real(_) => return Err(invalid_param("cannot encode non-finite real value")),
             Value::Text(value) => ("text", Some(serde_json::json!(value)), None),
-            Value::Json(value) => ("json", Some(value.clone()), None),
+            Value::Json(value) => ("json", Some(value.to_value()), None),
             Value::Blob(value) => ("blob", None, Some(ByteBuf::from(value.to_vec()))),
         };
         Ok(Self {

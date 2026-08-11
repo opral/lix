@@ -10,7 +10,7 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
     CommitRecord,
 };
-use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
+use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_snapshot};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
@@ -42,14 +42,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V61 authenticates the mutable branch-control and current plugin-checkpoint
-/// records. Semantic commit facts remain owned exclusively by `changelog.commit`;
-/// canonical snapshot metadata stays inside the immutable physical authority
-/// while its content-addressed tree chunks remain rebuildable.
+/// V65 removes per-row ChangeId copies from directly addressable immutable
+/// mutation leaves. The hard cut rejects repositories whose packed history
+/// predates that physical authority instead of retaining a second decoder.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v61";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"direct-change-id-leaf.v65";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -209,10 +208,10 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let initial_checkpoint_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(&main_branch_id)
-            .expect("generated main branch ID is a canonical UUID"),
-        CHECKPOINT_MARKER_SCHEMA_KEY,
-        checkpoint_marker_snapshot(&main_branch_id)?,
+        EntityPk::uuid_from_canonical(&initial_commit_id.to_string())
+            .expect("initial checkpoint commit ID is a canonical UUID"),
+        CHECKPOINT_SCHEMA_KEY,
+        checkpoint_snapshot(&initial_commit_id),
         timestamp,
     );
     let system_account_change = canonical_change(
@@ -453,6 +452,9 @@ where
         let absence_guards = std::collections::BTreeSet::default();
         for branch in &plan.branch_controls {
             let mut head_deltas = tracked_head_deltas.clone();
+            if branch.branch_id != GLOBAL_BRANCH_ID {
+                head_deltas.retain(|delta| delta.schema_key != CHECKPOINT_SCHEMA_KEY);
+            }
             if branch.branch_id == GLOBAL_BRANCH_ID {
                 head_deltas.extend(plan.untracked_rows.iter().map(|row| CurrentStateDeltaRef {
                     schema_key: &row.schema_key,
@@ -606,10 +608,12 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        format_version: 2,
+        format_version: 3,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
+        first_parent_jump_commit_id: plan.commit.id,
+        first_parent_jump_span: 0,
         change_id: plan.commit.change_id,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,
@@ -708,12 +712,6 @@ fn account_snapshot(id: &str, name: &str, kind: &str) -> Result<String, LixError
         "name": name,
         "kind": kind,
         "status": "active",
-    }))
-}
-
-fn checkpoint_marker_snapshot(branch_id: &str) -> Result<String, LixError> {
-    encode_snapshot(json!({
-        "branch_id": branch_id,
     }))
 }
 

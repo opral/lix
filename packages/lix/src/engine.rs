@@ -692,6 +692,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn predecessor_v61_checkpoint_marker_protocol_is_rejected() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"immutable-physical-commit-state.v61"[..],
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("V61 protocol marker should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("V61 checkpoint-marker repositories must fail closed");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
+    async fn predecessor_v64_direct_change_id_leaf_protocol_is_rejected() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"myers-first-parent-jump.v64"[..],
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("V64 protocol marker should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("V64 packed-history repositories must fail closed");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
     async fn predecessor_v15_protocol_is_rejected() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
@@ -1339,6 +1387,408 @@ mod tests {
         );
     }
 
+    /// The two working-diff read paths in `hot_working_diff_entries` must
+    /// answer identically for every row state a branch can actually reach.
+    ///
+    /// The broad path enumerates the sparse `HOT_DIFF` index and then loads
+    /// each dirty identity's primary row; the finite `schema_key + entity_pk`
+    /// path skips that index entirely and reads the primary rows directly.
+    /// They treat an untracked or absent primary row differently — the broad
+    /// path fails closed to canonical replay, the finite path skips the row —
+    /// so this walks every reachable shape (clean, modified, removed,
+    /// added, added-then-removed, untracked, untracked-recycled-as-tracked,
+    /// never-existed) and asserts the finite answer equals the broad answer
+    /// restricted to that identity.
+    #[tokio::test]
+    async fn working_diff_finite_bypass_and_index_scan_agree_on_every_row_state() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+
+        for path in ["/clean", "/modified", "/removed", "/recycled-source"] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json('{\"v\":0}'))",
+                    &[crate::Value::Text(path.to_string())],
+                )
+                .await
+                .expect("pre-checkpoint tracked row should commit");
+        }
+        session
+            .execute(
+                "DELETE FROM json_pointer WHERE path = '/recycled-source'",
+                &[],
+            )
+            .await
+            .expect("pre-checkpoint delete should commit");
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish a clean working state");
+
+        session
+            .execute(
+                "UPDATE json_pointer SET value = lix_json('{\"v\":1}') WHERE path = '/modified'",
+                &[],
+            )
+            .await
+            .expect("modify should dirty the row");
+        session
+            .execute("DELETE FROM json_pointer WHERE path = '/removed'", &[])
+            .await
+            .expect("delete should dirty the row");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) VALUES ('/added', lix_json('{\"v\":1}'))",
+                &[],
+            )
+            .await
+            .expect("insert should dirty a new identity");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/added-then-removed', lix_json('{\"v\":1}'))",
+                &[],
+            )
+            .await
+            .expect("insert should dirty a new identity");
+        session
+            .execute(
+                "DELETE FROM json_pointer WHERE path = '/added-then-removed'",
+                &[],
+            )
+            .await
+            .expect("delete of a post-checkpoint insert should commit");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/untracked', lix_json('{\"v\":1}'), true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should commit");
+
+        // Physically removing a HOT primary row is only reachable through an
+        // untracked delete (`CurrentStateDelta::physically_deletes` is
+        // `untracked && deleted`). Exercise that, then re-insert the identity
+        // as tracked so a dirty row exists whose HOT slot was previously
+        // vacated.
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/recycled', lix_json('{\"v\":1}'), true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should commit");
+        session
+            .execute("DELETE FROM json_pointer WHERE path = '/recycled'", &[])
+            .await
+            .expect("untracked delete should physically remove the hot row");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/recycled', lix_json('{\"v\":2}'))",
+                &[],
+            )
+            .await
+            .expect("tracked insert should reuse the vacated identity");
+
+        // The invariant that makes the two paths equivalent: retention is
+        // immutable while a physical member exists, so a dirty tracked row can
+        // never become untracked or vanish under its own `HOT_DIFF` entry.
+        let retention_flip = session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/modified', lix_json('{\"v\":9}'), true)",
+                &[],
+            )
+            .await;
+        assert!(
+            retention_flip.is_err(),
+            "an untracked write must not take over a dirty tracked identity"
+        );
+
+        use std::sync::atomic::Ordering;
+        let hits = &crate::live_state::WORKING_DIFF_PATH_HITS;
+        let index_before = hits.index_scan.load(Ordering::Relaxed);
+        let broad = session
+            .execute(
+                "SELECT entity_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'json_pointer' ORDER BY entity_pk",
+                &[],
+            )
+            .await
+            .expect("broad working-diff read should execute");
+        assert!(
+            hits.index_scan.load(Ordering::Relaxed) > index_before,
+            "the schema-only working-diff read must take the HOT_DIFF index path"
+        );
+        let broad_rows = broad
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<serde_json::Value>("entity_pk")
+                        .expect("entity_pk should decode")
+                        .to_string(),
+                    row.get::<String>("diff_type")
+                        .expect("diff_type should decode"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            broad_rows,
+            vec![
+                ("[\"/added\"]".to_string(), "added".to_string()),
+                ("[\"/modified\"]".to_string(), "modified".to_string()),
+                ("[\"/recycled\"]".to_string(), "added".to_string()),
+                ("[\"/removed\"]".to_string(), "removed".to_string()),
+            ],
+            "the index-driven working diff must classify every reachable shape"
+        );
+
+        for path in [
+            "/clean",
+            "/modified",
+            "/removed",
+            "/added",
+            "/added-then-removed",
+            "/untracked",
+            "/recycled",
+            "/recycled-source",
+            "/never-existed",
+        ] {
+            let entity_pk = format!("[\"{path}\"]");
+            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let finite = session
+                .execute(
+                    "SELECT entity_pk, diff_type FROM lix_working_diff \
+                     WHERE schema_key = 'json_pointer' AND entity_pk = lix_json($1) \
+                     ORDER BY entity_pk",
+                    &[crate::Value::Text(entity_pk.clone())],
+                )
+                .await
+                .expect("finite working-diff read should execute");
+            assert!(
+                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                "the finite working-diff read for {path} must take the primary-row bypass"
+            );
+            let finite_rows = finite
+                .rows()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<serde_json::Value>("entity_pk")
+                            .expect("entity_pk should decode")
+                            .to_string(),
+                        row.get::<String>("diff_type")
+                            .expect("diff_type should decode"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = broad_rows
+                .iter()
+                .filter(|(row_pk, _)| row_pk == &entity_pk)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                finite_rows, expected,
+                "the finite working-diff bypass disagrees with the index scan for {path}"
+            );
+        }
+    }
+
+    /// `WHERE lixcol_file_id = ?` is now an exact provider constraint, so
+    /// DataFusion drops its residual filter and the answer rests entirely on
+    /// `LiveStateFilter::file_ids`. Rows can live in four authorities — the
+    /// branch-local `HOT_ROW` overlay, a packed current base, a certified
+    /// entity batch, and the root current base — and a file-scoped seek is
+    /// only sound if every one of them applies the same filter. The checkpoint
+    /// in the middle republishes the generation, so rows written before and
+    /// after it reach the read through different authorities.
+    #[tokio::test]
+    async fn file_scoped_entity_read_matches_the_unfiltered_scan() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+
+        let files = ["66696c65-0000-8000-8000-000000000000", "66696c65-0001-8000-8000-000000000001"];
+        for (index, file) in files.iter().enumerate() {
+            session
+                .execute(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ($1, $2, CAST($3 AS BYTEA))",
+                    &[
+                        crate::Value::Text((*file).to_string()),
+                        crate::Value::Text(format!("/f{index}.txt")),
+                        crate::Value::Text("seed".to_string()),
+                    ],
+                )
+                .await
+                .expect("file should insert");
+        }
+
+        let mut expected: Vec<(String, Option<String>)> = Vec::new();
+        for (path, file) in [
+            ("/a0", Some(files[0])),
+            ("/a1", Some(files[0])),
+            ("/b0", Some(files[1])),
+            ("/none", None),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, lix_json('{\"v\":0}'), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("pre-checkpoint row should insert");
+            expected.push((path.to_string(), file.map(str::to_string)));
+        }
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should republish the generation");
+
+        for (path, file) in [
+            ("/a2", Some(files[0])),
+            ("/b1", Some(files[1])),
+            ("/none2", None),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, lix_json('{\"v\":1}'), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("post-checkpoint row should insert");
+            expected.push((path.to_string(), file.map(str::to_string)));
+        }
+        expected.sort();
+
+        let all = session
+            .execute("SELECT path, lixcol_file_id FROM json_pointer", &[])
+            .await
+            .expect("unfiltered scan should execute");
+        let mut all_rows = all
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("path").expect("path should decode"),
+                    // `lixcol_file_id` is nullable; the typed accessor has no
+                    // Option impl, so a NULL surfaces as a decode error here.
+                    row.get::<String>("lixcol_file_id").ok(),
+                )
+            })
+            .collect::<Vec<_>>();
+        all_rows.sort();
+        assert_eq!(all_rows, expected, "fixture should read back unfiltered");
+
+        for file in files {
+            let filtered = session
+                .execute(
+                    "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 ORDER BY path",
+                    &[crate::Value::Text(file.to_string())],
+                )
+                .await
+                .expect("file-scoped read should execute");
+            let filtered_rows = filtered
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("path should decode"))
+                .collect::<Vec<_>>();
+            let mut want = expected
+                .iter()
+                .filter(|(_, row_file)| row_file.as_deref() == Some(file))
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            want.sort();
+            assert_eq!(
+                filtered_rows, want,
+                "file-scoped entity read must return exactly the rows in {file}"
+            );
+        }
+
+        let in_list = session
+            .execute(
+                "SELECT path FROM json_pointer \
+                 WHERE lixcol_file_id IN ($1, $2) ORDER BY path",
+                &[
+                    crate::Value::Text(files[0].to_string()),
+                    crate::Value::Text(files[1].to_string()),
+                ],
+            )
+            .await
+            .expect("file-scoped IN read should execute");
+        let mut want_in = expected
+            .iter()
+            .filter(|(_, row_file)| row_file.is_some())
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        want_in.sort();
+        assert_eq!(
+            in_list
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("path should decode"))
+                .collect::<Vec<_>>(),
+            want_in
+        );
+
+        let point = session
+            .execute(
+                "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 AND path = '/a2'",
+                &[crate::Value::Text(files[0].to_string())],
+            )
+            .await
+            .expect("file + primary key read should execute");
+        assert_eq!(point.rows().len(), 1);
+
+        let contradiction = session
+            .execute(
+                "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 AND path = '/b0'",
+                &[crate::Value::Text(files[0].to_string())],
+            )
+            .await
+            .expect("contradictory file + primary key read should execute");
+        assert!(
+            contradiction.rows().is_empty(),
+            "a row must not be visible through another file's scope"
+        );
+    }
+
     #[tokio::test]
     async fn untracked_state_survives_checkpoint_and_next_tracked_write() {
         let storage = Memory::new();
@@ -1430,7 +1880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_reclaims_the_superseded_physical_working_diff_epoch() {
+    async fn checkpoint_reclaims_working_diff_epochs_and_retains_checkpoint_entities() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1476,9 +1926,25 @@ mod tests {
             .await
             .expect("post-checkpoint inventory read should open");
         let after = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
-        assert!(
-            after.entries.is_empty(),
-            "superseded sparse dirty keys must not remain until repository GC"
+        assert_eq!(
+            after.entries.len(),
+            1,
+            "the superseded branch epoch must be reclaimed; only the repository-global checkpoint entity may remain dirty"
+        );
+        drop(read);
+        session
+            .create_checkpoint()
+            .await
+            .expect("a second checkpoint should remain bounded");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("second checkpoint inventory read should open");
+        let after_second = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
+        assert_eq!(
+            after_second.entries.len(),
+            2,
+            "the second immutable checkpoint entity remains while the superseded branch epoch is reclaimed"
         );
         let logical = session
             .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])

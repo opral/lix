@@ -3508,36 +3508,20 @@ where
         if let Some(cached) = self.point_replay_commits.get(&commit_id) {
             return Ok(cached.clone());
         }
-        let record = {
-            let commit_ids = [commit_id];
-            let mut reader = ChangelogContext::new().reader(&self.store);
-            let batch = reader
-                .load_commits(CommitLoadRequest {
-                    commit_ids: &commit_ids,
-                })
-                .await?;
-            match batch.into_iter().next().and_then(|(_, value)| value) {
-                Some(record) => record,
-                None => {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "cannot point-replay tracked_state for unknown commit '{commit_id}'"
-                        ),
-                    ));
-                }
-            }
-        };
-        let manifest = storage::load_point_replay_commit_state(&self.store, commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state commit_state_manifest is missing for commit '{commit_id}'"
-                    ),
-                )
-            })?;
+        let (record, manifest) =
+            storage::load_commit_record_and_point_replay_state(&self.store, commit_id).await?;
+        let record = record.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("cannot point-replay tracked_state for unknown commit '{commit_id}'"),
+            )
+        })?;
+        let manifest = manifest.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("tracked_state commit_state_manifest is missing for commit '{commit_id}'"),
+            )
+        })?;
         let rootless = manifest.replay_debt.depth > 0;
         let root_id = manifest
             .snapshot_root
@@ -3789,11 +3773,23 @@ pub(crate) struct TrackedStateWriter<'a, S: ?Sized> {
     writes: &'a mut StorageWriteSet,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TrackedStateTransientRebuildState {
     chunk_overlay: storage::TrackedStateChunkOverlay,
     staged_roots: BTreeMap<String, TrackedStateCommitRoot>,
     transient_chunk_hashes: HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>,
+}
+
+impl Default for TrackedStateTransientRebuildState {
+    /// Rebuild state exists only for the explicit repair path, so its overlay
+    /// rewrites durable chunks instead of trusting an addressed digest.
+    fn default() -> Self {
+        Self {
+            chunk_overlay: storage::TrackedStateChunkOverlay::repairing(),
+            staged_roots: BTreeMap::new(),
+            transient_chunk_hashes: HashSet::new(),
+        }
+    }
 }
 
 impl TrackedStateTransientRebuildState {
@@ -3862,7 +3858,8 @@ where
             .copied()
             .collect::<Vec<_>>();
         self.chunk_overlay
-            .stage_selected_chunks(self.writes, promoted.iter().copied())?;
+            .stage_selected_chunks(self.store, self.writes, promoted.iter().copied())
+            .await?;
         for hash in promoted {
             self.transient_chunk_hashes.remove(&hash);
         }
@@ -7024,10 +7021,12 @@ mod tests {
                     commit_a.as_uuid().as_bytes(),
                 )),
                 crate::changelog::encode_commit_record(&CommitRecord {
-                    format_version: 2,
+                    format_version: 3,
                     commit_id: commit_a,
                     generation: 2,
                     parent_commit_ids: vec![commit_b],
+                    first_parent_jump_commit_id: commit_a,
+                    first_parent_jump_span: 0,
                     change_id: ChangeId::for_test_label("commit-a:commit"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(

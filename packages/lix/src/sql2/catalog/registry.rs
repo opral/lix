@@ -46,14 +46,22 @@ impl PublicCatalog {
     /// complete `lix_*` namespace, so only trusted bootstrap schemas can add
     /// Lix-owned surfaces to this catalog.
     pub(crate) fn fixed_system() -> &'static Self {
-        static FIXED_SYSTEM_CATALOG: OnceLock<PublicCatalog> = OnceLock::new();
+        Self::fixed_system_shared()
+    }
+
+    /// The same immutable catalog behind an `Arc` so per-statement provider
+    /// registration can share it instead of deep-copying two `BTreeMap`s.
+    pub(crate) fn fixed_system_shared() -> &'static Arc<Self> {
+        static FIXED_SYSTEM_CATALOG: OnceLock<Arc<PublicCatalog>> = OnceLock::new();
         FIXED_SYSTEM_CATALOG.get_or_init(|| {
             let schemas = crate::schema::seed_schema_definitions()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            Self::from_visible_schemas(&schemas)
-                .expect("compile-time Lix schemas must form a valid SQL catalog")
+            Arc::new(
+                Self::from_visible_schemas(&schemas)
+                    .expect("compile-time Lix schemas must form a valid SQL catalog"),
+            )
         })
     }
 
@@ -102,8 +110,6 @@ impl PublicCatalog {
                 Field::new("hidden", DataType::Boolean, false),
                 Field::new("commit_id", DataType::Utf8, false),
             ])),
-            PublicSurfaceKind::Checkpoint => checkpoint_schema(false),
-            PublicSurfaceKind::CheckpointByBranch => checkpoint_schema(true),
             PublicSurfaceKind::WorkingDiff => working_diff_schema(false),
             PublicSurfaceKind::WorkingDiffByBranch => working_diff_schema(true),
             PublicSurfaceKind::Revert
@@ -220,27 +226,6 @@ impl PublicCatalog {
                 ("created_at", false),
                 ("origin_key", true),
                 ("snapshot_content", true),
-            ]),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        self.insert(surface(
-            "lix_checkpoint",
-            PublicSurfaceKind::Checkpoint,
-            public_columns([
-                ("commit_id", false),
-                ("created_at", false),
-                ("lixcol_depth", false),
-            ]),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        self.insert(surface(
-            "lix_checkpoint_by_branch",
-            PublicSurfaceKind::CheckpointByBranch,
-            public_columns([
-                ("commit_id", false),
-                ("created_at", false),
-                ("lixcol_branch_id", false),
-                ("lixcol_depth", false),
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
@@ -390,17 +375,19 @@ impl PublicCatalog {
             capabilities.clone(),
         ))?;
 
-        let mut by_branch_columns = entity_columns(&spec);
-        by_branch_columns.extend(entity_hidden_columns(&spec, true));
+        if spec.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY {
+            let mut by_branch_columns = entity_columns(&spec);
+            by_branch_columns.extend(entity_hidden_columns(&spec, true));
 
-        self.insert(surface(
-            format!("{}_by_branch", spec.schema_key),
-            PublicSurfaceKind::EntityByBranch {
-                schema_key: spec.schema_key.clone(),
-            },
-            by_branch_columns,
-            capabilities,
-        ))?;
+            self.insert(surface(
+                format!("{}_by_branch", spec.schema_key),
+                PublicSurfaceKind::EntityByBranch {
+                    schema_key: spec.schema_key.clone(),
+                },
+                by_branch_columns,
+                capabilities,
+            ))?;
+        }
 
         if schema_exposed_as_entity_history_surface(&spec.schema_key) {
             let history_identity_roots = primary_key_roots(&spec);
@@ -429,19 +416,6 @@ impl PublicCatalog {
         self.entity_specs.insert(spec.schema_key.clone(), spec);
         Ok(())
     }
-}
-
-#[cfg(test)]
-fn checkpoint_schema(by_branch: bool) -> SchemaRef {
-    let mut fields = vec![
-        Field::new("commit_id", DataType::Utf8, false),
-        Field::new("created_at", DataType::Utf8, false),
-    ];
-    if by_branch {
-        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-    }
-    fields.push(Field::new("lixcol_depth", DataType::Int64, false));
-    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]

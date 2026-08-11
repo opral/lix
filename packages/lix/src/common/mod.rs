@@ -23,7 +23,7 @@ pub(crate) use metadata::{
     parse_row_metadata, parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
 };
 pub(crate) use timestamp::LixTimestamp;
-pub use types::{Blob, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
+pub use types::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use wire::{WireQueryResult, WireValue};
 
 /// Renders a JSON value through the public SQL string-column coercion.

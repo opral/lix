@@ -96,7 +96,8 @@ pub(crate) use file_view::{
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
 pub(crate) use planning_cache::{
-    CachedReadPlan, CachedUpdateLiteralShape, PhysicalReadPlanCacheKey, SqlPlanningCache,
+    CachedPhysicalRead, CachedReadPlan, CachedScanRequest, CachedUpdateLiteralShape,
+    PhysicalReadPlanCacheKey, PooledReadSession, SqlPlanningCache,
 };
 pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,

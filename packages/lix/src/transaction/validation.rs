@@ -16,7 +16,8 @@ use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::catalog::{CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan};
 #[cfg(test)]
-use crate::changelog::{ChangeId, CommitId};
+use crate::changelog::ChangeId;
+use crate::changelog::CommitId;
 use crate::common::NullableKeyFilter;
 use crate::common::format_json_pointer;
 #[cfg(test)]
@@ -51,6 +52,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 
 /// Immutable view of the final transaction write set before persistence.
@@ -62,6 +64,7 @@ pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a PreparedWriteValidationSet<'a>,
     schema_catalog: &'a CatalogSnapshot,
     live_state: &'a dyn LiveStateReader,
+    staged_commit_ids: BTreeSet<CommitId>,
     trust_filesystem_planner: bool,
 }
 
@@ -75,8 +78,14 @@ impl<'a> TransactionValidationInput<'a> {
             staged_writes,
             schema_catalog,
             live_state,
+            staged_commit_ids: BTreeSet::new(),
             trust_filesystem_planner: false,
         }
+    }
+
+    pub(crate) fn with_staged_commit_ids(mut self, staged_commit_ids: BTreeSet<CommitId>) -> Self {
+        self.staged_commit_ids = staged_commit_ids;
+        self
     }
 
     /// Trust namespace checks performed while a serialized, bounded write
@@ -411,7 +420,7 @@ pub(crate) async fn validate_prepared_writes(
         }
     }
     let unresolved_foreign_keys =
-        validate_pending_foreign_keys(&pending_constraints, &staged_snapshots)?;
+        validate_pending_foreign_keys(&input, &pending_constraints, &staged_snapshots)?;
     validate_pending_delete_restrictions(input.schema_catalog, &pending_constraints)?;
     let unresolved_foreign_keys =
         validate_committed_foreign_keys(&input, &pending_constraints, &unresolved_foreign_keys)
@@ -2603,6 +2612,7 @@ struct UnresolvedForeignKeyCheck {
 }
 
 fn validate_pending_foreign_keys(
+    input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
     staged_snapshots: &[(PreparedValidationRow<'_>, &SchemaPlan, &JsonValue)],
 ) -> Result<Vec<UnresolvedForeignKeyCheck>, LixError> {
@@ -2615,6 +2625,9 @@ fn validate_pending_foreign_keys(
             ) else {
                 continue;
             };
+            if staged_commit_foreign_key_is_satisfied(input, *row, foreign_key, &local_value)? {
+                continue;
+            }
             if let Some(check) = validate_pending_normal_foreign_key(
                 *row,
                 foreign_key,
@@ -2626,6 +2639,36 @@ fn validate_pending_foreign_keys(
         }
     }
     Ok(unresolved)
+}
+
+fn staged_commit_foreign_key_is_satisfied(
+    input: &TransactionValidationInput<'_>,
+    row: PreparedValidationRow<'_>,
+    foreign_key: &ForeignKeyPlan,
+    local_value: &UniqueConstraintValue,
+) -> Result<bool, LixError> {
+    if row.schema_key() != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+        || foreign_key.local_properties.as_slice() != [vec!["commit_id".to_string()]]
+        || foreign_key.referenced_schema.schema_key != COMMIT_SCHEMA_KEY
+        || foreign_key.referenced_properties.as_slice() != [vec!["id".to_string()]]
+    {
+        return Ok(false);
+    }
+    let [encoded_commit_id] = local_value.0.as_slice() else {
+        return Ok(false);
+    };
+    let JsonValue::String(commit_id) =
+        serde_json::from_str(encoded_commit_id).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("checkpoint commit_id is not a JSON string: {error}"),
+            )
+        })?
+    else {
+        return Ok(false);
+    };
+    let commit_id = CommitId::parse_lix(&commit_id, "checkpoint commit_id")?;
+    Ok(input.staged_commit_ids.contains(&commit_id))
 }
 
 fn validate_pending_normal_foreign_key(
@@ -6368,6 +6411,7 @@ mod tests {
         let _catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         let unresolved = validate_pending_foreign_keys(
+            &input,
             &indexes,
             &[(
                 PreparedValidationRow::State(row.borrowed()),
@@ -6477,6 +6521,7 @@ mod tests {
         let _catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         let unresolved = validate_pending_foreign_keys(
+            &input,
             &indexes,
             &[(
                 PreparedValidationRow::State(child.borrowed()),
@@ -6531,6 +6576,7 @@ mod tests {
         let _catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         let unresolved = validate_pending_foreign_keys(
+            &input,
             &indexes,
             &[(
                 PreparedValidationRow::State(child.borrowed()),
@@ -6570,6 +6616,7 @@ mod tests {
         let input = validation_input(&staged_writes, &visible_schemas);
         let _catalog = catalog_from_transaction_input(&input).expect("catalog should build");
         let unresolved = validate_pending_foreign_keys(
+            &input,
             &indexes,
             &[(
                 PreparedValidationRow::State(child.borrowed()),
@@ -6624,6 +6671,7 @@ mod tests {
         let input = validation_input(&staged_writes, &visible_schemas);
         let _catalog = catalog_from_transaction_input(&input).expect("catalog should build");
         let unresolved = validate_pending_foreign_keys(
+            &input,
             &indexes,
             &[(
                 PreparedValidationRow::State(child.borrowed()),

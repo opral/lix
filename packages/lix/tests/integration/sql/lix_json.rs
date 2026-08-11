@@ -30,9 +30,9 @@ simulation_test!(
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Json(json!({"name": "Ada", "tags": ["db"]})),
-                Value::Json(json!(null)),
-                Value::Json(json!(["db"])),
+                Value::Json(json!({"name": "Ada", "tags": ["db"]}).into()),
+                Value::Json(json!(null).into()),
+                Value::Json(json!(["db"]).into()),
                 Value::Null,
             ]],
         );

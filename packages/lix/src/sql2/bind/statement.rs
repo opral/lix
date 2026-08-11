@@ -1335,8 +1335,6 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         | PublicSurfaceKind::FileHistory
         | PublicSurfaceKind::DirectoryHistory
         | PublicSurfaceKind::Change
-        | PublicSurfaceKind::Checkpoint
-        | PublicSurfaceKind::CheckpointByBranch
         | PublicSurfaceKind::WorkingDiff
         | PublicSurfaceKind::WorkingDiffByBranch
         | PublicSurfaceKind::FileWorkingDiff

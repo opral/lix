@@ -81,7 +81,7 @@ simulation_test!(
             .await,
             vec![vec![
                 Value::Text("b".to_string()),
-                Value::Json(json!("two")),
+                Value::Json(json!("two").into()),
             ]]
         );
 
@@ -154,14 +154,21 @@ simulation_test!(
             Some(Value::Text(commit_id)) => commit_id.clone(),
             value => panic!("checkpoint RETURNING should contain a commit ID, got {value:?}"),
         };
-        let checkpoint_row = session
-            .execute(
-                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
-                &[Value::Text(checkpoint_commit_id.clone())],
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT commit_id, lixcol_global FROM lix_checkpoint \
+                     WHERE commit_id = '{checkpoint_commit_id}'"
+                ),
             )
-            .await
-            .expect("returned checkpoint commit should be queryable");
-        assert_eq!(checkpoint_row.len(), 1);
+            .await,
+            vec![vec![
+                Value::Text(checkpoint_commit_id.clone()),
+                Value::Boolean(true),
+            ]],
+            "partial checkpoint publication must remain globally owned",
+        );
         let child_head = engine
             .load_branch_head_commit_id(sim.main_branch_id())
             .await
@@ -176,7 +183,7 @@ simulation_test!(
              WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
             )
             .await,
-            vec![vec![Value::Json(json!(["b"]))]]
+            vec![vec![Value::Json(json!(["b"]).into())]]
         );
         assert_eq!(
             select_rows(
@@ -185,8 +192,8 @@ simulation_test!(
             )
             .await,
             vec![
-                vec![Value::Text("a".to_string()), Value::Json(json!("one"))],
-                vec![Value::Text("b".to_string()), Value::Json(json!("two"))],
+                vec![Value::Text("a".to_string()), Value::Json(json!("one").into())],
+                vec![Value::Text("b".to_string()), Value::Json(json!("two").into())],
             ]
         );
 

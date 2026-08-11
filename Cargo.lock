@@ -3438,6 +3438,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "datafusion",
  "duckdb",
+ "fastcdc",
  "futures-util",
  "libc",
  "lix",

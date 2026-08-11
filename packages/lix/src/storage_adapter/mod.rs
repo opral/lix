@@ -45,6 +45,11 @@ pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
+pub(crate) use spaces::{
+    REVISION_KEY_BINARY_CAS_PUBLICATION, REVISION_KEY_BINARY_CAS_RECLAMATION, REVISION_KEY_CATALOG,
+    REVISION_KEY_FILESYSTEM_PATH, REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE, load_revision,
+    load_revisions, revision_key,
+};
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
 };
