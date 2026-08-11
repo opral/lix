@@ -86,7 +86,9 @@ fn rocksdb_movie_workspace_interference() {
         let _qualification_guard = QUALIFICATION_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("create RocksDB movie fixture");
         let storage = RocksDB::open(temp.path().join("database")).expect("open RocksDB fixture");
-        qualify("rocksdb", storage).await;
+        qualify("rocksdb", storage.clone()).await;
+        storage.flush().expect("flush RocksDB fixture");
+        report_settled_bytes("rocksdb", temp.path());
     });
 }
 
@@ -97,8 +99,61 @@ fn slatedb_movie_workspace_interference() {
         let _qualification_guard = QUALIFICATION_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("create SlateDB movie fixture");
         let storage = SlateDB::open(temp.path().join("database")).expect("open SlateDB fixture");
-        qualify("slatedb", storage).await;
+        qualify("slatedb", storage.clone()).await;
+        storage.flush().await.expect("flush SlateDB fixture");
+        report_settled_bytes("slatedb", temp.path());
     });
+}
+
+/// Bytes the workload leaves on disk once the writer has flushed. Reported
+/// per top-level directory so an arm comparison can separate LSM state from
+/// the immutable value segments that carry the media payload.
+fn report_settled_bytes(backend: &str, root: &std::path::Path) {
+    fn directory_bytes(path: &std::path::Path) -> u64 {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if metadata.is_file() {
+            return metadata.len();
+        }
+        if !metadata.is_dir() {
+            return 0;
+        }
+        std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .map(|entry| match entry {
+                        Ok(entry) => directory_bytes(&entry.path()),
+                        Err(_) => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    let database = root.join("database");
+    let mut breakdown = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(database.join("db")) {
+        let mut named = entries
+            .filter_map(Result::ok)
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    directory_bytes(&entry.path()),
+                )
+            })
+            .collect::<Vec<_>>();
+        named.sort();
+        breakdown = named;
+    }
+    println!(
+        "movie_settled_bytes,backend={backend},total_bytes={},{}",
+        directory_bytes(&database),
+        breakdown
+            .iter()
+            .map(|(name, bytes)| format!("{name}_bytes={bytes}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
 }
 
 /// Null control for the playback assertions: identical schedule, sessions and
