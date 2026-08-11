@@ -3002,7 +3002,7 @@ pub(crate) fn query_result_from_batches(
 
     Ok(SqlQueryResult {
         rows,
-        columns: result_columns.clone(),
+        columns: result_columns,
         notices: Vec::new(),
     })
 }
@@ -3306,8 +3306,8 @@ mod tests {
 
     use super::{
         SqlExecutionContext, SqlWriteExecutionContext, build_write_session_with_options,
-        execute_sql, row_values_from_batch, write_provider_selection, write_session_options,
-        write_target_table_name,
+        execute_sql, query_result_from_batches, row_values_from_batch, write_provider_selection,
+        write_session_options, write_target_table_name,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
@@ -3341,11 +3341,109 @@ mod tests {
     };
     use crate::{LixError, NullableKeyFilter, Value};
     use bytes::Bytes;
-    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::array::{
+        ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
+        StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::error::DataFusionError;
     use datafusion::physical_plan::RecordBatchStream;
+
+    #[test]
+    fn direct_typed_public_rows_match_generic_scalar_conversion_for_every_supported_type() {
+        const ROWS: usize = 242;
+        let present = |index: usize| index % 7 != 0;
+        let fields = vec![
+            Field::new("null", DataType::Null, true),
+            Field::new("bool", DataType::Boolean, true),
+            Field::new("i8", DataType::Int8, true),
+            Field::new("i16", DataType::Int16, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("i64", DataType::Int64, true),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("u16", DataType::UInt16, true),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("u64", DataType::UInt64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("utf8", DataType::Utf8, true),
+            Field::new("utf8_view", DataType::Utf8View, true),
+            Field::new("large_utf8", DataType::LargeUtf8, true),
+            Field::new("binary", DataType::Binary, true),
+            Field::new("large_binary", DataType::LargeBinary, true),
+        ];
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(NullArray::new(ROWS)),
+            Arc::new(BooleanArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index % 2 == 0)),
+            )),
+            Arc::new(Int8Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some((index % 101) as i8 - 50)),
+            )),
+            Arc::new(Int16Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i16 - 120)),
+            )),
+            Arc::new(Int32Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i32 - 130)),
+            )),
+            Arc::new(Int64Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i64 - 140)),
+            )),
+            Arc::new(UInt8Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u8)),
+            )),
+            Arc::new(UInt16Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u16 * 3)),
+            )),
+            Arc::new(UInt32Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u32 * 5)),
+            )),
+            Arc::new(UInt64Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(if index == 1 {
+                    u64::MAX
+                } else {
+                    index as u64 * 7
+                })
+            }))),
+            Arc::new(Float32Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(index as f32 * 0.25 - 10.0)
+            }))),
+            Arc::new(Float64Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(index as f64 * 0.5 - 20.0)
+            }))),
+            Arc::new(StringArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("utf8")),
+            )),
+            Arc::new(StringViewArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("utf8-view")),
+            )),
+            Arc::new(LargeStringArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("large-utf8")),
+            )),
+            Arc::new(BinaryArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(b"binary".as_slice())),
+            )),
+            Arc::new(LargeBinaryArray::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(b"large-binary".as_slice())
+            }))),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), arrays)
+            .expect("all ordinary result arrays share one schema");
+
+        let generic_rows = (0..ROWS)
+            .map(|row_index| row_values_from_batch(&fields, &batch, row_index))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("generic scalar conversion");
+        let direct = query_result_from_batches(&fields, &[batch]).expect("direct typed conversion");
+
+        assert_eq!(
+            direct.columns,
+            fields.iter().map(Field::name).cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(direct.rows, generic_rows);
+    }
 
     struct DummyBlobReader;
     struct StaticBlobReader {

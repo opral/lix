@@ -10,7 +10,10 @@ use std::ops::{Bound, Deref, Range};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::changelog::ChangeRecordProjection;
-use crate::changelog::{ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest};
+use crate::changelog::{
+    COMMIT_SPACE, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest, CommitRecord,
+    commit_key,
+};
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
@@ -97,8 +100,11 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // payload-less certified-reference encoding is intentionally rejected. The
 // version also binds ordered mutation parts to the canonical 512-row geometry;
 // LXCD14 is intentionally rejected rather than read through a compatibility
+// decoder. Version 16 permits direct-address leaves to reconstruct the exact
+// per-row ChangeId from one shared commit id and the first packed ordinal.
+// LXCD15 is deliberately rejected rather than read through a compatibility
 // decoder.
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD15";
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD16";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
@@ -3665,8 +3671,91 @@ pub(crate) async fn load_point_replay_commit_state(
         },
     ];
     let mut values = exact_get_many(store, &requests).await?.values.into_iter();
-    let header = values.next().flatten().and_then(full_value_bytes);
-    let inventory = values.next().flatten().and_then(full_value_bytes);
+    decode_point_replay_commit_state_values(
+        commit_id,
+        values.next().flatten(),
+        values.next().flatten(),
+    )
+}
+
+/// Co-loads the semantic commit record and its physical replay authority.
+///
+/// State reconstruction needs both independent authorities for every replayed
+/// commit. Keeping them in one adapter batch preserves that separation while
+/// avoiding a second backend round trip per first-parent step.
+pub(crate) async fn load_commit_record_and_point_replay_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<
+    (
+        Option<CommitRecord>,
+        Option<AuthenticatedReplayCommitStateManifest>,
+    ),
+    LixError,
+> {
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_replay_manifest_load();
+    let commit_keys = [StorageKey(Bytes::from(commit_key(commit_id)))];
+    let header_keys = [StorageKey(Bytes::from(commit_state_manifest_key(
+        commit_id,
+    )))];
+    let inventory_keys = [StorageKey(Bytes::from(commit_mutation_inventory_key(
+        commit_id,
+    )))];
+    let requests = [
+        StorageGetManyRequest {
+            space: COMMIT_SPACE,
+            keys: &commit_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            keys: &header_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+            keys: &inventory_keys,
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
+    let record = values
+        .next()
+        .flatten()
+        .and_then(full_value_bytes)
+        .map(|bytes| storage_codec::decode::<CommitRecord>("commit record", &bytes))
+        .transpose()?;
+    if let Some(record) = record.as_ref()
+        && record.commit_id != commit_id
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "changelog commit key for commit '{commit_id}' contains record for '{}'",
+                record.commit_id
+            ),
+        ));
+    }
+    if record.is_none() {
+        return Ok((None, None));
+    }
+    let state = decode_point_replay_commit_state_values(
+        commit_id,
+        values.next().flatten(),
+        values.next().flatten(),
+    )?;
+    debug_assert!(values.next().is_none());
+    Ok((record, state))
+}
+
+fn decode_point_replay_commit_state_values(
+    commit_id: CommitId,
+    header: Option<StorageProjectedValue>,
+    inventory: Option<StorageProjectedValue>,
+) -> Result<Option<AuthenticatedReplayCommitStateManifest>, LixError> {
+    let header = header.and_then(full_value_bytes);
+    let inventory = inventory.and_then(full_value_bytes);
     let (header, inventory) = match (header, inventory) {
         (None, None) => return Ok(None),
         (Some(header), Some(inventory)) => (header, inventory),
@@ -11088,6 +11177,11 @@ fn encode_commit_delta_segment_layout(
 ) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     debug_assert_eq!(entries.len(), payloads.len());
     let leaf = encode_leaf_node_refs(entries);
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_leaf_layout(
+        entries.len(),
+        crate::tracked_state::codec::leaf_uses_direct_address_layout(&leaf),
+    );
     let authored_inline = payloads.iter().all(|payload| {
         payload.authored
             && matches!(payload.snapshot, crate::json_store::JsonSlotRef::Inline(_))
@@ -13245,6 +13339,7 @@ mod tests {
 
     struct ManifestCountingRead<R> {
         inner: R,
+        get_many_calls: std::sync::Arc<AtomicUsize>,
         manifest_requests: std::sync::Arc<AtomicUsize>,
         inventory_requests: std::sync::Arc<AtomicUsize>,
         directory_requests: std::sync::Arc<AtomicUsize>,
@@ -13264,6 +13359,7 @@ mod tests {
         ) -> impl Future<
             Output = Result<crate::storage::GetManyResult, crate::storage::StorageError>,
         > + Send {
+            self.get_many_calls.fetch_add(1, Ordering::Relaxed);
             for request in requests {
                 if request.space == super::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE {
                     self.manifest_requests.fetch_add(1, Ordering::Relaxed);
@@ -13315,10 +13411,12 @@ mod tests {
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
         let record = CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             change_id: ChangeId::for_test_label(&format!("{commit_id}:fixture-commit")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
@@ -14037,6 +14135,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("routed point read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -16342,6 +16441,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn point_replay_coloads_commit_and_state_authorities_in_one_batch() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("co-loaded-point-replay");
+        let mutations = CommitStateMutationInventory::default();
+        let mut writes = storage.new_write_set();
+        stage_fixture_manifest(&mut writes, commit_id, &mutations)
+            .expect("commit and physical authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("co-load fixture should commit");
+
+        let get_many_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let inventory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let read = ManifestCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("co-load read should open"),
+            get_many_calls: std::sync::Arc::clone(&get_many_calls),
+            manifest_requests: std::sync::Arc::clone(&manifest_requests),
+            inventory_requests: std::sync::Arc::clone(&inventory_requests),
+            directory_requests: std::sync::Arc::new(AtomicUsize::new(0)),
+        };
+        let (record, state) = super::load_commit_record_and_point_replay_state(&read, commit_id)
+            .await
+            .expect("co-loaded authorities should decode");
+
+        assert_eq!(
+            record.expect("semantic commit should exist").commit_id,
+            commit_id
+        );
+        assert_eq!(
+            state.expect("physical state should exist").commit_id,
+            commit_id
+        );
+        assert_eq!(get_many_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn shallow_point_replay_reads_one_immutable_physical_authority() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("one-read-shallow-point-replay");
@@ -16371,6 +16513,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("point read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -16441,6 +16584,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("bounded point read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -16501,6 +16645,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("bounded membership read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -17174,6 +17319,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("topology read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
@@ -17427,6 +17573,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("read should open"),
+            get_many_calls: std::sync::Arc::new(AtomicUsize::new(0)),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),

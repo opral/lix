@@ -26,6 +26,7 @@ mod types;
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
 pub(crate) use commit_root_rebuild::{
     load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
+    try_stage_collapsed_rebuild_plans_with_writer,
 };
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
@@ -73,12 +74,11 @@ pub(crate) use storage::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
     CommitDeltaReplacementScope, OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology,
-    StagedCommitStateManifest, commit_delta_contains_schema, commit_state_authority_key,
-    decode_commit_state_authority_id, direct_change_locator, load_change_record_by_id,
-    load_commit_delta_change_records, load_commit_delta_members_with_payloads,
-    load_commit_delta_members_with_payloads_for_schemas, load_commit_delta_replay_metadata,
-    load_commit_delta_selection_certificate, load_commit_mutation_directory_roots,
-    load_commit_state_authority_ids, load_commit_state_manifest, load_commit_state_manifests,
+    StagedCommitStateManifest, commit_delta_contains_schema, direct_change_locator,
+    load_change_record_by_id, load_commit_delta_change_records,
+    load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
+    load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
+    load_commit_mutation_directory_roots, load_commit_state_manifest, load_commit_state_manifests,
     load_local_selected_change_owner_commit_ids, load_owned_commit_delta_entries,
     load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_topology,
     load_retained_commit_snapshots_for_schemas, scan_change_records_from_commit_deltas,
@@ -106,7 +106,7 @@ pub(crate) use storage::{
 pub(crate) use storage::decode_change_locator;
 #[cfg(test)]
 pub(crate) use storage::{
-    change_id_from_packed_address, load_commit_delta_change_ids,
+    change_id_from_packed_address, commit_state_authority_key, load_commit_delta_change_ids,
     load_complete_current_state_values_from_scoped_root, load_snapshot_commit_root,
     scan_commit_delta_members, stage_resealed_commit_state_manifest_for_test,
 };

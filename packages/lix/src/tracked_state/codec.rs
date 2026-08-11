@@ -231,6 +231,14 @@ impl DecodedInternalNode {
 
 const NODE_KIND_LEAF_V4: u8 = 5;
 const NODE_KIND_INTERNAL_V4: u8 = 6;
+/// Packed direct-address leaves store the one shared commit id plus the first
+/// packed change ordinal. Every row's exact change id is reconstructed from
+/// that authenticated sequence instead of repeating another 16-byte UUID.
+const NODE_KIND_DIRECT_LEAF_V1: u8 = 7;
+
+pub(crate) fn leaf_uses_direct_address_layout(encoded: &[u8]) -> bool {
+    encoded.first() == Some(&NODE_KIND_DIRECT_LEAF_V1)
+}
 
 #[derive(Debug, Clone, Copy)]
 struct MutationSpan {
@@ -1464,6 +1472,9 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
             );
         }
     }
+    if let Some((commit_id, first_packed)) = direct_leaf_sequence(entries) {
+        return encode_direct_leaf_v1(entries, commit_id, first_packed);
+    }
     let commit_dictionary = repeated_dictionary::<16>(entries, VALUE_COMMIT_ID_START);
     let tail_dictionary = repeated_tail_dictionary(entries);
 
@@ -1493,6 +1504,71 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
         if commit_ref == 0 {
             out.extend_from_slice(&entry.value[VALUE_COMMIT_ID_START..VALUE_COMMIT_ID_END]);
         }
+        let tail = &entry.value[VALUE_STATE_TAIL_START..];
+        let tail_ref = slice_dictionary_ref(&tail_dictionary, tail);
+        write_varint(&mut out, tail_ref);
+        if tail_ref == 0 {
+            out.extend_from_slice(tail);
+        }
+        previous_key = entry.key;
+    }
+    #[cfg(debug_assertions)]
+    verify_leaf_round_trip(&out, entries);
+    out
+}
+
+fn direct_leaf_sequence(entries: &[EncodedLeafEntryRef<'_>]) -> Option<([u8; 16], u32)> {
+    let first = entries.first()?;
+    let commit_id: [u8; 16] = first.value[VALUE_COMMIT_ID_START..VALUE_COMMIT_ID_END]
+        .try_into()
+        .expect("validated tracked-state value has a commit id");
+    let first_change: [u8; 16] = first.value[..VALUE_CHANGE_ID_END]
+        .try_into()
+        .expect("validated tracked-state value has a change id");
+    if first_change[..12] != commit_id[..12] {
+        return None;
+    }
+    let first_packed = u32::from_be_bytes(
+        first_change[12..]
+            .try_into()
+            .expect("change-id suffix is a packed u32"),
+    );
+    for (ordinal, entry) in entries.iter().enumerate() {
+        if entry.value[VALUE_COMMIT_ID_START..VALUE_COMMIT_ID_END] != commit_id
+            || entry.value[..12] != commit_id[..12]
+            || u32::from_be_bytes(
+                entry.value[12..VALUE_CHANGE_ID_END]
+                    .try_into()
+                    .expect("change-id suffix is a packed u32"),
+            ) != first_packed.checked_add(u32::try_from(ordinal).ok()?)?
+        {
+            return None;
+        }
+    }
+    Some((commit_id, first_packed))
+}
+
+fn encode_direct_leaf_v1(
+    entries: &[EncodedLeafEntryRef<'_>],
+    commit_id: [u8; 16],
+    first_packed: u32,
+) -> Vec<u8> {
+    let tail_dictionary = repeated_tail_dictionary(entries);
+    let mut out = Vec::with_capacity(32 + entries.len() * 8);
+    out.push(NODE_KIND_DIRECT_LEAF_V1);
+    write_varint(&mut out, entries.len() as u64);
+    out.extend_from_slice(&commit_id);
+    out.extend_from_slice(&first_packed.to_be_bytes());
+    write_varint(&mut out, tail_dictionary.len() as u64);
+    for tail in &tail_dictionary {
+        out.extend_from_slice(tail);
+    }
+    let mut previous_key: &[u8] = &[];
+    for entry in entries {
+        let shared = shared_prefix_len(previous_key, entry.key);
+        write_varint(&mut out, shared as u64);
+        write_varint(&mut out, (entry.key.len() - shared) as u64);
+        out.extend_from_slice(&entry.key[shared..]);
         let tail = &entry.value[VALUE_STATE_TAIL_START..];
         let tail_ref = slice_dictionary_ref(&tail_dictionary, tail);
         write_varint(&mut out, tail_ref);
@@ -1720,6 +1796,151 @@ fn decode_leaf_v4(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "tracked-state leaf node has trailing bytes",
+        ));
+    }
+    Ok(DecodedLeafNodeRef {
+        arena: Bytes::from(arena),
+        entries,
+    })
+}
+
+fn decode_direct_leaf_v1(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+    fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
+        usize::try_from(value).map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("tracked-state direct leaf node {what} does not fit in usize"),
+            )
+        })
+    }
+    fn slice<'b>(body: &'b [u8], offset: &mut usize, len: usize) -> Result<&'b [u8], LixError> {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state direct leaf node length overflow",
+            )
+        })?;
+        let bytes = body.get(*offset..end).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state direct leaf node is truncated",
+            )
+        })?;
+        *offset = end;
+        Ok(bytes)
+    }
+
+    let mut offset = 0usize;
+    let entry_count = usize_from(
+        read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+        "entry count",
+    )?;
+    if entry_count == 0 {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state direct leaf node has no entries",
+        ));
+    }
+    let commit_id: [u8; 16] = slice(body, &mut offset, 16)?
+        .try_into()
+        .expect("fixed commit-id slice");
+    let first_packed = u32::from_be_bytes(
+        slice(body, &mut offset, 4)?
+            .try_into()
+            .expect("fixed packed-address slice"),
+    );
+    let tail_dict_len = usize_from(
+        read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+        "tail dictionary length",
+    )?;
+    let mut tail_dictionary = Vec::with_capacity(tail_dict_len.min(body.len()));
+    for _ in 0..tail_dict_len {
+        tail_dictionary.push(read_value_tail(
+            body,
+            &mut offset,
+            "tracked-state direct leaf node",
+        )?);
+    }
+    let omitted_value_bytes = entry_count.min(body.len()).saturating_mul(VALUE_MAX_BYTES);
+    let mut arena = Vec::with_capacity(body.len().saturating_add(omitted_value_bytes));
+    let mut entries = Vec::with_capacity(entry_count.min(body.len()));
+    let mut previous_key_start = 0usize;
+    let mut previous_key_end = 0usize;
+    for ordinal in 0..entry_count {
+        let shared = usize_from(
+            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+            "shared key length",
+        )?;
+        let suffix_len = usize_from(
+            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+            "key suffix length",
+        )?;
+        let previous_key_len = previous_key_end - previous_key_start;
+        if shared > previous_key_len {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state direct leaf node shares more key bytes than the previous key holds",
+            ));
+        }
+        let key_start = arena.len();
+        arena.extend_from_within(previous_key_start..previous_key_start + shared);
+        arena.extend_from_slice(slice(body, &mut offset, suffix_len)?);
+        let key_end = arena.len();
+        if !entries.is_empty()
+            && arena[previous_key_start..previous_key_end] >= arena[key_start..key_end]
+        {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state direct leaf node keys are not strictly ordered",
+            ));
+        }
+        let tail_ref = usize_from(
+            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+            "tail dictionary ref",
+        )?;
+        let tail = if tail_ref == 0 {
+            read_value_tail(body, &mut offset, "tracked-state direct leaf node")?
+        } else {
+            if tail_ref > tail_dict_len {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state direct leaf node tail dictionary ref is out of bounds",
+                ));
+            }
+            tail_dictionary[tail_ref - 1]
+        };
+        let packed = first_packed
+            .checked_add(u32::try_from(ordinal).map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state direct leaf node ordinal exceeds u32",
+                )
+            })?)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state direct leaf node address overflows u32",
+                )
+            })?;
+        let value_start = arena.len();
+        arena.extend_from_slice(&commit_id[..12]);
+        arena.extend_from_slice(&packed.to_be_bytes());
+        arena.extend_from_slice(&commit_id);
+        arena.extend_from_slice(tail);
+        let value_end = arena.len();
+        entries.push(LeafEntrySpan {
+            key_start,
+            key_end,
+            value_start,
+            value_end,
+        });
+        previous_key_start = key_start;
+        previous_key_end = key_end;
+    }
+    if offset != body.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state direct leaf node has trailing bytes",
         ));
     }
     Ok(DecodedLeafNodeRef {
@@ -1961,6 +2182,7 @@ pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> 
     match kind {
         NODE_KIND_LEAF_V4 => Ok(DecodedNodeRef::Leaf(decode_leaf_v4(body)?)),
         NODE_KIND_INTERNAL_V4 => Ok(DecodedNodeRef::Internal(decode_internal_v4(body)?)),
+        NODE_KIND_DIRECT_LEAF_V1 => Ok(DecodedNodeRef::Leaf(decode_direct_leaf_v1(body)?)),
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("tracked-state tree node has unknown kind byte {other}"),
@@ -2058,6 +2280,84 @@ mod tests {
             (vec![0x80, 0x01], raw_value(4, 5, 6)),
             (vec![0xff, 0xff, 0xff], raw_value(7, 8, 9)),
         ]);
+    }
+
+    #[test]
+    fn direct_leaf_reconstructs_exact_change_ids_without_per_row_uuid_bytes() {
+        let mut commit_id = [0x42; 16];
+        commit_id[12..].copy_from_slice(&0_u32.to_be_bytes());
+        let entries = (0_u32..128)
+            .map(|ordinal| {
+                let mut change_id = commit_id;
+                change_id[12..].copy_from_slice(&(513 + ordinal).to_be_bytes());
+                let mut value = Vec::new();
+                value.extend_from_slice(&change_id);
+                value.extend_from_slice(&commit_id);
+                write_value_tail(&mut value, false, 7, 7);
+                (format!("key-{ordinal:04}").into_bytes(), value)
+            })
+            .collect::<Vec<_>>();
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef { key, value })
+            .collect::<Vec<_>>();
+        let encoded = encode_leaf_refs_for_tests(&refs);
+        assert_eq!(encoded[0], NODE_KIND_DIRECT_LEAF_V1);
+        assert!(encoded.len() < entries.len() * 8);
+        leaf_entries_round_trip(&entries);
+    }
+
+    #[test]
+    fn direct_leaf_falls_back_for_mixed_or_nonsequential_change_ids() {
+        let mut commit_id = [0x42; 16];
+        commit_id[12..].copy_from_slice(&0_u32.to_be_bytes());
+        let mut entries = (0_u32..3)
+            .map(|ordinal| {
+                let mut change_id = commit_id;
+                change_id[12..].copy_from_slice(&(17 + ordinal).to_be_bytes());
+                let mut value = Vec::new();
+                value.extend_from_slice(&change_id);
+                value.extend_from_slice(&commit_id);
+                write_value_tail(&mut value, false, 9, 9);
+                (format!("key-{ordinal}").into_bytes(), value)
+            })
+            .collect::<Vec<_>>();
+        entries[1].1[0] ^= 0x80;
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef { key, value })
+            .collect::<Vec<_>>();
+
+        let encoded = encode_leaf_refs_for_tests(&refs);
+        assert_eq!(encoded[0], NODE_KIND_LEAF_V4);
+        leaf_entries_round_trip(&entries);
+    }
+
+    #[test]
+    fn direct_leaf_rejects_a_reconstructed_address_overflow() {
+        let mut commit_id = [0x42; 16];
+        commit_id[12..].copy_from_slice(&0_u32.to_be_bytes());
+        let entries = (0_u32..2)
+            .map(|ordinal| {
+                let mut change_id = commit_id;
+                change_id[12..].copy_from_slice(&(17 + ordinal).to_be_bytes());
+                let mut value = Vec::new();
+                value.extend_from_slice(&change_id);
+                value.extend_from_slice(&commit_id);
+                write_value_tail(&mut value, false, 9, 9);
+                (format!("key-{ordinal}").into_bytes(), value)
+            })
+            .collect::<Vec<_>>();
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef { key, value })
+            .collect::<Vec<_>>();
+        let mut encoded = encode_leaf_refs_for_tests(&refs);
+        // kind + one-byte entry count + shared commit id
+        encoded[18..22].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let error = decode_node_ref(&encoded).expect_err("second address must overflow");
+        assert!(error.message.contains("address overflows u32"));
     }
 
     #[test]

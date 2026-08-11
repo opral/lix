@@ -42,14 +42,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V63 replaces the branch-local checkpoint marker with immutable,
-/// repository-global `lix_checkpoint` entities keyed by captured commit. The
-/// hard cut rejects repositories seeded with an older checkpoint identity
-/// model instead of silently exposing mixed checkpoint identities.
+/// V65 removes per-row ChangeId copies from directly addressable immutable
+/// mutation leaves. The hard cut rejects repositories whose packed history
+/// predates that physical authority instead of retaining a second decoder.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"global-checkpoint-entity.v63";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"direct-change-id-leaf.v65";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -609,10 +608,12 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        format_version: 2,
+        format_version: 3,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
+        first_parent_jump_commit_id: plan.commit.id,
+        first_parent_jump_span: 0,
         change_id: plan.commit.change_id,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,

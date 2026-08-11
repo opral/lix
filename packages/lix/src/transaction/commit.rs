@@ -1196,6 +1196,8 @@ async fn stage_changelog_commits(
         })
         .await?;
     let mut generations = BTreeMap::new();
+    let mut first_parent_jumps = BTreeMap::new();
+    let mut topology_records = BTreeMap::new();
     let mut rootless_depths = BTreeMap::new();
     let mut rootless_rows = BTreeMap::new();
     let mut rootless_bytes = BTreeMap::new();
@@ -1227,6 +1229,14 @@ async fn stage_changelog_commits(
             ));
         }
         generations.insert(*commit_id, record.generation);
+        first_parent_jumps.insert(
+            *commit_id,
+            (
+                record.first_parent_jump_commit_id,
+                record.first_parent_jump_span,
+            ),
+        );
+        topology_records.insert(*commit_id, record.clone());
         let replay_debt = published.replay_debt();
         rootless_depths.insert(*commit_id, replay_debt.depth);
         rootless_rows.insert(*commit_id, replay_debt.rows);
@@ -1265,6 +1275,53 @@ async fn stage_changelog_commits(
                     .checked_add(1)
                     .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
             })?;
+        let parent_record = match commit.parent_commit_ids.as_slice() {
+            [parent_commit_id] => Some(
+                topology_records
+                    .get(parent_commit_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("commit '{commit_id}' has missing parent jump metadata"),
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+        if let Some(parent) = &parent_record
+            && !topology_records.contains_key(&parent.first_parent_jump_commit_id)
+        {
+            let jump_id = parent.first_parent_jump_commit_id;
+            let loaded = ChangelogContext::new()
+                .reader(&mut *read)
+                .load_commits(ChangelogCommitLoadRequest {
+                    commit_ids: std::slice::from_ref(&jump_id),
+                })
+                .await?;
+            let jump = loaded
+                .into_iter()
+                .next()
+                .and_then(|(_, record)| record)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("commit '{commit_id}' has a missing jump target '{jump_id}'"),
+                    )
+                })?;
+            topology_records.insert(jump_id, jump);
+        }
+        let parent_jump_record = parent_record.as_ref().map(|parent| {
+            topology_records
+                .get(&parent.first_parent_jump_commit_id)
+                .expect("loaded parent jump target")
+        });
+        let first_parent_jump = crate::changelog::next_first_parent_jump(
+            commit_id,
+            &commit.parent_commit_ids,
+            parent_record.as_ref(),
+            parent_jump_record,
+        )?;
         let selected_as_new_rootless = rootless_commit_ids.contains(&commit_id);
         let commit_delta_rows = tracked_row_indices_by_commit
             .get(&commit_id)
@@ -1392,6 +1449,21 @@ async fn stage_changelog_commits(
         rootless_rows.insert(commit_id, cumulative_rootless_rows);
         rootless_bytes.insert(commit_id, cumulative_rootless_bytes);
         generations.insert(commit_id, generation);
+        first_parent_jumps.insert(commit_id, first_parent_jump);
+        topology_records.insert(
+            commit_id,
+            CommitRecord {
+                format_version: 3,
+                commit_id,
+                generation,
+                parent_commit_ids: commit.parent_commit_ids.clone(),
+                first_parent_jump_commit_id: first_parent_jump.0,
+                first_parent_jump_span: first_parent_jump.1,
+                change_id: commit.change_id,
+                account_id: active_account_id.to_string(),
+                created_at: commit.created_at,
+            },
+        );
         for child in children.get(&commit_id).into_iter().flatten() {
             let remaining = staged_parent_count
                 .get_mut(child)
@@ -1450,10 +1522,12 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
+            first_parent_jump_commit_id: first_parent_jumps[&commit_row.commit_id].0,
+            first_parent_jump_span: first_parent_jumps[&commit_row.commit_id].1,
             change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
@@ -5742,6 +5816,23 @@ async fn stage_tracked_roots(
             true,
         )
         .await?;
+        let all_new = plans
+            .iter()
+            .all(|plan| !staged_rebuild_plan_ids.contains(&plan.commit_id));
+        if all_new
+            && crate::tracked_state::try_stage_collapsed_rebuild_plans_with_writer(
+                &mut tracked_writer,
+                &plans,
+            )
+            .await?
+            .is_some()
+        {
+            // A collapsed replay stages only its terminal root. Intermediate
+            // plan IDs remain unstaged so another rebuild parent sharing this
+            // suffix can independently collapse against immutable authority.
+            staged_rebuild_plan_ids.insert(plans[0].commit_id);
+            continue;
+        }
         for plan in plans.iter().rev() {
             if staged_rebuild_plan_ids.insert(plan.commit_id) {
                 crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
