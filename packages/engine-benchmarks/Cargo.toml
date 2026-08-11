@@ -65,6 +65,11 @@ path = "examples/space_growth.rs"
 required-features = ["storage-benches"]
 
 [[example]]
+name = "tree_chunk_trace"
+path = "examples/tree_chunk_trace.rs"
+required-features = ["storage-benches"]
+
+[[example]]
 name = "storage_layout"
 path = "examples/storage_layout.rs"
 required-features = ["storage-benches", "slatedb"]
