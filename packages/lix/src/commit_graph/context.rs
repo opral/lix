@@ -120,22 +120,11 @@ where
                 .iter()
                 .map(|commit_id| StorageKey(Bytes::from(crate::changelog::commit_key(*commit_id))))
                 .collect::<Vec<_>>();
-            let authority_keys = uncached_ids
-                .iter()
-                .map(|commit_id| crate::tracked_state::commit_state_authority_key(*commit_id))
-                .collect::<Vec<_>>();
-            let requests = [
-                StorageGetManyRequest {
-                    space: crate::changelog::COMMIT_SPACE,
-                    keys: &commit_keys,
-                    opts: StorageGetOptions::default(),
-                },
-                StorageGetManyRequest {
-                    space: crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-                    keys: &authority_keys,
-                    opts: StorageGetOptions::default(),
-                },
-            ];
+            let requests = [StorageGetManyRequest {
+                space: crate::changelog::COMMIT_SPACE,
+                keys: &commit_keys,
+                opts: StorageGetOptions::default(),
+            }];
             let mut values = exact_get_many(&self.store, &requests)
                 .await?
                 .values
@@ -152,18 +141,9 @@ where
                 })
                 .collect::<Result<Vec<Option<CommitRecord>>, LixError>>()?;
             let batch = ExactBatch::try_new("changelog commit", &uncached_ids, records)?;
-            let authority_ids = uncached_ids
-                .iter()
-                .map(|commit_id| {
-                    crate::tracked_state::decode_commit_state_authority_id(
-                        *commit_id,
-                        values.next().expect("exact authority slot is present"),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
             debug_assert!(values.next().is_none());
-            for ((commit_id, record), authority_id) in batch.into_iter().zip(authority_ids) {
-                let node = commit_graph_node_from_authority(*commit_id, record, authority_id)?;
+            for (commit_id, record) in batch {
+                let node = commit_graph_node_from_record(record)?;
                 self.node_cache.insert(*commit_id, node);
             }
         }
@@ -174,7 +154,7 @@ where
         ExactBatch::try_new("commit graph", commit_ids, nodes)
     }
 
-    /// Loads every direct commit fact from the commit-state authority.
+    /// Loads every direct commit fact from the immutable changelog authority.
     ///
     /// This is used by global commit surfaces where the caller wants the durable
     /// graph facts themselves, not reachability from a particular branch head.
@@ -189,17 +169,8 @@ where
                     limit: Some(1024),
                 })
                 .await?;
-            let commit_ids = scan
-                .entries
-                .iter()
-                .map(|record| record.commit_id)
-                .collect::<Vec<_>>();
-            let authority_ids =
-                crate::tracked_state::load_commit_state_authority_ids(&self.store, &commit_ids)
-                    .await?;
-            for (record, authority_id) in scan.entries.into_iter().zip(authority_ids) {
-                let commit_id = record.commit_id;
-                let node = commit_graph_node_from_authority(commit_id, Some(record), authority_id)?
+            for record in scan.entries {
+                let node = commit_graph_node_from_record(Some(record))?
                     .expect("scanned commit projection produces a graph node");
                 self.node_cache.insert(node.commit_id, Some(node.clone()));
                 commits.push(node);
@@ -561,27 +532,12 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
     }
 }
 
-fn commit_graph_node_from_authority(
-    commit_id: CommitId,
+fn commit_graph_node_from_record(
     record: Option<CommitRecord>,
-    authority_id: Option<CommitId>,
 ) -> Result<Option<CommitGraphNode>, LixError> {
-    // Public graph membership belongs to the compact changelog projection.
-    // A physical manifest is an independent serving/replay authority. Its
-    // absence is handled by payload/state readers, not by metadata membership.
     let Some(record) = record else {
         return Ok(None);
     };
-    if let Some(authority_id) = authority_id
-        && record.commit_id != authority_id
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit_graph projection disagrees with commit-state authority for commit '{commit_id}'"
-            ),
-        ));
-    }
     let node = CommitGraphNode {
         commit_id: record.commit_id,
         change_id: record.change_id,
@@ -783,6 +739,7 @@ mod tests {
         inner: MemoryRead,
         change_get_many_calls: Arc<AtomicUsize>,
         member_segment_get_many_calls: Arc<AtomicUsize>,
+        commit_state_manifest_get_many_calls: Arc<AtomicUsize>,
     }
 
     impl StorageRead for CountingMemoryRead {
@@ -800,6 +757,12 @@ mod tests {
                 request.space == crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE
             }) {
                 self.member_segment_get_many_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if requests.iter().any(|request| {
+                request.space == crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+            }) {
+                self.commit_state_manifest_get_many_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
             self.inner.get_many(requests).await
@@ -1135,6 +1098,7 @@ mod tests {
             inner: read,
             change_get_many_calls: Arc::clone(&change_get_many_calls),
             member_segment_get_many_calls,
+            commit_state_manifest_get_many_calls: Arc::new(AtomicUsize::new(0)),
         }));
         let request = CommitGraphChangeHistoryRequest {
             schema_keys: vec!["test_schema".to_string()],
@@ -1362,6 +1326,7 @@ mod tests {
         .await;
 
         let member_segment_get_many_calls = Arc::new(AtomicUsize::new(0));
+        let commit_state_manifest_get_many_calls = Arc::new(AtomicUsize::new(0));
         let read = memory
             .begin_read(StorageReadOptions::default())
             .await
@@ -1371,6 +1336,9 @@ mod tests {
                 inner: read,
                 change_get_many_calls: Arc::new(AtomicUsize::new(0)),
                 member_segment_get_many_calls: Arc::clone(&member_segment_get_many_calls),
+                commit_state_manifest_get_many_calls: Arc::clone(
+                    &commit_state_manifest_get_many_calls,
+                ),
             }));
         let head = commit_id("commit-head");
         let root = commit_id("commit-root");
@@ -1392,6 +1360,11 @@ mod tests {
             member_segment_get_many_calls.load(Ordering::Relaxed),
             0,
             "topology APIs must never touch commit member storage",
+        );
+        assert_eq!(
+            commit_state_manifest_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "topology APIs must read only the immutable changelog authority",
         );
 
         let commit_history = reader
