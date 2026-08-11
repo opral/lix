@@ -312,9 +312,17 @@ mod tests {
 
     #[test]
     fn payload_carries_exact_canonical_chunk_receipts() {
-        let bytes = (0..MEDIA_CHUNK_BYTES * 2 + 17)
-            .map(|index| (index as u8).wrapping_mul(31))
-            .collect::<Vec<_>>();
+        // A byte pattern with real variety: the gear hash finds no cut point in
+        // a short repeating sequence, so a periodic fixture would collapse to
+        // one max-sized chunk and prove nothing about receipt ordering.
+        let mut bytes = vec![0u8; MEDIA_CHUNK_BYTES * 5 + 17];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for chunk in bytes.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
         let payload = BlobPayload::from_bytes(bytes.clone());
 
         // Boundaries are content-defined, so the receipts are asserted by the
