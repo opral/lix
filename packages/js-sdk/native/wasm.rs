@@ -727,7 +727,9 @@ impl TryFrom<LixValueDto> for Value {
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .map(Self::Text)
                 .ok_or_else(|| invalid_param("text value must be a string")),
-            "json" => Ok(Self::Json(value.value.unwrap_or(serde_json::Value::Null))),
+            "json" => Ok(Self::Json(
+                value.value.unwrap_or(serde_json::Value::Null).into(),
+            )),
             "blob" => value
                 .blob
                 .map(|bytes| Self::Blob(bytes.into_vec().into()))
