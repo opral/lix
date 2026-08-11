@@ -6031,7 +6031,7 @@ where
     where
         I: ExactSizeIterator<Item = (&'a str, &'a EntityPk)> + Clone,
     {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         if rows.len() == 0 {
@@ -6110,7 +6110,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         if parts.owner_commit_id != *new_head.as_uuid().as_bytes()
@@ -6159,7 +6159,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(CommitId, bool), LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         let row_count = u64::try_from(row_count)
@@ -6349,7 +6349,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<Option<CommitId>, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         let Some(first) = deltas.first() else {
@@ -6441,7 +6441,7 @@ where
         deltas: &[CurrentStateDeltaRef<'_>],
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
     ) -> Result<Option<CommitId>, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         if working_diff_capture_checkpoint_commit_id.is_some() {
@@ -6624,7 +6624,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<Option<CommitId>, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         if deltas.is_empty() {
@@ -6842,7 +6842,7 @@ where
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         let deltas = deltas
@@ -6880,7 +6880,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         let deltas = deltas
@@ -6914,7 +6914,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         self.stage_current_state_with_working_diff_inner(
@@ -6950,7 +6950,7 @@ where
         deltas: &[CurrentStateDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         let sorted = sorted_lifecycle_hot_deltas(deltas, true)?;
@@ -7037,7 +7037,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         self.stage_current_state_with_working_diff_inner(
@@ -7072,7 +7072,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
         certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         self.stage_current_state_with_working_diff_inner(
@@ -7111,7 +7111,7 @@ where
         checkpoint_commit_id: CommitId,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         let generation = self
@@ -7157,7 +7157,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
         validated_absent_file_id: Option<&str>,
     ) -> Result<CommitId, LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         if parent_generation.is_none() {
@@ -7812,7 +7812,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(HotTrackedSnapshot, BTreeSet<String>), LixError> {
-        crate::storage_adapter::schema_intern_of(self.store)
+        schema_intern_of(self.store)
             .ensure_current(self.store)
             .await?;
         let mut rows = parent_tracked.rows;
