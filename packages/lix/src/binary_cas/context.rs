@@ -188,11 +188,11 @@ where
         .await
     }
 
-    pub(crate) async fn stage_fixed_part(
+    pub(crate) async fn stage_upload_part(
         &mut self,
         bytes: &[u8],
     ) -> Result<Vec<BlobChunkReceipt>, LixError> {
-        crate::binary_cas::kv::stage_fixed_part_skipping_existing(
+        crate::binary_cas::kv::stage_upload_part_skipping_existing(
             self.store,
             self.writes,
             &mut self.chunk_keys,
@@ -201,11 +201,11 @@ where
         .await
     }
 
-    pub(crate) fn stage_fixed_manifest(
+    pub(crate) fn stage_upload_manifest(
         &mut self,
         chunks: &[BlobChunkReceipt],
     ) -> Result<BlobWriteReceipt, LixError> {
-        crate::binary_cas::kv::stage_fixed_manifest(self.writes, chunks)
+        crate::binary_cas::kv::stage_upload_manifest(self.writes, chunks)
     }
 
     /// Stages a normal file payload, opportunistically retaining unchanged
