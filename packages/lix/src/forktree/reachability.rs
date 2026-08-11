@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use bytes::Bytes;
@@ -1109,9 +1109,83 @@ async fn validate_catalog_claims<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let commit_entry_ids = commits
+        .iter()
+        .map(|(_, entry)| entry.commit_object_id)
+        .collect::<BTreeSet<_>>();
+    let member_owner_ids = changes
+        .iter()
+        .filter_map(|(_, entry)| match entry.owner {
+            ChangeCatalogOwner::CommitMember {
+                commit_object_id, ..
+            }
+            | ChangeCatalogOwner::PackedCommit {
+                commit_object_id, ..
+            } => Some(commit_object_id),
+            ChangeCatalogOwner::BranchRef { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let ref_owner_ids = changes
+        .iter()
+        .filter_map(|(_, entry)| match entry.owner {
+            ChangeCatalogOwner::BranchRef {
+                ref_change_object_id,
+                ..
+            } => Some(ref_change_object_id),
+            ChangeCatalogOwner::CommitMember { .. } | ChangeCatalogOwner::PackedCommit { .. } => {
+                None
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    if commit_entry_ids
+        .iter()
+        .chain(member_owner_ids.iter())
+        .any(|id| ref_owner_ids.contains(id))
+    {
+        return Err(corruption(
+            "catalog claims repeat one object as both commit and RefChange",
+        ));
+    }
+    let object_ids = commit_entry_ids
+        .iter()
+        .chain(member_owner_ids.iter())
+        .chain(ref_owner_ids.iter())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let objects = load_object_bytes_many(read, &object_ids).await?;
+    let mut commit_cache = BTreeMap::new();
+    for id in commit_entry_ids.iter().chain(member_owner_ids.iter()) {
+        if commit_cache.contains_key(id) {
+            continue;
+        }
+        let bytes = objects
+            .get(id)
+            .ok_or_else(|| corruption("catalog commit batch omitted one object"))?;
+        commit_cache.insert(*id, CommitObjectV1::decode(*id, bytes)?);
+    }
+    let mut member_cache = BTreeMap::new();
+    for id in &member_owner_ids {
+        let commit = commit_cache
+            .get(id)
+            .ok_or_else(|| corruption("catalog member owner has no decoded commit"))?;
+        member_cache.insert(
+            *id,
+            super::serving::load_commit_members(read, commit).await?,
+        );
+    }
+    let mut ref_cache = BTreeMap::new();
+    for id in &ref_owner_ids {
+        let bytes = objects
+            .get(id)
+            .ok_or_else(|| corruption("catalog RefChange batch omitted one object"))?;
+        ref_cache.insert(*id, ChangeObjectV1::decode(*id, bytes)?);
+    }
     for (key, entry) in commits {
-        let bytes = load_object_bytes(read, entry.commit_object_id).await?;
-        let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+        let commit = commit_cache
+            .get(&entry.commit_object_id)
+            .ok_or_else(|| corruption("CommitCatalog claim has no decoded commit"))?;
         if commit.commit_id != *key {
             return Err(corruption("CommitCatalog key/object identity mismatch"));
         }
@@ -1122,9 +1196,9 @@ where
                 commit_object_id,
                 ordinal,
             } => {
-                let bytes = load_object_bytes(read, commit_object_id).await?;
-                let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-                let members = super::serving::load_commit_members(read, &commit).await?;
+                let members = member_cache.get(&commit_object_id).ok_or_else(|| {
+                    corruption("ChangeCatalog commit owner has no decoded member closure")
+                })?;
                 let member = members
                     .get(ordinal as usize)
                     .ok_or_else(|| corruption("ChangeCatalog commit ordinal is absent"))?;
@@ -1138,8 +1212,9 @@ where
                 ref_change_object_id,
                 branch_id,
             } => {
-                let bytes = load_object_bytes(read, ref_change_object_id).await?;
-                let change = ChangeObjectV1::decode(ref_change_object_id, &bytes)?;
+                let change = ref_cache.get(&ref_change_object_id).ok_or_else(|| {
+                    corruption("ChangeCatalog branch-ref owner has no decoded object")
+                })?;
                 let ChangeObjectV1::BranchRef {
                     change_id,
                     branch_id: object_branch,
@@ -1150,7 +1225,7 @@ where
                         "branch-ref catalog owner names semantic payload",
                     ));
                 };
-                if change_id != *key || branch_id != object_branch {
+                if *change_id != *key || branch_id != *object_branch {
                     return Err(corruption("ChangeCatalog owner/back-edge mismatch"));
                 }
             }
@@ -1158,9 +1233,12 @@ where
                 commit_object_id,
                 member_count,
             } => {
-                let bytes = load_object_bytes(read, commit_object_id).await?;
-                let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-                let members = super::serving::load_commit_members(read, &commit).await?;
+                let commit = commit_cache.get(&commit_object_id).ok_or_else(|| {
+                    corruption("packed ChangeCatalog owner has no decoded commit")
+                })?;
+                let members = member_cache.get(&commit_object_id).ok_or_else(|| {
+                    corruption("packed ChangeCatalog owner has no decoded member closure")
+                })?;
                 if commit.commit_id.as_bytes() != key.as_bytes()
                     || usize::try_from(member_count).ok() != Some(members.len())
                     || members.iter().enumerate().any(|(index, member)| {
@@ -1181,6 +1259,49 @@ where
         }
     }
     Ok(())
+}
+
+async fn load_object_bytes_many<R>(
+    read: &R,
+    ids: &[ObjectId],
+) -> Result<BTreeMap<ObjectId, Bytes>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let keys = ids
+        .iter()
+        .map(|id| Key(Bytes::copy_from_slice(id.as_bytes())))
+        .collect::<Vec<_>>();
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: OBJECT_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    if loaded.values.len() != ids.len() {
+        return Err(corruption(
+            "GC exact object batch returned the wrong slot count",
+        ));
+    }
+    ids.iter()
+        .copied()
+        .zip(loaded.values)
+        .map(|(id, value)| match value {
+            Some(ProjectedValue::FullValue(bytes)) => Ok((id, bytes)),
+            Some(ProjectedValue::KeyOnly) => {
+                Err(corruption("GC exact object batch returned key-only data"))
+            }
+            None => Err(corruption(format!(
+                "GC exact object batch omitted authenticated object {id}"
+            ))),
+        })
+        .collect()
 }
 
 async fn validate_chunk_sequence<R>(

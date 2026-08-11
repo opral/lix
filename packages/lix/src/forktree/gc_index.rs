@@ -748,8 +748,11 @@ fn leaf_domain(kind: GcRadixKindV1) -> ObjectDomain {
 }
 
 fn leaf_limit(kind: GcRadixKindV1) -> usize {
+    // Keep path-copy insertion from repeatedly decoding and authenticating one
+    // growing mark pack. The wire-format maximum remains unchanged for reads.
+    const MARK_OPERATIONAL_LEAF_ENTRIES: usize = 64;
     match kind {
-        GcRadixKindV1::Mark => GcMarkPackV2::MAX_ENTRIES,
+        GcRadixKindV1::Mark => GcMarkPackV2::MAX_ENTRIES.min(MARK_OPERATIONAL_LEAF_ENTRIES),
         GcRadixKindV1::Queue => GcQueuePackV1::MAX_ENTRIES,
         GcRadixKindV1::LiveBranch => GcLiveBranchPackV1::MAX_ENTRIES,
     }
