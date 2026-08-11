@@ -7378,37 +7378,45 @@ mod tests {
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
         let commits = [
             CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: source_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                first_parent_jump_commit_id: source_commit,
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: alias_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                first_parent_jump_commit_id: alias_commit,
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: authority_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                first_parent_jump_commit_id: authority_commit,
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
+                first_parent_jump_commit_id: live_head,
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -7621,28 +7629,34 @@ mod tests {
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
             CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: live_parent,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                first_parent_jump_commit_id: live_parent,
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![live_parent],
+                first_parent_jump_commit_id: live_head,
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: dead_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                first_parent_jump_commit_id: dead_commit,
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label("authority-gc-dead-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -8056,11 +8070,14 @@ mod tests {
     }
 
     fn gc_authority_record(label: &str) -> CommitRecord {
+        let commit_id = CommitId::for_test_label(label);
         CommitRecord {
-            format_version: 2,
-            commit_id: CommitId::for_test_label(label),
+            format_version: 3,
+            commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             change_id: ChangeId::for_test_label(&format!("{label}-header")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse(
@@ -8078,11 +8095,15 @@ mod tests {
     ) -> CommitRecord {
         let commit_id =
             CommitId::with_change_address_space(*CommitId::for_test_label(label).as_uuid());
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            parent.map_or((commit_id, 0), |parent| (parent, 1));
         CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation,
             parent_commit_ids: parent.into_iter().collect(),
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             change_id: ChangeId::for_test_label(&format!("{label}-header")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at,

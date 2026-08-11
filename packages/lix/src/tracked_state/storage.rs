@@ -13329,10 +13329,12 @@ mod tests {
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
         let record = CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             change_id: ChangeId::for_test_label(&format!("{commit_id}:fixture-commit")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),

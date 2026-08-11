@@ -6,7 +6,6 @@
     clippy::unused_self
 )]
 
-use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -327,49 +326,98 @@ where
         mut left: CommitGraphNode,
         mut right: CommitGraphNode,
     ) -> Result<LinearMergeBase, LixError> {
-        loop {
-            if left.commit_id == right.commit_id {
-                return Ok(LinearMergeBase::Resolved(left.commit_id));
-            }
-            match left.generation.cmp(&right.generation) {
-                Ordering::Greater => {
-                    let [parent_id] = left.parent_commit_ids.as_slice() else {
-                        return Ok(LinearMergeBase::GeneralGraph);
-                    };
-                    left = self.load_linear_parent(&left, *parent_id).await?;
-                }
-                Ordering::Less => {
-                    let [parent_id] = right.parent_commit_ids.as_slice() else {
-                        return Ok(LinearMergeBase::GeneralGraph);
-                    };
-                    right = self.load_linear_parent(&right, *parent_id).await?;
-                }
-                Ordering::Equal => match (
-                    left.parent_commit_ids.as_slice(),
-                    right.parent_commit_ids.as_slice(),
-                ) {
-                    ([], []) => return Ok(LinearMergeBase::Disconnected),
-                    ([left_parent_id], [right_parent_id]) => {
-                        let parent_ids = [*left_parent_id, *right_parent_id];
-                        let parents = self.load_nodes(&parent_ids).await?;
-                        let mut parents = parents.into_iter().map(|(_, parent)| parent);
-                        let left_parent = parents
-                            .next()
-                            .flatten()
-                            .ok_or_else(|| missing_commit_graph_error(left_parent_id))?;
-                        let right_parent = parents
-                            .next()
-                            .flatten()
-                            .ok_or_else(|| missing_commit_graph_error(right_parent_id))?;
-                        validate_parent_generation(&left, &left_parent)?;
-                        validate_parent_generation(&right, &right_parent)?;
-                        left = left_parent;
-                        right = right_parent;
-                    }
-                    _ => return Ok(LinearMergeBase::GeneralGraph),
-                },
+        while left.generation != right.generation {
+            let (deeper, target_generation) = if left.generation > right.generation {
+                (&mut left, right.generation)
+            } else {
+                (&mut right, left.generation)
+            };
+            let [_] = deeper.parent_commit_ids.as_slice() else {
+                return Ok(LinearMergeBase::GeneralGraph);
+            };
+            let jump = self.load_linear_jump(deeper).await?;
+            if jump.generation >= target_generation {
+                *deeper = jump;
+            } else {
+                let parent_id = deeper.parent_commit_ids[0];
+                *deeper = self.load_linear_parent(deeper, parent_id).await?;
             }
         }
+
+        while left.commit_id != right.commit_id {
+            let ([left_parent_id], [right_parent_id]) = (
+                left.parent_commit_ids.as_slice(),
+                right.parent_commit_ids.as_slice(),
+            ) else {
+                return Ok(
+                    if left.parent_commit_ids.is_empty() && right.parent_commit_ids.is_empty() {
+                        LinearMergeBase::Disconnected
+                    } else {
+                        LinearMergeBase::GeneralGraph
+                    },
+                );
+            };
+            let jump_ids = [
+                left.first_parent_jump_commit_id,
+                right.first_parent_jump_commit_id,
+            ];
+            let jumps = self.load_nodes(&jump_ids).await?;
+            let mut jumps = jumps.into_iter().map(|(_, jump)| jump);
+            let left_jump = jumps
+                .next()
+                .flatten()
+                .ok_or_else(|| missing_commit_graph_error(&jump_ids[0]))?;
+            let right_jump = jumps
+                .next()
+                .flatten()
+                .ok_or_else(|| missing_commit_graph_error(&jump_ids[1]))?;
+            validate_first_parent_jump(&left, &left_jump)?;
+            validate_first_parent_jump(&right, &right_jump)?;
+            // Myers' simultaneous LCA step assumes equal lane depth. Merge
+            // commits reset lanes, so unequal jump generations mean that one
+            // side crossed a reset boundary; let the general DAG walker own
+            // that case rather than risking an over-jump.
+            if left_jump.generation != right_jump.generation {
+                return Ok(LinearMergeBase::GeneralGraph);
+            }
+            if left_jump.commit_id == right_jump.commit_id {
+                let parent_ids = [*left_parent_id, *right_parent_id];
+                let parents = self.load_nodes(&parent_ids).await?;
+                let mut parents = parents.into_iter().map(|(_, parent)| parent);
+                let left_parent = parents
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| missing_commit_graph_error(left_parent_id))?;
+                let right_parent = parents
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| missing_commit_graph_error(right_parent_id))?;
+                validate_parent_generation(&left, &left_parent)?;
+                validate_parent_generation(&right, &right_parent)?;
+                left = left_parent;
+                right = right_parent;
+            } else {
+                left = left_jump;
+                right = right_jump;
+            }
+        }
+        Ok(LinearMergeBase::Resolved(left.commit_id))
+    }
+
+    async fn load_linear_jump(
+        &mut self,
+        node: &CommitGraphNode,
+    ) -> Result<CommitGraphNode, LixError> {
+        let jump_ids = [node.first_parent_jump_commit_id];
+        let jump = self
+            .load_nodes(&jump_ids)
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|(_, jump)| jump)
+            .ok_or_else(|| missing_commit_graph_error(&jump_ids[0]))?;
+        validate_first_parent_jump(node, &jump)?;
+        Ok(jump)
     }
 
     async fn load_linear_parent(
@@ -534,14 +582,63 @@ fn commit_graph_node_from_authority(
             ),
         ));
     }
-    Ok(Some(CommitGraphNode {
+    let node = CommitGraphNode {
         commit_id: record.commit_id,
         change_id: record.change_id,
         account_id: record.account_id,
         generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,
+        first_parent_jump_commit_id: record.first_parent_jump_commit_id,
+        first_parent_jump_span: record.first_parent_jump_span,
         created_at: record.created_at,
-    }))
+    };
+    validate_first_parent_jump_summary(&node)?;
+    Ok(Some(node))
+}
+
+fn first_parent_jump_generation(node: &CommitGraphNode) -> Result<u64, LixError> {
+    node.generation
+        .checked_sub(u64::from(node.first_parent_jump_span))
+        .ok_or_else(|| {
+            LixError::unknown(format!(
+                "commit '{}' first-parent jump span exceeds its generation",
+                node.commit_id
+            ))
+        })
+}
+
+fn validate_first_parent_jump_summary(node: &CommitGraphNode) -> Result<(), LixError> {
+    first_parent_jump_generation(node)?;
+    if node.parent_commit_ids.len() == 1 {
+        if node.first_parent_jump_span == 0 || node.first_parent_jump_commit_id == node.commit_id {
+            return Err(LixError::unknown(format!(
+                "linear commit '{}' has no advancing first-parent jump",
+                node.commit_id
+            )));
+        }
+    } else if node.first_parent_jump_span != 0 || node.first_parent_jump_commit_id != node.commit_id
+    {
+        return Err(LixError::unknown(format!(
+            "root or merge commit '{}' does not reset its first-parent jump",
+            node.commit_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_first_parent_jump(
+    node: &CommitGraphNode,
+    jump: &CommitGraphNode,
+) -> Result<(), LixError> {
+    if jump.commit_id != node.first_parent_jump_commit_id
+        || jump.generation != first_parent_jump_generation(node)?
+    {
+        return Err(LixError::unknown(format!(
+            "commit '{}' has an invalid first-parent jump '{}'",
+            node.commit_id, node.first_parent_jump_commit_id
+        )));
+    }
+    Ok(())
 }
 
 fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
@@ -1088,10 +1185,12 @@ mod tests {
             .stage_append(ChangelogAppend {
                 changes: Vec::new(),
                 commits: vec![CommitRecord {
-                    format_version: 2,
+                    format_version: 3,
                     commit_id,
                     generation: 0,
                     parent_commit_ids: Vec::new(),
+                    first_parent_jump_commit_id: commit_id,
+                    first_parent_jump_span: 0,
                     change_id: change_id("selected-tombstone-commit-change"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at,
@@ -1557,6 +1656,7 @@ mod tests {
         let mut append = ChangelogAppend::default();
         let mut commit_members = Vec::<(CommitId, Vec<ChangeRecord>)>::new();
         let mut generations = BTreeMap::<CommitId, u64>::new();
+        let mut topology_records = BTreeMap::<CommitId, CommitRecord>::new();
         for change in changes.iter().filter(|change| change.is_commit()) {
             let commit_label = change
                 .change
@@ -1571,6 +1671,14 @@ mod tests {
                 {
                     append_empty_commit(&mut append, *parent_commit_id);
                     generations.insert(*parent_commit_id, 0);
+                    topology_records.insert(
+                        *parent_commit_id,
+                        append
+                            .commits
+                            .last()
+                            .expect("empty commit was appended")
+                            .clone(),
+                    );
                 }
             }
             let generation = change
@@ -1579,6 +1687,23 @@ mod tests {
                 .filter_map(|parent| generations.get(parent).copied())
                 .max()
                 .map_or(0, |parent_generation| parent_generation + 1);
+            let parent = match change.parent_commit_ids.as_slice() {
+                [parent_commit_id] => topology_records.get(parent_commit_id),
+                _ => None,
+            };
+            let parent_jump = parent.map(|parent| {
+                topology_records
+                    .get(&parent.first_parent_jump_commit_id)
+                    .expect("test parent jump target exists")
+            });
+            let (first_parent_jump_commit_id, first_parent_jump_span) =
+                crate::changelog::next_first_parent_jump(
+                    commit_id,
+                    &change.parent_commit_ids,
+                    parent,
+                    parent_jump,
+                )
+                .expect("test commit jump should derive");
             let mut members = Vec::new();
             for change_id in &change.commit_change_ids {
                 if let Some(change) = changes_by_id.get(change_id) {
@@ -1586,15 +1711,19 @@ mod tests {
                 }
             }
 
-            append.commits.push(CommitRecord {
-                format_version: 2,
+            let record = CommitRecord {
+                format_version: 3,
                 commit_id,
                 generation,
                 parent_commit_ids: change.parent_commit_ids.clone(),
+                first_parent_jump_commit_id,
+                first_parent_jump_span,
                 change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
-            });
+            };
+            append.commits.push(record.clone());
+            topology_records.insert(commit_id, record);
             commit_members.push((commit_id, members));
             staged_commit_ids.insert(commit_id);
             generations.insert(commit_id, generation);
@@ -1672,10 +1801,12 @@ mod tests {
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
         let change_id = format!("{commit_id}-change");
         append.commits.push(CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             change_id: ChangeId::for_test_label(&change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -1721,6 +1852,8 @@ mod tests {
                 .iter()
                 .map(|parent_id| CommitId::for_test_label(parent_id))
                 .collect(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             created_at: ts("2026-01-01T00:00:00Z"),
         }
     }
