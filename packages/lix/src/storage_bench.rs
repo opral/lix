@@ -2749,17 +2749,18 @@ mod tests {
             first.staged_deletes
         );
         assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
-        // GC also stages the mandatory binary-CAS epoch key. Its put shares the
-        // key arena with the UUID-keyed delete descriptors. Since the revision
-        // singletons were consolidated into one space, the epoch's *logical* key
-        // is a single byte (`b"b"`) and the 4-byte space id is prepended at the
-        // physical layer, so derive the width from the constant rather than
-        // restating it.
-        const EPOCH_KEY_BYTES: usize = crate::storage_adapter::REVISION_KEY_BINARY_CAS_EPOCH.len();
+        // GC also stages the mandatory binary-CAS reclamation key. Its put
+        // shares the key arena with the UUID-keyed delete descriptors. Since the
+        // revision singletons were consolidated into one space, the reclamation
+        // token's *logical* key is a single byte (`b"b"`) and the 4-byte space
+        // id is prepended at the physical layer, so derive the width from the
+        // constant rather than restating it.
+        const FENCE_KEY_BYTES: usize =
+            crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
         assert_eq!(
             first.key_shared_bytes,
-            first.staged_deletes as usize * 16 + EPOCH_KEY_BYTES
+            first.staged_deletes as usize * 16 + FENCE_KEY_BYTES
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);

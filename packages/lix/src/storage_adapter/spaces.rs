@@ -16,14 +16,20 @@ use crate::storage_adapter::{StorageAdapterRead, exact_get_many};
 /// physical keys. That is one SST block, one hot-key write region, and one
 /// batched point read instead of five scattered ones.
 ///
-/// The value semantics stay per-key: the binary-CAS epoch is a CAS-guarded
-/// `u64` big-endian counter, the other four are opaque uuid-v7 tokens whose
-/// only meaningful operation is equality.
+/// Every key holds an opaque uuid-v7 token whose only meaningful operation is
+/// equality: "did this fact change since I read it".
 pub(crate) const REVISION_SPACE: StorageSpace =
     StorageSpace::mutable(SpaceId(0x0007_0000), "lix.revision.v1");
 
-/// Binary-CAS publication/reclamation epoch (`u64` BE, CAS-guarded).
-pub(crate) const REVISION_KEY_BINARY_CAS_EPOCH: &[u8] = b"b";
+/// Binary-CAS reclamation token. Rotated only by an authenticated CAS sweep,
+/// and asserted unchanged by every CAS publisher, so a publisher that planned
+/// against payload rows a sweep then deleted cannot commit.
+pub(crate) const REVISION_KEY_BINARY_CAS_RECLAMATION: &[u8] = b"b";
+/// Binary-CAS publication token. Rewritten by every CAS publisher without a
+/// precondition on itself — publishers are mutually independent — and asserted
+/// unchanged by every sweep, so a sweep whose reachability plan predates a
+/// concurrent publication cannot commit.
+pub(crate) const REVISION_KEY_BINARY_CAS_PUBLICATION: &[u8] = b"p";
 /// Registered-schema catalog visibility token.
 pub(crate) const REVISION_KEY_CATALOG: &[u8] = b"c";
 /// Filesystem path-index cache-freshness token.

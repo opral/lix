@@ -334,7 +334,12 @@ where
                 }
                 Some(UploadState::Complete(_)) => unreachable!("complete state returned above"),
             }
-            crate::binary_cas::stage_mutation_epoch(&read, &mut writes, &mut preconditions).await?;
+            crate::binary_cas::stage_cas_publication_fence(
+                &read,
+                &mut writes,
+                &mut preconditions,
+            )
+            .await?;
             drop(read);
 
             let commit_boundary = self.transaction_commit_boundary();
@@ -960,9 +965,9 @@ mod tests {
                 key: state_key,
             },
         ];
-        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_publication_fence(read, &mut writes, &mut preconditions)
             .await
-            .expect("deduplicated receipt epoch should stage");
+            .expect("deduplicated receipt publication fence should stage");
         (writes, preconditions)
     }
 
@@ -984,9 +989,9 @@ mod tests {
         .await
         .expect("stale CAS sweep should stage");
         assert_eq!(swept.reclaimed_chunk_rows, 1);
-        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_reclamation_fence(read, &mut writes, &mut preconditions)
             .await
-            .expect("stale sweep epoch should stage");
+            .expect("stale sweep reclamation fence should stage");
         (writes, preconditions)
     }
 
