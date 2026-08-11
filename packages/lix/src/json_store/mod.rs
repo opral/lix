@@ -10,6 +10,9 @@ pub(crate) use context::UntrackedJsonReclaimCandidate;
 pub(crate) use context::{
     JsonStoreContext, JsonStoreReader, JsonStoreWriter, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
 };
+// Owner facade for the storage-space registry (`crate::storage_spaces`).
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use store::JSON_SPACE;
 pub(crate) use types::{
     JSON_INLINE_MAX_BYTES, JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef,
     JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef, json_slot_storage,

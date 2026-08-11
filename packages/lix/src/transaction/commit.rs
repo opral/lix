@@ -771,7 +771,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &staged_hot_heads.controls,
-        &staged_hot_heads.tracked_snapshots,
         &state_rows,
         &engine_rows,
         &explicit_branch_targets,
@@ -1196,6 +1195,8 @@ async fn stage_changelog_commits(
         })
         .await?;
     let mut generations = BTreeMap::new();
+    let mut first_parent_jumps = BTreeMap::new();
+    let mut topology_records = BTreeMap::new();
     let mut rootless_depths = BTreeMap::new();
     let mut rootless_rows = BTreeMap::new();
     let mut rootless_bytes = BTreeMap::new();
@@ -1227,6 +1228,14 @@ async fn stage_changelog_commits(
             ));
         }
         generations.insert(*commit_id, record.generation);
+        first_parent_jumps.insert(
+            *commit_id,
+            (
+                record.first_parent_jump_commit_id,
+                record.first_parent_jump_span,
+            ),
+        );
+        topology_records.insert(*commit_id, record.clone());
         let replay_debt = published.replay_debt();
         rootless_depths.insert(*commit_id, replay_debt.depth);
         rootless_rows.insert(*commit_id, replay_debt.rows);
@@ -1265,6 +1274,53 @@ async fn stage_changelog_commits(
                     .checked_add(1)
                     .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
             })?;
+        let parent_record = match commit.parent_commit_ids.as_slice() {
+            [parent_commit_id] => Some(
+                topology_records
+                    .get(parent_commit_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("commit '{commit_id}' has missing parent jump metadata"),
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+        if let Some(parent) = &parent_record
+            && !topology_records.contains_key(&parent.first_parent_jump_commit_id)
+        {
+            let jump_id = parent.first_parent_jump_commit_id;
+            let loaded = ChangelogContext::new()
+                .reader(&mut *read)
+                .load_commits(ChangelogCommitLoadRequest {
+                    commit_ids: std::slice::from_ref(&jump_id),
+                })
+                .await?;
+            let jump = loaded
+                .into_iter()
+                .next()
+                .and_then(|(_, record)| record)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("commit '{commit_id}' has a missing jump target '{jump_id}'"),
+                    )
+                })?;
+            topology_records.insert(jump_id, jump);
+        }
+        let parent_jump_record = parent_record.as_ref().map(|parent| {
+            topology_records
+                .get(&parent.first_parent_jump_commit_id)
+                .expect("loaded parent jump target")
+        });
+        let first_parent_jump = crate::changelog::next_first_parent_jump(
+            commit_id,
+            &commit.parent_commit_ids,
+            parent_record.as_ref(),
+            parent_jump_record,
+        )?;
         let selected_as_new_rootless = rootless_commit_ids.contains(&commit_id);
         let commit_delta_rows = tracked_row_indices_by_commit
             .get(&commit_id)
@@ -1392,6 +1448,21 @@ async fn stage_changelog_commits(
         rootless_rows.insert(commit_id, cumulative_rootless_rows);
         rootless_bytes.insert(commit_id, cumulative_rootless_bytes);
         generations.insert(commit_id, generation);
+        first_parent_jumps.insert(commit_id, first_parent_jump);
+        topology_records.insert(
+            commit_id,
+            CommitRecord {
+                format_version: 3,
+                commit_id,
+                generation,
+                parent_commit_ids: commit.parent_commit_ids.clone(),
+                first_parent_jump_commit_id: first_parent_jump.0,
+                first_parent_jump_span: first_parent_jump.1,
+                change_id: commit.change_id,
+                account_id: active_account_id.to_string(),
+                created_at: commit.created_at,
+            },
+        );
         for child in children.get(&commit_id).into_iter().flatten() {
             let remaining = staged_parent_count
                 .get_mut(child)
@@ -1450,10 +1521,12 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
+            first_parent_jump_commit_id: first_parent_jumps[&commit_row.commit_id].0,
+            first_parent_jump_span: first_parent_jumps[&commit_row.commit_id].1,
             change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
@@ -2943,7 +3016,6 @@ fn select_new_rootless_ordered_commits(
 
 struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
-    tracked_snapshots: BTreeMap<CommitId, HotTrackedSnapshot>,
     deferred_fresh_hot_plans: Vec<crate::live_state::DeferredFreshHotPlan>,
 }
 
@@ -4496,7 +4568,6 @@ async fn stage_tracked_head(
     }
     Ok(StagedHotHeads {
         controls,
-        tracked_snapshots,
         deferred_fresh_hot_plans,
     })
 }
@@ -4974,6 +5045,7 @@ async fn stage_root_backed_branch_publication(
     stage_initial_working_diff_epoch: bool,
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
+    insert_selection: &PreparedInsertSelection,
 ) -> Result<BranchHeadControl, LixError> {
     let generation = lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
     let tracked_head = TrackedHeadContext::new();
@@ -4999,13 +5071,22 @@ async fn stage_root_backed_branch_publication(
         untracked_generation: previous_control
             .map(|control| control.untracked_generation)
             .unwrap_or(generation),
-        current_state_revision: previous_control
-            .map_or(0, |control| control.current_state_revision),
+        current_state_revision: match previous_control {
+            None => 0,
+            // An explicit move of an existing head is a new current-state
+            // revision for every reader holding the previous one.
+            Some(control) => next_current_state_revision(control.current_state_revision)?,
+        },
         // A branch is born at a complete authenticated root. Its private
         // working interval therefore starts at that exact head; no logical
         // checkpoint entity or history scan is needed to recover the cursor.
-        working_diff_checkpoint_commit_id: Some(head_commit_id),
-        created_at: target.created_at,
+        // Explicit lifecycle moves of an existing branch instead keep that
+        // branch's own compaction baseline.
+        working_diff_checkpoint_commit_id: match previous_control {
+            None => Some(head_commit_id),
+            Some(control) => control.working_diff_checkpoint_commit_id,
+        },
+        created_at: previous_control.map_or(target.created_at, |control| control.created_at),
         updated_at: target.updated_at,
         ref_change_id: target.ref_change_id,
         // Root reads answer schema presence directly. Keep the bloom
@@ -5028,11 +5109,34 @@ async fn stage_root_backed_branch_publication(
         )
         .collect::<Result<Vec<_>, _>>()?;
     if !untracked_deltas.is_empty() {
-        let next_generation = untracked_lifecycle_generation(
-            branch_id,
-            control.untracked_generation,
-            next_current_state_revision(control.current_state_revision)?,
-        );
+        // A new branch has not consumed its revision yet; an existing branch
+        // already advanced one above for this same publication.
+        let revision = match previous_control {
+            None => next_current_state_revision(control.current_state_revision)?,
+            Some(_) => control.current_state_revision,
+        };
+        let absence_guards = if insert_selection.is_empty() {
+            BTreeSet::new()
+        } else {
+            state_rows
+                .iter()
+                .enumerate()
+                .filter(|(row_index, row)| {
+                    row.untracked
+                        && row.branch_id.as_str() == branch_id
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                        && row.snapshot.is_some()
+                        && insert_selection.contains(*row_index)
+                })
+                .map(|(_, row)| TrackedStateKey {
+                    schema_key: row.schema_key.to_string(),
+                    file_id: row.file_id.map(ToString::to_string),
+                    entity_pk: row.entity_pk.clone(),
+                })
+                .collect()
+        };
+        let next_generation =
+            untracked_lifecycle_generation(branch_id, control.untracked_generation, revision);
         tracked_head
             .writer(read, writes)
             .stage_untracked_generation(
@@ -5040,12 +5144,11 @@ async fn stage_root_backed_branch_publication(
                 control.untracked_generation,
                 next_generation,
                 &untracked_deltas,
-                &BTreeSet::new(),
+                &absence_guards,
             )
             .await?;
         control.untracked_generation = next_generation;
-        control.current_state_revision =
-            next_current_state_revision(control.current_state_revision)?;
+        control.current_state_revision = revision;
     }
     Ok(control)
 }
@@ -5055,7 +5158,6 @@ async fn stage_branch_head_control_publications(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     normal_controls: &BTreeMap<String, BranchHeadControl>,
-    tracked_snapshots: &BTreeMap<CommitId, HotTrackedSnapshot>,
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
@@ -5083,7 +5185,6 @@ async fn stage_branch_head_control_publications(
         .iter()
         .map(|(branch_id, control)| (branch_id.clone(), Some(*control)))
         .collect::<BTreeMap<String, Option<BranchHeadControl>>>();
-    let tracked_head = TrackedHeadContext::new();
     let mut consumed_checkpoint_bridges = BTreeSet::new();
     for (branch_id, target) in explicit_branch_targets {
         if publications.contains_key(branch_id) {
@@ -5108,144 +5209,25 @@ async fn stage_branch_head_control_publications(
         let mut desired = match target.head_commit_id {
             None => None,
             Some(head_commit_id) => {
-                if existing.is_none() {
-                    let control = Box::pin(stage_root_backed_branch_publication(
-                        read,
-                        writes,
-                        branch_id,
-                        head_commit_id,
-                        target,
-                        existing,
-                        !branch_checkpoint_bridges.contains_key(branch_id),
-                        state_rows,
-                        engine_rows,
-                    ))
-                    .await?;
-                    root_backed_branch_publications.insert(branch_id.clone());
-                    Some(control)
-                } else {
-                    let tracked = if let Some(snapshot) = tracked_snapshots.get(&head_commit_id) {
-                        snapshot.clone()
-                    } else {
-                        let rows = load_persisted_lifecycle_tracked_snapshot(
-                            read,
-                            branch_id,
-                            head_commit_id,
-                        )
-                        .await?;
-                        HotTrackedSnapshot::from_materialized_rows(rows.into_values().collect())?
-                    };
-                    let mut untracked_deltas = state_rows
-                        .iter()
-                        .filter(|row| {
-                            row.untracked
-                                && row.branch_id.as_str() == branch_id
-                                && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                        })
-                        .map(current_state_delta_from_state_row)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    untracked_deltas.extend(
-                        engine_rows
-                            .iter()
-                            .filter(|row| row.branch_id == *branch_id)
-                            .map(current_state_delta_from_engine_row),
-                    );
-                    let absence_guards = if insert_selection.is_empty() {
-                        BTreeSet::new()
-                    } else {
-                        state_rows
-                            .iter()
-                            .enumerate()
-                            .filter(|(row_index, row)| {
-                                row.untracked
-                                    && row.branch_id.as_str() == branch_id
-                                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                                    && row.snapshot.is_some()
-                                    && insert_selection.contains(*row_index)
-                            })
-                            .map(|(_, row)| TrackedStateKey {
-                                schema_key: row.schema_key.to_string(),
-                                file_id: row.file_id.map(ToString::to_string),
-                                entity_pk: row.entity_pk.clone(),
-                            })
-                            .collect()
-                    };
-                    let generation =
-                        lifecycle_generation(&branch_id, head_commit_id, target.ref_change_id);
-                    let mut coverage = WorkingDiffIndexCoverage::default();
-                    let (_, schema_keys) = tracked_head
-                        .writer(read, writes)
-                        .stage_complete_current_state_with_working_diff(
-                            &branch_id,
-                            generation,
-                            tracked,
-                            existing.map(|control| control.tracked_generation),
-                            &[],
-                            &[],
-                            &absence_guards,
-                            None,
-                            &mut coverage,
-                        )
-                        .await?;
-                    let mut control = BranchHeadControl {
-                        head_commit_id,
-                        tracked_generation: generation,
-                        untracked_generation: existing
-                            .expect("existing lifecycle publication was handled above")
-                            .untracked_generation,
-                        current_state_revision: match existing {
-                            Some(control) => control
-                                .current_state_revision
-                                .checked_add(1)
-                                .ok_or_else(|| {
-                                    LixError::new(
-                                        LixError::CODE_INTERNAL_ERROR,
-                                        "branch current-state revision overflowed",
-                                    )
-                                })?,
-                            None => 0,
-                        },
-                        // Explicit lifecycle moves keep the branch's private
-                        // compaction baseline. New branches take the dedicated
-                        // root-backed path above and start clean at their head.
-                        working_diff_checkpoint_commit_id: existing
-                            .and_then(|control| control.working_diff_checkpoint_commit_id),
-                        created_at: existing
-                            .map_or(target.created_at, |control| control.created_at),
-                        updated_at: target.updated_at,
-                        ref_change_id: target.ref_change_id,
-                        schema_presence_bloom: existing
-                            .expect("existing lifecycle publication was handled above")
-                            .schema_presence_bloom,
-                    };
-                    if !untracked_deltas.is_empty() {
-                        let previous_untracked_generation = control.untracked_generation;
-                        let next_revision = control.current_state_revision;
-                        let next_untracked_generation = untracked_lifecycle_generation(
-                            &branch_id,
-                            previous_untracked_generation,
-                            next_revision,
-                        );
-                        tracked_head
-                            .writer(read, writes)
-                            .stage_untracked_generation(
-                                &branch_id,
-                                previous_untracked_generation,
-                                next_untracked_generation,
-                                &untracked_deltas,
-                                &absence_guards,
-                            )
-                            .await?;
-                        control.untracked_generation = next_untracked_generation;
-                    }
-                    control.note_schemas(
-                        schema_keys
-                            .iter()
-                            .map(String::as_str)
-                            .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
-                    );
-                    Some(control)
-                }
+                // Every explicit head move publishes one immutable tracked
+                // root reference. The head commit is already authoritative for
+                // every tracked identity, so materializing a branch-local copy
+                // of the whole working set would only restate it.
+                let control = Box::pin(stage_root_backed_branch_publication(
+                    read,
+                    writes,
+                    branch_id,
+                    head_commit_id,
+                    target,
+                    existing,
+                    existing.is_none() && !branch_checkpoint_bridges.contains_key(branch_id),
+                    state_rows,
+                    engine_rows,
+                    insert_selection,
+                ))
+                .await?;
+                root_backed_branch_publications.insert(branch_id.clone());
+                Some(control)
             }
         };
         if let Some(bridge) = branch_checkpoint_bridges.get(branch_id) {
@@ -5742,6 +5724,23 @@ async fn stage_tracked_roots(
             true,
         )
         .await?;
+        let all_new = plans
+            .iter()
+            .all(|plan| !staged_rebuild_plan_ids.contains(&plan.commit_id));
+        if all_new
+            && crate::tracked_state::try_stage_collapsed_rebuild_plans_with_writer(
+                &mut tracked_writer,
+                &plans,
+            )
+            .await?
+            .is_some()
+        {
+            // A collapsed replay stages only its terminal root. Intermediate
+            // plan IDs remain unstaged so another rebuild parent sharing this
+            // suffix can independently collapse against immutable authority.
+            staged_rebuild_plan_ids.insert(plans[0].commit_id);
+            continue;
+        }
         for plan in plans.iter().rev() {
             if staged_rebuild_plan_ids.insert(plan.commit_id) {
                 crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
@@ -6710,7 +6709,6 @@ mod tests {
         let controls = stage_branch_head_control_publications(
             &read,
             &mut writes,
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &PreparedStateBatch::new(),
             &[],

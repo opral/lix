@@ -111,6 +111,7 @@ mod lix_registered_schema;
 mod metadata;
 mod read_only;
 mod subquery_reads;
+mod subquery_writes;
 mod udfs;
 mod untracked_current_state;
 mod write_returning;

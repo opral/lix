@@ -102,6 +102,25 @@ impl SharedStr {
         })
     }
 
+    /// Retains bytes whose producer already proved complete-buffer UTF-8.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must contain valid UTF-8. Callers should prefer [`Self::from_utf8`]
+    /// unless validity follows directly from construction from `str` slices or
+    /// a UTF-8 serializer.
+    pub(crate) unsafe fn from_utf8_unchecked(bytes: bytes::Bytes) -> Self {
+        debug_assert!(
+            std::str::from_utf8(&bytes).is_ok(),
+            "SharedStr trusted producer emitted invalid UTF-8"
+        );
+        let len = bytes.len();
+        Self {
+            bytes,
+            range: 0..len,
+        }
+    }
+
     /// Retains one UTF-8 range of an otherwise arbitrary shared buffer.
     #[cfg(test)]
     pub(crate) fn from_utf8_range(bytes: bytes::Bytes, range: Range<usize>) -> Option<Self> {

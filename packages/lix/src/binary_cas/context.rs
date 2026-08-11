@@ -191,8 +191,7 @@ where
             self.writes,
             &mut self.blob_hashes,
             &mut self.chunk_keys,
-            payload.bytes(),
-            payload.hash(),
+            payload,
         )
         .await
     }

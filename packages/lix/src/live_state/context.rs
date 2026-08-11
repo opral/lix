@@ -2792,10 +2792,12 @@ mod tests {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
             let commit_change_id = format!("{commit_id_text}:commit");
             let record = crate::changelog::CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                first_parent_jump_commit_id: CommitId::for_test_label(&commit_id_text),
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
@@ -3024,11 +3026,17 @@ mod tests {
         let mut append = ChangelogAppend::default();
         for (commit_id, generation, parents) in [(parent, 0, Vec::new()), (child, 1, vec![parent])]
         {
+            let (first_parent_jump_commit_id, first_parent_jump_span) = parents
+                .first()
+                .copied()
+                .map_or((commit_id, 0), |parent| (parent, 1));
             append.commits.push(crate::changelog::CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id,
                 generation,
                 parent_commit_ids: parents,
+                first_parent_jump_commit_id,
+                first_parent_jump_span,
                 change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
@@ -3203,10 +3211,12 @@ mod tests {
                 .map(|id| CommitId::for_test_label(id))
                 .collect::<Vec<_>>();
             let record = crate::changelog::CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: CommitId::for_test_label(&commit_id),
                 generation,
                 parent_commit_ids: typed_parent_ids,
+                first_parent_jump_commit_id: CommitId::for_test_label(&commit_id),
+                first_parent_jump_span: 0,
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: commit_created_at,
