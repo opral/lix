@@ -11,7 +11,6 @@ use datafusion::catalog::{
     MemorySchemaProvider,
 };
 use datafusion::execution::session_state::SessionState;
-use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
@@ -220,10 +219,7 @@ where
             .register_schema("public", Arc::new(MemorySchemaProvider::new()))
             .expect("fresh DataFusion catalog accepts the public schema");
         catalogs.register_catalog("datafusion".to_string(), catalog);
-        let state = SessionStateBuilder::new_from_existing(self.datafusion_state.clone())
-            .with_catalog_list(catalogs)
-            .build();
-        super::session::attach_execution_slots(SessionContext::new_with_state(state))
+        super::session::sql_session_from_template(self.datafusion_state.clone(), Some(catalogs))
     }
 
     pub(crate) fn datafusion_read_session(&self) -> PooledReadSession {

@@ -1,4 +1,5 @@
-use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::catalog::CatalogProviderList;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use std::collections::BTreeSet;
@@ -237,28 +238,32 @@ pub(crate) fn new_sql_session_context() -> SessionContext {
         .build();
     let session = SessionContext::new_with_state(state);
     register_static_sql2_functions(&session);
-    attach_execution_slots(session)
+    sql_session_from_template(session.state(), None)
 }
 
-/// Gives a session its own execution-function slots and registers the five
-/// execution UDFs against them.
+/// Builds a Lix SQL session from a template state, gives it its own
+/// execution-function slots, and registers the five execution UDFs against them.
 ///
 /// Every Lix SQL session goes through here exactly once. Doing it at session
 /// construction rather than per statement is what lets a pooled session keep a
 /// stable function registry: nothing mutates `SessionState`'s scalar-function
 /// map after this point.
-pub(crate) fn attach_execution_slots(session: SessionContext) -> SessionContext {
+///
+/// The slots are installed into the config *before* the state is built, so this
+/// costs one `SessionState` construction rather than one per configuration step.
+/// Write sessions are not pooled — they are built per statement — so an extra
+/// registry deep copy here would land on every write.
+pub(crate) fn sql_session_from_template(
+    template: SessionState,
+    catalog_list: Option<Arc<dyn CatalogProviderList>>,
+) -> SessionContext {
     let slots = Arc::new(ExecutionSlots::default());
-    let config = session
-        .state_ref()
-        .read()
-        .config()
-        .clone()
-        .with_extension(Arc::clone(&slots));
-    let state = SessionStateBuilder::new_from_existing(session.state())
-        .with_config(config)
-        .build();
-    let session = SessionContext::new_with_state(state);
+    let config = template.config().clone().with_extension(Arc::clone(&slots));
+    let mut builder = SessionStateBuilder::new_from_existing(template).with_config(config);
+    if let Some(catalog_list) = catalog_list {
+        builder = builder.with_catalog_list(catalog_list);
+    }
+    let session = SessionContext::new_with_state(builder.build());
     register_execution_sql2_functions(&session, slots);
     session
 }
