@@ -9,20 +9,27 @@
 //! narrow file-scoped working-diff read cost O(rows returned) or O(all dirty
 //! rows in the branch)?
 //!
-//! Three query shapes are timed against the same fixture:
-//!   * `full`   — unfiltered `lix_working_diff` (the existing bench shape)
-//!   * `file`   — `WHERE file_id = $1` on one lightly dirtied file
-//!   * `finite` — `WHERE schema_key = $1 AND entity_pk = lix_json($2)`, which
-//!                takes the existing finite-filter bypass in
-//!                `hot_working_diff_entries` and therefore never touches the
-//!                HOT_DIFF index or its coverage proof.
+//! Five query shapes are timed against the same fixture:
+//!   * `full`        — unfiltered `lix_working_diff` (the existing bench shape)
+//!   * `file`        — `WHERE file_id = $1`, the shape `docs/diff-commands.md`
+//!                     shows first
+//!   * `file_schema` — `WHERE file_id = $1 AND schema_key = $2`, the shape of
+//!                     the one file-scoped working-diff test in the tree
+//!   * `point`       — `WHERE schema_key = $1 AND entity_pk = lix_json($2) AND
+//!                     file_id = $3`, which takes the finite-filter bypass in
+//!                     `hot_working_diff_entries` and therefore never reads the
+//!                     HOT_DIFF index or verifies its coverage proof. This is
+//!                     the control: it isolates the proof as the cost.
+//!   * `entity_scan` — the same file read through the ordinary entity surface,
+//!                     which does not push `lixcol_file_id` down at all.
 //!
 //! ```text
 //! cargo bench -p lix_benchmarks --features storage-benches,slatedb \
-//!   --bench working_diff_file_scope -- rocksdb 64 40 100 9
+//!   --bench working_diff_file_scope -- rocksdb 8 40 100 9 1000 20000 100000
 //! ```
-//! Positionals: `<rocksdb|slatedb> <files> <rows-per-file> <changes-per-commit> <reps>`
-//! then a list of total dirty-row targets, e.g. `1000 10000 100000`.
+//! Positionals: `<rocksdb|slatedb> <min-files> <rows-per-file> <changes-per-commit> <reps>`
+//! then a list of total dirty-row targets, e.g. `1000 10000 100000`. Rows per
+//! file is fixed; the file count grows to hold the requested dirty set.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -200,9 +207,14 @@ async fn run<StorageImpl>(
     let point_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
                      FROM lix_working_diff \
                      WHERE schema_key = $1 AND entity_pk = lix_json($2) AND file_id = $3";
-    // Live-state read of the same file through HOT_ROW's existing file-first
-    // prefix seek. Proxy for what a HOT_ROW-seeking working-diff read would
-    // cost: O(live rows in the file) instead of O(all dirty rows).
+    // Live-state read of the same file. HOT_ROW is keyed
+    // `schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` owns a
+    // file-first prefix route, but the entity surface never pushes
+    // `lixcol_file_id` into `TrackedStateFilter::file_ids` (its
+    // `filter_pushdown` only recognizes branch-id and primary-key analyzers),
+    // so this measures a full schema scan with a residual filter. Reported to
+    // keep that gap visible: `entity_rows` stays fixed at `rows_per_file`
+    // while the latency tracks the whole schema.
     let proxy_sql = format!("SELECT id FROM {SCHEMA_KEY} WHERE lixcol_file_id = $1");
     let file_params = vec![Value::Text(probe_file.clone())];
     let file_schema_params = vec![
@@ -231,12 +243,12 @@ async fn run<StorageImpl>(
     println!(
         "working_diff_file_scope backend={backend} files={files} total_dirty={full_rows} \
          file_rows={file_rows} full_rows={full_rows} file_schema_rows={file_schema_rows} \
-         point_rows={point_rows} proxy_rows={proxy_rows} reps={reps} \
+         point_rows={point_rows} entity_scan_rows={proxy_rows} reps={reps} \
          file_p50_ms={:.3} file_min_ms={:.3} file_max_ms={:.3} \
          full_p50_ms={:.3} full_min_ms={:.3} full_max_ms={:.3} \
          file_schema_p50_ms={:.3} file_schema_min_ms={:.3} file_schema_max_ms={:.3} \
          point_p50_ms={:.3} point_min_ms={:.3} point_max_ms={:.3} \
-         proxy_p50_ms={:.3} proxy_min_ms={:.3} proxy_max_ms={:.3}",
+         entity_scan_p50_ms={:.3} entity_scan_min_ms={:.3} entity_scan_max_ms={:.3}",
         millis(file.0),
         millis(file.1),
         millis(file.2),
