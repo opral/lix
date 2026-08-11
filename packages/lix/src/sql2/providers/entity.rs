@@ -4299,7 +4299,7 @@ mod tests {
         );
 
         // An IN list is still one contiguous set of file prefixes.
-        let in_list = Expr::InList(datafusion::logical_expr::expr::InList::new(
+        let in_list = Expr::InList(InList::new(
             Box::new(column("lixcol_file_id")),
             vec![
                 Expr::Literal(ScalarValue::Utf8(Some("file-a".to_string())), None),
@@ -4332,7 +4332,7 @@ mod tests {
             .await
             .expect("contradictory file scopes should plan");
         assert!(request.filter.file_ids.is_empty());
-        assert_eq!(request.filter.rows, crate::live_state::LiveStateRowFilter::None);
+        assert_eq!(request.filter.rows, LiveStateRowFilter::None);
 
         // Shapes the seek cannot represent stay unsupported so DataFusion keeps
         // its residual instead of silently widening the scan.
