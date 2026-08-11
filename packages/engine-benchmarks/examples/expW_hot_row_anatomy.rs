@@ -35,7 +35,19 @@ use lix_storage_slatedb::SlateDB;
 
 const HOT_ROW_SPACE: &str = "live_state.hot_row.v21";
 const SEED_BATCH_ROWS: usize = 5_000;
-const PAD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const PAD_UNIT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Payload padding. The default 64 bytes reproduces `branch_storage_sharing`
+/// exactly. Raising it past `json_store`'s 1024-byte inline threshold moves
+/// the snapshot slot from `INLINE_FINGERPRINTED` to `REF`, which is the
+/// already-shipped content-addressed sharing path.
+fn pad() -> String {
+    let bytes: usize = std::env::var("LIX_EXPW_PAD_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64);
+    PAD_UNIT.repeat(bytes.div_ceil(PAD_UNIT.len()))[..bytes].to_owned()
+}
 
 // Mirrors `live_state::tracked_head` value codec v8. Asserted against the
 // version byte of every scanned row, so a codec change fails loudly here.
@@ -339,6 +351,45 @@ content_only_distinct={},content_only_dup_classes={n2_classes},content_only_dup_
         content_only.len(),
     );
 
+    // Cost model for the candidate fix: replace the payload in every HOT value
+    // with a 32-byte content digest and store each distinct payload once in a
+    // content-addressed side space (32-byte digest key + 4 accounting bytes).
+    // Keys stay branch-scoped either way. This is the *optimistic* model: it
+    // charges nothing for the presence/refcount plane that manifest-driven GC
+    // would need, and nothing for the extra read hop.
+    let mut model_hot_value_bytes = 0u64;
+    let mut model_payloads: HashMap<blake3::Hash, u64> = HashMap::new();
+    for (_, value) in new_rows.iter() {
+        let p = parse_value(value);
+        let payload_len = p.snapshot_payload + p.metadata_payload;
+        model_hot_value_bytes += (value.len()
+            - p.snapshot_fingerprint
+            - p.snapshot_payload
+            - p.metadata_fingerprint
+            - p.metadata_payload
+            + JSON_REF_BYTES) as u64;
+        let digest = blake3::hash(
+            &value[p.snapshot_start + p.snapshot_fingerprint
+                ..p.snapshot_start + p.snapshot_fingerprint + p.snapshot_payload],
+        );
+        model_payloads.insert(digest, payload_len as u64);
+    }
+    let model_cas_bytes: u64 = model_payloads
+        .values()
+        .map(|len| len + JSON_REF_BYTES as u64 + 4)
+        .sum();
+    let today = a.key_total + a.value_total;
+    let modeled = a.key_total + model_hot_value_bytes + model_cas_bytes;
+    println!(
+        "expW_indirection_model,rows={rows},scenario={scenario},new_hot_rows={},\
+today_bytes={today},modeled_bytes={modeled},\
+modeled_hot_value_bytes={model_hot_value_bytes},modeled_cas_rows={},modeled_cas_bytes={model_cas_bytes},\
+delta_pct={:.2}",
+        a.rows,
+        model_payloads.len(),
+        (modeled as f64 - today as f64) / today as f64 * 100.0,
+    );
+
     // Cross-branch pairing: same logical identity in >1 branch scope.
     let mut paired_identities = 0u64;
     let mut paired_exact_equal = 0u64;
@@ -593,7 +644,10 @@ async fn modify_rows(engine: &Engine<SlateDB>, branch: &str, start: usize, count
                 .execute(
                     "UPDATE branch_fixture SET value = lix_json($1) WHERE path = $2",
                     &[
-                        Value::Text(format!(r#"{{"seed":{index},"edited":true,"pad":"{PAD}"}}"#)),
+                        Value::Text(format!(
+                            r#"{{"seed":{index},"edited":true,"pad":"{}"}}"#,
+                            pad()
+                        )),
                         Value::Text(row_path(index)),
                     ],
                 )
@@ -651,7 +705,7 @@ async fn seed_rows(session: &SessionContext<SlateDB>, rows: usize) {
                     "INSERT INTO branch_fixture (path, value) VALUES ($1, lix_json($2))",
                     &[
                         Value::Text(row_path(index)),
-                        Value::Text(format!(r#"{{"seed":{index},"pad":"{PAD}"}}"#)),
+                        Value::Text(format!(r#"{{"seed":{index},"pad":"{}"}}"#, pad())),
                     ],
                 )
                 .await
