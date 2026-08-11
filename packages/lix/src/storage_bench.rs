@@ -2657,7 +2657,10 @@ mod tests {
         // GC also stages the mandatory five-byte binary-CAS epoch key. Its
         // put shares the key arena with the UUID-keyed delete descriptors.
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        panic!("DEBUG key_shared_bytes={} buffers={} staged_deletes={}", first.key_shared_bytes, first.key_shared_buffers, first.staged_deletes);
+        assert_eq!(
+            first.key_shared_bytes,
+            first.staged_deletes as usize * 16 + 5
+        );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);
         assert_eq!(second.staged_deletes, first.staged_deletes);

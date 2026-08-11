@@ -747,20 +747,6 @@ impl StorageWriteSet {
         self.stats
     }
 
-    /// Temporary diagnostic: shared key-buffer lengths per space.
-    #[cfg(any(test, feature = "storage-benches"))]
-    pub fn debug_shared_key_lens(&self) -> Vec<(u32, Vec<usize>)> {
-        self.groups
-            .iter()
-            .map(|group| {
-                (
-                    group.space.id.0,
-                    group.key_arena.shared.iter().map(Bytes::len).collect(),
-                )
-            })
-            .collect()
-    }
-
     #[cfg(any(test, feature = "storage-benches"))]
     pub fn arena_stats(&self) -> StorageWriteSetArenaStats {
         let mut stats = StorageWriteSetArenaStats {
