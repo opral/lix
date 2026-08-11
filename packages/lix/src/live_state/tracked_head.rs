@@ -1495,6 +1495,13 @@ impl WorkingDiffSlotFingerprint {
             hash: [0; JSON_REF_BYTES],
         }
     }
+
+    fn none() -> Self {
+        Self {
+            kind: WORKING_DIFF_SLOT_NONE,
+            hash: [0; JSON_REF_BYTES],
+        }
+    }
 }
 
 fn working_diff_checkpoint_owner(baseline: WorkingDiffBaseline) -> Option<CommitId> {

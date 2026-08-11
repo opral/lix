@@ -10052,7 +10052,9 @@ async fn classify_hot_working_diff_entries(
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
     resolve_working_diff_before_payloads(
         store,
-        candidates.iter_mut().map(|(_, before, _)| before),
+        candidates
+            .iter_mut()
+            .map(|(key, before, _)| (key.clone(), before)),
     )
     .await?;
     let row_count = candidates.len();
@@ -10082,7 +10084,16 @@ async fn classify_hot_working_diff_entry_refs(
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
     resolve_working_diff_before_payloads(
         store,
-        candidates.iter_mut().map(|(_, before, _)| before),
+        candidates.iter_mut().map(|(key, before, _)| {
+            (
+                TrackedStateKey {
+                    schema_key: key.schema_key.to_owned(),
+                    file_id: key.file_id.map(str::to_owned),
+                    entity_pk: key.entity_pk.clone(),
+                },
+                before,
+            )
+        }),
     )
     .await?;
     let row_count = candidates.len();
@@ -10107,7 +10118,16 @@ async fn classify_hot_working_diff_scan_entries(
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
     resolve_working_diff_before_payloads(
         store,
-        candidates.iter_mut().map(|(_, before, _)| before),
+        candidates.iter_mut().map(|(identity, before, _)| {
+            (
+                TrackedStateKey {
+                    schema_key: identity.schema_key().to_owned(),
+                    file_id: identity.file_id().map(str::to_owned),
+                    entity_pk: identity.entity_pk.clone(),
+                },
+                before,
+            )
+        }),
     )
     .await?;
     let row_count = candidates.len();
@@ -10130,48 +10150,66 @@ async fn classify_hot_working_diff_scan_entries(
 
 /// Hydrates the payload slots of before images that were captured by reference.
 ///
-/// A root-backed baseline stores only the change id of its before image, so the
-/// write path pays no payload I/O. Classification needs the payload itself only
-/// to separate "different change, same payload" from a real modification, so
-/// the change records are fetched here, in one batch, and only for the rows
-/// that are actually unresolved.
+/// A root-backed baseline stores only the reference to its before image — the
+/// change id plus the commit that owns it — so the write path pays no payload
+/// I/O to capture it. Classification needs the payload itself for exactly one
+/// question the change id cannot answer alone: whether two distinct change
+/// records carry the same payload. Change records are addressed by owning
+/// commit, so the pending rows are grouped by commit and fetched one batch per
+/// commit, and only for the rows that are actually unresolved.
 async fn resolve_working_diff_before_payloads<'a>(
     store: &(impl StorageAdapterRead + ?Sized),
-    befores: impl Iterator<Item = &'a mut Option<WorkingDiffVersion>>,
+    rows: impl Iterator<Item = (TrackedStateKey, &'a mut Option<WorkingDiffVersion>)>,
 ) -> Result<(), LixError> {
-    let mut pending = befores
-        .filter(|before| {
-            before
-                .as_ref()
-                .is_some_and(|version| version.payload_is_unresolved())
-        })
-        .collect::<Vec<_>>();
+    let mut pending = Vec::new();
+    for (key, before) in rows {
+        let Some(version) = before.as_mut() else {
+            continue;
+        };
+        if !version.payload_is_unresolved() {
+            continue;
+        }
+        if version.deleted {
+            // A tombstone before image has no payload to hydrate, and its
+            // classification never consults one.
+            version.resolve_payload_slots(
+                WorkingDiffSlotFingerprint::none(),
+                WorkingDiffSlotFingerprint::none(),
+            );
+            continue;
+        }
+        pending.push((version.commit_id, key, version));
+    }
     if pending.is_empty() {
         return Ok(());
     }
-    let pending_len = pending.len();
-    let records = crate::changelog::load_change_records(
-        store,
-        pending.iter().map(|before| {
-            before
-                .as_ref()
-                .expect("pending before images are present")
-                .change_id
-        }),
-    )
-    .await?;
-    for before in &mut pending {
-        let version = before
-            .as_mut()
-            .expect("pending before images are present the second time");
-        let record = records.get(&version.change_id).ok_or_else(|| {
-            head_value_error(&format!(
-                "working-diff baseline references change record '{}' that is no longer readable (loaded {} of {})",
-                version.change_id,
-                records.len(),
-                pending_len,
-            ))
+    let mut by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
+    for (index, (commit_id, _, _)) in pending.iter().enumerate() {
+        by_commit.entry(*commit_id).or_default().push(index);
+    }
+    let mut resolved = vec![None; pending.len()];
+    for (commit_id, indexes) in by_commit {
+        let keys = indexes
+            .iter()
+            .map(|index| pending[*index].1.clone())
+            .collect::<Vec<_>>();
+        let records =
+            crate::tracked_state::load_commit_delta_change_records(store, commit_id, &keys).await?;
+        for (index, record) in indexes.into_iter().zip(records) {
+            resolved[index] = record;
+        }
+    }
+    for ((_, _, version), record) in pending.into_iter().zip(resolved) {
+        let record = record.ok_or_else(|| {
+            head_value_error(
+                "working-diff baseline references a before image that is missing from its commit",
+            )
         })?;
+        if record.change_id != version.change_id {
+            return Err(head_value_error(
+                "working-diff baseline before image does not match its referenced change record",
+            ));
+        }
         version.resolve_payload_slots(
             packed_working_diff_slot(&record.snapshot),
             packed_working_diff_slot(&record.metadata),
