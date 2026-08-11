@@ -771,7 +771,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &staged_hot_heads.controls,
-        &staged_hot_heads.tracked_snapshots,
         &state_rows,
         &engine_rows,
         &explicit_branch_targets,
@@ -5087,7 +5086,6 @@ async fn stage_branch_head_control_publications(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     normal_controls: &BTreeMap<String, BranchHeadControl>,
-    tracked_snapshots: &BTreeMap<CommitId, HotTrackedSnapshot>,
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
@@ -5115,7 +5113,6 @@ async fn stage_branch_head_control_publications(
         .iter()
         .map(|(branch_id, control)| (branch_id.clone(), Some(*control)))
         .collect::<BTreeMap<String, Option<BranchHeadControl>>>();
-    let tracked_head = TrackedHeadContext::new();
     let mut consumed_checkpoint_bridges = BTreeSet::new();
     for (branch_id, target) in explicit_branch_targets {
         if publications.contains_key(branch_id) {
