@@ -181,6 +181,12 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+    // Commit staging assigns interned schema ids. Refresh the table through
+    // this commit's snapshot first so ids published by other engines over the
+    // same storage are never re-allocated to different schemas.
+    crate::storage_adapter::schema_intern_of(read)
+        .load(read)
+        .await?;
     Box::pin(validate_active_account_and_account_rows(
         read,
         &prepared_writes,

@@ -150,12 +150,35 @@ impl SchemaIntern {
         Ok(())
     }
 
-    /// Read-path lookup. `None` means no hot key can carry this schema: the
-    /// mapping row is staged with the first hot key that uses it, so an
-    /// unmapped schema has no rows anywhere in the hot plane.
+    /// Read-path lookup. `None` means no hot key visible to the resolving
+    /// snapshot can carry this schema: the mapping row commits atomically with
+    /// the first hot key that uses it, so once the table has been refreshed
+    /// through a snapshot, an unmapped schema has no rows in that snapshot.
     pub(crate) fn resolve(&self, schema_key: &str) -> Option<SchemaInternId> {
         let inner = self.inner.read().expect("schema intern lock poisoned");
         inner.by_name.get(schema_key).copied().map(SchemaInternId)
+    }
+
+    /// Re-reads the persisted table through `store` when any of `schema_keys`
+    /// is unknown in memory. Engines sharing one storage publish mappings the
+    /// others have not seen; the merge is idempotent, so refreshing on a miss
+    /// makes resolution exact for the calling snapshot.
+    pub(crate) async fn refresh_if_missing<'a, S>(
+        &self,
+        store: &S,
+        mut schema_keys: impl Iterator<Item = &'a str>,
+    ) -> Result<(), StorageError>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        let all_known = {
+            let inner = self.inner.read().expect("schema intern lock poisoned");
+            schema_keys.all(|schema_key| inner.by_name.contains_key(schema_key))
+        };
+        if all_known {
+            return Ok(());
+        }
+        self.load(store).await
     }
 
     /// Decode-path lookup; a miss is corruption because assignment always

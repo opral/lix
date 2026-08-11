@@ -2211,6 +2211,10 @@ async fn load_stored_hot_collection_control(
     branch_generation: CommitId,
     scope: crate::collection_generation::CollectionScopeRef<'_>,
 ) -> Result<Option<HotCollectionControl>, LixError> {
+    schema_intern_of(store)
+        .refresh_if_missing(store, std::iter::once(scope.schema_key))
+        .await
+        .map_err(LixError::from)?;
     let Some(key) = resolve_hot_collection_control_key(store, branch_id, branch_generation, scope)
     else {
         return Ok(None);
@@ -2242,6 +2246,10 @@ async fn load_hot_collection_visibility_control(
     branch_generation: CommitId,
     scope: crate::collection_generation::CollectionScopeRef<'_>,
 ) -> Result<HotCollectionControl, LixError> {
+    schema_intern_of(store)
+        .refresh_if_missing(store, std::iter::once(scope.schema_key))
+        .await
+        .map_err(LixError::from)?;
     let value = match resolve_hot_collection_control_key(store, branch_id, branch_generation, scope)
     {
         Some(key) => {
@@ -2357,6 +2365,10 @@ async fn load_stored_hot_collection_controls(
     branch_generation: CommitId,
     scopes: &[crate::collection_generation::CollectionScopeRef<'_>],
 ) -> Result<Vec<Option<HotCollectionControl>>, LixError> {
+    schema_intern_of(store)
+        .refresh_if_missing(store, scopes.iter().map(|scope| scope.schema_key))
+        .await
+        .map_err(LixError::from)?;
     let resolved_keys = scopes
         .iter()
         .copied()
@@ -2887,6 +2899,10 @@ async fn packed_exclusive_schema_base_refs(
     generation: CommitId,
     schema_key: &str,
 ) -> Result<Vec<PackedExclusiveSchemaBaseRef>, LixError> {
+    schema_intern_of(store)
+        .refresh_if_missing(store, std::iter::once(schema_key))
+        .await
+        .map_err(LixError::from)?;
     let Some(schema_id) = schema_intern_of(store).resolve(schema_key) else {
         return Ok(Vec::new());
     };
@@ -3307,8 +3323,12 @@ async fn scan_root_current_base_rows_for_merge(
                 .await?
                 .entries;
         } else {
+            schema_intern_of(store)
+                .refresh_if_missing(store, request.filter.schema_keys.iter().map(String::as_str))
+                .await
+                .map_err(LixError::from)?;
             for schema_key in &request.filter.schema_keys {
-                // An unmapped schema has no control records.
+                // An unmapped schema has no control records in this snapshot.
                 let Some(schema_id) = schema_intern_of(store).resolve(schema_key) else {
                     continue;
                 };
@@ -4515,6 +4535,10 @@ where
         }
 
         let intern = schema_intern_of(&self.store);
+        intern
+            .refresh_if_missing(&self.store, std::iter::once(scope.schema_key))
+            .await
+            .map_err(LixError::from)?;
         let schema_id = intern.resolve(scope.schema_key);
         let scope_prefix = hot_scope_prefix(branch_id, branch_generation);
         let mut actual = 0_u64;
@@ -4724,6 +4748,10 @@ where
         control: BranchHeadControl,
         schema_key: &str,
     ) -> Result<bool, LixError> {
+        schema_intern_of(&self.store)
+            .refresh_if_missing(&self.store, std::iter::once(schema_key))
+            .await
+            .map_err(LixError::from)?;
         if let Some(schema_id) = schema_intern_of(&self.store).resolve(schema_key) {
             let mut prefix = hot_scope_prefix(branch_id, control.tracked_generation);
             write_schema_id(&mut prefix, schema_id);
@@ -7862,6 +7890,7 @@ async fn stage_incremental_file_delete_cascades(
     let values = hot_load_primary_identity_bytes(store, &identities).await?;
     let scope = hot_scope_prefix(branch_id, generation);
     let intern = schema_intern_of(store);
+    intern.load(store).await.map_err(LixError::from)?;
     let key_capacity = identities
         .iter()
         .try_fold(0_usize, |total, identity| {
@@ -9925,6 +9954,12 @@ async fn hot_working_diff_entries(
     expected_coverage: WorkingDiffIndexCoverage,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    // Diff scopes decode every schema in the checkpoint window; refresh so
+    // ids published by other engines resolve for this snapshot.
+    schema_intern_of(store)
+        .load(store)
+        .await
+        .map_err(LixError::from)?;
     let packed_refs = packed_current_base_refs(store, branch_id, generation).await?;
     let packed_refs = packed_refs
         .into_iter()
@@ -10302,6 +10337,17 @@ async fn hot_scan_entries<'a>(
     // does, fall through to the complete primary-prefix route so UPDATE and
     // DELETE still see every candidate member.
     let intern = schema_intern_of(store);
+    // Multiple engines over one storage publish schema mappings independently;
+    // refresh through this snapshot so filter misses and scope-wide decodes
+    // are exact for the rows this snapshot can see.
+    if filter.schema_keys.is_empty() {
+        intern.load(store).await.map_err(LixError::from)?;
+    } else {
+        intern
+            .refresh_if_missing(store, filter.schema_keys.iter().map(String::as_str))
+            .await
+            .map_err(LixError::from)?;
+    }
     if let Some(identities) = hot_exact_identity_batches(intern, branch_id, generation, filter) {
         let may_use_null_point_batch = !filter.file_ids.is_empty()
             || !hot_schema_has_file_members(store, branch_id, generation, &filter.schema_keys)
@@ -10693,6 +10739,10 @@ async fn hot_schema_has_file_member(
     generation: CommitId,
     schema_key: &str,
 ) -> Result<bool, LixError> {
+    schema_intern_of(store)
+        .refresh_if_missing(store, std::iter::once(schema_key))
+        .await
+        .map_err(LixError::from)?;
     let Some(schema_id) = schema_intern_of(store).resolve(schema_key) else {
         return Ok(false);
     };
@@ -11539,6 +11589,7 @@ pub(crate) async fn stage_collect_stale_hot_diff_records<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    schema_intern_of(store).load(store).await?;
     let range = StoragePrefix {
         bytes: Bytes::new(),
     }
