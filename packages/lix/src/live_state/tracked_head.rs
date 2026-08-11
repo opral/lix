@@ -186,6 +186,15 @@ struct WorkingDiffSlotFingerprint {
 const WORKING_DIFF_SLOT_NONE: u8 = 0;
 const WORKING_DIFF_SLOT_REF: u8 = 1;
 const WORKING_DIFF_SLOT_INLINE: u8 = 2;
+/// The before image is identified by its change id, but its payload slot was
+/// not materialized where the baseline was captured.
+///
+/// Root current bases are read under `ChangeRecordProjection::identity_only()`
+/// so the write path pays no payload I/O to capture a baseline. The reader
+/// hydrates the referenced change record only for the one question the change
+/// id cannot answer on its own: whether two distinct changes carry the same
+/// payload.
+const WORKING_DIFF_SLOT_UNRESOLVED: u8 = 3;
 const WORKING_DIFF_VERSION_BYTES: usize =
     16 + 16 + 1 + 8 + 8 + 1 + JSON_REF_BYTES + 1 + JSON_REF_BYTES;
 const WORKING_DIFF_CHECKPOINT_BYTES: usize = 16;
@@ -375,8 +384,29 @@ pub(crate) struct PackedHeadValue {
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    checkpoint_commit_id: Option<CommitId>,
+    working_diff_baseline: PackedWorkingDiffBaseline,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
+}
+
+/// Checkpoint-relative position of a current-state base row that is served
+/// without a branch-local hot row.
+///
+/// The two bases are not interchangeable and must not share one encoding. A
+/// *packed* current base is a collection published **inside** the active
+/// working interval, so its rows were absent at the checkpoint. A *root*
+/// current base is the referenced head itself, so its rows **are** the
+/// checkpoint state. Collapsing both onto "has an active checkpoint id" made
+/// the first branch-local mutation of a checkpointed identity look like a
+/// creation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PackedWorkingDiffBaseline {
+    /// No active checkpoint owns this generation.
+    Disabled,
+    /// Published inside the active working interval: absent at the checkpoint.
+    AbsentAtCheckpoint { checkpoint_commit_id: CommitId },
+    /// Served from the referenced root current base: present at the active
+    /// checkpoint and unchanged since.
+    CleanAtCheckpoint,
 }
 
 impl<'a> CurrentStateDeltaRef<'a> {
@@ -1283,16 +1313,21 @@ fn decode_working_diff_slot(
         .ok_or_else(|| working_diff_error(&format!("{field} kind is missing")))?;
     if !matches!(
         kind,
-        WORKING_DIFF_SLOT_NONE | WORKING_DIFF_SLOT_REF | WORKING_DIFF_SLOT_INLINE
+        WORKING_DIFF_SLOT_NONE
+            | WORKING_DIFF_SLOT_REF
+            | WORKING_DIFF_SLOT_INLINE
+            | WORKING_DIFF_SLOT_UNRESOLVED
     ) {
         return Err(working_diff_error(&format!("{field} slot kind is invalid")));
     }
     let hash: [u8; JSON_REF_BYTES] = take_working_diff_bytes(bytes, offset, JSON_REF_BYTES)?
         .try_into()
         .map_err(|_| working_diff_error(&format!("{field} hash is invalid")))?;
-    if kind == WORKING_DIFF_SLOT_NONE && hash != [0; JSON_REF_BYTES] {
+    if matches!(kind, WORKING_DIFF_SLOT_NONE | WORKING_DIFF_SLOT_UNRESOLVED)
+        && hash != [0; JSON_REF_BYTES]
+    {
         return Err(working_diff_error(&format!(
-            "{field} none slot must have a zero hash"
+            "{field} slot kind must have a zero hash"
         )));
     }
     Ok(WorkingDiffSlotFingerprint { kind, hash })
@@ -1392,6 +1427,11 @@ struct HeadValueView<'a> {
     metadata: HeadSlotView<'a>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
+    /// False when the JSON slots above are placeholders because this view was
+    /// synthesized from a current-state base that was read without payload
+    /// projection. Baselines captured from such a view record their payload
+    /// slots as unresolved and are hydrated by the reader on demand.
+    payload_slots_materialized: bool,
 }
 
 impl CertifiedCurrentStatePredecessor {
@@ -1409,18 +1449,22 @@ impl CertifiedCurrentStatePredecessor {
                 deleted: value.deleted,
                 created_at: value.created_at,
                 updated_at: value.updated_at,
-                // Packed current bases are immutable post-checkpoint inserts.
-                // Their active-epoch before image is therefore absent; no
-                // payload fingerprint is needed to preserve that baseline.
+                // Current-state bases are read without payload projection, so
+                // these slots are placeholders. The change id above is the
+                // reference the reader hydrates from when it needs the payload.
                 snapshot: HeadSlotView::None,
                 metadata: HeadSlotView::None,
+                payload_slots_materialized: false,
                 columnar_base_coordinate: value.columnar_base_coordinate,
-                working_diff_baseline: value.checkpoint_commit_id.map_or(
-                    WorkingDiffBaseline::Disabled,
-                    |checkpoint_commit_id| WorkingDiffBaseline::BeforeAbsent {
+                working_diff_baseline: match value.working_diff_baseline {
+                    PackedWorkingDiffBaseline::Disabled => WorkingDiffBaseline::Disabled,
+                    PackedWorkingDiffBaseline::AbsentAtCheckpoint {
+                        checkpoint_commit_id,
+                    } => WorkingDiffBaseline::BeforeAbsent {
                         checkpoint_commit_id,
                     },
-                ),
+                    PackedWorkingDiffBaseline::CleanAtCheckpoint => WorkingDiffBaseline::Clean,
+                },
             }),
         }
     }
@@ -1434,9 +1478,33 @@ impl HeadValueView<'_> {
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            snapshot: working_diff_slot_fingerprint(self.snapshot),
-            metadata: working_diff_slot_fingerprint(self.metadata),
+            snapshot: self.working_diff_slot(self.snapshot),
+            metadata: self.working_diff_slot(self.metadata),
         })
+    }
+
+    fn working_diff_slot(self, slot: HeadSlotView<'_>) -> WorkingDiffSlotFingerprint {
+        if self.payload_slots_materialized {
+            working_diff_slot_fingerprint(slot)
+        } else {
+            WorkingDiffSlotFingerprint::unresolved()
+        }
+    }
+}
+
+impl WorkingDiffSlotFingerprint {
+    fn unresolved() -> Self {
+        Self {
+            kind: WORKING_DIFF_SLOT_UNRESOLVED,
+            hash: [0; JSON_REF_BYTES],
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            kind: WORKING_DIFF_SLOT_NONE,
+            hash: [0; JSON_REF_BYTES],
+        }
     }
 }
 
@@ -1467,13 +1535,53 @@ fn effective_hot_commit_id(
     }
 }
 
+/// Whether two working-diff versions carry the same payload.
+///
+/// `Unresolved` is deliberately a distinct answer rather than a default. An
+/// accelerator over the canonical diff may answer correctly or decline, but it
+/// must never answer confidently and wrongly, so a caller that has not
+/// hydrated an unresolved before image cannot accidentally read it as
+/// "different".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkingDiffPayloadEquality {
+    Equal,
+    Different,
+    Unresolved,
+}
+
 impl WorkingDiffVersion {
-    fn payload_eq(self, other: Self) -> bool {
+    /// True when this version's payload slots were never materialized, so only
+    /// its change id is known. Resolve with `resolve_payload_slots` before
+    /// classifying.
+    fn payload_is_unresolved(self) -> bool {
+        self.snapshot.kind == WORKING_DIFF_SLOT_UNRESOLVED
+            || self.metadata.kind == WORKING_DIFF_SLOT_UNRESOLVED
+    }
+
+    fn resolve_payload_slots(
+        &mut self,
+        snapshot: WorkingDiffSlotFingerprint,
+        metadata: WorkingDiffSlotFingerprint,
+    ) {
+        self.snapshot = snapshot;
+        self.metadata = metadata;
+    }
+
+    fn payload_equality(self, other: Self) -> WorkingDiffPayloadEquality {
         // Keep the accelerator's net-change classification identical to the
         // canonical tracked diff: a shared change record is intrinsically the
         // same payload, otherwise compare the two stored payload slots.
-        self.change_id == other.change_id
-            || (self.snapshot == other.snapshot && self.metadata == other.metadata)
+        if self.change_id == other.change_id {
+            return WorkingDiffPayloadEquality::Equal;
+        }
+        if self.payload_is_unresolved() || other.payload_is_unresolved() {
+            return WorkingDiffPayloadEquality::Unresolved;
+        }
+        if self.snapshot == other.snapshot && self.metadata == other.metadata {
+            WorkingDiffPayloadEquality::Equal
+        } else {
+            WorkingDiffPayloadEquality::Different
+        }
     }
 
     fn into_diff_row(self, identity: TrackedStateDiffIdentity) -> TrackedStateDiffRow {
@@ -1937,6 +2045,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         updated_at,
         snapshot,
         metadata,
+        payload_slots_materialized: true,
         columnar_base_coordinate,
         working_diff_baseline,
     })
@@ -2606,9 +2715,38 @@ mod tests {
             ..baseline
         };
 
-        assert!(baseline.payload_eq(same_change));
-        assert!(baseline.payload_eq(same_payload));
-        assert!(!baseline.payload_eq(different_payload));
+        assert_eq!(
+            baseline.payload_equality(same_change),
+            WorkingDiffPayloadEquality::Equal
+        );
+        assert_eq!(
+            baseline.payload_equality(same_payload),
+            WorkingDiffPayloadEquality::Equal
+        );
+        assert_eq!(
+            baseline.payload_equality(different_payload),
+            WorkingDiffPayloadEquality::Different
+        );
+
+        // A baseline captured by reference must never be read as "different".
+        let unresolved = WorkingDiffVersion {
+            change_id: ChangeId::for_test_label("root-change"),
+            snapshot: WorkingDiffSlotFingerprint::unresolved(),
+            metadata: WorkingDiffSlotFingerprint::unresolved(),
+            ..baseline
+        };
+        assert_eq!(
+            unresolved.payload_equality(different_payload),
+            WorkingDiffPayloadEquality::Unresolved
+        );
+        assert_eq!(
+            unresolved.payload_equality(WorkingDiffVersion {
+                change_id: ChangeId::for_test_label("root-change"),
+                ..different_payload
+            }),
+            WorkingDiffPayloadEquality::Equal,
+            "a shared change record resolves without hydration"
+        );
     }
 
     #[tokio::test]
