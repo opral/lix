@@ -12,9 +12,9 @@ use crate::storage_adapter::{StorageAdapterRead, exact_get_many};
 /// singleton.
 ///
 /// Physical keys are `4-byte-BE space id ++ logical key`, so one space with
-/// one-byte logical keys puts all revision singletons in five adjacent
-/// physical keys. That is one SST block, one hot-key write region, and one
-/// batched point read instead of five scattered ones.
+/// one-byte logical keys puts all revision singletons in adjacent physical
+/// keys. That is one SST block, one hot-key write region, and one batched
+/// point read instead of one read per singleton.
 ///
 /// Every key holds an opaque uuid-v7 token whose only meaningful operation is
 /// equality: "did this fact change since I read it".
