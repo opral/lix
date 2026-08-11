@@ -1,17 +1,17 @@
 use lix::Value;
 
-/// Reads whose logical plan carries a nested subquery plan must not park
-/// snapshot-bound table providers in the engine planning cache.
-///
-/// `LogicalPlan`'s tree traversal only walks plan inputs, so the plans inside
-/// `Expr::ScalarSubquery`, `Expr::InSubquery` and `Expr::Exists` never reach
-/// `detach_cached_read_plan`. Caching such a plan left live providers — and
-/// therefore live storage-read handles — in an engine-lifetime LRU, which made
-/// the read scope fail with `LIX_STORAGE_ERROR: shared storage read still has
-/// N active handles` and left a released read reachable from the cache.
-///
-/// Each statement is executed twice so a cache entry written by the first run
-/// would be exercised by the second.
+// Reads whose logical plan carries a nested subquery plan must not park
+// snapshot-bound table providers in the engine planning cache.
+//
+// `LogicalPlan`'s tree traversal only walks plan inputs, so the plans inside
+// `Expr::ScalarSubquery`, `Expr::InSubquery` and `Expr::Exists` never reach
+// `detach_cached_read_plan`. Caching such a plan left live providers — and
+// therefore live storage-read handles — in an engine-lifetime LRU, which made
+// the read scope fail with `LIX_STORAGE_ERROR: shared storage read still has
+// N active handles` and left a released read reachable from the cache.
+//
+// Each statement is executed twice so a cache entry written by the first run
+// would be exercised by the second.
 simulation_test!(subquery_reads_do_not_leak_storage_read_handles, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
