@@ -19,17 +19,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// The resumable upload path accepts 16 MiB parts and completes up to four of
+/// them out of order, so a shipped CDC has to force a boundary at every part
+/// edge to keep parts independently chunkable. `anchor_bytes` models that.
 #[derive(Clone, Copy, Debug)]
 enum Policy {
-    Fixed { chunk_bytes: usize },
-    Cdc { avg_bytes: usize },
+    Fixed {
+        chunk_bytes: usize,
+    },
+    Cdc {
+        avg_bytes: usize,
+        anchor_bytes: Option<usize>,
+    },
 }
 
 impl Policy {
     fn label(&self) -> String {
         match self {
             Self::Fixed { chunk_bytes } => format!("fixed/{}", human(*chunk_bytes)),
-            Self::Cdc { avg_bytes } => format!("cdc/{}", human(*avg_bytes)),
+            Self::Cdc {
+                avg_bytes,
+                anchor_bytes: None,
+            } => format!("cdc/{}", human(*avg_bytes)),
+            Self::Cdc {
+                avg_bytes,
+                anchor_bytes: Some(anchor),
+            } => format!("cdc/{}@{}", human(*avg_bytes), human(*anchor)),
         }
     }
 
@@ -39,16 +54,36 @@ impl Policy {
                 .step_by(*chunk_bytes)
                 .map(|start| (start, start.saturating_add(*chunk_bytes).min(data.len())))
                 .collect(),
-            Self::Cdc { avg_bytes } => {
-                let min = (avg_bytes / 4).max(64) as u32;
-                let avg = *avg_bytes as u32;
-                let max = (avg_bytes * 4) as u32;
-                fastcdc::v2020::FastCDC::new(data, min, avg, max)
-                    .map(|chunk| (chunk.offset, chunk.offset + chunk.length))
-                    .collect()
+            Self::Cdc {
+                avg_bytes,
+                anchor_bytes,
+            } => {
+                let span = anchor_bytes.unwrap_or(usize::MAX);
+                let mut out = Vec::new();
+                let mut base = 0usize;
+                while base < data.len() {
+                    let end = base.saturating_add(span).min(data.len());
+                    out.extend(cdc_ranges(&data[base..end], *avg_bytes).into_iter().map(
+                        |(start, stop)| (base.saturating_add(start), base.saturating_add(stop)),
+                    ));
+                    base = end;
+                }
+                out
             }
         }
     }
+}
+
+fn cdc_ranges(data: &[u8], avg_bytes: usize) -> Vec<(usize, usize)> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let min = (avg_bytes / 4).max(64) as u32;
+    let avg = avg_bytes as u32;
+    let max = (avg_bytes * 4) as u32;
+    fastcdc::v2020::FastCDC::new(data, min, avg, max)
+        .map(|chunk| (chunk.offset, chunk.offset + chunk.length))
+        .collect()
 }
 
 fn human(bytes: usize) -> String {
@@ -71,12 +106,23 @@ const POLICIES: &[Policy] = &[
     },
     Policy::Cdc {
         avg_bytes: 1 << 20,
+        anchor_bytes: None,
     },
     Policy::Cdc {
         avg_bytes: 256 << 10,
+        anchor_bytes: None,
     },
     Policy::Cdc {
         avg_bytes: 64 << 10,
+        anchor_bytes: None,
+    },
+    Policy::Cdc {
+        avg_bytes: 1 << 20,
+        anchor_bytes: Some(16 << 20),
+    },
+    Policy::Cdc {
+        avg_bytes: 256 << 10,
+        anchor_bytes: Some(16 << 20),
     },
 ];
 
