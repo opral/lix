@@ -5,7 +5,6 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
     BranchHeadControlContext, branch_head_control_precondition, stage_branch_head_control,
-    untracked_lifecycle_generation,
 };
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::common::LixTimestamp;
@@ -98,17 +97,11 @@ pub(crate) async fn stage_sequence(
     let next_revision = control
         .next_current_state_revision()?
         .current_state_revision;
-    let next_generation = untracked_lifecycle_generation(
-        GLOBAL_BRANCH_ID,
-        control.untracked_generation,
-        next_revision,
-    );
     TrackedHeadContext::new()
         .writer(read, writes)
-        .stage_untracked_generation(
+        .stage_untracked_current_state(
             GLOBAL_BRANCH_ID,
-            control.untracked_generation,
-            next_generation,
+            control.tracked_generation,
             &[CurrentStateDeltaRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
@@ -130,7 +123,6 @@ pub(crate) async fn stage_sequence(
     // change. Merely restaging the old control would let two writers both
     // satisfy the same CAS after the first write, losing one group update.
     let mut next_control = control;
-    next_control.untracked_generation = next_generation;
     next_control.current_state_revision = next_revision;
     next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
     stage_branch_head_control(writes, GLOBAL_BRANCH_ID, next_control)?;
@@ -179,7 +171,7 @@ async fn load_key_value_row(
         reader
             .validate_exact_collection_closure(
                 GLOBAL_BRANCH_ID,
-                control.untracked_generation,
+                control.tracked_generation,
                 crate::collection_generation::CollectionScopeRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
@@ -546,17 +538,11 @@ mod tests {
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
-        let next_generation = untracked_lifecycle_generation(
-            GLOBAL_BRANCH_ID,
-            control.untracked_generation,
-            next_control.current_state_revision,
-        );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_untracked_generation(
+            .stage_untracked_current_state(
                 GLOBAL_BRANCH_ID,
-                control.untracked_generation,
-                next_generation,
+                control.tracked_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
@@ -575,7 +561,6 @@ mod tests {
             )
             .await
             .expect("test key-value current row should stage");
-        next_control.untracked_generation = next_generation;
         next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
         stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
             .expect("global control should publish current state");

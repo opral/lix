@@ -470,48 +470,49 @@ impl TrackedHeadContext {
     {
         hot::HotStateWriter { store, writes }
     }
-
-    /// Reclaims derived current-state generations that no durable branch
-    /// control can select and returns their history-free payload refs. Both
-    /// the authoritative hot rows and their key-only file membership index are
-    /// generation-scoped, so the control is the one ownership root for both
-    /// spaces. The caller compares the returned refs with its complete live
-    /// payload set before staging physical JSON deletion.
-    ///
-    /// A non-current control still owns its generation. Its tracked portion
-    /// may use historical replay, but that same generation preserves the
-    /// branch's history-free untracked members until a fresh complete serving
-    /// generation is published.
-    #[cfg(test)]
-    pub(crate) async fn stage_collect_stale_current_state_generations<S>(
-        &self,
-        store: &S,
-        writes: &mut StorageWriteSet,
-        controls: &[(String, BranchHeadControl)],
-    ) -> Result<Vec<JsonRef>, LixError>
-    where
-        S: StorageAdapterRead + ?Sized,
-    {
-        hot::stage_collect_stale_hot_generations(store, writes, controls).await
-    }
 }
 
-/// Converts the branch-control plane into the exact derived generations that
-/// are still reachable. A branch generation is meaningful only together with
-/// its branch id; a generation UUID alone is not a repository-global root.
-#[cfg(test)]
-fn active_current_state_generations(
-    controls: &[(String, BranchHeadControl)],
-) -> BTreeSet<(String, CommitId)> {
-    controls
-        .iter()
-        .flat_map(|(branch_id, control)| {
-            [
-                (branch_id.clone(), control.tracked_generation),
-                (branch_id.clone(), control.untracked_generation),
-            ]
-        })
-        .collect()
+impl<S> hot::HotStateWriter<'_, S>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    /// Stages history-free untracked deltas into the branch's one serving
+    /// generation.
+    ///
+    /// Untracked rows share the generation with tracked rows and are separated
+    /// only by their per-row flag, so this is an ordinary in-place hot
+    /// mutation: no new generation UUID, no republished snapshot, no commit.
+    /// The caller still advances `current_state_revision` so the branch
+    /// control CAS remains a real write fence.
+    ///
+    /// Untracked deltas never produce working-diff records (their baseline is
+    /// always `Disabled`), so the checkpoint context and the coverage counter
+    /// are deliberately not threaded through here.
+    pub(crate) async fn stage_untracked_current_state(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+    ) -> Result<(), LixError> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let mut coverage = WorkingDiffIndexCoverage::default();
+        self.stage_current_state_with_working_diff(
+            branch_id,
+            Some(generation),
+            generation,
+            deltas,
+            absence_guards,
+            None,
+            None,
+            None,
+            &mut coverage,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixError {
@@ -690,7 +691,6 @@ fn stage_test_current_control(
         BranchHeadControl {
             head_commit_id,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id,
@@ -2317,7 +2317,6 @@ mod tests {
         BranchHeadControl {
             head_commit_id,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
@@ -3089,7 +3088,6 @@ mod tests {
         let control = |head_commit_id, generation, checkpoint_commit_id| BranchHeadControl {
             head_commit_id,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
@@ -3561,7 +3559,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -3739,7 +3736,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -3807,7 +3803,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             tracked_generation: head,
-            untracked_generation: head,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -5083,116 +5078,6 @@ mod tests {
                 .next()
                 .flatten();
             assert!(value.is_none(), "malformed auxiliary key must be reclaimed");
-        }
-    }
-
-    #[tokio::test]
-    async fn current_state_gc_keeps_only_control_bound_untracked_generations() {
-        let storage = StorageAdapter::new(Memory::new());
-        let branch_id = "main";
-        let active_generation = CommitId::for_test_label("active-current-generation");
-        let stale_generation = CommitId::for_test_label("stale-current-generation");
-        let active_snapshot = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
-        let stale_snapshot = JsonRef::from_hash_bytes([9; JSON_REF_BYTES]);
-        let timestamp = ts("2026-01-01T00:00:00Z");
-        let active_identity = HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation: active_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("active-row"),
-            file_id: Some("active-file".to_string()),
-        };
-        let stale_identity = HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation: stale_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("stale-row"),
-            file_id: Some("stale-file".to_string()),
-        };
-        let active_control = BranchHeadControl {
-            head_commit_id: active_generation,
-            tracked_generation: active_generation,
-            untracked_generation: active_generation,
-            current_state_revision: 0,
-            schema_presence_bloom: [u64::MAX; 4],
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("active-current-ref"),
-        };
-        let controls = vec![(branch_id.to_string(), active_control)];
-
-        let untracked = |snapshot| HeadValue {
-            change_id: None,
-            commit_id: None,
-            untracked: true,
-            deleted: false,
-            created_at: timestamp,
-            updated_at: timestamp,
-            snapshot: JsonSlot::Ref(snapshot),
-            metadata: JsonSlot::None,
-            columnar_base_coordinate: None,
-        };
-        let mut writes = StorageWriteSet::new();
-        stage_put(&mut writes, &active_identity, &untracked(active_snapshot))
-            .expect("stage active untracked hot row");
-        stage_put(&mut writes, &stale_identity, &untracked(stale_snapshot))
-            .expect("stage stale untracked hot row");
-        stage_branch_head_control(&mut writes, branch_id, active_control)
-            .expect("stage active branch control");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit current-state GC fixture");
-
-        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("open current-state GC read"),
-        );
-        let rooted = TrackedHeadContext::new()
-            .reader(read.clone())
-            .untracked_json_refs(&controls)
-            .await
-            .expect("discover active untracked payload roots");
-        assert_eq!(rooted, vec![active_snapshot]);
-
-        let mut gc_writes = StorageWriteSet::new();
-        let stale_refs = TrackedHeadContext::new()
-            .stage_collect_stale_current_state_generations(&read, &mut gc_writes, &controls)
-            .await
-            .expect("stage stale current-state cleanup");
-        assert_eq!(stale_refs, vec![stale_snapshot]);
-        drop(read);
-        storage
-            .commit_write_set(gc_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit stale current-state cleanup");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open current-state GC verification read");
-        for (label, space) in [
-            ("primary hot row", HOT_ROW_SPACE),
-            ("file-schema hot markers", HOT_FILE_SPACE),
-        ] {
-            let entries = scan_test_space(&read, space).await.entries;
-            assert_eq!(entries.len(), 1, "only active {label} survives GC");
-            let encoded =
-                full_value_bytes(entries.into_iter().next().expect("one hot value").value)
-                    .expect("hot value is present");
-            if space == HOT_FILE_SPACE {
-                assert!(encoded.is_empty(), "file-schema markers remain key-only");
-                continue;
-            }
-            let value = decode_head_value(&encoded).expect("active hot value decodes");
-            assert!(value.untracked, "active hot value remains untracked");
-            match value.snapshot {
-                HeadSlotView::Ref(snapshot) => assert_eq!(snapshot, active_snapshot),
-                _ => panic!("active hot value must retain its JSON reference"),
-            }
         }
     }
 }

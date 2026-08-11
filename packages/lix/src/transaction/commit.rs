@@ -10,7 +10,7 @@ use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
     BranchHeadControlObservation, BranchRefReader, branch_head_control_precondition,
-    stage_branch_head_control, stage_delete_branch_head_control, untracked_lifecycle_generation,
+    stage_branch_head_control, stage_delete_branch_head_control,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
@@ -3496,7 +3496,6 @@ async fn stage_tracked_head(
         .collect::<BTreeSet<_>>();
     let tracked_head = TrackedHeadContext::new();
     let mut controls = BTreeMap::new();
-    let mut key_value_control_mutations = BTreeSet::new();
     let mut deferred_fresh_hot_plans = Vec::new();
     let mut exclusive_certified_columnar_publication = false;
 
@@ -3568,15 +3567,6 @@ async fn stage_tracked_head(
         } else {
             None
         };
-        if state_row_indices.iter().any(|&row_index| {
-            let row = state_rows.row(row_index);
-            !row.untracked && row.schema_key == "lix_key_value"
-        }) || selected_materialization
-            .as_ref()
-            .is_some_and(|(rows, _, _)| rows.iter().any(|row| row.schema_key == "lix_key_value"))
-        {
-            key_value_control_mutations.insert(root.branch_id.as_str());
-        }
         let mut untracked_deltas = if certified_columnar_parts.is_some() {
             Vec::new()
         } else {
@@ -3680,38 +3670,6 @@ async fn stage_tracked_head(
                     certified_fresh_plugin_file_id,
                 )
             };
-        if let Some(control) = parent_control
-            .filter(|control| control.tracked_generation != control.untracked_generation)
-        {
-            let split_generation_guards = state_row_indices
-                .iter()
-                .filter_map(|&row_index| {
-                    let row = state_rows.row(row_index);
-                    (row.branch_id.as_str() == root.branch_id
-                        && !row.untracked
-                        && row.snapshot.is_some())
-                    .then_some(TrackedStateKeyRef {
-                        schema_key: row.schema_key,
-                        file_id: row.file_id.map(crate::common::SharedStr::as_str),
-                        entity_pk: row.entity_pk,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let guards_to_check = if split_generation_guards.is_empty() {
-                &absence_guards
-            } else {
-                &split_generation_guards
-            };
-            if !guards_to_check.is_empty() {
-                reject_tracked_absence_guards_against_untracked(
-                    read,
-                    &root.branch_id,
-                    control,
-                    guards_to_check,
-                )
-                .await?;
-            }
-        }
         let parent_generation = match (root.parent_commit_id, parent_control) {
             (_, Some(control)) if is_checkpoint_publication => Some(control.tracked_generation),
             (Some(parent_commit_id), Some(control))
@@ -3739,6 +3697,9 @@ async fn stage_tracked_head(
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
             let mut coverage = WorkingDiffIndexCoverage::default();
             let owned_absence_guards = owned_absence_guards(&absence_guards);
+            // One generation carries both retentions, so the branch's
+            // history-free rows are preserved from — and republished into —
+            // that same complete snapshot. There is no second root to advance.
             let (final_tracked, schema_keys) = tracked_head
                 .writer(read, writes)
                 .stage_complete_current_state_with_working_diff(
@@ -3747,7 +3708,7 @@ async fn stage_tracked_head(
                     final_tracked,
                     parent_control.map(|control| control.tracked_generation),
                     &[],
-                    &[],
+                    &untracked_deltas,
                     &owned_absence_guards,
                     checkpoint_commit_id,
                     &mut coverage,
@@ -3755,30 +3716,6 @@ async fn stage_tracked_head(
                 .await?;
             let mut control =
                 normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
-            if !untracked_deltas.is_empty() {
-                let previous_untracked_generation = parent_control
-                    .map(|parent| parent.untracked_generation)
-                    .unwrap_or(generation);
-                let next_revision = parent_control.map_or(Ok(0), |parent| {
-                    next_current_state_revision(parent.current_state_revision)
-                })?;
-                let next_untracked_generation = untracked_lifecycle_generation(
-                    &root.branch_id,
-                    previous_untracked_generation,
-                    next_revision,
-                );
-                tracked_head
-                    .writer(read, writes)
-                    .stage_untracked_generation(
-                        &root.branch_id,
-                        previous_untracked_generation,
-                        next_untracked_generation,
-                        &untracked_deltas,
-                        &BTreeSet::new(),
-                    )
-                    .await?;
-                control.untracked_generation = next_untracked_generation;
-            }
             control.reset_schema_presence();
             control.note_schemas(schema_keys.iter().map(String::as_str));
             tracked_snapshots.insert(root.commit_id, final_tracked);
@@ -4412,30 +4349,18 @@ async fn stage_tracked_head(
             generation,
             working_diff_checkpoint_commit_id,
         )?;
-        if !untracked_deltas.is_empty() {
-            let previous_untracked_generation = parent_control
-                .map(|parent| parent.untracked_generation)
-                .unwrap_or(parent_generation);
-            let next_revision = parent_control.map_or(Ok(0), |parent| {
-                next_current_state_revision(parent.current_state_revision)
-            })?;
-            let next_untracked_generation = untracked_lifecycle_generation(
+        // History-free rows mutate the same generation the tracked deltas just
+        // published, in place. `normal_branch_head_control` already advanced
+        // `current_state_revision`, so the control CAS still fences this write.
+        tracked_head
+            .writer(read, writes)
+            .stage_untracked_current_state(
                 &root.branch_id,
-                previous_untracked_generation,
-                next_revision,
-            );
-            tracked_head
-                .writer(read, writes)
-                .stage_untracked_generation(
-                    &root.branch_id,
-                    previous_untracked_generation,
-                    next_untracked_generation,
-                    &untracked_deltas,
-                    &BTreeSet::new(),
-                )
-                .await?;
-            control.untracked_generation = next_untracked_generation;
-        }
+                generation,
+                &untracked_deltas,
+                &BTreeSet::new(),
+            )
+            .await?;
         control.note_schemas(
             deltas
                 .iter()
@@ -4443,44 +4368,6 @@ async fn stage_tracked_head(
                 .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
         );
         insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
-    }
-
-    // Bootstrap may initially use one physical generation for both selector
-    // domains. A tracked-only publication mutates that generation in place,
-    // so preserve the complete untracked authority under its own selector
-    // before publishing the updated branch control. Subsequent publications
-    // already have disjoint selectors and pay no copy cost.
-    for (branch_id, control) in &mut controls {
-        if !key_value_control_mutations.contains(branch_id.as_str()) {
-            continue;
-        }
-        let Some(previous) = observations
-            .get(branch_id)
-            .and_then(|observation| observation.control)
-        else {
-            continue;
-        };
-        if control.tracked_generation != control.untracked_generation
-            || control.untracked_generation != previous.untracked_generation
-        {
-            continue;
-        }
-        let next_generation = untracked_lifecycle_generation(
-            branch_id,
-            previous.untracked_generation,
-            control.current_state_revision,
-        );
-        tracked_head
-            .writer(read, writes)
-            .stage_untracked_generation(
-                branch_id,
-                previous.untracked_generation,
-                next_generation,
-                &[],
-                &BTreeSet::new(),
-            )
-            .await?;
-        control.untracked_generation = next_generation;
     }
 
     // An untracked-only transaction touches the same hot rows without
@@ -4549,19 +4436,15 @@ async fn stage_tracked_head(
                     "branch current-state revision overflowed",
                 )
             })?;
-        let next_generation =
-            untracked_lifecycle_generation(branch_id, control.untracked_generation, next_revision);
         tracked_head
             .writer(read, writes)
-            .stage_untracked_generation(
+            .stage_untracked_current_state(
                 branch_id,
-                control.untracked_generation,
-                next_generation,
+                control.tracked_generation,
                 &deltas,
                 &owned_absence_guards,
             )
             .await?;
-        control.untracked_generation = next_generation;
         control.current_state_revision = next_revision;
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, branch_id, control)?;
@@ -4630,85 +4513,6 @@ fn owned_absence_guards(guards: &[TrackedStateKeyRef<'_>]) -> BTreeSet<TrackedSt
 /// The tracked writer intentionally reads only its authenticated tracked root;
 /// when the selectors diverge, validate the correlated INSERT identities
 /// against the untracked generation before publishing the tracked root.
-async fn reject_tracked_absence_guards_against_untracked(
-    read: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    control: BranchHeadControl,
-    guards: &[TrackedStateKeyRef<'_>],
-) -> Result<(), LixError> {
-    let schema_keys = guards
-        .iter()
-        .map(|guard| guard.schema_key.to_owned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let entity_pks = guards
-        .iter()
-        .map(|guard| guard.entity_pk.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let file_ids = guards
-        .iter()
-        .map(|guard| guard.file_id.map(str::to_owned))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|file_id| match file_id {
-            Some(file_id) => NullableKeyFilter::Value(file_id),
-            None => NullableKeyFilter::Null,
-        })
-        .collect();
-    let rows = TrackedHeadContext::new()
-        .reader(read)
-        .scan_live_batch_for_retention(
-            branch_id,
-            control,
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys,
-                    entity_pks,
-                    file_ids,
-                    include_tombstones: true,
-                },
-                read_columns: TrackedStateReadColumns::default(),
-                limit: None,
-            },
-            Some(true),
-        )
-        .await?
-        .into_rows();
-    let existing = rows
-        .into_iter()
-        .filter(|row| row.untracked && !row.deleted)
-        .map(|row| TrackedStateKey {
-            schema_key: row.schema_key,
-            entity_pk: row.entity_pk,
-            file_id: row.file_id,
-        })
-        .collect::<BTreeSet<_>>();
-    for guard in guards {
-        let key = TrackedStateKey {
-            schema_key: guard.schema_key.to_owned(),
-            entity_pk: guard.entity_pk.clone(),
-            file_id: guard.file_id.map(str::to_owned),
-        };
-        if existing.contains(&key) {
-            return Err(untracked_current_identity_collision_error(&key));
-        }
-    }
-    Ok(())
-}
-
-fn untracked_current_identity_collision_error(key: &TrackedStateKey) -> LixError {
-    LixError::new(
-        LixError::CODE_UNIQUE,
-        format!(
-            "cannot insert tracked row in schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
-            key.schema_key, key.entity_pk,
-        ),
-    )
-}
-
 fn packed_current_base_guards_match(
     deltas: &[crate::live_state::CurrentStateDeltaRef<'_>],
     guards: &[TrackedStateKeyRef<'_>],
@@ -4943,9 +4747,6 @@ fn normal_branch_head_control(
     generation: CommitId,
     working_diff_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<BranchHeadControl, LixError> {
-    let untracked_generation = previous
-        .map(|control| control.untracked_generation)
-        .unwrap_or(generation);
     let current_state_revision = match previous {
         Some(control) => control
             .current_state_revision
@@ -4961,7 +4762,6 @@ fn normal_branch_head_control(
     Ok(BranchHeadControl {
         head_commit_id: root.commit_id,
         tracked_generation: generation,
-        untracked_generation,
         current_state_revision,
         working_diff_checkpoint_commit_id,
         created_at: previous.map_or(root.ref_updated_at, |control| control.created_at),
@@ -5068,9 +4868,6 @@ async fn stage_root_backed_branch_publication(
     let mut control = BranchHeadControl {
         head_commit_id,
         tracked_generation: generation,
-        untracked_generation: previous_control
-            .map(|control| control.untracked_generation)
-            .unwrap_or(generation),
         current_state_revision: match previous_control {
             None => 0,
             // An explicit move of an existing head is a new current-state
@@ -5135,19 +4932,15 @@ async fn stage_root_backed_branch_publication(
                 })
                 .collect()
         };
-        let next_generation =
-            untracked_lifecycle_generation(branch_id, control.untracked_generation, revision);
         tracked_head
             .writer(read, writes)
-            .stage_untracked_generation(
+            .stage_untracked_current_state(
                 branch_id,
-                control.untracked_generation,
-                next_generation,
+                control.tracked_generation,
                 &untracked_deltas,
                 &absence_guards,
             )
             .await?;
-        control.untracked_generation = next_generation;
         control.current_state_revision = revision;
     }
     Ok(control)

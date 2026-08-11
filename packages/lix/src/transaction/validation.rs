@@ -292,28 +292,19 @@ async fn scan_committed_canonical_rows(
             "untracked".to_string(),
         ],
     };
-    // Probe the two authenticated selectors independently. Each request is
+    // One plane means one row per identity, so a single retention-agnostic
+    // probe already returns whichever member owns the identity. The request is
     // exactly K identities and therefore remains bounded by the directory
     // point-read path; no schema or `All` expansion is permitted here.
-    let tracked = live_state
-        .load_exact_batch(&LiveStateExactBatchRequest {
-            rows: rows.clone(),
-            projection: projection.clone(),
-            untracked: Some(false),
-            include_tombstones: false,
-        })
-        .await?;
-    let untracked = live_state
+    let batch = live_state
         .load_exact_batch(&LiveStateExactBatchRequest {
             rows,
             projection,
-            untracked: Some(true),
+            untracked: None,
             include_tombstones: false,
         })
-        .await?;
-    let mut rows = tracked.into_present_batch().into_rows();
-    rows.extend(untracked.into_present_batch().into_rows());
-    let batch = MaterializedLiveStateBatch::from_rows(rows);
+        .await?
+        .into_present_batch();
     CommittedLiveStateRows::select(batch, |row| {
         domain.contains_canonical_ref(row)
             && row.schema_key() == schema_key
