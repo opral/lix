@@ -151,8 +151,7 @@ async fn run<StorageImpl>(
     seed_files(&session, &file_ids).await;
     // Every dirty row must exist before the checkpoint so the working diff is
     // a pure "modified" set with a stable returned-row count.
-    let bulk_rows_per_file = rows_per_file;
-    seed_rows(&session, &file_ids, bulk_rows_per_file).await;
+    seed_rows(&session, &file_ids, rows_per_file).await;
 
     session
         .create_checkpoint()
@@ -164,7 +163,7 @@ async fn run<StorageImpl>(
         &session,
         &[(0usize, PROBE_DIRTY_ROWS)],
         changes_per_commit,
-        bulk_rows_per_file,
+        rows_per_file,
     )
     .await;
     // … and spread the remainder over files 1..files, never touching file 0.
@@ -172,7 +171,7 @@ async fn run<StorageImpl>(
     let mut remaining = bulk_rows_needed;
     let mut file_index = 1usize;
     while remaining > 0 && file_index < files.max(2) {
-        let take = remaining.min(bulk_rows_per_file);
+        let take = remaining.min(rows_per_file);
         plan.push((file_index, take));
         remaining -= take;
         file_index += 1;
@@ -183,9 +182,9 @@ async fn run<StorageImpl>(
     assert_eq!(
         remaining, 0,
         "fixture cannot hold {dirty_target} dirty rows in {files} files \
-         at {bulk_rows_per_file} rows/file"
+         at {rows_per_file} rows/file"
     );
-    dirty_rows(&session, &plan, changes_per_commit, bulk_rows_per_file).await;
+    dirty_rows(&session, &plan, changes_per_commit, rows_per_file).await;
 
     let probe_file = file_ids[0].clone();
     let file_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
