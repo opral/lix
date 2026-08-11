@@ -32,6 +32,8 @@ const STREAM_PERIOD: Duration = Duration::from_millis(80);
 const PLAYBACK_READ_AHEAD: Duration = Duration::from_secs(1);
 const STREAM_SAMPLES: usize = 40;
 const SAVE_SAMPLES: usize = 40;
+const SAVE_CONFLICT_RETRIES: usize = 32;
+static SAVE_CONFLICT_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 const HISTORY_COMMITS: usize = 5_000;
 const TIB: u64 = 1024 * 1024 * 1024 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -323,7 +325,7 @@ where
     let projected_leaf_rows = TIB / FILE_UPLOAD_PART_BYTES as u64;
     let projected_chunk_rows = TIB / STREAM_READ_BYTES;
     println!(
-        "movie_workspace,backend={backend},row_count_projection_tib=1,representative_files=164,file_size_gib=1-20,projected_leaf_rows={projected_leaf_rows},projected_legacy_chunk_rows={projected_chunk_rows},timed_file_mib=512,save_p95_ms={:.3},stream_1_late={},stream_2_late={},ingest_mib_s={ingest_mib_s:.1},temporary_leaf_rows={},legacy_chunk_rows={},row_reduction_x={row_reduction:.1},locator_staging_attempts={},object_store_logical_reads={},object_store_logical_writes={},chunk_hash_bytes_including_retries={},segment_identity_metadata_hash_bytes={},cache_fs_read_attempts={},cache_fs_write_attempts={},cache_fs_remove_attempts={},writer_gate_wait_ms={:.3}",
+        "movie_workspace,backend={backend},row_count_projection_tib=1,representative_files=164,file_size_gib=1-20,projected_leaf_rows={projected_leaf_rows},projected_legacy_chunk_rows={projected_chunk_rows},timed_file_mib=512,save_p95_ms={:.3},stream_1_late={},stream_2_late={},ingest_mib_s={ingest_mib_s:.1},temporary_leaf_rows={},legacy_chunk_rows={},row_reduction_x={row_reduction:.1},locator_staging_attempts={},object_store_logical_reads={},object_store_logical_writes={},chunk_hash_bytes_including_retries={},segment_identity_metadata_hash_bytes={},cache_fs_read_attempts={},cache_fs_write_attempts={},cache_fs_remove_attempts={},writer_gate_wait_ms={:.3},save_conflict_retries={}",
         save_p95.as_secs_f64() * 1000.0,
         first_late,
         second_late,
@@ -338,6 +340,7 @@ where
         io.cache_filesystem_writes,
         io.cache_filesystem_removes,
         io.writer_gate_wait_nanos as f64 / 1_000_000.0,
+        SAVE_CONFLICT_RETRY_COUNT.load(Ordering::Relaxed),
     );
     assert!(save_p95 < Duration::from_millis(500));
     assert_eq!(first_late, 0, "first 100 Mbit/s stream fell behind");
@@ -498,10 +501,30 @@ where
             sample * 24
         );
         let started = Instant::now();
-        session
-            .upsert_file_content("/project/edit.json".to_owned(), payload.into_bytes().into())
-            .await
-            .expect("save project file");
+        // Saves run concurrently with media ingest, so the engine may reject a
+        // save whose snapshot went stale and ask for a retry. Retrying is what
+        // a real editor does, and the retry time belongs in the save latency
+        // this qualification gates on.
+        let mut attempt = 0;
+        loop {
+            match session
+                .upsert_file_content(
+                    "/project/edit.json".to_owned(),
+                    payload.clone().into_bytes().into(),
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(error)
+                    if error.code == lix::LixError::CODE_TRANSACTION_CONFLICT
+                        && attempt < SAVE_CONFLICT_RETRIES =>
+                {
+                    attempt += 1;
+                    SAVE_CONFLICT_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => panic!("save project file: {error:?}"),
+            }
+        }
         timings.push(started.elapsed());
     }
     timings
