@@ -189,39 +189,67 @@ async fn run<StorageImpl>(
                     FROM lix_working_diff WHERE file_id = $1";
     let full_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
                     FROM lix_working_diff";
-    let finite_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
-                      FROM lix_working_diff \
-                      WHERE schema_key = $1 AND entity_pk = lix_json($2)";
+    // `schema_key + file_id`, the shape of the only file-scoped working-diff
+    // test in the tree. Still a full HOT_DIFF scan today.
+    let file_schema_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
+                           FROM lix_working_diff WHERE file_id = $1 AND schema_key = $2";
+    // Finite identity + file id: takes the existing bypass and resolves as a
+    // point read. This is the floor a seekable file-scoped read aims at.
+    let point_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
+                     FROM lix_working_diff \
+                     WHERE schema_key = $1 AND entity_pk = lix_json($2) AND file_id = $3";
+    // Live-state read of the same file through HOT_ROW's existing file-first
+    // prefix seek. Proxy for what a HOT_ROW-seeking working-diff read would
+    // cost: O(live rows in the file) instead of O(all dirty rows).
+    let proxy_sql = format!("SELECT id FROM {SCHEMA_KEY} WHERE lixcol_file_id = $1");
     let file_params = vec![Value::Text(probe_file.clone())];
-    let finite_params = vec![
+    let file_schema_params = vec![
+        Value::Text(probe_file.clone()),
+        Value::Text(SCHEMA_KEY.to_string()),
+    ];
+    let point_params = vec![
         Value::Text(SCHEMA_KEY.to_string()),
         Value::Text(format!("[\"{}\"]", row_id(0, 0))),
+        Value::Text(probe_file.clone()),
     ];
 
     // Warm provider construction and the block cache outside the samples.
     let file_rows = rows(&session, file_sql, &file_params).await;
     let full_rows = rows(&session, full_sql, &[]).await;
-    let finite_rows = rows(&session, finite_sql, &finite_params).await;
+    let file_schema_rows = rows(&session, file_schema_sql, &file_schema_params).await;
+    let point_rows = rows(&session, point_sql, &point_params).await;
+    let proxy_rows = rows(&session, &proxy_sql, &file_params).await;
 
     let file = sample(&session, file_sql, &file_params, reps).await;
     let full = sample(&session, full_sql, &[], reps).await;
-    let finite = sample(&session, finite_sql, &finite_params, reps).await;
+    let file_schema = sample(&session, file_schema_sql, &file_schema_params, reps).await;
+    let point = sample(&session, point_sql, &point_params, reps).await;
+    let proxy = sample(&session, &proxy_sql, &file_params, reps).await;
 
     println!(
         "working_diff_file_scope backend={backend} files={files} total_dirty={full_rows} \
-         file_rows={file_rows} full_rows={full_rows} finite_rows={finite_rows} reps={reps} \
+         file_rows={file_rows} full_rows={full_rows} file_schema_rows={file_schema_rows} \
+         point_rows={point_rows} proxy_rows={proxy_rows} reps={reps} \
          file_p50_ms={:.3} file_min_ms={:.3} file_max_ms={:.3} \
          full_p50_ms={:.3} full_min_ms={:.3} full_max_ms={:.3} \
-         finite_p50_ms={:.3} finite_min_ms={:.3} finite_max_ms={:.3}",
+         file_schema_p50_ms={:.3} file_schema_min_ms={:.3} file_schema_max_ms={:.3} \
+         point_p50_ms={:.3} point_min_ms={:.3} point_max_ms={:.3} \
+         proxy_p50_ms={:.3} proxy_min_ms={:.3} proxy_max_ms={:.3}",
         millis(file.0),
         millis(file.1),
         millis(file.2),
         millis(full.0),
         millis(full.1),
         millis(full.2),
-        millis(finite.0),
-        millis(finite.1),
-        millis(finite.2),
+        millis(file_schema.0),
+        millis(file_schema.1),
+        millis(file_schema.2),
+        millis(point.0),
+        millis(point.1),
+        millis(point.2),
+        millis(proxy.0),
+        millis(proxy.1),
+        millis(proxy.2),
     );
     drop(session);
     drop(engine);
