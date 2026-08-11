@@ -2389,12 +2389,15 @@ mod ownership_census_fixture {
             pre_checkpoint.insert(head(&storage).await);
         }
         report_census(&storage, pre, "before-checkpoint", &pre_checkpoint).await;
+        report_row_provenance(&session, pre, "before-checkpoint").await;
         session
             .create_checkpoint()
             .await
             .expect("census checkpoint should publish");
         let checkpoint = head(&storage).await;
         report_census(&storage, pre, "after-checkpoint", &pre_checkpoint).await;
+        report_row_provenance(&session, pre, "after-checkpoint").await;
+        println!("CENSUS-CHECKPOINT depth={pre} checkpoint_commit={checkpoint}");
         for row in 0..post {
             session
                 .execute(
@@ -2408,8 +2411,27 @@ mod ownership_census_fixture {
                 .expect("census post row should publish");
         }
 
-        let _ = checkpoint;
         report_census(&storage, pre, "final", &pre_checkpoint).await;
+        report_row_provenance(&session, pre, "final").await;
+    }
+
+    async fn report_row_provenance(
+        session: &crate::session::SessionContext<Memory>,
+        depth: usize,
+        phase: &str,
+    ) {
+        let result = session
+            .execute(
+                "SELECT COUNT(*) AS rows, COUNT(DISTINCT lixcol_commit_id) AS commits FROM census_fixture",
+                &[],
+            )
+            .await
+            .expect("provenance query should run");
+        let rows = result.rows();
+        println!(
+            "CENSUS-PROVENANCE depth={depth} phase={phase} {:?}",
+            rows.iter().map(|row| format!("{:?}", row)).collect::<Vec<_>>()
+        );
     }
 
     async fn report_census(
