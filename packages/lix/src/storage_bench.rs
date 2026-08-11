@@ -476,7 +476,19 @@ pub enum CommitGraphBenchMode {
     LegacyAllNodes,
     ReachableNodes,
     LegacyReachableNodes,
+    /// Whole reachable history for one member schema.
+    HistoryFull,
+    /// History restricted to the head commit (`lixcol_depth = 0`).
+    HistoryDepth0,
+    /// History for a bounded row demand (`LIMIT 10`).
+    HistoryLimit10,
 }
+
+/// Row demand a bounded history benchmark mode asks for.
+const COMMIT_GRAPH_BENCH_HISTORY_LIMIT: usize = 10;
+
+/// Schema key that [`seed_commit_graph_members_for_bench`] writes per commit.
+const COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY: &str = "commit_graph_bench_member";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CommitGraphBenchResult {
@@ -737,6 +749,36 @@ where
     let mut reader = crate::commit_graph::CommitGraphContext::new().reader(read);
     let head_commit_id =
         crate::changelog::CommitId::parse_lix(head_commit_id, "commit graph benchmark head")?;
+    if let Some((max_depth, limit)) = match mode {
+        CommitGraphBenchMode::HistoryFull => Some((None, None)),
+        CommitGraphBenchMode::HistoryDepth0 => Some((Some(0), None)),
+        CommitGraphBenchMode::HistoryLimit10 => {
+            Some((None, Some(COMMIT_GRAPH_BENCH_HISTORY_LIMIT)))
+        }
+        _ => None,
+    } {
+        let history = reader
+            .change_history_from_commit(
+                &head_commit_id,
+                &crate::commit_graph::CommitGraphChangeHistoryRequest {
+                    entity_pks: Vec::new(),
+                    schema_keys: vec![COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY.to_string()],
+                    file_ids: Vec::new(),
+                    min_depth: None,
+                    max_depth,
+                    include_tombstones: true,
+                    limit,
+                },
+            )
+            .await?;
+        let entries = history.entries.len();
+        std::hint::black_box(history);
+        return Ok(CommitGraphBenchResult {
+            nodes: 0,
+            edges: 0,
+            member_changes: entries,
+        });
+    }
     let nodes = match mode {
         CommitGraphBenchMode::AllNodes | CommitGraphBenchMode::LegacyAllNodes => {
             reader.all_nodes().await?
@@ -747,6 +789,9 @@ where
             .iter()
             .map(|reachable| reachable.commit.clone())
             .collect(),
+        CommitGraphBenchMode::HistoryFull
+        | CommitGraphBenchMode::HistoryDepth0
+        | CommitGraphBenchMode::HistoryLimit10 => unreachable!("history modes returned above"),
     };
     let node_count = nodes.len();
     let edges = crate::commit_graph::commit_edges(&nodes).len();
@@ -825,7 +870,7 @@ where
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
                 delta: crate::tracked_state::TrackedStateDeltaRef {
-                    schema_key: "commit_graph_bench_member",
+                    schema_key: COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY,
                     file_id: None,
                     entity_pk: &entity_pk,
                     change_id: crate::changelog::ChangeId::for_test_label(&format!(

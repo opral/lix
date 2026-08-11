@@ -317,6 +317,7 @@ pub(crate) fn commit_graph_history_request(
 ) -> Option<CommitGraphChangeHistoryRequest> {
     let schema_keys = effective_schema_keys(route, schema_keys)?;
     Some(CommitGraphChangeHistoryRequest {
+        limit: None,
         entity_pks: if route.resolved_entity_pks.is_empty() {
             route
                 .entity_pks
