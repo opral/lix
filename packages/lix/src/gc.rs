@@ -836,6 +836,11 @@ async fn load_authenticated_serving_dependency_closure<S>(
     chronology_roots: BTreeSet<CommitId>,
     serving_dependencies: BTreeSet<CommitId>,
     history_dependencies: BTreeSet<CommitId>,
+    // Commits reachable from the roots through canonical parent links. This
+    // retains the *semantic* plane only: the public history surfaces walk the
+    // commit graph, so their projections are load-bearing, while their physical
+    // delta segments are exactly what compaction is supposed to free.
+    graph_reachable: BTreeSet<CommitId>,
 ) -> Result<AuthenticatedServingDependencyClosure, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
@@ -858,6 +863,7 @@ where
     physical_dependencies.extend(history_dependencies.iter().copied());
     let mut semantic_dependencies = serving_dependencies;
     semantic_dependencies.extend(history_dependencies.iter().copied());
+    semantic_dependencies.extend(graph_reachable);
     let mut cas_logical_dependencies = history_dependencies;
     let mut manifests = BTreeMap::new();
     let mut pending = chronology_roots.iter().copied().collect::<Vec<_>>();
@@ -1061,13 +1067,13 @@ where
                 ]
             }),
     );
-    let mut history_dependencies = control_reachability.history_dependencies;
-    history_dependencies.extend(collect_ref_reachable_commit_ids(store, &chronology_roots).await?);
+    let graph_reachable = collect_ref_reachable_commit_ids(store, &chronology_roots).await?;
     load_authenticated_serving_dependency_closure(
         store,
         chronology_roots,
         control_reachability.serving_dependencies,
-        history_dependencies,
+        control_reachability.history_dependencies,
+        graph_reachable,
     )
     .await
 }
@@ -2750,6 +2756,7 @@ mod tests {
         let closure = super::load_authenticated_serving_dependency_closure(
             &read,
             BTreeSet::from([active.commit_id]),
+            BTreeSet::new(),
             BTreeSet::new(),
             BTreeSet::new(),
         )
