@@ -1840,16 +1840,30 @@ pub struct CommitDeltaSegmentSimilarity {
     pub min_differing_pair_common_suffix: u64,
     /// Whether any pair was compared at all.
     pub compared_any: bool,
+    /// Segments that a content-addressed plane could have elided *if* the
+    /// format also hoisted per-commit identity out of the payload. Two segments
+    /// count as content-equal when they share a byte length and their differing
+    /// bytes all fall inside one window of at most
+    /// `SEGMENT_IDENTITY_WINDOW_BYTES`.
+    pub identity_normalized_duplicate_segments: u64,
+    pub identity_normalized_duplicate_bytes: u64,
+    /// Content-equivalence classes with more than one member.
+    pub identity_normalized_shared_classes: u64,
 }
 
 /// Cap on distinct same-length values compared pairwise per length bucket.
 const SEGMENT_SIMILARITY_BUCKET_CAP: usize = 128;
+/// How much per-segment identity a redesigned payload is allowed to hoist out.
+/// The LXCD16 direct leaf carries a 16-byte commit id, a 4-byte packed base and
+/// a small timestamp-tail dictionary; 128 bytes is a generous allowance for all
+/// of it, so this over-counts rather than under-counts the achievable win.
+const SEGMENT_IDENTITY_WINDOW_BYTES: usize = 128;
 
 pub async fn commit_delta_segment_similarity<R>(read: &R) -> CommitDeltaSegmentSimilarity
 where
     R: StorageAdapterRead,
 {
-    let mut distinct = std::collections::HashMap::<[u8; 32], Bytes>::new();
+    let mut distinct = std::collections::HashMap::<[u8; 32], (Bytes, u64)>::new();
     let mut segments = 0u64;
     for entry in scan_layout_entries(
         read,
@@ -1861,14 +1875,18 @@ where
         let StorageProjectedValue::FullValue(value) = entry.value else {
             continue;
         };
-        distinct
+        let slot = distinct
             .entry(*blake3::hash(&value).as_bytes())
-            .or_insert(value);
+            .or_insert((value, 0));
+        slot.1 += 1;
     }
 
-    let mut buckets = std::collections::BTreeMap::<usize, Vec<Bytes>>::new();
-    for value in distinct.into_values() {
-        buckets.entry(value.len()).or_default().push(value);
+    let mut buckets = std::collections::BTreeMap::<usize, Vec<(Bytes, u64)>>::new();
+    for (value, occurrences) in distinct.into_values() {
+        buckets
+            .entry(value.len())
+            .or_default()
+            .push((value, occurrences));
     }
 
     let mut similarity = CommitDeltaSegmentSimilarity {
@@ -1883,8 +1901,10 @@ where
         }
         similarity.same_length_distinct_values += values.len() as u64;
         let window = &values[..values.len().min(SEGMENT_SIMILARITY_BUCKET_CAP)];
-        for (index, left) in window.iter().enumerate() {
-            for right in &window[index + 1..] {
+        // Union-find over "content-equal once identity is hoisted out".
+        let mut class = (0..window.len()).collect::<Vec<_>>();
+        for (index, (left, _)) in window.iter().enumerate() {
+            for (offset, (right, _)) in window[index + 1..].iter().enumerate() {
                 let differing = left
                     .iter()
                     .zip(right.iter())
@@ -1895,21 +1915,41 @@ where
                 if differing * 100 <= left.len() as u64 {
                     similarity.near_identical_pairs += 1;
                 }
+                let common_prefix = left
+                    .iter()
+                    .zip(right.iter())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                let common_suffix = left
+                    .iter()
+                    .rev()
+                    .zip(right.iter().rev())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                if differing > 0
+                    && common_prefix + common_suffix + SEGMENT_IDENTITY_WINDOW_BYTES >= left.len()
+                {
+                    union(&mut class, index, index + 1 + offset);
+                }
                 if differing < similarity.min_differing_bytes {
                     similarity.min_differing_bytes = differing;
                     similarity.min_differing_pair_len = left.len() as u64;
-                    similarity.min_differing_pair_common_prefix = left
-                        .iter()
-                        .zip(right.iter())
-                        .take_while(|(left, right)| left == right)
-                        .count() as u64;
-                    similarity.min_differing_pair_common_suffix = left
-                        .iter()
-                        .rev()
-                        .zip(right.iter().rev())
-                        .take_while(|(left, right)| left == right)
-                        .count() as u64;
+                    similarity.min_differing_pair_common_prefix = common_prefix as u64;
+                    similarity.min_differing_pair_common_suffix = common_suffix as u64;
                 }
+            }
+        }
+        let mut members = std::collections::BTreeMap::<usize, (u64, u64)>::new();
+        for (index, (value, occurrences)) in window.iter().enumerate() {
+            let root = find(&mut class, index);
+            let slot = members.entry(root).or_insert((0, value.len() as u64));
+            slot.0 += occurrences;
+        }
+        for (occurrences, len) in members.into_values() {
+            if occurrences > 1 {
+                similarity.identity_normalized_shared_classes += 1;
+                similarity.identity_normalized_duplicate_segments += occurrences - 1;
+                similarity.identity_normalized_duplicate_bytes += (occurrences - 1) * len;
             }
         }
     }
@@ -1917,6 +1957,22 @@ where
         similarity.min_differing_bytes = 0;
     }
     similarity
+}
+
+fn find(class: &mut [usize], mut index: usize) -> usize {
+    while class[index] != index {
+        class[index] = class[class[index]];
+        index = class[index];
+    }
+    index
+}
+
+fn union(class: &mut [usize], left: usize, right: usize) {
+    let left = find(class, left);
+    let right = find(class, right);
+    if left != right {
+        class[right] = left;
+    }
 }
 
 pub async fn binary_manifest_layout_accounting<R>(
