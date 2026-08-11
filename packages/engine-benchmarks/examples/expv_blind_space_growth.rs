@@ -78,6 +78,11 @@ async fn main() {
             let rows = parse_usize(arguments.get(2), 10);
             checkpoints_scenario(&samples, rows).await;
         }
+        "entity_commits" => {
+            let samples = parse_samples(arguments.get(1));
+            let rows = parse_usize(arguments.get(2), 10);
+            entity_commits_scenario(&samples, rows).await;
+        }
         "checkpoint_then_gc" => {
             let commits = parse_usize(arguments.get(1), 200);
             let rows = parse_usize(arguments.get(2), 10);
@@ -197,6 +202,66 @@ async fn checkpoints_scenario(samples: &[usize], rows_per_commit: usize) {
         }
         report(
             "checkpoints",
+            "live",
+            target as u64,
+            &usage(&fixture.storage).await,
+        );
+    }
+}
+
+/// A strictly typed flat entity surface, which is what
+/// `encode_registered_entity_row_groups` needs before it publishes anything
+/// into the two `entity.columnar_row_group_*` spaces. The JSON-valued schema
+/// the other scenarios use never reaches that encoder, so those two spaces stay
+/// empty there and would be misread as "bounded" without this workload.
+async fn entity_commits_scenario(samples: &[usize], rows_per_commit: usize) {
+    let fixture = Fixture::open().await;
+    let schema = serde_json::json!({
+        "x-lix-key": "expv_entity",
+        "x-lix-primary-key": ["/id"],
+        "type": "object",
+        "required": ["id", "name", "amount"],
+        "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "amount": { "type": "integer" }
+        },
+        "additionalProperties": false
+    });
+    fixture
+        .session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("register entity schema");
+    let mut committed = 0usize;
+    for &target in samples {
+        while committed < target {
+            let mut transaction = fixture
+                .session
+                .begin_transaction()
+                .await
+                .expect("begin commit");
+            for index in 0..rows_per_commit {
+                transaction
+                    .execute(
+                        "INSERT INTO expv_entity (id, name, amount) VALUES ($1, $2, $3)",
+                        &[
+                            Value::Text(format!("{committed:08}-{index:08}")),
+                            Value::Text(format!("name-{committed}-{index}")),
+                            Value::Integer((committed * 1000 + index) as i64),
+                        ],
+                    )
+                    .await
+                    .expect("insert entity row");
+            }
+            transaction.commit().await.expect("commit entity batch");
+            committed += 1;
+        }
+        report(
+            "entity_commits",
             "live",
             target as u64,
             &usage(&fixture.storage).await,
