@@ -2568,7 +2568,6 @@ simulation_test!(
 
         main.switch_branch(SwitchBranchOptions {
             branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
-            pinned_commit_id: None,
         })
         .await
         .expect("switch should succeed");
