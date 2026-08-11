@@ -2,13 +2,9 @@ use bytes::Bytes;
 
 use crate::LixError;
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    REVISION_KEY_CATALOG, REVISION_SPACE, StorageAdapterRead, StorageValue, StorageWriteSet,
+    load_revision, revision_key,
 };
-
-const CATALOG_REVISION_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0007_0003), "catalog.schema_revision");
-const CATALOG_REVISION_KEY: &[u8] = b"global";
 
 /// Storage-snapshot identity for the visible registered-schema catalog.
 ///
@@ -18,8 +14,12 @@ const CATALOG_REVISION_KEY: &[u8] = b"global";
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CatalogRevision(Bytes);
 
-#[cfg(test)]
 impl CatalogRevision {
+    pub(crate) fn from_storage_bytes(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_test(value: &'static [u8]) -> Self {
         Self(Bytes::from_static(value))
     }
@@ -28,32 +28,15 @@ impl CatalogRevision {
 pub(crate) async fn load_catalog_revision(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Option<CatalogRevision>, LixError> {
-    let result = PointReadPlan::new(
-        CATALOG_REVISION_SPACE,
-        &[StorageKey(Bytes::from_static(CATALOG_REVISION_KEY))],
-    )
-    .materialize(
-        store,
-        StorageGetOptions {
-            projection: StorageCoreProjection::FullValue,
-        },
-    )
-    .await?;
-    Ok(result
-        .value
-        .into_iter()
-        .next()
-        .flatten()
-        .and_then(|value| match value {
-            StorageProjectedValue::FullValue(bytes) => Some(CatalogRevision(bytes)),
-            StorageProjectedValue::KeyOnly => None,
-        }))
+    Ok(load_revision(store, REVISION_KEY_CATALOG)
+        .await?
+        .map(CatalogRevision::from_storage_bytes))
 }
 
 pub(crate) fn stage_catalog_revision(writes: &mut StorageWriteSet) {
     writes.put(
-        CATALOG_REVISION_SPACE,
-        StorageKey(Bytes::from_static(CATALOG_REVISION_KEY)),
+        REVISION_SPACE,
+        revision_key(REVISION_KEY_CATALOG),
         StorageValue {
             bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
         },

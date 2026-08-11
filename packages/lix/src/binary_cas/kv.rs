@@ -15,7 +15,10 @@ use crate::binary_cas::{
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
-use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace, StorageWriteSet};
+use crate::storage_adapter::{
+    PointReadPlan, REVISION_KEY_BINARY_CAS_EPOCH, REVISION_SPACE, StorageAdapterRead, StorageSpace,
+    StorageWriteSet, load_revision, revision_key,
+};
 use crate::storage_adapter::{
     StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange,
     StoragePrecondition, StorageProjectedValue, StorageSpaceId, StorageValue,
@@ -53,34 +56,12 @@ pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::m
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
 );
-const BINARY_CAS_MUTATION_EPOCH_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0005_0005), "binary_cas.mutation_epoch.v1");
-const BINARY_CAS_MUTATION_EPOCH_KEY: &[u8] = b"epoch";
-
 pub(in crate::binary_cas) async fn load_mutation_epoch(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<(u64, Option<Bytes>), LixError> {
-    let key = StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY));
-    let value = PointReadPlan::new(BINARY_CAS_MUTATION_EPOCH_SPACE, std::slice::from_ref(&key))
-        .materialize(
-            store,
-            StorageGetOptions {
-                projection: StorageCoreProjection::FullValue,
-            },
-        )
-        .await?
-        .value
-        .into_iter()
-        .next()
-        .flatten();
+    let value = load_revision(store, REVISION_KEY_BINARY_CAS_EPOCH).await?;
     let Some(value) = value else {
         return Ok((0, None));
-    };
-    let StorageProjectedValue::FullValue(value) = value else {
-        return Err(LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "binary CAS mutation epoch omitted its value",
-        ));
     };
     if value.len() != 8 {
         return Err(LixError::new(
@@ -106,9 +87,9 @@ pub(in crate::binary_cas) fn stage_mutation_epoch(
             "binary CAS mutation epoch exhausted",
         )
     })?;
-    let key = StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY));
+    let key = revision_key(REVISION_KEY_BINARY_CAS_EPOCH);
     writes.put(
-        BINARY_CAS_MUTATION_EPOCH_SPACE,
+        REVISION_SPACE,
         key.clone(),
         StorageValue {
             bytes: Bytes::copy_from_slice(&next.to_be_bytes()),
@@ -116,12 +97,12 @@ pub(in crate::binary_cas) fn stage_mutation_epoch(
     );
     preconditions.push(match token {
         Some(expected) => StoragePrecondition::KeyValueEquals {
-            space: BINARY_CAS_MUTATION_EPOCH_SPACE,
+            space: REVISION_SPACE,
             key,
             expected,
         },
         None => StoragePrecondition::KeyAbsent {
-            space: BINARY_CAS_MUTATION_EPOCH_SPACE,
+            space: REVISION_SPACE,
             key,
         },
     });
@@ -2687,8 +2668,8 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let mut corrupt = storage.new_write_set();
         corrupt.put(
-            BINARY_CAS_MUTATION_EPOCH_SPACE,
-            StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY)),
+            REVISION_SPACE,
+            revision_key(REVISION_KEY_BINARY_CAS_EPOCH),
             StorageValue {
                 bytes: Bytes::from_static(b"bad"),
             },

@@ -20,8 +20,8 @@ use crate::live_state::{
     MaterializedLiveStateRow,
 };
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    REVISION_KEY_FILESYSTEM_PATH, REVISION_SPACE, StorageAdapterRead, StorageValue,
+    StorageWriteSet, load_revision, revision_key,
 };
 
 use super::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
@@ -31,11 +31,6 @@ use super::keys::{
 use super::persistent_map::PersistentMap;
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey};
 
-const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0007_0002),
-    "filesystem.path_index_revision",
-);
-const FILESYSTEM_PATH_REVISION_KEY: &[u8] = b"global";
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EAGER_BLOB_BYTES: usize = 32 * 1024;
 const MAX_EAGER_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -1398,32 +1393,15 @@ impl FilesystemPathIndexCache {
 pub(crate) async fn load_path_index_revision(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let result = PointReadPlan::new(
-        FILESYSTEM_PATH_REVISION_SPACE,
-        &[StorageKey(Bytes::from_static(FILESYSTEM_PATH_REVISION_KEY))],
-    )
-    .materialize(
-        store,
-        StorageGetOptions {
-            projection: StorageCoreProjection::FullValue,
-        },
-    )
-    .await?;
-    Ok(result
-        .value
-        .into_iter()
-        .next()
-        .flatten()
-        .and_then(|value| match value {
-            StorageProjectedValue::FullValue(bytes) => Some(bytes.to_vec()),
-            StorageProjectedValue::KeyOnly => None,
-        }))
+    Ok(load_revision(store, REVISION_KEY_FILESYSTEM_PATH)
+        .await?
+        .map(|bytes| bytes.to_vec()))
 }
 
 pub(crate) fn stage_path_index_revision(writes: &mut StorageWriteSet) {
     writes.put(
-        FILESYSTEM_PATH_REVISION_SPACE,
-        StorageKey(Bytes::from_static(FILESYSTEM_PATH_REVISION_KEY)),
+        REVISION_SPACE,
+        revision_key(REVISION_KEY_FILESYSTEM_PATH),
         StorageValue {
             bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
         },
