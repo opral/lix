@@ -10149,6 +10149,7 @@ async fn resolve_working_diff_before_payloads<'a>(
     if pending.is_empty() {
         return Ok(());
     }
+    let pending_len = pending.len();
     let records = crate::changelog::load_change_records(
         store,
         pending.iter().map(|before| {
@@ -10164,9 +10165,12 @@ async fn resolve_working_diff_before_payloads<'a>(
             .as_mut()
             .expect("pending before images are present the second time");
         let record = records.get(&version.change_id).ok_or_else(|| {
-            head_value_error(
-                "working-diff baseline references a change record that is no longer readable",
-            )
+            head_value_error(&format!(
+                "working-diff baseline references change record '{}' that is no longer readable (loaded {} of {})",
+                version.change_id,
+                records.len(),
+                pending_len,
+            ))
         })?;
         version.resolve_payload_slots(
             packed_working_diff_slot(&record.snapshot),
