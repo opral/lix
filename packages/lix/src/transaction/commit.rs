@@ -2942,7 +2942,6 @@ fn select_new_rootless_ordered_commits(
 
 struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
-    tracked_snapshots: BTreeMap<CommitId, HotTrackedSnapshot>,
     deferred_fresh_hot_plans: Vec<crate::live_state::DeferredFreshHotPlan>,
 }
 
@@ -4495,7 +4494,6 @@ async fn stage_tracked_head(
     }
     Ok(StagedHotHeads {
         controls,
-        tracked_snapshots,
         deferred_fresh_hot_plans,
     })
 }
