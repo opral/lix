@@ -3,21 +3,27 @@ use crate::compression::decompress_zstd;
 
 /// Compression level for JSON-store payloads.
 ///
-/// Level 3 is zstd's own default and is better tuned than level 1 for the
-/// multi-kilobyte JSON this store holds. Measured across seven corpora on the
-/// current head, it is better on every axis and worse on none: 2.8-8.8% smaller
-/// stored bytes, 2.5-8.4% *less* encode CPU, and 23% less decode CPU, because a
-/// level-3 frame spends its bytes on longer matches instead of literals and the
-/// decoder therefore copies more per token.
+/// MEASURED NEGATIVE RESULT — this level is not recommended. Level 3 buys
+/// 2.8-8.8% smaller stored bytes and 23% cheaper decode, but costs +3.0%/+3.3%
+/// on `tracked_state_crud`'s `update_all_rows` on both backends (9 reps,
+/// non-overlapping ranges, against a null control of +0.2%/+0.6%). The
+/// trade-off ranking puts OLTP write latency above physical bytes, so that
+/// trade loses.
+///
+/// The trap worth remembering: on six synthetic corpora level 3 encode is
+/// 2.5-8.4% *cheaper* than level 1. On the real commit path it is dearer. That
+/// is not compressor-context overhead — the oracle already constructs a fresh
+/// context per payload, which is the harder job than production's per-batch
+/// reuse — it is payload shape. Price compression parameters for this store
+/// against payloads captured from the real commit path, not against the
+/// `doc_*`/`kv` generators.
 ///
 /// The level is a writer choice only. A zstd frame carries its own parameters,
 /// so nothing on the read path knows or needs to know which level wrote it —
-/// which is why raising it needs no migration and no fallback reader.
+/// which is why changing it needs no migration and no fallback reader.
 ///
-/// Not higher: level 9 buys a further 6.8-12.0% of bytes but costs 5.9-12.9x
-/// the encode CPU, and level 19 costs 60-99x. Level 3 is the only step that is
-/// free; past it, physical bytes are bought with OLTP write latency, which the
-/// trade-off ranking does not allow.
+/// Nothing above 3 is defensible either: level 9 buys a further 6.8-12.0% of
+/// bytes for 5.9-12.9x the encode CPU, level 19 for 60-99x.
 #[cfg(not(target_family = "wasm"))]
 const JSON_ZSTD_LEVEL: i32 = 3;
 
