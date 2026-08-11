@@ -2102,6 +2102,8 @@ pub(crate) mod ownership_census {
         pub(crate) native_row_owners: BTreeSet<CommitId>,
         pub(crate) native_row_owner_rows: BTreeMap<CommitId, u64>,
         pub(crate) head_commit_id: Option<CommitId>,
+        /// Per branch: (branch id, has manifest, has scoped-range root, serving base).
+        pub(crate) branches: Vec<(String, bool, bool, Option<CommitId>)>,
     }
 
     impl CurrentStateOwnershipCensus {
@@ -2137,16 +2139,26 @@ pub(crate) mod ownership_census {
             .await?;
         let mut census = CurrentStateOwnershipCensus::default();
         let mut roots = Vec::new();
-        for (_, control) in controls {
+        for (branch_id, control) in controls {
             census.head_commit_id = Some(control.head_commit_id);
             let Some(manifest) =
                 crate::tracked_state::load_commit_state_manifest(store, control.head_commit_id)
                     .await?
             else {
+                census.branches.push((branch_id, false, false, None));
                 continue;
             };
-            if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-                roots.push(root.tree.clone());
+            match manifest.current_state_scoped_ranges.as_ref() {
+                Some(root) => {
+                    census.branches.push((
+                        branch_id,
+                        true,
+                        true,
+                        root.serving_base_commit_id,
+                    ));
+                    roots.push(root.tree.clone());
+                }
+                None => census.branches.push((branch_id, true, false, None)),
             }
         }
         if roots.is_empty() {
@@ -2268,11 +2280,13 @@ mod ownership_census_fixture {
                 .expect("census row should publish");
             pre_checkpoint.insert(head(&storage).await);
         }
+        report_census(&storage, pre, "before-checkpoint", &pre_checkpoint).await;
         session
             .create_checkpoint()
             .await
             .expect("census checkpoint should publish");
         let checkpoint = head(&storage).await;
+        report_census(&storage, pre, "after-checkpoint", &pre_checkpoint).await;
         for row in 0..post {
             session
                 .execute(
@@ -2286,6 +2300,16 @@ mod ownership_census_fixture {
                 .expect("census post row should publish");
         }
 
+        let _ = checkpoint;
+        report_census(&storage, pre, "final", &pre_checkpoint).await;
+    }
+
+    async fn report_census(
+        storage: &StorageAdapter<Memory>,
+        depth: usize,
+        phase: &str,
+        pre_checkpoint: &BTreeSet<CommitId>,
+    ) {
         let read = SharedStorageAdapterRead::new(
             storage
                 .begin_read(StorageReadOptions::default())
@@ -2294,10 +2318,10 @@ mod ownership_census_fixture {
         );
         let report = census(&read).await.expect("census should run");
         let pinned = report.pinned_commits();
-        let pre_pinned = pinned.intersection(&pre_checkpoint).count();
-        let rows_pre = report.rows_pinned_to(&pre_checkpoint);
+        let pre_pinned = pinned.intersection(pre_checkpoint).count();
+        let rows_pre = report.rows_pinned_to(pre_checkpoint);
         println!(
-            "CENSUS depth={pre} post={post} checkpoint={checkpoint} parts_by_kind={:?} rows_by_kind={:?} fragmented={} total_rows={} pinned_commits={} pre_checkpoint_pinned_commits={pre_pinned} pre_checkpoint_commits={} rows_pinned_to_pre_checkpoint={rows_pre} authority_owners={} native_row_owners={}",
+            "CENSUS depth={depth} phase={phase} parts_by_kind={:?} rows_by_kind={:?} fragmented={} total_rows={} pinned_commits={} pre_checkpoint_pinned_commits={pre_pinned} pre_checkpoint_commits={} rows_pinned_to_pre_checkpoint={rows_pre} authority_owners={} native_row_owners={}",
             report.parts_by_kind,
             report.rows_by_kind,
             report.fragmented_parts,
@@ -2307,6 +2331,7 @@ mod ownership_census_fixture {
             report.authority_owners.len(),
             report.native_row_owners.len(),
         );
+        println!("CENSUS-BRANCHES depth={depth} phase={phase} {:?}", report.branches);
     }
 
     #[tokio::test]
