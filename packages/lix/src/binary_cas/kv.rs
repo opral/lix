@@ -1273,6 +1273,40 @@ pub(crate) async fn load_bytes_many(
         .iter()
         .map(|metadata| (metadata.hash, metadata.clone()))
         .collect::<HashMap<_, _>>();
+    // A batch can request many deltas against one physical base. Authenticate
+    // and decode that base once, then let every result borrow the same bounded
+    // chunk descriptors. Preserve failures in the map so output traversal
+    // below still selects errors in first-request order.
+    let mut decoded_delta_bases =
+        HashMap::<BlobId, Result<Vec<DecodedBlobChunk<'_>>, LixError>>::new();
+    for entry in metadata.iter().flatten() {
+        let BlobLayout::Delta { base_blob_hash, .. } = &entry.layout else {
+            continue;
+        };
+        if decoded_delta_bases.contains_key(base_blob_hash) {
+            continue;
+        }
+        let decoded = physical_metadata_by_hash
+            .get(base_blob_hash)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS delta '{}' is missing base '{}'",
+                        entry.hash.to_hex(),
+                        base_blob_hash.to_hex()
+                    ),
+                )
+            })
+            .and_then(|base_metadata| {
+                decode_delta_base_chunks(
+                    base_metadata,
+                    &chunk_rows_by_hash,
+                    chunked_manifests_by_hash.get(base_blob_hash),
+                )
+            });
+        decoded_delta_bases.insert(*base_blob_hash, decoded);
+    }
     let mut full_bytes_by_hash = HashMap::<BlobId, Vec<u8>>::new();
     for metadata in physical_metadata {
         let hash = metadata.hash;
@@ -1305,9 +1339,8 @@ pub(crate) async fn load_bytes_many(
                         segments,
                         ..
                     } => {
-                        let base_metadata = physical_metadata_by_hash
-                            .get(&base_blob_hash)
-                            .ok_or_else(|| {
+                        let decoded_base =
+                            decoded_delta_bases.get(&base_blob_hash).ok_or_else(|| {
                                 LixError::new(
                                     "LIX_ERROR_UNKNOWN",
                                     format!(
@@ -1317,13 +1350,16 @@ pub(crate) async fn load_bytes_many(
                                     ),
                                 )
                             })?;
+                        let base_chunks = decoded_base.as_ref().map_err(Clone::clone)?;
+                        let base_metadata = physical_metadata_by_hash
+                            .get(&base_blob_hash)
+                            .expect("decoded delta base has physical metadata");
                         apply_flat_delta_from_chunks(
                             metadata.hash,
                             metadata.size_bytes,
                             base_metadata,
                             &segments,
-                            &chunk_rows_by_hash,
-                            chunked_manifests_by_hash.get(&base_blob_hash),
+                            base_chunks,
                         )
                     }
                     _ if movable_full_hashes.contains(&metadata.hash) => {
@@ -1549,12 +1585,9 @@ fn apply_flat_delta_from_chunks(
     size_bytes: u64,
     base_metadata: &BlobMetadata,
     segments: &[BlobDeltaSegment],
-    chunk_rows_by_hash: &HashMap<ChunkHash, Option<Bytes>>,
-    chunked_manifest: Option<&Vec<KvBlobManifestChunk>>,
+    base_chunks: &[DecodedBlobChunk<'_>],
 ) -> Result<Vec<u8>, LixError> {
     let expected_size = persisted_size_to_usize(size_bytes, "binary CAS delta")?;
-    let base_chunks =
-        decode_delta_base_chunks(base_metadata, chunk_rows_by_hash, chunked_manifest)?;
     let mut out = Vec::with_capacity(expected_size);
     for segment in segments {
         match segment {
@@ -1565,7 +1598,7 @@ fn apply_flat_delta_from_chunks(
                     base_metadata,
                     *offset,
                     *length,
-                    &base_chunks,
+                    base_chunks,
                 )?;
             }
             BlobDeltaSegment::Insert { bytes } => out.extend_from_slice(bytes),
@@ -4406,6 +4439,80 @@ mod tests {
                 Some(third),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn batched_flat_delta_corruption_errors_follow_request_order() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut deltas = Vec::new();
+        let mut base_chunk_hashes = Vec::new();
+        let mut writes = storage.new_write_set();
+        for (expected, tampered) in [
+            (&b"first-base"[..], &b"FIRST-base"[..]),
+            (&b"second-base"[..], &b"SECOND-base"[..]),
+        ] {
+            let chunk_hash = ChunkHash::from_content(expected);
+            let base_hash = BlobId::from_single_chunk(chunk_hash);
+            let mut result = expected.to_vec();
+            result.push(b'!');
+            let delta_hash = BlobId::from_content(&result);
+            stage_manifest(
+                &mut writes,
+                base_hash,
+                &BinaryCasManifest::SingleChunk {
+                    size_bytes: expected.len() as u64,
+                    chunk_hash: chunk_hash.into_bytes(),
+                },
+            );
+            stage_chunk(
+                &mut writes,
+                chunk_hash,
+                BinaryChunkCodec::Raw,
+                tampered.len() as u64,
+                tampered,
+            );
+            stage_manifest(
+                &mut writes,
+                delta_hash,
+                &BinaryCasManifest::Delta {
+                    size_bytes: result.len() as u64,
+                    base_blob_hash: base_hash.into_bytes(),
+                    base_size_bytes: expected.len() as u64,
+                    base_layout: StorageBinaryCasDeltaBaseLayout::SingleChunk {
+                        chunk_hash: chunk_hash.into_bytes(),
+                    },
+                    segments: vec![
+                        StorageBinaryCasDeltaSegment::Copy {
+                            offset: 0,
+                            length: expected.len() as u64,
+                        },
+                        StorageBinaryCasDeltaSegment::Insert { bytes: vec![b'!'] },
+                    ],
+                },
+            );
+            deltas.push(delta_hash);
+            base_chunk_hashes.push(chunk_hash);
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("corrupt delta fixtures should commit");
+
+        for order in [[0usize, 1usize], [1usize, 0usize]] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("corrupt delta read should open");
+            let error = load_bytes_many(&read, &[deltas[order[0]], deltas[order[1]]])
+                .await
+                .expect_err("corrupt delta base must fail closed");
+            assert!(
+                error
+                    .message
+                    .contains(&base_chunk_hashes[order[0]].to_hex()),
+                "first requested corrupt delta must select its base error: {error:?}",
+            );
+        }
     }
 
     #[tokio::test]
