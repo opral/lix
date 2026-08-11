@@ -132,14 +132,10 @@ async fn create_or_rebind_physical_plan(
             .query_planner()
             .create_physical_plan(&optimized, state)
             .await?;
-        if let Some(template) = detach_physical_plan_template(Arc::clone(&plan)) {
-            cache.remember_physical_read_plan(
-                key,
-                CachedPhysicalRead {
-                    optimized: detach_logical_plan_sources(optimized)?,
-                    template,
-                },
-            );
+        if let Some(template) = detach_physical_plan_template(Arc::clone(&plan))
+            && let Some(optimized) = detach_logical_plan_sources(optimized)
+        {
+            cache.remember_physical_read_plan(key, CachedPhysicalRead { optimized, template });
         }
         return Ok(plan);
     };
@@ -170,7 +166,7 @@ async fn create_or_rebind_physical_plan(
 ///
 /// Cached plans must not retain a provider bound to the storage snapshot that
 /// planned them.
-fn detach_logical_plan_sources(plan: LogicalPlan) -> Result<LogicalPlan> {
+fn detach_logical_plan_sources(plan: LogicalPlan) -> Option<LogicalPlan> {
     plan.transform_up(|node| {
         let LogicalPlan::TableScan(mut scan) = node else {
             return Ok(Transformed::no(node));
@@ -179,6 +175,7 @@ fn detach_logical_plan_sources(plan: LogicalPlan) -> Result<LogicalPlan> {
         Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
     })
     .map(|transformed| transformed.data)
+    .ok()
 }
 
 /// Grafts the current snapshot's table sources onto a cached optimized plan.
