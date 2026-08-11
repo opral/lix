@@ -7134,7 +7134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_rebuild_repairs_corrupt_head_root_chunk() {
+    async fn storage_rejects_corrupting_a_published_root_chunk() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
@@ -7155,22 +7155,16 @@ mod tests {
         )
         .await
         .expect("child root should write");
-        corrupt_root_chunk_for_test(&storage, "child").await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        tracked_state
-            .root_rebuilder(&read, &mut writes)
-            .rebuild_commit_root_at("child")
-            .await
-            .expect("corrupt child root chunk should repair");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("repaired root should commit");
+        // Tree chunks are content addressed, so the plane is declared
+        // immutable. Rebinding a published digest to different bytes is
+        // rejected at publication rather than repaired after the fact.
+        let rejection = corrupt_root_chunk_for_test(&storage, "child").await;
+        assert!(
+            rejection
+                .to_string()
+                .contains("immutable identity was assigned different bytes"),
+            "unexpected rejection: {rejection}"
+        );
 
         let diff = tracked_state
             .reader(
@@ -7181,7 +7175,7 @@ mod tests {
             )
             .diff_commits("base", "child", &test_schema_diff_request())
             .await
-            .expect("diff should use repaired root chunk");
+            .expect("diff should still use the intact root chunk");
 
         assert_eq!(diff.entries.len(), 1);
         assert_eq!(
@@ -9318,7 +9312,7 @@ mod tests {
             .expect("root chunk delete should commit");
     }
 
-    async fn corrupt_root_chunk_for_test(storage: &StorageAdapter, commit_id: &str) {
+    async fn corrupt_root_chunk_for_test(storage: &StorageAdapter, commit_id: &str) -> String {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -9336,7 +9330,8 @@ mod tests {
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("root chunk corruption should commit");
+            .expect_err("content-addressed root chunk overwrite must be rejected")
+            .to_string()
     }
 
     async fn overwrite_root_with_rows_for_test(

@@ -3612,8 +3612,8 @@ mod tests {
     use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StoragePrecondition, StorageReadOptions, StorageSpace, StorageValue,
-        StorageWriteOptions, StorageWriteSet,
+        StorageKey, StoragePrecondition, StorageProjectedValue, StorageReadOptions, StorageSpace,
+        StorageValue, StorageWriteOptions, StorageWriteSet,
     };
     use crate::storage_codec;
     use crate::tracked_state::{
@@ -5243,7 +5243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tree_sweep_epoch_fails_closed_on_missing_mark_or_corrupt_chunk() {
+    async fn tree_sweep_epoch_fails_closed_on_missing_mark_and_rejects_chunk_corruption() {
         let (storage, _commit_id, _root_hash, dead_hash, _dead_hash_two) =
             tree_sweep_fixture().await;
         let read = storage
@@ -5300,9 +5300,11 @@ mod tests {
         );
         drop(read);
 
-        // Restore the mark and corrupt an unmarked chunk. The page validates
-        // every key/value before it stages any delete, so the failed page has
-        // an empty write set and cannot partially reclaim its siblings.
+        // Restore the mark and attempt to corrupt an unmarked chunk. The
+        // tree-chunk plane is content addressed and therefore declared
+        // immutable, so the storage layer refuses to bind a second byte string
+        // to an existing digest. The sweep never has to observe a corrupt
+        // chunk because one cannot be published.
         let mut restore = storage.new_write_set();
         restore.put(
             GC_TREE_SWEEP_MARK_SPACE,
@@ -5333,31 +5335,59 @@ mod tests {
                 bytes: Bytes::from_static(b"corrupt-tree-chunk"),
             },
         );
-        storage
+        let rejection = storage
             .commit_write_set(corrupt, StorageWriteOptions::default())
             .await
-            .expect("test corruption should commit");
+            .expect_err("content-addressed chunk overwrite must be rejected at publication");
+        assert!(
+            rejection
+                .to_string()
+                .contains("immutable identity was assigned different bytes"),
+            "unexpected rejection: {rejection}"
+        );
+
+        // The rejected publication left the plane untouched, so the sweep page
+        // still validates and stages the unmarked chunk for reclamation.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("corruption read should open");
+            .expect("post-rejection read should open");
+        let surviving = PointReadPlan::new(
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            std::slice::from_ref(&StorageKey(Bytes::copy_from_slice(&dead_hash))),
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("dead chunk should read")
+        .value;
+        let Some(StorageProjectedValue::FullValue(bytes)) =
+            surviving.into_iter().next().expect("one chunk result")
+        else {
+            panic!("dead chunk must survive the rejected overwrite");
+        };
+        assert_eq!(
+            blake3::hash(&bytes).as_bytes().as_slice(),
+            dead_hash.as_slice(),
+            "surviving chunk must still hash to its content address"
+        );
         let mut session = open_tree_sweep_epoch(&read)
             .await
             .expect("restored epoch should load")
             .expect("restored epoch should exist");
         let mut page_writes = storage.new_write_set();
         let mut page_preconditions = Vec::new();
+        stage_tree_sweep_epoch_page(
+            &read,
+            &mut session,
+            &mut page_writes,
+            &mut page_preconditions,
+        )
+        .await
+        .expect("page over uncorruptible chunks should stage");
         assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut session,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .is_err()
+            !page_writes.is_empty(),
+            "page must stage the unmarked chunk reclamation"
         );
-        assert!(page_writes.is_empty(), "failed page must stage zero writes");
     }
 
     #[tokio::test]

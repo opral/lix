@@ -49,7 +49,12 @@ pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE: &str =
 pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE: &str =
     "tracked_state.commit_mutation_catalog.v1";
 const MIN_CURRENT_STATE_SCOPED_RANGE_POINT_READS: u16 = 4;
-pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
+/// Tree chunks are content addressed: the key is the BLAKE3 digest of the
+/// value. Declaring the space immutable puts the plane in the physical place
+/// every other content-addressed plane already occupies, and lets the storage
+/// layer enforce "same key implies same bytes" at stage time instead of
+/// silently accepting a corrupting overwrite.
+pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_0001),
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
 );
