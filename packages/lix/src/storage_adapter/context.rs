@@ -4,19 +4,18 @@ use bytes::Bytes;
 use tracing::Instrument as _;
 
 use crate::storage::{
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, Memory, Precondition, Prefix,
-    ProjectedValue, PutBatch, PutEntry, ReadOptions, Storage, StorageError, StorageWrite,
-    StoredValue, WriteOptions,
+    CommitResult, KeyRange, Memory, Precondition, Prefix, ReadOptions, Storage, StorageError,
+    StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{
     StorageAdapterRead, StorageAdapterReadScope, StorageSpace, StorageWriteSet,
     StorageWriteSetError, StorageWriteSetStats,
 };
 
-use super::exact_get_many;
-use super::spaces::{MUTATION_REVISION_SPACE, TRACKED_MUTATION_REVISION_SPACE};
-
-const MUTATION_REVISION_KEY: &[u8] = b"global";
+use super::spaces::{
+    REVISION_KEY_MUTATION, REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE, load_revision,
+    revision_key,
+};
 
 #[derive(Clone, Debug)]
 pub struct StorageAdapter<StorageImpl = Memory> {
@@ -85,9 +84,16 @@ where
 
     pub async fn prepare_write_set(
         &self,
-        write_set: StorageWriteSet,
+        mut write_set: StorageWriteSet,
         mut opts: WriteOptions,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
+        // Every revision singleton lives in one space, so the adapter's own
+        // mutation token joins the transaction's already-staged revision puts
+        // and lowers as one contiguous batch instead of a trailing extra
+        // write into a separate space.
+        if write_set.has_staged_mutations() {
+            stage_mutation_revision(&mut write_set);
+        }
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());
@@ -100,15 +106,7 @@ where
             ))
             .await
             .map_err(StorageWriteSetError::Storage)?;
-        let lowered = async {
-            let stats = write_set.lower_into(&mut write).await?;
-            if stats.staged_puts > 0 || stats.staged_deletes > 0 {
-                stage_mutation_revision(&mut write)
-                    .await
-                    .map_err(StorageWriteSetError::Storage)?;
-            }
-            Ok::<_, StorageWriteSetError>(stats)
-        }
+        let lowered = async { write_set.lower_into(&mut write).await }
         .instrument(tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.storage_lowering"
@@ -132,12 +130,12 @@ where
     pub(crate) fn tracked_mutation_revision_precondition(expected: Option<Bytes>) -> Precondition {
         expected.map_or_else(
             || Precondition::KeyAbsent {
-                space: TRACKED_MUTATION_REVISION_SPACE,
-                key: mutation_revision_key(),
+                space: REVISION_SPACE,
+                key: revision_key(REVISION_KEY_TRACKED_MUTATION),
             },
             |expected| Precondition::KeyValueEquals {
-                space: TRACKED_MUTATION_REVISION_SPACE,
-                key: mutation_revision_key(),
+                space: REVISION_SPACE,
+                key: revision_key(REVISION_KEY_TRACKED_MUTATION),
                 expected,
             },
         )
@@ -145,8 +143,8 @@ where
 
     pub(crate) fn stage_tracked_mutation_revision(write_set: &mut StorageWriteSet) {
         write_set.put(
-            TRACKED_MUTATION_REVISION_SPACE,
-            mutation_revision_key(),
+            REVISION_SPACE,
+            revision_key(REVISION_KEY_TRACKED_MUTATION),
             uuid::Uuid::now_v7().as_bytes().as_slice(),
         );
     }
@@ -157,26 +155,7 @@ where
     where
         R: StorageAdapterRead + ?Sized,
     {
-        let values = exact_get_many(
-            read,
-            &[crate::storage::GetManyRequest {
-                space: MUTATION_REVISION_SPACE,
-                keys: &[mutation_revision_key()],
-                opts: GetOptions {
-                    projection: CoreProjection::FullValue,
-                },
-            }],
-        )
-        .await?;
-        Ok(values
-            .values
-            .into_iter()
-            .next()
-            .flatten()
-            .and_then(|value| match value {
-                ProjectedValue::FullValue(bytes) => Some(bytes),
-                ProjectedValue::KeyOnly => None,
-            }))
+        load_revision(read, REVISION_KEY_MUTATION).await
     }
 
     pub(crate) async fn load_tracked_mutation_revision_from_read<R>(
@@ -185,26 +164,7 @@ where
     where
         R: StorageAdapterRead + ?Sized,
     {
-        let values = exact_get_many(
-            read,
-            &[crate::storage::GetManyRequest {
-                space: TRACKED_MUTATION_REVISION_SPACE,
-                keys: &[mutation_revision_key()],
-                opts: GetOptions {
-                    projection: CoreProjection::FullValue,
-                },
-            }],
-        )
-        .await?;
-        Ok(values
-            .values
-            .into_iter()
-            .next()
-            .flatten()
-            .and_then(|value| match value {
-                ProjectedValue::FullValue(bytes) => Some(bytes),
-                ProjectedValue::KeyOnly => None,
-            }))
+        load_revision(read, REVISION_KEY_TRACKED_MUTATION).await
     }
 
     pub async fn delete_range(
@@ -247,27 +207,14 @@ where
     }
 }
 
-fn mutation_revision_key() -> Key {
-    Key(Bytes::from_static(MUTATION_REVISION_KEY))
-}
-
-async fn stage_mutation_revision<W>(write: &mut W) -> Result<(), StorageError>
-where
-    W: StorageWrite,
-{
-    write
-        .put_many(
-            MUTATION_REVISION_SPACE,
-            PutBatch {
-                entries: vec![PutEntry {
-                    key: mutation_revision_key(),
-                    value: StoredValue {
-                        bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
-                    },
-                }],
-            },
-        )
-        .await
+fn stage_mutation_revision(write_set: &mut StorageWriteSet) {
+    write_set.put(
+        REVISION_SPACE,
+        revision_key(REVISION_KEY_MUTATION),
+        StoredValue {
+            bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
+        },
+    );
 }
 
 impl<'a, StorageImpl> PreparedStorageCommit<'a, StorageImpl>
