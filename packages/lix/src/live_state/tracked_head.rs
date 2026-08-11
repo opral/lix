@@ -187,6 +187,15 @@ struct WorkingDiffSlotFingerprint {
 const WORKING_DIFF_SLOT_NONE: u8 = 0;
 const WORKING_DIFF_SLOT_REF: u8 = 1;
 const WORKING_DIFF_SLOT_INLINE: u8 = 2;
+/// The before image is identified by its change id, but its payload slot was
+/// not materialized where the baseline was captured.
+///
+/// Root current bases are read under `ChangeRecordProjection::identity_only()`
+/// so the write path pays no payload I/O to capture a baseline. The reader
+/// hydrates the referenced change record only for the one question the change
+/// id cannot answer on its own: whether two distinct changes carry the same
+/// payload.
+const WORKING_DIFF_SLOT_UNRESOLVED: u8 = 3;
 const WORKING_DIFF_VERSION_BYTES: usize =
     16 + 16 + 1 + 8 + 8 + 1 + JSON_REF_BYTES + 1 + JSON_REF_BYTES;
 const WORKING_DIFF_CHECKPOINT_BYTES: usize = 16;
@@ -376,8 +385,29 @@ pub(crate) struct PackedHeadValue {
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    checkpoint_commit_id: Option<CommitId>,
+    working_diff_baseline: PackedWorkingDiffBaseline,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
+}
+
+/// Checkpoint-relative position of a current-state base row that is served
+/// without a branch-local hot row.
+///
+/// The two bases are not interchangeable and must not share one encoding. A
+/// *packed* current base is a collection published **inside** the active
+/// working interval, so its rows were absent at the checkpoint. A *root*
+/// current base is the referenced head itself, so its rows **are** the
+/// checkpoint state. Collapsing both onto "has an active checkpoint id" made
+/// the first branch-local mutation of a checkpointed identity look like a
+/// creation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PackedWorkingDiffBaseline {
+    /// No active checkpoint owns this generation.
+    Disabled,
+    /// Published inside the active working interval: absent at the checkpoint.
+    AbsentAtCheckpoint { checkpoint_commit_id: CommitId },
+    /// Served from the referenced root current base: present at the active
+    /// checkpoint and unchanged since.
+    CleanAtCheckpoint,
 }
 
 impl<'a> CurrentStateDeltaRef<'a> {
@@ -471,48 +501,53 @@ impl TrackedHeadContext {
     {
         hot::HotStateWriter { store, writes }
     }
-
-    /// Reclaims derived current-state generations that no durable branch
-    /// control can select and returns their history-free payload refs. Both
-    /// the authoritative hot rows and their key-only file membership index are
-    /// generation-scoped, so the control is the one ownership root for both
-    /// spaces. The caller compares the returned refs with its complete live
-    /// payload set before staging physical JSON deletion.
-    ///
-    /// A non-current control still owns its generation. Its tracked portion
-    /// may use historical replay, but that same generation preserves the
-    /// branch's history-free untracked members until a fresh complete serving
-    /// generation is published.
-    #[cfg(test)]
-    pub(crate) async fn stage_collect_stale_current_state_generations<S>(
-        &self,
-        store: &S,
-        writes: &mut StorageWriteSet,
-        controls: &[(String, BranchHeadControl)],
-    ) -> Result<Vec<JsonRef>, LixError>
-    where
-        S: StorageAdapterRead + ?Sized,
-    {
-        hot::stage_collect_stale_hot_generations(store, writes, controls).await
-    }
 }
 
-/// Converts the branch-control plane into the exact derived generations that
-/// are still reachable. A branch generation is meaningful only together with
-/// its branch id; a generation UUID alone is not a repository-global root.
-#[cfg(test)]
-fn active_current_state_generations(
-    controls: &[(String, BranchHeadControl)],
-) -> BTreeSet<(String, CommitId)> {
-    controls
-        .iter()
-        .flat_map(|(branch_id, control)| {
-            [
-                (branch_id.clone(), control.tracked_generation),
-                (branch_id.clone(), control.untracked_generation),
-            ]
-        })
-        .collect()
+impl<S> hot::HotStateWriter<'_, S>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    /// Stages history-free untracked deltas into the branch's one serving
+    /// generation.
+    ///
+    /// Untracked rows share the generation with tracked rows and are separated
+    /// only by their per-row flag, so this is an ordinary in-place hot
+    /// mutation: no new generation UUID, no republished snapshot, no commit.
+    /// The caller still advances `current_state_revision` so the branch
+    /// control CAS remains a real write fence.
+    ///
+    /// Untracked deltas never produce working-diff records (their baseline is
+    /// always `Disabled`), so the checkpoint context and the coverage counter
+    /// are deliberately not threaded through here.
+    pub(crate) async fn stage_untracked_current_state(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+    ) -> Result<(), LixError> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let mut coverage = WorkingDiffIndexCoverage::default();
+        // Boxed for the same reason the tracked staging call sites are: this
+        // sits on the commit path, and leaving the future inline pushes
+        // auto-trait resolution over the recursion limit for callers that
+        // require `Send`.
+        Box::pin(self.stage_current_state_with_working_diff(
+            branch_id,
+            Some(generation),
+            generation,
+            deltas,
+            absence_guards,
+            None,
+            None,
+            None,
+            &mut coverage,
+        ))
+        .await?;
+        Ok(())
+    }
 }
 
 fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixError {
@@ -691,7 +726,6 @@ fn stage_test_current_control(
         BranchHeadControl {
             head_commit_id,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id,
@@ -1284,16 +1318,21 @@ fn decode_working_diff_slot(
         .ok_or_else(|| working_diff_error(&format!("{field} kind is missing")))?;
     if !matches!(
         kind,
-        WORKING_DIFF_SLOT_NONE | WORKING_DIFF_SLOT_REF | WORKING_DIFF_SLOT_INLINE
+        WORKING_DIFF_SLOT_NONE
+            | WORKING_DIFF_SLOT_REF
+            | WORKING_DIFF_SLOT_INLINE
+            | WORKING_DIFF_SLOT_UNRESOLVED
     ) {
         return Err(working_diff_error(&format!("{field} slot kind is invalid")));
     }
     let hash: [u8; JSON_REF_BYTES] = take_working_diff_bytes(bytes, offset, JSON_REF_BYTES)?
         .try_into()
         .map_err(|_| working_diff_error(&format!("{field} hash is invalid")))?;
-    if kind == WORKING_DIFF_SLOT_NONE && hash != [0; JSON_REF_BYTES] {
+    if matches!(kind, WORKING_DIFF_SLOT_NONE | WORKING_DIFF_SLOT_UNRESOLVED)
+        && hash != [0; JSON_REF_BYTES]
+    {
         return Err(working_diff_error(&format!(
-            "{field} none slot must have a zero hash"
+            "{field} slot kind must have a zero hash"
         )));
     }
     Ok(WorkingDiffSlotFingerprint { kind, hash })
@@ -1393,6 +1432,11 @@ struct HeadValueView<'a> {
     metadata: HeadSlotView<'a>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
+    /// False when the JSON slots above are placeholders because this view was
+    /// synthesized from a current-state base that was read without payload
+    /// projection. Baselines captured from such a view record their payload
+    /// slots as unresolved and are hydrated by the reader on demand.
+    payload_slots_materialized: bool,
 }
 
 impl CertifiedCurrentStatePredecessor {
@@ -1410,18 +1454,22 @@ impl CertifiedCurrentStatePredecessor {
                 deleted: value.deleted,
                 created_at: value.created_at,
                 updated_at: value.updated_at,
-                // Packed current bases are immutable post-checkpoint inserts.
-                // Their active-epoch before image is therefore absent; no
-                // payload fingerprint is needed to preserve that baseline.
+                // Current-state bases are read without payload projection, so
+                // these slots are placeholders. The change id above is the
+                // reference the reader hydrates from when it needs the payload.
                 snapshot: HeadSlotView::None,
                 metadata: HeadSlotView::None,
+                payload_slots_materialized: false,
                 columnar_base_coordinate: value.columnar_base_coordinate,
-                working_diff_baseline: value.checkpoint_commit_id.map_or(
-                    WorkingDiffBaseline::Disabled,
-                    |checkpoint_commit_id| WorkingDiffBaseline::BeforeAbsent {
+                working_diff_baseline: match value.working_diff_baseline {
+                    PackedWorkingDiffBaseline::Disabled => WorkingDiffBaseline::Disabled,
+                    PackedWorkingDiffBaseline::AbsentAtCheckpoint {
+                        checkpoint_commit_id,
+                    } => WorkingDiffBaseline::BeforeAbsent {
                         checkpoint_commit_id,
                     },
-                ),
+                    PackedWorkingDiffBaseline::CleanAtCheckpoint => WorkingDiffBaseline::Clean,
+                },
             }),
         }
     }
@@ -1435,9 +1483,33 @@ impl HeadValueView<'_> {
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            snapshot: working_diff_slot_fingerprint(self.snapshot),
-            metadata: working_diff_slot_fingerprint(self.metadata),
+            snapshot: self.working_diff_slot(self.snapshot),
+            metadata: self.working_diff_slot(self.metadata),
         })
+    }
+
+    fn working_diff_slot(self, slot: HeadSlotView<'_>) -> WorkingDiffSlotFingerprint {
+        if self.payload_slots_materialized {
+            working_diff_slot_fingerprint(slot)
+        } else {
+            WorkingDiffSlotFingerprint::unresolved()
+        }
+    }
+}
+
+impl WorkingDiffSlotFingerprint {
+    fn unresolved() -> Self {
+        Self {
+            kind: WORKING_DIFF_SLOT_UNRESOLVED,
+            hash: [0; JSON_REF_BYTES],
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            kind: WORKING_DIFF_SLOT_NONE,
+            hash: [0; JSON_REF_BYTES],
+        }
     }
 }
 
@@ -1468,13 +1540,53 @@ fn effective_hot_commit_id(
     }
 }
 
+/// Whether two working-diff versions carry the same payload.
+///
+/// `Unresolved` is deliberately a distinct answer rather than a default. An
+/// accelerator over the canonical diff may answer correctly or decline, but it
+/// must never answer confidently and wrongly, so a caller that has not
+/// hydrated an unresolved before image cannot accidentally read it as
+/// "different".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkingDiffPayloadEquality {
+    Equal,
+    Different,
+    Unresolved,
+}
+
 impl WorkingDiffVersion {
-    fn payload_eq(self, other: Self) -> bool {
+    /// True when this version's payload slots were never materialized, so only
+    /// its change id is known. Resolve with `resolve_payload_slots` before
+    /// classifying.
+    fn payload_is_unresolved(self) -> bool {
+        self.snapshot.kind == WORKING_DIFF_SLOT_UNRESOLVED
+            || self.metadata.kind == WORKING_DIFF_SLOT_UNRESOLVED
+    }
+
+    fn resolve_payload_slots(
+        &mut self,
+        snapshot: WorkingDiffSlotFingerprint,
+        metadata: WorkingDiffSlotFingerprint,
+    ) {
+        self.snapshot = snapshot;
+        self.metadata = metadata;
+    }
+
+    fn payload_equality(self, other: Self) -> WorkingDiffPayloadEquality {
         // Keep the accelerator's net-change classification identical to the
         // canonical tracked diff: a shared change record is intrinsically the
         // same payload, otherwise compare the two stored payload slots.
-        self.change_id == other.change_id
-            || (self.snapshot == other.snapshot && self.metadata == other.metadata)
+        if self.change_id == other.change_id {
+            return WorkingDiffPayloadEquality::Equal;
+        }
+        if self.payload_is_unresolved() || other.payload_is_unresolved() {
+            return WorkingDiffPayloadEquality::Unresolved;
+        }
+        if self.snapshot == other.snapshot && self.metadata == other.metadata {
+            WorkingDiffPayloadEquality::Equal
+        } else {
+            WorkingDiffPayloadEquality::Different
+        }
     }
 
     fn into_diff_row(self, identity: TrackedStateDiffIdentity) -> TrackedStateDiffRow {
@@ -1938,6 +2050,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         updated_at,
         snapshot,
         metadata,
+        payload_slots_materialized: true,
         columnar_base_coordinate,
         working_diff_baseline,
     })
@@ -2318,7 +2431,6 @@ mod tests {
         BranchHeadControl {
             head_commit_id,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
@@ -2607,9 +2719,38 @@ mod tests {
             ..baseline
         };
 
-        assert!(baseline.payload_eq(same_change));
-        assert!(baseline.payload_eq(same_payload));
-        assert!(!baseline.payload_eq(different_payload));
+        assert_eq!(
+            baseline.payload_equality(same_change),
+            WorkingDiffPayloadEquality::Equal
+        );
+        assert_eq!(
+            baseline.payload_equality(same_payload),
+            WorkingDiffPayloadEquality::Equal
+        );
+        assert_eq!(
+            baseline.payload_equality(different_payload),
+            WorkingDiffPayloadEquality::Different
+        );
+
+        // A baseline captured by reference must never be read as "different".
+        let unresolved = WorkingDiffVersion {
+            change_id: ChangeId::for_test_label("root-change"),
+            snapshot: WorkingDiffSlotFingerprint::unresolved(),
+            metadata: WorkingDiffSlotFingerprint::unresolved(),
+            ..baseline
+        };
+        assert_eq!(
+            unresolved.payload_equality(different_payload),
+            WorkingDiffPayloadEquality::Unresolved
+        );
+        assert_eq!(
+            unresolved.payload_equality(WorkingDiffVersion {
+                change_id: ChangeId::for_test_label("root-change"),
+                ..different_payload
+            }),
+            WorkingDiffPayloadEquality::Equal,
+            "a shared change record resolves without hydration"
+        );
     }
 
     #[tokio::test]
@@ -3090,7 +3231,6 @@ mod tests {
         let control = |head_commit_id, generation, checkpoint_commit_id| BranchHeadControl {
             head_commit_id,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
@@ -3562,7 +3702,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -3740,7 +3879,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -3808,7 +3946,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             tracked_generation: head,
-            untracked_generation: head,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -5084,116 +5221,6 @@ mod tests {
                 .next()
                 .flatten();
             assert!(value.is_none(), "malformed auxiliary key must be reclaimed");
-        }
-    }
-
-    #[tokio::test]
-    async fn current_state_gc_keeps_only_control_bound_untracked_generations() {
-        let storage = StorageAdapter::new(Memory::new());
-        let branch_id = "main";
-        let active_generation = CommitId::for_test_label("active-current-generation");
-        let stale_generation = CommitId::for_test_label("stale-current-generation");
-        let active_snapshot = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
-        let stale_snapshot = JsonRef::from_hash_bytes([9; JSON_REF_BYTES]);
-        let timestamp = ts("2026-01-01T00:00:00Z");
-        let active_identity = HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation: active_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("active-row"),
-            file_id: Some("active-file".to_string()),
-        };
-        let stale_identity = HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation: stale_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("stale-row"),
-            file_id: Some("stale-file".to_string()),
-        };
-        let active_control = BranchHeadControl {
-            head_commit_id: active_generation,
-            tracked_generation: active_generation,
-            untracked_generation: active_generation,
-            current_state_revision: 0,
-            schema_presence_bloom: [u64::MAX; 4],
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("active-current-ref"),
-        };
-        let controls = vec![(branch_id.to_string(), active_control)];
-
-        let untracked = |snapshot| HeadValue {
-            change_id: None,
-            commit_id: None,
-            untracked: true,
-            deleted: false,
-            created_at: timestamp,
-            updated_at: timestamp,
-            snapshot: JsonSlot::Ref(snapshot),
-            metadata: JsonSlot::None,
-            columnar_base_coordinate: None,
-        };
-        let mut writes = StorageWriteSet::new();
-        stage_put(&mut writes, &active_identity, &untracked(active_snapshot))
-            .expect("stage active untracked hot row");
-        stage_put(&mut writes, &stale_identity, &untracked(stale_snapshot))
-            .expect("stage stale untracked hot row");
-        stage_branch_head_control(&mut writes, branch_id, active_control)
-            .expect("stage active branch control");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit current-state GC fixture");
-
-        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("open current-state GC read"),
-        );
-        let rooted = TrackedHeadContext::new()
-            .reader(read.clone())
-            .untracked_json_refs(&controls)
-            .await
-            .expect("discover active untracked payload roots");
-        assert_eq!(rooted, vec![active_snapshot]);
-
-        let mut gc_writes = StorageWriteSet::new();
-        let stale_refs = TrackedHeadContext::new()
-            .stage_collect_stale_current_state_generations(&read, &mut gc_writes, &controls)
-            .await
-            .expect("stage stale current-state cleanup");
-        assert_eq!(stale_refs, vec![stale_snapshot]);
-        drop(read);
-        storage
-            .commit_write_set(gc_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit stale current-state cleanup");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open current-state GC verification read");
-        for (label, space) in [
-            ("primary hot row", HOT_ROW_SPACE),
-            ("file-schema hot markers", HOT_FILE_SPACE),
-        ] {
-            let entries = scan_test_space(&read, space).await.entries;
-            assert_eq!(entries.len(), 1, "only active {label} survives GC");
-            let encoded =
-                full_value_bytes(entries.into_iter().next().expect("one hot value").value)
-                    .expect("hot value is present");
-            if space == HOT_FILE_SPACE {
-                assert!(encoded.is_empty(), "file-schema markers remain key-only");
-                continue;
-            }
-            let value = decode_head_value(&encoded).expect("active hot value decodes");
-            assert!(value.untracked, "active hot value remains untracked");
-            match value.snapshot {
-                HeadSlotView::Ref(snapshot) => assert_eq!(snapshot, active_snapshot),
-                _ => panic!("active hot value must retain its JSON reference"),
-            }
         }
     }
 }

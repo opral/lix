@@ -1,3 +1,10 @@
+// Unifying the tracked and untracked serving planes added one call edge to the
+// commit path, which pushes this crate's auto-trait resolution for the spawned
+// ingest future past the default recursion limit. The limit is a compile-time
+// analysis budget, not a runtime property; raise it here rather than distorting
+// the engine's call graph to fit it.
+#![recursion_limit = "256"]
+
 use std::fmt::{self, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;

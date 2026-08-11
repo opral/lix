@@ -255,7 +255,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             tracked_generation: initial_commit_id,
-            untracked_generation: initial_commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
@@ -276,7 +275,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             tracked_generation: initial_commit_id,
-            untracked_generation: initial_commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,

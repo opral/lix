@@ -19,7 +19,7 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v10";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v11";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0020),
     BRANCH_HEAD_CONTROL_NAMESPACE,
@@ -33,11 +33,11 @@ const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v1";
 
 /// The one mutable publication record for a branch.
 ///
-/// `tracked_generation` and `untracked_generation` are independently owned
-/// authenticated serving snapshots. A tracked-root publication may repoint
-/// the former without rewinding branch-local untracked rows; an untracked-only
-/// publication may advance the latter without changing the tracked root. The
-/// pair is one atomic selector, not two authorities for either semantic plane.
+/// `tracked_generation` is the branch's single authenticated serving snapshot.
+/// Tracked and history-free untracked rows share it; the per-row
+/// `HEAD_VALUE_UNTRACKED` flag is what separates the two semantic planes, not
+/// a second generation root. An untracked-only publication therefore mutates
+/// this generation in place and never mints a new one.
 /// The optional checkpoint binds the sparse working-diff accelerator to that
 /// exact generation. `current_state_revision` advances for every in-place
 /// current-state mutation, including history-free untracked writes. It is
@@ -48,7 +48,6 @@ const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v1";
 pub(crate) struct BranchHeadControl {
     pub(crate) head_commit_id: CommitId,
     pub(crate) tracked_generation: CommitId,
-    pub(crate) untracked_generation: CommitId,
     pub(crate) current_state_revision: u64,
     #[musli(with = storage_codec::option)]
     pub(crate) working_diff_checkpoint_commit_id: Option<CommitId>,
@@ -89,9 +88,9 @@ impl BranchHeadControl {
     ///
     /// `tracked_generation` is the atomic serving selector, not chronology.
     /// Its row/scoped owners are resolved through the authenticated
-    /// `TrackedHead` reader before GC evaluates retirement.
-    /// `untracked_generation` is intentionally absent: it names current-only
-    /// physical state and is not a semantic commit dependency.
+    /// `TrackedHead` reader before GC evaluates retirement. Untracked rows
+    /// live in that same generation and are skipped by the commit-provenance
+    /// projection because they carry no `commit_id`.
     pub(crate) fn tracked_reachability(self) -> BranchHeadTrackedReachability {
         BranchHeadTrackedReachability {
             chronology_roots: [
@@ -148,24 +147,6 @@ impl BranchHeadControl {
                 != 0
         })
     }
-}
-
-/// Derives the next immutable current-only generation from the previous
-/// selector and its monotonic publication revision.
-pub(crate) fn untracked_lifecycle_generation(
-    branch_id: &str,
-    previous_generation: CommitId,
-    revision: u64,
-) -> CommitId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lix.live_state.untracked_generation.v1");
-    hasher.update(&(branch_id.len() as u64).to_be_bytes());
-    hasher.update(branch_id.as_bytes());
-    hasher.update(previous_generation.as_uuid().as_bytes());
-    hasher.update(&revision.to_be_bytes());
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    CommitId::new(uuid::Uuid::from_bytes(bytes))
 }
 
 /// One coherent point-read observation used for both generation selection and
@@ -439,7 +420,6 @@ mod tests {
         let first = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("first-head"),
             tracked_generation: CommitId::for_test_label("first-generation"),
-            untracked_generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -450,7 +430,6 @@ mod tests {
         let second = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("second-head"),
             tracked_generation: CommitId::for_test_label("first-generation"),
-            untracked_generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 1,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
