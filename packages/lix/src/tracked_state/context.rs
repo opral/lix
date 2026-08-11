@@ -7054,8 +7054,18 @@ mod tests {
             .expect_err("first-parent cycle should not rebuild forever");
 
         assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        // Availability is proven from immutable commit-state authority instead
+        // of by walking the ancestry, so a cycle whose members are all rooted
+        // is no longer reported by the walk's cycle detector: the walk resumes
+        // at the first rooted member. It still fails closed, because replaying
+        // the cycle against that root cannot reproduce the root immutable
+        // authority names for this commit. The walk's `seen_commit_ids` guard
+        // remains the termination proof for cycles with no rooted member.
         assert!(
-            error.message.contains("first-parent cycle"),
+            error.message.contains("first-parent cycle")
+                || error
+                    .message
+                    .contains("disagrees with immutable commit authority"),
             "unexpected error message: {}",
             error.message
         );
