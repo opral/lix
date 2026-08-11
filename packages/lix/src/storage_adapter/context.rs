@@ -50,6 +50,15 @@ where
         self.schema_intern.intern()
     }
 
+    /// Shares this adapter's intern handle with an externally constructed
+    /// read scope (test instrumentation wrappers).
+    #[cfg(test)]
+    pub(crate) fn schema_intern_handle(
+        &self,
+    ) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+        &self.schema_intern
+    }
+
     pub async fn begin_read(
         &self,
         opts: ReadOptions,

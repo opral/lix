@@ -8998,7 +8998,7 @@ mod tests {
 
         let counts = Arc::new(TrackedHeadReadCounts::default());
         let scanned = live_state_context()
-            .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
+            .reader(StorageAdapterReadScope::new_with_intern_for_test(&storage, CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
                     .await
@@ -9054,7 +9054,7 @@ mod tests {
         );
 
         let loaded = live_state_context()
-            .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
+            .reader(StorageAdapterReadScope::new_with_intern_for_test(&storage, CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
                     .await
@@ -9072,7 +9072,7 @@ mod tests {
         );
 
         let exact_rows = live_state_context()
-            .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
+            .reader(StorageAdapterReadScope::new_with_intern_for_test(&storage, CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
                     .await
@@ -9165,7 +9165,7 @@ mod tests {
             .expect("first local commit should persist");
 
         let counts = Arc::new(TrackedHeadReadCounts::default());
-        let mut second_read = StorageAdapterReadScope::new(CountingTrackedHeadRead {
+        let mut second_read = StorageAdapterReadScope::new_with_intern_for_test(&storage, CountingTrackedHeadRead {
             inner: memory
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -9456,7 +9456,7 @@ mod tests {
 
         let counts = Arc::new(TrackedHeadReadCounts::default());
         let scanned = live_state_context()
-            .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
+            .reader(StorageAdapterReadScope::new_with_intern_for_test(&storage, CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
                     .await
@@ -9550,7 +9550,7 @@ mod tests {
             .expect("branch tombstone commit should persist");
 
         let scanned = live_state_context()
-            .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
+            .reader(StorageAdapterReadScope::new_with_intern_for_test(&storage, CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
                     .await

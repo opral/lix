@@ -67,6 +67,19 @@ impl<R> StorageAdapterReadScope<R> {
         }
     }
 
+    /// Test-only scope that shares an adapter's intern table, so keys staged
+    /// through the adapter decode through instrumented reads.
+    #[cfg(test)]
+    pub(crate) fn new_with_intern_for_test<StorageImpl>(
+        adapter: &crate::storage_adapter::StorageAdapter<StorageImpl>,
+        read: R,
+    ) -> Self
+    where
+        StorageImpl: crate::storage::Storage,
+    {
+        Self::new_with_intern(read, Arc::clone(adapter.schema_intern_handle()))
+    }
+
     fn into_inner(self) -> (R, Arc<SchemaInternHandle>) {
         (self.read, self.schema_intern)
     }
