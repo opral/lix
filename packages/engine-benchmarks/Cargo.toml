@@ -276,6 +276,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "branch_storage_sharing"
+path = "benches/branch_storage_sharing.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "fixed_live_history_scale"
 path = "benches/fixed_live_history_scale.rs"
 harness = false
