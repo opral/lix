@@ -2253,41 +2253,12 @@ pub fn layout_space_catalog() -> Vec<(u32, &'static str)> {
         .collect()
 }
 
+/// Every registered storage space, in physical key order.
+///
+/// Layout accounting derives from the one registry so a newly added space
+/// appears in every layout report without a second list to maintain.
 fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
-    &[
-        crate::init::REPOSITORY_PROTOCOL_SPACE,
-        crate::branch::BRANCH_HEAD_CONTROL_SPACE,
-        crate::live_state::HOT_ROW_SPACE,
-        crate::live_state::HOT_FILE_SPACE,
-        crate::live_state::HOT_DIFF_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_SPACE,
-        crate::live_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        crate::live_state::ROOT_CURRENT_BASE_SPACE,
-        crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
-        crate::transaction::plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE,
-        crate::json_store::store::JSON_SPACE,
-        crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-        crate::gc::GC_TREE_SWEEP_EPOCH_SPACE,
-        crate::gc::GC_TREE_SWEEP_MARK_SPACE,
-        crate::gc::GC_TREE_SWEEP_CURSOR_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
-        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-        crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
-        crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
-        crate::changelog::COMMIT_SPACE,
-        crate::changelog::CHANGE_SPACE,
-        crate::changelog::COMMIT_CHANGE_ID_SPACE,
-    ]
+    crate::storage_spaces::ALL_STORAGE_SPACES
 }
 
 async fn scan_layout_space<R>(

@@ -78,6 +78,8 @@ pub(crate) mod storage_adapter;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 pub(crate) mod storage_codec;
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) mod storage_spaces;
 pub mod telemetry;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;

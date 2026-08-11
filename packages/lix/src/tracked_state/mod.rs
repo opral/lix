@@ -94,16 +94,16 @@ pub(crate) use storage::{
     stage_ordered_columnar_mutations, stage_preencoded_ordered_addressable_replacement_parts,
     stage_prefixed_ordered_addressable_replacement_parts,
 };
-#[cfg(feature = "storage-benches")]
+// The storage-space constants are what the space registry
+// (`crate::storage_spaces`) and its layout invariants are built from, so they
+// must be reachable whenever tests compile, not only under `storage-benches`.
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::{
     TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-    decode_change_locator,
 };
-#[cfg(all(test, not(feature = "storage-benches")))]
-pub(crate) use storage::{
-    TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-};
+#[cfg(feature = "storage-benches")]
+pub(crate) use storage::decode_change_locator;
 #[cfg(test)]
 pub(crate) use storage::{
     change_id_from_packed_address, load_commit_delta_change_ids,
