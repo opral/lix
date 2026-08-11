@@ -4860,13 +4860,32 @@ async fn stage_root_backed_branch_publication(
     engine_rows: &[EngineCurrentRow],
     insert_selection: &PreparedInsertSelection,
 ) -> Result<BranchHeadControl, LixError> {
-    let generation = lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
     let tracked_head = TrackedHeadContext::new();
-    tracked_head.writer(read, writes).stage_root_current_base(
-        branch_id,
-        generation,
-        head_commit_id,
-    );
+    // Tracked and untracked rows share one serving generation, so minting a
+    // fresh one strands the branch's history-free rows in the old one. A
+    // republication that does not move the head therefore keeps its
+    // generation; there is nothing new to serve and nothing to copy.
+    //
+    // A publication that *does* move the head (or deletes the branch) is
+    // destructive, and `reject_explicit_branch_ref_lifecycle_with_untracked_rows`
+    // already refuses it while branch-local untracked rows exist — so a fresh
+    // generation there is only ever reached with no untracked rows to lose.
+    let reused_generation = previous_control
+        .filter(|previous| previous.head_commit_id == head_commit_id)
+        .map(|previous| previous.tracked_generation);
+    let generation = match reused_generation {
+        Some(generation) => generation,
+        None => {
+            let generation =
+                lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
+            tracked_head.writer(read, writes).stage_root_current_base(
+                branch_id,
+                generation,
+                head_commit_id,
+            );
+            generation
+        }
+    };
     if stage_initial_working_diff_epoch {
         stage_tracked_working_diff_epoch(
             writes,
