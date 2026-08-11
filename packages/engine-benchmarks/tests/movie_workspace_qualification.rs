@@ -612,9 +612,12 @@ async fn project_saves<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let trace = std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE").is_some();
     let mut timings = Vec::with_capacity(SAVE_SAMPLES);
     for sample in 0..SAVE_SAMPLES {
-        tokio::time::sleep_until(schedule_start + STREAM_PERIOD * sample as u32).await;
+        let scheduled = schedule_start + STREAM_PERIOD * sample as u32;
+        tokio::time::sleep_until(scheduled).await;
+        let wake_delay = tokio::time::Instant::now() - scheduled;
         let payload = format!(
             "{{\"timelineRevision\":{sample},\"playhead\":{}}}",
             sample * 24
@@ -624,7 +627,16 @@ where
             .upsert_file_content("/project/edit.json".to_owned(), payload.into_bytes().into())
             .await
             .expect("save project file");
-        timings.push(started.elapsed());
+        let elapsed = started.elapsed();
+        if trace {
+            println!(
+                "movie_save_sample,sample={sample},at_ms={:.3},wake_delay_ms={:.3},save_ms={:.3}",
+                (scheduled - schedule_start).as_secs_f64() * 1000.0,
+                wake_delay.as_secs_f64() * 1000.0,
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+        timings.push(elapsed);
     }
     timings
 }
