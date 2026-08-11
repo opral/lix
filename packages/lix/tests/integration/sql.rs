@@ -110,6 +110,7 @@ mod lix_key_value;
 mod lix_registered_schema;
 mod metadata;
 mod read_only;
+mod subquery_reads;
 mod udfs;
 mod untracked_current_state;
 mod write_returning;
