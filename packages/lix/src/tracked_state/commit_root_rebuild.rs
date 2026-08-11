@@ -402,11 +402,10 @@ where
             ));
         }
     }
-    if plans
-        .iter()
-        .flat_map(|plan| &plan.deltas)
-        .any(|delta| delta.deleted && delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
-    {
+    if plans.iter().flat_map(|plan| &plan.deltas).any(|delta| {
+        (delta.deleted && delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            || delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+    }) {
         return Ok(None);
     }
 
@@ -630,6 +629,42 @@ mod tests {
                 )
                 .await
                 .expect("child should use its independently staged parent root");
+        }
+    }
+
+    #[tokio::test]
+    async fn order_sensitive_lifecycle_intervals_keep_sequential_replay() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("test read should open");
+        let context = TrackedStateContext::new();
+        for sensitive_delta in [
+            CommitRootRebuildDelta {
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+                deleted: true,
+                ..delta("file", "file-delete", 20, 20, true)
+            },
+            CommitRootRebuildDelta {
+                schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    .to_owned(),
+                ..delta("replacement", "replacement", 20, 20, false)
+            },
+        ] {
+            let plans = vec![
+                plan("second", Some("first"), vec![sensitive_delta]),
+                plan("first", None, vec![delta("row", "first", 10, 10, false)]),
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut writer = context.writer(&read, &mut writes);
+            assert!(
+                try_stage_collapsed_rebuild_plans_with_writer(&mut writer, &plans)
+                    .await
+                    .expect("sensitive replay classification should validate")
+                    .is_none(),
+                "order-sensitive lifecycle replay must use the sequential writer"
+            );
         }
     }
 }
