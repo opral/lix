@@ -199,10 +199,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_json_predicate_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"meta\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -212,8 +211,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO engine_json_predicate_schema (id, meta, lixcol_untracked) \
-                 VALUES ('json-predicate-1', lix_json('{\"flag\":true}'), false)",
+                "INSERT INTO engine_json_predicate_schema (id, meta) \
+                 VALUES ('json-predicate-1', lix_json('{\"flag\":true}'))",
                 &[],
             )
             .await

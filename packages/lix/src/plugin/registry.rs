@@ -519,7 +519,7 @@ where
     };
     let current = crate::live_state::TrackedHeadContext::new()
         .reader(store)
-        .scan_live_batches_for_controls(controls, &request, None)
+        .scan_live_batches_for_controls(controls, &request)
         .await?;
     let mut roots = BTreeSet::new();
     for (branch_id, rows) in current {
@@ -1186,7 +1186,6 @@ fn tracked_key_value_write_row(
         global: false,
         change_id: None,
         commit_id: None,
-        untracked: false,
         branch_id: branch_id.into(),
     })
 }
@@ -1202,7 +1201,6 @@ fn validate_live_state_identity(
         || row.entity_pk.as_single_string().ok() != Some(key)
         || row.file_id.as_deref() != expected_file_id
         || row.global
-        || row.untracked
         || row.branch_id.as_ref() != branch_id
     {
         return Err(invalid_registry(format!(
@@ -1521,7 +1519,6 @@ mod tests {
             Some("01920000-0000-7000-8000-0000000000a2")
         );
         assert!(!row.global);
-        assert!(!row.untracked);
         assert_eq!(row.branch_id, "main");
         assert_eq!(row.snapshot.unwrap().value()["key"], PLUGIN_OWNER_KEY);
         assert_eq!(owner.schema_keys(), ["plugin_a_meta", "plugin_a_note"]);

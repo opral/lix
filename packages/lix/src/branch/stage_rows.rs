@@ -29,7 +29,6 @@ pub(crate) fn branch_descriptor_stage_row(
         global: true,
         change_id: None,
         commit_id: None,
-        untracked: false,
         branch_id: GLOBAL_BRANCH_ID.into(),
     }
 }
@@ -50,7 +49,6 @@ pub(crate) fn branch_ref_stage_row(branch_id: &str, commit_id: &CommitId) -> Tra
         global: true,
         change_id: None,
         commit_id: None,
-        untracked: true,
         branch_id: GLOBAL_BRANCH_ID.into(),
     }
 }
@@ -81,7 +79,6 @@ pub(crate) fn branch_ref_tombstone_row(branch_id: &str) -> TransactionWriteRow {
         global: true,
         change_id: None,
         commit_id: None,
-        untracked: true,
         branch_id: GLOBAL_BRANCH_ID.into(),
     }
 }

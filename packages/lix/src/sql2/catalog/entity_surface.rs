@@ -442,7 +442,6 @@ pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
     ];
     if shape == EntitySurfaceShape::ByBranch {
         fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));

@@ -66,7 +66,7 @@ simulation_test!(
 
         let refs_result = session
             .execute(
-                "SELECT id, commit_id, lixcol_untracked \
+                "SELECT id, commit_id  \
              FROM lix_branch_ref \
              ORDER BY id",
                 &[],
@@ -313,9 +313,9 @@ simulation_test!(
 
         let mode_result = session
             .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 lix_json('{\"enabled\":true}'), true)",
                 &[],
             )
             .await
@@ -389,9 +389,9 @@ simulation_test!(
 
         let mode_result = session
             .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 lix_json('{\"enabled\":true}'), true)",
                 &[],
             )
             .await
@@ -449,9 +449,9 @@ simulation_test!(
         );
         session
             .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 lix_json('{\"enabled\":true}'), true)",
                 &[],
             )
             .await
@@ -507,9 +507,9 @@ simulation_test!(
         );
         session
             .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 lix_json('{\"enabled\":true}'), true)",
                 &[],
             )
             .await

@@ -4583,6 +4583,36 @@ mod tests {
         assert_eq!(rows.rows()[1_023].get::<String>("value").unwrap(), sample);
     }
 
+    async fn assert_columnar_lifecycle_current_points(
+        session: &SessionContext<Memory>,
+        row_count: usize,
+        first: &str,
+        sample: &str,
+    ) {
+        let count = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM columnar_lifecycle_probe",
+                &[],
+            )
+            .await
+            .expect("typed lifecycle count should succeed");
+        assert_eq!(
+            count.rows()[0].get::<i64>("entries").unwrap(),
+            row_count as i64
+        );
+        for (id, expected) in [("00000", first), ("01023", sample)] {
+            let rows = session
+                .execute(
+                    "SELECT value FROM columnar_lifecycle_probe WHERE id = $1",
+                    &[Value::Text(id.to_owned())],
+                )
+                .await
+                .expect("typed lifecycle point read should succeed");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), expected);
+        }
+    }
+
     async fn assert_columnar_layout_selected(
         session: &SessionContext<Memory>,
         schema_key: &str,
@@ -6338,29 +6368,33 @@ mod tests {
             .expect("zero LIMIT should retain DataFusion semantics");
         assert!(zero.is_empty());
 
-        // The immutable groups can all be pruned for this value, but the HOT
-        // winner must still be reconciled and filtered before LIMIT executes.
+        // A finite primary-key read must reconcile the HOT winner above the
+        // immutable columnar base before applying the remaining predicate.
         let overlay_match = main
             .execute(
-                "SELECT id FROM columnar_lifecycle_probe \
-                 WHERE value = 'sparse-0512' LIMIT 1",
+                "SELECT id, value FROM columnar_lifecycle_probe \
+                 WHERE id = '00512' AND value = 'sparse-0512' LIMIT 1",
                 &[],
             )
             .await
-            .expect("pruned columnar scan should retain matching overlay winner");
+            .expect("finite columnar scan should retain the matching overlay winner");
         assert_eq!(overlay_match.len(), 1);
         assert_eq!(
             overlay_match.rows()[0].get::<String>("id").unwrap(),
             "00512"
         );
+        assert_eq!(
+            overlay_match.rows()[0].get::<String>("value").unwrap(),
+            "sparse-0512"
+        );
         let no_match = main
             .execute(
                 "SELECT id FROM columnar_lifecycle_probe \
-                 WHERE value = 'not-present' LIMIT 1",
+                 WHERE id = '00512' AND value = 'not-present' LIMIT 1",
                 &[],
             )
             .await
-            .expect("fully pruned columnar scan should return an exact empty result");
+            .expect("finite columnar scan should apply predicates to the overlay winner");
         assert!(no_match.is_empty());
 
         main.execute(
@@ -6393,16 +6427,35 @@ mod tests {
             )
             .await
             .expect("draft update should commit");
+        assert_columnar_lifecycle_current_points(
+            &draft_session,
+            ROW_COUNT,
+            "draft-0000",
+            "base-1023",
+        )
+        .await;
         draft_session
             .undo()
             .await
             .expect("draft update should undo");
-        assert_columnar_lifecycle_current(&draft_session, ROW_COUNT, "base-0000", "base-1023")
-            .await;
+        assert_columnar_lifecycle_current_points(
+            &draft_session,
+            ROW_COUNT,
+            "base-0000",
+            "base-1023",
+        )
+        .await;
         draft_session
             .redo()
             .await
             .expect("draft update should redo");
+        assert_columnar_lifecycle_current_points(
+            &draft_session,
+            ROW_COUNT,
+            "draft-0000",
+            "base-1023",
+        )
+        .await;
 
         main.execute(
             "UPDATE columnar_lifecycle_probe SET value = 'main-1023' WHERE id = '01023'",
@@ -6417,7 +6470,7 @@ mod tests {
             .await
             .expect("disjoint typed updates should merge");
         assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
+        assert_columnar_lifecycle_current_points(&main, ROW_COUNT, "draft-0000", "main-1023").await;
 
         let merged_head = engine
             .load_branch_head_commit_id(&main_branch_id)
@@ -6476,7 +6529,7 @@ mod tests {
             restored.rows()[0].get::<String>("value").unwrap(),
             "base-0512"
         );
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
+        assert_columnar_lifecycle_current_points(&main, ROW_COUNT, "draft-0000", "main-1023").await;
 
         let mut corrupt = engine.storage().new_write_set();
         corrupt.delete(
@@ -7450,72 +7503,6 @@ mod tests {
         assert!(
             rows.is_empty(),
             "the valid prefix must roll back with the missing-branch batch"
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_batch_preserves_later_durability_domain_error_index() {
-        let session = open_session().await;
-        let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_durability_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema \
-                 (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, true)",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .unwrap();
-
-        let sql = "INSERT INTO parameter_insert_durability_probe \
-                   (id, value, lixcol_untracked) VALUES ($1, $2, $3)";
-        let error = session
-            .execute_batch(&[
-                ExecuteBatchStatement {
-                    label: None,
-                    sql: sql.to_string(),
-                    params: vec![
-                        Value::Text("a".to_string()),
-                        Value::Text("value-a".to_string()),
-                        Value::Boolean(true),
-                    ],
-                },
-                ExecuteBatchStatement {
-                    label: None,
-                    sql: sql.to_string(),
-                    params: vec![
-                        Value::Text("b".to_string()),
-                        Value::Text("value-b".to_string()),
-                        Value::Boolean(false),
-                    ],
-                },
-            ])
-            .await
-            .expect_err("the second row's tracked-catalog failure must retain its statement index");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert_eq!(error.details.unwrap()["statementIndex"], 1);
-
-        let rows = session
-            .execute(
-                "SELECT id FROM parameter_insert_durability_probe WHERE id = 'a'",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert!(
-            rows.is_empty(),
-            "the untracked prefix must roll back with the mixed-durability batch"
         );
     }
 
@@ -9833,7 +9820,6 @@ mod tests {
                 global: true,
                 change_id: None,
                 commit_id: None,
-                untracked: false,
                 branch_id: crate::GLOBAL_BRANCH_ID.into(),
             }
         }

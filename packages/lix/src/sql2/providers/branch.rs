@@ -1366,7 +1366,6 @@ mod tests {
             global: true,
             change_id: None,
             commit_id: None,
-            untracked: false,
             branch_id: GLOBAL_BRANCH_ID.into(),
         }
     }

@@ -6,14 +6,6 @@ use crate::live_state::MaterializedLiveStateBatchBuilder;
 use crate::live_state::{LiveStateExactBatchRequest, LiveStateScanRequest};
 use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateExactBatch};
 
-/// Selects the authenticated serving domain for an internal read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LiveStateReadDomain {
-    Combined,
-    Tracked,
-    Untracked,
-}
-
 /// Minimal engine read model for transaction planning and SQL providers.
 ///
 /// Engine only needs visible state-row reads here. Changelog freshness/catch-up
@@ -36,43 +28,15 @@ pub(crate) trait LiveStateReader: Send + Sync {
     async fn scan_constraint_batch(
         &self,
         request: &LiveStateScanRequest,
-        tracked_only: bool,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        if tracked_only {
-            self.scan_tracked_batch(request).await
-        } else {
-            self.scan_batch(request).await
-        }
-    }
-
-    /// Reads one explicit authenticated serving domain.  Ordinary visibility
-    /// callers use `Combined`; internal historical/entity validation and
-    /// current-only durable callers select their domain explicitly.
-    async fn scan_domain_batch(
-        &self,
-        request: &LiveStateScanRequest,
-        domain: LiveStateReadDomain,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        match domain {
-            LiveStateReadDomain::Combined => self.scan_constraint_batch(request, false).await,
-            LiveStateReadDomain::Tracked => {
-                let mut request = request.clone();
-                request.filter.untracked = Some(false);
-                self.scan_constraint_batch(&request, true).await
-            }
-            LiveStateReadDomain::Untracked => {
-                let mut request = request.clone();
-                request.filter.untracked = Some(true);
-                self.scan_constraint_batch(&request, false).await
-            }
-        }
+        self.scan_tracked_batch(request).await
     }
 
     /// Scans the immutable tracked head selected by the current branch ref.
     ///
     /// Normal SQL reads use [`Self::scan_batch`] and therefore see exactly one
     /// canonical current row. Validation and schema planning use this explicit
-    /// durability view when a tracked commit must not depend on untracked
+    /// durability view when a historical commit must not depend on current-only
     /// live state. Readers that wrap canonical current scans must override
     /// this method instead of relying on the fallback below.
     /// The default keeps the explicit tracked filter in the batch
@@ -81,9 +45,7 @@ pub(crate) trait LiveStateReader: Send + Sync {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let mut request = request.clone();
-        request.filter.untracked = Some(false);
-        self.scan_batch(&request).await
+        self.scan_batch(request).await
     }
 
     /// Loads concrete visible identities while preserving request alignment.

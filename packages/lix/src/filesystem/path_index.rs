@@ -129,7 +129,6 @@ impl FilesystemPathEntry {
             global: self.key.global(),
             change_id: self.change_id,
             commit_id: self.commit_id,
-            untracked: self.key.is_untracked(),
             branch_id: self.key.branch_id().into(),
         }
     }
@@ -743,7 +742,6 @@ impl FilesystemPathIndex {
             && same_id.iter().any(|entry| {
                 !entry.key.global()
                     && entry.key.branch_id() == row.branch_id.as_ref()
-                    && entry.key.is_untracked() == row.untracked
                     && entry.key.file_id()
                         == if kind == FilesystemPathKind::File {
                             None
@@ -1281,9 +1279,9 @@ impl FilesystemPathIndexCache {
             .entries
             .lock()
             .expect("filesystem path cache lock poisoned");
-        // Global/untracked mutations can change visibility in every branch;
+        // Global mutations can change visibility in every branch;
         // leave that uncommon fan-out case to the reconstruction fallback.
-        if rows.iter().any(|row| row.global || row.untracked) {
+        if rows.iter().any(|row| row.global) {
             entries.retain(|candidate| candidate.key.revision != previous_revision);
             return;
         }
@@ -1343,7 +1341,7 @@ impl FilesystemPathIndexCache {
         rows: &[MaterializedLiveStateRow],
         next_revision_for: impl Fn(&[u8]) -> Option<Vec<u8>>,
     ) {
-        let invalidates_delta = rows.iter().any(|row| row.global || row.untracked);
+        let invalidates_delta = rows.iter().any(|row| row.global);
         let mut entries = self
             .entries
             .lock()
@@ -1434,11 +1432,7 @@ fn file_directory_parent_keys(
     file_key: &FilesystemDescriptorKey,
     directory_id: &str,
 ) -> Vec<FilesystemDescriptorKey> {
-    let mut keys = vec![file_key.in_same_scope(directory_id)];
-    if file_key.is_untracked() {
-        keys.push(file_key.in_tracked_scope(directory_id));
-    }
-    keys
+    vec![file_key.in_same_scope(directory_id)]
 }
 
 #[derive(Debug, Deserialize)]
@@ -1487,11 +1481,7 @@ impl DirectoryPathRecord for DirectoryRecord {
         let Some(parent_id) = self.parent_id.as_deref() else {
             return Vec::new();
         };
-        let mut keys = vec![key.in_same_scope(parent_id)];
-        if key.is_untracked() {
-            keys.push(key.in_tracked_scope(parent_id));
-        }
-        keys
+        vec![key.in_same_scope(parent_id)]
     }
 
     fn name(&self) -> &str {
@@ -2203,7 +2193,6 @@ mod tests {
             global,
             change_id: Some(ChangeId::for_test_label(id)),
             commit_id: Some(CommitId::for_test_label(id)),
-            untracked: false,
             branch_id: branch_id.into(),
         }
     }

@@ -28,9 +28,7 @@ use crate::commit_graph::CommitGraphContext;
 #[cfg(test)]
 use crate::json_store::JsonRef;
 #[cfg(test)]
-use crate::json_store::{
-    JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
-};
+use crate::json_store::{JsonSlot, JsonStoreContext};
 use crate::live_state::TrackedHeadContext;
 #[cfg(test)]
 use crate::live_state::stage_collect_stale_working_diff_indexes;
@@ -2684,20 +2682,13 @@ where
     let total_started = Instant::now();
     let phase_started = Instant::now();
     // Controls are the complete ownership root for the generation-keyed
-    // current-state plane. Read them once so untracked payload discovery and
-    // derived-generation sweeping use exactly the same pinned publication
-    // view.
+    // state plane. Read them once so root discovery and derived-generation
+    // sweeping use exactly the same pinned publication view.
     let controls = BranchHeadControlContext::new()
         .reader(store.clone())
         .scan()
         .await?;
-    let mut roots = TrackedHeadContext::new()
-        .reader(store.clone())
-        .untracked_json_refs(&controls)
-        .await?
-        .into_iter()
-        .map(GcRoot::CurrentPayload)
-        .collect::<Vec<_>>();
+    let mut roots = Vec::new();
     // Branch controls, not their public `lix_branch_ref` projection rows,
     // are the authoritative tracked-history roots.
     for (_branch_id, control) in &controls {
@@ -2721,66 +2712,11 @@ where
     // maintenance work, but delta rows have no shared ownership and must be
     // reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    // Old serving generations are derived data. Removing them in the same
-    // atomic sweep as their untracked payload-root withdrawal prevents stale
-    // branch generations from accumulating indefinitely.
-    let stale_untracked_refs = TrackedHeadContext::new()
+    // Old serving generations are derived data and can be removed after the
+    // authoritative history roots have been established.
+    TrackedHeadContext::new()
         .stage_collect_stale_current_state_generations(&store, writes, &controls)
         .await?;
-    // The changelog plan contains every payload reachable from tracked
-    // history plus the active untracked roots supplied above. A retired
-    // untracked JSON ref is only a deletion candidate: content-addressed
-    // payloads can be shared with another current row or reachable history,
-    // so absence from this complete live set is the required proof.
-    let live_payloads = changelog_plan
-        .live
-        .payloads
-        .iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
-    // `collect_garbage` already staged deletes for dead changelog payloads.
-    // Avoid emitting a second mutation for a content hash shared with a stale
-    // untracked generation; `StorageWriteSet` deliberately rejects duplicate
-    // final mutations, even when both are deletes.
-    let changelog_swept_payloads = changelog_plan
-        .sweep
-        .json_payloads
-        .iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
-    let mut reclaimable_untracked_refs = stale_untracked_refs
-        .into_iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
-    let mut consumed_candidate_keys = Vec::new();
-    for candidate in JsonStoreContext::new()
-        .scan_untracked_reclaim_candidates(&store)
-        .await?
-    {
-        let UntrackedJsonReclaimCandidate { key, json_ref } = candidate;
-        let Some(json_ref) = json_ref else {
-            // Candidate records are derived hints. A malformed one cannot
-            // safely name a JSON payload, but it must not become permanent
-            // maintenance debt.
-            consumed_candidate_keys.push(key);
-            continue;
-        };
-        if !live_payloads.contains(json_ref.as_hash_array()) {
-            reclaimable_untracked_refs.insert(*json_ref.as_hash_array());
-            consumed_candidate_keys.push(key);
-        }
-        // Keep a live candidate. If a shared owner later disappears through a
-        // different lifecycle path, the next GC can still prove reclamation
-        // without relying on that path to recreate this hint.
-    }
-    let reclaimable_untracked_refs = reclaimable_untracked_refs
-        .into_iter()
-        .filter(|hash| !live_payloads.contains(hash) && !changelog_swept_payloads.contains(hash))
-        .map(JsonRef::from_hash_bytes)
-        .collect::<Vec<_>>();
-    let json_writer = JsonStoreContext::new().writer();
-    json_writer.stage_delete_refs(writes, reclaimable_untracked_refs);
-    JsonStoreWriter::stage_delete_untracked_reclaim_candidates(writes, consumed_candidate_keys);
     // Checkpoint publication leaves prior dirty-index generations unreachable
     // in O(1). Reclaim those auxiliary records only in the asynchronous GC
     // pass so a foreground checkpoint never pays a history-sized delete cost.
@@ -3607,7 +3543,7 @@ mod tests {
     use crate::entity_pk::EntityPk;
     use crate::json_store::{
         JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
-        NormalizedJsonRef, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
+        NormalizedJsonRef,
     };
     use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
@@ -3683,8 +3619,7 @@ mod tests {
         let head = CommitId::with_change_address_space(
             *CommitId::for_test_label("control-projection-head").as_uuid(),
         );
-        let tracked_generation = CommitId::for_test_label("control-projection-tracked");
-        let untracked_generation = CommitId::for_test_label("control-projection-untracked");
+        let tracked_generation = CommitId::for_test_label("control-projection-generation");
         let working_diff = CommitId::with_change_address_space(
             *CommitId::for_test_label("control-projection-working-diff").as_uuid(),
         );
@@ -3695,7 +3630,6 @@ mod tests {
             BranchHeadControl {
                 head_commit_id: head,
                 tracked_generation,
-                untracked_generation,
                 current_state_revision: 7,
                 working_diff_checkpoint_commit_id: Some(working_diff),
                 created_at: timestamp,
@@ -3747,11 +3681,7 @@ mod tests {
         );
         assert!(reachability.serving_dependencies.is_empty());
         assert!(!reachability.chronology_roots.contains(&tracked_generation));
-        assert!(
-            !reachability
-                .chronology_roots
-                .contains(&untracked_generation)
-        );
+        assert!(!reachability.chronology_roots.contains(&tracked_generation));
     }
 
     #[tokio::test]
@@ -4940,7 +4870,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,
@@ -4993,7 +4922,7 @@ mod tests {
         let mut advanced = observed.control.expect("fixture control should exist");
         advanced.head_commit_id = CommitId::for_test_label("concurrent-head");
         advanced.tracked_generation = advanced.head_commit_id;
-        advanced.untracked_generation = advanced.head_commit_id;
+        advanced.tracked_generation = advanced.head_commit_id;
         advanced.current_state_revision = advanced.current_state_revision.saturating_add(1);
         stage_branch_head_control(&mut concurrent, "main", advanced)
             .expect("concurrent control should stage");
@@ -5508,7 +5437,6 @@ mod tests {
         let old_control = BranchHeadControl {
             head_commit_id: old_root,
             tracked_generation: old_root,
-            untracked_generation: old_root,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -5519,7 +5447,6 @@ mod tests {
         let new_control = BranchHeadControl {
             head_commit_id: new_root,
             tracked_generation: new_root,
-            untracked_generation: new_root,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -5591,7 +5518,6 @@ mod tests {
         let old_control = BranchHeadControl {
             head_commit_id: old_root,
             tracked_generation: old_root,
-            untracked_generation: old_root,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -5602,7 +5528,6 @@ mod tests {
         let new_control = BranchHeadControl {
             head_commit_id: new_root,
             tracked_generation: new_root,
-            untracked_generation: new_root,
             current_state_revision: 1,
             working_diff_checkpoint_commit_id: Some(new_root),
             created_at: timestamp,
@@ -6215,109 +6140,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn repository_gc_keeps_current_untracked_file_blob_across_cold_reopen() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("untracked-file repository should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("untracked-file repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("untracked-file session should open");
-        let live_bytes = b"current-only-untracked-file-blob";
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content, lixcol_untracked) \
-                 VALUES ('/current-only.bin', $1, true)",
-                &[Value::Blob(live_bytes.to_vec().into())],
-            )
-            .await
-            .expect("untracked file should publish");
-
-        let storage = StorageAdapter::new(backend.clone());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("unrelated orphan staging read should open");
-        let mut orphan_writes = storage.new_write_set();
-        let orphan = crate::binary_cas::BinaryCasContext::new()
-            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
-            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
-                b"untracked-file-unrelated-orphan".to_vec(),
-            ))
-            .await
-            .expect("unrelated orphan should stage");
-        drop(read);
-        storage
-            .commit_write_set(orphan_writes, StorageWriteOptions::default())
-            .await
-            .expect("unrelated orphan should commit");
-
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("untracked-file GC read should open"),
-        );
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        let plan =
-            super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
-                .await
-                .expect("untracked-file GC should stage");
-        assert!(plan.sweep.binary_cas.reclaimed_chunk_rows >= 1);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("untracked-file GC should commit");
-
-        drop(session);
-        drop(engine);
-        let reopened = Engine::new(backend.clone())
-            .await
-            .expect("repository should cold reopen after untracked-file GC");
-        let reopened_session = reopened
-            .open_workspace_session()
-            .await
-            .expect("cold untracked-file session should open");
-        let content = reopened_session
-            .execute(
-                "SELECT content FROM lix_file WHERE path = '/current-only.bin'",
-                &[],
-            )
-            .await
-            .expect("cold untracked file should read");
-        assert_eq!(
-            content.rows()[0].get::<Vec<u8>>("content").unwrap(),
-            live_bytes
-        );
-
-        let read = StorageAdapter::new(backend)
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("orphan verification read should open");
-        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-        assert!(
-            reader
-                .load_bytes_many(&[orphan.hash])
-                .await
-                .expect("orphan verification should load")
-                .into_vec()[0]
-                .is_none(),
-            "unrelated binary-CAS garbage must still be reclaimed"
-        );
-    }
-
     #[cfg(feature = "default_wasm_runtime")]
     #[tokio::test]
     async fn repository_gc_keeps_plugin_wasm_for_cold_runtime_execution() {
@@ -6524,7 +6346,6 @@ mod tests {
                     entity_pk: &entity_pk,
                     change_id: Some(ChangeId::for_test_label("corrupt-plugin-registry")),
                     commit_id: Some(control.head_commit_id),
-                    untracked: false,
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -6823,85 +6644,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_gc_reclaims_retired_untracked_update_without_inventory_sweep() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let old_value = serde_json::json!({
-            "payload": "old-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let old_json = old_value.to_string();
-        let old_ref = key_value_snapshot_ref("gc-update-untracked", &old_value);
-        let new_value = serde_json::json!({
-            "payload": "new-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let new_json = new_value.to_string();
-        let new_ref = key_value_snapshot_ref("gc-update-untracked", &new_value);
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-                 VALUES ('gc-update-untracked', lix_json($1), true)",
-                &[Value::Text(old_json)],
-            )
-            .await
-            .expect("old untracked value should write");
-        session
-            .execute(
-                "UPDATE lix_key_value SET value = lix_json($1) \
-                 WHERE key = 'gc-update-untracked'",
-                &[Value::Text(new_json)],
-            )
-            .await
-            .expect("untracked value should update in the same generation");
-
-        // A bare JSON object has no reclaim candidate. It proves this GC is
-        // deliberately targeted rather than a full JSON-store inventory scan.
-        let bare_orphan_ref =
-            stage_bare_json(&storage, &format!("\"{}\"", "bare-".repeat(1024))).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, old_ref).await,
-            "the superseded untracked payload should be reclaimed"
-        );
-        assert!(
-            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, new_ref).await,
-            "the current untracked payload must remain stored"
-        );
-        assert!(
-            json_ref_exists(
-                &storage,
-                crate::json_store::store::JSON_SPACE,
-                bare_orphan_ref,
-            )
-            .await,
-            "candidate GC must not scan and sweep unrelated JSON"
-        );
-        assert!(
-            !json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, old_ref,).await,
-            "a dead payload should consume its reclamation candidate"
-        );
-
-        let visible = session
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'gc-update-untracked'",
-                &[],
-            )
-            .await
-            .expect("live untracked value should remain readable after GC");
-        assert_eq!(visible.rows()[0].values(), &[Value::Json(new_value)]);
-    }
-
-    #[tokio::test]
     async fn repository_gc_retains_active_history_diff_undo_redo_and_reclaims_deleted_branch_refs()
     {
         let storage = Memory::new();
@@ -6928,7 +6670,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7211,58 +6953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_gc_reclaims_retired_untracked_delete() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let deleted_value = serde_json::json!({
-            "payload": "delete-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let deleted_json = deleted_value.to_string();
-        let deleted_ref = key_value_snapshot_ref("gc-delete-untracked", &deleted_value);
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-                 VALUES ('gc-delete-untracked', lix_json($1), true)",
-                &[Value::Text(deleted_json)],
-            )
-            .await
-            .expect("untracked value should write");
-        session
-            .execute(
-                "DELETE FROM lix_key_value WHERE key = 'gc-delete-untracked'",
-                &[],
-            )
-            .await
-            .expect("untracked value should delete physically");
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, deleted_ref,).await,
-            "a deleted untracked payload should be reclaimed"
-        );
-        assert!(
-            !json_ref_exists(
-                &storage,
-                UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-                deleted_ref,
-            )
-            .await,
-            "a reclaimed deletion should consume its candidate"
-        );
-    }
-
-    #[tokio::test]
-    async fn repository_gc_keeps_candidate_reachable_from_tracked_history() {
+    async fn repository_gc_keeps_payload_reachable_from_history() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -7288,20 +6979,11 @@ mod tests {
             .await
             .expect("tracked owner should write");
 
-        // Candidate records are merely ownership-loss hints. Injecting one
-        // for a tracked payload exercises the exact same liveness proof that
-        // protects a hash shared with retained history.
-        stage_untracked_reclaim_candidate(&storage, shared_ref).await;
-
         run_repository_gc(&storage).await;
 
         assert!(
             json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "reachable tracked history must retain a candidate payload"
-        );
-        assert!(
-            json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "a candidate rooted by history must survive for later re-evaluation"
+            "reachable history must retain its payload"
         );
         let tracked = session
             .execute(
@@ -7877,127 +7559,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn repository_gc_reclaims_candidate_after_last_live_untracked_owner_disappears() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let shared_ref = stage_bare_json(
-            &storage,
-            &serde_json::json!({
-                "payload": "shared-untracked-"
-                    .repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-            })
-            .to_string(),
-        )
-        .await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-a", Some(shared_ref)).await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-b", Some(shared_ref)).await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-a", None).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "the second live untracked owner must retain its payload"
-        );
-        assert!(
-            json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "the candidate must survive until the last untracked owner disappears"
-        );
-
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-b", None).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "the final owner's payload should be reclaimed after its deletion"
-        );
-        assert!(
-            !json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "reclaiming the payload should consume the durable candidate"
-        );
-    }
-
-    async fn stage_untracked_current_owner(
-        storage: &Memory,
-        entity_pk_value: &str,
-        snapshot: Option<JsonRef>,
-    ) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let read = storage_adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("current-state owner read should open");
-        let control = BranchHeadControlContext::new()
-            .reader(&read)
-            .load(GLOBAL_BRANCH_ID)
-            .await
-            .expect("global control should load")
-            .expect("global control should exist");
-        let entity_pk = EntityPk::single(entity_pk_value);
-        let snapshot_slot = snapshot.map_or(JsonSlot::None, JsonSlot::Ref);
-        let timestamp =
-            LixTimestamp::expect_parse("untracked GC owner timestamp", "2026-01-01T00:00:00Z");
-        let mut writes = storage_adapter.new_write_set();
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        TrackedHeadContext::new()
-            .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
-                GLOBAL_BRANCH_ID,
-                Some(control.tracked_generation),
-                control.head_commit_id,
-                &[CurrentStateDeltaRef {
-                    schema_key: "gc_untracked_owner",
-                    file_id: None,
-                    entity_pk: &entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: snapshot.is_none(),
-                    created_at: timestamp,
-                    updated_at: timestamp,
-                    snapshot: snapshot_slot.as_ref_slot(),
-                    metadata: JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }],
-                &BTreeSet::new(),
-                None,
-                None,
-                None,
-                &mut coverage,
-            )
-            .await
-            .expect("untracked current-state owner should stage");
-        stage_branch_head_control(
-            &mut writes,
-            GLOBAL_BRANCH_ID,
-            control
-                .next_current_state_revision()
-                .expect("current-state revision should advance"),
-        )
-        .expect("current-state control should stage");
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("untracked current-state owner should commit");
-    }
-
-    async fn stage_untracked_reclaim_candidate(storage: &Memory, json_ref: JsonRef) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let mut writes = storage_adapter.new_write_set();
-        crate::json_store::JsonStoreWriter::stage_untracked_reclaim_candidates(
-            &mut writes,
-            [json_ref],
-        );
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("reclaim candidate should commit");
-    }
-
     async fn run_repository_gc(storage: &Memory) {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let read = SharedStorageAdapterRead::new(
@@ -8097,7 +7658,6 @@ mod tests {
         BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,

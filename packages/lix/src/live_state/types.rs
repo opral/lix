@@ -32,7 +32,6 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) global: bool,
     pub(crate) change_id: Option<ChangeId>,
     pub(crate) commit_id: Option<CommitId>,
-    pub(crate) untracked: bool,
     pub(crate) branch_id: Arc<str>,
 }
 
@@ -113,7 +112,6 @@ pub(crate) struct MaterializedLiveStateBatch {
     global: Vec<bool>,
     change_id: Vec<Option<ChangeId>>,
     commit_id: Vec<Option<CommitId>>,
-    untracked: Vec<bool>,
     /// Encoded authoritative HOT predecessor resolved by a durable exact read.
     ///
     /// This is intentionally internal transaction evidence, not a public
@@ -383,7 +381,6 @@ impl MaterializedLiveStateBatch {
             self.global.capacity() * size_of::<bool>(),
             self.change_id.capacity() * size_of::<Option<ChangeId>>(),
             self.commit_id.capacity() * size_of::<Option<CommitId>>(),
-            self.untracked.capacity() * size_of::<bool>(),
             self.columnar_base_coordinate
                 .as_ref()
                 .map_or(0, |coordinates| {
@@ -496,13 +493,6 @@ impl<'a> MaterializedLiveStateRowRef<'a> {
         )
     }
 
-    pub(crate) fn untracked(self) -> bool {
-        self.singleton().map_or_else(
-            || self.batch.untracked[self.index],
-            |singleton| singleton.row.untracked,
-        )
-    }
-
     pub(crate) fn durable_predecessor(self) -> Option<&'a CertifiedCurrentStatePredecessor> {
         self.singleton().map_or_else(
             || self.batch.durable_predecessor[self.index].as_ref(),
@@ -561,7 +551,6 @@ impl<'a> MaterializedLiveStateRowRef<'a> {
             global: self.global(),
             change_id: self.change_id(),
             commit_id: self.commit_id(),
-            untracked: self.untracked(),
             branch_id,
         }
     }
@@ -647,28 +636,6 @@ impl MaterializedLiveStateExactBatch {
             .copied()
             .flatten()
             .map(|ordinal| self.batch.row(ordinal as usize))
-    }
-
-    pub(crate) fn filter(
-        &self,
-        mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
-    ) -> Result<Self, crate::LixError> {
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(self.len());
-        let mut slots = Vec::with_capacity(self.len());
-        for index in 0..self.len() {
-            let Some(row) = self.row(index).filter(|row| keep(*row)) else {
-                slots.push(None);
-                continue;
-            };
-            let ordinal = u32::try_from(builder.push_ref(row, None)).map_err(|_| {
-                crate::LixError::new(
-                    crate::LixError::CODE_INTERNAL_ERROR,
-                    "exact live-state result exceeds u32 rows",
-                )
-            })?;
-            slots.push(Some(ordinal));
-        }
-        Self::new(builder.finish(), slots)
     }
 
     /// Consumes an aligned exact result into one compact owner containing only
@@ -1014,7 +981,6 @@ pub(crate) struct MaterializedLiveStateBatchBuilder {
     global: Vec<bool>,
     change_id: Vec<Option<ChangeId>>,
     commit_id: Vec<Option<CommitId>>,
-    untracked: Vec<bool>,
     durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
     columnar_base_coordinate: Option<Vec<ColumnarBaseCoordinate>>,
 }
@@ -1079,7 +1045,6 @@ impl MaterializedLiveStateBatchBuilder {
             global: Vec::with_capacity(column_capacity),
             change_id: Vec::with_capacity(column_capacity),
             commit_id: Vec::with_capacity(column_capacity),
-            untracked: Vec::with_capacity(column_capacity),
             durable_predecessor: Vec::with_capacity(column_capacity),
             columnar_base_coordinate: None,
         }
@@ -1143,7 +1108,6 @@ impl MaterializedLiveStateBatchBuilder {
             global,
             change_id,
             commit_id,
-            untracked,
             branch_id,
         } = row;
         let schema_key = SchemaKeyId(self.intern_owned(schema_key));
@@ -1162,7 +1126,6 @@ impl MaterializedLiveStateBatchBuilder {
             global,
             change_id,
             commit_id,
-            untracked,
         );
         *self
             .durable_predecessor
@@ -1187,7 +1150,6 @@ impl MaterializedLiveStateBatchBuilder {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
-        untracked: bool,
         branch_id: &str,
     ) -> usize {
         let ordinal = self.len();
@@ -1204,7 +1166,6 @@ impl MaterializedLiveStateBatchBuilder {
                 global,
                 change_id,
                 commit_id,
-                untracked,
                 branch_id: Arc::from(branch_id),
             });
             return ordinal;
@@ -1225,7 +1186,6 @@ impl MaterializedLiveStateBatchBuilder {
             global,
             change_id,
             commit_id,
-            untracked,
         );
         ordinal
     }
@@ -1244,7 +1204,6 @@ impl MaterializedLiveStateBatchBuilder {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
-        untracked: bool,
         branch_id: &str,
     ) -> usize {
         let ordinal = self.len();
@@ -1261,7 +1220,6 @@ impl MaterializedLiveStateBatchBuilder {
                 global,
                 change_id,
                 commit_id,
-                untracked,
                 branch_id: Arc::from(branch_id),
             });
             return ordinal;
@@ -1282,7 +1240,6 @@ impl MaterializedLiveStateBatchBuilder {
             global,
             change_id,
             commit_id,
-            untracked,
         );
         ordinal
     }
@@ -1325,7 +1282,6 @@ impl MaterializedLiveStateBatchBuilder {
             row.global(),
             row.change_id(),
             row.commit_id(),
-            row.untracked(),
         );
         self.durable_predecessor
             .last_mut()
@@ -1352,7 +1308,6 @@ impl MaterializedLiveStateBatchBuilder {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
-        untracked: bool,
     ) {
         self.schema_keys.push(schema_key);
         self.file_ids.push(file_id);
@@ -1366,7 +1321,6 @@ impl MaterializedLiveStateBatchBuilder {
         self.global.push(global);
         self.change_id.push(change_id);
         self.commit_id.push(commit_id);
-        self.untracked.push(untracked);
         self.durable_predecessor.push(None);
         if let Some(coordinates) = &mut self.columnar_base_coordinate {
             coordinates.push(ColumnarBaseCoordinate::default());
@@ -1436,7 +1390,6 @@ impl MaterializedLiveStateBatchBuilder {
             global: self.global,
             change_id: self.change_id,
             commit_id: self.commit_id,
-            untracked: self.untracked,
             durable_predecessor: self.durable_predecessor,
             columnar_base_coordinate: self.columnar_base_coordinate,
         }
@@ -1447,12 +1400,6 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
     type Error = crate::LixError;
 
     fn try_from(row: &MaterializedLiveStateRow) -> Result<Self, Self::Error> {
-        if row.untracked {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked_state cannot store untracked live-state rows",
-            ));
-        }
         let Some(change_id) = row.change_id else {
             return Err(crate::LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1527,8 +1474,6 @@ pub(crate) struct LiveStateFilter {
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
-    pub(crate) untracked: Option<bool>,
-    #[serde(default)]
     pub(crate) constraints: Vec<ScanConstraint>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
@@ -1590,7 +1535,6 @@ pub(crate) struct LiveStateExactRowRequest {
 pub(crate) struct LiveStateExactBatchRequest {
     pub(crate) rows: Vec<LiveStateExactRowRequest>,
     pub(crate) projection: LiveStateProjection,
-    pub(crate) untracked: Option<bool>,
     pub(crate) include_tombstones: bool,
 }
 
@@ -1608,7 +1552,6 @@ impl LiveStateExactBatchRequest {
                             NullableKeyFilter::Value(file_id.clone())
                         }),
                 ],
-                untracked: self.untracked,
                 include_tombstones: self.include_tombstones,
                 ..LiveStateFilter::default()
             },
@@ -1648,7 +1591,6 @@ mod batch_tests {
             global: false,
             change_id: None,
             commit_id: None,
-            untracked: true,
             branch_id: Arc::from("shared_branch"),
         }
     }
@@ -1877,7 +1819,6 @@ mod batch_tests {
                 false,
                 None,
                 None,
-                true,
                 "shared_branch",
             );
         }

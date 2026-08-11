@@ -78,7 +78,6 @@ pub(crate) fn collection_delete_stage_row(
         global: false,
         change_id: None,
         commit_id: None,
-        untracked: false,
         branch_id: branch_id.into(),
     }
 }

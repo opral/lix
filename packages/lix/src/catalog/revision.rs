@@ -158,7 +158,7 @@ mod tests {
         rolled_back
             .execute(
                 "INSERT INTO lix_registered_schema \
-                 (value, lixcol_global, lixcol_untracked) VALUES ($1, false, true)",
+                 (value, lixcol_global) VALUES ($1, false)",
                 &[Value::Json(test_schema("rolled_back_schema", false))],
             )
             .await
@@ -169,27 +169,26 @@ mod tests {
             .expect("schema transaction should roll back");
         assert_eq!(current_revision(&adapter).await, initial_revision);
 
-        register_schema(&session, "untracked_revision_probe", true).await;
-        let untracked_revision = current_revision(&adapter).await;
-        assert_ne!(untracked_revision, initial_revision);
+        register_schema(&session, "dynamic_revision_probe").await;
+        let dynamic_revision = current_revision(&adapter).await;
+        assert_ne!(dynamic_revision, initial_revision);
         let inserted = session
             .execute(
-                "INSERT INTO untracked_revision_probe (id, lixcol_untracked) \
-                 VALUES ('untracked-row', true)",
+                "INSERT INTO dynamic_revision_probe (id) VALUES ('dynamic-row')",
                 &[],
             )
             .await
-            .expect("untracked schema should be visible after commit");
+            .expect("dynamic schema should be visible after commit");
         assert_eq!(inserted.rows_affected(), 1);
         assert_eq!(
             current_revision(&adapter).await,
-            untracked_revision,
+            dynamic_revision,
             "writes through a dynamic surface must not invalidate its catalog"
         );
 
-        register_schema(&session, "tracked_revision_probe", false).await;
+        register_schema(&session, "tracked_revision_probe").await;
         let tracked_revision = current_revision(&adapter).await;
-        assert_ne!(tracked_revision, untracked_revision);
+        assert_ne!(tracked_revision, dynamic_revision);
         let amended = session
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
@@ -256,7 +255,7 @@ mod tests {
             .await
             .expect("explicit transaction should capture the old catalog");
 
-        register_schema(&session_b, "concurrent_revision_probe", false).await;
+        register_schema(&session_b, "concurrent_revision_probe").await;
         let committed_revision = current_revision(&adapter).await;
         assert_ne!(committed_revision, pinned_revision);
         assert_eq!(
@@ -311,7 +310,7 @@ mod tests {
             .expect("initial head should load")
             .expect("initial head should exist");
 
-        register_schema(&session, "branch_rewind_probe", false).await;
+        register_schema(&session, "branch_rewind_probe").await;
         session
             .execute("SELECT COUNT(*) AS rows FROM branch_rewind_probe", &[])
             .await
@@ -394,7 +393,7 @@ mod tests {
         } else {
             "fast_forward_revision_probe"
         };
-        register_schema(&draft, schema_key, false).await;
+        register_schema(&draft, schema_key).await;
         let revision_before_merge = current_revision(&adapter).await;
         let receipt = main
             .merge_branch(MergeBranchOptions {
@@ -435,13 +434,12 @@ mod tests {
             .expect("initialized storage should have a catalog revision")
     }
 
-    async fn register_schema(session: &SessionContext<Memory>, schema_key: &str, untracked: bool) {
-        let sql = format!(
-            "INSERT INTO lix_registered_schema \
-             (value, lixcol_global, lixcol_untracked) VALUES ($1, false, {untracked})"
-        );
+    async fn register_schema(session: &SessionContext<Memory>, schema_key: &str) {
         session
-            .execute(&sql, &[Value::Json(test_schema(schema_key, false))])
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES ($1, false)",
+                &[Value::Json(test_schema(schema_key, false))],
+            )
             .await
             .expect("schema registration should commit");
     }

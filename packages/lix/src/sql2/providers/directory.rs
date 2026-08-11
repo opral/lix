@@ -1061,12 +1061,6 @@ impl UpsertSupport for LixDirectorySpec {
                 "lixcol_global",
                 "INSERT into lix_directory",
             )?;
-            defaultable_bool_insert_value(
-                batch,
-                row_index,
-                "lixcol_untracked",
-                "INSERT into lix_directory",
-            )?;
         }
         Ok(())
     }
@@ -1089,11 +1083,7 @@ impl UpsertSupport for LixDirectorySpec {
             "lixcol_global",
             Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
         )?;
-        materialize_omitted_column(
-            &materialized,
-            "lixcol_untracked",
-            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
-        )
+        Ok(materialized)
     }
 
     async fn materialize_returning_insert_defaults(
@@ -1157,7 +1147,7 @@ impl UpsertSupport for LixDirectorySpec {
         if target.kind() == UpsertConflictKind::Path {
             // `ON CONFLICT (path)` has a finite, exact set of proposed
             // paths. The filesystem index preserves every visible directory
-            // lane for each path (tracked, untracked, and global), so retain
+            // acquisition path for each public identity, so retain
             // those rows for the generic matcher and its lane validation.
             // Primary-key conflict targets intentionally retain the generic
             // entity-PK scan below. An index-build failure also falls through
@@ -1188,31 +1178,16 @@ impl UpsertSupport for LixDirectorySpec {
 
     fn validate_conflict_pair(
         &self,
-        existing: &RecordBatch,
-        existing_row: usize,
-        proposed: &RecordBatch,
-        proposed_row: usize,
+        _existing: &RecordBatch,
+        _existing_row: usize,
+        _proposed: &RecordBatch,
+        _proposed_row: usize,
         target: &UpsertConflictTarget,
     ) -> Result<()> {
         if target.kind() != UpsertConflictKind::Path {
             return Ok(());
         }
-        let existing_untracked =
-            optional_bool_value(existing, existing_row, "lixcol_untracked")?.unwrap_or(false);
-        let proposed_untracked =
-            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
-        if existing_untracked == proposed_untracked {
-            return Ok(());
-        }
-        let path = required_string_value(proposed, proposed_row, "path")?;
-        Err(lix_error_to_datafusion_error(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "INSERT ON CONFLICT (path) on lix_directory cannot write {} path {path:?} over existing {} directory",
-                lane_name(proposed_untracked),
-                lane_name(existing_untracked)
-            ),
-        )))
+        Ok(())
     }
 
     /// Apply the `DO UPDATE` assignments to the augmented batch (existing
@@ -1309,10 +1284,6 @@ fn validate_required_paths(batch: &RecordBatch, table_name: &str) -> Result<()> 
     Ok(())
 }
 
-fn lane_name(untracked: bool) -> &'static str {
-    if untracked { "untracked" } else { "tracked" }
-}
-
 fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
     match branch_binding {
         BranchBinding::Active { .. } => "lix_directory",
@@ -1329,7 +1300,6 @@ trait DirectoryLiveRow {
     fn created_at(&self) -> String;
     fn updated_at(&self) -> String;
     fn commit_id(&self) -> Option<String>;
-    fn untracked(&self) -> bool;
     fn metadata(&self) -> Option<String>;
     fn branch_id(&self) -> &str;
 }
@@ -1365,10 +1335,6 @@ impl DirectoryLiveRow for MaterializedLiveStateRow {
 
     fn commit_id(&self) -> Option<String> {
         self.commit_id.map(|id| id.to_string())
-    }
-
-    fn untracked(&self) -> bool {
-        self.untracked
     }
 
     fn metadata(&self) -> Option<String> {
@@ -1413,10 +1379,6 @@ impl DirectoryLiveRow for MaterializedLiveStateRowRef<'_> {
         (*self).commit_id().map(|id| id.to_string())
     }
 
-    fn untracked(&self) -> bool {
-        (*self).untracked()
-    }
-
     fn metadata(&self) -> Option<String> {
         (*self)
             .metadata()
@@ -1450,11 +1412,7 @@ impl<L> DirectoryPathRecord for DirectoryDescriptorRecord<L> {
         let Some(parent_id) = self.parent_id.as_deref() else {
             return Vec::new();
         };
-        let mut keys = vec![key.in_same_scope(parent_id)];
-        if key.is_untracked() {
-            keys.push(key.in_tracked_scope(parent_id));
-        }
-        keys
+        vec![key.in_same_scope(parent_id)]
     }
 
     fn name(&self) -> &str {
@@ -1670,7 +1628,6 @@ struct StateRowDedupeKey {
     file_id: Option<String>,
     branch_id: String,
     global: bool,
-    untracked: bool,
 }
 
 impl From<RawWriteRowRef<'_>> for StateRowDedupeKey {
@@ -1685,7 +1642,6 @@ impl From<RawWriteRowRef<'_>> for StateRowDedupeKey {
             file_id: row.file_id.map(ToString::to_string),
             branch_id: row.branch_id.to_string(),
             global: row.global,
-            untracked: row.untracked,
         }
     }
 }
@@ -1873,13 +1829,6 @@ fn directory_row_context_from_batch(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: defaultable_bool_insert_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "INSERT into lix_directory",
-        )?
-        .unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_directory")?,
     })
@@ -1908,7 +1857,6 @@ fn directory_row_context_from_update(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: update_optional_metadata_value(
             batch,
@@ -1924,7 +1872,6 @@ fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
     filesystem_storage_scope_key(
         &context.branch_id,
         context.global,
-        context.untracked,
         context.file_id.as_deref(),
     )
 }
@@ -2050,7 +1997,6 @@ where
     let mut created_ats = Vec::new();
     let mut updated_ats = Vec::new();
     let mut commit_ids = Vec::new();
-    let mut untracked_values = Vec::new();
     let mut metadata_values = Vec::new();
     let mut branch_ids = Vec::new();
 
@@ -2067,7 +2013,6 @@ where
         created_ats.push(directory.live.created_at());
         updated_ats.push(directory.live.updated_at());
         commit_ids.push(directory.live.commit_id());
-        untracked_values.push(Some(directory.live.untracked()));
         metadata_values.push(directory.live.metadata());
         branch_ids.push(Some(directory.live.branch_id().to_owned()));
     }
@@ -2087,7 +2032,6 @@ where
             "lixcol_created_at" => Arc::new(StringArray::from(created_ats.clone())),
             "lixcol_updated_at" => Arc::new(StringArray::from(updated_ats.clone())),
             "lixcol_commit_id" => Arc::new(StringArray::from(commit_ids.clone())),
-            "lixcol_untracked" => Arc::new(BooleanArray::from(untracked_values.clone())),
             "lixcol_metadata" => Arc::new(StringArray::from(metadata_values.clone())),
             "lixcol_branch_id" => Arc::new(StringArray::from(branch_ids.clone())),
             other => {
@@ -2355,7 +2299,6 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]))
 }
@@ -2731,7 +2674,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
@@ -3116,7 +3058,6 @@ mod tests {
                 global: false,
                 change_id: None,
                 commit_id: None,
-                untracked: false,
                 branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
             }]
         );
@@ -3319,7 +3260,6 @@ mod tests {
                     global: false,
                     change_id: None,
                     commit_id: None,
-                    untracked: false,
                     branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
                 }])
             }]
@@ -3446,12 +3386,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
             "{\"id\":\"01920000-0000-7000-8000-000000000403\",\"parent_id\":null,\"name\":\"docs\"}",
         );
-        let mut untracked = live_row(
-            "01920000-0000-7000-8000-000000000413",
-            "01920000-0000-7000-8000-0000000000a1",
-            "{\"id\":\"01920000-0000-7000-8000-000000000413\",\"parent_id\":null,\"name\":\"docs\"}",
-        );
-        untracked.untracked = true;
         let mut global = live_row(
             "01920000-0000-7000-8000-000000000363",
             "ffffffff-ffff-7fff-bfff-ffffffffffff",
@@ -3464,7 +3398,7 @@ mod tests {
             "{\"id\":\"01920000-0000-7000-8000-000000000383\",\"parent_id\":null,\"name\":\"other\"}",
         );
         let index = Arc::new(
-            path_index_from_rows(vec![tracked, untracked, global, other])
+            path_index_from_rows(vec![tracked, global, other])
                 .expect("filesystem path index should build"),
         );
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
@@ -3509,40 +3443,15 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("candidate global column should be boolean");
-        let untracked = candidates
-            .column_by_name("lixcol_untracked")
-            .expect("candidate untracked column")
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("candidate untracked column should be boolean");
         let lanes = (0..candidates.num_rows())
-            .map(|row| {
-                (
-                    ids.value(row).to_string(),
-                    globals.value(row),
-                    untracked.value(row),
-                )
-            })
+            .map(|row| (ids.value(row).to_string(), globals.value(row)))
             .collect::<BTreeSet<_>>();
 
         assert_eq!(
             lanes,
             [
-                (
-                    "01920000-0000-7000-8000-000000000363".to_string(),
-                    true,
-                    false
-                ),
-                (
-                    "01920000-0000-7000-8000-000000000403".to_string(),
-                    false,
-                    false
-                ),
-                (
-                    "01920000-0000-7000-8000-000000000413".to_string(),
-                    false,
-                    true
-                ),
+                ("01920000-0000-7000-8000-000000000363".to_string(), true),
+                ("01920000-0000-7000-8000-000000000403".to_string(), false),
             ]
             .into_iter()
             .collect(),

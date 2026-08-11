@@ -29,8 +29,7 @@ use crate::domain::{Domain, DomainRowIdentity, committed_row_ref_is_exact_branch
 use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateReadDomain, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateRowRef,
+    LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateRowRef,
 };
 use crate::plugin::PLUGIN_OWNER_KEY;
 #[cfg(test)]
@@ -58,7 +57,7 @@ const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 /// Immutable view of the final transaction write set before persistence.
 ///
 /// Validation intentionally runs after staging has coalesced overwrites and
-/// hydrated generated fields, but before changelog, tracked-state, untracked
+/// hydrated generated fields, but before changelog, historical state, current-only
 /// state, or binary CAS writes are flushed.
 pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a PreparedWriteValidationSet<'a>,
@@ -233,22 +232,12 @@ async fn scan_committed_constraint_rows(
             entity_pks: entity_pks.clone(),
             branch_ids: vec![domain.branch_id().to_string()],
             file_ids: domain.file_filters(),
-            untracked: Some(domain.untracked()),
             include_tombstones,
             ..Default::default()
         },
         ..Default::default()
     };
-    let batch = live_state
-        .scan_domain_batch(
-            &request,
-            if domain.untracked() {
-                LiveStateReadDomain::Untracked
-            } else {
-                LiveStateReadDomain::Tracked
-            },
-        )
-        .await?;
+    let batch = live_state.scan_constraint_batch(&request).await?;
     CommittedLiveStateRows::select(batch, |row| {
         domain.contains_ref(row)
             && (schema_keys.is_empty() || schema_keys.iter().any(|key| key == row.schema_key()))
@@ -289,32 +278,19 @@ async fn scan_committed_canonical_rows(
             "entity_pk".to_string(),
             "file_id".to_string(),
             "deleted".to_string(),
-            "untracked".to_string(),
         ],
     };
-    // Probe the two authenticated selectors independently. Each request is
-    // exactly K identities and therefore remains bounded by the directory
-    // point-read path; no schema or `All` expansion is permitted here.
-    let tracked = live_state
-        .load_exact_batch(&LiveStateExactBatchRequest {
-            rows: rows.clone(),
-            projection: projection.clone(),
-            untracked: Some(false),
-            include_tombstones: false,
-        })
-        .await?;
-    let untracked = live_state
+    // Probe the authenticated state once. Each request is exactly K
+    // identities and therefore remains bounded by the point-read path; no
+    // schema or `All` expansion is permitted here.
+    let batch = live_state
         .load_exact_batch(&LiveStateExactBatchRequest {
             rows,
             projection,
-            untracked: Some(true),
             include_tombstones: false,
         })
         .await?;
-    let mut rows = tracked.into_present_batch().into_rows();
-    rows.extend(untracked.into_present_batch().into_rows());
-    let batch = MaterializedLiveStateBatch::from_rows(rows);
-    CommittedLiveStateRows::select(batch, |row| {
+    CommittedLiveStateRows::select(batch.into_present_batch(), |row| {
         domain.contains_canonical_ref(row)
             && row.schema_key() == schema_key
             && requested_entity_pks.contains(row.entity_pk())
@@ -509,7 +485,6 @@ pub(crate) fn prepared_tracked_rows_have_row_local_certificates(rows: &PreparedS
         && rows.iter().all(|row| {
             row.facts.row_content_validated
                 && !row.facts.requires_transaction_validation
-                && !row.untracked
                 && row.file_id.is_none()
                 && !matches!(
                     row.schema_key.as_str(),
@@ -545,7 +520,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
     let [file_content] = prepared_writes.file_content_writes.as_slice() else {
         return None;
     };
-    if file_content.global || file_content.untracked || file_content.had_blob_ref {
+    if file_content.global || file_content.had_blob_ref {
         return None;
     }
     if prepared_writes.commit_change_refs_by_branch.len() != 1
@@ -567,7 +542,6 @@ pub(crate) fn fresh_plugin_file_import_certificate(
     let mut plugin_owner_count = 0_usize;
     for (row_index, row) in prepared_writes.state_rows.iter().enumerate() {
         if row.global
-            || row.untracked
             || row.branch_id.as_str() != file_content.branch_id
             || row.snapshot.is_none()
             || !row.facts.row_content_validated
@@ -671,9 +645,7 @@ fn prepared_insert_selection_matches_row(
     row_index: usize,
     row: PreparedStateRowRef<'_>,
 ) -> bool {
-    insert_selection.contains(row_index)
-        && !row.untracked
-        && insert_selection.origin(row_index) == row.origin
+    insert_selection.contains(row_index) && insert_selection.origin(row_index) == row.origin
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1030,7 +1002,6 @@ async fn filesystem_namespace_domain_changed(
         .is_some_and(|origin| origin.operation == TransactionWriteOperation::Insert)
         || input.staged_writes.inserts().any(|insert| {
             insert.row.branch_id == row.branch_id()
-                && insert.row.untracked == row.untracked()
                 && insert.row.file_id.map(crate::common::SharedStr::as_str) == row.file_id()
                 && insert.row.schema_key == row.schema_key()
                 && insert.row.entity_pk == row.entity_pk()
@@ -1106,7 +1077,7 @@ fn staged_filesystem_namespace_domains(
                 || row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
         })
         .map(|row| row.domain())
-        .map(|domain| Domain::any_file(domain.branch_id().to_string(), domain.untracked()))
+        .map(|domain| Domain::any_file(domain.branch_id().to_string()))
         .collect()
 }
 
@@ -1147,7 +1118,7 @@ fn committed_filesystem_row_is_in_domain(
 }
 
 fn prepared_filesystem_row_is_in_domain(row: PreparedValidationRow<'_>, domain: &Domain) -> bool {
-    row.branch_id() == domain.branch_id() && row.untracked() == domain.untracked()
+    row.branch_id() == domain.branch_id()
 }
 
 fn apply_staged_filesystem_namespace_rows(
@@ -1527,7 +1498,6 @@ where
         let group = &checks[group_start..group_end];
         let domain = Domain::exact_file(
             first.row.branch_id.to_string(),
-            first.row.untracked,
             first.row.file_id.map(ToString::to_string),
         );
         let entity_pks = group
@@ -1570,28 +1540,6 @@ where
             if committed_row.entity_pk() != insert.row.entity_pk {
                 continue;
             }
-            if committed_row.untracked() != domain.untracked() {
-                let requested = if domain.untracked() {
-                    "untracked"
-                } else {
-                    "tracked"
-                };
-                let existing = if committed_row.untracked() {
-                    "untracked"
-                } else {
-                    "tracked"
-                };
-                return Err(with_insert_statement_index(
-                    LixError::new(
-                        LixError::CODE_UNIQUE,
-                        format!(
-                            "cannot insert {requested} row for schema '{}' entity_pk {:?}: a canonical {existing} row already exists; delete it first",
-                            insert.row.schema_key, insert.row.entity_pk,
-                        ),
-                    ),
-                    insert.statement_index,
-                ));
-            }
             return Err(with_insert_statement_index(
                 LixError::new(
                     LixError::CODE_UNIQUE,
@@ -1631,12 +1579,9 @@ fn with_insert_statement_index(mut error: LixError, statement_index: Option<usiz
     error
 }
 
-fn insert_scope_key<'a>(
-    insert: PreparedInsertRef<'a>,
-) -> (&'a str, bool, Option<&'a str>, &'a str) {
+fn insert_scope_key<'a>(insert: PreparedInsertRef<'a>) -> (&'a str, Option<&'a str>, &'a str) {
     (
         insert.row.branch_id,
-        insert.row.untracked,
         insert.row.file_id.map(crate::common::SharedStr::as_str),
         insert.row.schema_key,
     )
@@ -1781,9 +1726,7 @@ impl FileOwnerReferenceValidator {
         };
 
         let row_domain = row.domain();
-        let target_domains = row_domain
-            .with_untracked(row.untracked())
-            .file_owner_domains();
+        let target_domains = row_domain.file_owner_domains();
 
         for domain in &target_domains {
             if pending_file_descriptors.state_in_domain(domain, file_id)
@@ -2280,7 +2223,7 @@ impl PendingConstraintIndexes {
             .collect::<Result<Vec<_>, _>>()?;
         let key = PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
             schema_key: schema_key.to_string(),
-            domain: Domain::exact_file(branch_id.to_string(), false, file_id.map(str::to_string)),
+            domain: Domain::exact_file(branch_id.to_string(), file_id.map(str::to_string)),
             pointer_group,
             value,
         });
@@ -2302,7 +2245,7 @@ impl PendingConstraintIndexes {
             .collect::<Result<Vec<_>, _>>()?;
         let key = PendingForeignKeyTargetKey {
             schema_key: schema_key.to_string(),
-            domain: Domain::exact_file(branch_id.to_string(), false, file_id.map(str::to_string)),
+            domain: Domain::exact_file(branch_id.to_string(), file_id.map(str::to_string)),
             pointer_group,
             value,
         };
@@ -2939,7 +2882,6 @@ fn pending_unique_owner_is_insert(
             && insert.row.entity_pk == entity_pk
             && Domain::exact_file(
                 insert.row.branch_id.to_string(),
-                insert.row.untracked,
                 insert.row.file_id.map(ToString::to_string),
             ) == key.domain
     }) || input.staged_writes.rows().any(|row| {
@@ -3282,7 +3224,6 @@ mod tests {
         async fn scan_constraint_batch(
             &self,
             _request: &LiveStateScanRequest,
-            _tracked_only: bool,
         ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(self
                 .rows
@@ -3336,7 +3277,6 @@ mod tests {
                 false,
                 None,
                 None,
-                false,
                 branch_id,
             );
         }
@@ -3348,7 +3288,7 @@ mod tests {
 
         let rows = scan_committed_constraint_rows(
             &reader,
-            &Domain::any_file(branch_id, false),
+            &Domain::any_file(branch_id),
             vec!["constraint_schema".to_string()],
             Vec::new(),
             false,
@@ -3397,7 +3337,6 @@ mod tests {
                 false,
                 None,
                 None,
-                false,
                 "branch",
             );
         }
@@ -3665,60 +3604,6 @@ mod tests {
         }
     }
 
-    struct OverlayingStaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
-    }
-
-    #[async_trait]
-    impl LiveStateReader for OverlayingStaticLiveStateReader {
-        async fn load_exact_batch(
-            &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
-        }
-
-        async fn scan_batch(
-            &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            let rows = self
-                .rows
-                .iter()
-                .cloned()
-                .chain(test_file_descriptor_rows())
-                .filter(|row| live_state_row_matches_scan(row, request))
-                .collect::<Vec<_>>();
-            if request.filter.untracked.is_some() {
-                return Ok(rows.into());
-            }
-            let tracked_rows = rows
-                .iter()
-                .filter(|row| !row.untracked)
-                .cloned()
-                .collect::<Vec<_>>();
-            let untracked_rows = rows
-                .into_iter()
-                .filter(|row| row.untracked)
-                .collect::<Vec<_>>();
-            Ok(overlay_untracked_rows_for_test(tracked_rows, untracked_rows).into())
-        }
-    }
-
-    fn overlay_untracked_rows_for_test(
-        tracked_rows: Vec<MaterializedLiveStateRow>,
-        untracked_rows: Vec<MaterializedLiveStateRow>,
-    ) -> Vec<MaterializedLiveStateRow> {
-        let mut rows_by_identity = BTreeMap::new();
-        for row in tracked_rows {
-            rows_by_identity.insert(DomainRowIdentity::from_live_row(&row), row);
-        }
-        for row in untracked_rows {
-            rows_by_identity.insert(DomainRowIdentity::from_live_row(&row), row);
-        }
-        rows_by_identity.into_values().collect()
-    }
-
     struct StrictEmptyLiveStateReader;
 
     #[async_trait]
@@ -3839,16 +3724,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
         );
         tracked.metadata = Some(test_stage_json(r#"{"revision":2}"#));
-        let mut untracked = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-000000000182",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked);
-        let mut committed_untracked = committed_file_descriptor_row(
-            "01920000-0000-7000-8000-000000000182",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_live_row_untracked(&mut committed_untracked);
         let directory = directory_descriptor_row(
             "01920000-0000-7000-8000-0000000000a3",
             None,
@@ -3864,11 +3739,6 @@ mod tests {
                     "01920000-0000-7000-8000-0000000000a1",
                 )],
                 "tracked descriptor",
-            ),
-            (
-                vec![untracked],
-                vec![committed_untracked],
-                "untracked descriptor",
             ),
             (
                 vec![staged_file_descriptor_row(
@@ -3913,11 +3783,6 @@ mod tests {
         moved.snapshot = Some(test_stage_json(
             r#"{"id":"01920000-0000-7000-8000-0000000000a2","directory_id":"01920000-0000-7000-8000-0000000000a3","name":"01920000-0000-7000-8000-0000000000a2"}"#,
         ));
-        let mut untracked = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked);
         let mut renamed_directory = directory_descriptor_row(
             "01920000-0000-7000-8000-0000000000a3",
             None,
@@ -3966,7 +3831,6 @@ mod tests {
                 ],
                 "multiple unchanged descriptors",
             ),
-            (vec![untracked], vec![committed_file], "durability mismatch"),
             (
                 vec![renamed_directory],
                 vec![committed_directory],
@@ -4292,7 +4156,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_catalog_rejects_pending_schema_duplicate_of_visible_identity() {
+    fn schema_catalog_rejects_incompatible_pending_schema_amendment() {
         let visible_schemas = vec![
             registered_schema(),
             json!({
@@ -4300,7 +4164,9 @@ mod tests {
                 "type": "object",
                 "properties": {
                     "old": { "type": "string" }
-                }
+                },
+                "required": [],
+                "additionalProperties": false
             }),
         ];
         let staged_writes = PreparedWriteSet {
@@ -4309,10 +4175,10 @@ mod tests {
         };
 
         let error = catalog_from_transaction_parts_unchecked(&staged_writes, &visible_schemas)
-            .expect_err("pending schema must not override a visible domain fact");
+            .expect_err("pending schema must not incompatibly amend a visible schema");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.message.contains("more than one schema domain"));
+        assert!(error.message.contains("cannot amend required properties"));
     }
 
     #[test]
@@ -4564,28 +4430,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_tracked_row_using_pending_untracked_schema_definition() {
-        let visible_schemas = vec![registered_schema()];
-        let mut untracked_schema = pending_registered_schema_row("untracked_only_schema");
-        mark_prepared_row_untracked(&mut untracked_schema);
-        let mut tracked_row = staged_row(
-            "untracked_only_schema",
-            Some(json!({ "id": "row-1" }).to_string()),
-        );
-        tracked_row.entity_pk = EntityPk::single("row-1");
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![untracked_schema, tracked_row],
-            ..empty_staged_write_set()
-        };
-
-        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
-            .await
-            .expect_err("tracked rows must not validate against untracked schema definitions");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-    }
-
-    #[tokio::test]
     async fn validation_validates_snapshot_content_against_schema() {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
@@ -4672,67 +4516,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_tracked_file_owner_reference_pending_only_as_untracked() {
-        let visible_schemas = vec![
-            unique_schema(),
-            file_descriptor_schema(),
-            directory_descriptor_schema(),
-        ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                untracked_file_descriptor,
-                unique_row("post-1", "hello-world", "first"),
-            ],
-            ..empty_staged_write_set()
-        };
-
-        let error =
-            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &StrictEmptyLiveStateReader,
-            ))
-            .await
-            .expect_err("tracked file owner must not resolve through pending untracked descriptor");
-
-        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn validation_allows_untracked_file_owner_reference_pending_as_tracked() {
-        let visible_schemas = vec![
-            unique_schema(),
-            file_descriptor_schema(),
-            directory_descriptor_schema(),
-        ];
-        let mut untracked_row = unique_row("post-1", "hello-world", "first");
-        mark_prepared_row_untracked(&mut untracked_row);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                staged_file_descriptor_row(
-                    "01920000-0000-7000-8000-0000000000a2",
-                    "01920000-0000-7000-8000-0000000000a1",
-                ),
-                untracked_row,
-            ],
-            ..empty_staged_write_set()
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &StrictEmptyLiveStateReader,
-        ))
-        .await
-        .expect("untracked file owner should resolve through pending tracked descriptor");
-    }
-
-    #[tokio::test]
     async fn validation_rejects_file_owner_reference_when_descriptor_tombstoned_in_transaction() {
         let visible_schemas = vec![
             unique_schema(),
@@ -4815,90 +4598,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_tracked_file_owner_reference_committed_only_as_untracked() {
-        let visible_schemas = vec![unique_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
-            ..empty_staged_write_set()
-        };
-        let mut untracked_file_descriptor = committed_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_live_row_untracked(&mut untracked_file_descriptor);
-        let live_state = StrictStaticLiveStateReader {
-            rows: vec![untracked_file_descriptor],
-        };
-
-        let error = validate_prepared_writes(
-            TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ),
-        )
-        .await
-        .expect_err("tracked file owner must not resolve through committed untracked descriptor");
-
-        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn validation_allows_untracked_file_owner_reference_committed_as_tracked() {
-        let visible_schemas = vec![unique_schema()];
-        let mut untracked_row = unique_row("post-1", "hello-world", "first");
-        mark_prepared_row_untracked(&mut untracked_row);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![untracked_row],
-            ..empty_staged_write_set()
-        };
-        let live_state = StrictStaticLiveStateReader {
-            rows: vec![committed_file_descriptor_row(
-                "01920000-0000-7000-8000-0000000000a2",
-                "01920000-0000-7000-8000-0000000000a1",
-            )],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("untracked file owner should resolve through committed tracked descriptor");
-    }
-
-    #[tokio::test]
-    async fn validation_allows_tracked_file_owner_reference_committed_behind_untracked_overlay() {
-        let visible_schemas = vec![unique_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
-            ..empty_staged_write_set()
-        };
-        let tracked_file_descriptor = committed_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        let mut untracked_tombstone = committed_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        untracked_tombstone.snapshot_content = None;
-        mark_live_row_untracked(&mut untracked_tombstone);
-        let live_state = OverlayingStaticLiveStateReader {
-            rows: vec![tracked_file_descriptor, untracked_tombstone],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("tracked file owner should resolve against tracked descriptor behind overlay");
-    }
-
-    #[tokio::test]
     async fn validation_allows_file_delete_cascade_over_committed_tracked_rows() {
         let visible_schemas = vec![
             unique_schema(),
@@ -4925,70 +4624,6 @@ mod tests {
         ))
         .await
         .expect("file descriptor deletion cascades committed file-owned rows");
-    }
-
-    #[tokio::test]
-    async fn validation_allows_file_delete_cascade_over_committed_untracked_rows() {
-        let visible_schemas = vec![
-            unique_schema(),
-            file_descriptor_schema(),
-            directory_descriptor_schema(),
-        ];
-        let mut file_descriptor_delete = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        file_descriptor_delete.snapshot = None;
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![file_descriptor_delete],
-            ..empty_staged_write_set()
-        };
-        let mut untracked_row =
-            MaterializedLiveStateRow::from(unique_row("post-1", "hello-world", "first"));
-        mark_live_row_untracked(&mut untracked_row);
-        let live_state = StrictStaticLiveStateReader {
-            rows: vec![
-                committed_file_descriptor_row(
-                    "01920000-0000-7000-8000-0000000000a2",
-                    "01920000-0000-7000-8000-0000000000a1",
-                ),
-                untracked_row,
-            ],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("file descriptor deletion cascades untracked file-owned rows");
-    }
-
-    #[tokio::test]
-    async fn validation_allows_untracked_directory_parent_to_tracked_directory() {
-        let visible_schemas = vec![directory_descriptor_schema()];
-        let tracked_parent = directory_descriptor_row(
-            "01920000-0000-7000-8000-000000000173",
-            None,
-            "parent",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        let mut untracked_child = directory_descriptor_row(
-            "01920000-0000-7000-8000-000000000183",
-            Some("01920000-0000-7000-8000-000000000173"),
-            "child",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_child);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![tracked_parent, untracked_child],
-            ..empty_staged_write_set()
-        };
-
-        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
-            .await
-            .expect("untracked directory parent_id should resolve through tracked directory");
     }
 
     #[tokio::test]
@@ -5173,62 +4808,6 @@ mod tests {
             ))
             .await
             .expect_err("committed visible unique value should conflict");
-
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-    }
-
-    #[tokio::test]
-    async fn validation_rejects_committed_tracked_unique_duplicate_behind_untracked_overlay() {
-        let visible_schemas = vec![unique_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
-            ..empty_staged_write_set()
-        };
-        let tracked_duplicate = committed_unique_row("post-1", "hello-world", "first");
-        let mut untracked_overlay = committed_unique_row("post-1", "draft-slug", "draft");
-        mark_live_row_untracked(&mut untracked_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
-            rows: vec![tracked_duplicate, untracked_overlay],
-        };
-
-        let error =
-            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ))
-            .await
-            .expect_err("tracked unique duplicate must be detected behind untracked overlay");
-
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-    }
-
-    #[tokio::test]
-    async fn validation_rejects_committed_unique_duplicate_when_untracked_tombstone_shadows_owner()
-    {
-        let visible_schemas = vec![unique_schema()];
-        let mut untracked_tombstone = unique_row("post-1", "ignored", "deleted");
-        untracked_tombstone.snapshot = None;
-        mark_prepared_row_untracked(&mut untracked_tombstone);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                untracked_tombstone,
-                unique_row("post-2", "hello-world", "second"),
-            ],
-            ..empty_staged_write_set()
-        };
-        let live_state = StaticLiveStateReader {
-            rows: vec![committed_unique_row("post-1", "hello-world", "first")],
-        };
-
-        let error =
-            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ))
-            .await
-            .expect_err("untracked tombstone must not hide tracked unique owner");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
@@ -5521,81 +5100,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_tracked_foreign_key_target_pending_only_as_untracked() {
-        let visible_schemas = vec![
-            fk_parent_schema(),
-            fk_child_schema(),
-            file_descriptor_schema(),
-            directory_descriptor_schema(),
-        ];
-        let mut untracked_parent =
-            fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
-        mark_prepared_row_untracked(&mut untracked_parent);
-        let mut untracked_file_descriptor = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                untracked_file_descriptor,
-                untracked_parent,
-                fk_child_row(
-                    "child-1",
-                    "parent-1",
-                    "01920000-0000-7000-8000-0000000000a1",
-                ),
-            ],
-            ..empty_staged_write_set()
-        };
-
-        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
-            .await
-            .expect_err("tracked FK must not resolve through a pending untracked target");
-
-        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-    }
-
-    #[tokio::test]
-    async fn validation_allows_untracked_foreign_key_target_pending_as_tracked() {
-        let visible_schemas = vec![
-            fk_parent_schema(),
-            fk_child_schema(),
-            file_descriptor_schema(),
-            directory_descriptor_schema(),
-        ];
-        let tracked_file_descriptor = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        let tracked_parent = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
-        let mut untracked_file_descriptor = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let mut untracked_child = fk_child_row(
-            "child-1",
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_child);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                tracked_file_descriptor,
-                tracked_parent,
-                untracked_file_descriptor,
-                untracked_child,
-            ],
-            ..empty_staged_write_set()
-        };
-
-        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
-            .await
-            .expect("untracked FK should be allowed to reference a pending tracked target");
-    }
-
-    #[tokio::test]
     async fn validation_rejects_foreign_key_target_that_exists_only_in_different_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
@@ -5652,193 +5156,6 @@ mod tests {
         ))
         .await
         .expect("foreign key should resolve against committed rows in the same branch");
-    }
-
-    #[tokio::test]
-    async fn validation_rejects_tracked_foreign_key_target_committed_only_as_untracked() {
-        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![fk_child_row(
-                "child-1",
-                "parent-1",
-                "01920000-0000-7000-8000-0000000000a1",
-            )],
-            ..empty_staged_write_set()
-        };
-        let mut untracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        mark_live_row_untracked(&mut untracked_parent);
-        let live_state = StaticLiveStateReader {
-            rows: vec![untracked_parent],
-        };
-
-        let error =
-            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ))
-            .await
-            .expect_err("tracked FK must not resolve through a committed untracked target");
-
-        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-    }
-
-    #[tokio::test]
-    async fn validation_allows_untracked_foreign_key_target_committed_as_tracked() {
-        let visible_schemas = vec![
-            fk_parent_schema(),
-            fk_child_schema(),
-            file_descriptor_schema(),
-            directory_descriptor_schema(),
-        ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let mut untracked_child = fk_child_row(
-            "child-1",
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_child);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![untracked_file_descriptor, untracked_child],
-            ..empty_staged_write_set()
-        };
-        let live_state = StaticLiveStateReader {
-            rows: vec![
-                committed_file_descriptor_row(
-                    "01920000-0000-7000-8000-0000000000a2",
-                    "01920000-0000-7000-8000-0000000000a1",
-                ),
-                MaterializedLiveStateRow::from(fk_parent_row(
-                    "parent-1",
-                    "01920000-0000-7000-8000-0000000000a1",
-                )),
-            ],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("untracked FK should be allowed to reference a committed tracked target");
-    }
-
-    #[tokio::test]
-    async fn validation_allows_tracked_foreign_key_target_committed_behind_untracked_overlay() {
-        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![fk_child_row(
-                "child-1",
-                "parent-1",
-                "01920000-0000-7000-8000-0000000000a1",
-            )],
-            ..empty_staged_write_set()
-        };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        let mut untracked_overlay = MaterializedLiveStateRow::from(fk_parent_row(
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        mark_live_row_untracked(&mut untracked_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
-            rows: vec![tracked_parent, untracked_overlay],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect(
-            "tracked FK should resolve against tracked storage target behind untracked overlay",
-        );
-    }
-
-    #[tokio::test]
-    async fn validation_rejects_deleting_tracked_fk_target_referenced_behind_untracked_overlay() {
-        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
-        parent_delete.snapshot = None;
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![parent_delete],
-            ..empty_staged_write_set()
-        };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        let tracked_child = MaterializedLiveStateRow::from(fk_child_row(
-            "child-1",
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        let mut untracked_child_overlay = MaterializedLiveStateRow::from(fk_child_row(
-            "child-1",
-            "other-parent",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        mark_live_row_untracked(&mut untracked_child_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
-            rows: vec![tracked_parent, tracked_child, untracked_child_overlay],
-        };
-
-        let error =
-            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ))
-            .await
-            .expect_err("tracked referencing row behind overlay must block target delete");
-
-        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-    }
-
-    #[tokio::test]
-    async fn validation_rejects_deleting_tracked_fk_target_referenced_by_committed_untracked_row() {
-        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
-        parent_delete.snapshot = None;
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![parent_delete],
-            ..empty_staged_write_set()
-        };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        let mut untracked_child = MaterializedLiveStateRow::from(fk_child_row(
-            "child-1",
-            "parent-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        mark_live_row_untracked(&mut untracked_child);
-        let live_state = StaticLiveStateReader {
-            rows: vec![tracked_parent, untracked_child],
-        };
-
-        let error =
-            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ))
-            .await
-            .expect_err("tracked target delete must be blocked by committed untracked references");
-
-        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 
     #[tokio::test]
@@ -5906,40 +5223,6 @@ mod tests {
             .expect_err("same-transaction tombstone should hide the committed FK target");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-    }
-
-    #[tokio::test]
-    async fn validation_allows_tracked_fk_target_when_untracked_tombstone_shadows_same_identity() {
-        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut untracked_parent_delete =
-            fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
-        untracked_parent_delete.snapshot = None;
-        mark_prepared_row_untracked(&mut untracked_parent_delete);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                untracked_parent_delete,
-                fk_child_row(
-                    "child-1",
-                    "parent-1",
-                    "01920000-0000-7000-8000-0000000000a1",
-                ),
-            ],
-            ..empty_staged_write_set()
-        };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1",
-                "01920000-0000-7000-8000-0000000000a1",
-            ))],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("untracked tombstone must not hide tracked FK target");
     }
 
     #[tokio::test]
@@ -6426,7 +5709,6 @@ mod tests {
             unresolved[0].source_identity,
             DomainRowIdentity::exact(
                 "01920000-0000-7000-8000-0000000000a1",
-                false,
                 Some("01920000-0000-7000-8000-0000000000a2".to_string()),
                 "fk_child_schema",
                 EntityPk::single("child-1"),
@@ -6462,7 +5744,6 @@ mod tests {
             schema_key: "unique_schema".to_string(),
             domain: Domain::exact_file(
                 "01920000-0000-7000-8000-0000000000a1",
-                false,
                 Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             ),
             pointer_group: vec![vec!["id".to_string()]],
@@ -6723,13 +6004,6 @@ mod tests {
         row: &MaterializedLiveStateRow,
         request: &LiveStateScanRequest,
     ) -> bool {
-        if request
-            .filter
-            .untracked
-            .is_some_and(|untracked| row.untracked != untracked)
-        {
-            return false;
-        }
         (request.filter.schema_keys.is_empty()
             || request.filter.schema_keys.contains(&row.schema_key))
             && (request.filter.branch_ids.is_empty()
@@ -6796,7 +6070,6 @@ mod tests {
             global: true,
             change_id: Some(ChangeId::for_test_label("change-registered-schema")),
             commit_id: Some(CommitId::for_test_label("commit-registered-schema")),
-            untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.into(),
         }
     }
@@ -6969,18 +6242,6 @@ mod tests {
         row
     }
 
-    fn mark_prepared_row_untracked(row: &mut TestPreparedStateRow) {
-        row.untracked = true;
-        row.change_id = None;
-        row.commit_id = None;
-    }
-
-    fn mark_live_row_untracked(row: &mut MaterializedLiveStateRow) {
-        row.untracked = true;
-        row.change_id = None;
-        row.commit_id = None;
-    }
-
     fn staged_file_descriptor_row(file_id: &str, branch_id: &str) -> TestPreparedStateRow {
         let mut row = staged_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -7050,7 +6311,6 @@ mod tests {
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
-            untracked: row.untracked,
             branch_id: Arc::from(row.branch_id.as_str()),
         }
     }
@@ -7079,7 +6339,6 @@ mod tests {
             global: true,
             change_id: Some(ChangeId::for_test_label("change-1")),
             commit_id: Some(CommitId::for_test_label("commit-1")),
-            untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.into(),
         }
     }
@@ -7167,7 +6426,6 @@ mod tests {
                 Some("a.json".to_string()),
                 "01920000-0000-7000-8000-0000000000a1".to_string(),
                 false,
-                false,
                 b"{}".to_vec(),
             )],
             ..empty_staged_write_set()
@@ -7194,12 +6452,6 @@ mod tests {
             .requires_transaction_validation = true;
         assert!(!prepared_tracked_rows_have_row_local_certificates(
             &prepared_rows![requires_cross_row_validation]
-        ));
-
-        let mut untracked = row.clone();
-        untracked.untracked = true;
-        assert!(!prepared_tracked_rows_have_row_local_certificates(
-            &prepared_rows![untracked]
         ));
 
         let mut file_scoped = row.clone();

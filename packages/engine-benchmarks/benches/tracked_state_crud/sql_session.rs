@@ -19,7 +19,6 @@ const BOUND_OLAP_UPDATE_LANE_SQL: &str = "UPDATE olap_row SET lane = $1 WHERE id
 const BOUND_OLAP_UPDATE_SCORE_SQL: &str = "UPDATE olap_row SET score = $1 WHERE id = $2";
 const BOUND_OLAP_UPDATE_ACTIVE_SQL: &str = "UPDATE olap_row SET active = $1 WHERE id = $2";
 const OLAP_ROWS_PER_STATEMENT: usize = 4_096;
-const UNTRACKED_PROBE_PATH: &str = "/__lix_untracked_probe";
 // These deliberately miss the native entity-read recognizer so profile mode
 // can measure the general DataFusion execution path rather than a specialized
 // public CRUD fast path.
@@ -160,13 +159,6 @@ struct OlapExpected {
     groups: [OlapGroupExpected; 32],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UntrackedFixture {
-    None,
-    OneUnrelated,
-    OneReadManyMember,
-}
-
 #[derive(Clone, Copy)]
 enum FixtureShape {
     FullCrud,
@@ -180,12 +172,6 @@ enum UpdateWorkload {
     PreparedDml(SharedParameterBatch),
 }
 
-impl UntrackedFixture {
-    const fn has_untracked_row(self) -> bool {
-        !matches!(self, Self::None)
-    }
-}
-
 pub(crate) enum SqlFixture {
     RocksDB(GenericSqlFixture<RocksDB>),
     #[cfg(feature = "slatedb")]
@@ -194,11 +180,8 @@ pub(crate) enum SqlFixture {
 
 pub(crate) struct GenericSqlFixture<StorageImpl: Storage + 'static> {
     session: SessionContext<StorageImpl>,
-    /// Number of tracked fixture rows. In mixed mode the untracked probe
-    /// replaces one of the requested rows rather than adding a 10,001st row.
     row_count: usize,
     visible_row_count: usize,
-    untracked_fixture: UntrackedFixture,
     read_many_by_pk_count: usize,
     bound_insert_all_batch: SharedParameterBatch,
     bound_seed_json_batch: SharedParameterBatch,
@@ -241,13 +224,11 @@ async fn empty_fixture_with_shape(
         "read-many primary-key count must be between 1 and {}, got {read_many_by_pk_count}",
         rows.len()
     );
-    let untracked_fixture = profile_untracked_fixture();
     match profile.storage() {
         ProfileStorage::RocksDB { storage, _dir: dir } => SqlFixture::RocksDB(fixture_for_session(
             prepare_session(storage).await,
             rows,
             read_many_by_pk_count,
-            untracked_fixture,
             shape,
             dir,
         )),
@@ -256,7 +237,6 @@ async fn empty_fixture_with_shape(
             prepare_session(storage).await,
             rows,
             read_many_by_pk_count,
-            untracked_fixture,
             shape,
             dir,
         )),
@@ -273,10 +253,6 @@ pub(crate) async fn seeded_fixture_with_read_many_pk_count(
     read_many_by_pk_count: usize,
 ) -> SqlFixture {
     let fixture = if selected_olap_read_shape().is_some() {
-        assert!(
-            std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_UNTRACKED").is_none(),
-            "typed OLAP profiles do not include the unrelated json_pointer overlay fixture"
-        );
         empty_fixture_with_shape(profile, rows, read_many_by_pk_count, FixtureShape::Olap).await
     } else {
         empty_fixture_with_read_many_pk_count(profile, rows, read_many_by_pk_count).await
@@ -287,7 +263,6 @@ pub(crate) async fn seeded_fixture_with_read_many_pk_count(
             .await;
     } else {
         fixture.seed_rows().await;
-        fixture.insert_untracked_probe().await;
     }
     fixture
 }
@@ -337,7 +312,6 @@ pub(crate) async fn seeded_bound_update_fixture_with_read_many_pk_count(
     .await;
     fixture.install_bound_seed_batch(rows);
     fixture.seed_rows().await;
-    fixture.insert_untracked_probe().await;
     fixture.release_bound_update_setup();
     fixture.install_bound_update_batch(crate::workload::fixture_update_rows(row_count));
     fixture
@@ -428,14 +402,6 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.apply_olap_mutations(mutation_profile).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.apply_olap_mutations(mutation_profile).await,
-        }
-    }
-
-    async fn insert_untracked_probe(&self) {
-        match self {
-            Self::RocksDB(fixture) => fixture.insert_untracked_probe().await,
-            #[cfg(feature = "slatedb")]
-            Self::SlateDB(fixture) => fixture.insert_untracked_probe().await,
         }
     }
 
@@ -998,17 +964,6 @@ where
         result.len()
     }
 
-    async fn insert_untracked_probe(&self) {
-        if !self.untracked_fixture.has_untracked_row() {
-            return;
-        }
-        let sql = format!(
-            "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ('{UNTRACKED_PROBE_PATH}', lix_json('{{\"lane\":\"untracked\"}}'), true)"
-        );
-        let affected = execute(&self.session, &sql).await.rows_affected();
-        assert_eq!(affected, 1, "insert untracked overlay probe");
-    }
-
     async fn read_all_result(&self) -> ExecuteResult {
         execute(&self.session, &self.select_all_sql).await
     }
@@ -1177,20 +1132,13 @@ fn fixture_for_session<StorageImpl>(
     session: SessionContext<StorageImpl>,
     rows: &[WorkloadRow],
     read_many_by_pk_count: usize,
-    untracked_fixture: UntrackedFixture,
     shape: FixtureShape,
     dir: tempfile::TempDir,
 ) -> GenericSqlFixture<StorageImpl>
 where
     StorageImpl: Storage,
 {
-    let tracked_rows = if untracked_fixture == UntrackedFixture::OneReadManyMember {
-        // The untracked probe occupies one selected identity, so keep the
-        // seeded and returned cardinality exactly equal to the baseline.
-        &rows[..rows.len() - 1]
-    } else {
-        rows
-    };
+    let tracked_rows = rows;
     let olap_expected = if matches!(shape, FixtureShape::Olap) {
         Some(olap_expected(
             tracked_rows.len(),
@@ -1203,8 +1151,7 @@ where
     GenericSqlFixture {
         session,
         row_count: tracked_rows.len(),
-        visible_row_count: tracked_rows.len() + usize::from(untracked_fixture.has_untracked_row()),
-        untracked_fixture,
+        visible_row_count: tracked_rows.len(),
         read_many_by_pk_count,
         bound_insert_all_batch: if matches!(shape, FixtureShape::FullCrud) {
             PreparedDmlParameterBatch::from_rows(tracked_rows.iter().map(|row| {
@@ -1230,11 +1177,7 @@ where
         },
         olap_expected,
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
-        select_many_by_pk_sql: select_many_by_pk_sql(
-            rows,
-            read_many_by_pk_count,
-            untracked_fixture,
-        ),
+        select_many_by_pk_sql: select_many_by_pk_sql(rows, read_many_by_pk_count),
         select_one_by_pk_sql: select_by_pk_sql(&tracked_rows[mid..][..1]),
         update_one_by_pk_sql: update_row_sql(&tracked_rows[mid]),
         update_all_workload: update_workload(shape, tracked_rows),
@@ -1699,22 +1642,6 @@ fn literal_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {
         .collect()
 }
 
-/// Profile-only unified-current-state fixture switch. `one_unrelated` keeps
-/// all selected rows tracked, proving an unrelated untracked row does not
-/// change routing. `one_read_many_member` replaces one selected tracked
-/// primary key with the untracked identity, proving normal SQL returns mixed
-/// state without an explicit lane predicate.
-fn profile_untracked_fixture() -> UntrackedFixture {
-    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_UNTRACKED").as_deref() {
-        Ok("one_unrelated") => UntrackedFixture::OneUnrelated,
-        Ok("one_read_many_member") => UntrackedFixture::OneReadManyMember,
-        Err(_) => UntrackedFixture::None,
-        Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_UNTRACKED '{other}'; expected one_unrelated or one_read_many_member"
-        ),
-    }
-}
-
 pub(crate) fn selected_olap_read_shape() -> Option<OlapReadShape> {
     std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE")
         .ok()
@@ -1772,7 +1699,7 @@ where
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -1798,7 +1725,7 @@ where
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -1827,7 +1754,7 @@ where
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -1850,23 +1777,7 @@ fn select_by_pk_sql(rows: &[WorkloadRow]) -> String {
     select_by_paths_sql(rows.iter().map(|row| row.path.as_str()))
 }
 
-fn select_many_by_pk_sql(
-    rows: &[WorkloadRow],
-    read_many_by_pk_count: usize,
-    untracked_fixture: UntrackedFixture,
-) -> String {
-    if untracked_fixture == UntrackedFixture::OneReadManyMember {
-        assert!(
-            read_many_by_pk_count >= 2,
-            "one_read_many_member requires at least two selected primary keys"
-        );
-        return select_by_paths_sql(
-            rows[..read_many_by_pk_count - 1]
-                .iter()
-                .map(|row| row.path.as_str())
-                .chain(std::iter::once(UNTRACKED_PROBE_PATH)),
-        );
-    }
+fn select_many_by_pk_sql(rows: &[WorkloadRow], read_many_by_pk_count: usize) -> String {
     match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_MANY_DISTRIBUTION").as_deref() {
         Ok("spread") if read_many_by_pk_count > 1 => select_by_paths_sql(
             (0..read_many_by_pk_count)

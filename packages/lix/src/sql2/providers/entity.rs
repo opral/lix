@@ -1402,13 +1402,6 @@ fn entity_delete_stage_rows_from_batch(
             "DELETE FROM entity surface",
         )?
         .map(Into::into);
-        let untracked = optional_bool_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "DELETE FROM entity surface",
-        )?
-        .unwrap_or(false);
         rows.push_parts(
             Some(entity_pk),
             spec.schema_key.as_str().into(),
@@ -1421,7 +1414,6 @@ fn entity_delete_stage_rows_from_batch(
             global,
             None,
             None,
-            untracked,
             branch_id.into(),
         );
     }
@@ -1519,13 +1511,6 @@ fn entity_update_stage_rows_from_batch(
         let file_id =
             optional_string_value(batch, row_index, "lixcol_file_id", "UPDATE entity surface")?
                 .map(Into::into);
-        let untracked = optional_bool_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "UPDATE entity surface",
-        )?
-        .unwrap_or(false);
         rows.push_parts(
             Some(entity_pk),
             spec.schema_key.as_str().into(),
@@ -1544,7 +1529,6 @@ fn entity_update_stage_rows_from_batch(
             global,
             None,
             None,
-            untracked,
             branch_id.into(),
         );
     }
@@ -2727,14 +2711,8 @@ fn entity_record_batch_with_parsed(
         EntityBatchProjection::ParsedSnapshots => {
             entity_record_batch_from_snapshots(spec, schema, rows)
         }
-        EntityBatchProjection::RawTrackedProjection if rows.iter().all(|row| !row.untracked()) => {
-            entity_record_batch_from_raw_projection(spec, schema, rows)
-        }
-        // Raw projection depends on the tracked write invariant: compact
-        // TransactionJson bytes with no duplicate-key recovery semantics.
-        // Keep every mixed-retention batch on the established parser path.
         EntityBatchProjection::RawTrackedProjection => {
-            entity_record_batch_from_snapshots(spec, schema, rows)
+            entity_record_batch_from_raw_projection(spec, schema, rows)
         }
     }
 }
@@ -2942,9 +2920,6 @@ fn entity_system_column_array(
         "commit_id" => Arc::new(StringArray::from_iter(
             rows.iter()
                 .map(|row| row.commit_id().map(|id| id.to_string())),
-        )) as ArrayRef,
-        "untracked" => Arc::new(BooleanArray::from_iter(
-            rows.iter().map(|row| Some(row.untracked())),
         )) as ArrayRef,
         "branch_id" => Arc::new(StringArray::from_iter(
             rows.iter().map(|row| Some(row.branch_id())),
@@ -3277,7 +3252,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label("change-a")),
             commit_id: Some(CommitId::for_test_label("commit-a")),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
@@ -3449,8 +3423,7 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         );
-        let mut winner = live_row();
-        winner.untracked = true;
+        let winner = live_row();
         let rejected = MaterializedLiveStateRow {
             snapshot_content: Some(r#"{"body":"goodbye"}"#.into()),
             ..live_row()
@@ -3850,7 +3823,7 @@ mod tests {
     }
 
     #[test]
-    fn untracked_broad_batches_keep_duplicate_key_last_wins_scalar_semantics() {
+    fn broad_batches_reject_noncanonical_duplicate_key_type_mismatches() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
@@ -3862,29 +3835,21 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         );
-        let batch = entity_record_batch(
+        let error = entity_record_batch(
             &spec,
             entity_surface_schema(&spec, EntitySurfaceShape::Active),
             &live_batch(vec![MaterializedLiveStateRow {
                 snapshot_content: Some(r#"{"body":"sidecar","count":"bad","count":7}"#.into()),
-                untracked: true,
                 ..live_row()
             }]),
             super::EntityBatchProjection::RawTrackedProjection,
         )
-        .expect("untracked broad batch must use the established parser path");
-
-        assert_eq!(
-            batch
-                .column_by_name("count")
-                .expect("count column")
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("count is i64")
-                .value(0),
-            7,
-            "the later duplicate value must replace an earlier invalid value"
-        );
+        .expect_err("tracked raw projection must reject the first invalid typed value");
+        let error = crate::sql2::error::datafusion_error_to_lix_error(error);
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(error.message.contains("project_message"), "{error:?}");
+        assert!(error.message.contains("count"), "{error:?}");
+        assert!(error.message.contains("BIGINT"), "{error:?}");
     }
 
     #[test]
@@ -3967,7 +3932,6 @@ mod tests {
             "lixcol_file_id",
             "lixcol_branch_id",
             "lixcol_global",
-            "lixcol_untracked",
         ] {
             assert!(
                 raw.schema().field_with_name(field).is_ok(),

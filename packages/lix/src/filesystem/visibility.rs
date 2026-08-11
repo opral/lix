@@ -510,7 +510,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse(
                 "filesystem visibility test created_at",
                 "2026-04-23T00:00:00Z",

@@ -1609,7 +1609,6 @@ fn push_plugin_transaction_row(
         false,
         None,
         None,
-        false,
         target_branch_id.clone(),
     );
 }
@@ -1659,7 +1658,6 @@ fn push_transaction_row_from_tracked_row_ref(
         false,
         None,
         None,
-        false,
         target_branch_id.clone(),
     );
 }

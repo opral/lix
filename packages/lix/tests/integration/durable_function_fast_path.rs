@@ -154,8 +154,8 @@ async fn pure_reads_do_not_advance_and_durable_reads_still_persist_deterministic
     let (_storage, session) = open_session().await;
     session
         .execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-             VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
+            "INSERT INTO lix_key_value (key, value, lixcol_global) \
+             VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true)",
             &[],
         )
         .await

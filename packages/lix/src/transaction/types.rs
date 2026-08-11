@@ -424,13 +424,11 @@ pub(crate) struct TransactionWriteRow {
     pub(crate) global: bool,
     pub(crate) change_id: Option<String>,
     pub(crate) commit_id: Option<String>,
-    pub(crate) untracked: bool,
     pub(crate) branch_id: SharedStr,
 }
 
 const RAW_WRITE_NONE: u32 = u32::MAX;
 const RAW_WRITE_GLOBAL: u8 = 1;
-const RAW_WRITE_UNTRACKED: u8 = 1 << 1;
 const RAW_WRITE_CONSTRAINTS_UNCHANGED: u8 = 1 << 2;
 
 /// Compact row topology for an incoming transaction write batch.
@@ -561,7 +559,6 @@ pub(crate) struct CertifiedParameterBatch {
     snapshots: Vec<TransactionJson>,
     schema_key: SharedStr,
     branch_id: SharedStr,
-    untracked: bool,
     certificate: CertifiedRawWriteBatchPreparation,
     entity_columnar: Option<crate::sql2::EncodedEntityRowGroups>,
 }
@@ -572,24 +569,6 @@ impl CertifiedParameterBatch {
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
-        certificate: CertifiedRawWriteBatchPreparation,
-    ) -> Result<Self, LixError> {
-        Self::new_with_lane(
-            entity_pks,
-            snapshots,
-            schema_key,
-            branch_id,
-            false,
-            certificate,
-        )
-    }
-
-    pub(crate) fn new_with_lane(
-        entity_pks: Vec<EntityPk>,
-        snapshots: Vec<TransactionJson>,
-        schema_key: SharedStr,
-        branch_id: SharedStr,
-        untracked: bool,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if entity_pks.len() != snapshots.len() {
@@ -609,7 +588,6 @@ impl CertifiedParameterBatch {
             snapshots,
             schema_key,
             branch_id,
-            untracked,
             certificate,
             entity_columnar: None,
         })
@@ -635,17 +613,12 @@ impl CertifiedParameterBatch {
         self.schema_key.as_str()
     }
 
-    pub(crate) fn untracked(&self) -> bool {
-        self.untracked
-    }
-
     pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
         RawWriteBatch::from_certified_parameter_rows(
             self.entity_pks,
             self.snapshots,
             self.schema_key,
             self.branch_id,
-            self.untracked,
             self.certificate,
         )
     }
@@ -668,7 +641,6 @@ impl CertifiedParameterBatch {
             snapshots,
             schema_key,
             branch_id,
-            untracked,
             certificate,
             entity_columnar,
         } = self;
@@ -718,7 +690,6 @@ impl CertifiedParameterBatch {
                 timestamps,
                 commit_id: None,
                 branch_id: branch_id_ordinal,
-                untracked,
                 direct_change_ids: None,
                 entity_columnar,
             }),
@@ -753,7 +724,6 @@ pub(crate) struct RawWriteRowRef<'a> {
     pub(crate) global: bool,
     pub(crate) change_id: Option<&'a str>,
     pub(crate) commit_id: Option<&'a str>,
-    pub(crate) untracked: bool,
     pub(crate) constraints_unchanged: bool,
     pub(crate) branch_id: &'a SharedStr,
 }
@@ -875,7 +845,6 @@ impl RawWriteBatch {
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
-        untracked: bool,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if entity_pks.len() != snapshots.len() {
@@ -923,7 +892,7 @@ impl RawWriteBatch {
             change_id: RAW_WRITE_NONE,
             commit_id: RAW_WRITE_NONE,
             branch_id: branch_id_ordinal,
-            flags: if untracked { RAW_WRITE_UNTRACKED } else { 0 },
+            flags: 0,
         };
         Ok(Self {
             slots: vec![slot; row_count],
@@ -980,7 +949,6 @@ impl RawWriteBatch {
             global: slot.flags & RAW_WRITE_GLOBAL != 0,
             change_id: self.optional_string(slot.change_id).map(SharedStr::as_str),
             commit_id: self.optional_string(slot.commit_id).map(SharedStr::as_str),
-            untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
             constraints_unchanged: slot.flags & RAW_WRITE_CONSTRAINTS_UNCHANGED != 0,
             branch_id: &self.strings[slot.branch_id as usize],
         })
@@ -1007,7 +975,6 @@ impl RawWriteBatch {
             row.global,
             row.change_id.map(SharedStr::from),
             row.commit_id.map(SharedStr::from),
-            row.untracked,
             row.branch_id,
         );
     }
@@ -1036,7 +1003,6 @@ impl RawWriteBatch {
         global: bool,
         change_id: Option<SharedStr>,
         commit_id: Option<SharedStr>,
-        untracked: bool,
         branch_id: SharedStr,
     ) {
         #[cfg(feature = "storage-benches")]
@@ -1065,8 +1031,7 @@ impl RawWriteBatch {
         let change_id = self.intern_optional_string(change_id);
         let commit_id = self.intern_optional_string(commit_id);
         let branch_id = self.intern_string(branch_id);
-        let flags =
-            (u8::from(global) * RAW_WRITE_GLOBAL) | (u8::from(untracked) * RAW_WRITE_UNTRACKED);
+        let flags = u8::from(global) * RAW_WRITE_GLOBAL;
         self.slots.push(RawWriteSlot {
             schema_key,
             file_id,
@@ -1213,7 +1178,7 @@ impl RawWriteBatch {
                 || slot.updated_at != RAW_WRITE_NONE
                 || slot.change_id != RAW_WRITE_NONE
                 || slot.commit_id != RAW_WRITE_NONE
-                || slot.flags & !RAW_WRITE_UNTRACKED != 0
+                || slot.flags != 0
                 || metadata.is_some()
             {
                 return Err(LixError::new(
@@ -1257,7 +1222,6 @@ impl RawWriteBatch {
                 change_id: Some(ChangeId::default()),
                 addressable_change_id: true,
                 commit_id: None,
-                untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
                 branch_id: slot.branch_id,
                 durable_predecessor: None,
             });
@@ -1458,7 +1422,6 @@ impl RawWriteBatch {
             commit_id: self
                 .optional_string(slot.commit_id)
                 .map(ToString::to_string),
-            untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
             branch_id: self.strings[slot.branch_id as usize].clone(),
         }
     }
@@ -1478,7 +1441,6 @@ impl RawWriteBatch {
             slot.flags & RAW_WRITE_GLOBAL != 0,
             self.optional_string(slot.change_id).cloned(),
             self.optional_string(slot.commit_id).cloned(),
-            slot.flags & RAW_WRITE_UNTRACKED != 0,
             self.strings[slot.branch_id as usize].clone(),
         );
         let destination_index = destination.len() - 1;
@@ -1716,7 +1678,6 @@ impl PartialEq for RawWriteRowRef<'_> {
             && self.global == other.global
             && self.change_id == other.change_id
             && self.commit_id == other.commit_id
-            && self.untracked == other.untracked
             && self.constraints_unchanged == other.constraints_unchanged
             && self.branch_id == other.branch_id
     }
@@ -1870,7 +1831,6 @@ pub(crate) struct TransactionFileContent {
     pub(crate) filename: Option<String>,
     pub(crate) branch_id: String,
     pub(crate) global: bool,
-    pub(crate) untracked: bool,
     /// Whether the visible pre-write file had a binary blob reference.
     ///
     /// File providers already know this while lowering an UPDATE. Carrying the
@@ -1919,7 +1879,6 @@ impl TransactionFileContent {
         filename: Option<String>,
         branch_id: String,
         global: bool,
-        untracked: bool,
         content: impl Into<FileContent>,
     ) -> Self {
         Self {
@@ -1928,7 +1887,6 @@ impl TransactionFileContent {
             filename,
             branch_id,
             global,
-            untracked,
             had_blob_ref: false,
             base_blob_hash: None,
             same_length_blob_splice: None,
@@ -2709,7 +2667,6 @@ pub(crate) struct TestPreparedStateRow {
     pub(crate) global: bool,
     pub(crate) change_id: Option<ChangeId>,
     pub(crate) commit_id: Option<CommitId>,
-    pub(crate) untracked: bool,
     pub(crate) branch_id: SharedStr,
 }
 
@@ -2734,7 +2691,6 @@ impl TestPreparedStateRow {
             change_id: self.change_id,
             addressable_change_id: false,
             commit_id: self.commit_id,
-            untracked: self.untracked,
             branch_id: &self.branch_id,
             durable_predecessor: None,
         }
@@ -2791,7 +2747,6 @@ struct PreparedStateSlot {
     /// with its final commit-delta address during commit planning.
     addressable_change_id: bool,
     commit_id: Option<CommitId>,
-    untracked: bool,
     branch_id: u32,
     durable_predecessor: Option<u32>,
 }
@@ -2806,7 +2761,6 @@ struct DenseCertifiedParameterSlots {
     timestamps: DenseParameterTimestamps,
     commit_id: Option<CommitId>,
     branch_id: u32,
-    untracked: bool,
     /// Absent until commit-delta publication assigns direct addresses. The
     /// compact segment map derives every UUID without a million-row column.
     direct_change_ids: Option<OrderedAddressableCommitDeltaStage>,
@@ -2874,7 +2828,6 @@ pub(crate) struct PreparedStateRowRef<'a> {
     pub(crate) change_id: Option<ChangeId>,
     pub(crate) addressable_change_id: bool,
     pub(crate) commit_id: Option<CommitId>,
-    pub(crate) untracked: bool,
     pub(crate) branch_id: &'a SharedStr,
     pub(crate) durable_predecessor: Option<&'a CertifiedCurrentStatePredecessor>,
 }
@@ -3013,7 +2966,6 @@ impl PreparedStateBatch {
                 || row.file_id.is_some()
                 || row.origin.is_some()
                 || row.origin_key.is_some()
-                || row.untracked
                 || row.global
             {
                 return None;
@@ -3088,7 +3040,6 @@ impl PreparedStateBatch {
                 )),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
-                untracked: dense.untracked,
                 branch_id: &self.strings[dense.branch_id as usize],
                 durable_predecessor: None,
             });
@@ -3110,7 +3061,6 @@ impl PreparedStateBatch {
             change_id: slot.change_id,
             addressable_change_id: slot.addressable_change_id,
             commit_id: slot.commit_id,
-            untracked: slot.untracked,
             branch_id: &self.strings[slot.branch_id as usize],
             durable_predecessor: slot
                 .durable_predecessor
@@ -3143,7 +3093,6 @@ impl PreparedStateBatch {
             row.global,
             row.change_id,
             row.commit_id,
-            row.untracked,
             row.branch_id,
         );
     }
@@ -3175,7 +3124,6 @@ impl PreparedStateBatch {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
-        untracked: bool,
         branch_id: SharedStr,
     ) {
         self.push_parts_with_change_addressability(
@@ -3194,7 +3142,6 @@ impl PreparedStateBatch {
             change_id,
             false,
             commit_id,
-            untracked,
             branch_id,
         );
     }
@@ -3217,7 +3164,6 @@ impl PreparedStateBatch {
         change_id: Option<ChangeId>,
         addressable_change_id: bool,
         commit_id: Option<CommitId>,
-        untracked: bool,
         branch_id: SharedStr,
     ) {
         #[cfg(feature = "storage-benches")]
@@ -3256,7 +3202,6 @@ impl PreparedStateBatch {
             change_id,
             addressable_change_id,
             commit_id,
-            untracked,
             branch_id,
             durable_predecessor: None,
         });
@@ -3296,7 +3241,6 @@ impl PreparedStateBatch {
                 )),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
-                untracked: false,
                 branch_id: dense.branch_id,
                 durable_predecessor: None,
             });
@@ -3884,7 +3828,6 @@ impl PreparedStateBatch {
             row.change_id,
             row.addressable_change_id,
             row.commit_id,
-            row.untracked,
             row.branch_id.clone(),
         );
         let index = self.len() - 1;
@@ -3955,7 +3898,6 @@ impl PartialEq for PreparedStateRowRef<'_> {
             && self.global == other.global
             && self.change_id == other.change_id
             && self.commit_id == other.commit_id
-            && self.untracked == other.untracked
             && self.branch_id == other.branch_id
     }
 }
@@ -3976,7 +3918,6 @@ impl From<PreparedStateRowRef<'_>> for MaterializedLiveStateRow {
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
-            untracked: row.untracked,
             branch_id: Arc::from(row.branch_id.as_str()),
         }
     }
@@ -3998,7 +3939,6 @@ impl From<TestPreparedStateRow> for MaterializedLiveStateRow {
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
-            untracked: row.untracked,
             branch_id: Arc::from(row.branch_id.as_str()),
         }
     }
@@ -4019,7 +3959,6 @@ impl From<&TestPreparedStateRow> for MaterializedLiveStateRow {
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
-            untracked: row.untracked,
             branch_id: Arc::from(row.branch_id.as_str()),
         }
     }
@@ -4809,7 +4748,6 @@ mod tests {
             global: false,
             change_id: Some(ChangeId::for_test_label(entity)),
             commit_id: None,
-            untracked: false,
             branch_id: "shared_branch".into(),
         }
     }
@@ -4857,7 +4795,6 @@ mod tests {
                 false,
                 None,
                 None,
-                false,
                 branch_id.clone(),
             );
         }
@@ -4940,7 +4877,6 @@ mod tests {
                 false,
                 None,
                 None,
-                false,
                 branch_id.clone(),
             );
         }
@@ -5219,7 +5155,6 @@ mod tests {
                 global: false,
                 change_id: Some(ChangeId::for_test_label(&format!("change-{index}"))),
                 commit_id: None,
-                untracked: false,
                 branch_id: format!("branch-{index}").into(),
             });
         }
@@ -5270,7 +5205,6 @@ mod tests {
             global: false,
             change_id: None,
             commit_id: None,
-            untracked: false,
             branch_id: branch_id.clone(),
         };
 
@@ -5850,7 +5784,6 @@ mod tests {
             None,
             "main".to_string(),
             false,
-            false,
             b"after!".to_vec(),
         )
         .with_base_blob_hash(Some(base));
@@ -5878,7 +5811,6 @@ mod tests {
             None,
             None,
             "main".to_string(),
-            false,
             false,
             b"after-more".to_vec(),
         )

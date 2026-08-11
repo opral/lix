@@ -116,7 +116,7 @@ where
             return false;
         }
         for row in &writes.state_rows {
-            if row.untracked || row.global || row.branch_id.as_str() != branch_id {
+            if row.global || row.branch_id.as_str() != branch_id {
                 return false;
             }
             if row.file_id.is_none()
@@ -541,7 +541,6 @@ pub(super) fn push_cohort_payload(
         false,
         None,
         None,
-        false,
         SharedStr::from(branch_id),
     );
 }

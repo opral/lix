@@ -15,7 +15,6 @@ pub(crate) use deterministic::DeterministicFunctionProvider;
 pub(crate) use provider::{
     FunctionProvider, FunctionProviderCheckpoint, FunctionProviderHandle, SystemFunctionProvider,
 };
-#[cfg(feature = "storage-benches")]
 pub(crate) use state::DETERMINISTIC_MODE_KEY;
 pub(crate) use state::DETERMINISTIC_SEQUENCE_KEY;
 pub(crate) use types::{DeterministicMode, DeterministicSequence};

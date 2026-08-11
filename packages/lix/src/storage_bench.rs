@@ -40,7 +40,6 @@ fn stage_bench_commit_deltas(
 }
 
 static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
-static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
@@ -1400,10 +1399,6 @@ pub(crate) fn record_transaction_rows_staged(count: usize) {
     TRANSACTION_ROWS_STAGED.fetch_add(count as u64, Ordering::Relaxed);
 }
 
-pub(crate) fn record_transaction_untracked_rows(count: usize) {
-    TRANSACTION_UNTRACKED_ROWS.fetch_add(count as u64, Ordering::Relaxed);
-}
-
 pub(crate) fn record_transaction_validation_branch() {
     TRANSACTION_VALIDATION_BRANCHS.fetch_add(1, Ordering::Relaxed);
 }
@@ -2225,7 +2220,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
         crate::transaction::plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE,
         crate::json_store::store::JSON_SPACE,
-        crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
+        crate::json_store::ORPHAN_JSON_RECLAIM_CANDIDATE_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         crate::gc::GC_TREE_SWEEP_EPOCH_SPACE,
         crate::gc::GC_TREE_SWEEP_MARK_SPACE,
@@ -2488,8 +2483,8 @@ mod tests {
             "additionalProperties": false
         });
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
+             VALUES (lix_json($1), false)",
             &[Value::Text(schema.to_string())],
         )
         .await

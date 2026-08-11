@@ -873,8 +873,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path, lixcol_global, lixcol_untracked) \
-                 VALUES ('6469722d-676c-8f62-816c-2d6f76657200', '/shared', true, false)",
+                "INSERT INTO lix_directory (id, path, lixcol_global) \
+                 VALUES ('6469722d-676c-8f62-816c-2d6f76657200', '/shared', true)",
                 &[],
             )
             .await
@@ -882,7 +882,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, lixcol_branch_id, lixcol_global, lixcol_untracked \
+                "SELECT id, path, lixcol_branch_id, lixcol_global  \
                  FROM lix_directory_by_branch \
                  WHERE id = '6469722d-676c-8f62-816c-2d6f76657200' \
                  ORDER BY lixcol_branch_id",
@@ -950,214 +950,6 @@ simulation_test!(
             .await
             .expect("global directory should read through active overlay");
         assert_rows_eq(result, vec![vec![Value::Text("/shared/child".to_string())]]);
-    }
-);
-
-simulation_test!(
-    lix_directory_tracked_path_insert_rejects_untracked_directory,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('6469722d-646f-8373-8000-000000000000', '/docs', true)",
-                &[],
-            )
-            .await
-            .expect("untracked directory insert should succeed");
-        let error = session
-            .execute("INSERT INTO lix_directory (path) VALUES ('/docs')", &[])
-            .await
-            .expect_err("tracked directory insert must not replace an untracked directory");
-        assert!(
-            error
-                .message
-                .contains("a canonical untracked row already exists; delete it first"),
-            "durability collision should have a targeted error: {error:?}"
-        );
-
-        let result = session
-            .execute(
-                "SELECT id, path, lixcol_untracked \
-                 FROM lix_directory \
-                 WHERE path = '/docs'",
-                &[],
-            )
-            .await
-            .expect("directory read should succeed");
-        assert_rows_eq(
-            result,
-            vec![vec![
-                Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
-                Value::Text("/docs".to_string()),
-                Value::Boolean(true),
-            ]],
-        );
-    }
-);
-
-simulation_test!(
-    lix_directory_untracked_path_insert_reuses_tracked_parent_directory,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
-                &[],
-            )
-            .await
-            .expect("tracked parent insert should succeed");
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('6469722d-6472-8166-8400-000000000000', '/docs/draft', true)",
-                &[],
-            )
-            .await
-            .expect("untracked child insert should reuse tracked parent");
-
-        let result = session
-            .execute(
-                "SELECT id, path, parent_id, lixcol_untracked \
-                 FROM lix_directory \
-                 WHERE id IN ('6469722d-646f-8373-8000-000000000000', '6469722d-6472-8166-8400-000000000000') \
-                 ORDER BY id",
-                &[],
-            )
-            .await
-            .expect("directory read should succeed");
-        assert_rows_eq(
-            result,
-            vec![
-                vec![
-                    Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
-                    Value::Text("/docs".to_string()),
-                    Value::Null,
-                    Value::Boolean(false),
-                ],
-                vec![
-                    Value::Text("6469722d-6472-8166-8400-000000000000".to_string()),
-                    Value::Text("/docs/draft".to_string()),
-                    Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
-                    Value::Boolean(true),
-                ],
-            ],
-        );
-    }
-);
-
-simulation_test!(
-    lix_directory_path_insert_rejects_untracked_duplicate_with_different_id,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
-                &[],
-            )
-            .await
-            .expect("tracked directory insert should succeed");
-        let error = session
-            .execute(
-                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('6469722d-646f-8373-8d73-6861646f7700', '/docs', true)",
-                &[],
-            )
-            .await
-            .expect_err("untracked duplicate with a different id should fail");
-
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-    }
-);
-
-simulation_test!(
-    lix_directory_path_update_rejects_untracked_parent,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('6469722d-7061-8265-8e74-000000000000', '/archive', true)",
-                &[],
-            )
-            .await
-            .expect("untracked parent insert should succeed");
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
-                &[],
-            )
-            .await
-            .expect("tracked directory insert should succeed");
-
-        let error = session
-            .execute(
-                "UPDATE lix_directory SET path = '/archive/docs' WHERE id = '6469722d-646f-8373-8000-000000000000'",
-                &[],
-            )
-            .await
-            .expect_err("directory path update must not promote an untracked parent");
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-
-        let result = session
-            .execute(
-                "SELECT id, path, parent_id, lixcol_untracked \
-                 FROM lix_directory \
-                 WHERE id IN ('6469722d-7061-8265-8e74-000000000000', '6469722d-646f-8373-8000-000000000000') \
-                 ORDER BY id",
-                &[],
-            )
-            .await
-            .expect("directory read should succeed");
-        assert_rows_eq(
-            result,
-            vec![
-                vec![
-                    Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
-                    Value::Text("/docs".to_string()),
-                    Value::Null,
-                    Value::Boolean(false),
-                ],
-                vec![
-                    Value::Text("6469722d-7061-8265-8e74-000000000000".to_string()),
-                    Value::Text("/archive".to_string()),
-                    Value::Null,
-                    Value::Boolean(true),
-                ],
-            ],
-        );
     }
 );
 
@@ -1516,41 +1308,6 @@ simulation_test!(
             .await
             .expect_err("path upsert without path should be rejected");
         assert!(error.message.contains("requires non-null path"));
-    }
-);
-
-simulation_test!(
-    lix_directory_insert_on_conflict_path_rejects_untracked_collision,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path) \
-                 VALUES ('6469722d-7472-8163-8b65-642d636f6c00', '/dir-collision')",
-                &[],
-            )
-            .await
-            .expect("tracked directory insert should succeed");
-
-        let error = session
-            .execute(
-                "INSERT INTO lix_directory (path, lixcol_untracked) \
-                 VALUES ('/dir-collision', true) \
-                 ON CONFLICT (path) DO NOTHING",
-                &[],
-            )
-            .await
-            .expect_err("tracked/untracked path collision should be rejected");
-        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert!(error.message.contains("existing tracked directory"));
     }
 );
 

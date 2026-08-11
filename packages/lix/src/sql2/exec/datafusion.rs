@@ -3301,7 +3301,6 @@ mod tests {
         snapshot_content: Option<String>,
         metadata: Option<String>,
         global: bool,
-        untracked: bool,
         tombstone: bool,
     }
 
@@ -3317,7 +3316,6 @@ mod tests {
                 branch_id: row.branch_id.into(),
                 file_id: row.file_id.map(Into::into),
                 global: row.global,
-                untracked: row.untracked,
                 tombstone: row.snapshot.is_none(),
                 snapshot_content: row.snapshot.map(|snapshot| snapshot.to_string()),
                 metadata: row.metadata.map(|metadata| metadata.to_string()),
@@ -3907,10 +3905,6 @@ mod tests {
                             .branch_ids
                             .iter()
                             .any(|branch_id| branch_id == row.branch_id.as_ref()))
-                    && request
-                        .filter
-                        .untracked
-                        .is_none_or(|untracked| row.untracked == untracked)
                     && (request.filter.include_tombstones || !row.deleted)
                     && (request.filter.file_ids.is_empty()
                         || request.filter.file_ids.iter().any(|filter| match filter {
@@ -4039,7 +4033,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
@@ -4049,7 +4042,6 @@ mod tests {
         entity_pk: &str,
         branch_id: &str,
         value: &str,
-        untracked: bool,
     ) -> MaterializedLiveStateRow {
         let mut row = live_entity_row(entity_pk, branch_id, value);
         row.snapshot_content = Some(
@@ -4057,7 +4049,6 @@ mod tests {
                 .to_string()
                 .into(),
         );
-        row.untracked = untracked;
         row
     }
 
@@ -4087,7 +4078,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
@@ -4119,7 +4109,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
@@ -4154,7 +4143,6 @@ mod tests {
                 "commit-{entity_pk}-blob"
             ))),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
@@ -4195,11 +4183,6 @@ mod tests {
             staged_writes,
             scans,
         )
-    }
-
-    fn mark_untracked(mut row: MaterializedLiveStateRow) -> MaterializedLiveStateRow {
-        row.untracked = true;
-        row
     }
 
     fn descriptor_names(rows: &[CapturedStageRow]) -> Vec<String> {
@@ -4317,18 +4300,8 @@ mod tests {
             blob_reader: Arc::new(DummyBlobReader),
             live_state: Arc::new(RowsLiveStateReader {
                 rows: vec![
-                    live_test_state_row(
-                        "entity-b",
-                        "01920000-0000-7000-8000-0000000000a1",
-                        "B",
-                        false,
-                    ),
-                    live_test_state_row(
-                        "entity-a",
-                        "01920000-0000-7000-8000-0000000000a1",
-                        "A",
-                        false,
-                    ),
+                    live_test_state_row("entity-b", "01920000-0000-7000-8000-0000000000a1", "B"),
+                    live_test_state_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
                 ],
             }),
             entity_snapshot_reader: None,
@@ -4382,18 +4355,8 @@ mod tests {
             blob_reader: Arc::new(DummyBlobReader),
             live_state: Arc::new(CountingRowsLiveStateReader {
                 rows: vec![
-                    live_test_state_row(
-                        "entity-b",
-                        "01920000-0000-7000-8000-0000000000a1",
-                        "B",
-                        false,
-                    ),
-                    live_test_state_row(
-                        "entity-a",
-                        "01920000-0000-7000-8000-0000000000a1",
-                        "A",
-                        false,
-                    ),
+                    live_test_state_row("entity-b", "01920000-0000-7000-8000-0000000000a1", "B"),
+                    live_test_state_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
                 ],
                 scans: Arc::clone(&scans),
             }),
@@ -4564,10 +4527,10 @@ mod tests {
             .expect("session should open");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"aggregate_filter_test\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"integer\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
-                 false, false)",
+                 false)",
                 &[],
             )
             .await
@@ -4673,10 +4636,9 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -4685,8 +4647,8 @@ mod tests {
         session
             .execute(
                 "INSERT INTO test_state_schema \
-	             (lixcol_entity_pk, value, count, lixcol_metadata, lixcol_untracked) \
-	             VALUES (lix_json('[\"entity-history\"]'), 'A', 7, '{\"source\":\"history\"}', false)",
+	             (lixcol_entity_pk, value, count, lixcol_metadata) \
+	             VALUES (lix_json('[\"entity-history\"]'), 'A', 7, '{\"source\":\"history\"}')",
                 &[],
             )
             .await?;
@@ -4732,10 +4694,9 @@ mod tests {
             .expect("session should open");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -4917,10 +4878,9 @@ mod tests {
             .expect("session should open");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -5097,10 +5057,9 @@ mod tests {
             .await
             .expect("main session should open");
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
-             false,\
              false\
              )",
             &[],
@@ -5527,7 +5486,6 @@ mod tests {
         assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"C\"}")
@@ -5618,7 +5576,6 @@ mod tests {
         assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"C\"}")
@@ -5772,18 +5729,8 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(CapturingRowsLiveStateReader {
             rows: vec![
-                live_test_state_row(
-                    "target",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    "old",
-                    true,
-                ),
-                live_test_state_row(
-                    "other",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    "skip",
-                    true,
-                ),
+                live_test_state_row("target", "01920000-0000-7000-8000-0000000000b1", "old"),
+                live_test_state_row("other", "01920000-0000-7000-8000-0000000000b1", "skip"),
             ],
             requests: Arc::clone(&requests),
         });
@@ -5809,8 +5756,8 @@ mod tests {
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch \
-             (id, value, lixcol_branch_id, lixcol_untracked) \
-             VALUES ('target', 'new', '01920000-0000-7000-8000-0000000000b1', true) \
+             (id, value, lixcol_branch_id) \
+             VALUES ('target', 'new', '01920000-0000-7000-8000-0000000000b1') \
              ON CONFLICT(id, lixcol_branch_id) DO UPDATE SET value = excluded.value",
             &[],
             WriteExecutorMode::Auto,
@@ -5833,10 +5780,7 @@ mod tests {
             vec!["01920000-0000-7000-8000-0000000000b1"]
         );
         assert_eq!(filter.file_ids, vec![NullableKeyFilter::Null]);
-        // V12 has one canonical identity across retention. The probe remains
-        // narrowed by schema, PK, branch, and file ID, but must inspect both
-        // tracked and untracked rows so an upsert preserves existing retention.
-        assert_eq!(filter.untracked, None);
+        // The probe remains narrowed by schema, PK, branch, and file ID.
         assert!(!filter.include_tombstones);
 
         let staged_writes = staged_writes.lock().expect("staged writes lock");
@@ -6116,7 +6060,6 @@ mod tests {
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some(
@@ -6163,7 +6106,6 @@ mod tests {
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
     }
 
     #[tokio::test]
@@ -6377,7 +6319,6 @@ mod tests {
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
@@ -6427,7 +6368,6 @@ mod tests {
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert!(!rows[0].global);
-        assert!(!rows[0].untracked);
     }
 
     #[tokio::test]
@@ -7061,38 +7001,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_multi_row_lix_file_do_nothing_rejects_untracked_collision() {
-        let (mut ctx, staged_writes, scans) =
-            counting_write_context(vec![mark_untracked(live_file_row(
-                "01920000-0000-7000-8000-000000000132",
-                "01920000-0000-7000-8000-0000000000a1",
-                None,
-                "untracked.md",
-            ))]);
-
-        let error = execute_write_sql_trace(
-            &mut ctx,
-            "INSERT INTO lix_file (path, content) \
-             VALUES ('/untracked.md', CAST('new' AS BYTEA)), ('/fresh.md', CAST('fresh' AS BYTEA)) \
-             ON CONFLICT (path) DO NOTHING",
-            &[],
-            WriteExecutorMode::ForceFast,
-        )
-        .await
-        .expect_err("DO NOTHING should still reject tracked/untracked conflicts");
-
-        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert_eq!(scans.load(Ordering::SeqCst), 1);
-        assert!(
-            staged_writes
-                .lock()
-                .expect("staged writes lock")
-                .deltas
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
     async fn execute_sql_multi_row_lix_file_id_path_data_uses_fast_shape() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
 
@@ -7375,60 +7283,6 @@ mod tests {
             snapshot["blob_hash"],
             crate::binary_cas::BlobId::from_content(b"new").to_hex()
         );
-    }
-
-    #[tokio::test]
-    async fn execute_sql_file_content_update_by_id_updates_same_path_in_every_matching_durability_lane()
-     {
-        let root = live_file_row(
-            "01920000-0000-7000-8000-0000000000d2",
-            "01920000-0000-7000-8000-0000000000a1",
-            None,
-            "shared.md",
-        );
-        let mut scoped = live_file_row(
-            "01920000-0000-7000-8000-0000000000d2",
-            "01920000-0000-7000-8000-0000000000a1",
-            None,
-            "shared.md",
-        );
-        scoped.untracked = true;
-        scoped.change_id = None;
-        scoped.commit_id = None;
-        let rows = vec![root, scoped];
-        let (mut fast_ctx, fast_staged, _) = counting_write_context(rows.clone());
-        let (mut datafusion_ctx, datafusion_staged, _) = counting_write_context(rows);
-        let sql = "UPDATE lix_file SET content = CAST('AB' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'";
-
-        let (fast_result, fast_path) =
-            execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
-                .await
-                .expect("scoped file data update should use the fast path");
-        let (datafusion_result, datafusion_path) = execute_write_sql_trace(
-            &mut datafusion_ctx,
-            sql,
-            &[],
-            WriteExecutorMode::ForceDataFusion,
-        )
-        .await
-        .expect("reference scoped file data update should succeed");
-
-        assert_eq!(fast_path, WriteExecutorPath::Fast);
-        assert_eq!(datafusion_path, WriteExecutorPath::DataFusion);
-        assert_eq!(fast_result.rows, vec![vec![Value::Integer(2)]]);
-        assert_eq!(fast_result.rows, datafusion_result.rows);
-        let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
-            .pending_write_overlay()
-            .expect("fast staged delta should project")
-            .visible_all_semantic_rows();
-        let datafusion_rows = datafusion_staged
-            .lock()
-            .expect("DataFusion writes lock")
-            .deltas[0]
-            .pending_write_overlay()
-            .expect("DataFusion staged delta should project")
-            .visible_all_semantic_rows();
-        assert_eq!(fast_rows, datafusion_rows);
     }
 
     #[tokio::test]

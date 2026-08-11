@@ -20,10 +20,9 @@ simulation_test!(
 
         let register_schema_result = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_dummy_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -64,8 +63,8 @@ simulation_test!(
 
         let insert_state_result = session
             .execute(
-                "INSERT INTO engine_dummy_schema (id, name, lixcol_untracked) \
-             VALUES ('dummy-1', 'Dummy', true)",
+                "INSERT INTO engine_dummy_schema (id, name) \
+             VALUES ('dummy-1', 'Dummy')",
                 &[],
             )
             .await
@@ -213,10 +212,9 @@ simulation_test!(
 
         transaction
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -268,45 +266,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    untracked_registered_schema_does_not_authorize_tracked_typed_write,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_untracked_only_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
-                 true\
-                 )",
-                &[],
-            )
-            .await
-            .expect("untracked schema registration should succeed");
-
-        let error = session
-            .execute(
-                "INSERT INTO engine_untracked_only_schema \
-                 (id, name, lixcol_untracked) \
-                 VALUES ('tracked-1', 'Tracked', false)",
-                &[],
-            )
-            .await
-            .expect_err("tracked rows must not validate against committed untracked schemas");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-    }
-);
-
-simulation_test!(
     lix_registered_schema_insert_rejects_reserved_lix_namespace,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -337,8 +296,8 @@ simulation_test!(
             let error = session
                 .execute(
                     "INSERT INTO lix_registered_schema \
-                     (value, lixcol_global, lixcol_untracked) \
-                     VALUES ($1, false, false)",
+                     (value, lixcol_global) \
+                     VALUES ($1, false)",
                     &[Value::Json(schema)],
                 )
                 .await
@@ -370,8 +329,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema \
-                 (value, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, false, false)",
+                 (value, lixcol_global) \
+                 VALUES ($1, false)",
                 &[Value::Json(noncolliding_schema)],
             )
             .await
@@ -509,10 +468,9 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
 
     session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_delete_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -621,8 +579,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, false, false)",
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
+                 VALUES ($1, false)",
                 &[Value::Json(initial_schema.clone())],
             )
             .await
@@ -696,10 +654,9 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_bad_pointer_schema\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -742,11 +699,10 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_empty_property_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}'),\
-                 true,\
-                 false\
+                 true\
                  )",
                 &[],
             )
@@ -788,10 +744,9 @@ simulation_test!(
         .expect("target branch should be created before schema registration");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -802,8 +757,8 @@ simulation_test!(
         let error = main
             .execute(
                 "INSERT INTO engine_poison_schema_by_branch \
-                 (id, name, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('poison-1', 'Poisoned', '01930000-0000-7000-8000-000000000015', true)",
+                 (id, name, lixcol_branch_id) \
+                 VALUES ('poison-1', 'Poisoned', '01930000-0000-7000-8000-000000000015')",
                 &[],
             )
             .await
@@ -838,10 +793,9 @@ simulation_test!(
         .expect("target branch should be created before schema divergence");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
                 &[],
@@ -882,10 +836,9 @@ simulation_test!(
 
         target
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -966,8 +919,8 @@ simulation_test!(
         });
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES ($1, false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
+             VALUES ($1, false)",
             &[Value::Json(base_schema)],
         )
         .await
@@ -1056,10 +1009,9 @@ simulation_test!(
         .expect("target branch should be created before FK schemas");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_fk_parent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -1068,10 +1020,9 @@ simulation_test!(
         .expect("parent schema should register on active main");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -1082,8 +1033,8 @@ simulation_test!(
         let parent_result = main
             .execute(
                 "INSERT INTO engine_fk_parent_schema_by_branch \
-                 (id, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('parent-1', '01930000-0000-7000-8000-000000000013', true)",
+                 (id, lixcol_branch_id) \
+                 VALUES ('parent-1', '01930000-0000-7000-8000-000000000013')",
                 &[],
             )
             .await;
@@ -1100,8 +1051,8 @@ simulation_test!(
         let error = main
             .execute(
                 "INSERT INTO engine_fk_child_schema_by_branch \
-                 (id, parent_id, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('child-1', 'parent-1', '01930000-0000-7000-8000-000000000013', true)",
+                 (id, parent_id, lixcol_branch_id) \
+                 VALUES ('child-1', 'parent-1', '01930000-0000-7000-8000-000000000013')",
                 &[],
             )
             .await
@@ -1130,10 +1081,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_default_id_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1185,10 +1135,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_nullable_default_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1256,11 +1205,10 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
 
     global_session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             true,\
-             false\
+             true\
              )",
             &[],
         )
@@ -1269,10 +1217,9 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -1283,8 +1230,8 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
     session
         .execute(
             "INSERT INTO engine_overlay_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('entity-global-overlay', 'Global Entity', true, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('entity-global-overlay', 'Global Entity', true)",
             &[],
         )
         .await
@@ -1292,7 +1239,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT id, name, lixcol_branch_id, lixcol_global, lixcol_untracked \
+            "SELECT id, name, lixcol_branch_id, lixcol_global  \
                  FROM engine_overlay_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"entity-global-overlay\"]') \
                  ORDER BY lixcol_branch_id",
@@ -1335,10 +1282,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_global_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1349,8 +1295,8 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO engine_global_poison_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('global-poison-1', 'Wrong Scope', true, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('global-poison-1', 'Wrong Scope', true)",
                 &[],
             )
             .await
@@ -1378,10 +1324,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_typed_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1392,8 +1337,8 @@ simulation_test!(
         let insert_result = session
             .execute(
                 "INSERT INTO engine_typed_entity_schema \
-                 (id, name, count, lixcol_global, lixcol_untracked) \
-                 VALUES ('typed-entity-1', 'Typed Entity', 7, false, false)",
+                 (id, name, count, lixcol_global) \
+                 VALUES ('typed-entity-1', 'Typed Entity', 7, false)",
                 &[],
             )
             .await
@@ -1435,10 +1380,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_number_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1449,8 +1393,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_number_update_schema \
-                 (id, score, lixcol_global, lixcol_untracked) \
-                 VALUES ('score-1', 1, false, false)",
+                 (id, score, lixcol_global) \
+                 VALUES ('score-1', 1, false)",
                 &[],
             )
             .await
@@ -1493,10 +1437,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_file_scoped_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1518,10 +1461,10 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_file_scoped_entity_schema \
-                 (id, name, lixcol_file_id, lixcol_global, lixcol_untracked) \
+                 (id, name, lixcol_file_id, lixcol_global) \
                  VALUES \
-                 ('row-1', 'before-1', '66696c65-2d31-8000-8000-000000000000', false, false), \
-                 ('row-2', 'before-2', '66696c65-2d32-8000-8000-000000000000', false, false)",
+                 ('row-1', 'before-1', '66696c65-2d31-8000-8000-000000000000', false), \
+                 ('row-2', 'before-2', '66696c65-2d32-8000-8000-000000000000', false)",
                 &[],
             )
             .await
@@ -1579,10 +1522,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1593,8 +1535,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_identity_literal_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'before', false)",
                 &[],
             )
             .await
@@ -1636,10 +1578,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1650,8 +1591,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_identity_in_literal_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'before', false)",
                 &[],
             )
             .await
@@ -1692,10 +1633,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_base_branch_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -1722,8 +1662,8 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO engine_base_branch_filter_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'draft', false)",
                 &[],
             )
             .await
@@ -1768,10 +1708,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_base_insert_branch_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -1790,8 +1729,8 @@ simulation_test!(
         let error = main
             .execute(
                 "INSERT INTO engine_base_insert_branch_schema \
-                 (id, name, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', '01930000-0000-7000-8000-00000000000e', false)",
+                 (id, name, lixcol_branch_id) \
+                 VALUES ('row-1', 'draft', '01930000-0000-7000-8000-00000000000e')",
                 &[],
             )
             .await
@@ -1826,10 +1765,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_unknown_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1840,8 +1778,8 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO engine_unknown_insert_column_schema \
-                 (id, name, missing_column, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', 'ignored-before-fix', false, false)",
+                 (id, name, missing_column, lixcol_global) \
+                 VALUES ('row-1', 'before', 'ignored-before-fix', false)",
                 &[],
             )
             .await
@@ -1870,10 +1808,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_duplicate_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1884,8 +1821,8 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO engine_duplicate_insert_column_schema \
-                 (id, name, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', 'after', false, false)",
+                 (id, name, name, lixcol_global) \
+                 VALUES ('row-1', 'before', 'after', false)",
                 &[],
             )
             .await
@@ -1914,10 +1851,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_qualified_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -1928,8 +1864,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO bogus.engine_qualified_insert_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'wrong', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'wrong', false)",
                 &[],
             )
             .await
@@ -1956,10 +1892,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_base_branch_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -1978,8 +1913,8 @@ simulation_test!(
         let error = main
             .execute(
                 "INSERT INTO engine_base_branch_insert_schema \
-                 (id, name, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft-via-main', '01930000-0000-7000-8000-00000000000e', false, false)",
+                 (id, name, lixcol_branch_id, lixcol_global) \
+                 VALUES ('row-1', 'draft-via-main', '01930000-0000-7000-8000-00000000000e', false)",
                 &[],
             )
             .await
@@ -2012,10 +1947,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_by_branch_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -2033,8 +1967,8 @@ simulation_test!(
 
         main.execute(
             "INSERT INTO engine_by_branch_delete_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
+             (id, name, lixcol_global) \
+             VALUES ('row-1', 'main', false)",
             &[],
         )
         .await
@@ -2050,8 +1984,8 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO engine_by_branch_delete_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'draft', false)",
                 &[],
             )
             .await
@@ -2108,10 +2042,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_by_branch_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -2129,8 +2062,8 @@ simulation_test!(
 
         main.execute(
             "INSERT INTO engine_by_branch_update_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
+             (id, name, lixcol_global) \
+             VALUES ('row-1', 'main', false)",
             &[],
         )
         .await
@@ -2146,8 +2079,8 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO engine_by_branch_update_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'draft', false)",
                 &[],
             )
             .await
@@ -2205,10 +2138,9 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_by_branch_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],
@@ -2226,8 +2158,8 @@ simulation_test!(
 
         main.execute(
             "INSERT INTO engine_by_branch_alias_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
+             (id, name, lixcol_global) \
+             VALUES ('row-1', 'main', false)",
             &[],
         )
         .await
@@ -2243,8 +2175,8 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO engine_by_branch_alias_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'draft', false)",
                 &[],
             )
             .await
@@ -2317,10 +2249,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_duplicate_update_assignment_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -2331,8 +2262,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_duplicate_update_assignment_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'before', false)",
                 &[],
             )
             .await
@@ -2374,10 +2305,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_optional_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -2388,8 +2318,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_optional_update_schema \
-                 (id, title, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', false, false)",
+                 (id, title, lixcol_global) \
+                 VALUES ('row-1', 'before', false)",
                 &[],
             )
             .await

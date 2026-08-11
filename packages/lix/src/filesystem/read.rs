@@ -13,8 +13,8 @@ use super::{DirectoryPathRecord, derive_directory_paths};
 
 /// Collects every file payload root selected by the authenticated serving
 /// controls and retained commit/checkpoint roots. Tracked history is read from
-/// commit state; current-only untracked rows are read from each control's
-/// untracked selector through the live-state owner.
+/// commit state; engine current-only rows are read from the complete branch
+/// generation through the live-state owner.
 pub(crate) async fn collect_gc_binary_blob_roots<S>(
     store: &S,
     controls: &[(String, crate::branch::BranchHeadControl)],
@@ -36,7 +36,7 @@ where
     let mut roots = BTreeSet::new();
     let current = crate::live_state::TrackedHeadContext::new()
         .reader(store)
-        .scan_live_batches_for_controls(controls, &request, Some(true))
+        .scan_live_batches_for_controls(controls, &request)
         .await
         .map_err(|error| {
             LixError::new(
@@ -107,7 +107,6 @@ impl FilesystemIndex {
             let scope = RowScope {
                 branch_id: row.branch_id().to_string(),
                 global: row.global(),
-                untracked: row.untracked(),
                 file_id: row.file_id().map(str::to_owned),
             };
             let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
@@ -269,7 +268,6 @@ pub(crate) struct FilesystemFileEntry {
 pub(crate) struct RowScope {
     pub(crate) branch_id: String,
     pub(crate) global: bool,
-    pub(crate) untracked: bool,
     pub(crate) file_id: Option<String>,
 }
 
@@ -278,7 +276,6 @@ impl RowScope {
         FilesystemRowContext {
             branch_id: self.branch_id.clone(),
             global: self.global,
-            untracked: self.untracked,
             file_id: file_id.or_else(|| self.file_id.clone()),
             metadata: None,
         }
@@ -303,11 +300,7 @@ impl DirectorySnapshot {
         let Some(parent_id) = self.parent_id.as_deref() else {
             return Vec::new();
         };
-        let mut keys = vec![key.in_same_scope(parent_id)];
-        if key.is_untracked() {
-            keys.push(key.in_tracked_scope(parent_id));
-        }
-        keys
+        vec![key.in_same_scope(parent_id)]
     }
 }
 
@@ -331,11 +324,7 @@ fn file_directory_parent_keys(
     file_key: &FilesystemDescriptorKey,
     directory_id: &str,
 ) -> Vec<FilesystemDescriptorKey> {
-    let mut keys = vec![file_key.in_same_scope(directory_id)];
-    if file_key.is_untracked() {
-        keys.push(file_key.in_tracked_scope(directory_id));
-    }
-    keys
+    vec![file_key.in_same_scope(directory_id)]
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,7 +436,6 @@ mod tests {
                 BLOB_REF_SCHEMA_KEY,
                 r#"{"id":"01920000-0000-7000-8000-0000000000d2","blob_hash":"abc123","size_bytes":5}"#,
                 "01920000-0000-7000-8000-0000000000b1",
-                false,
                 Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             ),
         ])
@@ -471,7 +459,6 @@ mod tests {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
                 r#"{"id":"dir-shared","parent_id":null,"name":"scoped"}"#,
                 "01920000-0000-7000-8000-0000000000b1",
-                false,
                 None,
             ),
             file_row(
@@ -483,7 +470,6 @@ mod tests {
                 FILE_DESCRIPTOR_SCHEMA_KEY,
                 r#"{"id":"01920000-0000-7000-8000-000000000342","directory_id":"dir-shared","name":"scoped.txt"}"#,
                 "01920000-0000-7000-8000-0000000000b1",
-                false,
                 Some("01920000-0000-7000-8000-000000000342".to_string()),
             ),
         ])
@@ -519,7 +505,6 @@ mod tests {
             FILE_DESCRIPTOR_SCHEMA_KEY,
             snapshot_content,
             "01920000-0000-7000-8000-0000000000a1",
-            false,
             Some(entity_pk.to_string()),
         )
     }
@@ -534,7 +519,6 @@ mod tests {
             schema_key,
             snapshot_content,
             "01920000-0000-7000-8000-0000000000a1",
-            false,
             None,
         )
     }
@@ -544,7 +528,6 @@ mod tests {
         schema_key: &str,
         snapshot_content: &str,
         branch_id: &str,
-        untracked: bool,
         file_id: Option<String>,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
@@ -558,7 +541,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked,
             created_at: LixTimestamp::expect_parse(
                 "filesystem read test created_at",
                 "2026-04-23T00:00:00Z",
@@ -584,7 +566,6 @@ mod tests {
         RowScope {
             branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             global: false,
-            untracked: false,
             file_id: None,
         }
     }

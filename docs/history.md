@@ -148,7 +148,7 @@ provenance retains the relevant ancestor tombstones.
 ## Workspace activity with `lix_change`
 
 `lix_change` contains every retained change across branches, without proving
-branch reachability. Ordinary untracked writes do not create change rows.
+branch reachability. Every ordinary entity write creates a change row.
 
 | Column | What it is |
 | :-- | :-- |

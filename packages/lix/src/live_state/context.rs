@@ -14,11 +14,10 @@ use crate::filesystem::{
 };
 use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReadDomain, LiveStateReader, LiveStateRowFilter,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
-    resolve_visible_batch,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_batch,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -296,7 +295,7 @@ const fn entity_point_snapshot_cache_disabled_for_profile() -> bool {
 /// Serving facade for visible live-state reads.
 ///
 /// Normal rows are resolved from one durable hot-state projection. Each row
-/// carries its own tracked|untracked retention, so readers do not route
+/// carries its own retention metadata, so readers do not route
 /// through a separate retention index or merge retention candidates.
 pub(crate) struct LiveStateContext {
     tracked_head: TrackedHeadContext,
@@ -546,7 +545,6 @@ where
             || request.limit.is_some()
             || !matches!(request.filter.rows, LiveStateRowFilter::All)
             || request.filter.include_tombstones
-            || request.filter.untracked.is_some()
             || !request.filter.file_ids.is_empty()
             || !request.filter.constraints.is_empty()
         {
@@ -630,9 +628,7 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Option<(String, BranchHeadControl, String)>, LixError> {
-        // The hot index carries tracked and untracked rows in one serving
-        // plane, so this route never probes a separate retention index.
-        if request.filter.untracked.is_some() || request_may_include_derived(request) {
+        if request_may_include_derived(request) {
             return Ok(None);
         }
         let [schema_key] = request.filter.schema_keys.as_slice() else {
@@ -658,13 +654,6 @@ where
         let Some(requested_control) = scope.branch_heads.get(requested_branch_id).copied() else {
             return Ok(None);
         };
-        // The direct immutable-base projection covers one serving generation.
-        // A split selector must use the merged tracked/untracked visibility
-        // path so branch-local untracked rows remain visible after a tracked
-        // root swap or an untracked-only generation advance.
-        if requested_control.tracked_generation != requested_control.untracked_generation {
-            return Ok(None);
-        }
         let tracked_head = self.tracked_head.reader(&self.store);
         if requested_branch_id != GLOBAL_BRANCH_ID
             && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
@@ -715,7 +704,6 @@ where
                 request,
                 &scope.projection_branch_ids,
                 &scope.storage_branch_ids,
-                request.filter.untracked,
             )
             .await?,
         );
@@ -724,18 +712,6 @@ where
         } else {
             Vec::new()
         };
-        // The ordered single-branch route bypasses the generic visibility
-        // resolver, so apply the retention predicate before taking that fast
-        // path. Otherwise `untracked = Some(..)` accidentally returned both
-        // member kinds from an already-unified group.
-        if request.filter.untracked.is_some() {
-            for branch_rows in &mut hot_branch_rows {
-                branch_rows.rows = filter_current_row_retention(
-                    std::mem::take(&mut branch_rows.rows),
-                    request.filter.untracked,
-                );
-            }
-        }
         if derived_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
@@ -767,7 +743,7 @@ where
     }
 
     /// Serves finite entity-PK scans from the hot current-state index. Every
-    /// row already has its retention tag, so an unrelated untracked row
+    /// row already has its retention tag, so an unrelated current-only row
     /// cannot route selected tracked identities through a separate scan.
     #[cfg(test)]
     async fn scan_direct_entity_pk_rows(
@@ -814,19 +790,13 @@ where
         // publication filter. Apply it per generation before a finite PK
         // lookup so an absent global schema does not pay the complete hot,
         // packed, and certified point-read stack for every active-branch row.
-        // The bloom summary belongs to the published tracked selector. An
-        // explicit current-only read must inspect the untracked selector even
-        // when the tracked summary has no bit for this schema; otherwise a
-        // durable runtime/ownership check is silently skipped.
-        if request.filter.untracked.is_none() {
-            controls.retain(|(_, control)| {
-                request
-                    .filter
-                    .schema_keys
-                    .iter()
-                    .any(|schema_key| control.may_have_schema(schema_key))
-            });
-        }
+        controls.retain(|(_, control)| {
+            request
+                .filter
+                .schema_keys
+                .iter()
+                .any(|schema_key| control.may_have_schema(schema_key))
+        });
         if controls.is_empty() {
             return Ok(Some(MaterializedLiveStateBatch::default()));
         }
@@ -839,13 +809,9 @@ where
             },
         );
         let rows_by_branch = tracked_head
-            .scan_live_batches_for_controls(&controls, &tracked_request, request.filter.untracked)
+            .scan_live_batches_for_controls(&controls, &tracked_request)
             .await?;
-        let rows = concat_live_state_batches(
-            rows_by_branch
-                .into_iter()
-                .map(|(_, rows)| filter_current_row_retention(rows, request.filter.untracked)),
-        );
+        let rows = concat_live_state_batches(rows_by_branch.into_iter().map(|(_, rows)| rows));
         Ok(Some(resolve_visible_batch(
             rows,
             MaterializedLiveStateBatch::default(),
@@ -924,16 +890,15 @@ where
         let scope_request = LiveStateScanRequest {
             filter: crate::live_state::LiveStateFilter {
                 branch_ids,
-                untracked: request.untracked,
                 ..Default::default()
             },
             ..Default::default()
         };
         // The hot current-state rows are authoritative for both retention modes.
-        // Even an untracked-only exact batch therefore needs the branch
+        // Even a current-only exact batch therefore needs the branch
         // controls that select the active generation; treating that request
         // as "not tracked" used to skip the controls entirely and made the
-        // workspace selector (an untracked row) invisible after hot-index init.
+        // workspace selector invisible after hot-index initialization.
         let scope = scan_scope(
             &self.store,
             &scope_request,
@@ -1000,26 +965,10 @@ where
                             file_id: identity.file_id,
                         })
                         .collect::<Vec<_>>();
-                    let domain =
-                        request
-                            .untracked
-                            .map_or(LiveStateReadDomain::Combined, |untracked| {
-                                if untracked {
-                                    LiveStateReadDomain::Untracked
-                                } else {
-                                    LiveStateReadDomain::Tracked
-                                }
-                            });
                     let rows = self
                         .tracked_head
                         .reader(&self.store)
-                        .load_projected_live_batch_refs_for_domain(
-                            branch_id,
-                            control,
-                            &keys,
-                            &projection,
-                            domain,
-                        )
+                        .load_projected_live_batch_refs(branch_id, control, &keys, &projection)
                         .await?;
                     Ok::<_, LixError>((range, rows))
                 }
@@ -1067,15 +1016,7 @@ where
                         current_batches[batch_index].1.row(slot)
                     })
             };
-            // Filter each source before branch/global precedence. A local
-            // row of the other retention must not mask a matching global
-            // row from an explicit retention-scoped internal read.
-            let row = lookup(branch_identity)
-                .filter(|row| current_row_matches_retention(*row, request.untracked))
-                .or_else(|| {
-                    lookup(global_identity)
-                        .filter(|row| current_row_matches_retention(*row, request.untracked))
-                });
+            let row = lookup(branch_identity).or_else(|| lookup(global_identity));
             let Some(row) = row else {
                 slots.push(None);
                 continue;
@@ -1131,7 +1072,6 @@ where
                 request,
                 &scope.projection_branch_ids,
                 &scope.storage_branch_ids,
-                Some(false),
             )
             .await?,
         );
@@ -1140,10 +1080,6 @@ where
         } else {
             Vec::new()
         };
-        for branch_rows in &mut hot_branch_rows {
-            branch_rows.rows =
-                filter_current_row_retention(std::mem::take(&mut branch_rows.rows), Some(false));
-        }
         if derived_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
@@ -1198,12 +1134,7 @@ where
                     let rows = self
                         .tracked_head
                         .reader(store)
-                        .scan_live_batch_for_retention(
-                            &branch_id,
-                            control,
-                            &tracked_request,
-                            request.filter.untracked,
-                        )
+                        .scan_live_batch_for_retention(&branch_id, control, &tracked_request)
                         .await?;
                     Ok::<_, LixError>(HotBranchRows {
                         branch_id: branch_id.clone(),
@@ -1227,18 +1158,9 @@ where
     async fn scan_constraint_batch(
         &self,
         request: &LiveStateScanRequest,
-        tracked_only: bool,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        if tracked_only {
-            self.scan_tracked_batch_with_schema_presence(request, true)
-                .await
-        } else {
-            // A combined constraint read is also the explicit cross-domain
-            // identity/collision probe. Its tracked bloom cannot prove that
-            // the current-only selector is empty, so never short-circuit it.
-            self.scan_batch_with_schema_presence(request, request.filter.untracked.is_some())
-                .await
-        }
+        self.scan_tracked_batch_with_schema_presence(request, true)
+            .await
     }
 
     async fn scan_batch(
@@ -1271,7 +1193,7 @@ where
         };
         self.tracked_head
             .reader(&self.store)
-            .collection_generation(branch_id, control.untracked_generation, scope)
+            .collection_generation(branch_id, control.tracked_generation, scope)
             .await
             .map(Some)
     }
@@ -1390,30 +1312,6 @@ fn finalize_ordered_unique_batch(
     rows.filter(|row| include_tombstones || !row.deleted(), limit)
 }
 
-fn current_row_matches_retention(
-    row: MaterializedLiveStateRowRef<'_>,
-    requested_untracked: Option<bool>,
-) -> bool {
-    requested_untracked.is_none_or(|untracked| row.untracked() == untracked)
-}
-
-fn filter_current_row_retention(
-    rows: MaterializedLiveStateBatch,
-    requested_untracked: Option<bool>,
-) -> MaterializedLiveStateBatch {
-    if requested_untracked.is_none()
-        || rows
-            .iter()
-            .all(|row| current_row_matches_retention(row, requested_untracked))
-    {
-        return rows;
-    }
-    rows.filter(
-        |row| current_row_matches_retention(row, requested_untracked),
-        None,
-    )
-}
-
 fn concat_live_state_batches(
     batches: impl IntoIterator<Item = MaterializedLiveStateBatch>,
 ) -> MaterializedLiveStateBatch {
@@ -1441,9 +1339,6 @@ fn concat_live_state_batches(
 /// to the storage scan; only a negative result from every selected generation
 /// can skip it.
 fn scope_may_have_schema_rows(request: &LiveStateScanRequest, scope: &LiveStateScanScope) -> bool {
-    if request.filter.untracked.is_some() {
-        return true;
-    }
     let [schema_key] = request.filter.schema_keys.as_slice() else {
         return true;
     };
@@ -1729,7 +1624,7 @@ mod tests {
     const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
     #[derive(Clone)]
-    struct MaterializedUntrackedStateRow {
+    struct MaterializedCurrentStateRow {
         entity_pk: EntityPk,
         schema_key: String,
         file_id: Option<String>,
@@ -2076,10 +1971,6 @@ mod tests {
             tracked_row_at_with_commit("branch", "second", None, "second"),
         ]);
         let entity_column = batch.entity_column_ptr();
-        let batch = filter_current_row_retention(batch, Some(false));
-        assert_eq!(batch.entity_column_ptr(), entity_column);
-
-        let entity_column = batch.entity_column_ptr();
         let batch = finalize_ordered_unique_batch(batch, false, None);
         assert_eq!(batch.entity_column_ptr(), entity_column);
 
@@ -2138,31 +2029,28 @@ mod tests {
     async fn direct_entity_snapshots_fall_back_for_retention_scoped_reads() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
-        for untracked in [false, true] {
-            let snapshots = live_state
-                .reader(
-                    storage
-                        .begin_read(StorageReadOptions::default())
-                        .await
-                        .expect("open retention-scoped entity read"),
-                )
-                .scan_direct_entity_snapshots(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec!["schema".to_string()],
-                        entity_pks: vec![EntityPk::single("row")],
-                        branch_ids: vec!["branch".to_string()],
-                        untracked: Some(untracked),
-                        ..LiveStateFilter::default()
-                    },
-                    ..LiveStateScanRequest::default()
-                })
-                .await
-                .expect("retention-scoped entity read should execute");
-            assert!(
-                snapshots.is_none(),
-                "raw snapshot serving must not bypass retention filtering"
-            );
-        }
+        let snapshots = live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("open entity read"),
+            )
+            .scan_direct_entity_snapshots(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["schema".to_string()],
+                    entity_pks: vec![EntityPk::single("row")],
+                    branch_ids: vec!["branch".to_string()],
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await
+            .expect("entity read should execute");
+        assert!(
+            snapshots.is_none(),
+            "raw snapshot serving must not bypass the canonical reader"
+        );
     }
 
     #[tokio::test]
@@ -2389,16 +2277,16 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let tracked_pk = EntityPk::single("tracked-entity");
-        let untracked_pk = EntityPk::single("untracked-entity");
+        let current_pk = EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_KEY);
         stage_direct_tracked_head_rows(
             &storage,
             GLOBAL_BRANCH_ID,
             CommitId::for_test_label("tracked-head"),
             &[DirectTrackedHeadRow {
-                schema_key: "schema",
+                schema_key: "lix_key_value",
                 entity_pk: &tracked_pk,
                 file_id: None,
-                snapshot: Some(r#"{"value":"tracked"}"#),
+                snapshot: Some(r#"{"key":"tracked-entity","value":"tracked"}"#),
                 deleted: false,
             }],
         )
@@ -2406,8 +2294,8 @@ mod tests {
 
         let request = finite_pk_scan_request(
             GLOBAL_BRANCH_ID,
-            "schema",
-            vec![tracked_pk.clone(), untracked_pk.clone()],
+            "lix_key_value",
+            vec![tracked_pk.clone(), current_pk.clone()],
         );
         assert!(
             scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
@@ -2420,23 +2308,9 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open untracked write read");
-        write_untracked_rows_to_store(
-            &storage,
-            &read,
-            &[MaterializedUntrackedStateRow {
-                entity_pk: untracked_pk.clone(),
-                schema_key: "schema".to_string(),
-                file_id: None,
-                snapshot_content: Some(r#"{"value":"untracked"}"#.to_string()),
-                metadata: None,
-                deleted: false,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: "2026-01-01T00:00:00Z".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-            }],
-        )
-        .await;
+            .expect("open current write read");
+        write_current_rows_to_store(&storage, &read, &[deterministic_sequence_current_row(7)])
+            .await;
 
         let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
             .await
@@ -2452,19 +2326,17 @@ mod tests {
             .iter()
             .find(|row| row.entity_pk == tracked_pk)
             .expect("tracked row should remain visible");
-        assert!(!tracked.untracked);
         assert_eq!(
             tracked.snapshot_content.as_deref(),
-            Some(r#"{"value":"tracked"}"#)
+            Some(r#"{"key":"tracked-entity","value":"tracked"}"#)
         );
-        let untracked = rows
+        let current = rows
             .iter()
-            .find(|row| row.entity_pk == untracked_pk)
-            .expect("untracked row should be merged into normal query results");
-        assert!(untracked.untracked);
+            .find(|row| row.entity_pk == current_pk)
+            .expect("current row should be merged into normal query results");
         assert_eq!(
-            untracked.snapshot_content.as_deref(),
-            Some(r#"{"value":"untracked"}"#)
+            current.snapshot_content.as_deref(),
+            Some(r#"{"key":"lix_deterministic_sequence_number","value":7}"#)
         );
     }
 
@@ -2521,10 +2393,10 @@ mod tests {
         );
     }
 
-    async fn write_untracked_rows_to_store(
+    async fn write_current_rows_to_store(
         storage: &StorageAdapter,
         _read: &(impl StorageAdapterRead + ?Sized),
-        rows: &[MaterializedUntrackedStateRow],
+        rows: &[MaterializedCurrentStateRow],
     ) {
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -2534,7 +2406,7 @@ mod tests {
         let mut json_writer = JsonStoreContext::new().writer();
         let mut branch_refs = std::collections::BTreeMap::new();
         let mut rows_by_branch =
-            std::collections::BTreeMap::<String, Vec<&MaterializedUntrackedStateRow>>::new();
+            std::collections::BTreeMap::<String, Vec<&MaterializedCurrentStateRow>>::new();
         for row in rows {
             if row.schema_key == BRANCH_REF_SCHEMA_KEY {
                 if row.deleted {
@@ -2577,7 +2449,7 @@ mod tests {
                             JsonRef::for_content(snapshot.as_bytes()),
                         )],
                     )
-                    .expect("untracked snapshot should stage");
+                    .expect("current snapshot should stage");
             }
             if let Some(metadata) = row.metadata.as_deref() {
                 json_writer
@@ -2589,7 +2461,7 @@ mod tests {
                             JsonRef::for_content(metadata.as_bytes()),
                         )],
                     )
-                    .expect("untracked metadata should stage");
+                    .expect("current metadata should stage");
             }
             rows_by_branch
                 .entry(row.branch_id.clone())
@@ -2598,8 +2470,8 @@ mod tests {
         }
 
         // A branch ref selects a fresh hot-state generation. Its tracked
-        // portion is reconstructed from the immutable root and its untracked
-        // portion is materialized into the same snapshot; untracked rows have
+        // portion is reconstructed from the immutable root and its current
+        // portion is materialized into the same snapshot; current rows have
         // no changelog record.
         for (branch_id, (head_commit_id, created_at, updated_at)) in branch_refs {
             let branch_rows = rows_by_branch.remove(&branch_id).unwrap_or_default();
@@ -2656,7 +2528,6 @@ mod tests {
                     entity_pk: &row.entity_pk,
                     change_id: None,
                     commit_id: None,
-                    untracked: true,
                     deleted: row.deleted,
                     created_at: ts(&row.created_at),
                     updated_at: ts(&row.updated_at),
@@ -2689,7 +2560,6 @@ mod tests {
             let mut control = BranchHeadControl {
                 head_commit_id,
                 tracked_generation: generation,
-                untracked_generation: generation,
                 current_state_revision: 0,
                 schema_presence_bloom: [0; 4],
                 working_diff_checkpoint_commit_id: None,
@@ -2702,7 +2572,7 @@ mod tests {
                 .expect("test branch-head control should stage");
         }
 
-        // A pure untracked write mutates the active generation in place and
+        // A pure current write mutates the active generation in place and
         // publishes a distinct control revision so concurrent writers cannot
         // satisfy the same stale control precondition.
         for (branch_id, branch_rows) in rows_by_branch {
@@ -2711,7 +2581,7 @@ mod tests {
                 .load(&branch_id)
                 .await
                 .expect("test branch control should load")
-                .expect("untracked fixture needs an existing branch control");
+                .expect("current fixture needs an existing branch control");
             let snapshots = branch_rows
                 .iter()
                 .map(|row| {
@@ -2740,7 +2610,6 @@ mod tests {
                     entity_pk: &row.entity_pk,
                     change_id: None,
                     commit_id: None,
-                    untracked: true,
                     deleted: row.deleted,
                     created_at: ts(&row.created_at),
                     updated_at: ts(&row.updated_at),
@@ -2764,7 +2633,7 @@ mod tests {
                     &mut working_diff_coverage,
                 )
                 .await
-                .expect("test untracked current state should stage");
+                .expect("test current current state should stage");
             crate::branch::stage_branch_head_control(
                 &mut writes,
                 &branch_id,
@@ -2772,7 +2641,7 @@ mod tests {
                     .next_current_state_revision()
                     .expect("test branch control revision should advance"),
             )
-            .expect("test untracked control should stage");
+            .expect("test current control should stage");
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2883,7 +2752,6 @@ mod tests {
             &typed_request,
             &scope.projection_branch_ids,
             &scope.storage_branch_ids,
-            Some(false),
         )
         .await
         .expect("typed point scan should succeed");
@@ -2902,7 +2770,6 @@ mod tests {
             &string_request,
             &scope.projection_branch_ids,
             &scope.storage_branch_ids,
-            Some(false),
         )
         .await
         .expect("string-typed point scan should succeed");
@@ -2947,7 +2814,6 @@ mod tests {
             &request,
             &scope.projection_branch_ids,
             &scope.storage_branch_ids,
-            Some(false),
         )
         .await
         .expect("proven-empty derived scan should succeed");
@@ -2985,7 +2851,6 @@ mod tests {
             &typed_request,
             &scope.projection_branch_ids,
             &scope.storage_branch_ids,
-            Some(true),
         )
         .await
         .expect("typed branch-ref point scan should succeed");
@@ -3003,7 +2868,6 @@ mod tests {
             &string_request,
             &scope.projection_branch_ids,
             &scope.storage_branch_ids,
-            Some(true),
         )
         .await
         .expect("string branch-ref point scan should succeed");
@@ -3100,7 +2964,6 @@ mod tests {
             &request,
             &scope.projection_branch_ids,
             &scope.storage_branch_ids,
-            Some(false),
         )
         .await
         .expect("mixed derived scan should succeed");
@@ -3129,12 +2992,6 @@ mod tests {
         let mut parent_by_commit = std::collections::BTreeMap::<String, Option<String>>::new();
 
         for row in rows {
-            if row.untracked {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "test tracked-row helper does not accept untracked rows",
-                ));
-            }
             let materialized = MaterializedTrackedStateRow::try_from(row)?;
             let commit_id = row.commit_id.clone().ok_or_else(|| {
                 LixError::new("LIX_ERROR_UNKNOWN", "test tracked row missing commit_id")
@@ -3324,53 +3181,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_state_serves_untracked_member_from_current_state() {
+    async fn live_state_serves_current_member_from_current_state() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
-
+        let tracked_pk = identity("tracked-tab");
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("tracked-head"),
+            &[DirectTrackedHeadRow {
+                schema_key: "lix_key_value",
+                entity_pk: &tracked_pk,
+                file_id: None,
+                snapshot: Some(r#"{"key":"tracked-tab","value":"tracked"}"#),
+                deleted: false,
+            }],
+        )
+        .await;
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
-        // Keep the tracked commit fixture separate from the untracked member
-        // under test: a single identity cannot change retention class.
-        let mut tracked_row =
-            tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
-        tracked_row.entity_pk = identity("tracked-tab");
-        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
-            .await
-            .expect("tracked row should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("tracked row should commit");
-        write_untracked_rows_to_store(
-            &storage,
-            &read,
-            &[
-                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-tracked"),
-                untracked_row("untracked-value"),
-            ],
-        )
-        .await;
+        write_current_rows_to_store(&storage, &read, &[deterministic_sequence_current_row(7)])
+            .await;
 
-        let rows = scan_selected_tab_at(
-            &live_state,
-            &storage,
-            "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            false,
-        )
-        .await
-        .expect("scan should succeed");
+        let current_pk = identity(crate::functions::DETERMINISTIC_SEQUENCE_KEY);
+        let rows = live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("read should reopen"),
+            )
+            .scan_batch(&finite_pk_scan_request(
+                GLOBAL_BRANCH_ID,
+                "lix_key_value",
+                vec![current_pk.clone()],
+            ))
+            .await
+            .expect("scan should succeed")
+            .into_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"untracked-value\"}")
+            Some("{\"key\":\"lix_deterministic_sequence_number\",\"value\":7}")
         );
-        assert!(rows[0].untracked);
         assert_eq!(rows[0].change_id, None);
+        assert_eq!(rows[0].commit_id, None);
 
         let loaded = live_state
             .reader(
@@ -3381,18 +3238,18 @@ mod tests {
             )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                entity_pk: current_pk,
                 file_id: NullableKeyFilter::Null,
             })
             .await
             .expect("load should succeed")
             .expect("current row should be visible");
-        assert!(loaded.untracked);
         assert_eq!(loaded.change_id, None);
+        assert_eq!(loaded.commit_id, None);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
-            Some("{\"value\":\"untracked-value\"}")
+            Some("{\"key\":\"lix_deterministic_sequence_number\",\"value\":7}")
         );
     }
 
@@ -3400,38 +3257,31 @@ mod tests {
     async fn exact_batch_preserves_duplicate_and_missing_slots_for_current_rows() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
+        let tracked_pk = identity("tracked-tab");
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("tracked-head"),
+            &[DirectTrackedHeadRow {
+                schema_key: "lix_key_value",
+                entity_pk: &tracked_pk,
+                file_id: None,
+                snapshot: Some(r#"{"key":"tracked-tab","value":"tracked"}"#),
+                deleted: false,
+            }],
+        )
+        .await;
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
-        // The tracked fixture establishes the branch head; use a distinct
-        // identity so the selected untracked row is not a retention conflict.
-        let mut tracked_row =
-            tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
-        tracked_row.entity_pk = identity("tracked-tab");
-        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
-            .await
-            .expect("tracked row should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("tracked row should commit");
-        write_untracked_rows_to_store(
-            &storage,
-            &read,
-            &[
-                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-tracked"),
-                untracked_row("untracked-value"),
-            ],
-        )
-        .await;
+        write_current_rows_to_store(&storage, &read, &[deterministic_sequence_current_row(7)])
+            .await;
 
         let selected = LiveStateExactRowRequest {
             schema_key: "lix_key_value".to_string(),
-            branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-            entity_pk: identity("selected-tab"),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            entity_pk: identity(crate::functions::DETERMINISTIC_SEQUENCE_KEY),
             file_id: None,
         };
         let rows = live_state
@@ -3447,7 +3297,7 @@ mod tests {
                     selected,
                     LiveStateExactRowRequest {
                         schema_key: "lix_key_value".to_string(),
-                        branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
+                        branch_id: GLOBAL_BRANCH_ID.to_string(),
                         entity_pk: identity("missing"),
                         file_id: None,
                     },
@@ -3467,9 +3317,8 @@ mod tests {
             rows[0]
                 .as_ref()
                 .and_then(|row| row.snapshot_content.as_deref()),
-            Some("{\"value\":\"untracked-value\"}")
+            Some("{\"key\":\"lix_deterministic_sequence_number\",\"value\":7}")
         );
-        assert!(rows[0].as_ref().is_some_and(|row| row.untracked));
         assert_eq!(rows[2], None);
     }
 
@@ -3504,7 +3353,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[branch_ref_row(
@@ -3518,7 +3367,6 @@ mod tests {
             .await
             .expect("load should succeed")
             .expect("tracked row should be visible");
-        assert!(!loaded.untracked);
         assert_eq!(loaded.change_id, Some(change_id("change-tracked")));
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -3553,7 +3401,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -3586,7 +3434,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1"
         );
         assert!(loaded.global);
-        assert!(!loaded.untracked);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"global-tracked\"}")
@@ -3621,7 +3468,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -3681,7 +3528,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -3704,7 +3551,6 @@ mod tests {
             loaded.branch_id.as_ref(),
             "01920000-0000-7000-8000-0000000000a1"
         );
-        assert!(!loaded.untracked);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"branch-tracked\"}")
@@ -3742,7 +3588,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -3796,7 +3642,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -3853,7 +3699,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -3920,7 +3766,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[branch_ref_row(
@@ -3971,7 +3817,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -4037,7 +3883,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -4120,7 +3966,7 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("tracked rows should commit");
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[
@@ -4237,7 +4083,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
-        write_untracked_rows_to_store(
+        write_current_rows_to_store(
             &storage,
             &read,
             &[branch_ref_row(
@@ -4499,7 +4345,6 @@ mod tests {
             global: branch_id == "ffffffff-ffff-7fff-bfff-ffffffffffff",
             change_id: change_id.map(ChangeId::for_test_label),
             commit_id: Some(commit_id),
-            untracked: false,
             branch_id: branch_id.into(),
         }
     }
@@ -4516,27 +4361,30 @@ mod tests {
         }
     }
 
-    fn untracked_row(value: &str) -> MaterializedUntrackedStateRow {
-        untracked_row_at("ffffffff-ffff-7fff-bfff-ffffffffffff", value)
-    }
-
-    fn untracked_row_at(branch_id: &str, value: &str) -> MaterializedUntrackedStateRow {
-        MaterializedUntrackedStateRow {
-            entity_pk: identity("selected-tab"),
+    fn deterministic_sequence_current_row(value: u64) -> MaterializedCurrentStateRow {
+        let key = crate::functions::DETERMINISTIC_SEQUENCE_KEY;
+        MaterializedCurrentStateRow {
+            entity_pk: identity(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
+            snapshot_content: Some(
+                serde_json::to_string(&json!({
+                    "key": key,
+                    "value": value,
+                }))
+                .expect("deterministic sequence row should serialize"),
+            ),
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            branch_id: branch_id.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
         }
     }
 
-    fn branch_ref_row(branch_id: &str, commit_id: &str) -> MaterializedUntrackedStateRow {
+    fn branch_ref_row(branch_id: &str, commit_id: &str) -> MaterializedCurrentStateRow {
         let commit_id = CommitId::for_test_label(commit_id).to_string();
-        MaterializedUntrackedStateRow {
+        MaterializedCurrentStateRow {
             entity_pk: identity(branch_id),
             schema_key: "lix_branch_ref".to_string(),
             file_id: None,
@@ -4604,7 +4452,6 @@ mod tests {
             global: true,
             change_id: Some(ChangeId::for_test_label(&format!("change-{commit_id}"))),
             commit_id: Some(commit_id),
-            untracked: false,
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".into(),
         }
     }

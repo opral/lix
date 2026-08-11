@@ -465,8 +465,8 @@ pub(crate) struct CommitStateManifest {
 /// Materialized tracked-state commit-root row.
 ///
 /// Tracked rows are the serving state that can be rebuilt from changelog facts.
-/// They intentionally do not carry an `untracked` flag: commit roots contain
-/// tracked history only. Mutable untracked rows share the current-state
+/// They intentionally carry no retention-lane flag: commit roots contain
+/// historical rows only. Engine-owned rows share the current-state
 /// projection with tracked rows, but never enter a commit root or changelog.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedTrackedStateRow {

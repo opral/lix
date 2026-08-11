@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
-    BranchHeadControlContext, branch_head_control_precondition, stage_branch_head_control,
-    untracked_lifecycle_generation,
+    BranchHeadControlContext, branch_head_control_precondition, current_lifecycle_generation,
+    stage_branch_head_control,
 };
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::common::LixTimestamp;
@@ -14,9 +14,7 @@ use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
 };
-use crate::live_state::{
-    CurrentStateDeltaRef, LiveStateReadDomain, MaterializedLiveStateRow, TrackedHeadContext,
-};
+use crate::live_state::{CurrentStateDeltaRef, MaterializedLiveStateRow, TrackedHeadContext};
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
 
@@ -25,7 +23,7 @@ pub(crate) const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
-/// Loads deterministic-mode settings from the canonical untracked current
+/// Loads deterministic-mode settings from the canonical engine current
 /// state member.
 ///
 /// Missing mode means deterministic execution is disabled. Malformed mode rows
@@ -57,7 +55,7 @@ pub(crate) async fn load_sequence(
 
 /// Persists the highest deterministic sequence value used by an execution.
 ///
-/// The row is untracked global `lix_key_value` current state. It never enters
+/// The row is engine-owned global `lix_key_value` current state. It never enters
 /// the changelog or commit graph.
 pub(crate) async fn stage_sequence(
     read: &(impl StorageAdapterRead + ?Sized),
@@ -98,16 +96,13 @@ pub(crate) async fn stage_sequence(
     let next_revision = control
         .next_current_state_revision()?
         .current_state_revision;
-    let next_generation = untracked_lifecycle_generation(
-        GLOBAL_BRANCH_ID,
-        control.untracked_generation,
-        next_revision,
-    );
+    let next_generation =
+        current_lifecycle_generation(GLOBAL_BRANCH_ID, control.tracked_generation, next_revision);
     TrackedHeadContext::new()
         .writer(read, writes)
-        .stage_untracked_generation(
+        .stage_current_generation(
             GLOBAL_BRANCH_ID,
-            control.untracked_generation,
+            control.tracked_generation,
             next_generation,
             &[CurrentStateDeltaRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
@@ -115,7 +110,6 @@ pub(crate) async fn stage_sequence(
                 entity_pk: &entity_pk,
                 change_id: None,
                 commit_id: None,
-                untracked: true,
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -130,7 +124,7 @@ pub(crate) async fn stage_sequence(
     // change. Merely restaging the old control would let two writers both
     // satisfy the same CAS after the first write, losing one group update.
     let mut next_control = control;
-    next_control.untracked_generation = next_generation;
+    next_control.tracked_generation = next_generation;
     next_control.current_state_revision = next_revision;
     next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
     stage_branch_head_control(writes, GLOBAL_BRANCH_ID, next_control)?;
@@ -167,34 +161,19 @@ async fn load_key_value_row(
         })
         .collect::<Vec<_>>();
     let rows = reader
-        .load_projected_live_batch_refs_for_domain(
-            GLOBAL_BRANCH_ID,
-            control,
-            &key_refs,
-            &projection,
-            LiveStateReadDomain::Untracked,
-        )
+        .load_projected_live_batch_refs(GLOBAL_BRANCH_ID, control, &key_refs, &projection)
         .await?;
     let Some(row) = rows.row(0) else {
-        reader
-            .validate_exact_collection_closure(
-                GLOBAL_BRANCH_ID,
-                control.untracked_generation,
-                crate::collection_generation::CollectionScopeRef {
-                    schema_key: KEY_VALUE_SCHEMA_KEY,
-                    file_id: None,
-                },
-                key_refs[0],
-                LiveStateReadDomain::Untracked,
-                control.current_state_revision == 0,
-            )
-            .await?;
+        // The selected generation's authenticated collection control proves
+        // absence. Mode and sequence are independent exact engine members, so
+        // enabling deterministic mode before the first generated value must
+        // still observe an uninitialized sequence.
         return Ok(None);
     };
-    if !row.untracked() || row.deleted() {
+    if row.deleted() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!("deterministic key-value row '{key}' is not a live untracked authority member"),
+            format!("deterministic key-value row '{key}' is deleted"),
         ));
     }
     Ok(Some(row.to_owned()))
@@ -341,7 +320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_count_sequence_substitution_fails_identity_closure() {
+    async fn same_count_sequence_substitution_fails_next_generation_validation() {
         let memory = Memory::new();
         let storage = StorageAdapter::new(memory.clone());
         crate::test_support::seed_global_branch_head(storage.clone()).await;
@@ -439,14 +418,22 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("corrupt sequence storage should read");
-        let error = load_sequence(&read)
-            .await
-            .expect_err("missing selected sequence member must fail closed");
+        let mut writes = storage.new_write_set();
+        let error = stage_sequence(
+            &read,
+            &mut writes,
+            DeterministicSequence { highest_seen: 8 },
+            test_timestamp(),
+            ChangeId::for_test_label("sequence-after-corruption-change"),
+        )
+        .await
+        .expect_err("the next complete current generation must reject the substitute");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
         assert!(
-            error
-                .message
-                .contains("identity digest does not match its canonical members"),
-            "unexpected closure error: {error:?}"
+            error.message.contains(
+                "preserved history-free row is not an authenticated deterministic engine identity"
+            ),
+            "unexpected current-generation validation error: {error:?}"
         );
     }
 
@@ -474,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_sequence_persists_untracked_global_key_value() {
+    async fn write_sequence_persists_history_free_global_key_value() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
@@ -514,7 +501,6 @@ mod tests {
             .await
             .expect("sequence row should load")
             .expect("sequence row should exist");
-        assert!(row.untracked);
         assert!(row.global);
         assert_eq!(row.change_id, None);
         assert_eq!(row.commit_id, None);
@@ -546,16 +532,16 @@ mod tests {
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
-        let next_generation = untracked_lifecycle_generation(
+        let next_generation = current_lifecycle_generation(
             GLOBAL_BRANCH_ID,
-            control.untracked_generation,
+            control.tracked_generation,
             next_control.current_state_revision,
         );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_untracked_generation(
+            .stage_current_generation(
                 GLOBAL_BRANCH_ID,
-                control.untracked_generation,
+                control.tracked_generation,
                 next_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
@@ -563,7 +549,6 @@ mod tests {
                     entity_pk: &entity_pk,
                     change_id: None,
                     commit_id: None,
-                    untracked: true,
                     deleted: false,
                     created_at: test_timestamp(),
                     updated_at: test_timestamp(),
@@ -575,7 +560,7 @@ mod tests {
             )
             .await
             .expect("test key-value current row should stage");
-        next_control.untracked_generation = next_generation;
+        next_control.tracked_generation = next_generation;
         next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
         stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
             .expect("global control should publish current state");

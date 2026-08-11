@@ -42,7 +42,7 @@ use crate::transaction::CommitCoordinator;
 
 pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 
-/// Loads the workspace selector from its canonical untracked current-state
+/// Loads the workspace selector from its canonical current-state
 /// member when opening a workspace session.
 pub(crate) async fn load_workspace_branch_id_from_index(
     live_state: &LiveStateContext,
@@ -61,7 +61,6 @@ pub(crate) async fn load_workspace_branch_id_from_index(
             projection: LiveStateProjection {
                 columns: vec!["snapshot_content".to_string()],
             },
-            untracked: Some(true),
             include_tombstones: false,
         })
         .await?;
@@ -447,7 +446,7 @@ where
     /// same storage transaction as the writes it influences.
     ///
     /// Pinned sessions are pure in-memory views over one branch. Workspace
-    /// sessions read the shared workspace selector from untracked global
+    /// sessions read the shared workspace selector from global current
     /// `lix_key_value` state so multiple open app sessions can observe the same
     /// active workspace branch.
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
@@ -660,7 +659,7 @@ where
         self.catalog_context
             .compiled_catalog_for_transaction_open(
                 live_state.as_ref(),
-                &Domain::schema_catalog(self.active_branch_id.to_string(), true),
+                &Domain::schema_catalog(self.active_branch_id.to_string()),
                 revision.as_ref(),
             )
             .await

@@ -1,76 +1,50 @@
 use crate::entity_pk::EntityPk;
-#[cfg(test)]
-use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::MaterializedLiveStateRowRef;
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 /// Validation/storage coordinate for repository facts.
 ///
 /// A domain is the complete scope in which a row identity is meaningful:
-/// branch, durability, and file scope. Projection methods on this type are
+/// branch and file scope. Projection methods on this type are
 /// deliberately named so callers cannot silently erase part of the coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Domain {
     branch_id: String,
-    untracked: bool,
     file_scope: DomainFileScope,
 }
 
 impl Domain {
-    pub(crate) fn exact_file(
-        branch_id: impl Into<String>,
-        untracked: bool,
-        file_id: Option<String>,
-    ) -> Self {
+    pub(crate) fn exact_file(branch_id: impl Into<String>, file_id: Option<String>) -> Self {
         Self {
             branch_id: branch_id.into(),
-            untracked,
             file_scope: DomainFileScope::Exact(file_id),
         }
     }
 
-    pub(crate) fn any_file(branch_id: impl Into<String>, untracked: bool) -> Self {
+    pub(crate) fn any_file(branch_id: impl Into<String>) -> Self {
         Self {
             branch_id: branch_id.into(),
-            untracked,
             file_scope: DomainFileScope::Any,
         }
     }
 
-    pub(crate) fn schema_catalog(branch_id: impl Into<String>, untracked: bool) -> Self {
-        Self::any_file(branch_id, untracked)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_live_row(row: &MaterializedLiveStateRow) -> Self {
-        Self::exact_file(
-            row.branch_id.to_string(),
-            row.untracked,
-            row.file_id.clone(),
-        )
+    pub(crate) fn schema_catalog(branch_id: impl Into<String>) -> Self {
+        Self::any_file(branch_id)
     }
 
     pub(crate) fn for_live_row_ref(row: MaterializedLiveStateRowRef<'_>) -> Self {
-        Self::exact_file(
-            row.branch_id(),
-            row.untracked(),
-            row.file_id().map(str::to_owned),
-        )
+        Self::exact_file(row.branch_id(), row.file_id().map(str::to_owned))
     }
 
     pub(crate) fn schema_catalog_domain(&self) -> Self {
-        // Schema definitions are branch + durability scoped. They are not
+        // Schema definitions are branch scoped. They are not
         // owned by a data file, so schema catalog lookup deliberately erases
         // row file scope into `Any`.
-        Self::schema_catalog(self.branch_id.clone(), self.untracked)
+        Self::schema_catalog(self.branch_id.clone())
     }
 
     pub(crate) fn branch_id(&self) -> &str {
         &self.branch_id
-    }
-
-    pub(crate) fn untracked(&self) -> bool {
-        self.untracked
     }
 
     pub(crate) fn fingerprint_component(&self) -> String {
@@ -79,7 +53,7 @@ impl Domain {
             DomainFileScope::Exact(Some(file_id)) => format!("={file_id}"),
             DomainFileScope::Exact(None) => "=".to_string(),
         };
-        format!("{}|{}|{}", self.branch_id, self.untracked, file_scope)
+        format!("{}|{}", self.branch_id, file_scope)
     }
 
     #[cfg(test)]
@@ -87,18 +61,9 @@ impl Domain {
         &self.file_scope
     }
 
-    pub(crate) fn with_untracked(&self, untracked: bool) -> Self {
-        Self {
-            branch_id: self.branch_id.clone(),
-            untracked,
-            file_scope: self.file_scope.clone(),
-        }
-    }
-
     pub(crate) fn with_file_scope(&self, file_scope: DomainFileScope) -> Self {
         Self {
             branch_id: self.branch_id.clone(),
-            untracked: self.untracked,
             file_scope,
         }
     }
@@ -115,13 +80,10 @@ impl Domain {
     }
 
     pub(crate) fn contains_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
-        row.branch_id() == self.branch_id
-            && row.untracked() == self.untracked
-            && self.contains_canonical_ref(row)
+        row.branch_id() == self.branch_id && self.contains_canonical_ref(row)
     }
 
-    /// Matches branch and file scope while accepting whichever durability
-    /// member won canonical tracked/untracked overlay.
+    /// Matches branch and file scope for the canonical row.
     pub(crate) fn contains_canonical_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
         row.branch_id() == self.branch_id
             && committed_row_ref_is_exact_branch_scoped(row, &self.branch_id)
@@ -132,25 +94,15 @@ impl Domain {
     }
 
     fn reachable_target_domains(&self) -> Vec<Self> {
-        if self.untracked {
-            vec![self.with_untracked(false), self.clone()]
-        } else {
-            vec![self.clone()]
-        }
+        vec![self.clone()]
     }
 
     fn source_domains_that_can_reach(&self) -> Vec<Self> {
-        if self.untracked {
-            vec![self.clone()]
-        } else {
-            vec![self.clone(), self.with_untracked(true)]
-        }
+        vec![self.clone()]
     }
 
     fn can_reach(&self, target: &Self) -> bool {
-        self.branch_id == target.branch_id
-            && self.file_scope == target.file_scope
-            && (self.untracked || !target.untracked)
+        self.branch_id == target.branch_id && self.file_scope == target.file_scope
     }
 
     pub(crate) fn schema_catalog_domains(&self) -> Vec<Self> {
@@ -211,15 +163,6 @@ impl DomainRowIdentity {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_live_row(row: &MaterializedLiveStateRow) -> Self {
-        Self::new(
-            Domain::for_live_row(row),
-            row.schema_key.clone(),
-            row.entity_pk.clone(),
-        )
-    }
-
     pub(crate) fn in_domain(
         domain: Domain,
         schema_key: impl Into<String>,
@@ -231,13 +174,12 @@ impl DomainRowIdentity {
     #[cfg(test)]
     pub(crate) fn exact(
         branch_id: impl Into<String>,
-        untracked: bool,
         file_id: Option<String>,
         schema_key: impl Into<String>,
         entity_pk: EntityPk,
     ) -> Self {
         Self::new(
-            Domain::exact_file(branch_id, untracked, file_id),
+            Domain::exact_file(branch_id, file_id),
             schema_key,
             entity_pk,
         )

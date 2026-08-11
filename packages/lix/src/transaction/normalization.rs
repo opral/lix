@@ -204,8 +204,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
             )
             .with_hint("Schema definitions are scoped by branch and durability only; write them with null file_id."));
         }
-        let schema_domain =
-            Domain::schema_catalog(row.schema_scope_branch_id().to_string(), row.untracked);
+        let schema_domain = Domain::schema_catalog(row.schema_scope_branch_id().to_string());
         remember_pending_registered_schema(
             normalized_snapshot.as_ref().map(TransactionJson::value),
             schema_domain,
@@ -313,7 +312,7 @@ fn ensure_internal_control_schema(
         .clone();
     let key = crate::schema::schema_key_from_definition(&schema)?;
     schema_catalog.insert_schema_for_domain(
-        Domain::schema_catalog(row.schema_scope_branch_id().to_string(), row.untracked),
+        Domain::schema_catalog(row.schema_scope_branch_id().to_string()),
         key,
         schema,
     )?;
@@ -1065,7 +1064,6 @@ mod tests {
                 "commit_id": commit_id,
             }))),
             global: true,
-            untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.into(),
             ..base_stage_row()
         };
@@ -1146,7 +1144,6 @@ mod tests {
             global: true,
             change_id: None,
             commit_id: None,
-            untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.into(),
         }
     }

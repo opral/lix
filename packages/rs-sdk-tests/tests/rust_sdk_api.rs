@@ -1446,35 +1446,35 @@ async fn on_demand_filesystem_lix_rename_replaces_tracked_path() {
 }
 
 #[tokio::test]
-async fn filesystem_materializes_untracked_sdk_sql_writes() {
+async fn filesystem_materializes_sdk_sql_writes() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_filesystem_lix(tempdir.path()).await;
 
     lix.execute(
-        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
         &[
             Value::Text("01920000-0000-7000-8000-000000000503".to_string()),
-            Value::Text("/untracked.txt".to_string()),
-            Value::Blob(b"untracked".to_vec().into()),
+            Value::Text("/materialized.txt".to_string()),
+            Value::Blob(b"materialized".to_vec().into()),
         ],
     )
     .await
     .unwrap();
     assert_eq!(
-        std::fs::read(tempdir.path().join("untracked.txt")).unwrap(),
-        b"untracked"
+        std::fs::read(tempdir.path().join("materialized.txt")).unwrap(),
+        b"materialized"
     );
 
     lix.execute(
-        "INSERT INTO lix_directory (id, path, lixcol_untracked) VALUES ($1, $2, true)",
+        "INSERT INTO lix_directory (id, path) VALUES ($1, $2)",
         &[
             Value::Text("01920000-0000-7000-8000-000000000512".to_string()),
-            Value::Text("/untracked-dir".to_string()),
+            Value::Text("/materialized-dir".to_string()),
         ],
     )
     .await
     .unwrap();
-    assert!(tempdir.path().join("untracked-dir").is_dir());
+    assert!(tempdir.path().join("materialized-dir").is_dir());
 
     lix.close().await.unwrap();
 }

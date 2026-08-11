@@ -1187,9 +1187,9 @@ simulation_test!(
         let (raw_session, session) = open_workspace_session(&sim, &engine).await;
         session
             .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 lix_json('{\"enabled\":true}'), true)",
                 &[],
             )
             .await

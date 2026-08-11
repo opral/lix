@@ -1319,12 +1319,6 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
-    pub(crate) fn untracked(&self) -> bool {
-        match self {
-            Self::State(row) => row.untracked,
-        }
-    }
-
     pub(crate) fn branch_id(&self) -> &str {
         match self {
             Self::State(row) => &row.branch_id,
@@ -1334,7 +1328,6 @@ impl<'a> PreparedValidationRow<'a> {
     pub(crate) fn domain(&self) -> Domain {
         Domain::exact_file(
             self.branch_id().to_string(),
-            self.untracked(),
             self.file_id().map(str::to_owned),
         )
     }
@@ -1565,7 +1558,7 @@ impl PreparedWriteSet {
             change_refs.tracked_change_count = self
                 .state_rows
                 .iter()
-                .filter(|row| !row.untracked && row.branch_id.as_str() != GLOBAL_BRANCH_ID)
+                .filter(|row| row.branch_id.as_str() != GLOBAL_BRANCH_ID)
                 .count();
         }
     }
@@ -1590,7 +1583,6 @@ impl PreparedWriteSet {
                 .entry(
                     Domain::exact_file(
                         insert.row.branch_id.to_string(),
-                        insert.row.untracked,
                         insert.row.file_id.map(ToString::to_string),
                     )
                     .schema_catalog_domain(),
@@ -1989,7 +1981,7 @@ impl TransactionWriteBuffer {
         let has_file = rows.iter().any(|row| row.file_id.is_some());
         let invalid_row = rows
             .iter()
-            .any(|row| row.untracked || row.global || row.branch_id.as_str() != branch_id);
+            .any(|row| row.global || row.branch_id.as_str() != branch_id);
         if !has_file || invalid_row {
             return false;
         }
@@ -2209,7 +2201,6 @@ impl TransactionWriteBuffer {
         let matches_domain = |row: PreparedStateRowRef<'_>| {
             row.schema_key.as_str() == registered_schema_key
                 && row.branch_id.as_str() == domain.branch_id()
-                && (row.untracked == domain.untracked() || (domain.untracked() && !row.untracked))
         };
         Ok(match candidate_slots {
             Some(slots) => slots.iter().any(|slot| match slot {
@@ -2284,7 +2275,7 @@ impl TransactionWriteBuffer {
         let StagedPreparedRows::AppendOnly { rows, last_key, .. } = &*guard else {
             return Ok(false);
         };
-        if rows.is_empty() || request.untracked == Some(true) {
+        if rows.is_empty() {
             return Ok(true);
         }
         let Some(last_key) = last_key else {
@@ -2314,7 +2305,7 @@ impl TransactionWriteBuffer {
         let StagedPreparedRows::AppendOnly { rows, last_key, .. } = &*guard else {
             return Ok(false);
         };
-        if rows.is_empty() || request.filter.untracked == Some(true) {
+        if rows.is_empty() {
             return Ok(true);
         }
         let Some(last_key) = last_key else {
@@ -2351,7 +2342,7 @@ impl TransactionWriteBuffer {
     }
 
     /// Takes the normal tracked write lane directly into the transaction
-    /// journal. Any duplicate, cross-scope, untracked, global, or otherwise
+    /// journal. Any duplicate, cross-scope, global, or otherwise
     /// irregular batch falls back to the indexed overlay.
     fn stage_append_only_if_possible(
         &self,
@@ -3102,21 +3093,12 @@ impl TransactionWriteBuffer {
                     "failed to acquire transaction staged commit change refs lock",
                 )
             })?;
-        for (row, identity) in rows.iter().zip(&identities) {
+        for row in rows.iter() {
             if row.global && row.branch_id != GLOBAL_BRANCH_ID {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     "global staged rows must use the global branch id",
                 ));
-            }
-            let Some(RowSlot::State(index)) = by_identity.get(identity).copied() else {
-                continue;
-            };
-            let Some(previous) = staged_rows.get(index) else {
-                continue;
-            };
-            if previous.untracked != row.untracked {
-                return Err(mixed_durability_error(row));
             }
         }
         // Reject the entire batch before mutating any journal index or commit
@@ -3331,7 +3313,7 @@ fn rows_are_append_only_tracked(
 }
 
 fn is_normal_tracked_append_row(row: PreparedStateRowRef<'_>) -> bool {
-    !row.untracked && !row.global && row.change_id.is_some()
+    !row.global && row.change_id.is_some()
 }
 
 fn compare_rows_by_tracked_key(
@@ -3632,12 +3614,6 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
             let Some(row) = staged_rows.get(index) else {
                 continue;
             };
-            if request
-                .untracked
-                .is_some_and(|untracked| row.untracked != untracked)
-            {
-                continue;
-            }
             if row.snapshot.is_none() && !request.include_tombstones {
                 continue;
             } else {
@@ -3770,7 +3746,6 @@ fn push_ordered_mutation_materialized(
         false,
         None,
         Some(journal.commit_id()),
-        false,
         chunk.branch_id(),
     );
     if let Some(predecessor) = chunk
@@ -3797,13 +3772,12 @@ fn append_matching_ordered_mutations(
     let Some(journal) = ordered.as_ref() else {
         return Ok(());
     };
-    if request.filter.untracked == Some(true)
-        || (!request.filter.schema_keys.is_empty()
-            && !request
-                .filter
-                .schema_keys
-                .iter()
-                .any(|schema_key| schema_key == journal.schema_key()))
+    if (!request.filter.schema_keys.is_empty()
+        && !request
+            .filter
+            .schema_keys
+            .iter()
+            .any(|schema_key| schema_key == journal.schema_key()))
         || (!request.filter.branch_ids.is_empty()
             && !request
                 .filter
@@ -3862,9 +3836,6 @@ fn load_ordered_mutation_exact_batch(
         .rows
         .iter()
         .map(|request_row| {
-            if request.untracked == Some(true) {
-                return Ok(None);
-            }
             let Some((chunk, row_index)) = ordered_mutation_journal_row(
                 journal,
                 &request_row.branch_id,
@@ -4044,7 +4015,6 @@ fn validate_batch_row_identities(
 }
 
 enum BatchIdentityViolation<'a> {
-    MixedDurability(PreparedStateRowRef<'a>),
     DuplicatePresent {
         row: PreparedStateRowRef<'a>,
         previous: PreparedStateRowRef<'a>,
@@ -4057,7 +4027,6 @@ fn validate_rows_in_identity_order<'a>(
     order: impl IntoIterator<Item = usize>,
 ) -> Result<bool, LixError> {
     let mut previous_identity = None::<&PreparedStateRowIdentity>;
-    let mut group_untracked = false;
     let mut pending_present = None::<PreparedStateRowRef<'a>>;
     let mut unique_count = 0usize;
     let mut earliest_violation = None::<(usize, BatchIdentityViolation<'a>)>;
@@ -4067,19 +4036,11 @@ fn validate_rows_in_identity_order<'a>(
         let identity = &identities[index];
         if previous_identity != Some(identity) {
             previous_identity = Some(identity);
-            group_untracked = row.untracked;
             pending_present = row.snapshot.map(|_| row);
             unique_count += 1;
             continue;
         }
 
-        if group_untracked != row.untracked {
-            retain_earliest_batch_identity_violation(
-                &mut earliest_violation,
-                index,
-                BatchIdentityViolation::MixedDurability(row),
-            );
-        }
         if row.snapshot.is_none() {
             pending_present = None;
         } else if let Some(previous) = pending_present.replace(row) {
@@ -4093,7 +4054,6 @@ fn validate_rows_in_identity_order<'a>(
 
     if let Some((_, violation)) = earliest_violation {
         return Err(match violation {
-            BatchIdentityViolation::MixedDurability(row) => mixed_durability_error(row),
             BatchIdentityViolation::DuplicatePresent { row, previous } => {
                 duplicate_staged_present_row_error(row, previous)
             }
@@ -4113,20 +4073,6 @@ fn retain_earliest_batch_identity_violation<'a>(
     {
         *earliest = Some((index, violation));
     }
-}
-
-fn mixed_durability_error(row: PreparedStateRowRef<'_>) -> LixError {
-    let entity_pk = row
-        .entity_pk
-        .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
-    LixError::new(
-        LixError::CODE_INVALID_PARAM,
-        format!(
-            "cannot mix tracked and untracked writes for schema '{}' entity_pk '{}' in branch '{}' within one transaction; commit or roll back before changing durability",
-            row.schema_key, entity_pk, row.branch_id
-        ),
-    )
 }
 
 fn duplicate_staged_present_row_error(
@@ -4217,9 +4163,6 @@ fn add_row_to_commit_change_refs(
     row: PreparedStateRowRef<'_>,
     functions: &FunctionProviderHandle,
 ) -> Option<CommitId> {
-    if row.untracked {
-        return row.commit_id;
-    }
     let change_id = row
         .change_id
         .expect("tracked staged rows must carry change_id for commit change refs");
@@ -4245,9 +4188,6 @@ fn remove_row_from_commit_change_refs(
     change_refs_by_branch: &mut BTreeMap<String, StagedCommitChangeRefs>,
     row: PreparedStateRowRef<'_>,
 ) {
-    if row.untracked {
-        return;
-    }
     let Some(change_refs) = change_refs_by_branch.get_mut(row.branch_id.as_str()) else {
         return;
     };
@@ -4293,11 +4233,10 @@ fn push_prepared_materialized(
         row.created_at,
         row.updated_at,
         row.global,
-        (!row.addressable_change_id || row.untracked)
+        (!row.addressable_change_id)
             .then_some(row.change_id)
             .flatten(),
         row.commit_id,
-        row.untracked,
         row.branch_id.as_str(),
     )
 }
@@ -4324,13 +4263,6 @@ fn staged_row_identity_matches_scan(
         return false;
     }
     if !staged_branch_matches_scan(row.branch_id, request) {
-        return false;
-    }
-    if request
-        .filter
-        .untracked
-        .is_some_and(|untracked| row.untracked != untracked)
-    {
         return false;
     }
     nullable_key_matches_filters(row.file_id.map(SharedStr::as_str), &request.filter.file_ids)
@@ -4672,7 +4604,7 @@ mod tests {
                 rows: prepared_rows![
                     state_row("[\"json_pointer\",null]", "marker")
                         .with_schema(crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY)
-                        .with_tracked()
+                        .with_history()
                         .with_branch(branch_id)
                         .with_change_id("collection-marker")
                 ],
@@ -4920,7 +4852,7 @@ mod tests {
         );
         assert!(staged_writes.uses_identity_index_for_tests());
 
-        let tracked_domain = Domain::schema_catalog(branch_id, false);
+        let tracked_domain = Domain::schema_catalog(branch_id);
         assert!(
             !staged_writes
                 .has_staged_schema_catalog_change(&tracked_domain)
@@ -4942,15 +4874,9 @@ mod tests {
                 .expect("tracked catalog change should be detected")
         );
         assert!(
-            staged_writes
-                .has_staged_schema_catalog_change(&Domain::schema_catalog(branch_id, true))
-                .expect("untracked catalog includes tracked schema definitions")
-        );
-        assert!(
             !staged_writes
                 .has_staged_schema_catalog_change(&Domain::schema_catalog(
                     "01920000-0000-7000-8000-0000000000b1",
-                    false,
                 ))
                 .expect("other branch should remain independent")
         );
@@ -4959,7 +4885,7 @@ mod tests {
     #[test]
     fn schema_catalog_probe_binary_searches_ordered_journal() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
-        let tracked_domain = Domain::schema_catalog(branch_id, false);
+        let tracked_domain = Domain::schema_catalog(branch_id);
         let ordinary_writes = test_staged_writes();
         ordinary_writes
             .stage_write(PreparedTransactionWrite::Rows {
@@ -5402,7 +5328,6 @@ mod tests {
             Some("readme.md".to_string()),
             "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             true,
-            true,
             result,
         );
         file_content.set_splice_provenance(Some(provenance.clone()));
@@ -5455,7 +5380,6 @@ mod tests {
             Some("/batch.json".to_string()),
             Some("batch.json".to_string()),
             "01920000-0000-7000-8000-0000000000a1".to_string(),
-            false,
             false,
             b"payload".to_vec(),
         );
@@ -5514,7 +5438,6 @@ mod tests {
             Some("batch.json".to_string()),
             "01920000-0000-7000-8000-0000000000a1".to_string(),
             false,
-            false,
             b"payload".to_vec(),
         );
 
@@ -5550,7 +5473,6 @@ mod tests {
             Some("/resurrected.json".to_string()),
             Some("resurrected.json".to_string()),
             "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-            true,
             true,
             b"payload".to_vec(),
         );
@@ -5608,7 +5530,6 @@ mod tests {
             Some("requested.bin".to_string()),
             "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             true,
-            true,
             b"requested-main".to_vec(),
         );
         requested_write.add_auxiliary_payload(b"requested-auxiliary".to_vec());
@@ -5617,7 +5538,6 @@ mod tests {
             Some("/unrelated.bin".to_string()),
             Some("unrelated.bin".to_string()),
             "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-            true,
             true,
             b"unrelated-main".to_vec(),
         );
@@ -5656,7 +5576,7 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![state_row("tracked-key", "value").with_tracked()],
+                rows: prepared_rows![state_row("tracked-key", "value").with_history()],
             })
             .expect("tracked global row should stage");
 
@@ -5669,21 +5589,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_writes_do_not_track_untracked_rows_as_commit_members() {
-        let staged_writes = test_staged_writes();
-
-        staged_writes
-            .stage_write(PreparedTransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![state_row("untracked-key", "value")],
-            })
-            .expect("untracked row should stage");
-
-        let drained = staged_writes.drain().expect("drain should succeed");
-        assert!(drained.commit_change_refs_by_branch.is_empty());
-    }
-
-    #[tokio::test]
     async fn staged_writes_replace_commit_member_on_tracked_overwrite() {
         let staged_writes = test_staged_writes();
 
@@ -5692,7 +5597,7 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
                     state_row("overwrite-key", "first")
-                        .with_tracked()
+                        .with_history()
                         .with_change_id("change-first"),
                 ],
             })
@@ -5702,7 +5607,7 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
                     state_row("overwrite-key", "second")
-                        .with_tracked()
+                        .with_history()
                         .with_change_id("change-second"),
                 ],
             })
@@ -5714,32 +5619,6 @@ mod tests {
             .get("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .expect("global commit change_refs should exist");
         assert_eq!(change_refs.tracked_change_count, 1);
-    }
-
-    #[tokio::test]
-    async fn staged_writes_reject_mixed_durability_in_one_batch() {
-        let staged_writes = test_staged_writes();
-
-        let error = staged_writes
-            .stage_write(PreparedTransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![
-                    state_row("tracked-to-untracked-key", "tracked")
-                        .with_tracked()
-                        .with_change_id("change-tracked"),
-                    state_row("tracked-to-untracked-key", "untracked")
-                        .with_change_id("change-untracked"),
-                ],
-            })
-            .expect_err("mixed durability should be rejected");
-
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(
-            error
-                .message
-                .contains("cannot mix tracked and untracked writes")
-        );
-        assert!(staged_writes.drain().unwrap().state_rows.is_empty());
     }
 
     #[tokio::test]
@@ -5800,60 +5679,12 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
 
-    #[test]
-    fn batch_identity_validation_preserves_source_order_error_precedence() {
-        let rows = prepared_rows![
-            state_row("z", "tracked")
-                .with_tracked()
-                .with_change_id("z-tracked"),
-            state_row("z", "untracked").with_change_id("z-untracked"),
-            state_row("a", "first"),
-            state_row("a", "duplicate"),
-        ];
-        let identities = rows
-            .iter()
-            .map(PreparedStateRowIdentity::from)
-            .collect::<Vec<_>>();
-
-        let error = validate_batch_row_identities(&rows, &identities)
-            .expect_err("the earliest source-order violation must win");
-        assert_eq!(
-            error.code,
-            LixError::CODE_INVALID_PARAM,
-            "the row-1 durability error precedes the row-3 duplicate even though 'a' sorts first"
-        );
-        assert!(error.message.contains("cannot mix tracked and untracked"));
-    }
-
     #[tokio::test]
-    async fn staged_writes_reject_mixed_durability_across_calls() {
-        let staged_writes = test_staged_writes();
-
-        staged_writes
-            .stage_write(PreparedTransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![state_row("shared-domain-key", "tracked").with_tracked()],
-            })
-            .expect("tracked row should stage");
-        let error = staged_writes
-            .stage_write(PreparedTransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![state_row("shared-domain-key", "untracked")],
-            })
-            .expect_err("durability switch should fail");
-
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        let drained = staged_writes.drain().expect("drain should succeed");
-        assert_eq!(drained.state_rows.len(), 1);
-        assert!(!drained.state_rows.row(0).untracked);
-    }
-
-    #[tokio::test]
-    async fn same_durability_replacement_keeps_only_the_latest_row() {
+    async fn repeated_replacement_keeps_only_the_latest_row() {
         let staged_writes = test_staged_writes();
         for row in [
-            state_row("alternating-key", "tracked-first").with_tracked(),
-            state_row("alternating-key", "tracked-final").with_tracked(),
+            state_row("alternating-key", "first").with_history(),
+            state_row("alternating-key", "final").with_history(),
         ] {
             staged_writes
                 .stage_write(PreparedTransactionWrite::Rows {
@@ -5865,7 +5696,6 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
         assert_eq!(drained.state_rows.len(), 1);
-        assert!(!drained.state_rows.row(0).untracked);
         assert_eq!(
             drained
                 .state_rows
@@ -5873,7 +5703,7 @@ mod tests {
                 .snapshot
                 .map(StageJson::materialize_shared)
                 .as_deref(),
-            Some("{\"key\":\"alternating-key\",\"value\":\"tracked-final\"}")
+            Some("{\"key\":\"alternating-key\",\"value\":\"final\"}")
         );
     }
 
@@ -5886,7 +5716,7 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
                     state_row("active-branch-key", "value")
-                        .with_tracked()
+                        .with_history()
                         .with_branch("01920000-0000-7000-8000-0000000000a1"),
                 ],
             })
@@ -6287,7 +6117,7 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![state_row("sql2-functions-key", "value").with_tracked()],
+                rows: prepared_rows![state_row("sql2-functions-key", "value").with_history()],
             })
             .expect("staging rows should succeed");
 
@@ -6311,7 +6141,7 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: prepared_rows![state_row("tracked-commit-key", "value").with_tracked()],
+                rows: prepared_rows![state_row("tracked-commit-key", "value").with_history()],
             })
             .expect("tracked row should stage");
 
@@ -6378,6 +6208,7 @@ mod tests {
             "test staged row snapshot_content",
         )
         .expect("test snapshot should prepare");
+        let change_id = ChangeId::for_test_label(&format!("state-row-{key}-{value}"));
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
@@ -6391,9 +6222,8 @@ mod tests {
             created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
             updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.000Z"),
             global: true,
-            change_id: None,
+            change_id: Some(change_id),
             commit_id: None,
-            untracked: true,
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".into(),
         }
     }
@@ -6424,7 +6254,7 @@ mod tests {
 
     fn tracked_append_row(key: &str, value: &str) -> TestPreparedStateRow {
         state_row(key, value)
-            .with_tracked()
+            .with_history()
             .with_branch("01920000-0000-7000-8000-0000000000a1")
             .with_change_id(&format!("append-{key}"))
     }
@@ -6478,7 +6308,7 @@ mod tests {
     trait StateRowTestExt {
         fn with_schema(self, schema_key: &str) -> Self;
         fn with_file_id(self, file_id: &str) -> Self;
-        fn with_tracked(self) -> Self;
+        fn with_history(self) -> Self;
         fn with_branch(self, branch_id: &str) -> Self;
         fn with_change_id(self, change_id: &str) -> Self;
     }
@@ -6494,8 +6324,7 @@ mod tests {
             self
         }
 
-        fn with_tracked(mut self) -> Self {
-            self.untracked = false;
+        fn with_history(mut self) -> Self {
             if self.change_id.is_none() {
                 self.change_id = Some(ChangeId::for_test_label("test-change-id"));
             }

@@ -50,7 +50,7 @@ impl CatalogSnapshot {
             let key = crate::schema::schema_key_from_definition(schema)?;
             let catalog_key = SchemaCatalogKey::from_schema_key(key);
             let identity = DomainSchemaIdentity::new(
-                Domain::schema_catalog(crate::GLOBAL_BRANCH_ID, true),
+                Domain::schema_catalog(crate::GLOBAL_BRANCH_ID),
                 catalog_key.schema_key.clone(),
             );
             catalog.remember_schema_identity(identity, catalog_key, schema.clone())?;
@@ -150,7 +150,7 @@ impl CatalogSnapshot {
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!("schema '{}' is visible from more than one schema domain", existing_entry.key.schema_key),
             )
-            .with_hint("Schema references store schema_key, but not the schema domain. Remove the duplicate tracked/untracked schema registration or use a distinct schema key."));
+            .with_hint("Schema references store schema_key, but not the schema domain. Remove the duplicate schema registration or use a distinct schema key."));
         }
 
         let plan_id = SchemaPlanId(self.entries.len() as u32);
@@ -3530,20 +3530,20 @@ mod tests {
     }
 
     #[test]
-    fn catalog_rejects_same_schema_key_from_multiple_domains() {
-        let tracked = SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
+    fn catalog_rejects_same_schema_key_from_distinct_branch_domains() {
+        let first = SchemaCatalogFact::new(
+            Domain::schema_catalog("main"),
             SchemaKey::new("example_schema"),
             schema_json("example_schema"),
         );
-        let untracked = SchemaCatalogFact::new(
-            Domain::schema_catalog("main", true),
+        let duplicate = SchemaCatalogFact::new(
+            Domain::schema_catalog("other-branch"),
             SchemaKey::new("example_schema"),
             schema_json("example_schema"),
         );
 
-        let error = CatalogSnapshot::from_schema_facts(&[tracked, untracked])
-            .expect_err("same schema key in two reachable domains is ambiguous");
+        let error = CatalogSnapshot::from_schema_facts(&[first, duplicate])
+            .expect_err("duplicate reachable schema keys are ambiguous");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(error.message.contains("more than one schema domain"));
@@ -3552,7 +3552,7 @@ mod tests {
     #[test]
     fn insert_schema_for_domain_is_atomic_when_binding_fails() {
         let mut catalog = CatalogSnapshot::from_schema_facts(&[SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
+            Domain::schema_catalog("main"),
             SchemaKey::new("base_schema"),
             schema_json("base_schema"),
         )])
@@ -3560,7 +3560,7 @@ mod tests {
 
         let error = catalog
             .insert_schema_for_domain(
-                Domain::schema_catalog("main", false),
+                Domain::schema_catalog("main"),
                 SchemaKey::new("bad_child_schema"),
                 child_schema_json("bad_child_schema", "missing_parent_schema"),
             )
@@ -3578,12 +3578,12 @@ mod tests {
     fn facts_fingerprint_matches_built_snapshot_fingerprint() {
         let facts = vec![
             SchemaCatalogFact::new(
-                Domain::schema_catalog("main", false),
+                Domain::schema_catalog("main"),
                 SchemaKey::new("parent_schema"),
                 schema_json("parent_schema"),
             ),
             SchemaCatalogFact::new(
-                Domain::schema_catalog("main", false),
+                Domain::schema_catalog("main"),
                 SchemaKey::new("child_schema"),
                 child_schema_json("child_schema", "parent_schema"),
             ),
@@ -3604,7 +3604,7 @@ mod tests {
     fn transaction_catalog_copy_on_write_isolates_shared_snapshot() {
         let shared = Arc::new(
             CatalogSnapshot::from_schema_facts(&[SchemaCatalogFact::new(
-                Domain::schema_catalog("main", false),
+                Domain::schema_catalog("main"),
                 SchemaKey::new("base_schema"),
                 schema_json("base_schema"),
             )])
@@ -3617,7 +3617,7 @@ mod tests {
 
         handle
             .insert_schema_for_domain(
-                Domain::schema_catalog("main", false),
+                Domain::schema_catalog("main"),
                 SchemaKey::new("registered_schema"),
                 schema_json("registered_schema"),
             )
@@ -3642,12 +3642,12 @@ mod tests {
     #[test]
     fn catalog_fingerprint_is_independent_of_fact_order() {
         let parent = SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
+            Domain::schema_catalog("main"),
             SchemaKey::new("parent_schema"),
             schema_json("parent_schema"),
         );
         let child = SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
+            Domain::schema_catalog("main"),
             SchemaKey::new("child_schema"),
             child_schema_json("child_schema", "parent_schema"),
         );
@@ -3666,12 +3666,12 @@ mod tests {
         let alpha = schema_json("alpha_schema");
         let catalog = CatalogSnapshot::from_schema_facts(&[
             SchemaCatalogFact::new(
-                Domain::schema_catalog("main", false),
+                Domain::schema_catalog("main"),
                 SchemaKey::new("zeta_schema"),
                 zeta.clone(),
             ),
             SchemaCatalogFact::new(
-                Domain::schema_catalog("main", false),
+                Domain::schema_catalog("main"),
                 SchemaKey::new("alpha_schema"),
                 alpha.clone(),
             ),
@@ -3684,7 +3684,7 @@ mod tests {
     #[test]
     fn delete_plan_has_no_committed_checks_for_unreferenced_schema() {
         let catalog = CatalogSnapshot::from_schema_facts(&[SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
+            Domain::schema_catalog("main"),
             SchemaKey::new("standalone_schema"),
             schema_json("standalone_schema"),
         )])
@@ -3699,12 +3699,12 @@ mod tests {
     #[test]
     fn delete_plan_indexes_foreign_keys_by_referenced_schema() {
         let parent = SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
+            Domain::schema_catalog("main"),
             SchemaKey::new("parent_schema"),
             schema_json("parent_schema"),
         );
         let child = SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
+            Domain::schema_catalog("main"),
             SchemaKey::new("child_schema"),
             child_schema_json("child_schema", "parent_schema"),
         );

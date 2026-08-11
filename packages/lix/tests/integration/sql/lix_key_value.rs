@@ -358,8 +358,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value_by_branch \
-             (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-             VALUES ('kv-upsert-global', 'first', 'ffffffff-ffff-7fff-bfff-ffffffffffff', true, true) \
+             (key, value, lixcol_branch_id, lixcol_global) \
+             VALUES ('kv-upsert-global', 'first', 'ffffffff-ffff-7fff-bfff-ffffffffffff', true) \
              ON CONFLICT(key, lixcol_branch_id) DO UPDATE SET value = excluded.value",
                 &[],
             )
@@ -369,8 +369,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value_by_branch \
-             (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-             VALUES ('kv-upsert-global', 'second', 'ffffffff-ffff-7fff-bfff-ffffffffffff', true, true) \
+             (key, value, lixcol_branch_id, lixcol_global) \
+             VALUES ('kv-upsert-global', 'second', 'ffffffff-ffff-7fff-bfff-ffffffffffff', true) \
              ON CONFLICT(key, lixcol_branch_id) DO UPDATE SET value = excluded.value",
                 &[],
             )

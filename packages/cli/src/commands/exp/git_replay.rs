@@ -371,8 +371,8 @@ where
     let lix = db::block_on(open_lix().with_storage(storage.clone()))
         .map_err(|error| CliError::msg(format!("failed to open replay Lix: {error}")))?;
     db::block_on(lix.execute(
-        "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-         VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
+        "INSERT INTO lix_key_value (key, value, lixcol_global) \
+         VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true)",
         &[],
     ))
     .map_err(|error| CliError::msg(format!("failed to enable deterministic mode: {error}")))?;

@@ -51,7 +51,7 @@ simulation_test!(
         let commit_rows = select_rows(
             &session,
             &format!(
-                "SELECT id, lixcol_global, lixcol_untracked \
+                "SELECT id, lixcol_global  \
                  FROM lix_commit WHERE id = '{second_head}'"
             ),
         )
@@ -68,7 +68,7 @@ simulation_test!(
         let edge_rows = select_rows(
             &session,
             &format!(
-                "SELECT parent_id, child_id, parent_order, lixcol_global, lixcol_untracked \
+                "SELECT parent_id, child_id, parent_order, lixcol_global  \
                  FROM lix_commit_edge WHERE child_id = '{second_head}'"
             ),
         )
@@ -87,7 +87,7 @@ simulation_test!(
         let by_branch_rows = select_rows(
             &session,
             &format!(
-                "SELECT id, lixcol_branch_id, lixcol_global, lixcol_untracked \
+                "SELECT id, lixcol_branch_id, lixcol_global  \
                  FROM lix_commit_by_branch \
                  WHERE id IN ('{initial_head}', '{first_head}', '{second_head}') \
                  ORDER BY id, lixcol_branch_id"
@@ -134,7 +134,7 @@ simulation_test!(
         let edge_by_branch_rows = select_rows(
             &session,
             &format!(
-                "SELECT parent_id, child_id, parent_order, lixcol_branch_id, lixcol_global, lixcol_untracked \
+                "SELECT parent_id, child_id, parent_order, lixcol_branch_id, lixcol_global  \
                  FROM lix_commit_edge_by_branch \
                  WHERE child_id = '{second_head}' \
                  ORDER BY lixcol_branch_id"

@@ -133,7 +133,6 @@ fn workspace_branch_stage_row(branch_id: &str) -> Result<TransactionWriteRow, Li
         global: true,
         change_id: None,
         commit_id: None,
-        untracked: true,
         branch_id: GLOBAL_BRANCH_ID.into(),
     })
 }

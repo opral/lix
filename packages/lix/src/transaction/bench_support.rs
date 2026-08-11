@@ -394,7 +394,6 @@ where
                 entity_pk: &entity_pk,
                 change_id: None,
                 commit_id: None,
-                untracked: true,
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -443,7 +442,6 @@ fn transaction_row(row: &BenchTransactionRow, value: &Arc<JsonValue>) -> Transac
         global: false,
         change_id: None,
         commit_id: None,
-        untracked: false,
         branch_id: BENCH_BRANCH_ID.into(),
     }
 }
@@ -605,7 +603,6 @@ async fn seed_visible_schema_rows<StorageImpl>(
         let mut control = BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,

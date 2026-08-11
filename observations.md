@@ -36,7 +36,7 @@ than silently removed.
   without either an `O(n²)` identity expansion or one serial prefix scan per
   file. That could extend predictable list performance beyond the current
   threshold.
-- **Why it is not a small PR:** Correctly preserving active/global/untracked
+- **Why it is not a small PR:** Correctly preserving active/global
   visibility, tombstones, projection materialization, and duplicate request
   handling crosses the live-state reader, mutable index, tracked-state, and
   file provider layers (roughly six production files).

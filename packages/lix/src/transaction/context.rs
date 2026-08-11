@@ -562,7 +562,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     functions: FunctionProviderHandle,
     /// Tracked-state revision observed by the coherent transaction-open read.
     /// Durable tracked publication must still be based on this revision;
-    /// untracked current-state writes do not invalidate the tracked snapshot.
+    /// current-only engine writes do not invalidate the historical snapshot.
     opening_tracked_mutation_revision: Option<Bytes>,
     /// Branch roots captured by the same coherent opening read. They let an
     /// explicit transaction distinguish a disjoint concurrent commit from an
@@ -849,9 +849,11 @@ where
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, message)
                 .with_hint("Retry the transaction against the latest committed state.")
         };
-        if prepared_writes.state_rows.iter().any(|row| {
-            row.untracked || row.global || row.branch_id.as_str() != self.active_branch_id
-        }) || !prepared_writes.extra_commit_parents_by_branch.is_empty()
+        if prepared_writes
+            .state_rows
+            .iter()
+            .any(|row| row.global || row.branch_id.as_str() != self.active_branch_id)
+            || !prepared_writes.extra_commit_parents_by_branch.is_empty()
             || !prepared_writes
                 .first_commit_parent_override_by_branch
                 .is_empty()
@@ -1325,7 +1327,6 @@ where
                     row.global,
                     row.change_id.map(|change_id| change_id.to_string().into()),
                     None,
-                    row.untracked,
                     row.branch_id.clone(),
                 );
         }
@@ -1543,18 +1544,18 @@ where
                 let sql_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
                         &visible_live_state,
-                        &Domain::schema_catalog(active_branch_id.clone(), true),
+                        &Domain::schema_catalog(active_branch_id.clone()),
                         catalog_revision.as_ref(),
                     )
                     .await?;
-                // SQL planning needs the untracked-visible catalog, while
+                // SQL planning needs the current visible catalog, while
                 // normal tracked mutations normalize against the tracked
                 // catalog. Pin both under the same revision at open so the
                 // first write never falls back to a catalog scan.
                 let tracked_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
                         &visible_live_state,
-                        &Domain::schema_catalog(active_branch_id.clone(), false),
+                        &Domain::schema_catalog(active_branch_id.clone()),
                         catalog_revision.as_ref(),
                     )
                     .await?;
@@ -1603,11 +1604,11 @@ where
         drop(read);
         let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
         schema_resolver.remember_compiled_catalog(
-            &Domain::schema_catalog(active_branch_id.clone(), true),
+            &Domain::schema_catalog(active_branch_id.clone()),
             Arc::clone(&sql_schema_catalog),
         );
         schema_resolver.remember_compiled_catalog(
-            &Domain::schema_catalog(active_branch_id.clone(), false),
+            &Domain::schema_catalog(active_branch_id.clone()),
             tracked_schema_catalog,
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
@@ -1697,15 +1698,10 @@ where
         transaction
             .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
             .await;
-        let tracked_state_changed = prepared_writes.state_rows.iter().any(|row| !row.untracked)
+        let tracked_state_changed = !prepared_writes.state_rows.is_empty()
             || !prepared_writes.commit_change_refs_by_branch.is_empty()
             || !prepared_writes.extra_commit_parents_by_branch.is_empty();
-        let has_untracked_state_writes = prepared_writes.state_rows.iter().any(|row| row.untracked);
-        // Untracked rows are mutable current state, but their validation can read
-        // tracked schemas, parents, uniqueness owners, or filesystem state.
-        // Fence that snapshot without rotating the tracked revision: normal
-        // tracked transactions remain independent of untracked-only commits.
-        let requires_tracked_snapshot_fence = tracked_state_changed || has_untracked_state_writes;
+        let requires_tracked_snapshot_fence = tracked_state_changed;
         let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         if let Err(error) = check_commit_boundary(commit_boundary.as_ref()) {
@@ -2192,7 +2188,6 @@ where
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(row_count);
-            crate::storage_bench::record_transaction_untracked_rows(0);
         }
         let prepared = self
             .prepare_transaction_rows(rows)
@@ -2237,7 +2232,6 @@ where
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(row_count);
-            crate::storage_bench::record_transaction_untracked_rows(0);
         }
         let prepared = self
             .prepare_transaction_rows(rows)
@@ -2298,9 +2292,6 @@ where
             crate::storage_bench::record_transaction_rows_staged(transaction_write_row_count(
                 &write,
             ));
-            crate::storage_bench::record_transaction_untracked_rows(
-                transaction_write_untracked_row_count(&write),
-            );
         }
         let (write, file_view_mutations, actor_publications) =
             self.reconcile_plugin_write(write).await?;
@@ -2353,7 +2344,6 @@ where
         if affects_filesystem_path_index {
             let tracked_branch_ids = filesystem_delta_rows
                 .iter()
-                .filter(|row| !row.untracked)
                 .map(|row| row.branch_id.to_string())
                 .collect::<BTreeSet<_>>();
             let mut commit_ids = BTreeMap::new();
@@ -2364,11 +2354,7 @@ where
                 );
             }
             for row in &mut filesystem_delta_rows {
-                row.commit_id = if row.untracked {
-                    None
-                } else {
-                    commit_ids.get(row.branch_id.as_ref()).copied().flatten()
-                };
+                row.commit_id = commit_ids.get(row.branch_id.as_ref()).copied().flatten();
             }
             let previous_epoch = self
                 .filesystem_path_index_epoch
@@ -2584,7 +2570,6 @@ where
                     entity_pks: vec![validated_uuid_entity_pk(&key.file_id)?],
                     branch_ids: vec![key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(key.file_id.clone())],
-                    untracked: Some(key.untracked),
                     ..Default::default()
                 },
                 projection: plugin_registry_live_state_projection(),
@@ -2625,7 +2610,6 @@ where
         let file_key = PluginFileWriteKey {
             branch_id: actor_key.branch_id.clone(),
             global: false,
-            untracked: false,
             file_id: actor_key.file_id.clone(),
         };
         let blob_rows = overlay_scan_batch(
@@ -2637,7 +2621,6 @@ where
                     entity_pks: vec![validated_uuid_entity_pk(&actor_key.file_id)?],
                     branch_ids: vec![actor_key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
-                    untracked: Some(false),
                     ..Default::default()
                 },
                 projection: plugin_registry_live_state_projection(),
@@ -2705,7 +2688,6 @@ where
                         schema_keys: plugin.schema_keys().to_vec(),
                         branch_ids: vec![actor_key.branch_id.clone()],
                         file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
-                        untracked: Some(false),
                         ..Default::default()
                     },
                     projection: plugin_state_live_state_projection(),
@@ -2822,7 +2804,6 @@ where
                 let file_key = PluginFileWriteKey {
                     branch_id: actor_key.branch_id.clone(),
                     global: false,
-                    untracked: false,
                     file_id: actor_key.file_id.clone(),
                 };
                 let Some(visible_materialization) = self.visible_materialization(&file_key).await?
@@ -2900,7 +2881,6 @@ where
             .load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
                 rows: requests,
                 projection: plugin_state_live_state_projection(),
-                untracked: Some(false),
                 include_tombstones: false,
             })
             .await?;
@@ -2971,7 +2951,6 @@ where
             self.load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
                 rows: exact_rows,
                 projection: plugin_state_live_state_projection(),
-                untracked: Some(false),
                 include_tombstones: false,
             })
             .await?
@@ -3027,7 +3006,6 @@ where
                     })
                     .collect(),
                 projection: plugin_state_live_state_projection(),
-                untracked: Some(false),
                 include_tombstones: false,
             })
             .await?;
@@ -3055,7 +3033,6 @@ where
                     schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
                     branch_ids: vec![file_key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(file_key.file_id.clone())],
-                    untracked: Some(false),
                     ..Default::default()
                 },
                 projection: plugin_registry_live_state_projection(),
@@ -3127,7 +3104,6 @@ where
                         context: FilesystemRowContext {
                             branch_id: file_key.branch_id.clone(),
                             global: file_key.global,
-                            untracked: file_key.untracked,
                             file_id: None,
                             metadata: None,
                         },
@@ -3211,7 +3187,6 @@ where
                         context: FilesystemRowContext {
                             branch_id: file_key.branch_id.clone(),
                             global: file_key.global,
-                            untracked: file_key.untracked,
                             file_id: None,
                             metadata: None,
                         },
@@ -3355,24 +3330,19 @@ where
                         "prepared CAS content cannot install a plugin archive",
                     ));
                 }
-                if !write.global && !write.untracked {
+                if !write.global {
                     branch_ids.insert(write.branch_id.clone());
                 }
                 continue;
             };
             if !is_plugin_storage_path(path) {
-                if !write.global && !write.untracked {
+                if !write.global {
                     branch_ids.insert(write.branch_id.clone());
                 }
                 continue;
             }
-            let plan = plugin_install_plan_from_archive_path(
-                path,
-                data,
-                &write.branch_id,
-                write.global,
-                write.untracked,
-            )?;
+            let plan =
+                plugin_install_plan_from_archive_path(path, data, &write.branch_id, write.global)?;
             if write.file_id != plan.archive_file_id {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
@@ -3480,7 +3450,7 @@ where
                 .and_then(|origin| plugin_key_from_archive_delete_origin(&origin.surface))
                 .filter(|plugin_key| plugin_archive_file_id_matches(&file_id, plugin_key))
             {
-                if row.global || row.untracked || row.branch_id == GLOBAL_BRANCH_ID {
+                if row.global || row.branch_id == GLOBAL_BRANCH_ID {
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         "plugin uninstall requires a tracked branch-local archive",
@@ -3496,13 +3466,12 @@ where
                 branch_ids.insert(row.branch_id.to_string());
                 continue;
             }
-            if row.global || row.untracked {
+            if row.global {
                 continue;
             }
             let key = PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: false,
                 file_id,
             };
             deleted_file_keys
@@ -3516,7 +3485,7 @@ where
         // Otherwise a later public UPDATE/DELETE could invalidate an active
         // plugin's durable state contract behind the registry's back.
         for row in rows.iter().take(input_row_count) {
-            if row.schema_key == REGISTERED_SCHEMA_KEY && !row.global && !row.untracked {
+            if row.schema_key == REGISTERED_SCHEMA_KEY && !row.global {
                 branch_ids.insert(row.branch_id.to_string());
             }
         }
@@ -3526,7 +3495,7 @@ where
         // therefore needs the small branch registry lookup before the host can
         // decide whether an entity-to-file transition is required.
         for row in rows.iter().take(input_row_count) {
-            if !row.global && !row.untracked && row.file_id.is_some() {
+            if !row.global && row.file_id.is_some() {
                 branch_ids.insert(row.branch_id.to_string());
             }
         }
@@ -3602,7 +3571,6 @@ where
                             .into_iter()
                             .collect(),
                         file_ids: vec![NullableKeyFilter::Null],
-                        untracked: Some(false),
                         ..Default::default()
                     },
                     projection: plugin_registry_live_state_projection(),
@@ -3629,11 +3597,7 @@ where
             // archive in one transaction batch. Model those rows after the
             // visible snapshot before checking the derived plugin rows.
             for row in rows.iter().take(input_row_count) {
-                if row.schema_key != REGISTERED_SCHEMA_KEY
-                    || row.global
-                    || row.untracked
-                    || row.file_id.is_some()
-                {
+                if row.schema_key != REGISTERED_SCHEMA_KEY || row.global || row.file_id.is_some() {
                     continue;
                 }
                 let Some(entity_pk) = row.entity_pk.cloned() else {
@@ -3676,7 +3640,6 @@ where
                     })
                     .collect(),
                 projection: plugin_registry_live_state_projection(),
-                untracked: Some(false),
                 include_tombstones: false,
             },
         )
@@ -3730,7 +3693,7 @@ where
             changed_registry_branches.insert(key.branch_id);
         }
         for row in rows.iter().take(input_row_count) {
-            if row.schema_key != REGISTERED_SCHEMA_KEY || row.global || row.untracked {
+            if row.schema_key != REGISTERED_SCHEMA_KEY || row.global {
                 continue;
             }
             let Some(schema_key) = row
@@ -3793,7 +3756,6 @@ where
         if active_branch_ids.is_empty() && deleted_file_keys.is_empty() {
             for write in file_content.iter().filter(|write| {
                 !write.global
-                    && !write.untracked
                     && write
                         .path
                         .as_deref()
@@ -3811,7 +3773,6 @@ where
         let mut candidate_file_keys = BTreeSet::<PluginFileWriteKey>::new();
         for write in file_content.iter() {
             if write.global
-                || write.untracked
                 || !active_branch_ids.contains(&write.branch_id)
                 || write.path.as_deref().is_none_or(is_plugin_storage_path)
             {
@@ -3827,7 +3788,6 @@ where
         }
         for row in rows.iter().take(input_row_count) {
             if row.global
-                || row.untracked
                 || !active_branch_ids.contains(row.branch_id.as_str())
                 || row.file_id.is_none()
             {
@@ -3836,7 +3796,6 @@ where
             candidate_file_keys.insert(PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: false,
                 file_id: row
                     .file_id
                     .as_ref()
@@ -3863,7 +3822,6 @@ where
                     })
                     .collect(),
                 projection: plugin_registry_live_state_projection(),
-                untracked: Some(false),
                 include_tombstones: false,
             },
         )
@@ -3888,7 +3846,6 @@ where
             let key = PluginFileWriteKey {
                 branch_id,
                 global: false,
-                untracked: false,
                 file_id: owner.file_id().to_string(),
             };
             if owners.insert(key.clone(), owner).is_some() {
@@ -3921,7 +3878,7 @@ where
             let Some(file_id) = row.file_id.as_deref() else {
                 continue;
             };
-            if row.global || row.untracked || !active_branch_ids.contains(row.branch_id.as_str()) {
+            if row.global || !active_branch_ids.contains(row.branch_id.as_str()) {
                 continue;
             }
             let registry = registries
@@ -3939,7 +3896,6 @@ where
             let file_key = PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: false,
                 file_id: file_id.to_string(),
             };
             let owner = owners.get(&file_key).ok_or_else(|| {
@@ -4038,7 +3994,6 @@ where
                             && entry.id() == file_key.file_id
                             && live.branch_id.as_ref() == file_key.branch_id
                             && !live.global
-                            && !live.untracked
                     })
                     .collect::<Vec<_>>();
                 let [entry] = entries.as_slice() else {
@@ -4089,7 +4044,6 @@ where
                 continue;
             };
             if write.global
-                || write.untracked
                 || is_plugin_storage_path(path)
                 || !active_branch_ids.contains(&write.branch_id)
             {
@@ -4218,7 +4172,6 @@ where
                             .cloned()
                             .map(NullableKeyFilter::Value)
                             .collect(),
-                        untracked: Some(false),
                         ..Default::default()
                     },
                     projection: plugin_state_live_state_projection(),
@@ -4395,7 +4348,6 @@ where
             .filter_map(|(index, write)| {
                 let path = write.path.as_deref()?;
                 if write.global
-                    || write.untracked
                     || is_plugin_storage_path(path)
                     || !active_branch_ids.contains(&write.branch_id)
                 {
@@ -4692,7 +4644,6 @@ where
                 let context = FilesystemRowContext {
                     branch_id: write.branch_id.clone(),
                     global: false,
-                    untracked: false,
                     file_id: None,
                     metadata: None,
                 };
@@ -4732,7 +4683,6 @@ where
                 continue;
             };
             if write.global
-                || write.untracked
                 || is_plugin_storage_path(path)
                 || !active_branch_ids.contains(&write.branch_id)
             {
@@ -4747,7 +4697,6 @@ where
             let context = FilesystemRowContext {
                 branch_id: write.branch_id.clone(),
                 global: false,
-                untracked: false,
                 file_id: None,
                 metadata: None,
             };
@@ -5178,7 +5127,6 @@ where
                                             file_ids: vec![NullableKeyFilter::Value(
                                                 actor_key.file_id.clone(),
                                             )],
-                                            untracked: Some(false),
                                             ..Default::default()
                                         },
                                         projection: plugin_state_live_state_projection(),
@@ -5874,7 +5822,6 @@ where
                 row.branch_id.as_str() != file_key.branch_id
                     || row.file_id.map(SharedStr::as_str) != Some(file_key.file_id.as_str())
                     || row.global
-                    || row.untracked
                     || group
                         .plugin
                         .schema_keys()
@@ -6337,7 +6284,6 @@ where
             rows_by_scope
                 .entry(Domain::schema_catalog(
                     row.schema_scope_branch_id().to_string(),
-                    row.untracked,
                 ))
                 .or_default()
                 .push(index);
@@ -6363,7 +6309,7 @@ where
                 }
                 remember_pending_registered_schema(
                     row.snapshot.map(TransactionJson::value),
-                    Domain::schema_catalog(row.schema_scope_branch_id().to_string(), row.untracked),
+                    Domain::schema_catalog(row.schema_scope_branch_id().to_string()),
                     catalog,
                 )?;
             }
@@ -6563,51 +6509,6 @@ where
             ));
         }
         Ok(())
-    }
-
-    /// Reports whether visible untracked state is owned by any requested file.
-    pub(crate) async fn has_untracked_file_scoped_rows(
-        &mut self,
-        file_ids: &[String],
-    ) -> Result<bool, LixError> {
-        if file_ids.is_empty() {
-            return Ok(false);
-        }
-        let branch_id = self.active_branch_id.clone();
-        let rows = self
-            .scan_visible_live_state_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    branch_ids: vec![branch_id],
-                    file_ids: file_ids
-                        .iter()
-                        .cloned()
-                        .map(NullableKeyFilter::Value)
-                        .collect(),
-                    untracked: Some(true),
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection::default(),
-                limit: Some(1),
-            })
-            .await?;
-        Ok(!rows.is_empty())
-    }
-
-    /// Reports whether the active branch has any visible untracked state.
-    pub(crate) async fn has_untracked_rows(&mut self) -> Result<bool, LixError> {
-        let branch_id = self.active_branch_id.clone();
-        let rows = self
-            .scan_visible_live_state_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    branch_ids: vec![branch_id],
-                    untracked: Some(true),
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection::default(),
-                limit: Some(1),
-            })
-            .await?;
-        Ok(!rows.is_empty())
     }
 
     /// Stages the protocol replay receipt into this transaction's final
@@ -6948,7 +6849,7 @@ where
         sql: &str,
         plan: &crate::sql2::SqlLogicalPlan,
     ) -> Result<(), LixError> {
-        let domain = Domain::schema_catalog(self.active_branch_id.clone(), false);
+        let domain = Domain::schema_catalog(self.active_branch_id.clone());
         if self
             .staged_writes
             .has_staged_schema_catalog_change(&domain)?
@@ -7195,7 +7096,6 @@ where
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(journal_rows);
-            crate::storage_bench::record_transaction_untracked_rows(0);
         }
         let timestamp = journal.timestamp.ok_or_else(|| {
             LixError::new(
@@ -7315,7 +7215,6 @@ where
                     })
                     .collect(),
                 projection: LiveStateProjection::default(),
-                untracked: Some(false),
                 include_tombstones: false,
             };
             let current = load_opening_exact_live_state_batch(
@@ -7371,7 +7270,6 @@ where
                 })
                 .collect(),
             projection: LiveStateProjection::default(),
-            untracked: Some(false),
             include_tombstones: false,
         };
         let current = load_opening_exact_live_state_batch(
@@ -7777,7 +7675,6 @@ where
                 global: false,
                 change_id: None,
                 commit_id: None,
-                untracked: false,
                 branch_id: branch_id.clone().into(),
             });
         }
@@ -7896,7 +7793,6 @@ where
                 )
                 .collect(),
             projection: LiveStateProjection::default(),
-            untracked: Some(false),
             include_tombstones: true,
         };
         let current = self
@@ -7934,7 +7830,6 @@ where
                     global: false,
                     change_id: None,
                     commit_id: None,
-                    untracked: false,
                     branch_id: branch_id.clone().into(),
                 });
             }
@@ -7971,7 +7866,6 @@ where
                     global: false,
                     change_id: None,
                     commit_id: None,
-                    untracked: false,
                     branch_id: branch_id.clone().into(),
                 });
             }
@@ -8187,7 +8081,6 @@ where
                 })
                 .collect(),
             projection: LiveStateProjection::default(),
-            untracked: Some(false),
             include_tombstones: false,
         };
         let current = reader.load_exact_batch(&request).await?;
@@ -8779,7 +8672,6 @@ fn push_prepared_state_row_from_planned_parts(
     let file_id = row.file_id.cloned();
     let origin = row.origin.cloned();
     let global = row.global;
-    let untracked = row.untracked;
     let branch_id = row.branch_id.clone();
     let snapshot = rows
         .take_snapshot(row_index)
@@ -8811,7 +8703,6 @@ fn push_prepared_state_row_from_planned_parts(
         scalar.change_id,
         scalar.addressable_change_id,
         scalar.commit_id,
-        untracked,
         branch_id,
     );
     prepared.set_durable_predecessor(prepared.len() - 1, durable_predecessor);
@@ -8829,14 +8720,11 @@ fn homogeneous_row_normalization_domain(rows: &RawWriteBatch) -> Option<Domain> 
         return None;
     }
     let branch_id = first.schema_scope_branch_id();
-    let untracked = first.untracked;
     rows.iter()
         .all(|row| {
-            row.schema_key != REGISTERED_SCHEMA_KEY
-                && row.untracked == untracked
-                && row.schema_scope_branch_id() == branch_id
+            row.schema_key != REGISTERED_SCHEMA_KEY && row.schema_scope_branch_id() == branch_id
         })
-        .then(|| Domain::schema_catalog(branch_id.to_string(), untracked))
+        .then(|| Domain::schema_catalog(branch_id.to_string()))
 }
 
 fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestamp, LixError> {
@@ -9091,7 +8979,7 @@ where
         };
         let mut generation = TrackedHeadContext::new()
             .reader(read)
-            .collection_generation(branch_id, control.untracked_generation, scope)
+            .collection_generation(branch_id, control.tracked_generation, scope)
             .await?;
         let staged = self.staged_writes.staging_overlay()?;
         if StagedLiveStateRows::collection_replaced(
@@ -9124,7 +9012,7 @@ where
         };
         TrackedHeadContext::new()
             .reader(read)
-            .exact_collection_live_count(branch_id, control.untracked_generation, scope)
+            .exact_collection_live_count(branch_id, control.tracked_generation, scope)
             .await
             .map(Some)
     }
@@ -9215,11 +9103,8 @@ where
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(row_count);
-            crate::storage_bench::record_transaction_untracked_rows(
-                row_count * usize::from(rows.untracked()),
-            );
         }
-        let domain = Domain::schema_catalog(branch_id, rows.untracked());
+        let domain = Domain::schema_catalog(branch_id);
         let prepared = if self
             .staged_writes
             .has_staged_schema_catalog_change(&domain)?
@@ -9280,12 +9165,8 @@ where
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(row_count);
-            crate::storage_bench::record_transaction_untracked_rows(
-                row_count * usize::from(rows.untracked()),
-            );
         }
-        let domain =
-            Domain::schema_catalog(rows.schema_scope_branch_id().to_string(), rows.untracked());
+        let domain = Domain::schema_catalog(rows.schema_scope_branch_id().to_string());
         let prepared = if self
             .staged_writes
             .has_staged_schema_catalog_change(&domain)?
@@ -9325,7 +9206,7 @@ where
             return Ok(TransactionWriteOutcome { count: 0 });
         }
         self.ensure_plugin_generation_read_guard().await;
-        let domain = Domain::schema_catalog(rows.branch_id.to_string(), false);
+        let domain = Domain::schema_catalog(rows.branch_id.to_string());
         if self.origin_key.is_some()
             || self
                 .staged_writes
@@ -9360,7 +9241,6 @@ where
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(row_count);
-            crate::storage_bench::record_transaction_untracked_rows(0);
         }
         let expected_ordered_identity_digest = rows.expected_ordered_identity_digest;
         let schema_key = rows.schema_key.clone();
@@ -9414,7 +9294,7 @@ where
         live_count: u64,
         ordered_identity_digest: [u8; 32],
     ) -> Result<bool, LixError> {
-        let domain = Domain::schema_catalog(self.active_branch_id.clone(), false);
+        let domain = Domain::schema_catalog(self.active_branch_id.clone());
         if self.origin_key.is_some()
             || self
                 .staged_writes
@@ -9700,7 +9580,6 @@ fn append_plugin_change_rows(
             context.global,
             None,
             None,
-            context.untracked,
             branch_id.clone(),
         );
     }
@@ -9889,7 +9768,6 @@ fn v2_host_entity_ordinals_from_live_batch(
             row.branch_id() == file_key.branch_id
                 && row.file_id() == Some(file_key.file_id.as_str())
                 && !row.global()
-                && !row.untracked()
                 && row.snapshot_content().is_some()
                 && schema_keys
                     .binary_search_by(|schema_key| schema_key.as_str().cmp(row.schema_key()))
@@ -9931,7 +9809,7 @@ fn v2_host_changes_from_prepared_rows(
     let mut changes = rows
         .iter()
         .map(|row| {
-            if row.global || row.untracked || row.file_id.is_none() {
+            if row.global || row.file_id.is_none() {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     "component semantic rendering requires tracked, branch-local, file-scoped rows",
@@ -10006,7 +9884,6 @@ fn reject_external_plugin_registry_rows(rows: &RawWriteBatch) -> Result<(), LixE
 struct PluginFileWriteKey {
     branch_id: String,
     global: bool,
-    untracked: bool,
     file_id: String,
 }
 
@@ -10015,7 +9892,6 @@ impl PluginFileWriteKey {
         row.schema_key == BLOB_REF_SCHEMA_KEY
             && row.branch_id.as_str() == self.branch_id
             && row.global == self.global
-            && row.untracked == self.untracked
             && row.file_id.map(SharedStr::as_str) == Some(self.file_id.as_str())
     }
 
@@ -10029,7 +9905,6 @@ impl From<&TransactionFileContent> for PluginFileWriteKey {
         Self {
             branch_id: write.branch_id.clone(),
             global: write.global,
-            untracked: write.untracked,
             file_id: write.file_id.clone(),
         }
     }
@@ -10742,7 +10617,6 @@ fn semantic_rendered_file_content(
         Some(filename),
         branch_id,
         false,
-        false,
         rendered_bytes,
     )
     .with_had_blob_ref(true)
@@ -10948,7 +10822,6 @@ async fn preflight_owned_generation_upgrades(
                 schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
                 entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
                 branch_ids: branch_ids.clone(),
-                untracked: Some(false),
                 ..Default::default()
             },
             projection: plugin_registry_live_state_projection(),
@@ -11036,7 +10909,6 @@ async fn preflight_owned_generation_upgrades(
                     .into_iter()
                     .collect(),
                 file_ids: vec![NullableKeyFilter::Null],
-                untracked: Some(false),
                 ..Default::default()
             },
             projection: plugin_registry_live_state_projection(),
@@ -11140,7 +11012,6 @@ async fn preflight_owned_generation_upgrades(
                     schema_keys: upgrade.previous.schema_keys().to_vec(),
                     branch_ids: vec![upgrade.branch_id.clone()],
                     file_ids: file_id_filters.clone(),
-                    untracked: Some(false),
                     ..Default::default()
                 },
                 projection: plugin_state_live_state_projection(),
@@ -11155,7 +11026,6 @@ async fn preflight_owned_generation_upgrades(
             };
             if row.branch_id() == upgrade.branch_id
                 && !row.global()
-                && !row.untracked()
                 && row.snapshot_content().is_some()
                 && upgrade
                     .previous
@@ -11211,7 +11081,6 @@ async fn preflight_owned_generation_upgrades(
                         .collect::<Result<Vec<_>, _>>()?,
                     branch_ids: vec![upgrade.branch_id.clone()],
                     file_ids: file_id_filters,
-                    untracked: Some(false),
                     ..Default::default()
                 },
                 projection: plugin_registry_live_state_projection(),
@@ -11224,7 +11093,7 @@ async fn preflight_owned_generation_upgrades(
             let Some(file_id) = row.file_id() else {
                 continue;
             };
-            if row.branch_id() != upgrade.branch_id || row.global() || row.untracked() {
+            if row.branch_id() != upgrade.branch_id || row.global() {
                 continue;
             }
             let Some(snapshot) = row.snapshot_content().map(|content| content.as_str()) else {
@@ -11333,7 +11202,6 @@ async fn preflight_owned_generation_upgrades(
                         && entry.id() == owner.file_id()
                         && row.branch_id.as_ref() == upgrade.branch_id
                         && !row.global
-                        && !row.untracked
                 })
                 .collect::<Vec<_>>();
             let [entry] = matches.as_slice() else {
@@ -11591,7 +11459,6 @@ fn plugin_state_tombstone_batch(
             context.global,
             None,
             None,
-            context.untracked,
             context.branch_id.as_str().into(),
         );
     }
@@ -11667,16 +11534,6 @@ fn transaction_write_row_count(write: &TransactionWrite) -> usize {
     match write {
         TransactionWrite::Rows { rows, .. } => rows.len(),
         TransactionWrite::RowsWithFileContent { rows, .. } => rows.len(),
-    }
-}
-
-#[cfg(feature = "storage-benches")]
-fn transaction_write_untracked_row_count(write: &TransactionWrite) -> usize {
-    match write {
-        TransactionWrite::Rows { rows, .. } => rows.iter().filter(|row| row.untracked).count(),
-        TransactionWrite::RowsWithFileContent { rows, .. } => {
-            rows.iter().filter(|row| row.untracked).count()
-        }
     }
 }
 
@@ -11786,9 +11643,7 @@ mod tests {
     use crate::engine::Engine;
     use crate::functions::{DeterministicFunctionProvider, FunctionProvider};
     use crate::storage_adapter::{Memory, StorageReadOptions};
-    use crate::tracked_state::{
-        TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
-    };
+    use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
     use crate::transaction::types::{
         StagedCommitChangeBatchBuilder, StagedCommitChangeRefs, TransactionJson,
     };
@@ -11837,8 +11692,8 @@ mod tests {
 
     #[test]
     fn reconciliation_rows_share_one_static_surface_across_mark_calls() {
-        let mut first = key_value_stage_row("first", "value", false);
-        let mut second = key_value_stage_row("second", "value", false);
+        let mut first = key_value_stage_row("first", "value");
+        let mut second = key_value_stage_row("second", "value");
 
         mark_plugin_reconciliation_row(&mut first);
         mark_plugin_reconciliation_row(&mut second);
@@ -11871,7 +11726,6 @@ mod tests {
                 false,
                 None,
                 None,
-                false,
                 SharedStr::from_static("main"),
             );
         }
@@ -11944,7 +11798,6 @@ mod tests {
             Some(ChangeId::for_test_label("provisional")),
             true,
             Some(CommitId::for_test_label("commit")),
-            false,
             "main".into(),
         );
         let prepared_writes = PreparedWriteSet {
@@ -11985,7 +11838,6 @@ mod tests {
             global: false,
             change_id: Some(ChangeId::default()),
             commit_id: None,
-            untracked: false,
             branch_id: "main".into(),
         };
 
@@ -12067,7 +11919,6 @@ mod tests {
             global: false,
             change_id: None,
             commit_id: None,
-            untracked: false,
             branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
         };
         let upsert = |id: &str, snapshot: &[u8], effect| {
@@ -12174,10 +12025,10 @@ mod tests {
 
     #[test]
     fn active_branch_write_gate_ignores_global_companion_rows_and_files() {
-        let mut active_row = key_value_stage_row("active-row", "value", false);
+        let mut active_row = key_value_stage_row("active-row", "value");
         active_row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         active_row.global = false;
-        let mut global_row = key_value_stage_row("global-row", "value", false);
+        let mut global_row = key_value_stage_row("global-row", "value");
         global_row.branch_id = GLOBAL_BRANCH_ID.into();
         global_row.global = true;
         let global_file = TransactionFileContent::new(
@@ -12186,7 +12037,6 @@ mod tests {
             None,
             GLOBAL_BRANCH_ID.to_string(),
             true,
-            false,
             Vec::new(),
         );
 
@@ -12809,7 +12659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
+    async fn stage_rows_persists_historical_rows_without_sql() {
         let storage = Memory::new();
         let storage = StorageAdapter::new(storage.clone());
         let live_state = Arc::new(live_state_context());
@@ -12839,20 +12689,19 @@ mod tests {
         let runtime_functions = opened.runtime_functions;
 
         transaction
-            .stage_rows(raw_write_rows(vec![
-                key_value_stage_row("tracked-programmatic", "tracked", false),
-                key_value_stage_row("untracked-programmatic", "untracked", true),
-            ]))
+            .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                "programmatic",
+                "persisted",
+            )]))
             .await
             .expect("programmatic rows should stage");
         let staged = transaction
             .scan_live_state_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
-                    entity_pks: vec![EntityPk::single("tracked-programmatic")],
+                    entity_pks: vec![EntityPk::single("programmatic")],
                     branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
-                    untracked: Some(false),
                     ..Default::default()
                 },
                 limit: Some(1),
@@ -12882,7 +12731,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single("tracked-programmatic"),
+                entity_pk: EntityPk::single("programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -12909,7 +12758,7 @@ mod tests {
                     .iter()
                     .any(|member| member.change.change_id == tracked_change_id
                         && member.change.entity_pk.as_single_string_owned().as_deref()
-                            == Ok("tracked-programmatic"))),
+                            == Ok("programmatic"))),
             "tracked staged row should be authoritative in a packed commit delta"
         );
 
@@ -12944,7 +12793,7 @@ mod tests {
                 .entity_pk
                 .as_single_string_owned()
                 .as_deref(),
-            Ok("tracked-programmatic")
+            Ok("programmatic")
         );
 
         let tracked_row = TrackedStateContext::new()
@@ -12958,7 +12807,7 @@ mod tests {
                 &head_commit_id.to_string(),
                 &[TrackedStateKey {
                     schema_key: "lix_key_value".to_string(),
-                    entity_pk: EntityPk::single("tracked-programmatic"),
+                    entity_pk: EntityPk::single("programmatic"),
                     file_id: None,
                 }],
             )
@@ -12971,61 +12820,7 @@ mod tests {
         assert_eq!(tracked_row.commit_id, head_commit_id);
         assert_eq!(
             tracked_row.snapshot_content.as_deref(),
-            Some(r#"{"key":"tracked-programmatic","value":"tracked"}"#)
-        );
-
-        let live_untracked_row = live_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .load_row(&LiveStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single("untracked-programmatic"),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await
-            .expect("live state should load")
-            .expect("untracked row should be visible through live state");
-        assert!(live_untracked_row.untracked);
-        assert!(live_untracked_row.global);
-        assert_eq!(live_untracked_row.branch_id.as_ref(), GLOBAL_BRANCH_ID);
-        assert_eq!(
-            live_untracked_row.snapshot_content.as_deref(),
-            Some(r#"{"key":"untracked-programmatic","value":"untracked"}"#)
-        );
-        assert_eq!(
-            live_untracked_row.change_id, None,
-            "ordinary untracked rows must not enter the changelog"
-        );
-        assert_eq!(
-            live_untracked_row.commit_id, None,
-            "ordinary untracked rows must not enter the commit graph"
-        );
-
-        let tracked_rows = TrackedStateContext::new()
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .scan_batch_at_commit(
-                &head_commit_id.to_string(),
-                &TrackedStateScanRequest::default(),
-            )
-            .await
-            .expect("tracked state should scan")
-            .into_rows();
-        assert!(
-            tracked_rows
-                .iter()
-                .all(|row| row.entity_pk.as_single_string_owned().as_deref()
-                    != Ok("untracked-programmatic")),
-            "untracked staged rows should not be written into tracked state"
+            Some(r#"{"key":"programmatic","value":"persisted"}"#)
         );
     }
 
@@ -13038,12 +12833,12 @@ mod tests {
         assert!(
             transaction
                 .schema_resolver
-                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID, true))
+                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID))
         );
         assert!(
             transaction
                 .schema_resolver
-                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID, false))
+                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID))
         );
     }
 
@@ -13053,7 +12848,7 @@ mod tests {
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
 
-        let mut row = key_value_stage_row("lossy-timestamp", "value", true);
+        let mut row = key_value_stage_row("lossy-timestamp", "value");
         row.created_at = Some("1969-12-31T23:59:59.999999Z".to_string());
         row.updated_at = Some("2026-04-23T00:00:00.123456Z".to_string());
 
@@ -13070,7 +12865,6 @@ mod tests {
                     entity_pks: vec![EntityPk::single("lossy-timestamp")],
                     branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
-                    untracked: Some(true),
                     ..Default::default()
                 },
                 limit: Some(1),
@@ -13080,9 +12874,10 @@ mod tests {
             .expect("staged row should scan through transaction live state");
 
         assert_eq!(rows.len(), 1);
-        assert!(
-            rows.row(0).change_id().is_some(),
-            "prepared untracked rows must receive a real change id"
+        assert_eq!(
+            rows.row(0).change_id(),
+            None,
+            "provisional engine-generated change IDs must not escape before commit"
         );
         assert_eq!(
             rows.row(0).created_at().to_string(),
@@ -13096,7 +12891,7 @@ mod tests {
 
     #[test]
     fn explicit_row_timestamps_do_not_advance_deterministic_sequence() {
-        let mut row = key_value_stage_row("explicit-timestamps", "value", true);
+        let mut row = key_value_stage_row("explicit-timestamps", "value");
         row.created_at = Some("2026-04-23T00:00:00.123Z".to_string());
         row.updated_at = Some("2026-04-24T00:00:00.456Z".to_string());
         row.change_id = Some(ChangeId::for_test_label("explicit-change").to_string());
@@ -13153,7 +12948,7 @@ mod tests {
         .expect("transaction should open");
         let mut transaction = opened.transaction;
 
-        let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid", false);
+        let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid");
         invalid_row.snapshot = Some(TransactionJson::from_value_for_test(
             json!({"key": "invalid-programmatic"}),
         ));
@@ -13190,7 +12985,7 @@ mod tests {
             open_test_transaction(&storage).await;
         let storage = StorageAdapter::new(storage);
 
-        let mut row = key_value_stage_row("invalid-metadata", "value", false);
+        let mut row = key_value_stage_row("invalid-metadata", "value");
         row.metadata = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
         let error = transaction
             .stage_rows(raw_write_rows(vec![row]))
@@ -13217,7 +13012,7 @@ mod tests {
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
 
-        let mut row = key_value_stage_row("unknown-schema", "value", false);
+        let mut row = key_value_stage_row("unknown-schema", "value");
         row.schema_key = "missing_schema".into();
 
         let error = transaction
@@ -13240,7 +13035,7 @@ mod tests {
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
 
-        let mut row = key_value_stage_row("ghost-branch-row", "value", false);
+        let mut row = key_value_stage_row("ghost-branch-row", "value");
         row.branch_id = "ghost-branch".into();
         row.global = false;
 
@@ -13264,7 +13059,7 @@ mod tests {
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
 
-        let mut row = key_value_stage_row("invalid-storage-scope", "value", false);
+        let mut row = key_value_stage_row("invalid-storage-scope", "value");
         row.branch_id = GLOBAL_BRANCH_ID.into();
         row.global = false;
 
@@ -13288,7 +13083,7 @@ mod tests {
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
 
-        let mut row = key_value_stage_row("invalid-json", "value", false);
+        let mut row = key_value_stage_row("invalid-json", "value");
         row.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
 
         let error = transaction
@@ -13310,7 +13105,7 @@ mod tests {
             open_test_transaction(&storage).await;
         let storage = StorageAdapter::new(storage);
 
-        let mut row = key_value_stage_row("schema-mismatch", "value", false);
+        let mut row = key_value_stage_row("schema-mismatch", "value");
         row.snapshot = Some(TransactionJson::from_value_for_test(
             json!({"key": "schema-mismatch"}),
         ));
@@ -13339,7 +13134,7 @@ mod tests {
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
 
-        let mut row = key_value_stage_row("malformed-registered-schema", "value", false);
+        let mut row = key_value_stage_row("malformed-registered-schema", "value");
         row.schema_key = "lix_registered_schema".into();
         row.snapshot = Some(TransactionJson::from_value_for_test(json!({
             "value": {
@@ -13373,7 +13168,7 @@ mod tests {
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
 
-        let mut row = key_value_stage_row("right-id", "value", false);
+        let mut row = key_value_stage_row("right-id", "value");
         row.entity_pk = Some(EntityPk::single("wrong-id"));
 
         let error = transaction
@@ -13440,7 +13235,6 @@ mod tests {
             global: true,
             change_id: None,
             commit_id: None,
-            untracked: true,
             branch_id: GLOBAL_BRANCH_ID.into(),
         }
     }
@@ -13487,9 +13281,9 @@ mod tests {
         let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
-        let mut scalar_invalid = key_value_stage_row("scalar-invalid", "value", false);
+        let mut scalar_invalid = key_value_stage_row("scalar-invalid", "value");
         scalar_invalid.updated_at = Some("not-a-timestamp".to_string());
-        let mut schema_invalid = key_value_stage_row("schema-invalid", "value", false);
+        let mut schema_invalid = key_value_stage_row("schema-invalid", "value");
         schema_invalid.snapshot =
             Some(TransactionJson::from_value_for_test(json!("not-an-object")));
 
@@ -13508,13 +13302,13 @@ mod tests {
         let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
-        let prepared_source = key_value_stage_row("prepared", "value", false);
+        let prepared_source = key_value_stage_row("prepared", "value");
         let prepared = transaction
             .prepare_transaction_rows(raw_write_rows(vec![prepared_source.clone()]))
             .await
             .expect("prepared semantic slot");
-        let raw_valid = key_value_stage_row("raw-valid", "value", false);
-        let mut raw_invalid = key_value_stage_row("raw-invalid", "value", false);
+        let raw_valid = key_value_stage_row("raw-valid", "value");
+        let mut raw_invalid = key_value_stage_row("raw-invalid", "value");
         raw_invalid.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
         let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
             prepared_source,
@@ -13541,14 +13335,14 @@ mod tests {
         let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
-        let prepared_source = key_value_stage_row("prepared", "value", false);
+        let prepared_source = key_value_stage_row("prepared", "value");
         let prepared = transaction
             .prepare_transaction_rows(raw_write_rows(vec![prepared_source.clone()]))
             .await
             .expect("prepared semantic slot");
-        let mut scalar_invalid = key_value_stage_row("raw-scalar-invalid", "value", false);
+        let mut scalar_invalid = key_value_stage_row("raw-scalar-invalid", "value");
         scalar_invalid.updated_at = Some("not-a-timestamp".to_string());
-        let mut schema_invalid = key_value_stage_row("raw-schema-invalid", "value", false);
+        let mut schema_invalid = key_value_stage_row("raw-schema-invalid", "value");
         schema_invalid.snapshot =
             Some(TransactionJson::from_value_for_test(json!("not-an-object")));
         let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
@@ -13722,7 +13516,7 @@ mod tests {
         );
     }
 
-    fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> TransactionWriteRow {
+    fn key_value_stage_row(key: &str, value: &str) -> TransactionWriteRow {
         TransactionWriteRow {
             entity_pk: Some(EntityPk::single(key)),
             schema_key: "lix_key_value".into(),
@@ -13738,7 +13532,6 @@ mod tests {
             global: true,
             change_id: None,
             commit_id: None,
-            untracked,
             branch_id: GLOBAL_BRANCH_ID.into(),
         }
     }
@@ -13763,7 +13556,6 @@ mod tests {
             global: true,
             change_id: None,
             commit_id: None,
-            untracked: true,
             branch_id: GLOBAL_BRANCH_ID.into(),
         };
         let rendered = transaction
@@ -13808,8 +13600,8 @@ mod tests {
         let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
-        let first_source = key_value_stage_row("semantic-first", "first", true);
-        let second_source = key_value_stage_row("semantic-second", "second", true);
+        let first_source = key_value_stage_row("semantic-first", "first");
+        let second_source = key_value_stage_row("semantic-second", "second");
         let prepared = transaction
             .prepare_transaction_rows(raw_write_rows(vec![
                 first_source.clone(),
@@ -13826,11 +13618,11 @@ mod tests {
         // relative order while stale raw rows before and between them are
         // compacted and a new engine row is appended.
         let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
-            key_value_stage_row("remove-before-semantic", "stale", true),
+            key_value_stage_row("remove-before-semantic", "stale"),
             first_source,
-            key_value_stage_row("remove-between-semantic", "stale", true),
+            key_value_stage_row("remove-between-semantic", "stale"),
             second_source,
-            key_value_stage_row("appended-reconciliation", "new", true),
+            key_value_stage_row("appended-reconciliation", "new"),
         ]));
         rows.take_raw_rows_at(&[1])
             .expect("first semantic source should move once");
@@ -13889,7 +13681,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, snapshot)| {
-                let mut row = key_value_stage_row(&format!("canonical-{index}"), "value", true);
+                let mut row = key_value_stage_row(&format!("canonical-{index}"), "value");
                 row.snapshot = Some(TransactionJson::from_canonical_batch(snapshot));
                 row
             })
@@ -13944,7 +13736,6 @@ mod tests {
             .prepare_transaction_rows(raw_write_rows(vec![key_value_stage_row(
                 "large-semantic-entity",
                 &large_value,
-                true,
             )]))
             .await
             .expect("large semantic row should normalize");
@@ -13961,7 +13752,6 @@ mod tests {
         // normalization that the synthetic, unseeded `main` branch is valid.
         let source = prepared.row(0);
         assert!(source.global);
-        assert!(source.untracked);
         assert!(source.file_id.is_none());
         let mut semantic_rows = PreparedStateBatch::with_capacity(1);
         semantic_rows.push_parts(
@@ -13979,7 +13769,6 @@ mod tests {
             false,
             source.change_id,
             source.commit_id,
-            false,
             "main".into(),
         );
 

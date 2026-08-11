@@ -17,10 +17,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_history_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -31,8 +30,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_history_schema \
-                 (lixcol_entity_pk, id, count, active, meta, lixcol_untracked) \
-                 VALUES (lix_json('[\"history-entity\"]'), 'history-entity', 1, true, lix_json('{\"source\":\"insert\"}'), false)",
+                 (lixcol_entity_pk, id, count, active, meta) \
+                 VALUES (lix_json('[\"history-entity\"]'), 'history-entity', 1, true, lix_json('{\"source\":\"insert\"}'))",
                 &[],
             )
             .await
@@ -112,10 +111,9 @@ simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
 
     session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_history_error_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],
@@ -126,8 +124,8 @@ simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
     session
         .execute(
             "INSERT INTO engine_history_error_schema \
-                 (lixcol_entity_pk, id, lixcol_untracked) \
-                 VALUES (lix_json('[\"history-default\"]'), 'history-default', false)",
+                 (lixcol_entity_pk, id) \
+                 VALUES (lix_json('[\"history-default\"]'), 'history-default')",
             &[],
         )
         .await
@@ -165,10 +163,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_history_bare_error_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 false,\
                  false\
                  )",
                 &[],

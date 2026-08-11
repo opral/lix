@@ -3939,7 +3939,7 @@ mod tests {
                 .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
+                crate::domain::Domain::schema_catalog("main"),
                 crate::schema::SchemaKey::new("csv_row"),
                 schema,
             )])
@@ -4021,7 +4021,7 @@ mod tests {
                 .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
+                crate::domain::Domain::schema_catalog("main"),
                 crate::schema::SchemaKey::new("csv_row"),
                 schema,
             )])
@@ -4078,7 +4078,7 @@ mod tests {
                 .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
+                crate::domain::Domain::schema_catalog("main"),
                 crate::schema::SchemaKey::new("csv_row"),
                 schema,
             )])
@@ -4155,12 +4155,12 @@ mod tests {
         .expect("CSV table schema");
         let catalog = CatalogSnapshot::from_schema_facts(&[
             crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
+                crate::domain::Domain::schema_catalog("main"),
                 crate::schema::SchemaKey::new("csv_row"),
                 row_schema,
             ),
             crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
+                crate::domain::Domain::schema_catalog("main"),
                 crate::schema::SchemaKey::new("csv_table"),
                 table_schema,
             ),

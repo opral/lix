@@ -77,10 +77,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                    lix_json('{\"x-lix-key\":\"engine_column_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"},\"active\":{\"type\":\"boolean\"},\"metadata\":{\"type\":\"object\"}},\"required\":[\"id\",\"title\",\"count\",\"ratio\",\"active\",\"metadata\"],\"additionalProperties\":false}'),\
-                   false,\
                    false\
                  )",
                 &[],
@@ -89,10 +88,9 @@ simulation_test!(
             .expect("registered schema insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                    lix_json('{\"x-lix-key\":\"engine_no_pk_contract\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}'),\
-                   false,\
                    false\
                  )",
                 &[],
@@ -101,10 +99,9 @@ simulation_test!(
             .expect("no-primary-key schema insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                    lix_json('{\"x-lix-key\":\"columns\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"table_name\":{\"type\":\"string\"}},\"required\":[\"id\",\"table_name\"],\"additionalProperties\":false}'),\
-                   false,\
                    false\
                  )",
                 &[],
@@ -302,7 +299,7 @@ simulation_test!(
                    AND column_name IN (\
                      'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
                      'lixcol_entity_pk', 'lixcol_global', 'lixcol_schema_key', \
-                     'lixcol_untracked', 'lixcol_updated_at'\
+                     'lixcol_updated_at'\
                    )\
                  ) OR (\
                    table_name = 'engine_no_pk_contract' \
@@ -360,13 +357,6 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
-                    Value::Text("lixcol_untracked".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("FALSE".to_string()),
-                    Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_column_contract".to_string()),
                     Value::Text("lixcol_updated_at".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
@@ -388,8 +378,7 @@ simulation_test!(
                  FROM information_schema.columns \
                  WHERE table_name IN ('lix_file', 'lix_directory') \
                    AND column_name IN (\
-                     'lixcol_created_at', 'lixcol_global', \
-                     'lixcol_untracked', 'lixcol_updated_at'\
+                     'lixcol_created_at', 'lixcol_global', 'lixcol_updated_at'\
                    ) \
                  ORDER BY table_name, column_name",
                 &[],
@@ -409,13 +398,6 @@ simulation_test!(
                 vec![
                     Value::Text(table_name.to_string()),
                     Value::Text("lixcol_global".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("FALSE".to_string()),
-                    Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text(table_name.to_string()),
-                    Value::Text("lixcol_untracked".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Text("FALSE".to_string()),
                     Value::Text("DEFAULT".to_string()),
@@ -531,10 +513,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                    lix_json('{\"x-lix-key\":\"engine_scalar_cast_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"text_value\":{\"type\":\"string\"},\"integer_value\":{\"type\":\"integer\"},\"number_value\":{\"type\":\"number\"},\"boolean_value\":{\"type\":\"boolean\"},\"json_value\":{\"type\":\"object\"}},\"required\":[\"id\",\"text_value\",\"integer_value\",\"number_value\",\"boolean_value\",\"json_value\"],\"additionalProperties\":false}'),\
-                   false,\
                    false\
                  )",
                 &[],
@@ -1015,10 +996,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                    lix_json('{\"x-lix-key\":\"engine_default_identity_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                   false,\
                    false\
                  )",
                 &[],
@@ -1132,12 +1112,12 @@ simulation_test!(
              VALUES ('6e756c6c-2d63-8f6d-8d69-742d62726100', 'Null commit', NULL)",
             "INSERT INTO lix_file (path, lixcol_global) \
              VALUES ('/null-global-file.txt', NULL)",
-            "INSERT INTO lix_file (path, lixcol_untracked) \
-             VALUES ('/null-untracked-file.txt', NULL)",
+            "INSERT INTO lix_file (path) \
+             VALUES ('/null-current-file.txt', NULL)",
             "INSERT INTO lix_directory (path, lixcol_global) \
              VALUES ('/null-global-directory', NULL)",
-            "INSERT INTO lix_directory (path, lixcol_untracked) \
-             VALUES ('/null-untracked-directory', NULL)",
+            "INSERT INTO lix_directory (path) \
+             VALUES ('/null-current-directory', NULL)",
         ] {
             let error = session
                 .execute(sql, &[])
@@ -1166,10 +1146,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
                    lix_json('{\"x-lix-key\":\"engine_excluded_typed_default\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"status\":{\"type\":\"string\",\"default\":\"fresh\"},\"mirror\":{\"type\":\"string\"},\"identity_copy\":{\"type\":\"array\"}},\"required\":[\"id\",\"status\"],\"additionalProperties\":false}'),\
-                   false,\
                    false\
                  )",
                 &[],
@@ -1252,7 +1231,7 @@ simulation_test!(
             vec![vec![Value::Text("old".to_string())]],
         );
 
-        for column_name in ["lixcol_global", "lixcol_untracked"] {
+        for column_name in ["lixcol_global"] {
             let error = session
                 .execute(
                     &format!(

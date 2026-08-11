@@ -51,7 +51,7 @@ async fn client_state_roundtrips_every_json_kind_and_upserts() {
 
     let placement = lix
         .execute(
-            "SELECT lixcol_branch_id, lixcol_global, lixcol_untracked \
+            "SELECT lixcol_branch_id, lixcol_global  \
              FROM lix_key_value_by_branch \
              WHERE key = 'lix_client_state:upsert' \
                AND lixcol_branch_id = $1",

@@ -153,12 +153,6 @@ harness = false
 required-features = ["storage-benches"]
 
 [[bench]]
-name = "untracked_state_crud"
-path = "benches/untracked_state_crud/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
 name = "tracked_state_crud"
 path = "benches/tracked_state_crud/main.rs"
 harness = false

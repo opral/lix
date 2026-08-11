@@ -27,23 +27,19 @@ enum DerivedFileIdentity {
 #[derive(Debug, Clone, Copy)]
 struct DerivedProviderDescriptor {
     schema_key: &'static str,
-    untracked: bool,
     file_identity: DerivedFileIdentity,
 }
 
 const COMMIT_DESCRIPTOR: DerivedProviderDescriptor = DerivedProviderDescriptor {
     schema_key: COMMIT_SCHEMA_KEY,
-    untracked: false,
     file_identity: DerivedFileIdentity::Null,
 };
 const COMMIT_EDGE_DESCRIPTOR: DerivedProviderDescriptor = DerivedProviderDescriptor {
     schema_key: COMMIT_EDGE_SCHEMA_KEY,
-    untracked: false,
     file_identity: DerivedFileIdentity::Null,
 };
 const BRANCH_REF_DESCRIPTOR: DerivedProviderDescriptor = DerivedProviderDescriptor {
     schema_key: BRANCH_REF_SCHEMA_KEY,
-    untracked: true,
     file_identity: DerivedFileIdentity::Null,
 };
 #[derive(Debug, Clone, Copy)]
@@ -104,7 +100,6 @@ where
 struct DerivedScanScope<'a> {
     branch_ids: &'a [String],
     storage_branch_ids: &'a [String],
-    retention: Option<bool>,
 }
 
 #[async_trait]
@@ -370,7 +365,6 @@ pub(super) async fn scan_derived_rows<S>(
     request: &LiveStateScanRequest,
     projection_branch_ids: &[String],
     storage_branch_ids: &[String],
-    retention: Option<bool>,
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -389,7 +383,6 @@ where
     let scope = DerivedScanScope {
         branch_ids: &branch_ids,
         storage_branch_ids,
-        retention,
     };
     let mut reads = DerivedReadContext::new(store, commit_graph);
     let mut rows = Vec::new();
@@ -437,7 +430,7 @@ where
     P: DerivedEntityPointProvider<S>,
 {
     let descriptor = provider.descriptor();
-    if !provider_filter_allows(request, scope, descriptor) {
+    if !provider_filter_allows(request, descriptor) {
         return Ok(());
     }
 
@@ -469,13 +462,9 @@ where
 
 fn provider_filter_allows(
     request: &LiveStateScanRequest,
-    scope: &DerivedScanScope<'_>,
     descriptor: DerivedProviderDescriptor,
 ) -> bool {
     schema_filter_allows(&request.filter.schema_keys, descriptor.schema_key)
-        && !scope
-            .retention
-            .is_some_and(|untracked| untracked != descriptor.untracked)
         && file_filter_allows(&request.filter.file_ids, descriptor.file_identity)
 }
 
@@ -590,7 +579,6 @@ fn commit_row(
         global: true,
         change_id: Some(change_id),
         commit_id: Some(commit_id),
-        untracked: false,
         branch_id: branch_id.into(),
     })
 }
@@ -626,7 +614,6 @@ fn commit_edge_row(
         global: true,
         change_id: None,
         commit_id: Some(edge.child_commit_id),
-        untracked: false,
         branch_id: branch_id.into(),
     })
 }
@@ -662,7 +649,6 @@ fn branch_ref_row(
         global: true,
         change_id: Some(control.ref_change_id),
         commit_id: None,
-        untracked: true,
         branch_id: GLOBAL_BRANCH_ID.into(),
     })
 }

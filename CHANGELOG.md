@@ -32,7 +32,7 @@
   Every change now has one required account, anonymous work uses the built-in anonymous account, and applications can select an active account through the Rust, JavaScript, SQL, and server-protocol APIs.
 - Added persistent undo and redo for tracked branch history across the Rust SDK, JavaScript SDK, remote protocol, and CLI.
 
-  Undo and redo append inverse and replay commits without rewinding branch history. Atomic batches and transactions remain one undo unit, while untracked state remains unchanged; checkpoints and merge commits form undo boundaries.
+  Undo and redo append inverse and replay commits without rewinding branch history. Atomic batches and transactions remain one undo unit; checkpoints and merge commits form undo boundaries.
 - Renamed the `lix_file`, `lix_file_by_branch`, and `lix_file_history` binary payload column from `data` to `content`. Native file read and write APIs now use `content` names as well; the former `data` surface is not supported.
 - Git replay can now seed the complete parent tree for a bounded commit window.
 

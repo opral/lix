@@ -489,115 +489,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_branch_destructive_ref_changes_reject_branch_local_untracked_state,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_branch (id, name) \
-                 VALUES ('73716c2d-6272-816e-8368-2d6c6f636100', 'Local Untracked')",
-                &[],
-            )
-            .await
-            .expect("branch insert should succeed");
-        let original_head = select_single_text(
-            &session,
-            "SELECT commit_id FROM lix_branch \
-             WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'",
-        )
-        .await;
-        session
-            .execute(
-                "INSERT INTO lix_key_value_by_branch \
-                 (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('73716c2d-6272-816e-8368-2d6c6f636100', 'draft', \
-                         '73716c2d-6272-816e-8368-2d6c6f636100', false, true)",
-                &[],
-            )
-            .await
-            .expect("branch-local untracked row should insert");
-
-        session
-            .execute(
-                &format!(
-                    "UPDATE lix_branch SET commit_id = '{original_head}' \
-                     WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'"
-                ),
-                &[],
-            )
-            .await
-            .expect("assigning the existing head should preserve local state");
-
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('73716c2d-6272-816e-8368-2d7265706f00', 'new-head')",
-                &[],
-            )
-            .await
-            .expect("tracked write should create another head");
-        let new_head = select_single_text(
-            &session,
-            &format!(
-                "SELECT commit_id FROM lix_branch WHERE id = '{}'",
-                sim.main_branch_id()
-            ),
-        )
-        .await;
-
-        let repoint_error = session
-            .execute(
-                &format!(
-                    "UPDATE lix_branch SET commit_id = '{new_head}' \
-                     WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'"
-                ),
-                &[],
-            )
-            .await
-            .expect_err("repoint should reject branch-local untracked state");
-        assert_eq!(repoint_error.code, LixError::CODE_INVALID_PARAM);
-        assert!(
-            repoint_error
-                .message
-                .contains("cannot repoint branch '73716c2d-6272-816e-8368-2d6c6f636100'"),
-            "unexpected repoint error: {repoint_error:?}"
-        );
-
-        let delete_error = session
-            .execute(
-                "DELETE FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'",
-                &[],
-            )
-            .await
-            .expect_err("delete should reject branch-local untracked state");
-        assert_eq!(delete_error.code, LixError::CODE_INVALID_PARAM);
-        assert!(
-            delete_error
-                .message
-                .contains("cannot delete branch '73716c2d-6272-816e-8368-2d6c6f636100'"),
-            "unexpected delete error: {delete_error:?}"
-        );
-        assert_eq!(
-            select_single_text(
-                &session,
-                "SELECT commit_id FROM lix_branch \
-                 WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'",
-            )
-            .await,
-            original_head
-        );
-    }
-);
-
-simulation_test!(
     lix_branch_delete_then_recreate_does_not_restore_old_current_root,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -620,9 +511,9 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value_by_branch \
-                 (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
+                 (key, value, lixcol_branch_id, lixcol_global) \
                  VALUES ('73716c2d-6272-816e-8368-2d7265637201', 'old', \
-                         '73716c2d-6272-816e-8368-2d7265637201', false, false)",
+                        '73716c2d-6272-816e-8368-2d7265637201', false)",
                 &[],
             )
             .await
@@ -644,7 +535,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("branch without untracked local state should delete");
+            .expect("branch without local state should delete");
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \

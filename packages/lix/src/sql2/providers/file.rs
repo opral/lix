@@ -1598,7 +1598,7 @@ impl LixFileSpec {
                     } else if let Some(mut path_resolvers) = captured_path_resolvers {
                         if let Some(active_branch_id) = branch_binding.active_branch_id() {
                             let resolver_key =
-                                filesystem_storage_scope_key(active_branch_id, false, false, None);
+                                filesystem_storage_scope_key(active_branch_id, false, None);
                             path_resolvers.entry(resolver_key).or_default();
                         }
                         path_resolvers
@@ -1758,12 +1758,6 @@ impl UpsertSupport for LixFileSpec {
                 "lixcol_global",
                 "INSERT into lix_file",
             )?;
-            defaultable_bool_insert_value(
-                batch,
-                row_index,
-                "lixcol_untracked",
-                "INSERT into lix_file",
-            )?;
             if !insert_column_is_omitted(batch, "content") {
                 insert_optional_binary_value(batch, row_index, "content")?;
             }
@@ -1797,11 +1791,7 @@ impl UpsertSupport for LixFileSpec {
             "lixcol_global",
             Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
         )?;
-        materialize_omitted_column(
-            &materialized,
-            "lixcol_untracked",
-            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
-        )
+        Ok(materialized)
     }
 
     async fn materialize_returning_insert_defaults(
@@ -1936,31 +1926,16 @@ impl UpsertSupport for LixFileSpec {
 
     fn validate_conflict_pair(
         &self,
-        existing: &RecordBatch,
-        existing_row: usize,
-        proposed: &RecordBatch,
-        proposed_row: usize,
+        _existing: &RecordBatch,
+        _existing_row: usize,
+        _proposed: &RecordBatch,
+        _proposed_row: usize,
         target: &UpsertConflictTarget,
     ) -> Result<()> {
         if target.kind() != UpsertConflictKind::Path {
             return Ok(());
         }
-        let existing_untracked =
-            optional_bool_value(existing, existing_row, "lixcol_untracked")?.unwrap_or(false);
-        let proposed_untracked =
-            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
-        if existing_untracked == proposed_untracked {
-            return Ok(());
-        }
-        let path = required_string_value(proposed, proposed_row, "path")?;
-        Err(lix_error_to_datafusion_error(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "INSERT ON CONFLICT (path) on lix_file cannot write {} path {path:?} over existing {} file",
-                lane_name(proposed_untracked),
-                lane_name(existing_untracked)
-            ),
-        )))
+        Ok(())
     }
 
     async fn apply_conflict_update(
@@ -2155,10 +2130,6 @@ fn validate_required_paths(batch: &RecordBatch, table_name: &str) -> Result<()> 
     Ok(())
 }
 
-fn lane_name(untracked: bool) -> &'static str {
-    if untracked { "untracked" } else { "tracked" }
-}
-
 struct LixFileInsertSink {
     write_ctx: SqlWriteContext,
     functions: FunctionProviderHandle,
@@ -2339,18 +2310,13 @@ impl FileDescriptorRecord {
         FilesystemRowContext {
             branch_id: live.branch_id().to_owned(),
             global: live.global(),
-            untracked: live.untracked(),
             file_id: live.file_id().map(str::to_owned),
             metadata: None,
         }
     }
 
     fn directory_parent_keys(&self, directory_id: &str) -> Vec<FilesystemDescriptorKey> {
-        let mut keys = vec![self.key.in_same_scope(directory_id)];
-        if self.key.is_untracked() {
-            keys.push(self.key.in_tracked_scope(directory_id));
-        }
-        keys
+        vec![self.key.in_same_scope(directory_id)]
     }
 
     fn blob_ref_key(&self, owners: &LiveStateBatchOwners) -> FilesystemBlobRefKey {
@@ -2419,11 +2385,7 @@ impl DirectoryPathRecord for DirectoryDescriptorRecord {
         let Some(parent_id) = self.parent_id.as_deref() else {
             return Vec::new();
         };
-        let mut keys = vec![key.in_same_scope(parent_id)];
-        if key.is_untracked() {
-            keys.push(key.in_tracked_scope(parent_id));
-        }
-        keys
+        vec![key.in_same_scope(parent_id)]
     }
 
     fn name(&self) -> &str {
@@ -2694,7 +2656,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
         Err(error) => return Err(error),
     };
     let mut path_resolvers = directory_path_resolvers_from_state_batch(&live_rows)?;
-    let resolver_key = filesystem_storage_scope_key(&active_branch_id, false, false, None);
+    let resolver_key = filesystem_storage_scope_key(&active_branch_id, false, None);
     path_resolvers.entry(resolver_key).or_default();
     let mut staged = LixFileStagedBatch::with_row_capacity(parsed_writes.len().saturating_mul(3));
 
@@ -2705,19 +2667,12 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                 .blob_hash
                 .as_deref()
                 .and_then(|hash| BlobId::from_hex(hash).ok());
-            if conflict != FastLixFilePathWriteConflict::None {
-                validate_fast_lix_file_path_conflict_pair(
-                    existing.scope.untracked,
-                    &write.parsed.path,
-                )?;
-            }
             match conflict {
                 FastLixFilePathWriteConflict::None => {
                     let file_id = fast_file_write_id(&write, ctx);
                     let context = FilesystemRowContext {
                         branch_id: active_branch_id.clone(),
                         global: false,
-                        untracked: false,
                         file_id: None,
                         metadata: write.metadata,
                     };
@@ -2799,7 +2754,6 @@ async fn execute_fast_lix_file_id_path_writes_inner(
             let context = FilesystemRowContext {
                 branch_id: active_branch_id.clone(),
                 global: false,
-                untracked: false,
                 file_id: None,
                 metadata: write.metadata,
             };
@@ -2881,7 +2835,7 @@ async fn indexed_file_path_writes(
         }
     } else if has_missing {
         Some(BTreeMap::from([(
-            filesystem_storage_scope_key(active_branch_id, false, false, None),
+            filesystem_storage_scope_key(active_branch_id, false, None),
             DirectoryPathResolver::default(),
         )]))
     } else {
@@ -2951,16 +2905,6 @@ async fn stage_indexed_file_path_writes(
     debug_assert!(
         conflict.updates_existing() || conflict == FastLixFilePathWriteConflict::IdDoNothing
     );
-    for (write, entry) in writes.iter().zip(&indexed.existing) {
-        if !conflict.targets_id()
-            && let Some(entry) = entry
-        {
-            validate_fast_lix_file_path_conflict_pair(
-                entry.key.is_untracked(),
-                &write.parsed.path,
-            )?;
-        }
-    }
     let existing = if conflict.updates_existing() {
         indexed
             .existing
@@ -2986,7 +2930,6 @@ async fn stage_indexed_file_path_writes(
             let mut context = FilesystemRowContext {
                 branch_id: entry.key.branch_id().to_string(),
                 global: entry.key.global(),
-                untracked: entry.key.is_untracked(),
                 file_id: entry.key.file_id().map(str::to_string),
                 metadata: None,
             };
@@ -3048,7 +2991,6 @@ async fn stage_indexed_file_path_writes(
             let context = FilesystemRowContext {
                 branch_id: active_branch_id.to_string(),
                 global: false,
-                untracked: false,
                 file_id: None,
                 metadata: write.metadata,
             };
@@ -3113,7 +3055,6 @@ async fn load_exact_existing_materializations(
             .map(|(_, request)| request.clone())
             .collect(),
         projection: LiveStateProjection::default(),
-        untracked: Some(false),
         include_tombstones: false,
     };
     let rows = ctx.load_exact_live_state_batch(&request).await?;
@@ -3123,8 +3064,7 @@ async fn load_exact_existing_materializations(
         let Some(row) = rows.row(row_index) else {
             continue;
         };
-        let tracking_mismatch = row.untracked() ^ key.is_untracked();
-        if row.branch_id() != key.branch_id() || row.global() != key.global() || tracking_mismatch {
+        if row.branch_id() != key.branch_id() || row.global() != key.global() {
             continue;
         }
         let materialization = materializations.entry(key).or_default();
@@ -3350,24 +3290,6 @@ fn attach_fast_file_write_metadata(
         file_content.set_splice_provenance(splice_provenance.clone());
         file_content.set_mutation_identity(mutation_identity);
     }
-}
-
-fn validate_fast_lix_file_path_conflict_pair(
-    existing_untracked: bool,
-    path: &str,
-) -> Result<(), LixError> {
-    let proposed_untracked = false;
-    if existing_untracked == proposed_untracked {
-        return Ok(());
-    }
-    Err(LixError::new(
-        LixError::CODE_CONSTRAINT_VIOLATION,
-        format!(
-            "INSERT ON CONFLICT (path) on lix_file cannot write {} path {path:?} over existing {} file",
-            lane_name(proposed_untracked),
-            lane_name(existing_untracked)
-        ),
-    ))
 }
 
 async fn stage_lix_file_fast_batch(
@@ -4166,7 +4088,6 @@ fn stage_lix_file_content_insert_write(
         filename,
         context.branch_id.clone(),
         context.global,
-        context.untracked,
         content,
     );
     if !file_payload.is_empty() {
@@ -4193,7 +4114,6 @@ fn stage_lix_file_content_update_write(
         filename,
         context.branch_id.clone(),
         context.global,
-        context.untracked,
         content,
     )
     .with_had_blob_ref(has_blob_ref)
@@ -4272,13 +4192,6 @@ fn file_row_context_from_batch(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: defaultable_bool_insert_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "INSERT into lix_file",
-        )?
-        .unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_file")?,
     })
@@ -4307,7 +4220,6 @@ fn file_row_context_from_update(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: update_optional_metadata_value(
             batch,
@@ -4323,7 +4235,6 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
     filesystem_storage_scope_key(
         &context.branch_id,
         context.global,
-        context.untracked,
         // `file_id` is descriptor ownership, not filesystem namespace scope.
         // Directory resolvers are shared by every file in the same durability
         // and branch lane.
@@ -4386,7 +4297,7 @@ fn plugin_file_can_have_durable_owner(file: &FileDescriptorRecord) -> bool {
 }
 
 fn plugin_descriptor_key_can_have_durable_owner(key: &FilesystemDescriptorKey) -> bool {
-    !key.global() && !key.is_untracked() && key.file_id().is_none()
+    !key.global() && key.file_id().is_none()
 }
 
 fn plugin_owner_candidates_from_batch(
@@ -4566,7 +4477,6 @@ fn prepare_indexed_lix_file_rows(
                 blob_ref.global,
                 blob_ref.change_id,
                 blob_ref.commit_id,
-                blob_ref.untracked,
                 &blob_ref.branch_id,
             );
             if let Some(data) = entry.cached_blob_data() {
@@ -4698,12 +4608,6 @@ fn lix_file_record_batch_from_path_selection(
                     .map(|entry| entry.commit_id().map(|id| id.to_string()))
                     .collect::<Vec<_>>(),
             )),
-            "lixcol_untracked" => Arc::new(BooleanArray::from(
-                entries
-                    .iter()
-                    .map(|entry| Some(entry.key.is_untracked()))
-                    .collect::<Vec<_>>(),
-            )),
             "lixcol_metadata" => Arc::new(StringArray::from(
                 entries
                     .iter()
@@ -4747,7 +4651,6 @@ struct LixFileRecordBatchRow {
     created_at: String,
     updated_at: String,
     commit_id: Option<String>,
-    untracked: bool,
     metadata: Option<String>,
     branch_id: String,
 }
@@ -4767,7 +4670,6 @@ struct LixFileRecordBatchColumns {
     created_ats: Vec<Option<String>>,
     updated_ats: Vec<Option<String>>,
     commit_ids: Vec<Option<String>>,
-    untracked_values: Vec<Option<bool>>,
     metadata_values: Vec<Option<String>>,
     branch_ids: Vec<Option<String>>,
 }
@@ -4788,7 +4690,6 @@ impl LixFileRecordBatchColumns {
         self.created_ats.push(Some(row.created_at));
         self.updated_ats.push(Some(row.updated_at));
         self.commit_ids.push(row.commit_id);
-        self.untracked_values.push(Some(row.untracked));
         self.metadata_values.push(row.metadata);
         self.branch_ids.push(Some(row.branch_id));
     }
@@ -4809,7 +4710,6 @@ impl LixFileRecordBatchColumns {
             created_ats,
             updated_ats,
             commit_ids,
-            untracked_values,
             metadata_values,
             branch_ids,
         } = self;
@@ -4831,7 +4731,6 @@ impl LixFileRecordBatchColumns {
         let created_ats: ArrayRef = Arc::new(StringArray::from(created_ats));
         let updated_ats: ArrayRef = Arc::new(StringArray::from(updated_ats));
         let commit_ids: ArrayRef = Arc::new(StringArray::from(commit_ids));
-        let untracked_values: ArrayRef = Arc::new(BooleanArray::from(untracked_values));
         let metadata_values: ArrayRef = Arc::new(StringArray::from(metadata_values));
         let branch_ids: ArrayRef = Arc::new(StringArray::from(branch_ids));
 
@@ -4851,7 +4750,6 @@ impl LixFileRecordBatchColumns {
                 "lixcol_created_at" => Arc::clone(&created_ats),
                 "lixcol_updated_at" => Arc::clone(&updated_ats),
                 "lixcol_commit_id" => Arc::clone(&commit_ids),
-                "lixcol_untracked" => Arc::clone(&untracked_values),
                 "lixcol_metadata" => Arc::clone(&metadata_values),
                 "lixcol_branch_id" => Arc::clone(&branch_ids),
                 other => {
@@ -4966,7 +4864,6 @@ async fn lix_file_record_batch_from_prepared(
             created_at: live.created_at().to_string(),
             updated_at: content_live.unwrap_or(live).updated_at().to_string(),
             commit_id: live.commit_id().map(|id| id.to_string()),
-            untracked: live.untracked(),
             metadata: live.metadata().map(|value| serialize_row_metadata(value)),
             branch_id: live.branch_id().to_owned(),
         });
@@ -5466,7 +5363,6 @@ async fn load_plugin_render_branches(
                                 entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
                                 branch_ids: vec![branch_id.clone()],
                                 file_ids: vec![crate::NullableKeyFilter::Null],
-                                untracked: Some(false),
                                 ..LiveStateFilter::default()
                             },
                             projection: plugin_control_live_state_projection(),
@@ -5479,7 +5375,6 @@ async fn load_plugin_render_branches(
                             && row.file_id().is_none()
                             && row.branch_id() == branch_id.as_str()
                             && !row.global()
-                            && !row.untracked()
                     });
                     let row = row.map(MaterializedLiveStateRowRef::to_owned);
                     let registry =
@@ -5558,7 +5453,6 @@ async fn plugin_render_context_with_branches(
                                 .cloned()
                                 .map(crate::NullableKeyFilter::Value)
                                 .collect(),
-                            untracked: Some(false),
                             ..LiveStateFilter::default()
                         },
                         projection: plugin_control_live_state_projection(),
@@ -5580,7 +5474,6 @@ async fn plugin_render_context_with_branches(
                 || row.entity_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
                 || row.branch_id() != branch_id.as_str()
                 || row.global()
-                || row.untracked()
                 || !file_ids.contains(file_id)
             {
                 continue;
@@ -5863,7 +5756,6 @@ fn scan_indexed_file_batch(
             row.global,
             row.change_id,
             row.commit_id,
-            row.untracked,
             &row.branch_id,
         );
     }
@@ -5904,7 +5796,6 @@ async fn scan_exact_file_blob_batch(
         .load_exact_batch(&LiveStateExactBatchRequest {
             rows: exact_rows,
             projection: request.projection.clone(),
-            untracked: request.filter.untracked,
             include_tombstones: request.filter.include_tombstones,
         })
         .await?;
@@ -6840,7 +6731,6 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]))
 }
@@ -7646,12 +7536,11 @@ mod tests {
     async fn by_branch_descriptor_scan_keeps_scope_columns_and_residual_filtering() {
         let live_state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
-        let mut target = live_file_row(
+        let target = live_file_row(
             "01920000-0000-7000-8000-000000000522",
             "01920000-0000-7000-8000-0000000000b1",
             r#"{"id":"01920000-0000-7000-8000-000000000522","directory_id":null,"name":"readme.md"}"#,
         );
-        target.untracked = true;
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_file_row(
@@ -7680,7 +7569,6 @@ mod tests {
             "id",
             "lixcol_file_id",
             "lixcol_global",
-            "lixcol_untracked",
             "lixcol_created_at",
             "lixcol_updated_at",
             "lixcol_branch_id",
@@ -7730,7 +7618,6 @@ mod tests {
             "01920000-0000-7000-8000-000000000522"
         );
         assert!(!boolean_value("lixcol_global"));
-        assert!(boolean_value("lixcol_untracked"));
         assert_eq!(
             string_value("lixcol_created_at"),
             "2026-04-23T00:00:00.000Z"
@@ -8096,10 +7983,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indexed_blob_exact_batch_preserves_lanes_and_rejects_cross_pairs() {
+    async fn indexed_blob_exact_batch_preserves_exact_pairs() {
         let tracked_data = b"tracked".to_vec();
         let global_data = b"global".to_vec();
-        let untracked_data = b"untracked".to_vec();
+        let sibling_data = b"sibling".to_vec();
         let misplaced_data = b"misplaced".to_vec();
 
         let mut global_file = live_file_row(
@@ -8109,12 +7996,11 @@ mod tests {
             r#"{"id":"01920000-0000-7000-8000-000000000112","directory_id":null,"name":"global.md"}"#,
         );
         global_file.global = true;
-        let mut untracked_file = live_file_row(
+        let sibling_file = live_file_row(
             "01920000-0000-7000-8000-000000000132",
             "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-000000000132","directory_id":null,"name":"untracked.md"}"#,
+            r#"{"id":"01920000-0000-7000-8000-000000000132","directory_id":null,"name":"sibling.md"}"#,
         );
-        untracked_file.untracked = true;
         let mut index_rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-000000000122",
@@ -8122,7 +8008,7 @@ mod tests {
                 r#"{"id":"01920000-0000-7000-8000-000000000122","directory_id":null,"name":"tracked.md"}"#,
             ),
             global_file,
-            untracked_file,
+            sibling_file,
         ];
         index_rows.extend((0..30).map(|index| {
             let file_id = format!("01920000-0000-7000-8000-{index:012x}");
@@ -8150,15 +8036,14 @@ mod tests {
         );
         global_blob.global = true;
         global_blob.change_id = Some(ChangeId::for_test_label("global-blob"));
-        let mut untracked_blob = live_blob_ref_row(
+        let mut sibling_blob = live_blob_ref_row(
             "01920000-0000-7000-8000-000000000132",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000132",
-            &BlobId::from_content(&untracked_data).to_hex(),
-            untracked_data.len(),
+            &BlobId::from_content(&sibling_data).to_hex(),
+            sibling_data.len(),
         );
-        untracked_blob.untracked = true;
-        untracked_blob.change_id = Some(ChangeId::for_test_label("untracked-blob"));
+        sibling_blob.change_id = Some(ChangeId::for_test_label("sibling-blob"));
         // A malformed `(entity=01920000-0000-7000-8000-000000000122, file=different-file-id)` row must
         // never be fetched for the exact descriptor identity.
         let mut misplaced_blob = live_blob_ref_row(
@@ -8172,7 +8057,7 @@ mod tests {
         index_rows.extend([
             tracked_blob.clone(),
             global_blob.clone(),
-            untracked_blob.clone(),
+            sibling_blob.clone(),
             misplaced_blob.clone(),
         ]);
         let index =
@@ -8229,7 +8114,7 @@ mod tests {
             .zip(change_ids.iter())
             .filter_map(|(path, change_id)| {
                 let path = path?;
-                if !matches!(path, "/global.md" | "/tracked.md" | "/untracked.md") {
+                if !matches!(path, "/global.md" | "/tracked.md" | "/sibling.md") {
                     return None;
                 }
                 change_id.map(|change_id| (path.to_string(), change_id.to_string()))
@@ -8247,8 +8132,8 @@ mod tests {
                     ChangeId::for_test_label("tracked-blob").to_string(),
                 ),
                 (
-                    "/untracked.md".to_string(),
-                    ChangeId::for_test_label("untracked-blob").to_string(),
+                    "/sibling.md".to_string(),
+                    ChangeId::for_test_label("sibling-blob").to_string(),
                 ),
             ])
         );
@@ -8409,7 +8294,6 @@ mod tests {
             &BTreeSet::from([blob_ref_key(
                 "01920000-0000-7000-8000-0000000000b1",
                 false,
-                false,
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
         )
@@ -8446,17 +8330,11 @@ mod tests {
         )
     }
 
-    fn blob_ref_key(
-        branch_id: &str,
-        global: bool,
-        untracked: bool,
-        file_id: &str,
-    ) -> FilesystemBlobRefKey {
+    fn blob_ref_key(branch_id: &str, global: bool, file_id: &str) -> FilesystemBlobRefKey {
         FilesystemBlobRefKey::from_context(
             &FilesystemRowContext {
                 branch_id: branch_id.to_string(),
                 global,
-                untracked,
                 file_id: None,
                 metadata: None,
             },
@@ -8580,9 +8458,6 @@ mod tests {
                                 row.schema_key == requested.schema_key
                                     && row.entity_pk == requested.entity_pk
                                     && row.file_id == requested.file_id
-                                    && request
-                                        .untracked
-                                        .is_none_or(|untracked| row.untracked == untracked)
                             };
                             let mut row = self
                                 .rows
@@ -8825,7 +8700,6 @@ mod tests {
                             None => NullableKeyFilter::Null,
                         })
                         .collect(),
-                    untracked: request.untracked,
                     include_tombstones: request.include_tombstones,
                     ..LiveStateFilter::default()
                 },
@@ -8858,9 +8732,6 @@ mod tests {
                                 row.schema_key == requested.schema_key
                                     && row.entity_pk == requested.entity_pk
                                     && row.file_id == requested.file_id
-                                    && request
-                                        .untracked
-                                        .is_none_or(|untracked| row.untracked == untracked)
                             };
                             let mut row = self
                                 .rows
@@ -8977,7 +8848,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
@@ -9005,7 +8875,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
@@ -9531,7 +9400,6 @@ mod tests {
                 false,
                 None,
                 None,
-                false,
                 branch_id,
             );
             builder.push_materialized_ref(
@@ -9549,7 +9417,6 @@ mod tests {
                 false,
                 None,
                 None,
-                false,
                 branch_id,
             );
         }
@@ -9962,7 +9829,6 @@ mod tests {
             vec!["01920000-0000-7000-8000-0000000000b1"]
         );
         assert_eq!(requests[0].filter.file_ids, vec![NullableKeyFilter::Null]);
-        assert_eq!(requests[0].filter.untracked, Some(false));
         assert_eq!(requests[0].limit, Some(1));
         assert_eq!(
             requests[1].filter.entity_pks,
@@ -10540,7 +10406,6 @@ mod tests {
             super::filesystem_storage_scope_key(
                 "01920000-0000-7000-8000-0000000000b1",
                 false,
-                false,
                 None,
             ),
             super::DirectoryPathResolver::from_existing([(
@@ -10585,7 +10450,6 @@ mod tests {
         resolvers.insert(
             super::filesystem_storage_scope_key(
                 "01920000-0000-7000-8000-0000000000b1",
-                false,
                 false,
                 None,
             ),
@@ -10726,7 +10590,6 @@ mod tests {
             super::filesystem_storage_scope_key(
                 "01920000-0000-7000-8000-0000000000b1",
                 false,
-                false,
                 None,
             ),
             super::DirectoryPathResolver::from_existing([(
@@ -10775,7 +10638,6 @@ mod tests {
         resolvers.insert(
             super::filesystem_storage_scope_key(
                 "01920000-0000-7000-8000-0000000000b1",
-                false,
                 false,
                 None,
             ),
@@ -10869,7 +10731,6 @@ mod tests {
             &BTreeSet::from([blob_ref_key(
                 "01920000-0000-7000-8000-0000000000b1",
                 false,
-                false,
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
             &BTreeSet::new(),
@@ -10932,7 +10793,6 @@ mod tests {
             &mut test_id_generator(&["should-not-be-used"]),
             &BTreeSet::from([blob_ref_key(
                 "01920000-0000-7000-8000-0000000000a1",
-                false,
                 false,
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
@@ -11007,7 +10867,6 @@ mod tests {
             &BTreeSet::from([blob_ref_key(
                 "01920000-0000-7000-8000-0000000000b1",
                 false,
-                false,
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
             None,
@@ -11073,7 +10932,6 @@ mod tests {
             &BTreeSet::from([blob_ref_key(
                 "01920000-0000-7000-8000-0000000000a1",
                 false,
-                false,
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
             None,
@@ -11091,7 +10949,6 @@ mod tests {
         resolvers.insert(
             super::filesystem_storage_scope_key(
                 "01920000-0000-7000-8000-0000000000b1",
-                false,
                 false,
                 None,
             ),
@@ -12067,39 +11924,6 @@ mod tests {
                 row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
             })
         );
-    }
-
-    #[tokio::test]
-    async fn fast_file_path_write_declines_ambiguous_cross_scope_paths() {
-        let tracked = live_file_row(
-            "01920000-0000-7000-8000-000000000122",
-            "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-000000000122","directory_id":null,"name":"shared.md"}"#,
-        );
-        let mut untracked = live_file_row(
-            "01920000-0000-7000-8000-000000000132",
-            "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-000000000132","directory_id":null,"name":"shared.md"}"#,
-        );
-        untracked.untracked = true;
-        let mut write_context = CapturingWriteContext {
-            rows: vec![tracked, untracked],
-            ..CapturingWriteContext::default()
-        };
-
-        let outcome = super::execute_fast_lix_file_path_writes(
-            &mut write_context,
-            vec![("/shared.md".to_string(), b"new".to_vec().into(), None, None)],
-            super::FastLixFilePathWriteConflict::UpdateContentAndMetadata,
-            None,
-        )
-        .await
-        .expect("ambiguous legacy topology should decline the fast path");
-
-        assert_eq!(outcome, None);
-        assert_eq!(write_context.path_index_count, 1);
-        assert_eq!(write_context.scan_count, 1);
-        assert!(write_context.writes.is_empty());
     }
 
     #[tokio::test]

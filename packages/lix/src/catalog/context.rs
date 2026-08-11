@@ -73,7 +73,7 @@ impl CatalogContext {
     ///
     /// The revision is loaded from the same pinned read as `live_state`. A
     /// matching `(domain, revision)` therefore proves that registered-schema
-    /// visibility is identical without rescanning its tracked and untracked
+    /// visibility is identical without rescanning separate durability
     /// rows. Missing revisions conservatively retain the scan path for stores
     /// initialized by older engines.
     pub(crate) async fn compiled_catalog_for_transaction_open<R>(
@@ -205,7 +205,7 @@ impl CatalogContext {
 
     /// Projects schema definitions for SQL surface-planning cache tests.
     ///
-    /// SQL surfaces are a read-planning projection over the active untracked
+    /// SQL surfaces are a read-planning projection over the active current
     /// schema catalog. Validation must use `schema_facts_for_domain` instead so
     /// schema durability remains explicit.
     #[cfg(test)]
@@ -219,7 +219,7 @@ impl CatalogContext {
     {
         self.sql_read_schema_loads.fetch_add(1, Ordering::Relaxed);
         let facts = self
-            .schema_facts_for_domain(live_state, &Domain::schema_catalog(branch_id, true))
+            .schema_facts_for_domain(live_state, &Domain::schema_catalog(branch_id))
             .await?;
         let mut schemas = BTreeMap::<String, JsonValue>::new();
         for fact in facts {
@@ -294,17 +294,12 @@ where
                 schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
                 branch_ids: vec![schema_domain.branch_id().to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
-                untracked: Some(schema_domain.untracked()),
                 include_tombstones: false,
                 ..LiveStateFilter::default()
             },
             ..LiveStateScanRequest::default()
         };
-        let rows = if schema_domain.untracked() {
-            live_state.scan_batch(&request).await?
-        } else {
-            live_state.scan_tracked_batch(&request).await?
-        };
+        let rows = live_state.scan_tracked_batch(&request).await?;
         catalog_rows.push(CatalogDomainRows {
             domain: schema_domain,
             rows,
@@ -339,7 +334,6 @@ fn row_belongs_to_schema_catalog_domain(
         && row.file_id().is_none()
         && row.snapshot_content().is_some()
         && row.branch_id() == domain.branch_id()
-        && row.untracked() == domain.untracked()
         && committed_row_ref_is_exact_branch_scoped(row, domain.branch_id())
 }
 
@@ -390,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn compiled_catalog_for_domain_hits_cache_without_decoding() {
         let context = CatalogContext::new();
-        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff");
         let reader = RowsLiveStateReader::new(vec![
             registered_schema_row("alpha_schema"),
             registered_schema_row("beta_schema"),
@@ -428,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn transaction_opening_revision_skips_catalog_row_scans_until_it_changes() {
         let context = CatalogContext::new();
-        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff");
         let revision = CatalogRevision::for_test(b"revision-one");
         let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
@@ -438,8 +432,8 @@ mod tests {
             .expect("opening catalog should compile");
         assert_eq!(
             reader.scan_count(),
-            2,
-            "cold open scans both durability scopes"
+            1,
+            "cold open scans the single schema-catalog scope"
         );
         let second = context
             .compiled_catalog_for_transaction_open(&reader, &domain, Some(&revision))
@@ -448,7 +442,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(
             reader.scan_count(),
-            2,
+            1,
             "hot open must not rescan registered-schema rows"
         );
 
@@ -461,31 +455,32 @@ mod tests {
             )
             .await
             .expect("changed revision should reload the catalog");
-        assert_eq!(changed_reader.scan_count(), 2);
+        assert_eq!(changed_reader.scan_count(), 1);
         assert!(changed.contains("beta_schema"));
         assert!(!changed.contains("alpha_schema"));
     }
 
     #[tokio::test]
-    async fn transaction_opening_revision_caches_tracked_and_sql_catalogs_separately() {
+    async fn transaction_opening_revision_reuses_the_single_schema_catalog() {
         let context = CatalogContext::new();
-        let sql_domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
-        let tracked_domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false);
+        let sql_domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff");
+        let tracked_domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff");
         let revision = CatalogRevision::for_test(b"revision-one");
         let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
-        context
+        let sql_catalog = context
             .compiled_catalog_for_transaction_open(&reader, &sql_domain, Some(&revision))
             .await
             .expect("SQL catalog should compile");
-        context
+        let tracked_catalog = context
             .compiled_catalog_for_transaction_open(&reader, &tracked_domain, Some(&revision))
             .await
             .expect("tracked catalog should compile");
+        assert!(Arc::ptr_eq(&sql_catalog, &tracked_catalog));
         assert_eq!(
             reader.scan_count(),
-            3,
-            "a cold SQL catalog scans two scopes and a cold tracked catalog scans one"
+            1,
+            "SQL and transaction planning share one schema-catalog scope"
         );
 
         context
@@ -498,15 +493,15 @@ mod tests {
             .expect("tracked catalog should hit by revision");
         assert_eq!(
             reader.scan_count(),
-            3,
-            "hot transaction opens must not rescan either schema catalog"
+            1,
+            "hot transaction opens must not rescan the schema catalog"
         );
     }
 
     #[tokio::test]
     async fn missing_transaction_opening_revision_conservatively_rescans() {
         let context = CatalogContext::new();
-        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff");
         let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
         context
@@ -518,7 +513,7 @@ mod tests {
             .await
             .expect("second opening catalog should compile");
 
-        assert_eq!(reader.scan_count(), 4);
+        assert_eq!(reader.scan_count(), 2);
     }
 
     #[test]
@@ -549,7 +544,7 @@ mod tests {
 
     fn catalog_fact(schema_key: &str) -> SchemaCatalogFact {
         SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
+            Domain::schema_catalog("main"),
             crate::schema::SchemaKey::new(schema_key),
             json!({
                 "x-lix-key": schema_key,
@@ -590,13 +585,11 @@ mod tests {
     #[tokio::test]
     async fn compiled_catalog_projects_the_same_sql_visible_schemas() {
         let context = CatalogContext::new();
-        let mut tracked = registered_schema_row("zeta_tracked_schema");
-        tracked.untracked = false;
         let reader = RowsLiveStateReader::new(vec![
-            registered_schema_row("alpha_untracked_schema"),
-            tracked,
+            registered_schema_row("alpha_schema"),
+            registered_schema_row("zeta_schema"),
         ]);
-        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff");
 
         let durable_projection = context
             .schema_jsons_for_sql_read_planning(&reader, "ffffffff-ffff-7fff-bfff-ffffffffffff")
@@ -647,56 +640,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_domain_sees_tracked_seed_schemas_but_not_user_untracked_schemas() {
-        let context = CatalogContext::new();
-        let mut seed_schema = registered_schema_row("lix_key_value");
-        seed_schema.untracked = false;
-
-        let facts = context
-            .schema_facts_for_domain(
-                &RowsLiveStateReader::new(vec![
-                    seed_schema,
-                    registered_schema_row("engine_dynamic_schema"),
-                ]),
-                &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false),
-            )
-            .await
-            .expect("schema visibility should load");
-        let schemas = facts
-            .iter()
-            .map(SchemaCatalogFact::schema)
-            .collect::<Vec<_>>();
-
-        assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
-        }));
-        assert!(!schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
-        }));
-    }
-
-    #[tokio::test]
-    async fn tracked_domain_does_not_see_untracked_seed_schemas() {
-        let context = CatalogContext::new();
-
-        let facts = context
-            .schema_facts_for_domain(
-                &RowsLiveStateReader::new(vec![registered_schema_row("lix_key_value")]),
-                &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false),
-            )
-            .await
-            .expect("schema visibility should load");
-        let schemas = facts
-            .iter()
-            .map(SchemaCatalogFact::schema)
-            .collect::<Vec<_>>();
-
-        assert!(!schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
-        }));
-    }
-
-    #[tokio::test]
     async fn visible_schemas_ignore_projected_global_schema_rows_for_branch_scope() {
         let context = CatalogContext::new();
         let mut global_only = registered_schema_row("global_only_schema");
@@ -730,7 +673,7 @@ mod tests {
                     file_scoped_schema,
                     tombstoned_schema,
                 ]),
-                &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true),
+                &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff"),
             )
             .await
             .expect("schema facts should load");
@@ -804,12 +747,6 @@ mod tests {
                                 .iter()
                                 .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref())
                     })
-                    .filter(|row| {
-                        request
-                            .filter
-                            .untracked
-                            .is_none_or(|untracked| row.untracked == untracked)
-                    })
                     .cloned()
                     .collect(),
             ))
@@ -827,7 +764,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label("change-registered-schema")),
             commit_id: None,
             global: true,
-            untracked: true,
             created_at: LixTimestamp::expect_parse(
                 "registered schema test created_at",
                 "2026-04-23T00:00:00Z",

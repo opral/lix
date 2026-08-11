@@ -36,7 +36,7 @@ where
     /// Creates a new branch from this session's current branch head.
     ///
     /// Branch descriptors are tracked global facts so every branch agrees on
-    /// which branches exist. Branch refs are untracked global moving pointers:
+    /// which branches exist. Branch refs are global moving pointers:
     /// each update is a changelog fact, but never a commit member.
     pub async fn create_branch(
         &self,

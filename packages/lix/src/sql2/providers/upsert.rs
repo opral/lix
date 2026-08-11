@@ -242,7 +242,7 @@ pub(super) trait UpsertSupport: Send + Sync {
 
     /// Validate a matched existing/proposed pair before applying the conflict
     /// action. Most tables need no extra check; filesystem path targets use it
-    /// to reject tracked/untracked namespace collisions.
+    /// to reject namespace collisions.
     fn validate_conflict_pair(
         &self,
         _existing: &RecordBatch,

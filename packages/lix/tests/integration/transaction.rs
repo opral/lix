@@ -12,9 +12,9 @@ use lix::storage::{
 };
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-const UNTRACKED_RACE_BRANCH_ID: &str = "01930000-0000-7000-8000-000000000018";
+const FK_RACE_BRANCH_ID: &str = "01930000-0000-7000-8000-000000000018";
 
-async fn setup_untracked_race_branch<StorageImpl>(engine: &Engine<StorageImpl>)
+async fn setup_fk_race_branch<StorageImpl>(engine: &Engine<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -24,24 +24,24 @@ where
         .expect("setup session should open");
     setup
         .execute(
-            r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (lix_json('{"x-lix-key":"untracked_race_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false, false)"#,
+            r#"INSERT INTO lix_registered_schema (value, lixcol_global)
+               VALUES (lix_json('{"x-lix-key":"fk_race_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false)"#,
             &[],
         )
         .await
         .expect("parent schema should register");
     setup
         .execute(
-            r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (lix_json('{"x-lix-key":"untracked_race_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"untracked_race_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}'), false, false)"#,
+            r#"INSERT INTO lix_registered_schema (value, lixcol_global)
+               VALUES (lix_json('{"x-lix-key":"fk_race_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"fk_race_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}'), false)"#,
             &[],
         )
         .await
         .expect("child schema should register");
     setup
         .create_branch(CreateBranchOptions {
-            id: Some(UNTRACKED_RACE_BRANCH_ID.to_string()),
-            name: "Untracked race".to_string(),
+            id: Some(FK_RACE_BRANCH_ID.to_string()),
+            name: "FK race".to_string(),
             from_commit_id: None,
         })
         .await
@@ -171,8 +171,8 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
     let concurrent_session = engine.open_workspace_session().await.unwrap();
     concurrent_session
         .execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-             VALUES ('snapshot-key', 'base', false)",
+            "INSERT INTO lix_key_value (key, value) \
+             VALUES ('snapshot-key', 'base')",
             &[],
         )
         .await
@@ -192,8 +192,8 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
     );
     concurrent_session
         .execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-             VALUES ('snapshot-key', 'concurrent', false) \
+            "INSERT INTO lix_key_value (key, value) \
+             VALUES ('snapshot-key', 'concurrent') \
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             &[],
         )
@@ -242,8 +242,8 @@ simulation_test!(
         );
         session
             .execute(
-                r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-                   VALUES (lix_json('{"x-lix-key":"transaction_collection_delete","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false, false)"#,
+                r#"INSERT INTO lix_registered_schema (value, lixcol_global)
+                   VALUES (lix_json('{"x-lix-key":"transaction_collection_delete","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false)"#,
                 &[],
             )
             .await
@@ -362,10 +362,10 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
     );
 }
 
-/// An untracked write may validate a foreign key against tracked state. It must
+/// An fk write may validate a foreign key against tracked state. It must
 /// therefore retry when that tracked state changes before its storage commit.
 #[tokio::test]
-async fn untracked_commit_retries_when_tracked_fk_target_changes_after_validation() {
+async fn fk_commit_retries_when_tracked_fk_target_changes_after_validation() {
     let storage = BlockingCommitStorage::new();
     Engine::initialize(storage.clone())
         .await
@@ -374,74 +374,68 @@ async fn untracked_commit_retries_when_tracked_fk_target_changes_after_validatio
     let setup_engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create a setup engine");
-    setup_untracked_race_branch(&setup_engine).await;
+    setup_fk_race_branch(&setup_engine).await;
 
     // Separate engines avoid the per-engine collaboration gate so this test
     // exercises exactly the storage-level optimistic-concurrency boundary.
     let tracked_engine = Engine::new(storage.clone())
         .await
         .expect("tracked engine should open");
-    let untracked_engine = Engine::new(storage.clone())
+    let fk_engine = Engine::new(storage.clone())
         .await
-        .expect("untracked engine should open");
+        .expect("fk engine should open");
     let tracked_session = tracked_engine
-        .open_session(UNTRACKED_RACE_BRANCH_ID)
+        .open_session(FK_RACE_BRANCH_ID)
         .await
         .expect("tracked session should open");
-    let untracked_session = untracked_engine
-        .open_session(UNTRACKED_RACE_BRANCH_ID)
+    let fk_session = fk_engine
+        .open_session(FK_RACE_BRANCH_ID)
         .await
-        .expect("untracked session should open");
+        .expect("fk session should open");
 
     tracked_session
-        .execute(
-            "INSERT INTO untracked_race_parent (id) VALUES ('parent-1')",
-            &[],
-        )
+        .execute("INSERT INTO fk_race_parent (id) VALUES ('parent-1')", &[])
         .await
         .expect("tracked parent should seed");
 
-    let mut untracked_insert = untracked_session
+    let mut fk_insert = fk_session
         .begin_transaction()
         .await
-        .expect("untracked transaction should begin");
-    untracked_insert
+        .expect("fk transaction should begin");
+    fk_insert
         .execute(
-            "INSERT INTO untracked_race_child (id, parent_id, lixcol_untracked) VALUES ('child-1', 'parent-1', true)",
+            "INSERT INTO fk_race_child (id, parent_id) VALUES ('child-1', 'parent-1')",
             &[],
         )
         .await
-        .expect("untracked child should stage");
+        .expect("fk child should stage");
 
     let gate = storage.gate();
     gate.block_next_write();
-    let untracked_commit = thread::spawn(move || {
+    let fk_commit = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime should build");
-        runtime.block_on(async move { untracked_insert.commit().await })
+        runtime.block_on(async move { fk_insert.commit().await })
     });
     gate.wait_until_blocked();
 
     let tracked_delete_result = tracked_session
-        .execute(
-            "DELETE FROM untracked_race_parent WHERE id = 'parent-1'",
-            &[],
-        )
+        .execute("DELETE FROM fk_race_parent WHERE id = 'parent-1'", &[])
         .await;
     gate.release();
-    tracked_delete_result.expect("tracked delete should commit while untracked write is blocked");
-    let error = join_thread(untracked_commit, "blocked untracked foreign-key insert")
-        .expect_err("untracked write validated against stale tracked state must retry");
+    tracked_delete_result.expect("tracked delete should commit while fk write is blocked");
+    let error = join_thread(fk_commit, "blocked fk foreign-key insert")
+        .expect_err("fk write validated against stale tracked state must retry");
     assert_eq!(error.code, "LIX_TRANSACTION_CONFLICT");
 
-    let retry_error = untracked_session
+    let retry_error = fk_session
         .execute(
-            "INSERT INTO untracked_race_child (id, parent_id, lixcol_untracked) VALUES ('child-1', 'parent-1', true)",
+            "INSERT INTO fk_race_child (id, parent_id) VALUES ('child-1', 'parent-1')",
             &[],
         )
         .await
-        .expect_err("fresh untracked insert must observe that its tracked FK target was deleted");
+        .expect_err("fresh fk insert must observe that its tracked FK target was deleted");
     assert_eq!(retry_error.code, "LIX_ERROR_FOREIGN_KEY");
 }
 
@@ -676,9 +670,9 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
 
     session
         .execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_key_value (key, value, lixcol_global) \
              VALUES ('lix_deterministic_mode', \
-             lix_json('{\"enabled\":true}'), true, true)",
+             lix_json('{\"enabled\":true}'), true)",
             &[],
         )
         .await

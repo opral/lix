@@ -185,10 +185,9 @@ async fn register_pushdown_note_schema(
 ) {
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"pushdown_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"},\"optional\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"id\",\"kind\",\"title\",\"score\"],\"additionalProperties\":false}'),\
-             false,\
              false\
              )",
             &[],

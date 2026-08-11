@@ -491,7 +491,7 @@ pub(crate) struct RebuildIndexStats {
 pub(crate) enum GcRoot {
     BranchHead(CommitId),
     StandaloneChange(ChangeId),
-    /// A history-free untracked current-state member owns this payload
+    /// A history-free engine current-state member owns this payload
     /// directly, without a changelog record to retain it.
     CurrentPayload(JsonRef),
 }

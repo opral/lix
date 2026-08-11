@@ -267,7 +267,6 @@ pub(crate) fn require_existing_id_authorities(
                 && row.file_id() == Some(file_id)
                 && row.branch_id() == branch_id
                 && !row.global()
-                && !row.untracked()
         });
         if !valid {
             return Err(LixError::new(
@@ -435,7 +434,6 @@ fn reservation_row(
         global: false,
         change_id: None,
         commit_id: None,
-        untracked: false,
         branch_id: branch_id.into(),
     })
 }
@@ -451,7 +449,6 @@ fn validate_reservation_identity(
         || row.file_id.as_deref() != Some(file_id)
         || row.branch_id.as_ref() != branch_id
         || row.global
-        || row.untracked
         || row.deleted
     {
         return Err(invalid_id(format!(
@@ -598,7 +595,6 @@ mod tests {
             global: false,
             change_id: None,
             commit_id: None,
-            untracked: false,
             branch_id: "main".into(),
         }
     }
@@ -671,7 +667,6 @@ mod tests {
             global: false,
             change_id: None,
             commit_id: None,
-            untracked: false,
             branch_id: "main".into(),
         };
 

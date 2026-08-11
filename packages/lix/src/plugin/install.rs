@@ -34,14 +34,13 @@ pub(crate) fn plugin_install_plan_from_archive_path(
     archive_bytes: &[u8],
     branch_id: &str,
     global: bool,
-    untracked: bool,
 ) -> Result<PluginArchiveInstallPlan, LixError> {
-    if global || untracked {
+    if global {
         return Err(LixError::new(
             LixError::CODE_CONSTRAINT_VIOLATION,
             "Plugin archives must be tracked and branch-local",
         )
-        .with_hint("Install the plugin without GLOBAL or UNTRACKED scope."));
+        .with_hint("Install the plugin without GLOBAL scope."));
     }
     let plugin_key = plugin_key_from_archive_path(archive_path).ok_or_else(|| {
         LixError::new(
@@ -59,7 +58,7 @@ pub(crate) fn plugin_install_plan_from_archive_path(
             ),
         ));
     }
-    let schema_rows = plugin_schema_rows(&parsed, branch_id, global, untracked)?;
+    let schema_rows = plugin_schema_rows(&parsed, branch_id, global)?;
     Ok(PluginArchiveInstallPlan {
         archive_file_id: plugin_storage_archive_file_id(&plugin_key),
         plugin_key,
@@ -72,7 +71,6 @@ fn plugin_schema_rows(
     parsed: &ParsedPluginArchive,
     branch_id: &str,
     global: bool,
-    untracked: bool,
 ) -> Result<RawWriteBatch, LixError> {
     if parsed.schemas.len() != parsed.schema_keys.len() {
         return Err(LixError::new(
@@ -97,7 +95,6 @@ fn plugin_schema_rows(
             global,
             None,
             None,
-            untracked,
             branch_id.into(),
         );
     }
@@ -134,7 +131,6 @@ mod tests {
             &archive,
             "draft",
             false,
-            false,
         )
         .expect("canonical plugin should produce one install plan");
 
@@ -167,7 +163,6 @@ mod tests {
             &archive,
             "main",
             false,
-            false,
         )
         .expect("content is part of the durable matcher contract");
 
@@ -187,7 +182,7 @@ mod tests {
         for (plugin_key, path_glob) in cases {
             let archive = plugin_archive_for(plugin_key, path_glob, Some("text"));
             let path = format!("/.lix/plugins/{plugin_key}.lixplugin");
-            let plan = plugin_install_plan_from_archive_path(&path, &archive, "main", false, false)
+            let plan = plugin_install_plan_from_archive_path(&path, &archive, "main", false)
                 .unwrap_or_else(|error| {
                     panic!("bundled {plugin_key} manifest must install: {error:?}")
                 });
@@ -209,7 +204,6 @@ mod tests {
             &archive,
             "main",
             false,
-            false,
         )
         .expect_err("archive path and manifest keys define one identity");
 
@@ -218,23 +212,17 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_rejects_global_and_untracked_lifecycles_before_parsing() {
-        for (global, untracked) in [(true, false), (false, true), (true, true)] {
-            let error = plugin_install_plan_from_archive_path(
-                "/.lix/plugins/plugin_test.lixplugin",
-                b"not parsed because the lifecycle scope is unsupported",
-                "main",
-                global,
-                untracked,
-            )
-            .expect_err("plugin registry entries are tracked and branch-local");
+    fn install_plan_rejects_global_lifecycle_before_parsing() {
+        let error = plugin_install_plan_from_archive_path(
+            "/.lix/plugins/plugin_test.lixplugin",
+            b"not parsed because the lifecycle scope is unsupported",
+            "main",
+            true,
+        )
+        .expect_err("plugin registry entries are branch-local");
 
-            assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-            assert!(
-                error.message.contains("tracked and branch-local"),
-                "{error:?}"
-            );
-        }
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("branch-local"), "{error:?}");
     }
 
     fn plugin_archive(content: Option<&str>) -> Vec<u8> {

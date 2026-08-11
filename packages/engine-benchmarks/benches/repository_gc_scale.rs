@@ -242,7 +242,7 @@ where
         "additionalProperties": false
     });
     main.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+        "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
         &[Value::Text(schema.to_string())],
     )
     .await

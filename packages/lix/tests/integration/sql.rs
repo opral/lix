@@ -111,7 +111,6 @@ mod lix_registered_schema;
 mod metadata;
 mod read_only;
 mod udfs;
-mod untracked_current_state;
 mod write_returning;
 
 use lix::ExecuteResult;

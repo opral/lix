@@ -455,7 +455,6 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]);
     if by_branch {
@@ -594,7 +593,6 @@ fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::hidden("lixcol_created_at", false),
         PublicColumn::hidden("lixcol_updated_at", false),
         PublicColumn::hidden("lixcol_commit_id", true),
-        PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
         PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
     ];
     if by_branch {
@@ -625,7 +623,6 @@ fn entity_system_columns(
         PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
         PublicColumn::public_read_only("lixcol_change_id", true),
         PublicColumn::public_read_only("lixcol_commit_id", true),
-        PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
     ];
     if variant == EntitySurfaceShape::ByBranch {
         columns.push(PublicColumn::public_insert_only("lixcol_branch_id", false));

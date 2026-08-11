@@ -51,7 +51,6 @@ pub(crate) fn checkpoint_stage_row(commit_id: &CommitId, change_id: String) -> T
         global: true,
         change_id: Some(change_id),
         commit_id: None,
-        untracked: false,
         branch_id: GLOBAL_BRANCH_ID.into(),
     }
 }

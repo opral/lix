@@ -173,7 +173,6 @@ where
     candidate_request.limit = None;
     candidate_request.filter.include_tombstones = true;
     candidate_request.filter.branch_ids = expanded_branch_ids(&request.filter.branch_ids);
-    candidate_request.filter.untracked = Some(false);
     let staged_rows = staged.staged_batch(&candidate_request)?;
     let rows = base.scan_tracked_batch(&candidate_request).await?;
     Ok(resolve_visible_batch(
@@ -239,7 +238,6 @@ where
     let staged_request = LiveStateExactBatchRequest {
         rows: staged_requests,
         projection: request.projection.clone(),
-        untracked: request.untracked,
         include_tombstones: true,
     };
     let staged_rows = staged.load_exact_batch(&staged_request)?;
@@ -532,7 +530,6 @@ mod tests {
                 global: false,
                 change_id: None,
                 commit_id: None,
-                untracked: true,
                 branch_id: branch_id.into(),
             })
             .collect();
@@ -629,26 +626,23 @@ mod tests {
 
     #[test]
     fn empty_branch_filter_uses_last_base_row_for_duplicate_identity() {
-        let mut tracked = row_at(
+        let first = row_at(
             "01920000-0000-7000-8000-0000000000a1",
             "entity",
-            "tracked",
+            "first",
             false,
-            Some("change-tracked"),
+            Some("change-first"),
         );
-        tracked.untracked = false;
-        let mut untracked = row_at(
+        let second = row_at(
             "01920000-0000-7000-8000-0000000000a1",
             "entity",
-            "untracked",
+            "second",
             false,
-            Some("change-untracked"),
+            Some("change-second"),
         );
-        untracked.untracked = true;
-        untracked.commit_id = None;
 
         let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![tracked, untracked]),
+            &MaterializedLiveStateBatch::from_rows(vec![first, second]),
             &MaterializedLiveStateBatch::default(),
             &[],
             false,
@@ -657,10 +651,9 @@ mod tests {
         .into_rows();
 
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"untracked\"}")
+            Some("{\"value\":\"second\"}")
         );
     }
 
@@ -726,28 +719,25 @@ mod tests {
     }
 
     #[test]
-    fn staged_duplicate_identity_uses_last_mutation_without_tracking_lane_preference() {
-        let mut tracked = row_at(
+    fn staged_duplicate_identity_uses_last_mutation() {
+        let first = row_at(
             "01920000-0000-7000-8000-0000000000a1",
             "entity",
-            "tracked",
+            "first",
             false,
-            Some("change-tracked"),
+            Some("change-first"),
         );
-        tracked.untracked = false;
-        let mut untracked = row_at(
+        let second = row_at(
             "01920000-0000-7000-8000-0000000000a1",
             "entity",
-            "untracked",
+            "second",
             false,
-            Some("change-untracked"),
+            Some("change-second"),
         );
-        untracked.untracked = true;
-        untracked.commit_id = None;
 
         let rows = resolve_live_state_batch(
             &MaterializedLiveStateBatch::default(),
-            &MaterializedLiveStateBatch::from_rows(vec![untracked.clone(), tracked.clone()]),
+            &MaterializedLiveStateBatch::from_rows(vec![second.clone(), first.clone()]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -755,15 +745,14 @@ mod tests {
         .into_rows();
 
         assert_eq!(rows.len(), 1);
-        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"tracked\"}")
+            Some("{\"value\":\"first\"}")
         );
 
         let rows = resolve_live_state_batch(
             &MaterializedLiveStateBatch::default(),
-            &MaterializedLiveStateBatch::from_rows(vec![tracked, untracked]),
+            &MaterializedLiveStateBatch::from_rows(vec![first, second]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -771,33 +760,28 @@ mod tests {
         .into_rows();
 
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"untracked\"}")
+            Some("{\"value\":\"second\"}")
         );
     }
 
     #[test]
     fn staged_row_replaces_base_row_for_same_visible_identity() {
-        let mut base = row_at(
+        let base = row_at(
             "01920000-0000-7000-8000-0000000000a1",
             "entity",
-            "base-untracked",
+            "base",
             false,
-            Some("change-base-untracked"),
+            Some("change-base"),
         );
-        base.untracked = true;
-        base.commit_id = None;
-        let mut staged = row_at(
+        let staged = row_at(
             "01920000-0000-7000-8000-0000000000a1",
             "entity",
-            "staged-tracked",
+            "staged",
             false,
             Some("change-staged"),
         );
-        staged.untracked = false;
-
         let rows = resolve_live_state_batch(
             &MaterializedLiveStateBatch::from_rows(vec![base]),
             &MaterializedLiveStateBatch::from_rows(vec![staged]),
@@ -808,10 +792,9 @@ mod tests {
         .into_rows();
 
         assert_eq!(rows.len(), 1);
-        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"staged-tracked\"}")
+            Some("{\"value\":\"staged\"}")
         );
     }
 
@@ -858,36 +841,6 @@ mod tests {
             true,
             Some("change-staged"),
         );
-
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![base]),
-            &MaterializedLiveStateBatch::from_rows(vec![staged]),
-            &["01920000-0000-7000-8000-0000000000a1".to_string()],
-            false,
-            None,
-        )
-        .into_rows();
-
-        assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn base_branch_tombstone_hides_staged_global_row_regardless_of_tracking_state() {
-        let base = tombstone_at(
-            "01920000-0000-7000-8000-0000000000a1",
-            "entity",
-            false,
-            Some("change-base"),
-        );
-        let mut staged = row_at(
-            "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            "entity",
-            "staged",
-            true,
-            Some("change-staged"),
-        );
-        staged.untracked = true;
-        staged.commit_id = None;
 
         let rows = resolve_live_state_batch(
             &MaterializedLiveStateBatch::from_rows(vec![base]),
@@ -1257,7 +1210,6 @@ mod tests {
             global,
             change_id: change_id.map(ChangeId::for_test_label),
             commit_id: Some(CommitId::for_test_label("commit")),
-            untracked: false,
             branch_id: branch_id.into(),
         }
     }

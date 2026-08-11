@@ -101,13 +101,12 @@ pub(crate) fn unsupported_repository_protocol_error() -> LixError {
 ///
 /// Tracked bootstrap facts go to the changelog. Moving heads are seeded in
 /// the direct current-state control plane and retain a standalone immutable
-/// branch-ref ledger change; ordinary untracked data shares the same current
-/// state generation without creating a changelog fact.
+/// branch-ref ledger change. Public key-value state, including the workspace
+/// selector, is historical like every other public entity row.
 pub(crate) struct InitSeedPlan {
     commit: InitSeedCommit,
     changes: Vec<InitSeedChange>,
     branch_controls: Vec<InitBranchHeadControl>,
-    untracked_rows: Vec<InitSeedLiveRow>,
     pub(crate) receipt: InitReceipt,
 }
 
@@ -253,7 +252,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             tracked_generation: initial_commit_id,
-            untracked_generation: initial_commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
@@ -274,7 +272,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             tracked_generation: initial_commit_id,
-            untracked_generation: initial_commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
@@ -284,7 +281,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         },
         branch_ref_change: main_branch_ref_change,
     };
-    let workspace_branch_row = untracked_row(
+    let workspace_branch_change = canonical_change(
         functions.call_uuid_v7(),
         EntityPk::single(WORKSPACE_BRANCH_KEY),
         KEY_VALUE_SCHEMA_KEY,
@@ -303,10 +300,10 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
                 initial_checkpoint_change,
                 system_account_change,
                 anonymous_account_change,
+                workspace_branch_change,
             ])
             .collect(),
         branch_controls: vec![global_branch_control, main_branch_control],
-        untracked_rows: vec![workspace_branch_row],
         receipt: InitReceipt {
             lix_id,
             global_branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -321,7 +318,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 /// The pure seed planner decides which bootstrap facts exist. This function is
 /// only responsible for durably writing those facts to their owning stores:
 /// changelog for tracked changes, and live_state for the serving state
-/// plus untracked moving refs.
+/// plus moving refs.
 pub(crate) async fn initialize<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     tracked_state: &TrackedStateContext,
@@ -348,7 +345,7 @@ where
     let branch_ref_ledger_changes = plan
         .branch_controls
         .iter()
-        .map(|branch| seed_untracked_change_to_change_record(&branch.branch_ref_change))
+        .map(|branch| seed_current_only_change_to_change_record(&branch.branch_ref_change))
         .collect::<Vec<_>>();
 
     stage_init_json_payloads(&mut writes, &plan)?;
@@ -440,7 +437,6 @@ where
                 entity_pk: &change.entity_pk,
                 change_id: Some(change.change_id),
                 commit_id: Some(plan.commit.id),
-                untracked: false,
                 deleted: change.snapshot.is_none(),
                 created_at: change.created_at,
                 updated_at: change.created_at,
@@ -455,22 +451,6 @@ where
             let mut head_deltas = tracked_head_deltas.clone();
             if branch.branch_id != GLOBAL_BRANCH_ID {
                 head_deltas.retain(|delta| delta.schema_key != CHECKPOINT_SCHEMA_KEY);
-            }
-            if branch.branch_id == GLOBAL_BRANCH_ID {
-                head_deltas.extend(plan.untracked_rows.iter().map(|row| CurrentStateDeltaRef {
-                    schema_key: &row.schema_key,
-                    file_id: None,
-                    entity_pk: &row.entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: false,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                    snapshot: crate::json_store::JsonSlotRef::Inline(&row.snapshot_content),
-                    metadata: crate::json_store::JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }));
             }
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
@@ -558,7 +538,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
     }
 }
 
-fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord {
+fn seed_current_only_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord {
     ChangeRecord {
         format_version: 2,
         change_id: row.id,
@@ -586,11 +566,6 @@ fn stage_init_json_payloads(
         plan.changes
             .iter()
             .map(|change| change.snapshot_content.as_str())
-            .chain(
-                plan.untracked_rows
-                    .iter()
-                    .map(|row| row.snapshot_content.as_str()),
-            )
             .chain(
                 plan.branch_controls
                     .iter()
@@ -624,25 +599,6 @@ async fn stage_init_changelog_commit(
             changes,
         })
         .await
-}
-
-fn untracked_row(
-    id: uuid::Uuid,
-    entity_pk: EntityPk,
-    schema_key: &str,
-    snapshot_content: String,
-    timestamp: LixTimestamp,
-) -> InitSeedLiveRow {
-    InitSeedLiveRow {
-        id: ChangeId::from(id),
-        entity_pk,
-        schema_key: schema_key.to_string(),
-        snapshot_content,
-        created_at: timestamp,
-        updated_at: timestamp,
-        global: true,
-        branch_id: GLOBAL_BRANCH_ID.to_string(),
-    }
 }
 
 /// The direct control owns a branch ref's current visibility, while this
@@ -741,11 +697,10 @@ mod tests {
     use crate::tracked_state::TrackedStateContext;
 
     #[test]
-    fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
+    fn plan_init_seed_returns_historical_changes_including_workspace_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 6);
-        assert_eq!(plan.untracked_rows.len(), 1);
+        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 7);
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
@@ -773,7 +728,7 @@ mod tests {
             .iter()
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 7);
         let first_seed_change_id = test_uuid(4);
         assert!(change_ids.contains(&first_seed_change_id));
         assert!(!change_ids.contains(&plan.commit.change_id.to_string()));
@@ -817,14 +772,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_init_seed_keeps_branch_heads_out_of_untracked_state() {
+    fn plan_init_seed_keeps_branch_heads_out_of_entity_history() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
-        assert_eq!(plan.untracked_rows.len(), 1);
-        assert!(
-            plan.untracked_rows
-                .iter()
-                .all(|row| row.schema_key != "lix_branch_ref")
-        );
         assert!(
             plan.changes
                 .iter()
@@ -834,7 +783,7 @@ mod tests {
         for branch in &plan.branch_controls {
             assert_eq!(branch.branch_ref_change.schema_key, BRANCH_REF_SCHEMA_KEY);
             assert_eq!(branch.control.ref_change_id, branch.branch_ref_change.id);
-            let snapshot = untracked_snapshot(&branch.branch_ref_change);
+            let snapshot = current_only_snapshot(&branch.branch_ref_change);
             assert_eq!(
                 snapshot.get("id").and_then(JsonValue::as_str),
                 Some(branch.branch_id.as_str())
@@ -850,7 +799,7 @@ mod tests {
     fn plan_init_seed_workspace_branch_points_to_main_branch() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
         let workspace_row = plan
-            .untracked_rows
+            .changes
             .iter()
             .find(|row| {
                 row.schema_key == KEY_VALUE_SCHEMA_KEY
@@ -858,9 +807,7 @@ mod tests {
             })
             .expect("workspace branch row should exist");
 
-        assert_eq!(workspace_row.branch_id, GLOBAL_BRANCH_ID);
-        assert!(workspace_row.global);
-        let snapshot = untracked_snapshot(workspace_row);
+        let snapshot = snapshot(workspace_row);
         assert_eq!(
             snapshot.get("key").and_then(JsonValue::as_str),
             Some(WORKSPACE_BRANCH_KEY)
@@ -906,7 +853,7 @@ mod tests {
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
                 .expect("initial commit membership should load");
-        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 7);
         assert!(
             !change_refs.contains(&record.change_id),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
@@ -1055,7 +1002,7 @@ mod tests {
         serde_json::from_str(&change.snapshot_content).expect("snapshot should be JSON")
     }
 
-    fn untracked_snapshot(row: &InitSeedLiveRow) -> JsonValue {
+    fn current_only_snapshot(row: &InitSeedLiveRow) -> JsonValue {
         serde_json::from_str(&row.snapshot_content).expect("snapshot should be JSON")
     }
 

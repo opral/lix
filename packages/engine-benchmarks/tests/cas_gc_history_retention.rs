@@ -2,9 +2,7 @@ use lix::Value;
 use lix::integration::Engine;
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
-use lix::storage_bench::{
-    collect_repository_gc_for_bench, read_binary_cas_for_bench, write_binary_cas_for_bench,
-};
+use lix::storage_bench::{collect_repository_gc_for_bench, read_binary_cas_for_bench};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -48,92 +46,6 @@ async fn slatedb_history_blob_survives_until_final_root_release() {
     )
     .await;
     verify_final_state(SlateDB::open(&path).expect("final reopen SlateDB history fixture")).await;
-}
-
-#[tokio::test]
-async fn rocksdb_current_untracked_blob_survives_sweep_and_cold_reopen() {
-    let temp = tempfile::tempdir().expect("create RocksDB untracked fixture");
-    let path = temp.path().join("database");
-    prepare_current_untracked(RocksDB::open(&path).expect("open RocksDB untracked preparation"))
-        .await;
-    verify_current_untracked(RocksDB::open(&path).expect("cold reopen RocksDB untracked fixture"))
-        .await;
-}
-
-#[tokio::test]
-async fn slatedb_current_untracked_blob_survives_sweep_and_cold_reopen() {
-    let temp = tempfile::tempdir().expect("create SlateDB untracked fixture");
-    let path = temp.path().join("database");
-    prepare_current_untracked(SlateDB::open(&path).expect("open SlateDB untracked preparation"))
-        .await;
-    verify_current_untracked(SlateDB::open(&path).expect("cold reopen SlateDB untracked fixture"))
-        .await;
-}
-
-async fn prepare_current_untracked<S>(storage: S)
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    Engine::initialize(storage.clone())
-        .await
-        .expect("untracked repository should initialize");
-    let engine = Engine::new(storage.clone())
-        .await
-        .expect("untracked repository should open");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("untracked session should open");
-    session
-        .execute(
-            "INSERT INTO lix_file (path, content, lixcol_untracked) \
-             VALUES ('/current-untracked.bin', $1, true)",
-            &[Value::Blob(b"durable-current-untracked".to_vec().into())],
-        )
-        .await
-        .expect("current untracked file should publish");
-    let adapter = StorageAdapter::new(storage.clone());
-    let orphan_hash = write_binary_cas_for_bench(&adapter, b"durable-untracked-orphan")
-        .await
-        .expect("untracked unrelated orphan should stage");
-    collect_repository_gc_for_bench(&adapter)
-        .await
-        .expect("untracked preserving sweep should commit");
-    assert!(
-        read_binary_cas_for_bench(&adapter, &orphan_hash)
-            .await
-            .expect("untracked orphan CAS lookup should succeed")
-            .is_none(),
-        "unrelated CAS garbage must reclaim while the current untracked root survives",
-    );
-    drop(session);
-    drop(engine);
-    drop(adapter);
-    drop(storage);
-}
-
-async fn verify_current_untracked<S>(storage: S)
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let engine = Engine::new(storage)
-        .await
-        .expect("untracked repository should cold reopen");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("cold untracked session should open");
-    let content = session
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/current-untracked.bin'",
-            &[],
-        )
-        .await
-        .expect("cold current untracked file should read");
-    assert_eq!(
-        content.rows()[0].get::<Vec<u8>>("content").unwrap(),
-        b"durable-current-untracked",
-    );
 }
 
 async fn prepare_history<S>(storage: S) -> HistoryFixture

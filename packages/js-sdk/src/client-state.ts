@@ -56,7 +56,7 @@ export type OpenClientStateOptions = {
 /**
  * Opens the typed client-state facade over a private local Rust Lix.
  *
- * Values are ordinary global, untracked `lix_key_value` rows. The physical
+ * Values are ordinary global `lix_key_value` rows. The physical
  * prefix is intentionally private so built-in Lix key/value rows never leak
  * through this small API.
  */

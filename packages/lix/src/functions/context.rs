@@ -126,7 +126,7 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::branch::{
-        BranchHeadControlContext, stage_branch_head_control, untracked_lifecycle_generation,
+        BranchHeadControlContext, current_lifecycle_generation, stage_branch_head_control,
     };
     use crate::entity_pk::EntityPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
@@ -366,16 +366,16 @@ mod tests {
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
-        let next_generation = untracked_lifecycle_generation(
+        let next_generation = current_lifecycle_generation(
             GLOBAL_BRANCH_ID,
-            control.untracked_generation,
+            control.tracked_generation,
             next_control.current_state_revision,
         );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_untracked_generation(
+            .stage_current_generation(
                 GLOBAL_BRANCH_ID,
-                control.untracked_generation,
+                control.tracked_generation,
                 next_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: "lix_key_value",
@@ -383,7 +383,6 @@ mod tests {
                     entity_pk: &entity_pk,
                     change_id: None,
                     commit_id: None,
-                    untracked: true,
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -395,7 +394,7 @@ mod tests {
             )
             .await
             .expect("test key-value current row should stage");
-        next_control.untracked_generation = next_generation;
+        next_control.tracked_generation = next_generation;
         next_control.note_schema("lix_key_value");
         stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
             .expect("global control should publish current state");

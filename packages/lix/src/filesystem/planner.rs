@@ -60,7 +60,6 @@ pub(crate) struct DirectoryPathCreatePlan {
 pub(crate) struct FilesystemRowContext {
     pub(crate) branch_id: String,
     pub(crate) global: bool,
-    pub(crate) untracked: bool,
     pub(crate) file_id: Option<String>,
     pub(crate) metadata: Option<TransactionJson>,
 }
@@ -71,7 +70,6 @@ impl FilesystemRowContext {
         Self {
             branch_id: branch_id.into(),
             global: false,
-            untracked: false,
             file_id: None,
             metadata: None,
         }
@@ -82,7 +80,6 @@ impl FilesystemRowContext {
 pub(crate) struct FilesystemDescriptorKey {
     branch_id: String,
     global: bool,
-    untracked: bool,
     file_id: Option<String>,
     descriptor_id: String,
 }
@@ -92,7 +89,6 @@ impl FilesystemDescriptorKey {
         Self {
             branch_id: context.branch_id.clone(),
             global: context.global,
-            untracked: context.untracked,
             file_id: context.file_id.clone(),
             descriptor_id: descriptor_id.to_string(),
         }
@@ -105,7 +101,6 @@ impl FilesystemDescriptorKey {
         Self {
             branch_id: row.branch_id.to_string(),
             global: row.global,
-            untracked: row.untracked,
             file_id: row.file_id.clone(),
             descriptor_id: descriptor_id.into(),
         }
@@ -118,7 +113,6 @@ impl FilesystemDescriptorKey {
         Self {
             branch_id: row.branch_id().to_owned(),
             global: row.global(),
-            untracked: row.untracked(),
             file_id: row.file_id().map(str::to_owned),
             descriptor_id: descriptor_id.into(),
         }
@@ -131,7 +125,6 @@ impl FilesystemDescriptorKey {
         Self {
             branch_id: row.branch_id.to_string(),
             global: row.global,
-            untracked: row.untracked,
             file_id: None,
             descriptor_id: descriptor_id.into(),
         }
@@ -144,7 +137,6 @@ impl FilesystemDescriptorKey {
         Self {
             branch_id: row.branch_id().to_owned(),
             global: row.global(),
-            untracked: row.untracked(),
             file_id: None,
             descriptor_id: descriptor_id.into(),
         }
@@ -154,24 +146,9 @@ impl FilesystemDescriptorKey {
         Self {
             branch_id: self.branch_id.clone(),
             global: self.global,
-            untracked: self.untracked,
             file_id: self.file_id.clone(),
             descriptor_id: descriptor_id.to_string(),
         }
-    }
-
-    pub(crate) fn in_tracked_scope(&self, descriptor_id: &str) -> Self {
-        Self {
-            branch_id: self.branch_id.clone(),
-            global: self.global,
-            untracked: false,
-            file_id: self.file_id.clone(),
-            descriptor_id: descriptor_id.to_string(),
-        }
-    }
-
-    pub(crate) fn is_untracked(&self) -> bool {
-        self.untracked
     }
 
     pub(crate) fn branch_id(&self) -> &str {
@@ -194,7 +171,6 @@ impl FilesystemDescriptorKey {
         FilesystemBlobRefKey(Self {
             branch_id: self.branch_id.clone(),
             global: self.global,
-            untracked: self.untracked,
             file_id: Some(self.descriptor_id.clone()),
             descriptor_id: self.descriptor_id.clone(),
         })
@@ -221,7 +197,6 @@ impl FilesystemBlobRefKey {
         Self(FilesystemDescriptorKey {
             branch_id: context.branch_id.clone(),
             global: context.global,
-            untracked: context.untracked,
             file_id: Some(file_id.to_string()),
             descriptor_id: file_id.to_string(),
         })
@@ -608,8 +583,7 @@ impl DirectoryPathResolver {
                             &existing_id,
                             fallback_entry,
                         )?;
-                        if !context.untracked
-                            && let FilesystemNamespaceEntry::Directory(fallback_id) = fallback_entry
+                        if let FilesystemNamespaceEntry::Directory(fallback_id) = fallback_entry
                             && fallback_id == &existing_id
                         {
                             self.stage_promoted_directory_once(&existing_id, &context, &mut rows)?;
@@ -654,9 +628,7 @@ impl DirectoryPathResolver {
                             seed.name.clone(),
                             seed.id.clone(),
                         )?;
-                        if !context.untracked {
-                            self.stage_promoted_directory_seed_once(seed, &context, &mut rows);
-                        }
+                        self.stage_promoted_directory_seed_once(seed, &context, &mut rows);
                         parent_id = Some(existing_id);
                         continue;
                     }
@@ -747,7 +719,6 @@ impl DirectoryPathResolver {
             name: seed.name,
             context: FilesystemRowContext {
                 file_id: None,
-                untracked: false,
                 ..context.clone()
             },
         }
@@ -1009,11 +980,10 @@ pub(crate) fn plan_parsed_file_path_write_with_resolvers(
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
-    let fallback = fallback_path_resolver(resolvers, &context);
     let resolver = resolvers.entry(path_resolver_key(&context)).or_default();
     plan_parsed_file_path_write_with_fallback(
         resolver,
-        fallback.as_ref(),
+        None,
         parsed,
         id,
         content,
@@ -1074,7 +1044,6 @@ fn plan_parsed_file_path_write_with_fallback(
             Some(filename),
             context.branch_id.clone(),
             context.global,
-            context.untracked,
             content,
         );
         if !file_payload.is_empty() {
@@ -1132,7 +1101,6 @@ pub(crate) fn plan_file_descriptor_write(
             Some(filename),
             input.context.branch_id.clone(),
             input.context.global,
-            input.context.untracked,
             FileContent::inline(data),
         );
         if !file_payload.is_empty() {
@@ -1167,11 +1135,10 @@ pub(crate) fn plan_parsed_file_path_update_with_resolvers(
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
-    let fallback = fallback_path_resolver(resolvers, &context);
     let resolver = resolvers.entry(path_resolver_key(&context)).or_default();
     plan_parsed_file_path_update_with_fallback(
         resolver,
-        fallback.as_ref(),
+        None,
         existing_file_id,
         parsed,
         context,
@@ -1242,10 +1209,9 @@ pub(crate) fn create_directory_path_with_leaf_id_with_resolvers(
 ) -> Result<DirectoryPathCreatePlan, LixError> {
     let segments = parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
     let duplicate_directory_path = directory_path_from_segments(&segments);
-    let fallback = fallback_path_resolver(resolvers, &context);
     let resolver = resolvers.entry(path_resolver_key(&context)).or_default();
     let rows = resolver.plan_directory_segments_with_fallback(
-        fallback.as_ref(),
+        None,
         segments.clone(),
         leaf_id,
         context,
@@ -1280,10 +1246,9 @@ pub(crate) fn plan_parsed_directory_path_update_with_resolvers(
         .expect("parsed directory path should have a leaf segment")
         .clone();
     let parent_segments = &segments[..segments.len() - 1];
-    let fallback = fallback_path_resolver(resolvers, &context);
     let resolver = resolvers.entry(path_resolver_key(&context)).or_default();
     let mut rows = resolver.plan_directory_segments_with_fallback(
-        fallback.as_ref(),
+        None,
         parent_segments.to_vec(),
         None,
         context.clone(),
@@ -1311,24 +1276,10 @@ pub(crate) fn plan_parsed_directory_path_update_with_resolvers(
     Ok(rows)
 }
 
-fn fallback_path_resolver(
-    resolvers: &BTreeMap<String, DirectoryPathResolver>,
-    context: &FilesystemRowContext,
-) -> Option<DirectoryPathResolver> {
-    let fallback_key = filesystem_storage_scope_key(
-        &context.branch_id,
-        context.global,
-        !context.untracked,
-        context.file_id.as_deref(),
-    );
-    resolvers.get(&fallback_key).cloned()
-}
-
 fn path_resolver_key(context: &FilesystemRowContext) -> String {
     filesystem_storage_scope_key(
         &context.branch_id,
         context.global,
-        context.untracked,
         context.file_id.as_deref(),
     )
 }
@@ -1417,12 +1368,8 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
         };
         match row.schema_key() {
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                let resolver_key = filesystem_storage_scope_key(
-                    storage_branch_id,
-                    row.global(),
-                    row.untracked(),
-                    None,
-                );
+                let resolver_key =
+                    filesystem_storage_scope_key(storage_branch_id, row.global(), None);
                 let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                     .map_err(|error| {
                         LixError::new(
@@ -1440,12 +1387,8 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
                 );
             }
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                let resolver_key = filesystem_storage_scope_key(
-                    storage_branch_id,
-                    row.global(),
-                    row.untracked(),
-                    None,
-                );
+                let resolver_key =
+                    filesystem_storage_scope_key(storage_branch_id, row.global(), None);
                 let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
                     .map_err(|error| {
                         LixError::new(
@@ -1501,7 +1444,7 @@ pub(crate) async fn directory_path_resolvers_from_live_state(
         .await?;
     let mut resolvers = directory_path_resolvers_from_state_batch(&rows)?;
     if let Some(branch_id) = branch_binding {
-        let key = filesystem_storage_scope_key(branch_id, false, false, None);
+        let key = filesystem_storage_scope_key(branch_id, false, None);
         resolvers.entry(key).or_default();
     }
     Ok(resolvers)
@@ -1520,12 +1463,8 @@ pub(crate) fn directory_path_resolvers_from_path_index(
         } else {
             key.branch_id()
         };
-        let resolver_key = filesystem_storage_scope_key(
-            storage_branch_id,
-            key.global(),
-            key.is_untracked(),
-            key.file_id(),
-        );
+        let resolver_key =
+            filesystem_storage_scope_key(storage_branch_id, key.global(), key.file_id());
         match entry.kind {
             super::path_index::FilesystemPathKind::Directory => {
                 directory_rows.entry(resolver_key).or_default().insert(
@@ -1562,7 +1501,7 @@ pub(crate) fn directory_path_resolvers_from_path_index(
         );
     }
     if let Some(branch_id) = branch_binding {
-        let key = filesystem_storage_scope_key(branch_id, false, false, None);
+        let key = filesystem_storage_scope_key(branch_id, false, None);
         resolvers.entry(key).or_default();
     }
     Ok(resolvers)
@@ -1571,11 +1510,10 @@ pub(crate) fn directory_path_resolvers_from_path_index(
 pub(crate) fn filesystem_storage_scope_key(
     branch_id: &str,
     global: bool,
-    untracked: bool,
     file_id: Option<&str>,
 ) -> String {
     format!(
-        "branch={branch_id}\0global={global}\0untracked={untracked}\0file_id_present={}\0file_id={}",
+        "branch={branch_id}\0global={global}\0file_id_present={}\0file_id={}",
         file_id.is_some(),
         file_id.unwrap_or("")
     )
@@ -1641,7 +1579,6 @@ fn append_partial_state_row(
         context.global,
         None,
         None,
-        context.untracked,
         context.branch_id.into(),
     );
 }
@@ -2449,7 +2386,6 @@ mod tests {
         let context = FilesystemRowContext {
             branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             global: true,
-            untracked: true,
             file_id: Some("context-file".to_string()),
             metadata: Some(metadata.clone()),
         };
@@ -2472,7 +2408,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(directory_row.global, true);
-        assert_eq!(directory_row.untracked, true);
         assert_eq!(directory_row.file_id, None);
         assert_eq!(directory_row.metadata.as_ref(), Some(&metadata));
 
@@ -2514,7 +2449,6 @@ mod tests {
             .find(|row| row.schema_key == "lix_directory_descriptor")
             .expect("directory descriptor should be planned");
         assert_eq!(directory.global, true);
-        assert_eq!(directory.untracked, true);
         assert_eq!(directory.file_id, None);
         assert_eq!(directory.metadata, Some(&metadata));
 
@@ -2524,7 +2458,6 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor should be planned");
         assert_eq!(descriptor.global, true);
-        assert_eq!(descriptor.untracked, true);
         assert_eq!(
             descriptor.file_id.map(crate::common::SharedStr::as_str),
             Some("01920000-0000-7000-8000-0000000000d2")
@@ -2537,7 +2470,6 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref should be planned");
         assert_eq!(blob.global, true);
-        assert_eq!(blob.untracked, true);
         assert_eq!(
             blob.file_id.map(crate::common::SharedStr::as_str),
             Some("01920000-0000-7000-8000-0000000000d2")
@@ -2553,7 +2485,6 @@ mod tests {
             plan.file_content[0].branch_id,
             "01920000-0000-7000-8000-0000000000a1"
         );
-        assert_eq!(plan.file_content[0].untracked, true);
         assert_eq!(plan.file_content[0].content(), b"hello");
     }
 
@@ -2609,7 +2540,6 @@ mod tests {
             .get(&super::filesystem_storage_scope_key(
                 "01920000-0000-7000-8000-0000000000a1",
                 false,
-                false,
                 None,
             ))
             .expect("storage-scope resolver should exist");
@@ -2651,14 +2581,12 @@ mod tests {
                 "dir-01920000-0000-7000-8000-0000000000a1",
                 "01920000-0000-7000-8000-0000000000a1",
                 false,
-                false,
                 None,
                 "{\"id\":\"dir-01920000-0000-7000-8000-0000000000a1\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_directory_row_with_scope(
                 "dir-01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000b1",
-                false,
                 false,
                 None,
                 "{\"id\":\"dir-01920000-0000-7000-8000-0000000000b1\",\"parent_id\":null,\"name\":\"docs\"}",
@@ -2667,17 +2595,8 @@ mod tests {
                 "01920000-0000-7000-8000-000000000363",
                 "01920000-0000-7000-8000-0000000000a1",
                 true,
-                false,
                 None,
                 "{\"id\":\"01920000-0000-7000-8000-000000000363\",\"parent_id\":null,\"name\":\"docs\"}",
-            ),
-            live_directory_row_with_scope(
-                "01920000-0000-7000-8000-000000000413",
-                "01920000-0000-7000-8000-0000000000a1",
-                false,
-                true,
-                None,
-                "{\"id\":\"01920000-0000-7000-8000-000000000413\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
         ];
 
@@ -2688,32 +2607,22 @@ mod tests {
         let branch_a_key = super::filesystem_storage_scope_key(
             "01920000-0000-7000-8000-0000000000a1",
             false,
-            false,
             None,
         );
         let branch_b_key = super::filesystem_storage_scope_key(
             "01920000-0000-7000-8000-0000000000b1",
             false,
-            false,
             None,
         );
-        let global_key = super::filesystem_storage_scope_key(GLOBAL_BRANCH_ID, true, false, None);
-        let untracked_key = super::filesystem_storage_scope_key(
-            "01920000-0000-7000-8000-0000000000a1",
-            false,
-            true,
-            None,
-        );
+        let global_key = super::filesystem_storage_scope_key(GLOBAL_BRANCH_ID, true, None);
         let literal_null_file_id_key = super::filesystem_storage_scope_key(
             "01920000-0000-7000-8000-0000000000a1",
-            false,
             false,
             Some("<null>"),
         );
 
         assert_ne!(branch_a_key, branch_b_key);
         assert_ne!(branch_a_key, global_key);
-        assert_ne!(branch_a_key, untracked_key);
         assert_ne!(branch_a_key, literal_null_file_id_key);
 
         assert_eq!(
@@ -2739,14 +2648,6 @@ mod tests {
                 .directory_id("/docs")
                 .unwrap(),
             Some("01920000-0000-7000-8000-000000000363")
-        );
-        assert_eq!(
-            resolvers
-                .get(&untracked_key)
-                .unwrap()
-                .directory_id("/docs")
-                .unwrap(),
-            Some("01920000-0000-7000-8000-000000000413")
         );
     }
 
@@ -2930,14 +2831,13 @@ mod tests {
         branch_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
-        live_directory_row_with_scope(entity_pk, branch_id, false, false, None, snapshot_content)
+        live_directory_row_with_scope(entity_pk, branch_id, false, None, snapshot_content)
     }
 
     fn live_directory_row_with_scope(
         entity_pk: &str,
         branch_id: &str,
         global: bool,
-        untracked: bool,
         file_id: Option<String>,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
@@ -2952,7 +2852,6 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global,
-            untracked,
             created_at: LixTimestamp::expect_parse(
                 "filesystem planner test created_at",
                 "2026-04-23T00:00:00Z",

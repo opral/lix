@@ -43,7 +43,6 @@ pub(crate) fn marker_stage_row(marker: &UndoRedoMarker) -> TransactionWriteRow {
         global: false,
         change_id: None,
         commit_id: None,
-        untracked: false,
         branch_id: marker.branch_id.clone().into(),
     }
 }

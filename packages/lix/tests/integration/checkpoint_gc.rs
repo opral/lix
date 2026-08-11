@@ -17,7 +17,6 @@ simulation_test!(
                 .expect("workspace session should open"),
             &engine,
         );
-
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('gc-key', 'interval-one')",
@@ -459,7 +458,7 @@ async fn register_replay_gc_schema(session: &support::simulation_test::engine::S
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
             &[Value::Text(schema.to_string())],
         )
         .await
