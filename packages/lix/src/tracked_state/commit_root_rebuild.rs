@@ -175,12 +175,13 @@ where
                 ),
             ));
         }
-        if !force_current
-            && load_available_root(store, &current_commit_id)
-                .await?
-                .is_some()
-        {
-            break;
+        if !force_current {
+            let available = load_available_root(store, &current_commit_id).await?;
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_root_replay_available_root_probe(available.is_some());
+            if available.is_some() {
+                break;
+            }
         }
         let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
         let parent_commit_id = plan.parent_commit_id;
@@ -248,6 +249,8 @@ where
         let mut scratch_writes = StorageWriteSet::new();
         let context = TrackedStateContext::new();
         let mut writer = context.writer(store, &mut scratch_writes);
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_root_replay_proof_staging();
         let report = stage_rebuild_plan_with_writer(&mut writer, plan).await?;
         if report.root_id != metadata.root_id {
             return Ok(None);

@@ -17,6 +17,7 @@ default = ["rocksdb"]
 rocksdb = ["dep:lix_storage_rocksdb"]
 slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix/storage-benches", "rocksdb"]
+root-replay-trace = ["lix/root-replay-trace", "storage-benches"]
 tpch = ["dep:duckdb", "dep:tpchgen"]
 # Opt-in profiling build that routes Rust allocations through libc so tools
 # such as heaptrack can attribute transient allocation churn to call stacks.
@@ -59,6 +60,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[[example]]
+name = "expaa_replay_scope"
+path = "examples/expaa_replay_scope.rs"
+required-features = ["storage-benches"]
 
 [[example]]
 name = "space_growth"

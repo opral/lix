@@ -22,6 +22,9 @@ workspace = true
 default = ["default_wasm_runtime"]
 all-simulations = []
 storage-benches = []
+# Per-node cost attribution for commit-root replay (experiment AA). Kept out of
+# `storage-benches` so timing A/B runs never pay for the inline `Instant::now()`.
+root-replay-trace = ["storage-benches"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [[test]]

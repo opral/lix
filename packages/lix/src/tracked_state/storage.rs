@@ -11996,6 +11996,22 @@ pub(crate) async fn read_chunk(
     store: &(impl StorageAdapterRead + ?Sized),
     hash: &[u8; TRACKED_STATE_HASH_BYTES],
 ) -> Result<Option<Bytes>, LixError> {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let bytes = get_one(store, TRACKED_STATE_TREE_CHUNK_SPACE, hash.to_vec()).await;
+        let read_bytes = bytes
+            .as_ref()
+            .ok()
+            .and_then(|value| value.as_ref())
+            .map_or(0, |value| value.len() as u64);
+        crate::storage_bench::record_replay_chunk_read(
+            start.elapsed().as_nanos() as u64,
+            read_bytes,
+        );
+        return bytes;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
     get_one(store, TRACKED_STATE_TREE_CHUNK_SPACE, hash.to_vec()).await
 }
 
