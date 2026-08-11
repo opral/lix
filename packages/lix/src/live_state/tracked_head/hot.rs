@@ -10653,10 +10653,53 @@ fn encode_hot_diff_key_parts(
 ///   into segments keyed by `scope ++ digest`; the identity components leave
 ///   the key for the segment value altogether.
 ///
-/// The order is therefore an arbitrary but load-bearing input to the
-/// coverage hash: every writer, the segment visitor, and the stored epoch
-/// coverage must produce these bytes identically. Change it only for a
-/// reason, and only everywhere at once.
+/// The order is not arbitrary in one respect: it is exactly
+/// `compare_hot_deltas`, the order a publication's deltas are already sorted
+/// in, so the segment packer can append identity suffixes without a second
+/// sort. It is otherwise a load-bearing input to the coverage hash: every
+/// writer, the segment visitor, and the stored epoch coverage must produce
+/// these bytes identically. Change it only for a reason, and only everywhere
+/// at once.
+///
+/// # Why the proof is not partitioned
+///
+/// [`WorkingDiffIndexCoverage`] is a monoid — `group_count` is additive and
+/// `group_key_xor` is commutative — so it looks like it could be maintained
+/// per `file_id`, composed back into the scope proof, and a
+/// `scope ++ file_id` seek made legal. Two independent facts block that:
+///
+/// - **Not every coverage group is an identity.** A packed current base
+///   contributes exactly one group key naming a *commit*
+///   (`hot_scope_prefix ++ new_head`, see the collection-replacement writer),
+///   standing for a whole schema collection whose members span every file and
+///   are only recoverable through `load_commit_delta_members_with_payloads`
+///   at read time. Attributing it to file partitions means expanding it per
+///   member on the write path — reinstating the per-identity coverage cost
+///   the manifest exists to remove.
+/// - **A partition-keyed segment is not a packed segment.** A segment batches
+///   whatever identities one publication produced, in `compare_hot_deltas`
+///   order — which is this key's `schema_key ++ entity_pk ++ file_id`, so
+///   `file_id` is the *last* discriminator and identities of one file are
+///   scattered through the batch. Moving the partition ahead of the digest
+///   forces the packer to re-sort and split each publication by `file_id`, so
+///   a bulk edit spread over many files emits one segment per file — each
+///   re-paying the scope and a 32-byte digest — and most publications stop
+///   reaching `HOT_DIFF_PACK_MIN_IDENTITIES` per partition at all.
+///
+/// Measured consequence of leaving the proof scope-global (rocksdb,
+/// hetzner-cpx62-II, `working_diff_file_scope`, 9 reps, four dirty rows in the
+/// probed file): `WHERE file_id = ?` costs 0.61 ms at 1k total dirty rows and
+/// 51.6 ms at 100k — linear in the dirty set, flat in the answer — while the
+/// finite `schema_key + entity_pk + file_id` shape that bypasses this space
+/// stays at ~0.5 ms across the same range.
+///
+/// The route that would remove that scan does not need this space at all:
+/// `HOT_ROW` is already keyed `schema_key ++ file_id ++ entity_pk` and
+/// `hot_scan_entries` already owns a file-first prefix route, so a
+/// `schema_key + file_id` working-diff read could enumerate primary rows the
+/// way the finite bypass does. That trades O(dirty rows in the branch) for
+/// O(live rows in the file) and still owes a soundness argument for rows that
+/// leave `HOT_ROW` entirely (untracked deletes), so it is not implemented.
 fn append_hot_diff_key_parts(
     key_bytes: &mut Vec<u8>,
     scope: &[u8],
