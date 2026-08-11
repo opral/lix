@@ -72,7 +72,6 @@ use crate::sql2::{
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
 
 pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_column_omitted";
-const COLUMNAR_RESULT_CELL_THRESHOLD: usize = 4_096;
 
 pub(crate) struct DataFusionLogicalPlan {
     pub(super) session: SessionContext,
