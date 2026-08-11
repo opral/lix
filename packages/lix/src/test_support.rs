@@ -699,6 +699,34 @@ async fn stage_test_changelog_commit(
                 .checked_add(1)
                 .ok_or_else(|| crate::LixError::unknown("test commit generation exceeds u64"))
         })?;
+    let parent_record = match typed_parent_ids.as_slice() {
+        [_] => parent_records
+            .iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .cloned(),
+        _ => None,
+    };
+    let parent_jump_record = if let Some(parent) = &parent_record {
+        ChangelogContext::new()
+            .reader(&mut *read)
+            .load_commits(CommitLoadRequest {
+                commit_ids: std::slice::from_ref(&parent.first_parent_jump_commit_id),
+            })
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+    } else {
+        None
+    };
+    let (first_parent_jump_commit_id, first_parent_jump_span) =
+        crate::changelog::next_first_parent_jump(
+            typed_commit_id,
+            &typed_parent_ids,
+            parent_record.as_ref(),
+            parent_jump_record.as_ref(),
+        )?;
     let winner_indices = final_state_row_winner_indices(rows)?;
     let mut append = ChangelogAppend::default();
     let mut change_commit_ids = Vec::new();
@@ -719,10 +747,12 @@ async fn stage_test_changelog_commit(
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
         .unwrap_or_else(test_timestamp);
     let record = CommitRecord {
-        format_version: 2,
+        format_version: 3,
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,
+        first_parent_jump_commit_id,
+        first_parent_jump_span,
         change_id: typed_commit_change_id,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at,
