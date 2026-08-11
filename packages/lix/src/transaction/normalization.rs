@@ -297,8 +297,7 @@ fn ensure_internal_control_schema(
 ) -> Result<(), LixError> {
     let internal = matches!(
         row.schema_key.as_str(),
-        crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
-            | crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+        crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
             | crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
     );
     if !internal || schema_catalog.snapshot().schema(&row.schema_key).is_some() {
@@ -1052,30 +1051,36 @@ mod tests {
     }
 
     #[test]
-    fn normalization_supports_checkpoint_markers_in_legacy_catalogs() {
-        let mut catalog = catalog_with(Vec::new());
-        let branch_id = "01920000-0000-7000-8000-0000000000c6";
+    fn normalization_supports_global_checkpoint_entity() {
+        let mut catalog = catalog_with(vec![
+            builtin_schema("lix_commit"),
+            builtin_schema(crate::checkpoint::CHECKPOINT_SCHEMA_KEY),
+        ]);
+        let commit_id = "01920000-0000-7000-8000-0000000000c6";
         let row = TransactionWriteRow {
             entity_pk: None,
-            schema_key: crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY.into(),
-            snapshot: Some(transaction_json(json!({ "branch_id": branch_id }))),
-            global: false,
+            schema_key: crate::checkpoint::CHECKPOINT_SCHEMA_KEY.into(),
+            snapshot: Some(transaction_json(json!({
+                "id": commit_id,
+                "commit_id": commit_id,
+            }))),
+            global: true,
             untracked: false,
-            branch_id: branch_id.into(),
+            branch_id: crate::GLOBAL_BRANCH_ID.into(),
             ..base_stage_row()
         };
 
         let normalized = normalize_test_row(row, &mut catalog, functions())
-            .expect("legacy catalog should use the fixed internal checkpoint schema");
+            .expect("checkpoint should normalize through its registered entity schema");
 
         assert_eq!(
             normalized.entity_pk,
-            Some(EntityPk::uuid_from_canonical(branch_id).expect("fixture branch ID"))
+            Some(EntityPk::uuid_from_canonical(commit_id).expect("checkpoint commit ID"))
         );
         assert!(
             catalog
                 .snapshot()
-                .schema(crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY)
+                .schema(crate::checkpoint::CHECKPOINT_SCHEMA_KEY)
                 .is_some()
         );
     }

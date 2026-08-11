@@ -71,7 +71,6 @@ simulation_test!(
             "lix_label_assignment",
             "lix_label_assignment_by_branch",
             "lix_label_assignment_history",
-            "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",

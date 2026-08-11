@@ -997,7 +997,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_branch_does_not_import_source_checkpoint_marker,
+    merge_branch_does_not_republish_global_checkpoint_entity,
     |sim| async move {
         let (_engine, main, draft) = create_draft_from_main(&sim).await;
         main.execute(
@@ -1013,10 +1013,22 @@ simulation_test!(
             )
             .await
             .expect("draft write should succeed");
-        draft
+        let checkpoint = draft
             .create_checkpoint()
             .await
             .expect("draft checkpoint should succeed");
+        assert_eq!(
+            main.execute(
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = ?",
+                &[Value::Text(checkpoint.commit_id.clone())],
+            )
+            .await
+            .expect("global checkpoint should be visible from main")
+            .rows()[0]
+                .values(),
+            &[Value::Text(checkpoint.commit_id.clone())],
+            "a checkpoint is a global entity inherited by every branch"
+        );
 
         let receipt = main
             .merge_branch(MergeBranchOptions {
@@ -1038,19 +1050,19 @@ simulation_test!(
 
         let checkpoints = main
             .execute(
-                "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_depth",
-                &[],
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = ?",
+                &[Value::Text(checkpoint.commit_id.clone())],
             )
             .await
-            .expect("target checkpoint history should remain queryable");
+            .expect("global checkpoint should remain queryable");
         assert_eq!(
             checkpoints.len(),
             1,
-            "selecting a source marker must not label the target merge commit"
+            "merge must not duplicate the checkpoint entity"
         );
         assert_eq!(
             checkpoints.rows()[0].values(),
-            &[Value::Text(sim.initial_commit_id().to_string())]
+            &[Value::Text(checkpoint.commit_id)]
         );
         assert_key_value(&main, "checkpoint-merge-source", Some("\"draft\"")).await;
     }

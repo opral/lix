@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::branch::BranchRefReader;
-use crate::checkpoint::latest_checkpoint_for_branch;
+use crate::checkpoint::checkpoint_commit_id_at_head;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
@@ -23,7 +23,7 @@ use crate::tracked_state::{
     TrackedStateScanRequest, TrackedStateStoreReader,
 };
 
-use super::checkpoint::{filter_conjuncts, selected_heads};
+use super::branch_selection::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -131,7 +131,7 @@ where
                     route,
                     self.kind,
                 ),
-                move |(active_branch_id, branch_ref, commit_graph, store, schema, route, kind)| async move {
+                move |(active_branch_id, branch_ref, _commit_graph, store, schema, route, kind)| async move {
                     if route.contradictory {
                         return FILESYSTEM_WORKING_DIFF_COLS
                             .build(schema, &[])
@@ -144,24 +144,16 @@ where
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                    let mut graph = commit_graph.lock().await;
-                    let mut tracked = TrackedStateContext::new().reader(store);
+                    let mut tracked = TrackedStateContext::new().reader(store.clone());
                     let mut rows = Vec::new();
                     for head in heads {
-                        let checkpoint_id = latest_checkpoint_for_branch(
-                            graph.as_mut(),
-                            &mut tracked,
-                            &head.commit_id,
+                        let checkpoint_id = checkpoint_commit_id_at_head(
+                            store.clone(),
                             &head.branch_id,
+                            head.commit_id,
                         )
                         .await
-                        .map_err(lix_error_to_datafusion_error)?
-                        .ok_or_else(|| {
-                            datafusion::common::DataFusionError::Execution(format!(
-                                "branch '{}' has no checkpoint baseline",
-                                head.branch_id
-                            ))
-                        })?;
+                        .map_err(lix_error_to_datafusion_error)?;
                         let mut branch_rows = load_rows(
                             &mut tracked,
                             &checkpoint_id.to_string(),

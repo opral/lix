@@ -1,0 +1,38 @@
+{
+  "x-lix-key": "lix_checkpoint",
+  "description": "A repository-global checkpoint. Each checkpoint is a normal immutable entity whose identity references the commit containing the checkpointed state.",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/commit_id"
+      ],
+      "references": {
+        "schemaKey": "lix_commit",
+        "properties": [
+          "/id"
+        ]
+      }
+    }
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Commit containing the state captured by this checkpoint."
+    },
+    "commit_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Commit containing the state captured by this checkpoint."
+    }
+  },
+  "required": [
+    "id",
+    "commit_id"
+  ],
+  "additionalProperties": false
+}

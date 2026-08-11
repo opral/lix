@@ -9,7 +9,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use tokio::sync::Mutex;
 
 use crate::branch::{BranchHeadControlContext, BranchRefReader};
-use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, latest_checkpoint_for_branch};
+use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_commit_id_at_head};
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
 use crate::live_state::TrackedHeadContext;
@@ -22,7 +22,7 @@ use crate::tracked_state::{
 };
 use crate::{LixError, NullableKeyFilter};
 
-use super::checkpoint::{filter_conjuncts, selected_heads};
+use super::branch_selection::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -117,7 +117,7 @@ where
                     schema,
                     route,
                 ),
-                move |(active_branch_id, branch_ref, commit_graph, store, schema, route)| async move {
+                move |(active_branch_id, branch_ref, _commit_graph, store, schema, route)| async move {
                     if route.contradictory {
                         return WORKING_DIFF_COLS
                             .build(schema, &[])
@@ -135,7 +135,6 @@ where
                     // not need the historical graph or tracked-state reader.
                     // Keep both fallback-only so the accelerated route does
                     // not serialize behind an unrelated historical diff.
-                    let mut graph = None;
                     let mut tracked = None;
                     let mut rows = Vec::new();
                     for head in heads {
@@ -164,29 +163,16 @@ where
                         let diff = if let Some(direct) = direct_diff {
                             direct.diff
                         } else {
-                            if graph.is_none() {
-                                graph = Some(commit_graph.lock().await);
-                            }
-                            let graph = graph
-                                .as_mut()
-                                .expect("historical working-diff graph should be initialized");
                             let tracked = tracked.get_or_insert_with(|| {
                                 TrackedStateContext::new().reader(store.clone())
                             });
-                            let checkpoint_commit_id = latest_checkpoint_for_branch(
-                                graph.as_mut(),
-                                tracked,
-                                &head.commit_id,
+                            let checkpoint_commit_id = checkpoint_commit_id_at_head(
+                                store.clone(),
                                 &head.branch_id,
+                                head.commit_id,
                             )
                             .await
-                            .map_err(lix_error_to_datafusion_error)?
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "branch '{}' has no checkpoint baseline",
-                                    head.branch_id
-                                ))
-                            })?;
+                            .map_err(lix_error_to_datafusion_error)?;
                             tracked
                                 .diff_commits(
                                     &checkpoint_commit_id.to_string(),
@@ -197,7 +183,7 @@ where
                                 .map_err(lix_error_to_datafusion_error)?
                         };
                         for entry in diff.entries {
-                            if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY
+                            if entry.identity.schema_key() == CHECKPOINT_SCHEMA_KEY
                                 || entry.identity.schema_key()
                                     == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
                             {

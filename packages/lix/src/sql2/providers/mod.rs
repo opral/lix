@@ -9,8 +9,8 @@ use crate::LixError;
 use crate::branch::BranchRefReader;
 
 mod branch;
+mod branch_selection;
 mod change;
-mod checkpoint;
 mod columns;
 mod diff;
 mod directory;
@@ -229,12 +229,13 @@ where
     let needs_history_query_source = catalog.surfaces().any(|surface| {
         scope.includes(surface)
             && selection.includes(surface)
-            && matches!(
-                &surface.kind,
-                PublicSurfaceKind::FileHistory
-                    | PublicSurfaceKind::DirectoryHistory
-                    | PublicSurfaceKind::EntityHistory { .. }
-            )
+            && match &surface.kind {
+                PublicSurfaceKind::FileHistory | PublicSurfaceKind::DirectoryHistory => true,
+                PublicSurfaceKind::EntityHistory { schema_key } => {
+                    schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+                }
+                _ => false,
+            }
     });
     let history_query_source = if needs_history_query_source {
         let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
@@ -256,6 +257,30 @@ where
             )
         })
     };
+    let needs_checkpoint_history = catalog.surfaces().any(|surface| {
+        scope.includes(surface)
+            && selection.includes(surface)
+            && matches!(
+                &surface.kind,
+                PublicSurfaceKind::EntityHistory { schema_key }
+                    if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+            )
+    });
+    let checkpoint_history_query_source = if needs_checkpoint_history {
+        let global_head = branch_ref
+            .load_head_commit_id(crate::GLOBAL_BRANCH_ID)
+            .await?
+            .ok_or_else(|| {
+                LixError::branch_not_found(
+                    crate::GLOBAL_BRANCH_ID,
+                    "register checkpoint history provider",
+                    "global branch",
+                )
+            })?;
+        Some(ctx.history_query_source(global_head.to_string()))
+    } else {
+        None
+    };
     for surface in catalog.surfaces() {
         if !scope.includes(surface) || !selection.includes(surface) {
             continue;
@@ -267,28 +292,6 @@ where
                     &surface.name,
                     ctx.live_state(),
                     Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::Checkpoint => {
-                checkpoint::register_checkpoint_provider(
-                    session,
-                    &surface.name,
-                    Some(ctx.active_branch_id().to_string()),
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::CheckpointByBranch => {
-                checkpoint::register_checkpoint_provider(
-                    session,
-                    &surface.name,
-                    None,
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
                 )
                 .await?;
             }
@@ -462,11 +465,8 @@ where
         ctx.entity_snapshot_reader(),
         Arc::clone(&branch_ref),
         needs_entity_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
-        if needs_entity_history {
-            Some(history_query_source_for_provider()?)
-        } else {
-            None
-        },
+        history_query_source,
+        checkpoint_history_query_source,
         catalog,
         scope == ReadProviderScope::All,
         selection,
@@ -616,8 +616,6 @@ async fn register_write_from_catalog(
                 .await?;
             }
             PublicSurfaceKind::Change
-            | PublicSurfaceKind::Checkpoint
-            | PublicSurfaceKind::CheckpointByBranch
             | PublicSurfaceKind::WorkingDiff
             | PublicSurfaceKind::WorkingDiffByBranch
             | PublicSurfaceKind::FileWorkingDiff
@@ -665,9 +663,9 @@ mod tests {
     };
 
     use super::{
-        ProviderSelection, ReadProviderScope, branch, change, checkpoint, directory,
-        directory_history, entity, file, file_history, filesystem_working_diff, is_write_surface,
-        read_provider_selection, working_diff,
+        ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, entity,
+        file, file_history, filesystem_working_diff, is_write_surface, read_provider_selection,
+        working_diff,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -825,8 +823,6 @@ mod tests {
             read_only,
             vec![
                 "lix_change",
-                "lix_checkpoint",
-                "lix_checkpoint_by_branch",
                 "lix_directory_history",
                 "lix_directory_working_diff",
                 "lix_directory_working_diff_by_branch",
@@ -854,10 +850,10 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 32, "previous construction count");
+        assert_eq!(all_read + writable.len(), 30, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            22,
+            20,
             "new construction count"
         );
     }
@@ -936,16 +932,6 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_checkpoint",
-            checkpoint::checkpoint_schema(false),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_checkpoint_by_branch",
-            checkpoint::checkpoint_schema(true),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
             "lix_working_diff",
             working_diff::working_diff_schema(false),
         );
@@ -1012,6 +998,7 @@ mod tests {
                 EmptyCommitGraphReader,
             )))),
             Some(empty_history_query_source().await),
+            None,
             &catalog,
             true,
             &ProviderSelection::All,

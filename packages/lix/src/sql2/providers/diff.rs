@@ -9,7 +9,7 @@ use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
-use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
+use crate::checkpoint::CHECKPOINT_SCHEMA_KEY;
 use crate::entity_pk::EntityPk;
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
@@ -21,7 +21,7 @@ use crate::tracked_state::{
 };
 use crate::{LixError, NullableKeyFilter};
 
-use super::checkpoint::filter_conjuncts;
+use super::branch_selection::filter_conjuncts;
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
@@ -156,7 +156,7 @@ where
                         .map_err(lix_error_to_datafusion_error)?;
                     let mut rows = Vec::with_capacity(diff.entries.len());
                     for entry in diff.entries {
-                        if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY
+                        if entry.identity.schema_key() == CHECKPOINT_SCHEMA_KEY
                             || entry.identity.schema_key()
                                 == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
                         {
