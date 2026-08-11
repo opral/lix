@@ -78,6 +78,12 @@ async fn main() {
             let rows = parse_usize(arguments.get(2), 10);
             checkpoints_scenario(&samples, rows).await;
         }
+        "checkpoint_then_gc" => {
+            let commits = parse_usize(arguments.get(1), 200);
+            let rows = parse_usize(arguments.get(2), 10);
+            let gc_rounds = parse_usize(arguments.get(3), 12);
+            checkpoint_then_gc_scenario(commits, rows, gc_rounds).await;
+        }
         "idempotency" => {
             let samples = parse_samples(arguments.get(1));
             idempotency_scenario(&samples).await;
@@ -193,6 +199,53 @@ async fn checkpoints_scenario(samples: &[usize], rows_per_commit: usize) {
             "checkpoints",
             "live",
             target as u64,
+            &usage(&fixture.storage).await,
+        );
+    }
+}
+
+/// Isolates the drain rate of the authenticated reachability queue.
+///
+/// Without a checkpoint the whole commit chain is the retained undo interval
+/// (`gc.rs:118-159` walks head → `serving_checkpoint_commit_id`), so no old
+/// root is retirable and no queue row is consumable. One checkpoint lowers that
+/// floor; the explicit GC rounds afterwards then measure how many queue rows
+/// one sweep actually consumes.
+async fn checkpoint_then_gc_scenario(commits: usize, rows_per_commit: usize, gc_rounds: usize) {
+    let fixture = Fixture::open().await;
+    register_schema(&fixture.session).await;
+    for index in 0..commits {
+        commit_batch(&fixture.session, index, rows_per_commit).await;
+    }
+    report(
+        "checkpoint_then_gc",
+        "before_checkpoint",
+        commits as u64,
+        &usage(&fixture.storage).await,
+    );
+    fixture
+        .session
+        .create_checkpoint()
+        .await
+        .expect("create checkpoint");
+    report(
+        "checkpoint_then_gc",
+        "after_checkpoint",
+        0,
+        &usage(&fixture.storage).await,
+    );
+    for round in 1..=gc_rounds {
+        let result = collect_repository_gc_for_bench(&StorageAdapter::new(fixture.storage.clone()))
+            .await
+            .expect("commit repository GC");
+        println!(
+            "expv_gc,scenario=checkpoint_then_gc,round={round},commits={commits},staged_deletes={},swept_commits={}",
+            result.staged_deletes, result.swept_commits
+        );
+        report(
+            "checkpoint_then_gc",
+            "gc",
+            round as u64,
             &usage(&fixture.storage).await,
         );
     }
