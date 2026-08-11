@@ -10444,6 +10444,191 @@ pub(crate) async fn stage_delete_commit_state_manifest_for_gc(
     Ok(())
 }
 
+/// The content-addressed nodes and parts that are still reachable from the
+/// repository's live root closure.
+///
+/// Every tracked-state plane below is content addressed and therefore shared
+/// between commits, so a retired commit may only drop a node the live closure
+/// does not also name.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetainedPhysicalState<'a> {
+    pub(crate) mutation_nodes: &'a BTreeSet<[u8; 32]>,
+    pub(crate) scoped_nodes: &'a BTreeSet<[u8; 32]>,
+    pub(crate) native_parts: &'a BTreeSet<[u8; 32]>,
+}
+
+/// Retires every physical tracked-state row owned by one unreachable commit.
+///
+/// GC proves unreachability from refs and hands the proof here; the layout of
+/// mutation directories, scoped-range trees, and native current-state parts —
+/// and therefore which keys a retirement touches — stays inside the module
+/// that writes them.
+pub(crate) async fn stage_retire_commit_physical_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    retained: RetainedPhysicalState<'_>,
+) -> Result<(), LixError> {
+    let manifest = load_commit_state_manifest(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("retired GC root '{commit_id}' has no authenticated manifest"),
+            )
+        })?;
+    let retired_root = load_commit_mutation_directory_roots(store, &[commit_id])
+        .await?
+        .into_iter()
+        .next()
+        .flatten();
+    if let Some(root) = retired_root {
+        let nodes = crate::tracked_state::collect_mutation_directory_node_ids(store, &root).await?;
+        for node_id in nodes.difference(retained.mutation_nodes) {
+            writes.delete(
+                crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+                key(node_id.to_vec()),
+            );
+        }
+    }
+    if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
+        let reachable = crate::tracked_state::validate_scoped_range_trees(
+            store,
+            std::slice::from_ref(&root.tree),
+        )
+        .await?;
+        for node_id in reachable.node_ids.difference(retained.scoped_nodes) {
+            writes.delete(
+                crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+                key(node_id.to_vec()),
+            );
+        }
+        for part in reachable.parts {
+            let descriptor =
+                crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
+            if descriptor.source_kind == 1
+                && !retained.native_parts.contains(&descriptor.content_digest)
+            {
+                writes.delete(
+                    crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+                    key(descriptor.content_digest.to_vec()),
+                );
+                writes.delete(
+                    crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+                    key(descriptor.payload_refs_digest.to_vec()),
+                );
+            }
+        }
+    }
+    stage_delete_commit_state_manifest_for_gc(store, writes, commit_id, &manifest).await
+}
+
+/// Loads the owning commit ids of every native current-state data part named by
+/// `digests`, proving each payload is still physically present.
+///
+/// A scoped-range descriptor is authority for the digest, but not proof that
+/// the immutable payload still exists; treating a missing payload as an empty
+/// live set would silently turn corruption into deletion, so this fails closed.
+pub(crate) async fn load_native_current_state_part_owners(
+    store: &(impl StorageAdapterRead + ?Sized),
+    digests: &BTreeSet<[u8; 32]>,
+) -> Result<BTreeSet<CommitId>, LixError> {
+    if digests.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let keys = digests
+        .iter()
+        .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
+        .collect::<Vec<_>>();
+    let loaded = PointReadPlan::new(crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut commit_ids = BTreeSet::new();
+    for (digest, value) in digests.iter().zip(loaded.value) {
+        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "live current-state directory references a missing native data part",
+            ));
+        };
+        commit_ids.extend(
+            crate::tracked_state::decode_current_state_data_part_commit_ids(digest, &bytes)?,
+        );
+    }
+    Ok(commit_ids)
+}
+
+/// Sweeps every content-addressed tracked-state plane down to a repository-wide
+/// live closure.
+///
+/// This is the whole-repository counterpart to
+/// [`stage_retire_commit_physical_state`]: it discovers rows by scanning rather
+/// than from a retirement proof, so it is reserved for the offline oracle that
+/// cross-checks incremental GC.
+#[cfg(test)]
+pub(crate) async fn stage_sweep_unreachable_content_nodes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    retained: RetainedPhysicalState<'_>,
+) -> Result<(), LixError> {
+    for (space, live) in [
+        (
+            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+            retained.scoped_nodes,
+        ),
+        (
+            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+            retained.mutation_nodes,
+        ),
+        (
+            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+            retained.native_parts,
+        ),
+        (
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            retained.native_parts,
+        ),
+    ] {
+        let range = StorageKeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        };
+        let mut cursor = store
+            .begin_scan(
+                space,
+                range,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await?;
+        loop {
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await?;
+            for entry in page.entries {
+                let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "content-addressed space '{}' contains a malformed key",
+                            space.name
+                        ),
+                    )
+                })?;
+                if !live.contains(&node_id) {
+                    writes.delete(space, entry.key);
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn scan_full_space(
     store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
