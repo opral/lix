@@ -13916,7 +13916,11 @@ mod tests {
 
     #[tokio::test]
     async fn hot_working_diff_entries_share_one_identity_batch() {
-        let store = StorageAdapter::new(Memory::new());
+        let storage = StorageAdapter::new(Memory::new());
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("classification read should open");
         let candidates = ["first", "second"]
             .into_iter()
             .map(|entity| {
@@ -13949,7 +13953,11 @@ mod tests {
 
     #[tokio::test]
     async fn finite_hot_working_diff_borrows_keys_into_one_identity_batch() {
-        let store = StorageAdapter::new(Memory::new());
+        let storage = StorageAdapter::new(Memory::new());
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("classification read should open");
         let schema_key = String::from("schema");
         let file_id = String::from("file");
         let entity_pks = [EntityPk::single("first"), EntityPk::single("second")];
