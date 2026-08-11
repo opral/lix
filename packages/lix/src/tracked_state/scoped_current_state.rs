@@ -2104,6 +2104,9 @@ pub(crate) mod ownership_census {
         pub(crate) head_commit_id: Option<CommitId>,
         /// Per branch: (branch id, has manifest, has scoped-range root, serving base).
         pub(crate) branches: Vec<(String, bool, bool, Option<CommitId>)>,
+        /// `serving_dependencies` as GC computes them: the authoring commit of
+        /// every live tracked row in the serving generation.
+        pub(crate) serving_dependencies: BTreeSet<CommitId>,
     }
 
     impl CurrentStateOwnershipCensus {
@@ -2138,6 +2141,14 @@ pub(crate) mod ownership_census {
             .scan()
             .await?;
         let mut census = CurrentStateOwnershipCensus::default();
+        let projections = controls
+            .iter()
+            .map(|(branch_id, control)| (branch_id.clone(), control.tracked_reachability()))
+            .collect::<Vec<_>>();
+        census.serving_dependencies = crate::live_state::TrackedHeadContext::new()
+            .reader(store)
+            .tracked_serving_commit_dependencies(&projections)
+            .await?;
         let mut roots = Vec::new();
         for (branch_id, control) in controls {
             census.head_commit_id = Some(control.head_commit_id);
@@ -2332,6 +2343,15 @@ mod ownership_census_fixture {
             report.native_row_owners.len(),
         );
         println!("CENSUS-BRANCHES depth={depth} phase={phase} {:?}", report.branches);
+        let serving_pre = report
+            .serving_dependencies
+            .intersection(pre_checkpoint)
+            .count();
+        println!(
+            "CENSUS-SERVING depth={depth} phase={phase} serving_dependencies={} pre_checkpoint_serving_dependencies={serving_pre} pre_checkpoint_commits={}",
+            report.serving_dependencies.len(),
+            pre_checkpoint.len(),
+        );
     }
 
     #[tokio::test]
