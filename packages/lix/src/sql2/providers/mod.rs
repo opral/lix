@@ -74,23 +74,40 @@ where
     if selection.is_empty() {
         return Ok(());
     }
-    let dynamic_catalog;
     let catalog = if selection.requires_visible_schemas() {
-        dynamic_catalog = ctx.public_catalog().await?;
-        dynamic_catalog.as_ref()
+        ctx.public_catalog().await?
     } else {
-        PublicCatalog::fixed_system()
+        Arc::clone(PublicCatalog::fixed_system_shared())
     };
     register_read_from_catalog(
         session,
         ctx,
         branch_ref,
         active_branch_commit_id,
-        catalog,
+        catalog.as_ref(),
         ReadProviderScope::All,
         selection,
     )
     .await?;
+    register_information_schema(session, selection, catalog)
+}
+
+/// Installs the `information_schema` views only for statements that can reach
+/// them.
+///
+/// `read_provider_selection` widens to [`ProviderSelection::All`] for every
+/// `information_schema`-qualified reference and every `SHOW` form, so a narrowed
+/// selection provably never resolves an information-schema table. Registering
+/// the schema anyway cost one catalog write lock and one `SchemaProvider`
+/// allocation on every ordinary statement.
+fn register_information_schema(
+    session: &SessionContext,
+    selection: &ProviderSelection,
+    catalog: Arc<PublicCatalog>,
+) -> Result<(), LixError> {
+    if !matches!(selection, ProviderSelection::All) {
+        return Ok(());
+    }
     crate::sql2::information_schema::register(session, catalog)
 }
 
@@ -144,15 +161,13 @@ impl ProviderSelection {
 }
 
 pub(crate) fn read_provider_selection(
-    session: &SessionContext,
+    state: &datafusion::execution::session_state::SessionState,
     statements: &[datafusion::sql::parser::Statement],
 ) -> ProviderSelection {
     let mut names = BTreeSet::new();
-    // Resolving references only reads the SQL parser configuration. Borrowing
-    // the session state avoids deep-copying its `String`-keyed function
-    // registries once per statement.
-    let state_ref = session.state_ref();
-    let state = state_ref.read();
+    // Resolving references only reads the SQL parser configuration, so the
+    // statement's pooled session state is used directly instead of cloning the
+    // live one.
     for statement in statements {
         if statement_requires_all_providers(statement) {
             return ProviderSelection::All;
@@ -490,7 +505,7 @@ pub(crate) async fn register_write(
     let catalog = write_ctx.public_catalog()?;
     register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
         .await?;
-    crate::sql2::information_schema::register(session, &catalog)
+    register_information_schema(session, selection, catalog)
 }
 
 pub(crate) async fn register_transaction<C>(
@@ -529,7 +544,7 @@ where
         selection,
     )
     .await?;
-    crate::sql2::information_schema::register(session, &catalog)
+    register_information_schema(session, selection, catalog)
 }
 
 async fn register_write_from_catalog(
@@ -677,7 +692,7 @@ mod tests {
             .iter()
             .map(|sql| crate::sql2::parse_statement(sql).expect("SQL should parse"))
             .collect::<Vec<_>>();
-        read_provider_selection(&SessionContext::new(), &statements)
+        read_provider_selection(&SessionContext::new().state(), &statements)
     }
 
     fn selected_names(names: &[&str]) -> ProviderSelection {

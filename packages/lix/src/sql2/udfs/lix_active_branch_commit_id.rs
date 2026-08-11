@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Result, ScalarValue, plan_err};
@@ -6,14 +7,30 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+use super::execution_slots::ExecutionSlots;
+
+#[derive(Clone)]
 pub(super) struct LixActiveBranchCommitId {
-    commit_id: Option<String>,
+    slots: Arc<ExecutionSlots>,
 }
 
 impl LixActiveBranchCommitId {
-    pub(super) fn new(commit_id: Option<String>) -> Self {
-        Self { commit_id }
+    pub(super) fn new(slots: Arc<ExecutionSlots>) -> Self {
+        Self { slots }
+    }
+}
+
+impl PartialEq for LixActiveBranchCommitId {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LixActiveBranchCommitId {}
+
+impl std::hash::Hash for LixActiveBranchCommitId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
     }
 }
 
@@ -47,7 +64,7 @@ impl ScalarUDFImpl for LixActiveBranchCommitId {
             return plan_err!("lix_active_branch_commit_id requires no arguments");
         }
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
-            self.commit_id.clone(),
+            self.slots.active_branch_commit_id(),
         )))
     }
 }

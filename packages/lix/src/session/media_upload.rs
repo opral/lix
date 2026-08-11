@@ -334,7 +334,12 @@ where
                 }
                 Some(UploadState::Complete(_)) => unreachable!("complete state returned above"),
             }
-            crate::binary_cas::stage_mutation_epoch(&read, &mut writes, &mut preconditions).await?;
+            crate::binary_cas::stage_cas_publication_fence(
+                &read,
+                &mut writes,
+                &mut preconditions,
+            )
+            .await?;
             drop(read);
 
             let commit_boundary = self.transaction_commit_boundary();
@@ -912,6 +917,58 @@ mod tests {
         receipts[0].hash
     }
 
+    /// A resumable upload keeps four parts in flight by design, and the engine —
+    /// not the caller — owns that window. Parts staged from one snapshot write
+    /// disjoint manifest leaves over content-addressed payloads, so they are
+    /// independent publications: every one of them must commit.
+    ///
+    /// Making publishers share a compare-and-set row broke exactly this. It was
+    /// invisible at the public surface because `upsert_file_content_part` retries
+    /// a bounded number of times — a full window plus any other concurrent writer
+    /// exhausts that budget, which is how the movie-workspace qualification fails
+    /// its upload acknowledgement.
+    #[tokio::test]
+    async fn concurrent_upload_part_publications_from_one_snapshot_all_commit() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = b"windowed-upload-part-payload";
+        seed_orphan_upload_chunk(&storage, payload).await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("upload window read should open");
+        let mut window = Vec::new();
+        for part in 0..4 {
+            window.push(
+                stage_deduplicated_receipt_publication(
+                    &storage,
+                    &read,
+                    &format!("windowed-part-{part}"),
+                    payload,
+                    true,
+                )
+                .await,
+            );
+        }
+        drop(read);
+
+        for (part, (writes, preconditions)) in window.into_iter().enumerate() {
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "every part of one upload window must commit; part {part} was rejected: {error:?}"
+                    )
+                });
+        }
+    }
+
     async fn stage_deduplicated_receipt_publication(
         storage: &StorageAdapter<Memory>,
         read: &impl StorageAdapterRead,
@@ -960,9 +1017,9 @@ mod tests {
                 key: state_key,
             },
         ];
-        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_publication_fence(read, &mut writes, &mut preconditions)
             .await
-            .expect("deduplicated receipt epoch should stage");
+            .expect("deduplicated receipt publication fence should stage");
         (writes, preconditions)
     }
 
@@ -984,9 +1041,9 @@ mod tests {
         .await
         .expect("stale CAS sweep should stage");
         assert_eq!(swept.reclaimed_chunk_rows, 1);
-        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_reclamation_fence(read, &mut writes, &mut preconditions)
             .await
-            .expect("stale sweep epoch should stage");
+            .expect("stale sweep reclamation fence should stage");
         (writes, preconditions)
     }
 

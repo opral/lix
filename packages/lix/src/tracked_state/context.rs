@@ -3773,11 +3773,23 @@ pub(crate) struct TrackedStateWriter<'a, S: ?Sized> {
     writes: &'a mut StorageWriteSet,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TrackedStateTransientRebuildState {
     chunk_overlay: storage::TrackedStateChunkOverlay,
     staged_roots: BTreeMap<String, TrackedStateCommitRoot>,
     transient_chunk_hashes: HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>,
+}
+
+impl Default for TrackedStateTransientRebuildState {
+    /// Rebuild state exists only for the explicit repair path, so its overlay
+    /// rewrites durable chunks instead of trusting an addressed digest.
+    fn default() -> Self {
+        Self {
+            chunk_overlay: storage::TrackedStateChunkOverlay::repairing(),
+            staged_roots: BTreeMap::new(),
+            transient_chunk_hashes: HashSet::new(),
+        }
+    }
 }
 
 impl TrackedStateTransientRebuildState {
@@ -3846,7 +3858,8 @@ where
             .copied()
             .collect::<Vec<_>>();
         self.chunk_overlay
-            .stage_selected_chunks(self.writes, promoted.iter().copied())?;
+            .stage_selected_chunks(self.store, self.writes, promoted.iter().copied())
+            .await?;
         for hash in promoted {
             self.transient_chunk_hashes.remove(&hash);
         }

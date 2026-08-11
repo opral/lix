@@ -70,6 +70,8 @@ pub(crate) use storage::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE;
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
+#[cfg(test)]
+pub(crate) use storage::stage_sweep_unreachable_content_nodes;
 pub(crate) use storage::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
@@ -89,21 +91,25 @@ pub(crate) use storage::{
     stage_current_state_scoped_ranges_from_published_parent,
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
-    stage_current_state_scoped_ranges_from_topology, stage_delete_commit_state_manifest_for_gc,
-    stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
-    stage_ordered_columnar_mutations, stage_preencoded_ordered_addressable_replacement_parts,
+    stage_current_state_scoped_ranges_from_topology, stage_ordered_addressable_commit_deltas,
+    stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
+    stage_preencoded_ordered_addressable_replacement_parts,
     stage_prefixed_ordered_addressable_replacement_parts,
+};
+pub(crate) use storage::{
+    RetainedPhysicalState, load_native_current_state_part_owners,
+    stage_retire_commit_physical_state,
 };
 // The storage-space constants are what the space registry
 // (`crate::storage_spaces`) and its layout invariants are built from, so they
 // must be reachable whenever tests compile, not only under `storage-benches`.
+#[cfg(feature = "storage-benches")]
+pub(crate) use storage::decode_change_locator;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::{
     TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
 };
-#[cfg(feature = "storage-benches")]
-pub(crate) use storage::decode_change_locator;
 #[cfg(test)]
 pub(crate) use storage::{
     change_id_from_packed_address, commit_state_authority_key, load_commit_delta_change_ids,

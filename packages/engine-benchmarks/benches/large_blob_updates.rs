@@ -444,7 +444,7 @@ where
     }
 
     async fn space_accounting(&self, space: SpaceId) -> SpaceAccounting {
-        space_accounting(&self.storage, space).await
+        space_accounting(&self.storage, space, self.workload.operation).await
     }
 }
 
@@ -515,12 +515,25 @@ struct SpaceAccounting {
     value_bytes: u64,
 }
 
-async fn space_accounting<S>(storage: &S, space: SpaceId) -> SpaceAccounting
+/// A physical space id has exactly one value semantics per fixture, and the
+/// accounting scan must use the one the operation under test actually wrote
+/// with. `raw_backend_initial_write` deliberately bypasses the binary CAS and
+/// stores plain payload bytes in the payload space, so scanning that space as
+/// `immutable` would hand raw payload bytes to the immutable-locator decoder
+/// and fail with `Corruption("immutable segment locator is invalid")`.
+async fn space_accounting<S>(
+    storage: &S,
+    space: SpaceId,
+    operation: Operation,
+) -> SpaceAccounting
 where
     S: Storage,
 {
-    let space = if space == PAYLOAD_SPACE {
+    let payload_is_immutable = !matches!(operation, Operation::RawBackendInitialWrite);
+    let space = if space == PAYLOAD_SPACE && payload_is_immutable {
         StorageSpace::immutable(space, "benchmark.binary_cas_payload")
+    } else if space == PAYLOAD_SPACE {
+        StorageSpace::mutable(space, "bench.raw_payload")
     } else {
         StorageSpace::mutable(space, "benchmark.binary_cas_metadata")
     };

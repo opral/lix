@@ -5,25 +5,23 @@ use std::sync::Arc;
 #[cfg(feature = "storage-benches")]
 use std::time::Instant;
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::ScanArgs;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DataFusionError, TableReference, internal_err};
-use datafusion::dataframe::DataFrame;
-use datafusion::datasource::empty::EmptyTable;
-use datafusion::datasource::{provider_as_source, source_as_provider};
+use datafusion::common::{DataFusionError, internal_err};
 use datafusion::error::Result;
 use datafusion::execution::SessionState;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::logical_expr::{LogicalPlan, TableSource};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
+use datafusion::physical_expr::{LexOrdering, Partitioning};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::execution_plan::{CardinalityEffect, EmissionType};
+use datafusion::physical_plan::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::limit::LimitStream;
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -33,7 +31,9 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use tokio::sync::OnceCell;
 
 use crate::catalog::CatalogFingerprint;
-use crate::sql2::{CachedPhysicalRead, PhysicalReadPlanCacheKey, SqlPlanningCache};
+use crate::sql2::{
+    CachedPhysicalRead, CachedScanRequest, PhysicalReadPlanCacheKey, SqlPlanningCache,
+};
 
 use super::providers::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 
@@ -42,16 +42,15 @@ type PhysicalPlanningCache = (
     PhysicalReadPlanCacheKey<CatalogFingerprint>,
 );
 
-pub(crate) async fn collect_dataframe(
-    dataframe: DataFrame,
+pub(crate) async fn collect_plan(
+    state: &SessionState,
+    logical_plan: LogicalPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Vec<RecordBatch>> {
-    let (state, logical_plan) = dataframe.into_parts();
-    let task_ctx = execution_task_context(&state);
+    let task_ctx = execution_task_context(state);
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan =
-        create_or_rebind_physical_plan(&state, logical_plan, physical_planning_cache).await?;
+    let plan = create_or_rebind_physical_plan(state, logical_plan, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -78,16 +77,15 @@ pub(crate) async fn collect_dataframe(
 /// stop polling it early; dropping the stream then drops the underlying scan
 /// futures as well.
 #[cfg(feature = "storage-benches")]
-pub(crate) async fn stream_dataframe(
-    dataframe: DataFrame,
+pub(crate) async fn stream_plan(
+    state: &SessionState,
+    logical_plan: LogicalPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<SendableRecordBatchStream> {
-    let (state, logical_plan) = dataframe.into_parts();
-    let task_ctx = execution_task_context(&state);
+    let task_ctx = execution_task_context(state);
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan =
-        create_or_rebind_physical_plan(&state, logical_plan, physical_planning_cache).await?;
+    let plan = create_or_rebind_physical_plan(state, logical_plan, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -132,19 +130,23 @@ async fn create_or_rebind_physical_plan(
             .query_planner()
             .create_physical_plan(&optimized, state)
             .await?;
-        if let Some(template) = detach_physical_plan_template(Arc::clone(&plan))
-            && let Some(optimized) = detach_logical_plan_sources(optimized)
-        {
-            cache.remember_physical_read_plan(key, CachedPhysicalRead { optimized, template });
+        if let Some(template) = detach_physical_plan_template(Arc::clone(&plan)) {
+            cache.remember_physical_read_plan(
+                key,
+                CachedPhysicalRead {
+                    scans: cached_scan_requests(&optimized),
+                    template,
+                },
+            );
         }
         return Ok(plan);
     };
 
-    // Warm path. The optimized plan is reused verbatim, so DataFusion's
-    // analyzer and logical optimizer never run again for this statement shape;
-    // only the snapshot-bound table sources are grafted back on.
-    if let Some(optimized) = rebind_logical_plan_sources(&cached.optimized, &logical_plan)
-        && let Some(replacements) = plan_current_spec_scans(&optimized, state).await?
+    // Warm path. Neither DataFusion's analyzer, logical optimizer nor physical
+    // planner runs again for this statement shape: each cached leaf scan is
+    // replanned against the current snapshot's provider and grafted into the
+    // template.
+    if let Some(replacements) = plan_cached_spec_scans(&cached.scans, state).await?
         && let Some(plan) =
             rebind_physical_plan_template(Arc::clone(&cached.template), replacements)
     {
@@ -162,91 +164,53 @@ async fn create_or_rebind_physical_plan(
         .await
 }
 
-/// Replaces every table source with an empty stand-in of the same schema.
+/// Reduces an optimized plan's leaf scans to provider-free scan requests.
 ///
-/// Cached plans must not retain a provider bound to the storage snapshot that
-/// planned them.
-fn detach_logical_plan_sources(plan: LogicalPlan) -> Option<LogicalPlan> {
-    plan.transform_up(|node| {
-        let LogicalPlan::TableScan(mut scan) = node else {
-            return Ok(Transformed::no(node));
-        };
-        scan.source = provider_as_source(Arc::new(EmptyTable::new(scan.source.schema())));
-        Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
-    })
-    .map(|transformed| transformed.data)
-    .ok()
+/// A cache entry must never retain a table provider bound to the storage
+/// snapshot that planned it. Keeping only the resolved table name, projection,
+/// filters and fetch makes that structural rather than a discipline: there is
+/// no provider in the entry to go stale, and no logical plan to clone on the
+/// warm path.
+fn cached_scan_requests(plan: &LogicalPlan) -> Vec<CachedScanRequest> {
+    fn collect(plan: &LogicalPlan, scans: &mut Vec<CachedScanRequest>) {
+        if let LogicalPlan::TableScan(scan) = plan {
+            scans.push(CachedScanRequest {
+                table: scan.table_name.clone(),
+                projection: scan.projection.clone(),
+                filters: unnormalize_cols(scan.filters.clone()),
+                fetch: scan.fetch,
+            });
+        }
+        for input in plan.inputs() {
+            collect(input, scans);
+        }
+    }
+
+    let mut scans = Vec::new();
+    collect(plan, &mut scans);
+    scans
 }
 
-/// Grafts the current snapshot's table sources onto a cached optimized plan.
+/// Replans each cached leaf scan against the current snapshot's provider.
 ///
-/// Sources are taken from the freshly bound plan for the same statement, which
-/// already resolved them against the live read session. A cached plan that
-/// references a table the current plan does not provide is treated as stale.
-fn rebind_logical_plan_sources(
-    cached: &LogicalPlan,
-    current: &LogicalPlan,
-) -> Option<LogicalPlan> {
-    let mut sources: HashMap<TableReference, Arc<dyn TableSource>> = HashMap::new();
-    collect_logical_table_sources(current, &mut sources);
-    cached
-        .clone()
-        .transform_up(|node| {
-            let LogicalPlan::TableScan(mut scan) = node else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(source) = sources.get(&scan.table_name) else {
-                return internal_err!("cached SQL plan provider is unavailable");
-            };
-            scan.source = Arc::clone(source);
-            Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
-        })
-        .map(|transformed| transformed.data)
-        .ok()
-}
-
-fn collect_logical_table_sources(
-    plan: &LogicalPlan,
-    sources: &mut HashMap<TableReference, Arc<dyn TableSource>>,
-) {
-    if let LogicalPlan::TableScan(scan) = plan {
-        sources
-            .entry(scan.table_name.clone())
-            .or_insert_with(|| Arc::clone(&scan.source));
-    }
-    for input in plan.inputs() {
-        collect_logical_table_sources(input, sources);
-    }
-}
-
-fn collect_logical_table_scans(
-    plan: &LogicalPlan,
-    scans: &mut Vec<datafusion::logical_expr::TableScan>,
-) {
-    if let LogicalPlan::TableScan(scan) = plan {
-        scans.push(scan.clone());
-    }
-    for input in plan.inputs() {
-        collect_logical_table_scans(input, scans);
-    }
-}
-
-async fn plan_current_spec_scans(
-    logical_plan: &LogicalPlan,
+/// Declining (returning `None`) is always safe: the caller evicts the entry and
+/// falls back to the ordinary DataFusion planner.
+async fn plan_cached_spec_scans(
+    scans: &[CachedScanRequest],
     state: &SessionState,
 ) -> Result<Option<HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>>>> {
-    let mut logical_scans = Vec::new();
-    collect_logical_table_scans(logical_plan, &mut logical_scans);
     let mut replacements: HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>> =
         HashMap::new();
-    for scan in logical_scans {
-        let Ok(provider) = source_as_provider(&scan.source) else {
+    for scan in scans {
+        let Ok(schema) = state.schema_for_ref(scan.table.clone()) else {
             return Ok(None);
         };
-        let filters = unnormalize_cols(scan.filters);
+        let Some(provider) = schema.table(scan.table.table()).await? else {
+            return Ok(None);
+        };
         let args = ScanArgs::default()
             .with_projection(scan.projection.as_deref())
-            .with_filters(Some(&filters))
+            .with_filters(Some(&scan.filters))
             .with_limit(scan.fetch);
         let result = provider.scan_with_args(state, args).await?;
         let plan = Arc::clone(result.plan());
@@ -269,8 +233,13 @@ async fn plan_current_spec_scans(
 /// alive, so it is rejected rather than rebuilt.
 fn template_operator_is_reusable(plan: &dyn ExecutionPlan) -> bool {
     match plan.name() {
-        "ProjectionExec" | "HashJoinExec" | "FilterExec" | "CooperativeExec"
-        | "CoalesceBatchesExec" | "CoalescePartitionsExec" | "SortPreservingMergeExec" => true,
+        "ProjectionExec"
+        | "HashJoinExec"
+        | "FilterExec"
+        | "CooperativeExec"
+        | "CoalesceBatchesExec"
+        | "CoalescePartitionsExec"
+        | "SortPreservingMergeExec" => true,
         "SortExec" => plan
             .as_any()
             .downcast_ref::<SortExec>()
@@ -311,7 +280,9 @@ fn rebind_physical_plan_template_inner(
 ) -> Option<Arc<dyn ExecutionPlan>> {
     if let Some(detached) = plan.as_any().downcast_ref::<DetachedSpecScanExec>() {
         let replacement = replacements.get_mut(&detached.key)?.pop_front()?;
-        return (physical_plan_fingerprint(replacement.as_ref()) == detached.fingerprint)
+        return detached
+            .fingerprint
+            .matches(replacement.as_ref())
             .then_some(replacement);
     }
     let children = plan
@@ -356,17 +327,53 @@ fn rebuild_template_node(
     plan.with_new_children(children).ok()
 }
 
-fn physical_plan_fingerprint(plan: &dyn ExecutionPlan) -> Arc<str> {
-    Arc::from(format!(
-        "schema={:?};properties={:?}",
-        plan.schema(),
-        plan.properties()
-    ))
+/// The structural identity a replacement scan must reproduce before a detached
+/// template leaf accepts it.
+///
+/// This is compared once per leaf on every warm execution, so it is kept as
+/// direct field equality. Formatting `Debug` for the schema and the full
+/// `PlanProperties` — including `EquivalenceProperties` — allocated several
+/// kilobytes of string per scan per query for the same decision.
+///
+/// `Partitioning` deliberately compares by discriminant and partition count:
+/// its `PartialEq` returns `false` for two identical `UnknownPartitioning`
+/// values, which is the variant every `SpecScanExec` reports.
+struct ScanFingerprint {
+    schema: SchemaRef,
+    partitioning: std::mem::Discriminant<Partitioning>,
+    partition_count: usize,
+    output_ordering: Option<LexOrdering>,
+    emission_type: EmissionType,
+    boundedness: Boundedness,
+}
+
+impl ScanFingerprint {
+    fn new(plan: &dyn ExecutionPlan) -> Self {
+        let properties = plan.properties();
+        Self {
+            schema: plan.schema(),
+            partitioning: std::mem::discriminant(&properties.partitioning),
+            partition_count: properties.partitioning.partition_count(),
+            output_ordering: properties.output_ordering().cloned(),
+            emission_type: properties.emission_type,
+            boundedness: properties.boundedness,
+        }
+    }
+
+    fn matches(&self, plan: &dyn ExecutionPlan) -> bool {
+        let properties = plan.properties();
+        self.partition_count == properties.partitioning.partition_count()
+            && self.partitioning == std::mem::discriminant(&properties.partitioning)
+            && self.emission_type == properties.emission_type
+            && self.boundedness == properties.boundedness
+            && self.output_ordering.as_ref() == properties.output_ordering()
+            && self.schema == plan.schema()
+    }
 }
 
 struct DetachedSpecScanExec {
     key: PhysicalScanKey,
-    fingerprint: Arc<str>,
+    fingerprint: ScanFingerprint,
     properties: Arc<PlanProperties>,
 }
 
@@ -374,7 +381,7 @@ impl DetachedSpecScanExec {
     fn new(scan: &SpecScanExec) -> Self {
         Self {
             key: scan.physical_cache_key().clone(),
-            fingerprint: physical_plan_fingerprint(scan),
+            fingerprint: ScanFingerprint::new(scan),
             properties: Arc::clone(scan.properties()),
         }
     }

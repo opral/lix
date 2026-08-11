@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Result, ScalarValue, plan_err};
@@ -6,11 +7,11 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 
-use crate::functions::FunctionProviderHandle;
+use super::execution_slots::ExecutionSlots;
 
 #[derive(Clone)]
 pub(super) struct LixTimestamp {
-    pub(super) functions: FunctionProviderHandle,
+    pub(super) slots: Arc<ExecutionSlots>,
 }
 
 impl PartialEq for LixTimestamp {
@@ -57,7 +58,7 @@ impl ScalarUDFImpl for LixTimestamp {
             return plan_err!("lix_timestamp requires no arguments");
         }
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-            self.functions.call_timestamp().to_string(),
+            self.slots.functions()?.call_timestamp().to_string(),
         ))))
     }
 }

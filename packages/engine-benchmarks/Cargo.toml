@@ -66,6 +66,16 @@ path = "examples/space_growth.rs"
 required-features = ["storage-benches"]
 
 [[example]]
+name = "expv_blind_space_growth"
+path = "examples/expv_blind_space_growth.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "delta_segment_duplication"
+path = "examples/delta_segment_duplication.rs"
+required-features = ["storage-benches"]
+
+[[example]]
 name = "storage_layout"
 path = "examples/storage_layout.rs"
 required-features = ["storage-benches", "slatedb"]
@@ -73,6 +83,11 @@ required-features = ["storage-benches", "slatedb"]
 [[example]]
 name = "duplicate_audit"
 path = "examples/duplicate_audit.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "expu_json_delta"
+path = "examples/expu_json_delta.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
@@ -97,6 +112,11 @@ required-features = ["storage-benches", "slatedb"]
 [[example]]
 name = "cas_publication_epoch_qualification"
 path = "examples/cas_publication_epoch_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "expW_hot_row_anatomy"
+path = "examples/expW_hot_row_anatomy.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
@@ -199,6 +219,12 @@ required-features = ["storage-benches", "tpch"]
 [[bench]]
 name = "tracked_working_diff"
 path = "benches/tracked_working_diff.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "working_diff_file_scope"
+path = "benches/working_diff_file_scope.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]
 
