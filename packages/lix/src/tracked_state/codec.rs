@@ -479,6 +479,17 @@ impl TrackedStateMutationBatchBuilder {
 }
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; TRACKED_STATE_HASH_BYTES] {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let digest = *blake3::hash(bytes).as_bytes();
+        crate::storage_bench::record_replay_node_hash(
+            start.elapsed().as_nanos() as u64,
+            bytes.len() as u64,
+        );
+        return digest;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
     *blake3::hash(bytes).as_bytes()
 }
 
@@ -1451,6 +1462,21 @@ const VALUE_TAIL_DISTINCT_MAX: u8 =
 /// produces sorted entries); it is asserted in debug builds but not
 /// revalidated on every release-mode read.
 pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let encoded = encode_leaf_node_refs_inner(entries);
+        crate::storage_bench::record_replay_node_encode(
+            start.elapsed().as_nanos() as u64,
+            encoded.len() as u64,
+        );
+        return encoded;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    encode_leaf_node_refs_inner(entries)
+}
+
+fn encode_leaf_node_refs_inner(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
     debug_assert!(
         entries.windows(2).all(|pair| pair[0].key < pair[1].key),
         "leaf entries must be strictly sorted by key"
@@ -2002,6 +2028,21 @@ pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
 }
 
 pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let encoded = encode_internal_node_refs_inner(children);
+        crate::storage_bench::record_replay_node_encode(
+            start.elapsed().as_nanos() as u64,
+            encoded.len() as u64,
+        );
+        return encoded;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    encode_internal_node_refs_inner(children)
+}
+
+fn encode_internal_node_refs_inner(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
     assert!(
         !children.is_empty(),
         "tracked-state internal nodes must contain at least one child"
@@ -2176,6 +2217,21 @@ pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
 }
 
 pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let decoded = decode_node_ref_inner(bytes);
+        crate::storage_bench::record_replay_node_decode(
+            start.elapsed().as_nanos() as u64,
+            bytes.len() as u64,
+        );
+        return decoded;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    decode_node_ref_inner(bytes)
+}
+
+fn decode_node_ref_inner(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> {
     let (&kind, body) = bytes
         .split_first()
         .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
