@@ -2811,8 +2811,16 @@ mod tests {
         let closure = load_audited_repository_retention(&storage).await;
         assert!(closure.physical_authorities.contains(&owner.commit_id));
 
+        // The not-yet-published `released` commit is a candidate the moment its
+        // manifest exists, and reclaiming it is correct: nothing references it.
+        // What must not move is the pinned owner.
         let retained_plan = run_ordinary_repository_gc(&storage).await;
-        assert!(retained_plan.sweep.tracked_commit_roots.is_empty());
+        assert!(
+            !retained_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&owner.commit_id)
+        );
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -2976,11 +2984,11 @@ mod tests {
         assert!(closure.physical_authorities.contains(&owner.commit_id));
 
         assert!(
-            run_ordinary_repository_gc(&storage)
+            !run_ordinary_repository_gc(&storage)
                 .await
                 .sweep
                 .tracked_commit_roots
-                .is_empty()
+                .contains(&owner.commit_id)
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3257,11 +3265,11 @@ mod tests {
             .expect("authenticated native part restoration should commit");
 
         assert!(
-            run_ordinary_repository_gc(&storage)
+            !run_ordinary_repository_gc(&storage)
                 .await
                 .sweep
                 .tracked_commit_roots
-                .is_empty()
+                .contains(&owner.commit_id)
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4126,7 +4134,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("derived candidate timestamp", "2026-01-01T00:00:00Z");
-        let head = replay_commit_record("derived-candidate-head", 1, None, timestamp);
+        let head = replay_commit_record("derived-candidate-head", 0, None, timestamp);
         // No commit record and no parent link binds this one to anything.
         let orphan = replay_commit_record("derived-candidate-orphan", 0, None, timestamp);
         let mut head_manifest =
