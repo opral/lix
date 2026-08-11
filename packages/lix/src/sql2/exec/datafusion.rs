@@ -70,11 +70,13 @@ use crate::sql2::{
 };
 
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
+use crate::sql2::PooledReadSession;
+use datafusion::execution::SessionState;
 
 pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_column_omitted";
 
 pub(crate) struct DataFusionLogicalPlan {
-    pub(super) session: SessionContext,
+    pub(super) state: std::sync::Arc<SessionState>,
     pub(super) plan: LogicalPlan,
     pub(super) notices: Vec<LixNotice>,
     pub(super) json_predicate_params: BTreeSet<usize>,
@@ -240,7 +242,7 @@ impl SessionReadResult {
 
 /// DataFusion catalog and providers scoped to one immutable storage read.
 pub(crate) struct ReadSqlSession<'ctx> {
-    session: SessionContext,
+    session: Option<PooledReadSession>,
     planning_environment: Option<(
         std::sync::Arc<SqlPlanningCache<CatalogFingerprint>>,
         CatalogFingerprint,
@@ -248,10 +250,27 @@ pub(crate) struct ReadSqlSession<'ctx> {
     _context: PhantomData<&'ctx ()>,
 }
 
+impl ReadSqlSession<'_> {
+    fn pooled(&self) -> &PooledReadSession {
+        self.session
+            .as_ref()
+            .expect("read session is only taken back when the statement ends")
+    }
+
+    fn context(&self) -> &SessionContext {
+        self.pooled().context()
+    }
+
+    fn state(&self) -> &std::sync::Arc<SessionState> {
+        self.pooled().state()
+    }
+}
+
 impl Drop for ReadSqlSession<'_> {
     fn drop(&mut self) {
-        if let Some((cache, _)) = &self.planning_environment {
-            cache.recycle_datafusion_read_session(self.session.clone());
+        if let (Some((cache, _)), Some(session)) = (&self.planning_environment, self.session.take())
+        {
+            cache.recycle_datafusion_read_session(session);
         }
     }
 }
@@ -288,7 +307,7 @@ where
 {
     let planning_environment = ctx.sql_planning_environment().await?;
     Ok(ReadSqlSession {
-        session: build_read_session(ctx, statements).await?,
+        session: Some(build_read_session(ctx, statements).await?),
         planning_environment,
         _context: PhantomData,
     })
@@ -304,7 +323,7 @@ where
 {
     let planning_environment = ctx.sql_planning_environment().await?;
     Ok(ReadSqlSession {
-        session: build_read_session_at_head(ctx, active_head, statements).await?,
+        session: Some(build_read_session_at_head(ctx, active_head, statements).await?),
         planning_environment,
         _context: PhantomData,
     })
@@ -406,9 +425,9 @@ async fn create_logical_plan_in_session_from_parsed(
         && let Some((cache, catalog)) = &session.planning_environment
         && let Some(cached) = cache.read_plan(sql, params, catalog)
     {
-        let plan = rebind_cached_read_plan(&session.session, cached.plan.clone()).await?;
+        let plan = rebind_cached_read_plan(session.context(), cached.plan.clone()).await?;
         return Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
-            session: session.session.clone(),
+            state: std::sync::Arc::clone(session.state()),
             plan,
             notices: Vec::new(),
             json_predicate_params: cached.json_predicate_params.clone(),
@@ -418,7 +437,7 @@ async fn create_logical_plan_in_session_from_parsed(
         }));
     }
     bind_table_function_parameters(&mut statement, params)?;
-    let plan = create_logical_plan_from_statement(&session.session, statement).await?;
+    let plan = create_logical_plan_from_statement(session.context(), statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
@@ -453,7 +472,7 @@ async fn create_logical_plan_in_session_from_parsed(
     };
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
-        session: session.session.clone(),
+        state: std::sync::Arc::clone(session.state()),
         plan,
         notices: Vec::new(),
         json_predicate_params,
@@ -569,7 +588,7 @@ fn logical_plan_has_scalar_function(plan: &LogicalPlan) -> bool {
     found
 }
 
-fn statement_has_table_function(statement: &DataFusionStatement) -> bool {
+pub(crate) fn statement_has_table_function(statement: &DataFusionStatement) -> bool {
     struct TableFunctionVisitor(bool);
 
     impl Visitor for TableFunctionVisitor {
@@ -605,14 +624,10 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
     let planning_environment = read_ctx.sql_planning_environment().await?;
-    let plan = create_transaction_read_logical_plan_from_parsed(
+    let (plan, session) = create_transaction_read_logical_plan_from_parsed(
         read_ctx, write_ctx, sql, statement, params,
     )
     .await?;
-    let session = match &plan {
-        SqlLogicalPlan::DataFusion(plan) => plan.session.clone(),
-        _ => unreachable!("transaction reads are planned by DataFusion"),
-    };
     let result = execute_logical_plan(plan, params)
         .await
         .and_then(SessionReadResult::into_sql_query_result);
@@ -628,27 +643,30 @@ async fn create_transaction_read_logical_plan_from_parsed(
     sql: &str,
     mut statement: DataFusionStatement,
     params: &[Value],
-) -> Result<SqlLogicalPlan, LixError> {
+) -> Result<(SqlLogicalPlan, PooledReadSession), LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
     let parameter_names = statement_parameter_names(&statement)?;
     let expected_parameter_count = expected_positional_parameter_count(&parameter_names)?;
     validate_parameter_count_values(expected_parameter_count, &parameter_names, params.len())?;
     bind_table_function_parameters(&mut statement, params)?;
     let session = build_transaction_read_session(read_ctx, write_ctx, &statement).await?;
-    let plan = create_logical_plan_from_statement(&session, statement).await?;
+    let plan = create_logical_plan_from_statement(session.context(), statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
 
-    Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
+    Ok((
+        SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
+            state: std::sync::Arc::clone(session.state()),
+            plan,
+            notices: Vec::new(),
+            json_predicate_params,
+            expected_parameter_count,
+            physical_planning_cache: None,
+        }),
         session,
-        plan,
-        notices: Vec::new(),
-        json_predicate_params,
-        expected_parameter_count,
-        physical_planning_cache: None,
-    }))
+    ))
 }
 
 async fn create_logical_plan_from_statement(
@@ -1324,6 +1342,20 @@ fn validate_history_anchor_predicates_in_logical_plan(plan: &LogicalPlan) -> Res
     visit_history_anchor_plan(plan, &[]).map(|_| ())
 }
 
+/// Substitutes positional parameters into a bound read plan.
+///
+/// Mirrors `DataFrame::with_param_values`, which is exactly
+/// `LogicalPlan::with_param_values` plus a `SessionState` it does not need.
+fn bind_plan_param_values(plan: LogicalPlan, params: &[Value]) -> Result<LogicalPlan, LixError> {
+    if params.is_empty() {
+        return Ok(plan);
+    }
+    plan.with_param_values(ParamValues::List(
+        params.iter().map(scalar_value_from_lix_value).collect(),
+    ))
+    .map_err(datafusion_error_to_lix_error)
+}
+
 async fn execute_logical_plan(
     plan: SqlLogicalPlan,
     params: &[Value],
@@ -1335,7 +1367,7 @@ async fn execute_logical_plan(
         ));
     };
     let SqlDataFusionLogicalPlan {
-        session,
+        state,
         plan,
         notices,
         json_predicate_params,
@@ -1345,25 +1377,20 @@ async fn execute_logical_plan(
     debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
 
-    let mut dataframe = session
-        .execute_logical_plan(plan)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
-    if !params.is_empty() {
-        dataframe = dataframe
-            .with_param_values(ParamValues::List(
-                params.iter().map(scalar_value_from_lix_value).collect(),
-            ))
-            .map_err(datafusion_error_to_lix_error)?;
-    }
+    // `SessionContext::execute_logical_plan` only branches for DDL and utility
+    // statements, both of which `validate_supported_logical_plan` already
+    // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
+    // here is to carry a freshly deep-copied `SessionState`. Bind the
+    // parameters on the plan directly against the statement's pooled state.
+    let plan = bind_plan_param_values(plan, params)?;
 
-    let result_fields = dataframe
+    let result_fields = plan
         .schema()
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = crate::sql2::runtime::collect_dataframe(dataframe, physical_planning_cache)
+    let batches = crate::sql2::runtime::collect_plan(&state, plan, physical_planning_cache)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     // This is a benchmark-only causal ceiling probe. It keeps DataFusion's
@@ -1414,7 +1441,7 @@ async fn execute_logical_plan_stream<'session>(
         ));
     };
     let SqlDataFusionLogicalPlan {
-        session,
+        state,
         plan,
         notices,
         json_predicate_params,
@@ -1424,24 +1451,19 @@ async fn execute_logical_plan_stream<'session>(
     debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
 
-    let mut dataframe = session
-        .execute_logical_plan(plan)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
-    if !params.is_empty() {
-        dataframe = dataframe
-            .with_param_values(ParamValues::List(
-                params.iter().map(scalar_value_from_lix_value).collect(),
-            ))
-            .map_err(datafusion_error_to_lix_error)?;
-    }
-    let fields = dataframe
+    // `SessionContext::execute_logical_plan` only branches for DDL and utility
+    // statements, both of which `validate_supported_logical_plan` already
+    // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
+    // here is to carry a freshly deep-copied `SessionState`. Bind the
+    // parameters on the plan directly against the statement's pooled state.
+    let plan = bind_plan_param_values(plan, params)?;
+    let fields = plan
         .schema()
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let stream = crate::sql2::runtime::stream_dataframe(dataframe, physical_planning_cache)
+    let stream = crate::sql2::runtime::stream_plan(&state, plan, physical_planning_cache)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     Ok(SessionReadBatchStreamResult {
@@ -1464,7 +1486,7 @@ async fn execute_logical_plan_collected_batches(
         ));
     };
     let SqlDataFusionLogicalPlan {
-        session,
+        state,
         plan,
         notices,
         json_predicate_params,
@@ -1474,24 +1496,19 @@ async fn execute_logical_plan_collected_batches(
     debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
 
-    let mut dataframe = session
-        .execute_logical_plan(plan)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
-    if !params.is_empty() {
-        dataframe = dataframe
-            .with_param_values(ParamValues::List(
-                params.iter().map(scalar_value_from_lix_value).collect(),
-            ))
-            .map_err(datafusion_error_to_lix_error)?;
-    }
-    let fields = dataframe
+    // `SessionContext::execute_logical_plan` only branches for DDL and utility
+    // statements, both of which `validate_supported_logical_plan` already
+    // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
+    // here is to carry a freshly deep-copied `SessionState`. Bind the
+    // parameters on the plan directly against the statement's pooled state.
+    let plan = bind_plan_param_values(plan, params)?;
+    let fields = plan
         .schema()
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = crate::sql2::runtime::collect_dataframe(dataframe, physical_planning_cache)
+    let batches = crate::sql2::runtime::collect_plan(&state, plan, physical_planning_cache)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     Ok(SessionReadCollectedBatchResult {

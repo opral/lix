@@ -20,6 +20,7 @@ mod merge_fuzz;
 mod observe;
 mod observe_mutation_revision;
 mod physical_plan_cache;
+mod pooled_session_reuse;
 mod sql;
 mod storage_accounting;
 mod transaction;

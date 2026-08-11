@@ -310,9 +310,9 @@ async fn run_case<S, Flush, FlushFuture>(
     );
     let lifecycle_write_amplification = ratio(lifecycle_io.write_bytes, logical_written_bytes);
     let storage_amplification = ratio(backend_bytes, logical_written_bytes);
-    let manifest = find_layout(&layout, "tracked_state.commit_delta_manifest.v2");
-    let segments = find_layout(&layout, "tracked_state.commit_delta_segment.v2");
-    let locators = find_layout(&layout, "tracked_state.change_locator.v1");
+    let manifest = find_layout(&layout, "tracked_state.commit_state_manifest.v7");
+    let segments = find_layout(&layout, "tracked_state.commit_delta_segment.v6");
+    let locators = find_layout(&layout, "tracked_state.change_locator.v2");
     let json_payloads = find_layout(&layout, "json_store.json");
 
     println!(
@@ -385,17 +385,22 @@ async fn run_case<S, Flush, FlushFuture>(
     );
 }
 
+/// `layout_accounting` enumerates every registered space, so a name that is not
+/// present is a stale namespace in this bench, not an empty space. Failing loudly
+/// is the only way the columns cannot silently rot into zeros the next time a
+/// namespace version is bumped.
 fn find_layout(layout: &[BenchLayoutAccounting], name: &str) -> BenchLayoutAccounting {
     layout
         .iter()
         .find(|space| space.space == name)
         .copied()
-        .unwrap_or(BenchLayoutAccounting {
-            space_id: 0,
-            space: "missing",
-            rows: 0,
-            key_bytes: 0,
-            value_bytes: 0,
+        .unwrap_or_else(|| {
+            let known = layout
+                .iter()
+                .map(|space| space.space)
+                .collect::<Vec<_>>()
+                .join(", ");
+            panic!("packed_history_scale asked for unregistered storage space '{name}'; registered: {known}")
         })
 }
 

@@ -605,10 +605,10 @@ pub(crate) async fn stage_reachability_delta_batch(
     checkpoint_roots: &[CommitId],
     preconditions: &mut Vec<StoragePrecondition>,
 ) -> Result<(), LixError> {
-    // This is the central authenticated root-publication boundary. Rotate the
-    // binary-CAS epoch in this same atomic write even when the transition only
-    // revives an existing commit and stages no blob bytes.
-    crate::binary_cas::stage_mutation_epoch(read, writes, preconditions).await?;
+    // This is the central authenticated root-publication boundary. Stage the
+    // binary-CAS publication fence in this same atomic write even when the
+    // transition only revives an existing commit and stages no blob bytes.
+    crate::binary_cas::stage_cas_publication_fence(read, writes, preconditions).await?;
     if deltas.is_empty() && checkpoint_roots.is_empty() {
         return Ok(());
     }
@@ -2380,7 +2380,8 @@ where
     let binary_cas =
         crate::binary_cas::stage_gc_reclamation(&store, writes, &blob_roots, &upload_chunks)
             .await?;
-    crate::binary_cas::stage_mutation_epoch(&store, writes, &mut staged_preconditions).await?;
+    crate::binary_cas::stage_cas_reclamation_fence(&store, writes, &mut staged_preconditions)
+        .await?;
 
     if batches.is_empty() {
         preconditions.extend(staged_preconditions);
