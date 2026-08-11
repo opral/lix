@@ -11007,6 +11007,125 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
 
 
 #[cfg(test)]
+fn decode_hot_diff_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
+    if !bytes.starts_with(scope) {
+        return Err(key_codec_error(
+            "hot diff row does not begin with its scanned scope",
+        ));
+    }
+    let mut offset = scope.len();
+    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
+    if schema_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error(
+            "hot diff row schema key has an invalid terminator",
+        ));
+    }
+    let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    let file_id = read_file_id(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(key_codec_error("hot diff row key has trailing bytes"));
+    }
+    Ok(HeadRowIdentity {
+        schema_key,
+        entity_pk,
+        file_id,
+    })
+}
+
+fn decode_hot_diff_segment_key(bytes: &[u8]) -> Result<HotDiffSegmentScope, LixError> {
+    let mut offset = 0;
+    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
+    if branch_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error(
+            "hot diff branch id has an invalid terminator",
+        ));
+    }
+    let checkpoint_commit_id = read_generation(bytes, &mut offset)?;
+    let generation = read_generation(bytes, &mut offset)?;
+    let digest_bytes = bytes
+        .get(offset..)
+        .ok_or_else(|| key_codec_error("hot diff segment key is truncated before its digest"))?;
+    let digest = <[u8; 32]>::try_from(digest_bytes)
+        .map_err(|_| key_codec_error("hot diff segment key has an invalid digest length"))?;
+    Ok(HotDiffSegmentScope {
+        branch_id,
+        checkpoint_commit_id,
+        generation,
+        digest,
+    })
+}
+
+fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        scope
+            .len()
+            .saturating_add(encoded_key_bytes_len(schema_key.as_bytes()).unwrap_or(0)),
+    );
+    key.extend_from_slice(scope);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    key
+}
+
+fn visit_hot_diff_segment(
+    bytes: &[u8],
+    scope: &[u8],
+    coverage: &mut WorkingDiffIndexCoverage,
+    mut visit: impl FnMut(HeadRowIdentity),
+) -> Result<(), LixError> {
+    if bytes.len() < HOT_DIFF_SEGMENT_HEADER_BYTES {
+        return Err(key_codec_error("hot diff segment is truncated"));
+    }
+    if bytes[0] != HOT_DIFF_SEGMENT_VERSION {
+        return Err(key_codec_error("hot diff segment has an unknown version"));
+    }
+    let count = u32::from_le_bytes(
+        bytes[1..HOT_DIFF_SEGMENT_HEADER_BYTES]
+            .try_into()
+            .expect("hot diff segment header has a fixed count width"),
+    );
+    if count == 0 || count > HOT_DIFF_SEGMENT_MAX_IDENTITIES {
+        return Err(key_codec_error(
+            "hot diff segment has an invalid identity count",
+        ));
+    }
+    let mut offset = HOT_DIFF_SEGMENT_HEADER_BYTES;
+    let mut full_key = Vec::with_capacity(scope.len() + 128);
+    full_key.extend_from_slice(scope);
+    for _ in 0..count {
+        let length_end = offset
+            .checked_add(4)
+            .ok_or_else(|| key_codec_error("hot diff segment length offset overflow"))?;
+        let encoded_length = bytes.get(offset..length_end).ok_or_else(|| {
+            key_codec_error("hot diff segment is truncated before identity length")
+        })?;
+        let suffix_len = u32::from_le_bytes(
+            encoded_length
+                .try_into()
+                .expect("hot diff identity length has a fixed width"),
+        ) as usize;
+        if suffix_len == 0 {
+            return Err(key_codec_error("hot diff segment has an empty identity"));
+        }
+        let suffix_end = length_end
+            .checked_add(suffix_len)
+            .ok_or_else(|| key_codec_error("hot diff segment identity offset overflow"))?;
+        let suffix = bytes
+            .get(length_end..suffix_end)
+            .ok_or_else(|| key_codec_error("hot diff segment is truncated in an identity"))?;
+        full_key.truncate(scope.len());
+        full_key.extend_from_slice(suffix);
+        coverage
+            .add_encoded_group_key(&full_key)
+            .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
+        visit(decode_hot_diff_key_in_scope(&full_key, scope)?);
+        offset = suffix_end;
+    }
+    if offset != bytes.len() {
+        return Err(key_codec_error("hot diff segment has trailing bytes"));
+    }
+    Ok(())
+}
+
 fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
