@@ -2421,7 +2421,7 @@ simulation_test!(
                 )
                 .await
                 .expect("updated propertyless entity should remain readable"),
-            vec![vec![Value::Json(json!({"phase": "after"}))]],
+            vec![vec![Value::Json(json!({"phase": "after"}).into())]],
         );
     }
 );
