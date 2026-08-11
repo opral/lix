@@ -10763,8 +10763,18 @@ fn encode_hot_diff_key_parts(
 /// `hot_scan_entries` already owns a file-first prefix route, so a
 /// `schema_key + file_id` working-diff read could enumerate primary rows the
 /// way the finite bypass does. That trades O(dirty rows in the branch) for
-/// O(live rows in the file) and still owes a soundness argument for rows that
-/// leave `HOT_ROW` entirely (untracked deletes), so it is not implemented.
+/// O(live rows in the file). It is still not implemented *for the working
+/// diff*, because a diff must also see identities whose current authority is a
+/// packed current base published inside this checkpoint window, and those
+/// contribute exactly the whole-commit coverage groups described above.
+///
+/// The ordinary **entity** surface has no such obligation and does take that
+/// route: `lixcol_file_id` is an exact provider constraint that lands in
+/// `LiveStateFilter::file_ids`, and every authority the live-state merge reads
+/// — `HOT_ROW`, the packed current base, the certified entity batches, and the
+/// root current base — filters on it, two of them with their own file-scoped
+/// seek. Rows that never had a branch-local `HOT_ROW` are therefore still
+/// returned by the other three legs.
 fn append_hot_diff_key_parts(
     key_bytes: &mut Vec<u8>,
     scope: &[u8],
