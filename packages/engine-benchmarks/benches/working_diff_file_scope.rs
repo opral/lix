@@ -184,7 +184,6 @@ async fn run<StorageImpl>(
     );
     dirty_rows(&session, &plan, changes_per_commit, bulk_rows_per_file).await;
 
-    let total_dirty = count(&session, "SELECT COUNT(*) FROM lix_working_diff", &[]).await;
     let probe_file = file_ids[0].clone();
     let file_sql = "SELECT diff_id, entity_pk, schema_key, file_id, diff_type \
                     FROM lix_working_diff WHERE file_id = $1";
@@ -209,7 +208,7 @@ async fn run<StorageImpl>(
     let finite = sample(&session, finite_sql, &finite_params, reps).await;
 
     println!(
-        "working_diff_file_scope backend={backend} files={files} total_dirty={total_dirty} \
+        "working_diff_file_scope backend={backend} files={files} total_dirty={full_rows} \
          file_rows={file_rows} full_rows={full_rows} finite_rows={finite_rows} reps={reps} \
          file_p50_ms={:.3} file_min_ms={:.3} file_max_ms={:.3} \
          full_p50_ms={:.3} full_min_ms={:.3} full_max_ms={:.3} \
@@ -264,24 +263,6 @@ where
         .await
         .expect("working-diff query should succeed")
         .len()
-}
-
-async fn count<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
-    sql: &str,
-    params: &[Value],
-) -> i64
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let result = session
-        .execute(sql, params)
-        .await
-        .expect("working-diff count should succeed");
-    match result.rows().first().and_then(|row| row.get(0)) {
-        Some(Value::Integer(value)) => *value,
-        other => panic!("unexpected count row {other:?}"),
-    }
 }
 
 async fn register_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
