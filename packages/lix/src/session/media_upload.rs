@@ -654,12 +654,12 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
     let part_size = u64::from_be_bytes(
         value[8..16]
             .try_into()
-            .expect("fixed upload manifest leaf part size"),
+            .expect("upload manifest leaf part size"),
     );
     let chunk_count = u32::from_be_bytes(
         value[16..20]
             .try_into()
-            .expect("fixed upload manifest leaf chunk count"),
+            .expect("upload manifest leaf chunk count"),
     ) as usize;
     let expected_len = HEADER_BYTES
         .checked_add(chunk_count.saturating_mul(40))
@@ -677,7 +677,7 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
         let size_bytes = u64::from_be_bytes(
             encoded[32..]
                 .try_into()
-                .expect("fixed upload manifest leaf chunk size"),
+                .expect("upload manifest leaf chunk size"),
         );
         chunks.push(BlobChunkReceipt {
             hash: ChunkHash::from_bytes(hash),
@@ -902,13 +902,13 @@ mod tests {
             .writer_skipping_existing_chunks(&read, &mut writes)
             .stage_upload_part(payload)
             .await
-            .expect("orphan fixed chunk should stage");
+            .expect("orphan upload chunk should stage");
         assert_eq!(receipts.len(), 1);
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("orphan fixed chunk should commit");
+            .expect("orphan upload chunk should commit");
         receipts[0].hash
     }
 
