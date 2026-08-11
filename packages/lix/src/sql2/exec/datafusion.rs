@@ -2957,16 +2957,8 @@ pub(crate) fn query_result_from_batches(
         .collect::<Vec<_>>();
     let mut rows =
         Vec::<Vec<Value>>::with_capacity(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
-    let column_count = result_fields.len();
     for batch in batches {
-        let cursors = column_cursors(result_fields, batch)?;
-        for row_index in 0..batch.num_rows() {
-            let mut row = Vec::<Value>::with_capacity(column_count);
-            for cursor in &cursors {
-                row.push(cursor.value(row_index)?);
-            }
-            rows.push(row);
-        }
+        append_batch_rows(result_fields, batch, &mut rows)?;
     }
 
     Ok(SqlQueryResult {
@@ -2976,18 +2968,47 @@ pub(crate) fn query_result_from_batches(
     })
 }
 
+/// Appends one batch to `rows`, filling it column by column.
+///
+/// Rows are grown to their final width first, then each column is downcast once
+/// and written across every row. Reading a column top to bottom keeps both the
+/// Arrow side and the type dispatch out of the inner loop: the array kind is
+/// matched once per column instead of once per cell.
+fn append_batch_rows(
+    result_fields: &[Field],
+    batch: &RecordBatch,
+    rows: &mut Vec<Vec<Value>>,
+) -> Result<(), LixError> {
+    let row_base = rows.len();
+    let column_count = batch.num_columns();
+    rows.resize_with(row_base + batch.num_rows(), || {
+        Vec::<Value>::with_capacity(column_count)
+    });
+    let batch_rows = &mut rows[row_base..];
+    for (column_index, array) in batch.columns().iter().enumerate() {
+        let cursor = column_cursor(result_fields.get(column_index), array.as_ref())?;
+        cursor.append_column(batch_rows)?;
+    }
+    Ok(())
+}
+
 #[cfg(any(feature = "storage-benches", test))]
 pub(crate) fn row_values_from_batch(
     result_fields: &[Field],
     batch: &RecordBatch,
     row_index: usize,
 ) -> Result<Vec<Value>, LixError> {
-    let cursors = column_cursors(result_fields, batch)?;
-    let mut row = Vec::<Value>::with_capacity(cursors.len());
-    for cursor in &cursors {
-        row.push(cursor.value(row_index)?);
-    }
-    Ok(row)
+    // Slicing is an offset adjustment, not a copy, so one row reuses exactly
+    // the same column fill as a whole batch.
+    let row = batch.slice(row_index, 1);
+    let mut rows = Vec::<Vec<Value>>::with_capacity(1);
+    append_batch_rows(result_fields, &row, &mut rows)?;
+    rows.pop().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "result row index out of range",
+        )
+    })
 }
 
 /// One result column of one `RecordBatch`, already downcast to its concrete
@@ -3023,18 +3044,6 @@ enum ColumnCursor<'a> {
 enum TextKind {
     Text,
     Json,
-}
-
-fn column_cursors<'a>(
-    result_fields: &[Field],
-    batch: &'a RecordBatch,
-) -> Result<Vec<ColumnCursor<'a>>, LixError> {
-    batch
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(column_index, array)| column_cursor(result_fields.get(column_index), array.as_ref()))
-        .collect()
 }
 
 fn column_cursor<'a>(
@@ -3092,85 +3101,131 @@ fn downcast_column<'a, ArrayType: 'static>(
 }
 
 impl ColumnCursor<'_> {
-    fn value(&self, row_index: usize) -> Result<Value, LixError> {
+    /// Pushes this column's value onto every row of the batch.
+    ///
+    /// `rows` is exactly the batch's row window, so row `n` of the slice is row
+    /// `n` of the array.
+    fn append_column(&self, rows: &mut [Vec<Value>]) -> Result<(), LixError> {
         match self {
-            Self::Null => Ok(Value::Null),
-            Self::Boolean(values) => Ok(if values.is_null(row_index) {
-                Value::Null
-            } else {
-                Value::Boolean(values.value(row_index))
-            }),
-            Self::Int8(values) => Ok(integer_value(values, row_index)),
-            Self::Int16(values) => Ok(integer_value(values, row_index)),
-            Self::Int32(values) => Ok(integer_value(values, row_index)),
-            Self::Int64(values) => Ok(integer_value(values, row_index)),
-            Self::UInt8(values) => Ok(integer_value(values, row_index)),
-            Self::UInt16(values) => Ok(integer_value(values, row_index)),
-            Self::UInt32(values) => Ok(integer_value(values, row_index)),
-            Self::UInt64(values) => Ok(if values.is_null(row_index) {
-                Value::Null
-            } else {
-                let value = values.value(row_index);
-                match i64::try_from(value) {
-                    Ok(value) => Value::Integer(value),
-                    Err(_) => Value::Text(value.to_string()),
+            Self::Null => {
+                for row in rows.iter_mut() {
+                    row.push(Value::Null);
                 }
-            }),
-            Self::Float32(values) => real_value(values, row_index),
-            Self::Float64(values) => real_value(values, row_index),
-            Self::Utf8(values, kind) => Ok(if values.is_null(row_index) {
-                Value::Null
-            } else {
-                text_value(values.value(row_index), *kind)
-            }),
-            Self::LargeUtf8(values, kind) => Ok(if values.is_null(row_index) {
-                Value::Null
-            } else {
-                text_value(values.value(row_index), *kind)
-            }),
-            Self::Utf8View(values, kind) => Ok(if values.is_null(row_index) {
-                Value::Null
-            } else {
-                text_value(values.value(row_index), *kind)
-            }),
-            Self::Binary(values) => Ok(if values.is_null(row_index) {
-                Value::Null
-            } else {
-                Value::Blob(values.value(row_index).into())
-            }),
-            Self::LargeBinary(values) => Ok(if values.is_null(row_index) {
-                Value::Null
-            } else {
-                Value::Blob(values.value(row_index).into())
-            }),
+            }
+            Self::Boolean(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Boolean(values.value(row_index))
+                    });
+                }
+            }
+            Self::Int8(values) => append_integers(values, rows),
+            Self::Int16(values) => append_integers(values, rows),
+            Self::Int32(values) => append_integers(values, rows),
+            Self::Int64(values) => append_integers(values, rows),
+            Self::UInt8(values) => append_integers(values, rows),
+            Self::UInt16(values) => append_integers(values, rows),
+            Self::UInt32(values) => append_integers(values, rows),
+            Self::UInt64(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        let value = values.value(row_index);
+                        match i64::try_from(value) {
+                            Ok(value) => Value::Integer(value),
+                            // Unsigned values past the signed range have no
+                            // integer representation in a Lix row, so they are
+                            // preserved exactly as decimal text.
+                            Err(_) => Value::Text(value.to_string()),
+                        }
+                    });
+                }
+            }
+            Self::Float32(values) => append_reals(values, rows)?,
+            Self::Float64(values) => append_reals(values, rows)?,
+            Self::Utf8(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::LargeUtf8(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::Utf8View(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::Binary(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Blob(values.value(row_index).into())
+                    });
+                }
+            }
+            Self::LargeBinary(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Blob(values.value(row_index).into())
+                    });
+                }
+            }
         }
+        Ok(())
     }
 }
 
-fn integer_value<NativeType>(values: &PrimitiveArray<NativeType>, row_index: usize) -> Value
+fn append_integers<NativeType>(values: &PrimitiveArray<NativeType>, rows: &mut [Vec<Value>])
 where
     NativeType: ArrowPrimitiveType,
     NativeType::Native: Into<i64>,
 {
-    if values.is_null(row_index) {
-        Value::Null
-    } else {
-        Value::Integer(values.value(row_index).into())
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        row.push(if values.is_null(row_index) {
+            Value::Null
+        } else {
+            Value::Integer(values.value(row_index).into())
+        });
     }
 }
 
-fn real_value<NativeType>(
+fn append_reals<NativeType>(
     values: &PrimitiveArray<NativeType>,
-    row_index: usize,
-) -> Result<Value, LixError>
+    rows: &mut [Vec<Value>],
+) -> Result<(), LixError>
 where
     NativeType: ArrowPrimitiveType,
     NativeType::Native: Into<f64>,
 {
-    if values.is_null(row_index) {
-        return Ok(Value::Null);
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        row.push(if values.is_null(row_index) {
+            Value::Null
+        } else {
+            finite_query_float(values.value(row_index).into())?
+        });
     }
-    finite_query_float(values.value(row_index).into())
+    Ok(())
 }
 
 fn text_value(value: &str, kind: TextKind) -> Value {
