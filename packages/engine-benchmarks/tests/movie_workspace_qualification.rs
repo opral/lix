@@ -62,22 +62,59 @@ async fn slatedb_resumes_media_upload_after_engine_restart() {
     finish_restart_upload(storage).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "release qualification benchmark"]
-async fn rocksdb_movie_workspace_interference() {
-    let _qualification_guard = QUALIFICATION_LOCK.lock().await;
-    let temp = tempfile::tempdir().expect("create RocksDB movie fixture");
-    let storage = RocksDB::open(temp.path().join("database")).expect("open RocksDB fixture");
-    qualify("rocksdb", storage).await;
+/// The qualification models a desktop editor: a small fixed worker pool that
+/// media ingest, project saves and playback all share. `LIX_MOVIE_WORKER_THREADS`
+/// exists only so an investigation can separate executor starvation from engine
+/// latency; the qualification itself always runs the four-thread profile.
+fn qualification_runtime() -> tokio::runtime::Runtime {
+    let worker_threads = std::env::var("LIX_MOVIE_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("build movie qualification runtime")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "release qualification benchmark"]
-async fn slatedb_movie_workspace_interference() {
-    let _qualification_guard = QUALIFICATION_LOCK.lock().await;
-    let temp = tempfile::tempdir().expect("create SlateDB movie fixture");
-    let storage = SlateDB::open(temp.path().join("database")).expect("open SlateDB fixture");
-    qualify("slatedb", storage).await;
+fn rocksdb_movie_workspace_interference() {
+    qualification_runtime().block_on(async {
+        let _qualification_guard = QUALIFICATION_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("create RocksDB movie fixture");
+        let storage = RocksDB::open(temp.path().join("database")).expect("open RocksDB fixture");
+        qualify("rocksdb", storage).await;
+    });
+}
+
+#[test]
+#[ignore = "release qualification benchmark"]
+fn slatedb_movie_workspace_interference() {
+    qualification_runtime().block_on(async {
+        let _qualification_guard = QUALIFICATION_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("create SlateDB movie fixture");
+        let storage = SlateDB::open(temp.path().join("database")).expect("open SlateDB fixture");
+        qualify("slatedb", storage).await;
+    });
+}
+
+/// Null control for the playback assertions: identical schedule, sessions and
+/// fixture, with the concurrent 512 MiB ingest removed. Whatever scheduling
+/// jitter this run shows is the floor below which a playback deadline cannot
+/// be attributed to ingest interference.
+#[test]
+#[ignore = "playback null control"]
+fn slatedb_movie_workspace_playback_control() {
+    qualification_runtime().block_on(async {
+        let _qualification_guard = QUALIFICATION_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("create SlateDB control fixture");
+        let storage = SlateDB::open(temp.path().join("database")).expect("open SlateDB fixture");
+        let part_concurrency = upload_concurrency();
+        qualify_case("slatedb-control", storage, part_concurrency, None, None, false).await;
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -187,20 +224,24 @@ async fn qualify_delayed_slatedb(latency_ms: u64, upload_concurrency: usize) -> 
         upload_concurrency,
         Some((delayed, Duration::from_millis(latency_ms))),
         Some(counters),
+        true,
     )
     .await
+}
+
+fn upload_concurrency() -> usize {
+    std::env::var("LIX_MOVIE_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=4).contains(value))
+        .unwrap_or(4)
 }
 
 async fn qualify<S>(backend: &str, storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let part_concurrency = std::env::var("LIX_MOVIE_UPLOAD_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=4).contains(value))
-        .unwrap_or(4);
-    qualify_case(backend, storage, part_concurrency, None, None).await;
+    qualify_case(backend, storage, upload_concurrency(), None, None, true).await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -218,6 +259,7 @@ async fn qualify_case<S>(
     part_concurrency: usize,
     artificial_latency: Option<(LatencyObjectStore, Duration)>,
     io_counters: Option<SlateDBIoCounters>,
+    run_ingest: bool,
 ) -> Qualification
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -255,6 +297,7 @@ where
         PROXY_BYTES,
         1,
         part_concurrency,
+        None,
     )
     .await;
     if let Some((store, latency)) = &artificial_latency {
@@ -293,15 +336,18 @@ where
     let started = tokio::time::Instant::now();
     let ingest_started = Instant::now();
     let ingest_future = async {
-        upload(
-            &ingest,
-            "concurrent-ingest",
-            "/media/import.mov",
-            INGEST_BYTES,
-            2,
-            part_concurrency,
-        )
-        .await;
+        if run_ingest {
+            upload(
+                &ingest,
+                "concurrent-ingest",
+                "/media/import.mov",
+                INGEST_BYTES,
+                2,
+                part_concurrency,
+                std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE").is_some().then_some(started),
+            )
+            .await;
+        }
         ingest_started.elapsed()
     };
     let save_future = project_saves(saver, started);
@@ -339,14 +385,16 @@ where
         io.cache_filesystem_removes,
         io.writer_gate_wait_nanos as f64 / 1_000_000.0,
     );
-    assert!(save_p95 < Duration::from_millis(500));
-    assert_eq!(first_late, 0, "first 100 Mbit/s stream fell behind");
-    assert_eq!(second_late, 0, "second 100 Mbit/s stream fell behind");
-    assert_eq!(structural.temporary_manifest_leaf_rows, 32);
-    assert_eq!(structural.legacy_equivalent_chunk_rows, 512);
-    assert_eq!(row_reduction, 16.0);
-    assert_eq!(projected_chunk_rows / projected_leaf_rows, 16);
-    assert!(structural.chunk_payload_hash_bytes >= INGEST_BYTES as u64);
+    if run_ingest {
+        assert!(save_p95 < Duration::from_millis(500));
+        assert_eq!(first_late, 0, "first 100 Mbit/s stream fell behind");
+        assert_eq!(second_late, 0, "second 100 Mbit/s stream fell behind");
+        assert_eq!(structural.temporary_manifest_leaf_rows, 32);
+        assert_eq!(structural.legacy_equivalent_chunk_rows, 512);
+        assert_eq!(row_reduction, 16.0);
+        assert_eq!(projected_chunk_rows / projected_leaf_rows, 16);
+        assert!(structural.chunk_payload_hash_bytes >= INGEST_BYTES as u64);
+    }
     Qualification {
         ingest_mib_s,
         save_p95,
@@ -421,6 +469,7 @@ async fn upload<S>(
     total_bytes: usize,
     seed: u64,
     part_concurrency: usize,
+    schedule_start: Option<tokio::time::Instant>,
 ) where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -448,6 +497,12 @@ async fn upload<S>(
             .max()
             .expect("upload window contains a part");
         assert_eq!(acknowledged, window_end as u64);
+        if let Some(schedule_start) = schedule_start {
+            println!(
+                "movie_upload_window,upload_id={upload_id},window_end={window_end},at_ms={:.3}",
+                (tokio::time::Instant::now() - schedule_start).as_secs_f64() * 1000.0,
+            );
+        }
         window_start = window_end;
     }
 }
