@@ -6031,6 +6031,9 @@ where
     where
         I: ExactSizeIterator<Item = (&'a str, &'a EntityPk)> + Clone,
     {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         if rows.len() == 0 {
             return Err(head_value_error(
                 "ordered packed current base requires at least one inserted row",
@@ -6107,6 +6110,9 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         if parts.owner_commit_id != *new_head.as_uuid().as_bytes()
             || parts.row_count == 0
             || lifecycle.scope.schema_key != parts.schema_key
@@ -6153,6 +6159,9 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(CommitId, bool), LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         let row_count = u64::try_from(row_count)
             .map_err(|_| head_value_error("packed replacement row count exceeds u64"))?;
         if row_count == 0 {
@@ -6340,6 +6349,9 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<Option<CommitId>, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         let Some(first) = deltas.first() else {
             return Ok(None);
         };
@@ -6429,6 +6441,9 @@ where
         deltas: &[CurrentStateDeltaRef<'_>],
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
     ) -> Result<Option<CommitId>, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         if working_diff_capture_checkpoint_commit_id.is_some() {
             return Ok(None);
         }
@@ -6609,6 +6624,9 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<Option<CommitId>, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         if deltas.is_empty() {
             return Err(head_value_error(
                 "packed current base requires at least one inserted row",
@@ -6824,6 +6842,9 @@ where
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         let deltas = deltas
             .iter()
             .map(TrackedHeadDeltaRef::as_current)
@@ -6859,6 +6880,9 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         let deltas = deltas
             .iter()
             .map(TrackedHeadDeltaRef::as_current)
@@ -6890,6 +6914,9 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         self.stage_current_state_with_working_diff_inner(
             branch_id,
             parent_generation,
@@ -6923,6 +6950,9 @@ where
         deltas: &[CurrentStateDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         let sorted = sorted_lifecycle_hot_deltas(deltas, true)?;
         let mut rows =
             load_hot_untracked_generation(self.store, branch_id, previous_generation).await?;
@@ -7007,6 +7037,9 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         self.stage_current_state_with_working_diff_inner(
             branch_id,
             parent_generation,
@@ -7039,6 +7072,9 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
         certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         self.stage_current_state_with_working_diff_inner(
             branch_id,
             parent_generation,
@@ -7075,6 +7111,9 @@ where
         checkpoint_commit_id: CommitId,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         let generation = self
             .stage_current_state_with_working_diff_inner(
                 branch_id,
@@ -7118,6 +7157,9 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
         validated_absent_file_id: Option<&str>,
     ) -> Result<CommitId, LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         if parent_generation.is_none() {
             let owned_guards = absence_guards
                 .iter()
@@ -7770,6 +7812,9 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(HotTrackedSnapshot, BTreeSet<String>), LixError> {
+        crate::storage_adapter::schema_intern_of(self.store)
+            .ensure_current(self.store)
+            .await?;
         let mut rows = parent_tracked.rows;
         let mut untracked_rows = match preserved_untracked_generation {
             Some(previous_generation) => {

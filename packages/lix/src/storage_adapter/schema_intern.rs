@@ -334,7 +334,11 @@ impl SchemaIntern {
         })
     }
 
-    /// Write-path assignment. Returns the schema's id, allocating the next
+    /// Write-path assignment. Callers MUST have brought the table up to date
+    /// with `ensure_current` on the same snapshot first: allocating against a
+    /// stale table would hand a durable id to a second schema key.
+    ///
+    /// Returns the schema's id, allocating the next
     /// sequence id on first use, and stages the mapping row into `writes`
     /// whenever this process has not yet loaded it back from storage. The
     /// staged put is byte-identical on every repetition, so re-staging an
