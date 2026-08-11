@@ -4,8 +4,8 @@ use bytes::Bytes;
 use tracing::Instrument as _;
 
 use crate::storage::{
-    CommitResult, KeyRange, Memory, Precondition, Prefix, ReadOptions, Storage, StorageError,
-    StorageWrite, StoredValue, WriteOptions,
+    CommitResult, KeyRange, Memory, Precondition, Prefix, PutBatch, PutEntry, ReadOptions, Storage,
+    StorageError, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{
     StorageAdapterRead, StorageAdapterReadScope, StorageSpace, StorageWriteSet,
@@ -84,16 +84,9 @@ where
 
     pub async fn prepare_write_set(
         &self,
-        mut write_set: StorageWriteSet,
+        write_set: StorageWriteSet,
         mut opts: WriteOptions,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
-        // Every revision singleton lives in one space, so the adapter's own
-        // mutation token joins the transaction's already-staged revision puts
-        // and lowers as one contiguous batch instead of a trailing extra
-        // write into a separate space.
-        if write_set.has_staged_mutations() {
-            stage_mutation_revision(&mut write_set);
-        }
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());
@@ -106,7 +99,19 @@ where
             ))
             .await
             .map_err(StorageWriteSetError::Storage)?;
-        let lowered = async { write_set.lower_into(&mut write).await }
+        let lowered = async {
+            let stats = write_set.lower_into(&mut write).await?;
+            if stats.staged_puts > 0 || stats.staged_deletes > 0 {
+                // The adapter's own mutation token is not a caller mutation,
+                // so it stays out of the write set (and out of the returned
+                // stats). It now lands in the shared revision space, next to
+                // every other revision the same commit rotated.
+                stage_mutation_revision(&mut write)
+                    .await
+                    .map_err(StorageWriteSetError::Storage)?;
+            }
+            Ok::<_, StorageWriteSetError>(stats)
+        }
         .instrument(tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.storage_lowering"
@@ -207,14 +212,23 @@ where
     }
 }
 
-fn stage_mutation_revision(write_set: &mut StorageWriteSet) {
-    write_set.put(
-        REVISION_SPACE,
-        revision_key(REVISION_KEY_MUTATION),
-        StoredValue {
-            bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
-        },
-    );
+async fn stage_mutation_revision<W>(write: &mut W) -> Result<(), StorageError>
+where
+    W: StorageWrite,
+{
+    write
+        .put_many(
+            REVISION_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: revision_key(REVISION_KEY_MUTATION),
+                    value: StoredValue {
+                        bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
+                    },
+                }],
+            },
+        )
+        .await
 }
 
 impl<'a, StorageImpl> PreparedStorageCommit<'a, StorageImpl>

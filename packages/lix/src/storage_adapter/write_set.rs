@@ -269,16 +269,6 @@ impl StorageWriteSet {
                 .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
-    /// Whether this write set stages at least one point put or point delete.
-    ///
-    /// This is exactly the condition the adapter uses to decide whether a
-    /// commit advances the storage mutation revision. Lowering never changes
-    /// `staged_puts`/`staged_deletes`, so asking before lowering and asking
-    /// after lowering give the same answer.
-    pub(crate) fn has_staged_mutations(&self) -> bool {
-        self.stats.staged_puts > 0 || self.stats.staged_deletes > 0
-    }
-
     pub(crate) fn identity(&self) -> u64 {
         self.identity
     }
