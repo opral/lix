@@ -10052,9 +10052,9 @@ async fn classify_hot_working_diff_entries(
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
     resolve_working_diff_before_payloads(
         store,
-        candidates
-            .iter_mut()
-            .map(|(key, before, _)| (key.clone(), before)),
+        &mut candidates,
+        |(key, _, _)| key.clone(),
+        |(_, before, _)| before,
     )
     .await?;
     let row_count = candidates.len();
@@ -10084,16 +10084,13 @@ async fn classify_hot_working_diff_entry_refs(
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
     resolve_working_diff_before_payloads(
         store,
-        candidates.iter_mut().map(|(key, before, _)| {
-            (
-                TrackedStateKey {
-                    schema_key: key.schema_key.to_owned(),
-                    file_id: key.file_id.map(str::to_owned),
-                    entity_pk: key.entity_pk.clone(),
-                },
-                before,
-            )
-        }),
+        &mut candidates,
+        |(key, _, _)| TrackedStateKey {
+            schema_key: key.schema_key.to_owned(),
+            file_id: key.file_id.map(str::to_owned),
+            entity_pk: key.entity_pk.clone(),
+        },
+        |(_, before, _)| before,
     )
     .await?;
     let row_count = candidates.len();
@@ -10118,16 +10115,13 @@ async fn classify_hot_working_diff_scan_entries(
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
     resolve_working_diff_before_payloads(
         store,
-        candidates.iter_mut().map(|(identity, before, _)| {
-            (
-                TrackedStateKey {
-                    schema_key: identity.schema_key().to_owned(),
-                    file_id: identity.file_id().map(str::to_owned),
-                    entity_pk: identity.entity_pk.clone(),
-                },
-                before,
-            )
-        }),
+        &mut candidates,
+        |(identity, _, _)| TrackedStateKey {
+            schema_key: identity.schema_key().to_owned(),
+            file_id: identity.file_id().map(str::to_owned),
+            entity_pk: identity.entity_pk.clone(),
+        },
+        |(_, before, _)| before,
     )
     .await?;
     let row_count = candidates.len();
@@ -10155,65 +10149,71 @@ async fn classify_hot_working_diff_scan_entries(
 /// I/O to capture it. Classification needs the payload itself for exactly one
 /// question the change id cannot answer alone: whether two distinct change
 /// records carry the same payload. Change records are addressed by owning
-/// commit, so the pending rows are grouped by commit and fetched one batch per
-/// commit, and only for the rows that are actually unresolved.
-async fn resolve_working_diff_before_payloads<'a>(
+/// commit, so pending rows are grouped by commit and fetched one batch per
+/// commit. Identity keys are materialized only for rows that are actually
+/// unresolved, so a diff with no root-backed baselines pays nothing.
+async fn resolve_working_diff_before_payloads<T>(
     store: &(impl StorageAdapterRead + ?Sized),
-    rows: impl Iterator<Item = (TrackedStateKey, &'a mut Option<WorkingDiffVersion>)>,
+    candidates: &mut [T],
+    key_of: impl Fn(&T) -> TrackedStateKey,
+    before_of: impl Fn(&mut T) -> &mut Option<WorkingDiffVersion>,
 ) -> Result<(), LixError> {
     let mut pending = Vec::new();
-    for (key, before) in rows {
-        let Some(version) = before.as_mut() else {
+    for index in 0..candidates.len() {
+        let Some(version) = before_of(&mut candidates[index]).as_mut() else {
             continue;
         };
         if !version.payload_is_unresolved() {
             continue;
         }
         if version.deleted {
-            // A tombstone before image has no payload to hydrate, and its
-            // classification never consults one.
+            // A tombstone before image has no payload to hydrate, and
+            // classification never consults one for a deleted row.
             version.resolve_payload_slots(
                 WorkingDiffSlotFingerprint::none(),
                 WorkingDiffSlotFingerprint::none(),
             );
             continue;
         }
-        pending.push((version.commit_id, key, version));
+        pending.push(index);
     }
     if pending.is_empty() {
         return Ok(());
     }
     let mut by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
-    for (index, (commit_id, _, _)) in pending.iter().enumerate() {
-        by_commit.entry(*commit_id).or_default().push(index);
+    for index in pending {
+        let commit_id = before_of(&mut candidates[index])
+            .as_ref()
+            .expect("pending before images are present")
+            .commit_id;
+        by_commit.entry(commit_id).or_default().push(index);
     }
-    let mut resolved = vec![None; pending.len()];
     for (commit_id, indexes) in by_commit {
         let keys = indexes
             .iter()
-            .map(|index| pending[*index].1.clone())
+            .map(|index| key_of(&candidates[*index]))
             .collect::<Vec<_>>();
         let records =
             crate::tracked_state::load_commit_delta_change_records(store, commit_id, &keys).await?;
         for (index, record) in indexes.into_iter().zip(records) {
-            resolved[index] = record;
+            let record = record.ok_or_else(|| {
+                head_value_error(
+                    "working-diff baseline references a before image that is missing from its commit",
+                )
+            })?;
+            let version = before_of(&mut candidates[index])
+                .as_mut()
+                .expect("pending before images are present the second time");
+            if record.change_id != version.change_id {
+                return Err(head_value_error(
+                    "working-diff baseline before image does not match its referenced change record",
+                ));
+            }
+            version.resolve_payload_slots(
+                packed_working_diff_slot(&record.snapshot),
+                packed_working_diff_slot(&record.metadata),
+            );
         }
-    }
-    for ((_, _, version), record) in pending.into_iter().zip(resolved) {
-        let record = record.ok_or_else(|| {
-            head_value_error(
-                "working-diff baseline references a before image that is missing from its commit",
-            )
-        })?;
-        if record.change_id != version.change_id {
-            return Err(head_value_error(
-                "working-diff baseline before image does not match its referenced change record",
-            ));
-        }
-        version.resolve_payload_slots(
-            packed_working_diff_slot(&record.snapshot),
-            packed_working_diff_slot(&record.metadata),
-        );
     }
     Ok(())
 }
