@@ -289,7 +289,7 @@ async fn seed_media<S>(session: &SessionContext<S>, files: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let len = env_usize("LIX_AUDIT_FILE_BYTES", 256 * 1024);
+    let len = env_usize("LIX_AUDIT_FILE_BYTES", 4 * 1024 * 1024);
     for file in 0..files {
         session
             .execute(
@@ -310,7 +310,7 @@ async fn edit_media<S>(session: &SessionContext<S>, files: usize, rounds: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let len = env_usize("LIX_AUDIT_FILE_BYTES", 256 * 1024);
+    let len = env_usize("LIX_AUDIT_FILE_BYTES", 4 * 1024 * 1024);
     for round in 1..=rounds {
         for file in 0..files {
             let mut bytes = media_bytes(file, 0, len);
