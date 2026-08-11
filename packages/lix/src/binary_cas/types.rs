@@ -1,5 +1,5 @@
 use crate::LixError;
-use crate::binary_cas::chunking::{MEDIA_CHUNK_BYTES, chunk_ranges};
+use crate::binary_cas::chunking::chunk_ranges;
 use crate::binary_cas::codec::BinaryChunkCodec;
 use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
 use std::ops::Range;
@@ -308,6 +308,7 @@ pub(crate) struct BinaryCasChunkView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
 
     #[test]
     fn payload_carries_exact_canonical_chunk_receipts() {
