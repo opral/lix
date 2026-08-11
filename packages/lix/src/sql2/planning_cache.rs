@@ -101,9 +101,64 @@ pub(crate) struct CachedUpdateLiteralShape {
 /// public surfaces and injects branch scope. Cached DataFusion read plans are
 /// stripped of snapshot-bound providers and rebound to the current read
 /// session before execution.
+/// One DataFusion session borrowed from the engine's pool for the duration of
+/// one statement.
+///
+/// The `SessionState` travels with the session instead of being cloned out of
+/// it per statement. `SessionState::clone` deep-copies the `String`-keyed
+/// registries for every built-in scalar, aggregate, window and table function;
+/// with the execution UDFs registered once at session construction those
+/// registries no longer change, so the pooled copy stays authoritative for the
+/// lifetime of the session.
+pub(crate) struct PooledReadSession {
+    context: SessionContext,
+    state: Arc<SessionState>,
+}
+
+impl PooledReadSession {
+    fn new(context: SessionContext) -> Self {
+        let state = Arc::new(context.state());
+        Self { context, state }
+    }
+
+    /// A session that is not owned by any pool, used by lightweight contexts
+    /// that build one DataFusion session per statement.
+    pub(crate) fn standalone(context: SessionContext) -> Self {
+        Self::new(context)
+    }
+
+    pub(crate) fn context(&self) -> &SessionContext {
+        &self.context
+    }
+
+    /// The session state for this statement.
+    ///
+    /// Table registration flows through the shared catalog list, so this stays
+    /// current for provider resolution. Per-statement table-valued functions
+    /// are registered on the live session and are resolved there during logical
+    /// planning; this copy is used for physical planning and execution, which
+    /// never resolves a function by name.
+    pub(crate) fn state(&self) -> &Arc<SessionState> {
+        &self.state
+    }
+
+    /// Restamps `query_execution_start_time` so `now()` and friends observe the
+    /// statement's own start rather than the session's construction time.
+    fn begin_statement(&mut self) {
+        match Arc::get_mut(&mut self.state) {
+            Some(state) => state.mark_start_execution(),
+            None => {
+                let mut state = self.state.as_ref().clone();
+                state.mark_start_execution();
+                self.state = Arc::new(state);
+            }
+        }
+    }
+}
+
 pub(crate) struct SqlPlanningCache<CatalogKey> {
     datafusion_state: SessionState,
-    read_sessions: Mutex<Vec<SessionContext>>,
+    read_sessions: Mutex<Vec<PooledReadSession>>,
     parsed_statements: Mutex<LruCache<Arc<str>, Arc<DataFusionStatement>>>,
     public_catalogs: Mutex<LruCache<CatalogKey, Arc<PublicCatalog>>>,
     write_plans: Mutex<LruCache<WritePlanCacheKey<CatalogKey>, Arc<LogicalWritePlan>>>,
@@ -157,39 +212,38 @@ where
         let state = SessionStateBuilder::new_from_existing(self.datafusion_state.clone())
             .with_catalog_list(catalogs)
             .build();
-        SessionContext::new_with_state(state)
+        super::session::attach_execution_slots(SessionContext::new_with_state(state))
     }
 
-    pub(crate) fn datafusion_read_session(&self) -> SessionContext {
-        lock_or_recover(&self.read_sessions)
+    pub(crate) fn datafusion_read_session(&self) -> PooledReadSession {
+        let mut session = lock_or_recover(&self.read_sessions)
             .pop()
-            .unwrap_or_else(|| self.datafusion_session())
+            .unwrap_or_else(|| PooledReadSession::new(self.datafusion_session()));
+        session.begin_statement();
+        session
     }
 
-    pub(crate) fn recycle_datafusion_read_session(&self, session: SessionContext) {
-        if let Some(catalog) = session.catalog("datafusion")
+    pub(crate) fn recycle_datafusion_read_session(&self, session: PooledReadSession) {
+        if let Some(catalog) = session.context.catalog("datafusion")
             && let Some(public) = catalog.schema("public")
         {
             for table in public.table_names() {
-                let _ = session.deregister_table(datafusion::common::TableReference::full(
-                    "datafusion",
-                    "public",
-                    table,
-                ));
+                let _ = session
+                    .context
+                    .deregister_table(datafusion::common::TableReference::full(
+                        "datafusion",
+                        "public",
+                        table,
+                    ));
             }
         }
-        // Borrow the live session state instead of cloning it. `SessionState`
-        // owns `String`-keyed registries for every built-in scalar, aggregate
-        // and window function, so a clone here would deep-copy hundreds of
-        // keys just to diff two name sets.
-        let state_ref = session.state_ref();
+        // Only table-valued functions are registered per statement; the five
+        // execution scalar functions are installed once at session construction
+        // and read their per-statement values from the session's slots. Borrow
+        // the live state rather than cloning it — a clone would deep-copy the
+        // registries for every built-in function just to diff two name sets.
+        let state_ref = session.context.state_ref();
         let state = state_ref.read();
-        let execution_scalar_functions = state
-            .scalar_functions()
-            .keys()
-            .filter(|name| !self.datafusion_state.scalar_functions().contains_key(*name))
-            .cloned()
-            .collect::<Vec<_>>();
         let execution_table_functions = state
             .table_functions()
             .keys()
@@ -198,11 +252,8 @@ where
             .collect::<Vec<_>>();
         drop(state);
         drop(state_ref);
-        for name in execution_scalar_functions {
-            session.deregister_udf(&name);
-        }
         for name in execution_table_functions {
-            session.deregister_udtf(&name);
+            session.context.deregister_udtf(&name);
         }
 
         let mut sessions = lock_or_recover(&self.read_sessions);
@@ -1106,8 +1157,9 @@ mod tests {
     fn recycled_read_sessions_drop_snapshot_bound_tables() {
         let cache = test_cache(2);
         let session = cache.datafusion_read_session();
-        let session_id = session.session_id();
+        let session_id = session.context().session_id();
         session
+            .context()
             .register_table(
                 "snapshot_table",
                 Arc::new(EmptyTable::new(Arc::new(Schema::empty()))),
@@ -1116,8 +1168,8 @@ mod tests {
 
         cache.recycle_datafusion_read_session(session);
         let recycled = cache.datafusion_read_session();
-        assert_eq!(recycled.session_id(), session_id);
-        assert!(!recycled.table_exist("snapshot_table").unwrap());
+        assert_eq!(recycled.context().session_id(), session_id);
+        assert!(!recycled.context().table_exist("snapshot_table").unwrap());
     }
 
     #[test]

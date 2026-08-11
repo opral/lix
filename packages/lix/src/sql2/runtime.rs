@@ -5,11 +5,11 @@ use std::sync::Arc;
 #[cfg(feature = "storage-benches")]
 use std::time::Instant;
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::ScanArgs;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DataFusionError, TableReference, internal_err};
-use datafusion::dataframe::DataFrame;
 use datafusion::datasource::empty::EmptyTable;
 use datafusion::datasource::{provider_as_source, source_as_provider};
 use datafusion::error::Result;
@@ -19,7 +19,8 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::logical_expr::{LogicalPlan, TableSource};
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::execution_plan::{CardinalityEffect, EmissionType};
+use datafusion::physical_expr::{LexOrdering, Partitioning};
+use datafusion::physical_plan::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -42,16 +43,15 @@ type PhysicalPlanningCache = (
     PhysicalReadPlanCacheKey<CatalogFingerprint>,
 );
 
-pub(crate) async fn collect_dataframe(
-    dataframe: DataFrame,
+pub(crate) async fn collect_plan(
+    state: &SessionState,
+    logical_plan: LogicalPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Vec<RecordBatch>> {
-    let (state, logical_plan) = dataframe.into_parts();
-    let task_ctx = execution_task_context(&state);
+    let task_ctx = execution_task_context(state);
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan =
-        create_or_rebind_physical_plan(&state, logical_plan, physical_planning_cache).await?;
+    let plan = create_or_rebind_physical_plan(state, logical_plan, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -78,16 +78,15 @@ pub(crate) async fn collect_dataframe(
 /// stop polling it early; dropping the stream then drops the underlying scan
 /// futures as well.
 #[cfg(feature = "storage-benches")]
-pub(crate) async fn stream_dataframe(
-    dataframe: DataFrame,
+pub(crate) async fn stream_plan(
+    state: &SessionState,
+    logical_plan: LogicalPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<SendableRecordBatchStream> {
-    let (state, logical_plan) = dataframe.into_parts();
-    let task_ctx = execution_task_context(&state);
+    let task_ctx = execution_task_context(state);
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan =
-        create_or_rebind_physical_plan(&state, logical_plan, physical_planning_cache).await?;
+    let plan = create_or_rebind_physical_plan(state, logical_plan, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -311,7 +310,9 @@ fn rebind_physical_plan_template_inner(
 ) -> Option<Arc<dyn ExecutionPlan>> {
     if let Some(detached) = plan.as_any().downcast_ref::<DetachedSpecScanExec>() {
         let replacement = replacements.get_mut(&detached.key)?.pop_front()?;
-        return (physical_plan_fingerprint(replacement.as_ref()) == detached.fingerprint)
+        return detached
+            .fingerprint
+            .matches(replacement.as_ref())
             .then_some(replacement);
     }
     let children = plan
@@ -356,17 +357,53 @@ fn rebuild_template_node(
     plan.with_new_children(children).ok()
 }
 
-fn physical_plan_fingerprint(plan: &dyn ExecutionPlan) -> Arc<str> {
-    Arc::from(format!(
-        "schema={:?};properties={:?}",
-        plan.schema(),
-        plan.properties()
-    ))
+/// The structural identity a replacement scan must reproduce before a detached
+/// template leaf accepts it.
+///
+/// This is compared once per leaf on every warm execution, so it is kept as
+/// direct field equality. Formatting `Debug` for the schema and the full
+/// `PlanProperties` — including `EquivalenceProperties` — allocated several
+/// kilobytes of string per scan per query for the same decision.
+///
+/// `Partitioning` deliberately compares by discriminant and partition count:
+/// its `PartialEq` returns `false` for two identical `UnknownPartitioning`
+/// values, which is the variant every `SpecScanExec` reports.
+struct ScanFingerprint {
+    schema: SchemaRef,
+    partitioning: std::mem::Discriminant<Partitioning>,
+    partition_count: usize,
+    output_ordering: Option<LexOrdering>,
+    emission_type: EmissionType,
+    boundedness: Boundedness,
+}
+
+impl ScanFingerprint {
+    fn new(plan: &dyn ExecutionPlan) -> Self {
+        let properties = plan.properties();
+        Self {
+            schema: plan.schema(),
+            partitioning: std::mem::discriminant(&properties.partitioning),
+            partition_count: properties.partitioning.partition_count(),
+            output_ordering: properties.output_ordering().cloned(),
+            emission_type: properties.emission_type,
+            boundedness: properties.boundedness,
+        }
+    }
+
+    fn matches(&self, plan: &dyn ExecutionPlan) -> bool {
+        let properties = plan.properties();
+        self.partition_count == properties.partitioning.partition_count()
+            && self.partitioning == std::mem::discriminant(&properties.partitioning)
+            && self.emission_type == properties.emission_type
+            && self.boundedness == properties.boundedness
+            && self.output_ordering.as_ref() == properties.output_ordering()
+            && self.schema == plan.schema()
+    }
 }
 
 struct DetachedSpecScanExec {
     key: PhysicalScanKey,
-    fingerprint: Arc<str>,
+    fingerprint: ScanFingerprint,
     properties: Arc<PlanProperties>,
 }
 
@@ -374,7 +411,7 @@ impl DetachedSpecScanExec {
     fn new(scan: &SpecScanExec) -> Self {
         Self {
             key: scan.physical_cache_key().clone(),
-            fingerprint: physical_plan_fingerprint(scan),
+            fingerprint: ScanFingerprint::new(scan),
             properties: Arc::clone(scan.properties()),
         }
     }

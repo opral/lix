@@ -99,8 +99,8 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
         super::session::new_sql_session_context()
     }
-    fn datafusion_read_session(&self) -> datafusion::prelude::SessionContext {
-        self.datafusion_session()
+    fn datafusion_read_session(&self) -> super::planning_cache::PooledReadSession {
+        super::planning_cache::PooledReadSession::standalone(self.datafusion_session())
     }
     async fn sql_planning_environment(
         &self,

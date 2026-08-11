@@ -8430,7 +8430,7 @@ where
         self.sql_planning_cache.datafusion_session()
     }
 
-    fn datafusion_read_session(&self) -> datafusion::prelude::SessionContext {
+    fn datafusion_read_session(&self) -> crate::sql2::PooledReadSession {
         self.sql_planning_cache.datafusion_read_session()
     }
 
