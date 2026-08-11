@@ -9952,7 +9952,9 @@ async fn hot_working_diff_entries(
             after,
         ));
     }
-    Ok(Some(classify_hot_working_diff_entries(candidates)?))
+    Ok(Some(
+        classify_hot_working_diff_entries(store, candidates).await?,
+    ))
 }
 
 fn choose_hot_or_packed_working_diff(
@@ -9990,7 +9992,9 @@ async fn hot_working_diff_entries_for_finite_filter(
                 };
                 candidates.push((identity, before, after));
             }
-            Ok(Some(classify_hot_working_diff_scan_entries(candidates)?))
+            Ok(Some(
+                classify_hot_working_diff_scan_entries(store, candidates).await?,
+            ))
         }
         HotScanEntries::Finite(batches) => {
             let row_count = batches
@@ -10013,7 +10017,9 @@ async fn hot_working_diff_entries_for_finite_filter(
                     candidates.push((batch.identities.key_ref(index), before, after));
                 }
             }
-            Ok(Some(classify_hot_working_diff_entry_refs(candidates)?))
+            Ok(Some(
+                classify_hot_working_diff_entry_refs(store, candidates).await?,
+            ))
         }
     }
 }
@@ -10036,13 +10042,19 @@ fn finite_working_diff_versions(
     Some(Some((before, after)))
 }
 
-fn classify_hot_working_diff_entries(
-    candidates: Vec<(
+async fn classify_hot_working_diff_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    mut candidates: Vec<(
         TrackedStateKey,
         Option<WorkingDiffVersion>,
         WorkingDiffVersion,
     )>,
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
+    resolve_working_diff_before_payloads(
+        store,
+        candidates.iter_mut().map(|(_, before, _)| before),
+    )
+    .await?;
     let row_count = candidates.len();
     let mut keys = Vec::with_capacity(row_count);
     let mut versions = Vec::with_capacity(row_count);
@@ -10053,39 +10065,51 @@ fn classify_hot_working_diff_entries(
     let identities = TrackedStateDiffIdentity::from_key_batch(keys)?;
     let mut entries = Vec::with_capacity(row_count);
     for (identity, (before, after)) in identities.into_iter().zip(versions) {
-        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after) {
+        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after)? {
             entries.push(entry);
         }
     }
     Ok(entries)
 }
 
-fn classify_hot_working_diff_entry_refs(
-    candidates: Vec<(
+async fn classify_hot_working_diff_entry_refs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    mut candidates: Vec<(
         TrackedStateKeyRef<'_>,
         Option<WorkingDiffVersion>,
         WorkingDiffVersion,
     )>,
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
+    resolve_working_diff_before_payloads(
+        store,
+        candidates.iter_mut().map(|(_, before, _)| before),
+    )
+    .await?;
     let row_count = candidates.len();
     let identities =
         TrackedStateDiffIdentity::from_key_refs(row_count, |index| candidates[index].0)?;
     let mut entries = Vec::with_capacity(row_count);
     for (identity, (_, before, after)) in identities.into_iter().zip(candidates) {
-        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after) {
+        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after)? {
             entries.push(entry);
         }
     }
     Ok(entries)
 }
 
-fn classify_hot_working_diff_scan_entries(
-    candidates: Vec<(
+async fn classify_hot_working_diff_scan_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    mut candidates: Vec<(
         HotScanIdentity,
         Option<WorkingDiffVersion>,
         WorkingDiffVersion,
     )>,
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
+    resolve_working_diff_before_payloads(
+        store,
+        candidates.iter_mut().map(|(_, before, _)| before),
+    )
+    .await?;
     let row_count = candidates.len();
     let identities = TrackedStateDiffIdentity::from_key_refs(row_count, |index| {
         let identity = &candidates[index].0;
@@ -10097,44 +10121,103 @@ fn classify_hot_working_diff_scan_entries(
     })?;
     let mut entries = Vec::with_capacity(row_count);
     for (identity, (_, before, after)) in identities.into_iter().zip(candidates) {
-        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after) {
+        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after)? {
             entries.push(entry);
         }
     }
     Ok(entries)
 }
 
+/// Hydrates the payload slots of before images that were captured by reference.
+///
+/// A root-backed baseline stores only the change id of its before image, so the
+/// write path pays no payload I/O. Classification needs the payload itself only
+/// to separate "different change, same payload" from a real modification, so
+/// the change records are fetched here, in one batch, and only for the rows
+/// that are actually unresolved.
+async fn resolve_working_diff_before_payloads<'a>(
+    store: &(impl StorageAdapterRead + ?Sized),
+    befores: impl Iterator<Item = &'a mut Option<WorkingDiffVersion>>,
+) -> Result<(), LixError> {
+    let mut pending = befores
+        .filter(|before| {
+            before
+                .as_ref()
+                .is_some_and(|version| version.payload_is_unresolved())
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let records = crate::changelog::load_change_records(
+        store,
+        pending.iter().map(|before| {
+            before
+                .as_ref()
+                .expect("pending before images are present")
+                .change_id
+        }),
+    )
+    .await?;
+    for before in &mut pending {
+        let version = before
+            .as_mut()
+            .expect("pending before images are present the second time");
+        let record = records.get(&version.change_id).ok_or_else(|| {
+            head_value_error(
+                "working-diff baseline references a change record that is no longer readable",
+            )
+        })?;
+        version.resolve_payload_slots(
+            packed_working_diff_slot(&record.snapshot),
+            packed_working_diff_slot(&record.metadata),
+        );
+    }
+    Ok(())
+}
+
 fn classify_hot_working_diff_entry(
     diff_identity: TrackedStateDiffIdentity,
     before: Option<WorkingDiffVersion>,
     after: WorkingDiffVersion,
-) -> Option<TrackedStateDiffEntry> {
+) -> Result<Option<TrackedStateDiffEntry>, LixError> {
     let before_row = before.map(|version| version.into_diff_row(diff_identity.clone()));
     let after_row = after.into_diff_row(diff_identity.clone());
     match (
         before_row.as_ref().filter(|row| !row.deleted),
         (!after_row.deleted).then_some(&after_row),
     ) {
-        (None, None) => None,
-        (None, Some(_)) => Some(TrackedStateDiffEntry {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Ok(Some(TrackedStateDiffEntry {
             identity: diff_identity,
             kind: TrackedStateDiffKind::Added,
             before: before_row,
             after: Some(after_row),
-        }),
-        (Some(_), None) => Some(TrackedStateDiffEntry {
+        })),
+        (Some(_), None) => Ok(Some(TrackedStateDiffEntry {
             identity: diff_identity,
             kind: TrackedStateDiffKind::Removed,
             before: before_row,
             after: Some(after_row),
-        }),
-        (Some(_), Some(_)) if before.is_some_and(|version| version.payload_eq(after)) => None,
-        (Some(_), Some(_)) => Some(TrackedStateDiffEntry {
-            identity: diff_identity,
-            kind: TrackedStateDiffKind::Modified,
-            before: before_row,
-            after: Some(after_row),
-        }),
+        })),
+        (Some(_), Some(_)) => {
+            let before = before.expect("a present before row implies a before version");
+            match before.payload_equality(after) {
+                WorkingDiffPayloadEquality::Equal => Ok(None),
+                WorkingDiffPayloadEquality::Different => Ok(Some(TrackedStateDiffEntry {
+                    identity: diff_identity,
+                    kind: TrackedStateDiffKind::Modified,
+                    before: before_row,
+                    after: Some(after_row),
+                })),
+                // Never guess. Every caller hydrates unresolved before images
+                // before classifying, so reaching this arm means a new baseline
+                // source skipped that step.
+                WorkingDiffPayloadEquality::Unresolved => Err(head_value_error(
+                    "working-diff classification reached an unresolved before image",
+                )),
+            }
+        }
     }
 }
 
@@ -13831,8 +13914,9 @@ mod tests {
         (key, value)
     }
 
-    #[test]
-    fn hot_working_diff_entries_share_one_identity_batch() {
+    #[tokio::test]
+    async fn hot_working_diff_entries_share_one_identity_batch() {
+        let store = StorageAdapter::new(Memory::new());
         let candidates = ["first", "second"]
             .into_iter()
             .map(|entity| {
@@ -13848,8 +13932,9 @@ mod tests {
             })
             .collect();
 
-        let entries =
-            classify_hot_working_diff_entries(candidates).expect("valid working diff batch");
+        let entries = classify_hot_working_diff_entries(&store, candidates)
+            .await
+            .expect("valid working diff batch");
 
         assert_eq!(entries.len(), 2);
         assert!(entries[0].identity.shares_batch_with(&entries[1].identity));
@@ -13862,8 +13947,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finite_hot_working_diff_borrows_keys_into_one_identity_batch() {
+    #[tokio::test]
+    async fn finite_hot_working_diff_borrows_keys_into_one_identity_batch() {
+        let store = StorageAdapter::new(Memory::new());
         let schema_key = String::from("schema");
         let file_id = String::from("file");
         let entity_pks = [EntityPk::single("first"), EntityPk::single("second")];
@@ -13883,8 +13969,9 @@ mod tests {
             })
             .collect();
 
-        let entries =
-            classify_hot_working_diff_entry_refs(candidates).expect("valid borrowed diff batch");
+        let entries = classify_hot_working_diff_entry_refs(&store, candidates)
+            .await
+            .expect("valid borrowed diff batch");
 
         assert_eq!(entries.len(), 2);
         assert!(entries[0].identity.shares_batch_with(&entries[1].identity));
