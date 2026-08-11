@@ -1518,6 +1518,9 @@ mod tests {
             "an untracked write must not take over a dirty tracked identity"
         );
 
+        use std::sync::atomic::Ordering;
+        let hits = &crate::live_state::WORKING_DIFF_PATH_HITS;
+        let index_before = hits.index_scan.load(Ordering::Relaxed);
         let broad = session
             .execute(
                 "SELECT entity_pk, diff_type FROM lix_working_diff \
@@ -1526,6 +1529,10 @@ mod tests {
             )
             .await
             .expect("broad working-diff read should execute");
+        assert!(
+            hits.index_scan.load(Ordering::Relaxed) > index_before,
+            "the schema-only working-diff read must take the HOT_DIFF index path"
+        );
         let broad_rows = broad
             .rows()
             .iter()
@@ -1562,6 +1569,7 @@ mod tests {
             "/never-existed",
         ] {
             let entity_pk = format!("[\"{path}\"]");
+            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
             let finite = session
                 .execute(
                     "SELECT entity_pk, diff_type FROM lix_working_diff \
@@ -1571,6 +1579,10 @@ mod tests {
                 )
                 .await
                 .expect("finite working-diff read should execute");
+            assert!(
+                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                "the finite working-diff read for {path} must take the primary-row bypass"
+            );
             let finite_rows = finite
                 .rows()
                 .iter()
@@ -1594,6 +1606,186 @@ mod tests {
                 "the finite working-diff bypass disagrees with the index scan for {path}"
             );
         }
+    }
+
+    /// `WHERE lixcol_file_id = ?` is now an exact provider constraint, so
+    /// DataFusion drops its residual filter and the answer rests entirely on
+    /// `LiveStateFilter::file_ids`. Rows can live in four authorities — the
+    /// branch-local `HOT_ROW` overlay, a packed current base, a certified
+    /// entity batch, and the root current base — and a file-scoped seek is
+    /// only sound if every one of them applies the same filter. The checkpoint
+    /// in the middle republishes the generation, so rows written before and
+    /// after it reach the read through different authorities.
+    #[tokio::test]
+    async fn file_scoped_entity_read_matches_the_unfiltered_scan() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+
+        let files = ["66696c65-0000-8000-8000-000000000000", "66696c65-0001-8000-8000-000000000001"];
+        for (index, file) in files.iter().enumerate() {
+            session
+                .execute(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ($1, $2, CAST($3 AS BYTEA))",
+                    &[
+                        crate::Value::Text((*file).to_string()),
+                        crate::Value::Text(format!("/f{index}.txt")),
+                        crate::Value::Text("seed".to_string()),
+                    ],
+                )
+                .await
+                .expect("file should insert");
+        }
+
+        let mut expected: Vec<(String, Option<String>)> = Vec::new();
+        for (path, file) in [
+            ("/a0", Some(files[0])),
+            ("/a1", Some(files[0])),
+            ("/b0", Some(files[1])),
+            ("/none", None),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, lix_json('{\"v\":0}'), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("pre-checkpoint row should insert");
+            expected.push((path.to_string(), file.map(str::to_string)));
+        }
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should republish the generation");
+
+        for (path, file) in [
+            ("/a2", Some(files[0])),
+            ("/b1", Some(files[1])),
+            ("/none2", None),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, lix_json('{\"v\":1}'), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("post-checkpoint row should insert");
+            expected.push((path.to_string(), file.map(str::to_string)));
+        }
+        expected.sort();
+
+        let all = session
+            .execute("SELECT path, lixcol_file_id FROM json_pointer", &[])
+            .await
+            .expect("unfiltered scan should execute");
+        let mut all_rows = all
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("path").expect("path should decode"),
+                    row.get::<Option<String>>("lixcol_file_id")
+                        .expect("file id should decode"),
+                )
+            })
+            .collect::<Vec<_>>();
+        all_rows.sort();
+        assert_eq!(all_rows, expected, "fixture should read back unfiltered");
+
+        for file in files {
+            let filtered = session
+                .execute(
+                    "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 ORDER BY path",
+                    &[crate::Value::Text(file.to_string())],
+                )
+                .await
+                .expect("file-scoped read should execute");
+            let filtered_rows = filtered
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("path should decode"))
+                .collect::<Vec<_>>();
+            let mut want = expected
+                .iter()
+                .filter(|(_, row_file)| row_file.as_deref() == Some(file))
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            want.sort();
+            assert_eq!(
+                filtered_rows, want,
+                "file-scoped entity read must return exactly the rows in {file}"
+            );
+        }
+
+        let in_list = session
+            .execute(
+                "SELECT path FROM json_pointer \
+                 WHERE lixcol_file_id IN ($1, $2) ORDER BY path",
+                &[
+                    crate::Value::Text(files[0].to_string()),
+                    crate::Value::Text(files[1].to_string()),
+                ],
+            )
+            .await
+            .expect("file-scoped IN read should execute");
+        let mut want_in = expected
+            .iter()
+            .filter(|(_, row_file)| row_file.is_some())
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        want_in.sort();
+        assert_eq!(
+            in_list
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("path should decode"))
+                .collect::<Vec<_>>(),
+            want_in
+        );
+
+        let point = session
+            .execute(
+                "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 AND path = '/a2'",
+                &[crate::Value::Text(files[0].to_string())],
+            )
+            .await
+            .expect("file + primary key read should execute");
+        assert_eq!(point.rows().len(), 1);
+
+        let contradiction = session
+            .execute(
+                "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 AND path = '/b0'",
+                &[crate::Value::Text(files[0].to_string())],
+            )
+            .await
+            .expect("contradictory file + primary key read should execute");
+        assert!(
+            contradiction.rows().is_empty(),
+            "a row must not be visible through another file's scope"
+        );
     }
 
     #[tokio::test]

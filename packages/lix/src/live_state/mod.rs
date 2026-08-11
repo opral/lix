@@ -25,6 +25,8 @@ pub(crate) use reader::{LiveStateReadDomain, LiveStateReader};
 #[cfg(test)]
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
 #[cfg(test)]
+pub(crate) use tracked_head::WORKING_DIFF_PATH_HITS;
+#[cfg(test)]
 pub(crate) use tracked_head::stage_collect_stale_working_diff_indexes;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{

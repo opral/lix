@@ -9745,6 +9745,21 @@ fn packed_working_diff_version(
     }
 }
 
+/// Counts which of the two working-diff read paths served a request, so the
+/// public-surface equivalence test can prove it exercised both instead of
+/// silently comparing one path against itself.
+#[cfg(test)]
+pub(crate) static WORKING_DIFF_PATH_HITS: WorkingDiffPathHits = WorkingDiffPathHits {
+    index_scan: std::sync::atomic::AtomicUsize::new(0),
+    finite_bypass: std::sync::atomic::AtomicUsize::new(0),
+};
+
+#[cfg(test)]
+pub(crate) struct WorkingDiffPathHits {
+    pub(crate) index_scan: std::sync::atomic::AtomicUsize,
+    pub(crate) finite_bypass: std::sync::atomic::AtomicUsize,
+}
+
 /// Resolves a checkpoint diff from row-local first-before images. Broad diffs
 /// enumerate the sparse dirty-key index; finite PK queries read only the
 /// primary rows that can answer the request.
@@ -9772,6 +9787,10 @@ async fn hot_working_diff_entries(
         .await;
     }
 
+    #[cfg(test)]
+    WORKING_DIFF_PATH_HITS
+        .index_scan
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
     let range = StoragePrefix {
         bytes: Bytes::from(scope.clone()),
@@ -9976,6 +9995,10 @@ async fn hot_working_diff_entries_for_finite_filter(
     generation: CommitId,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    #[cfg(test)]
+    WORKING_DIFF_PATH_HITS
+        .finite_bypass
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rows = hot_scan_entries(store, branch_id, generation, filter, None, None)
         .await?
         .expect("unbounded HOT scan cannot exhaust a byte budget");
