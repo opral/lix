@@ -116,7 +116,16 @@ impl SchemaIntern {
         self.probe_tail(store).await
     }
 
-    /// Point-reads the dense ids past the in-memory end until one is absent.
+    /// Reconciles the unconfirmed tail of the table with storage.
+    ///
+    /// Ids below `loaded_len` are already known durable. From there upward the
+    /// probe point-reads the dense id sequence and:
+    ///   * confirms an id this process assigned once storage agrees,
+    ///   * adopts an id another engine published,
+    ///   * stops at the first absent id and truncates any in-memory
+    ///     assignments past it — those belong to a write set that never
+    ///     committed, so nothing durable can reference them.
+    /// In the steady state this is one batched point read that misses.
     async fn probe_tail<S>(&self, store: &S) -> Result<(), StorageError>
     where
         S: StorageAdapterRead + ?Sized,
@@ -124,7 +133,7 @@ impl SchemaIntern {
         loop {
             let start = {
                 let inner = self.inner.read().expect("schema intern lock poisoned");
-                inner.by_id.len() as u32
+                inner.loaded_len
             };
             let keys = (start..start.saturating_add(Self::TAIL_PROBE_WIDTH))
                 .map(|id| Key(Bytes::copy_from_slice(&id.to_be_bytes())))
@@ -140,28 +149,60 @@ impl SchemaIntern {
                 }],
             )
             .await?;
-            let mut appended = 0_u32;
             let mut inner = self.inner.write().expect("schema intern lock poisoned");
+            if inner.loaded_len != start {
+                // Another task advanced the tail while this probe was in
+                // flight; re-read the bound instead of merging stale offsets.
+                continue;
+            }
+            let mut confirmed = 0_u32;
+            let mut exhausted = false;
             for (offset, value) in result.values.into_iter().enumerate() {
-                let Some(value) = value else { break };
+                let id = start.saturating_add(offset as u32);
+                let Some(value) = value else {
+                    exhausted = true;
+                    break;
+                };
                 let ProjectedValue::FullValue(bytes) = value else {
                     return Err(intern_corruption("value projection"));
                 };
-                let id = start.saturating_add(offset as u32);
-                if inner.by_id.len() as u32 != id {
-                    // Another thread already merged this id.
-                    continue;
+                let name = SharedStr::from_utf8(bytes)
+                    .map_err(|_| intern_corruption("schema key utf-8"))?;
+                match inner.by_id.get(id as usize) {
+                    Some(existing) if *existing == name => {}
+                    Some(_) => {
+                        // Storage is the authority: a concurrent writer won
+                        // this id. Drop this process's unconfirmed tail so the
+                        // rejected assignments are re-made against the
+                        // published sequence.
+                        let keep = id as usize;
+                        for stale in inner.by_id.split_off(keep) {
+                            inner.by_name.remove(&stale);
+                        }
+                        inner.by_name.insert(name.clone(), id);
+                        inner.by_id.push(name);
+                    }
+                    None => {
+                        if inner.by_name.insert(name.clone(), id).is_some() {
+                            return Err(intern_corruption("duplicate schema key"));
+                        }
+                        inner.by_id.push(name);
+                    }
                 }
-                let name =
-                    SharedStr::from_utf8(bytes).map_err(|_| intern_corruption("schema key utf-8"))?;
-                if inner.by_name.insert(name.clone(), id).is_some() {
-                    return Err(intern_corruption("duplicate schema key"));
-                }
-                inner.by_id.push(name);
-                inner.loaded_len = inner.by_id.len() as u32;
-                appended += 1;
+                confirmed += 1;
             }
-            if appended < Self::TAIL_PROBE_WIDTH {
+            inner.loaded_len = start.saturating_add(confirmed);
+            if exhausted {
+                // Assignments past the durable end never committed.
+                let keep = inner.loaded_len as usize;
+                if inner.by_id.len() > keep {
+                    for stale in inner.by_id.split_off(keep) {
+                        inner.by_name.remove(&stale);
+                    }
+                }
+                return Ok(());
+            }
+            if confirmed < Self::TAIL_PROBE_WIDTH {
                 return Ok(());
             }
         }
@@ -225,6 +266,14 @@ impl SchemaIntern {
         }
         inner.loaded_len = inner.loaded_len.max(rows.len() as u32);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_len(&self) -> u32 {
+        self.inner
+            .read()
+            .expect("schema intern lock poisoned")
+            .loaded_len
     }
 
     /// Read-path lookup. `None` means no hot key visible to the resolving
