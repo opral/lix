@@ -524,8 +524,34 @@ pub struct LixNotice {
 
 #[cfg(test)]
 mod tests {
-    use super::{SharedStr, Value};
+    use super::{Json, SharedStr, Value};
     use bytes::Bytes;
+
+    #[test]
+    fn json_values_serialize_their_retained_bytes_verbatim() {
+        let canonical = r#"{"a":1,"b":[true,null],"c":"x"}"#;
+        let value = Value::Json(Json::from_canonical_text(canonical));
+
+        let encoded = serde_json::to_string(&value).expect("value serializes");
+        assert_eq!(encoded, format!(r#"{{"Json":{canonical}}}"#));
+    }
+
+    #[test]
+    fn json_text_matches_what_re_serializing_the_dom_produced() {
+        // The read path stops building a DOM, so the retained bytes must equal
+        // the bytes the previous `serde_json::Value` round trip emitted.
+        let canonical = r#"{"a":1,"b":[true,null],"c":"x"}"#;
+        let dom = serde_json::from_str::<serde_json::Value>(canonical).expect("valid JSON");
+
+        assert_eq!(Json::from_canonical_text(canonical).as_str(), canonical);
+        assert_eq!(Json::from(dom).as_str(), canonical);
+    }
+
+    #[test]
+    fn json_deserialization_canonicalizes_noncanonical_input() {
+        let decoded = serde_json::from_str::<Json>(r#"{ "b" : 2 , "a" : 1 }"#).expect("decodes");
+        assert_eq!(decoded.as_str(), r#"{"a":1,"b":2}"#);
+    }
 
     #[test]
     fn cloning_blob_values_shares_the_payload() {
