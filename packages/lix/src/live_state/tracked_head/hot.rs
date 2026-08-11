@@ -12487,12 +12487,17 @@ mod tests {
                 Memory::from_snapshot(&snapshot).expect("reopen base closure fixture"),
             );
             // Load the persisted intern table before resolving against it.
-            drop(
-                storage
+            {
+                let warm = storage
                     .begin_read(StorageReadOptions::default())
                     .await
-                    .expect("warm up reopened intern table"),
-            );
+                    .expect("warm up reopened intern table");
+                storage
+                    .schema_intern()
+                    .ensure_current(&warm)
+                    .await
+                    .expect("load reopened intern table");
+            }
             let schema_id = storage
                 .schema_intern()
                 .resolve(SCHEMA_KEY)

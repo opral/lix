@@ -246,16 +246,23 @@ impl SchemaIntern {
             }
         }
         let mut inner = self.inner.write().expect("schema intern lock poisoned");
-        // Merge instead of replace: assignments staged by this process before
-        // the first load (bootstrap staging) must survive, and the persisted
-        // rows must agree with them byte-for-byte wherever they overlap.
+        // Storage is the authority. Persisted rows are adopted as-is;
+        // unconfirmed in-memory assignments that disagree belong to a write
+        // set that never committed and are dropped, so this process re-assigns
+        // them against the published sequence.
         for (index, (id, name)) in rows.iter().enumerate() {
             if *id as usize != index {
                 return Err(intern_corruption("id sequence"));
             }
             match inner.by_id.get(index) {
                 Some(existing) if existing == name => {}
-                Some(_) => return Err(intern_corruption("schema key assignment")),
+                Some(_) => {
+                    for stale in inner.by_id.split_off(index) {
+                        inner.by_name.remove(&stale);
+                    }
+                    inner.by_name.insert(name.clone(), *id);
+                    inner.by_id.push(name.clone());
+                }
                 None => {
                     if inner.by_name.insert(name.clone(), *id).is_some() {
                         return Err(intern_corruption("duplicate schema key"));
@@ -264,7 +271,14 @@ impl SchemaIntern {
                 }
             }
         }
-        inner.loaded_len = inner.loaded_len.max(rows.len() as u32);
+        inner.loaded_len = rows.len() as u32;
+        // Anything past the persisted end was staged by an uncommitted write
+        // set; drop it so ids are never reused for two schema keys.
+        if inner.by_id.len() > rows.len() {
+            for stale in inner.by_id.split_off(rows.len()) {
+                inner.by_name.remove(&stale);
+            }
+        }
         Ok(())
     }
 
