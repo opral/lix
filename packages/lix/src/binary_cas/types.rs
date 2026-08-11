@@ -1,5 +1,5 @@
 use crate::LixError;
-use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
+use crate::binary_cas::chunking::chunk_ranges;
 use crate::binary_cas::codec::BinaryChunkCodec;
 use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
 use std::ops::Range;
@@ -14,13 +14,19 @@ impl BlobId {
     }
 
     pub(crate) fn from_content(content: &[u8]) -> Self {
-        if content.len() <= MEDIA_CHUNK_BYTES {
-            return Self::from_single_chunk(ChunkHash::from_content(content));
+        let ranges = chunk_ranges(content);
+        match ranges.as_slice() {
+            [] | [_] => Self::from_single_chunk(ChunkHash::from_content(content)),
+            ranges => Self::from_chunks(
+                content.len() as u64,
+                ranges.iter().map(|&(start, end)| {
+                    (
+                        ChunkHash::from_content(&content[start..end]),
+                        (end - start) as u64,
+                    )
+                }),
+            ),
         }
-        let chunks = content
-            .chunks(MEDIA_CHUNK_BYTES)
-            .map(|chunk| (ChunkHash::from_content(chunk), chunk.len() as u64));
-        Self::from_chunks(content.len() as u64, chunks)
     }
 
     pub(crate) fn from_single_chunk(chunk_hash: ChunkHash) -> Self {
@@ -135,11 +141,13 @@ pub(crate) struct BlobPayload {
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        let chunks = bytes
-            .chunks(MEDIA_CHUNK_BYTES)
-            .map(|chunk| BlobChunkReceipt {
-                hash: ChunkHash::from_content(chunk),
-                size_bytes: chunk.len() as u64,
+        // The one and only boundary search for these bytes. Staging rebuilds
+        // the ranges from the receipt sizes below.
+        let chunks = chunk_ranges(&bytes)
+            .into_iter()
+            .map(|(start, end)| BlobChunkReceipt {
+                hash: ChunkHash::from_content(&bytes[start..end]),
+                size_bytes: (end - start) as u64,
             })
             .collect::<Arc<[_]>>();
         let hash = match chunks.as_ref() {
@@ -169,9 +177,9 @@ impl BlobPayload {
         self.hash
     }
 
-    /// Canonical fixed-chunk identities derived from these exact immutable
-    /// bytes. Keeping the receipts inside the payload prevents CAS staging
-    /// from hashing every large-file chunk a second time.
+    /// Canonical chunk identities derived from these exact immutable bytes,
+    /// in order. Their sizes are also the payload's chunk layout, so staging
+    /// neither hashes nor re-searches for boundaries a second time.
     pub(crate) fn chunks(&self) -> &[BlobChunkReceipt] {
         &self.chunks
     }
@@ -300,6 +308,7 @@ pub(crate) struct BinaryCasChunkView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
 
     #[test]
     fn payload_carries_exact_canonical_chunk_receipts() {

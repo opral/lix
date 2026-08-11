@@ -9,7 +9,6 @@ mod types;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) use chunking::BinaryCasChunking;
 #[cfg(all(feature = "storage-benches", test))]
 pub(crate) use codec::encode_binary_cas_manifest;
 #[cfg(feature = "storage-benches")]

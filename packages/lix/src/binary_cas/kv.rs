@@ -1,7 +1,7 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::{MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking};
+use crate::binary_cas::chunking::MAX_BINARY_CAS_CHUNK_BYTES;
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, StorageBinaryCasDeltaBaseLayout,
     StorageBinaryCasDeltaSegment, decode_binary_cas_chunk, decode_binary_cas_manifest,
@@ -9,7 +9,7 @@ use crate::binary_cas::codec::{
     encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::{
-    BinaryCasChunking, BinaryCasGcSweep, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment,
+    BinaryCasGcSweep, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment,
     BlobEditSplice, BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes,
     BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
 };
@@ -2025,7 +2025,6 @@ fn decode_and_verify_payload(
 }
 
 pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
-    chunking: BinaryCasChunking,
     store: &S,
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
@@ -2060,7 +2059,7 @@ where
             layout: metadata.layout,
         });
     }
-    let plan = prepare_blob_write(chunking, payload)?;
+    let plan = prepare_blob_write(payload)?;
     let receipt = plan.receipt.clone();
     if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
         return Ok(receipt);
@@ -2080,9 +2079,9 @@ where
 /// This is deliberately opportunistic. The caller still owns complete
 /// replacement bytes and falls back to [`stage_blob_write_skipping_existing_chunks`]
 /// for every missing, malformed, non-chunked, length-changing, or otherwise
-/// ineligible base. A manifest is an ordered content-addressed chunk list;
-/// readers do not require its boundaries to have been freshly produced by
-/// FastCDC, so keeping valid existing boundaries is format-compatible.
+/// ineligible base. A manifest is an ordered content-addressed chunk list and a
+/// same-length splice cannot move a boundary, so reusing the base's existing
+/// boundaries produces the layout the chunker would have produced anyway.
 pub(in crate::binary_cas) async fn try_stage_blob_write_reusing_same_length_splice<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -2422,8 +2421,51 @@ fn normalize_delta_segments(segments: Vec<BlobDeltaSegment>) -> Vec<BlobDeltaSeg
     out
 }
 
+/// Rebuilds the payload's chunk layout from the receipt sizes that
+/// [`crate::binary_cas::BlobPayload::from_bytes`] already produced.
+///
+/// The receipts are the boundary decision, so staging never runs the boundary
+/// search a second time over bytes it is about to write. The tiling check below
+/// is what makes that safe: receipts that do not cover the payload exactly are
+/// rejected rather than trusted.
+fn chunk_ranges_from_receipts(
+    receipts: &[crate::binary_cas::BlobChunkReceipt],
+    len: usize,
+) -> Result<Vec<(usize, usize)>, LixError> {
+    let mut ranges = Vec::with_capacity(receipts.len());
+    let mut cursor = 0usize;
+    for receipt in receipts {
+        let size = usize::try_from(receipt.size_bytes)
+            .ok()
+            .filter(|size| *size > 0 && *size <= MAX_BINARY_CAS_CHUNK_BYTES)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "binary CAS payload chunk receipt has an unusable size".to_string(),
+                )
+            })?;
+        let end = cursor
+            .checked_add(size)
+            .filter(|end| *end <= len)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "binary CAS payload chunk receipts overrun the payload".to_string(),
+                )
+            })?;
+        ranges.push((cursor, end));
+        cursor = end;
+    }
+    if cursor != len {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "binary CAS payload chunk receipts do not tile the payload".to_string(),
+        ));
+    }
+    Ok(ranges)
+}
+
 fn prepare_blob_write(
-    chunking: BinaryCasChunking,
     payload: &crate::binary_cas::BlobPayload,
 ) -> Result<BlobWritePlan, LixError> {
     let bytes = payload.bytes();
@@ -2439,13 +2481,7 @@ fn prepare_blob_write(
         }
         (Vec::new(), BlobLayout::Empty)
     } else {
-        let chunk_ranges = fastcdc_chunk_ranges_with_chunking(bytes, chunking);
-        if chunk_ranges.len() != payload.chunks().len() {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "binary CAS payload chunk receipts disagree with canonical chunking".to_string(),
-            ));
-        }
+        let chunk_ranges = chunk_ranges_from_receipts(payload.chunks(), bytes.len())?;
         let layout = match chunk_ranges.as_slice() {
             [] => unreachable!("non-empty blobs always have at least one chunk"),
             [_] => BlobLayout::SingleChunk {
@@ -4001,7 +4037,7 @@ mod tests {
     fn every_non_empty_blob_is_out_of_line() {
         for size in [1, 32 * 1024, 128 * 1024] {
             let payload = BlobPayload::from_bytes(vec![b'a'; size]);
-            let plan = prepare_blob_write(BinaryCasChunking::default(), &payload)
+            let plan = prepare_blob_write(&payload)
                 .expect("non-empty blob should plan");
             assert!(!plan.chunk_ranges.is_empty());
             assert!(matches!(
@@ -4128,7 +4164,7 @@ mod tests {
         let data = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(data.clone());
         let blob_hash = payload.hash().expect("payload should have a hash");
-        let chunk_ranges = crate::binary_cas::chunking::fastcdc_chunk_ranges(&data);
+        let chunk_ranges = crate::binary_cas::chunking::chunk_ranges(&data);
         assert!(chunk_ranges.len() > 1);
         let chunk_hashes = chunk_ranges
             .iter()
@@ -4160,7 +4196,6 @@ mod tests {
             .expect("read should open");
         let mut writes = storage.new_write_set();
         stage_blob_write_skipping_existing_chunks(
-            BinaryCasChunking::default(),
             &store,
             &mut writes,
             &mut HashSet::new(),
@@ -4557,7 +4592,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("result read should open");
-        let expected_hashes = crate::binary_cas::chunking::fastcdc_chunk_ranges(&after)
+        let expected_hashes = crate::binary_cas::chunking::chunk_ranges(&after)
             .into_iter()
             .map(|(start, end)| BlobId::from_content(&after[start..end]).into_bytes())
             .collect::<Vec<_>>();
@@ -4569,7 +4604,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             actual_hashes, expected_hashes,
-            "fallback must retain FastCDC layout"
+            "fallback must retain the canonical chunk layout"
         );
         assert_eq!(
             load_bytes_many(&store, &[after_blob_hash])
