@@ -317,15 +317,18 @@ mod tests {
             .collect::<Vec<_>>();
         let payload = BlobPayload::from_bytes(bytes.clone());
 
-        assert_eq!(payload.chunks().len(), 3);
-        assert_eq!(payload.chunks()[0].size_bytes, MEDIA_CHUNK_BYTES as u64);
-        assert_eq!(payload.chunks()[1].size_bytes, MEDIA_CHUNK_BYTES as u64);
-        assert_eq!(payload.chunks()[2].size_bytes, 17);
+        // Boundaries are content-defined, so the receipts are asserted by the
+        // properties staging relies on rather than by fixed sizes: they tile
+        // the payload in order and each names its own slice.
+        assert!(payload.chunks().len() > 1);
         assert_eq!(payload.hash(), Some(BlobId::from_content(&bytes)));
-        for (receipt, chunk) in payload.chunks().iter().zip(bytes.chunks(MEDIA_CHUNK_BYTES)) {
-            assert_eq!(receipt.hash, ChunkHash::from_content(chunk));
-            assert_eq!(receipt.size_bytes, chunk.len() as u64);
+        let mut cursor = 0usize;
+        for receipt in payload.chunks() {
+            let end = cursor + receipt.size_bytes as usize;
+            assert_eq!(receipt.hash, ChunkHash::from_content(&bytes[cursor..end]));
+            cursor = end;
         }
+        assert_eq!(cursor, bytes.len());
 
         let clone = payload.clone();
         assert!(std::ptr::eq(
