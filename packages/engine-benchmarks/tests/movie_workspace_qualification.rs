@@ -354,8 +354,14 @@ where
                 }
             })
         });
+    // Ingest, project saves and the two proxy streams are four independent
+    // actors in the workload this qualification claims to model, so each one
+    // gets its own task. Driving them as branches of a single `tokio::join!`
+    // future put all four on one task: a slow write in any branch could not
+    // overlap a playback read, and the resulting delay was scored against the
+    // playback deadline even though the read itself had not started.
     let ingest_started = Instant::now();
-    let ingest_future = async {
+    let ingest_task = tokio::spawn(async move {
         if run_ingest {
             upload(
                 &ingest,
@@ -364,17 +370,28 @@ where
                 INGEST_BYTES,
                 2,
                 part_concurrency,
-                std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE").is_some().then_some(started),
+                std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE")
+                    .is_some()
+                    .then_some(started),
             )
             .await;
         }
         ingest_started.elapsed()
-    };
-    let save_future = project_saves(saver, started);
-    let first_playback = playback(first_reader, started, 0, 1);
-    let second_playback = playback(second_reader, started, PROXY_BYTES as u64 / 2, 2);
-    let (ingest_elapsed, mut save_latencies, first_late, second_late) =
-        tokio::join!(ingest_future, save_future, first_playback, second_playback);
+    });
+    let save_task = tokio::spawn(project_saves(saver, started));
+    let first_task = tokio::spawn(playback(first_reader, started, 0, 1));
+    let second_task = tokio::spawn(playback(
+        second_reader,
+        started,
+        PROXY_BYTES as u64 / 2,
+        2,
+    ));
+    let (ingest_elapsed, mut save_latencies, first_late, second_late) = tokio::join!(
+        async { ingest_task.await.expect("ingest task") },
+        async { save_task.await.expect("project save task") },
+        async { first_task.await.expect("first playback task") },
+        async { second_task.await.expect("second playback task") },
+    );
 
     if let Some(watchdog) = watchdog {
         watchdog.abort();
