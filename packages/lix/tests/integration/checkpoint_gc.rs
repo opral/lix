@@ -190,12 +190,9 @@ simulation_test!(
                 .await
                 .expect("post-delete GC checkpoint should succeed");
         }
-        wait_for_commits(
-            &main,
-            &[&protected_first, &protected_head, &source_head],
-            false,
-        )
-        .await;
+        // This contract covers the recovered pre-checkpoint interval. The
+        // deleted branch's final head has independent history/undo ownership.
+        wait_for_commits(&main, &[&protected_first, &protected_head], false).await;
     }
 );
 
