@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use std::panic::AssertUnwindSafe;
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use futures_util::future::join_all;
 use futures_util::stream::{self, BoxStream};
 use lix::FILE_UPLOAD_PART_BYTES;
@@ -86,9 +88,17 @@ fn rocksdb_movie_workspace_interference() {
         let _qualification_guard = QUALIFICATION_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("create RocksDB movie fixture");
         let storage = RocksDB::open(temp.path().join("database")).expect("open RocksDB fixture");
-        qualify("rocksdb", storage.clone()).await;
+        // Settled bytes are part of the measurement, so they are reported even
+        // when an assertion above them fails — otherwise an arm that trips a
+        // structural assertion silently contributes no byte number.
+        let outcome = AssertUnwindSafe(qualify("rocksdb", storage.clone()))
+            .catch_unwind()
+            .await;
         storage.flush().expect("flush RocksDB fixture");
         report_settled_bytes("rocksdb", temp.path());
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     });
 }
 
@@ -99,9 +109,14 @@ fn slatedb_movie_workspace_interference() {
         let _qualification_guard = QUALIFICATION_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("create SlateDB movie fixture");
         let storage = SlateDB::open(temp.path().join("database")).expect("open SlateDB fixture");
-        qualify("slatedb", storage.clone()).await;
+        let outcome = AssertUnwindSafe(qualify("slatedb", storage.clone()))
+            .catch_unwind()
+            .await;
         storage.flush().await.expect("flush SlateDB fixture");
         report_settled_bytes("slatedb", temp.path());
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     });
 }
 
