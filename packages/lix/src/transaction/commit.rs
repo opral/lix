@@ -181,12 +181,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
-    // Commit staging assigns interned schema ids. Refresh the table through
-    // this commit's snapshot first so ids published by other engines over the
-    // same storage are never re-allocated to different schemas.
-    crate::storage_adapter::schema_intern_of(read)
-        .ensure_current(read)
-        .await?;
     Box::pin(validate_active_account_and_account_rows(
         read,
         &prepared_writes,
@@ -251,6 +245,14 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         }
     }
     let mut writes = StorageWriteSet::new();
+    // Commit staging assigns interned schema ids. Reconcile the table through
+    // this commit's snapshot before anything allocates, so ids published by
+    // other engines over the same storage are never re-allocated to a second
+    // schema key. Keyed on this write set, so the staging entry points below
+    // reuse this one reconciliation.
+    crate::storage_adapter::schema_intern_of(read)
+        .ensure_current_for_write_set(&*read, &writes)
+        .await?;
     let mut preconditions = Vec::new();
     #[cfg(test)]
     let seeded_reachability_queue =

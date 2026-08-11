@@ -6032,7 +6032,7 @@ where
         I: ExactSizeIterator<Item = (&'a str, &'a EntityPk)> + Clone,
     {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         if rows.len() == 0 {
             return Err(head_value_error(
@@ -6111,7 +6111,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         if parts.owner_commit_id != *new_head.as_uuid().as_bytes()
             || parts.row_count == 0
@@ -6160,7 +6160,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(CommitId, bool), LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         let row_count = u64::try_from(row_count)
             .map_err(|_| head_value_error("packed replacement row count exceeds u64"))?;
@@ -6350,7 +6350,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<Option<CommitId>, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         let Some(first) = deltas.first() else {
             return Ok(None);
@@ -6442,7 +6442,7 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
     ) -> Result<Option<CommitId>, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         if working_diff_capture_checkpoint_commit_id.is_some() {
             return Ok(None);
@@ -6625,7 +6625,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<Option<CommitId>, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         if deltas.is_empty() {
             return Err(head_value_error(
@@ -6843,7 +6843,7 @@ where
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         let deltas = deltas
             .iter()
@@ -6881,7 +6881,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         let deltas = deltas
             .iter()
@@ -6915,7 +6915,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         self.stage_current_state_with_working_diff_inner(
             branch_id,
@@ -6951,7 +6951,7 @@ where
         absence_guards: &BTreeSet<TrackedStateKey>,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         let sorted = sorted_lifecycle_hot_deltas(deltas, true)?;
         let mut rows =
@@ -7038,7 +7038,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         self.stage_current_state_with_working_diff_inner(
             branch_id,
@@ -7073,7 +7073,7 @@ where
         certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         self.stage_current_state_with_working_diff_inner(
             branch_id,
@@ -7112,7 +7112,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         let generation = self
             .stage_current_state_with_working_diff_inner(
@@ -7158,7 +7158,7 @@ where
         validated_absent_file_id: Option<&str>,
     ) -> Result<CommitId, LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         if parent_generation.is_none() {
             let owned_guards = absence_guards
@@ -7813,7 +7813,7 @@ where
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(HotTrackedSnapshot, BTreeSet<String>), LixError> {
         schema_intern_of(self.store)
-            .ensure_current(self.store)
+            .ensure_current_for_write_set(self.store, self.writes)
             .await?;
         let mut rows = parent_tracked.rows;
         let mut untracked_rows = match preserved_untracked_generation {

@@ -77,6 +77,17 @@ pub struct SchemaIntern {
     /// Set once the whole space has been scanned; before that a miss cannot
     /// be distinguished from an unloaded table.
     scanned: std::sync::atomic::AtomicBool,
+    /// Snapshot this table was last reconciled against. One commit or read
+    /// touches several hot-plane entry points over the same snapshot, and the
+    /// table cannot go stale within one snapshot, so the first probe serves
+    /// them all. Backends that expose no snapshot identity fall back to the
+    /// write-set memo below.
+    probed_snapshot: RwLock<Option<u128>>,
+    /// Write set this table was last reconciled for. One commit calls several
+    /// staging entry points with the same write set; ids published by another
+    /// engine after the first probe cannot be adopted mid-commit anyway,
+    /// because this commit's key-absent preconditions would reject them.
+    probed_write_set: RwLock<Option<u64>>,
 }
 
 impl std::fmt::Debug for SchemaIntern {
@@ -107,13 +118,30 @@ impl SchemaIntern {
     where
         S: StorageAdapterRead + ?Sized,
     {
+        let snapshot = store.snapshot_cache_key();
+        if let Some(snapshot) = snapshot
+            && *self
+                .probed_snapshot
+                .read()
+                .expect("schema intern lock poisoned")
+                == Some(snapshot)
+        {
+            return Ok(());
+        }
         if !self.scanned.load(std::sync::atomic::Ordering::Acquire) {
             self.load(store).await?;
             self.scanned
                 .store(true, std::sync::atomic::Ordering::Release);
-            return Ok(());
+        } else {
+            self.probe_tail(store).await?;
         }
-        self.probe_tail(store).await
+        if let Some(snapshot) = snapshot {
+            *self
+                .probed_snapshot
+                .write()
+                .expect("schema intern lock poisoned") = Some(snapshot);
+        }
+        Ok(())
     }
 
     /// Reconciles the unconfirmed tail of the table with storage.
@@ -284,6 +312,35 @@ impl SchemaIntern {
     pub(crate) fn resolve(&self, schema_key: &str) -> Option<SchemaInternId> {
         let inner = self.inner.read().expect("schema intern lock poisoned");
         inner.by_name.get(schema_key).copied().map(SchemaInternId)
+    }
+
+    /// `ensure_current` for one commit's staging: probes at most once per
+    /// write set, so the several staging entry points a commit touches share
+    /// a single reconciliation on every backend, including those that expose
+    /// no snapshot identity.
+    pub(crate) async fn ensure_current_for_write_set<S>(
+        &self,
+        store: &S,
+        writes: &StorageWriteSet,
+    ) -> Result<(), StorageError>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        let identity = writes.identity();
+        if *self
+            .probed_write_set
+            .read()
+            .expect("schema intern lock poisoned")
+            == Some(identity)
+        {
+            return Ok(());
+        }
+        self.ensure_current(store).await?;
+        *self
+            .probed_write_set
+            .write()
+            .expect("schema intern lock poisoned") = Some(identity);
+        Ok(())
     }
 
     /// Cheap variant of `ensure_current` for operations whose schema set is
