@@ -1729,6 +1729,252 @@ where
     accounting
 }
 
+/// Exact value-level duplication for one storage space.
+///
+/// `duplicate_value_bytes` is what a perfect content-addressed store would not
+/// have had to write: for every distinct value byte string that occurs `n`
+/// times, `(n - 1) * len`. It is an upper bound on the win from content
+/// addressing that plane, because it ignores whatever indirection a real
+/// content-addressed layout would have to add.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageValueDuplication {
+    pub space_id: u32,
+    pub space: &'static str,
+    pub rows: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+    /// Distinct value byte strings in the space.
+    pub distinct_values: u64,
+    /// Rows whose value byte string also occurs on at least one other row.
+    pub duplicate_rows: u64,
+    pub duplicate_value_bytes: u64,
+    /// Largest number of rows sharing one value byte string.
+    pub max_occurrences: u64,
+}
+
+impl StorageValueDuplication {
+    /// Share of the space's value bytes a perfect CAS would have elided.
+    pub fn duplicate_fraction(&self) -> f64 {
+        if self.value_bytes == 0 {
+            0.0
+        } else {
+            self.duplicate_value_bytes as f64 / self.value_bytes as f64
+        }
+    }
+}
+
+/// Byte-exact duplication for every native storage space.
+pub async fn space_value_duplication<R>(read: &R) -> Vec<StorageValueDuplication>
+where
+    R: StorageAdapterRead,
+{
+    let mut accounting = Vec::with_capacity(native_storage_spaces().len());
+    for space in native_storage_spaces() {
+        accounting.push(scan_space_value_duplication(read, *space).await);
+    }
+    accounting
+}
+
+async fn scan_space_value_duplication<R>(
+    read: &R,
+    space: crate::storage_adapter::StorageSpace,
+) -> StorageValueDuplication
+where
+    R: StorageAdapterRead,
+{
+    let mut accounting = StorageValueDuplication {
+        space_id: space.id.0,
+        space: space.name,
+        ..StorageValueDuplication::default()
+    };
+    let mut occurrences = std::collections::HashMap::<[u8; 32], (u64, u64)>::new();
+    for entry in scan_layout_entries(read, space).await {
+        accounting.rows += 1;
+        accounting.key_bytes += entry.key.0.len() as u64 + 4;
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            continue;
+        };
+        accounting.value_bytes += value.len() as u64;
+        let digest = *blake3::hash(&value).as_bytes();
+        let slot = occurrences.entry(digest).or_insert((0, value.len() as u64));
+        slot.0 += 1;
+    }
+    accounting.distinct_values = occurrences.len() as u64;
+    for (count, len) in occurrences.into_values() {
+        accounting.max_occurrences = accounting.max_occurrences.max(count);
+        if count > 1 {
+            accounting.duplicate_rows += count - 1;
+            accounting.duplicate_value_bytes += (count - 1) * len;
+        }
+    }
+    accounting
+}
+
+/// Nearest-neighbour analysis of the commit-delta segment plane.
+///
+/// Byte-exact duplication answers "would a naive CAS dedup this". This answers
+/// the follow-up: when two segments are *not* byte-identical, how far apart are
+/// they? Two equal-length segments differing in a handful of bytes mean the
+/// payload carries per-commit identity (commit id, timestamps) that a redesign
+/// could hoist out; two segments differing in most of their bytes mean the
+/// content genuinely differs and no format change would help.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitDeltaSegmentSimilarity {
+    pub segments: u64,
+    pub distinct_values: u64,
+    /// Distinct values that share their byte length with another distinct value.
+    pub same_length_distinct_values: u64,
+    /// Compared pairs of equal-length distinct values.
+    pub compared_pairs: u64,
+    /// Pairs differing in at most 1% of their bytes.
+    pub near_identical_pairs: u64,
+    /// Smallest positive byte-difference count over all compared pairs.
+    pub min_differing_bytes: u64,
+    /// Byte length of the pair that produced `min_differing_bytes`.
+    pub min_differing_pair_len: u64,
+    /// Shared leading bytes of the pair that produced `min_differing_bytes`.
+    pub min_differing_pair_common_prefix: u64,
+    /// Shared trailing bytes of the same pair. A long shared suffix next to a
+    /// short shared prefix is the signature of a small identity header in front
+    /// of otherwise identical content.
+    pub min_differing_pair_common_suffix: u64,
+    /// Whether any pair was compared at all.
+    pub compared_any: bool,
+    /// Segments that a content-addressed plane could have elided *if* the
+    /// format also hoisted per-commit identity out of the payload. Two segments
+    /// count as content-equal when they share a byte length and their differing
+    /// bytes all fall inside one window of at most
+    /// `SEGMENT_IDENTITY_WINDOW_BYTES`.
+    pub identity_normalized_duplicate_segments: u64,
+    pub identity_normalized_duplicate_bytes: u64,
+    /// Content-equivalence classes with more than one member.
+    pub identity_normalized_shared_classes: u64,
+}
+
+/// Cap on distinct same-length values compared pairwise per length bucket.
+const SEGMENT_SIMILARITY_BUCKET_CAP: usize = 128;
+/// How much per-segment identity a redesigned payload is allowed to hoist out.
+/// The LXCD16 direct leaf carries a 16-byte commit id, a 4-byte packed base and
+/// a small timestamp-tail dictionary; 128 bytes is a generous allowance for all
+/// of it, so this over-counts rather than under-counts the achievable win.
+const SEGMENT_IDENTITY_WINDOW_BYTES: usize = 128;
+
+pub async fn commit_delta_segment_similarity<R>(read: &R) -> CommitDeltaSegmentSimilarity
+where
+    R: StorageAdapterRead,
+{
+    let mut distinct = std::collections::HashMap::<[u8; 32], (Bytes, u64)>::new();
+    let mut segments = 0u64;
+    for entry in scan_layout_entries(
+        read,
+        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    )
+    .await
+    {
+        segments += 1;
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            continue;
+        };
+        let slot = distinct
+            .entry(*blake3::hash(&value).as_bytes())
+            .or_insert((value, 0));
+        slot.1 += 1;
+    }
+
+    let mut buckets = std::collections::BTreeMap::<usize, Vec<(Bytes, u64)>>::new();
+    for (value, occurrences) in distinct.into_values() {
+        buckets
+            .entry(value.len())
+            .or_default()
+            .push((value, occurrences));
+    }
+
+    let mut similarity = CommitDeltaSegmentSimilarity {
+        segments,
+        min_differing_bytes: u64::MAX,
+        ..CommitDeltaSegmentSimilarity::default()
+    };
+    for values in buckets.values() {
+        similarity.distinct_values += values.len() as u64;
+        if values.len() < 2 {
+            continue;
+        }
+        similarity.same_length_distinct_values += values.len() as u64;
+        let window = &values[..values.len().min(SEGMENT_SIMILARITY_BUCKET_CAP)];
+        // Union-find over "content-equal once identity is hoisted out".
+        let mut class = (0..window.len()).collect::<Vec<_>>();
+        for (index, (left, _)) in window.iter().enumerate() {
+            for (offset, (right, _)) in window[index + 1..].iter().enumerate() {
+                let differing = left
+                    .iter()
+                    .zip(right.iter())
+                    .filter(|(left, right)| left != right)
+                    .count() as u64;
+                similarity.compared_pairs += 1;
+                similarity.compared_any = true;
+                if differing * 100 <= left.len() as u64 {
+                    similarity.near_identical_pairs += 1;
+                }
+                let common_prefix = left
+                    .iter()
+                    .zip(right.iter())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                let common_suffix = left
+                    .iter()
+                    .rev()
+                    .zip(right.iter().rev())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                if differing > 0
+                    && common_prefix + common_suffix + SEGMENT_IDENTITY_WINDOW_BYTES >= left.len()
+                {
+                    union(&mut class, index, index + 1 + offset);
+                }
+                if differing < similarity.min_differing_bytes {
+                    similarity.min_differing_bytes = differing;
+                    similarity.min_differing_pair_len = left.len() as u64;
+                    similarity.min_differing_pair_common_prefix = common_prefix as u64;
+                    similarity.min_differing_pair_common_suffix = common_suffix as u64;
+                }
+            }
+        }
+        let mut members = std::collections::BTreeMap::<usize, (u64, u64)>::new();
+        for (index, (value, occurrences)) in window.iter().enumerate() {
+            let root = find(&mut class, index);
+            let slot = members.entry(root).or_insert((0, value.len() as u64));
+            slot.0 += occurrences;
+        }
+        for (occurrences, len) in members.into_values() {
+            if occurrences > 1 {
+                similarity.identity_normalized_shared_classes += 1;
+                similarity.identity_normalized_duplicate_segments += occurrences - 1;
+                similarity.identity_normalized_duplicate_bytes += (occurrences - 1) * len;
+            }
+        }
+    }
+    if !similarity.compared_any {
+        similarity.min_differing_bytes = 0;
+    }
+    similarity
+}
+
+fn find(class: &mut [usize], mut index: usize) -> usize {
+    while class[index] != index {
+        class[index] = class[class[index]];
+        index = class[index];
+    }
+    index
+}
+
+fn union(class: &mut [usize], left: usize, right: usize) {
+    let left = find(class, left);
+    let right = find(class, right);
+    if left != right {
+        class[right] = left;
+    }
+}
+
 pub async fn binary_manifest_layout_accounting<R>(
     read: &R,
 ) -> Result<BinaryManifestLayoutAccounting, crate::LixError>
