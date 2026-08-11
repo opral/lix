@@ -4115,14 +4115,13 @@ async fn stage_tracked_head(
         let packed_guards_match = packed_current_base_candidate
             && !absence_guards.is_empty()
             && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
-        let deltas = tracked_deltas.clone();
-        // Every absence guard above is derived from one of these exact
-        // transaction deltas. The fresh-file certificate likewise proves its
-        // complete file-scoped namespace absent. The branch-control CAS
-        // protects both proofs through publication.
-        let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
-            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
-        let mut writer = tracked_head.writer(read, writes);
+        // Untracked deltas are ordinary in-place mutations of the same
+        // generation, so stage them in the same pass as the tracked deltas:
+        // one pass means one coherent view of the incremental collection
+        // controls. The packed routes below reject untracked deltas by
+        // construction, and they are only candidates when their collection
+        // scopes are provably disjoint from the untracked ones, so those
+        // routes stage the untracked deltas in a second in-place pass.
         let exact_delete_candidate = !is_checkpoint_publication
             && certified_fresh_plugin_file_id.is_none()
             && !host_certified_live_increments.contains_key(&root.branch_id)
@@ -4138,6 +4137,22 @@ async fn stage_tracked_head(
                     && delta.commit_id == Some(root.commit_id)
                     && delta.change_id.is_some()
             });
+        let stage_untracked_separately = packed_current_base_candidate || exact_delete_candidate;
+        let deltas = if stage_untracked_separately {
+            tracked_deltas.clone()
+        } else {
+            let mut deltas = Vec::with_capacity(tracked_deltas.len() + untracked_deltas.len());
+            deltas.extend(tracked_deltas.iter().copied());
+            deltas.extend(untracked_deltas.iter().copied());
+            deltas
+        };
+        // Every absence guard above is derived from one of these exact
+        // transaction deltas. The fresh-file certificate likewise proves its
+        // complete file-scoped namespace absent. The branch-control CAS
+        // protects both proofs through publication.
+        let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
+            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
+        let mut writer = tracked_head.writer(read, writes);
         let delete_generation = if exact_delete_candidate {
             writer
                 .try_stage_exact_collection_delete_current_base(
@@ -4254,25 +4269,6 @@ async fn stage_tracked_head(
                 ))
                 .await?
         } else if let Some(generation) = packed_generation {
-            if !untracked_deltas.is_empty() {
-                writer
-                    .stage_current_state_with_working_diff(
-                        &root.branch_id,
-                        Some(parent_generation),
-                        root.commit_id,
-                        &untracked_deltas,
-                        &BTreeSet::new(),
-                        None,
-                        None,
-                        None,
-                        &mut coverage,
-                    )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.materialization.tracked_head.stage_current_overlay"
-                    ))
-                    .await?;
-            }
             generation
         } else if let Some(certified_live_increments) =
             host_certified_live_increments.get(&root.branch_id)
@@ -4349,18 +4345,21 @@ async fn stage_tracked_head(
             generation,
             working_diff_checkpoint_commit_id,
         )?;
-        // History-free rows mutate the same generation the tracked deltas just
-        // published, in place. `normal_branch_head_control` already advanced
+        // The packed routes could not carry the history-free rows. Mutate the
+        // same generation they just published, in place.
+        // `normal_branch_head_control` already advanced
         // `current_state_revision`, so the control CAS still fences this write.
-        tracked_head
-            .writer(read, writes)
-            .stage_untracked_current_state(
-                &root.branch_id,
-                generation,
-                &untracked_deltas,
-                &BTreeSet::new(),
-            )
-            .await?;
+        if stage_untracked_separately {
+            tracked_head
+                .writer(read, writes)
+                .stage_untracked_current_state(
+                    &root.branch_id,
+                    generation,
+                    &untracked_deltas,
+                    &BTreeSet::new(),
+                )
+                .await?;
+        }
         control.note_schemas(
             deltas
                 .iter()
