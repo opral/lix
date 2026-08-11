@@ -27,6 +27,7 @@ use crate::tracked_state::TrackedStateReadColumns;
 use crate::wasm::WasmCertifiedEntityBatch;
 
 use super::*;
+use crate::changelog::{CHANGE_SPACE, change_key};
 
 pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v21";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
@@ -5713,11 +5714,11 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) async fn untracked_json_refs(
+    pub(crate) async fn untracked_change_ids(
         &self,
         controls: &[(String, BranchHeadControl)],
-    ) -> Result<Vec<JsonRef>, LixError> {
-        let mut refs = BTreeSet::new();
+    ) -> Result<Vec<ChangeId>, LixError> {
+        let mut change_ids = BTreeSet::new();
         for (branch_id, control) in controls {
             let scope = hot_scope_prefix(branch_id, control.untracked_generation);
             let range = StoragePrefix {
@@ -5735,14 +5736,18 @@ where
                 for entry in page.entries {
                     let bytes = full_value_bytes(entry.value)?;
                     let value = decode_head_value(&bytes)?;
-                    collect_hot_untracked_refs(value, &mut refs);
+                    if value.untracked {
+                        change_ids.insert(value.change_id.ok_or_else(|| {
+                            head_value_error("untracked current-state row is missing change_id")
+                        })?);
+                    }
                 }
                 if !page.has_more {
                     break;
                 }
             }
         }
-        Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
+        Ok(change_ids.into_iter().collect())
     }
 
     pub(crate) async fn working_diff_for_control(
@@ -6821,12 +6826,14 @@ where
         let mut rows =
             load_hot_untracked_generation(self.store, branch_id, previous_generation).await?;
         let mut retired_untracked_json_refs = BTreeSet::new();
+        let mut retired_untracked_change_ids = BTreeSet::new();
         for delta in sorted {
             apply_complete_hot_snapshot_delta(
                 &mut rows,
                 delta,
                 absence_guards,
                 &mut retired_untracked_json_refs,
+                &mut retired_untracked_change_ids,
             )?;
         }
         let has_key_value_scope = rows
@@ -6863,6 +6870,9 @@ where
                 .into_iter()
                 .map(JsonRef::from_hash_bytes),
         );
+        for change_id in retired_untracked_change_ids {
+            self.writes.delete(CHANGE_SPACE, change_key(change_id));
+        }
         Ok(new_generation)
     }
 
@@ -7363,6 +7373,7 @@ where
         }
         let mut created_ats = Vec::with_capacity(sorted.len());
         let mut retired_untracked_json_refs = BTreeSet::new();
+        let mut retired_untracked_change_ids = BTreeSet::new();
         for (delta, previous) in sorted.iter().zip(&previous_values) {
             let Some(previous) = previous else {
                 created_ats.push(delta.created_at);
@@ -7381,6 +7392,11 @@ where
                     delta,
                     &mut retired_untracked_json_refs,
                 );
+                if existing.change_id != delta.change_id {
+                    retired_untracked_change_ids.insert(existing.change_id.ok_or_else(|| {
+                        head_value_error("untracked predecessor is missing change_id")
+                    })?);
+                }
             }
             created_ats.push(if reset_working_diff_baselines && !delta.untracked {
                 // Checkpoint selection canonicalizes newly added rows to the
@@ -7598,6 +7614,7 @@ where
                 reset_working_diff_baselines,
                 &mut next_coverage,
                 &mut retired_untracked_json_refs,
+                &mut retired_untracked_change_ids,
             )
             .await
         }
@@ -7612,6 +7629,9 @@ where
                 .into_iter()
                 .map(JsonRef::from_hash_bytes),
         );
+        for change_id in retired_untracked_change_ids {
+            self.writes.delete(CHANGE_SPACE, change_key(change_id));
+        }
         *coverage = next_coverage;
         Ok(generation)
     }
@@ -7651,12 +7671,14 @@ where
         reject_lifecycle_retention_collisions(&sorted_untracked, &sorted_tracked)?;
 
         let mut retired_untracked_json_refs = BTreeSet::new();
+        let mut retired_untracked_change_ids = BTreeSet::new();
         for delta in &sorted_untracked {
             apply_complete_hot_snapshot_delta(
                 &mut untracked_rows,
                 delta,
                 absence_guards,
                 &mut retired_untracked_json_refs,
+                &mut retired_untracked_change_ids,
             )?;
         }
         merge_final_untracked_rows(&mut rows, untracked_rows)?;
@@ -7666,6 +7688,7 @@ where
                 delta,
                 absence_guards,
                 &mut retired_untracked_json_refs,
+                &mut retired_untracked_change_ids,
             )?;
         }
 
@@ -7697,6 +7720,9 @@ where
                 .into_iter()
                 .map(JsonRef::from_hash_bytes),
         );
+        for change_id in retired_untracked_change_ids {
+            self.writes.delete(CHANGE_SPACE, change_key(change_id));
+        }
         *coverage = WorkingDiffIndexCoverage::default();
         Ok((
             HotTrackedSnapshot {
@@ -7718,6 +7744,7 @@ async fn stage_incremental_file_delete_cascades(
     reset_working_diff_baselines: bool,
     coverage: &mut WorkingDiffIndexCoverage,
     retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+    retired_untracked_change_ids: &mut BTreeSet<ChangeId>,
 ) -> Result<(), LixError> {
     let mut cascades = BTreeMap::<String, &CurrentStateDeltaRef<'_>>::new();
     for cascade in deltas {
@@ -7814,6 +7841,9 @@ async fn stage_incremental_file_delete_cascades(
         let row_key = BufferRange::new(row_start, mutations.key_bytes.len() - row_start);
         if existing.untracked {
             collect_hot_untracked_refs(existing, retired_untracked_json_refs);
+            retired_untracked_change_ids.insert(existing.change_id.ok_or_else(|| {
+                head_value_error("untracked cascade predecessor is missing change_id")
+            })?);
             mutations.row_deletes.push(row_key);
             continue;
         }
@@ -8193,8 +8223,14 @@ fn apply_complete_hot_snapshot_delta(
     delta: &CurrentStateDeltaRef<'_>,
     absence_guards: &BTreeSet<TrackedStateKey>,
     retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+    retired_untracked_change_ids: &mut BTreeSet<ChangeId>,
 ) -> Result<(), LixError> {
-    apply_complete_file_delete_cascade(rows, delta, retired_untracked_json_refs)?;
+    apply_complete_file_delete_cascade(
+        rows,
+        delta,
+        retired_untracked_json_refs,
+        retired_untracked_change_ids,
+    )?;
     let identity = HeadRowIdentity {
         schema_key: delta.schema_key.to_string(),
         entity_pk: delta.entity_pk.clone(),
@@ -8207,6 +8243,11 @@ fn apply_complete_hot_snapshot_delta(
         reject_retention_change(delta, existing)?;
         if existing.untracked {
             collect_retired_untracked_json_refs(existing, delta, retired_untracked_json_refs);
+            if existing.change_id != delta.change_id {
+                retired_untracked_change_ids.insert(existing.change_id.ok_or_else(|| {
+                    head_value_error("untracked predecessor is missing change_id")
+                })?);
+            }
         }
     }
     if delta.physically_deletes() {
@@ -8232,6 +8273,7 @@ fn apply_complete_file_delete_cascade(
     rows: &mut HotRowMap,
     delta: &CurrentStateDeltaRef<'_>,
     retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+    retired_untracked_change_ids: &mut BTreeSet<ChangeId>,
 ) -> Result<(), LixError> {
     let Some(file_id) = file_delete_cascade_id(delta)? else {
         return Ok(());
@@ -8251,6 +8293,9 @@ fn apply_complete_file_delete_cascade(
         }
         if existing.untracked {
             collect_hot_untracked_refs(existing, retired_untracked_json_refs);
+            retired_untracked_change_ids.insert(existing.change_id.ok_or_else(|| {
+                head_value_error("untracked cascade predecessor is missing change_id")
+            })?);
             rows.remove(&identity);
             continue;
         }
@@ -8962,7 +9007,7 @@ fn stage_hot_bootstrap(
             file_id: row.file_id,
         };
         let value = HeadValueRef {
-            change_id: None,
+            change_id: row.change_id,
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -8990,8 +9035,14 @@ fn stage_hot_bootstrap(
         }
     }
     let mut retired_untracked_json_refs = BTreeSet::new();
+    let mut retired_untracked_change_ids = BTreeSet::new();
     for delta in deltas {
-        apply_complete_file_delete_cascade(&mut rows, delta, &mut retired_untracked_json_refs)?;
+        apply_complete_file_delete_cascade(
+            &mut rows,
+            delta,
+            &mut retired_untracked_json_refs,
+            &mut retired_untracked_change_ids,
+        )?;
         let identity = HeadRowIdentity {
             schema_key: delta.schema_key.to_string(),
             entity_pk: delta.entity_pk.clone(),
@@ -9008,6 +9059,11 @@ fn stage_hot_bootstrap(
                     delta,
                     &mut retired_untracked_json_refs,
                 );
+                if existing.change_id != delta.change_id {
+                    retired_untracked_change_ids.insert(existing.change_id.ok_or_else(|| {
+                        head_value_error("untracked predecessor is missing change_id")
+                    })?);
+                }
             }
         }
         if delta.physically_deletes() {
@@ -9042,6 +9098,9 @@ fn stage_hot_bootstrap(
             .into_iter()
             .map(JsonRef::from_hash_bytes),
     );
+    for change_id in retired_untracked_change_ids {
+        writes.delete(CHANGE_SPACE, change_key(change_id));
+    }
     *coverage = WorkingDiffIndexCoverage::default();
     Ok(())
 }
@@ -11800,7 +11859,7 @@ mod tests {
     fn encoded_test_hot_value(generation: CommitId, untracked: bool, deleted: bool) -> Bytes {
         Bytes::from(
             encode_head_value(&HeadValueRef {
-                change_id: (!untracked).then(|| ChangeId::for_test_label("closure-change")),
+                change_id: Some(ChangeId::for_test_label("closure-change")),
                 commit_id: (!untracked).then_some(generation),
                 untracked,
                 deleted,
@@ -14304,7 +14363,7 @@ mod tests {
             schema_key: "schema\0escaped",
             file_id: Some("file\0id"),
             entity_pk: &first_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("planned-untracked-change")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14318,7 +14377,7 @@ mod tests {
             schema_key: "schema_without_file",
             file_id: None,
             entity_pk: &second_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("planned-removed-change")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14437,7 +14496,7 @@ mod tests {
             schema_key: "untracked_schema",
             file_id: Some("untracked.json"),
             entity_pk: &untracked_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("planned-untracked-change")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14451,7 +14510,7 @@ mod tests {
             schema_key: "untracked_schema",
             file_id: Some("removed.json"),
             entity_pk: &removed_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("planned-removed-change")),
             commit_id: None,
             untracked: true,
             deleted: true,
@@ -14715,6 +14774,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let mut coverage = WorkingDiffIndexCoverage::default();
         let mut retired_untracked_json_refs = BTreeSet::new();
+        let mut retired_untracked_change_ids = BTreeSet::new();
         let explicit_index_builds = incremental_cascade_explicit_index_builds();
 
         stage_incremental_file_delete_cascades(
@@ -14727,6 +14787,7 @@ mod tests {
             false,
             &mut coverage,
             &mut retired_untracked_json_refs,
+            &mut retired_untracked_change_ids,
         )
         .await
         .expect("ordinary imports do not need file-delete cascade staging");

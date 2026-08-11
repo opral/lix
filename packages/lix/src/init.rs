@@ -321,7 +321,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 /// The pure seed planner decides which bootstrap facts exist. This function is
 /// only responsible for durably writing those facts to their owning stores:
 /// changelog for tracked changes, and live_state for the serving state
-/// plus untracked moving refs.
+/// plus untracked moving refs. Every live untracked seed owns one standalone
+/// changelog fact, without becoming a commit member.
 pub(crate) async fn initialize<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     tracked_state: &TrackedStateContext,
@@ -350,15 +351,19 @@ where
         .iter()
         .map(|branch| seed_untracked_change_to_change_record(&branch.branch_ref_change))
         .collect::<Vec<_>>();
+    let standalone_untracked_changes = branch_ref_ledger_changes
+        .iter()
+        .cloned()
+        .chain(
+            plan.untracked_rows
+                .iter()
+                .map(seed_untracked_change_to_change_record),
+        )
+        .collect::<Vec<_>>();
 
     stage_init_json_payloads(&mut writes, &plan)?;
-    stage_init_changelog_commit(
-        &mut read,
-        &mut writes,
-        &plan,
-        branch_ref_ledger_changes.clone(),
-    )
-    .await?;
+    stage_init_changelog_commit(&mut read, &mut writes, &plan, standalone_untracked_changes)
+        .await?;
 
     {
         let root_deltas = authored_changes
@@ -458,7 +463,7 @@ where
                     schema_key: &row.schema_key,
                     file_id: None,
                     entity_pk: &row.entity_pk,
-                    change_id: None,
+                    change_id: Some(row.id),
                     commit_id: None,
                     untracked: true,
                     deleted: false,

@@ -1,5 +1,7 @@
 use crate::LixError;
 use crate::changelog::ChangeId;
+#[cfg(test)]
+use crate::changelog::{ChangelogContext, TransactionChangeRecordRef};
 use crate::common::LixTimestamp;
 use crate::functions::{
     DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
@@ -363,6 +365,24 @@ mod tests {
             .expect("global branch control should load")
             .expect("global branch control should exist");
         let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
+        let change_id = ChangeId::for_test_label(&format!("function-context-{key}"));
+        ChangelogContext::new()
+            .stage_terminal_standalone_change(
+                &mut writes,
+                TransactionChangeRecordRef {
+                    format_version: 2,
+                    change_id,
+                    account_id: crate::SYSTEM_ACCOUNT_ID,
+                    entity_pk: &entity_pk,
+                    schema_key: "lix_key_value",
+                    file_id: None,
+                    snapshot: snapshot.as_ref_slot(),
+                    metadata: crate::json_store::JsonSlotRef::None,
+                    created_at: timestamp,
+                    origin_key: None,
+                },
+            )
+            .expect("test key-value change should stage");
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
@@ -381,7 +401,7 @@ mod tests {
                     schema_key: "lix_key_value",
                     file_id: None,
                     entity_pk: &entity_pk,
-                    change_id: None,
+                    change_id: Some(change_id),
                     commit_id: None,
                     untracked: true,
                     deleted: false,

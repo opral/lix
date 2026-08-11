@@ -7,7 +7,9 @@ use crate::branch::{
     BranchHeadControlContext, branch_head_control_precondition, stage_branch_head_control,
     untracked_lifecycle_generation,
 };
-use crate::changelog::{ChangeId, ChangeRecordProjection};
+use crate::changelog::{
+    ChangeId, ChangeRecordProjection, ChangelogContext, TransactionChangeRecordRef,
+};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
@@ -30,7 +32,8 @@ const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 ///
 /// Missing mode means deterministic execution is disabled. Malformed mode rows
 /// are errors because they would make runtime function behavior ambiguous. This
-/// is engine-owned global state and has no changelog or commit history.
+/// is engine-owned global state. Its current value owns one terminal
+/// standalone changelog record, but it never enters commit history.
 pub(crate) async fn load_mode(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<DeterministicMode, LixError> {
@@ -57,14 +60,14 @@ pub(crate) async fn load_sequence(
 
 /// Persists the highest deterministic sequence value used by an execution.
 ///
-/// The row is untracked global `lix_key_value` current state. It never enters
-/// the changelog or commit graph.
+/// The row is untracked global `lix_key_value` current state. It owns one
+/// standalone change but never enters the commit graph.
 pub(crate) async fn stage_sequence(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     sequence: DeterministicSequence,
     timestamp: LixTimestamp,
-    _change_id: ChangeId,
+    change_id: ChangeId,
 ) -> Result<StoragePrecondition, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
@@ -95,6 +98,21 @@ pub(crate) async fn stage_sequence(
         [NormalizedJsonRef::from(&snapshot)],
     )?;
     let snapshot_slot = JsonSlot::from_json(snapshot.as_str());
+    ChangelogContext::new().stage_terminal_standalone_change(
+        writes,
+        TransactionChangeRecordRef {
+            format_version: 2,
+            change_id,
+            account_id: crate::SYSTEM_ACCOUNT_ID,
+            entity_pk: &entity_pk,
+            schema_key: KEY_VALUE_SCHEMA_KEY,
+            file_id: None,
+            snapshot: snapshot_slot.as_ref_slot(),
+            metadata: crate::json_store::JsonSlotRef::None,
+            created_at: timestamp,
+            origin_key: None,
+        },
+    )?;
     let next_revision = control
         .next_current_state_revision()?
         .current_state_revision;
@@ -113,7 +131,7 @@ pub(crate) async fn stage_sequence(
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
                 entity_pk: &entity_pk,
-                change_id: None,
+                change_id: Some(change_id),
                 commit_id: None,
                 untracked: true,
                 deleted: false,
@@ -516,7 +534,10 @@ mod tests {
             .expect("sequence row should exist");
         assert!(row.untracked);
         assert!(row.global);
-        assert_eq!(row.change_id, None);
+        assert_eq!(
+            row.change_id,
+            Some(ChangeId::for_test_label("sequence-change-7"))
+        );
         assert_eq!(row.commit_id, None);
         assert_eq!(
             row.snapshot_content.as_deref(),
@@ -543,6 +564,24 @@ mod tests {
             .expect("global control should load")
             .expect("global control should exist");
         let snapshot = JsonSlot::from_json(&snapshot_content);
+        let change_id = ChangeId::for_test_label(&format!("test-key-value-{key}"));
+        ChangelogContext::new()
+            .stage_terminal_standalone_change(
+                &mut writes,
+                TransactionChangeRecordRef {
+                    format_version: 2,
+                    change_id,
+                    account_id: crate::SYSTEM_ACCOUNT_ID,
+                    entity_pk: &entity_pk,
+                    schema_key: KEY_VALUE_SCHEMA_KEY,
+                    file_id: None,
+                    snapshot: snapshot.as_ref_slot(),
+                    metadata: crate::json_store::JsonSlotRef::None,
+                    created_at: test_timestamp(),
+                    origin_key: None,
+                },
+            )
+            .expect("test key-value change should stage");
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
@@ -561,7 +600,7 @@ mod tests {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
                     entity_pk: &entity_pk,
-                    change_id: None,
+                    change_id: Some(change_id),
                     commit_id: None,
                     untracked: true,
                     deleted: false,

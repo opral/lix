@@ -20,12 +20,13 @@ simulation_test!(untracked_insert_is_current_state_only, |sim| async move {
         .await
         .expect("untracked insert should succeed");
 
-    assert_untracked_current_state(&session, "untracked-current-insert").await;
+    let change_id = assert_untracked_current_state(&session, "untracked-current-insert").await;
     assert_eq!(
         change_count_for_key(&session, "untracked-current-insert").await,
-        0,
-        "ordinary untracked state must not create a lix_change record"
+        1,
+        "ordinary untracked state must own exactly one standalone lix_change record"
     );
+    assert!(change_exists(&session, &change_id).await);
     assert_eq!(
         branch_head(&session, sim.main_branch_id()).await,
         head_before,
@@ -54,6 +55,8 @@ simulation_test!(
             )
             .await
             .expect("initial untracked insert should succeed");
+        let initial_change_id =
+            assert_untracked_current_state(&session, "untracked-current-overwrite").await;
         session
             .execute(
                 "UPDATE lix_key_value SET value = 'two' \
@@ -75,12 +78,16 @@ simulation_test!(
             visible.rows()[0].values(),
             &[Value::Json(serde_json::json!("two"))]
         );
-        assert_untracked_current_state(&session, "untracked-current-overwrite").await;
+        let replacement_change_id =
+            assert_untracked_current_state(&session, "untracked-current-overwrite").await;
+        assert_ne!(replacement_change_id, initial_change_id);
         assert_eq!(
             change_count_for_key(&session, "untracked-current-overwrite").await,
-            0,
-            "untracked replacement must not create history"
+            1,
+            "untracked replacement must retain only its current logical change"
         );
+        assert!(!change_exists(&session, &initial_change_id).await);
+        assert!(change_exists(&session, &replacement_change_id).await);
 
         session
             .execute(
@@ -101,8 +108,9 @@ simulation_test!(
         assert_eq!(
             change_count_for_key(&session, "untracked-current-overwrite").await,
             0,
-            "untracked deletion must physically remove state without a tombstone change"
+            "untracked deletion must retire the final current change without a tombstone change"
         );
+        assert!(!change_exists(&session, &replacement_change_id).await);
         assert_eq!(
             branch_head(&session, sim.main_branch_id()).await,
             head_before,
@@ -298,7 +306,8 @@ simulation_test!(
         assert_untracked_current_state(&session, "untracked-current-tx-untracked").await;
         assert_eq!(
             change_count_for_key(&session, "untracked-current-tx-untracked").await,
-            0
+            1,
+            "mixed transactions retain one standalone current change for the untracked member"
         );
 
         let tracked_history = session
@@ -393,7 +402,7 @@ simulation_test!(
             session
                 .execute(sql, &[])
                 .await
-                .expect("history-free current-state mutation should succeed");
+                .expect("untracked current-state mutation should succeed");
             let working_diff = session
                 .execute("SELECT COUNT(*) FROM lix_working_diff", &[])
                 .await
@@ -430,7 +439,7 @@ async fn branch_head(
 async fn assert_untracked_current_state(
     session: &crate::support::simulation_test::engine::SimSession,
     key: &str,
-) {
+) -> String {
     let result = session
         .execute(
             &format!(
@@ -444,11 +453,10 @@ async fn assert_untracked_current_state(
     let [row] = result.rows() else {
         panic!("expected exactly one current row for key '{key}'");
     };
-    assert_eq!(
-        row.values(),
-        &[Value::Null, Value::Null, Value::Boolean(true)],
-        "ordinary untracked state must expose neither a change nor commit id"
-    );
+    let [Value::Text(change_id), Value::Null, Value::Boolean(true)] = row.values() else {
+        panic!("ordinary untracked state must expose a change id and no commit id");
+    };
+    change_id.clone()
 }
 
 async fn current_tracked_change_id(

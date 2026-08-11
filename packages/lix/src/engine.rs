@@ -1330,8 +1330,9 @@ mod tests {
             "an untracked-only write must not publish a new branch commit"
         );
         assert_eq!(
-            changes_after, changes_before,
-            "an untracked-only write must not append a changelog change"
+            changes_after,
+            changes_before + 1,
+            "an untracked-only write must publish exactly one standalone change"
         );
         assert_eq!(
             diff_after, diff_before,
@@ -1383,8 +1384,8 @@ mod tests {
             json!({"source": "tracked"})
         );
 
-        // A checkpointed branch remains writable. This history-free mutation
-        // updates the same complete hot generation without advancing history.
+        // A checkpointed branch remains writable. This untracked mutation
+        // updates the same complete hot generation without advancing commit history.
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
@@ -1407,7 +1408,7 @@ mod tests {
             json!({"source": "untracked"})
         );
 
-        // The next tracked child carries the history-free member forward.
+        // The next tracked child carries the untracked member forward.
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \

@@ -1405,12 +1405,12 @@ async fn stage_changelog_commits(
     }
     let changes = state_rows
         .iter()
-        // Ordinary untracked members are intentionally current-state only in
-        // V16. `lix_branch_ref` is the one control-plane exception: its
-        // published control retains a public ref_change_id, so that immutable
-        // ledger fact must remain available to `lix_change` and GC even
-        // though it is not a commit member.
-        .filter(|row| row.untracked && row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        // Each live untracked member owns one standalone changelog fact. A
+        // physical delete has no surviving current owner, except for the
+        // branch-control ledger whose immutable deletion fact is public.
+        .filter(|row| {
+            row.untracked && (row.snapshot.is_some() || row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        })
         .map(|row| transaction_change_record_from_state_row(row, active_account_id))
         .chain(
             branch_head_changes
@@ -1837,7 +1837,7 @@ fn current_state_delta_from_state_row(
         schema_key: row.schema_key,
         file_id: row.file_id.map(crate::common::SharedStr::as_str),
         entity_pk: row.entity_pk,
-        change_id: (!row.untracked).then_some(change_id),
+        change_id: Some(change_id),
         commit_id,
         untracked: row.untracked,
         deleted: row.snapshot.is_none(),
@@ -1911,7 +1911,7 @@ fn current_state_delta_from_engine_row(
         schema_key: &row.change.schema_key,
         file_id: row.change.file_id.as_deref(),
         entity_pk: &row.change.entity_pk,
-        change_id: None,
+        change_id: Some(row.change.change_id),
         commit_id: None,
         untracked: true,
         deleted: row.change.snapshot == crate::json_store::JsonSlot::None,
@@ -9598,7 +9598,7 @@ mod tests {
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
-        assert_eq!(loaded.change_id, None);
+        assert_eq!(loaded.change_id, Some(change_id("change-untracked")));
 
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
@@ -9614,9 +9614,13 @@ mod tests {
             .await
             .expect("untracked changelog lookup should load");
         assert_eq!(
-            changes.iter().all(|(_, value)| value.is_none()),
-            true,
-            "untracked state is history-free and must not enter the changelog"
+            changes
+                .iter()
+                .next()
+                .and_then(|(_, change)| change)
+                .map(|change| change.change_id),
+            Some(change_id("change-untracked")),
+            "the live untracked row must own one standalone changelog fact"
         );
     }
 
@@ -9884,7 +9888,7 @@ mod tests {
             untracked.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
-        assert_eq!(untracked.change_id, None);
+        assert_eq!(untracked.change_id, Some(change_id("change-untracked")));
 
         let sequence_row = live_state
             .reader(

@@ -28,7 +28,7 @@ use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, ChangelogReader, ChangelogWriter, CommitId, CommitLoadBatch,
     CommitLoadRequest, CommitRecord, CommitScanBatch, CommitScanRequest,
-    TransactionChangelogAppend,
+    TransactionChangeRecordRef, TransactionChangelogAppend,
 };
 use crate::json_store::JsonSlotRef;
 use crate::storage_adapter::Storage;
@@ -48,6 +48,23 @@ pub(crate) struct ChangelogContext;
 impl ChangelogContext {
     pub(crate) fn new() -> Self {
         Self
+    }
+
+    /// Stages one normalized standalone change in the caller's existing
+    /// publication write set. This is the no-second-read terminal path for
+    /// engine-owned untracked current state.
+    pub(crate) fn stage_terminal_standalone_change(
+        &self,
+        writes: &mut StorageWriteSet,
+        change: TransactionChangeRecordRef<'_>,
+    ) -> Result<(), LixError> {
+        let mut batch =
+            EncodedChangelogBatch::with_capacity(1, 16, transaction_change_value_capacity(&change));
+        batch.try_put(change.change_id.as_uuid().as_bytes(), |bytes| {
+            append_transaction_change_record(bytes, &change)
+        })?;
+        batch.stage(writes, CHANGE_SPACE);
+        Ok(())
     }
 
     pub(crate) fn reader<S>(&self, store: S) -> ChangelogStoreReader<S>
@@ -142,9 +159,7 @@ impl EncodedChangelogBatch {
     }
 }
 
-fn transaction_change_value_capacity(
-    change: &crate::changelog::TransactionChangeRecordRef<'_>,
-) -> usize {
+fn transaction_change_value_capacity(change: &TransactionChangeRecordRef<'_>) -> usize {
     96usize
         .saturating_add(change.schema_key.len())
         .saturating_add(change.entity_pk.estimated_heap_bytes())
@@ -155,7 +170,7 @@ fn transaction_change_value_capacity(
 }
 
 fn change_value_capacity(change: &ChangeRecord) -> usize {
-    let change = crate::changelog::TransactionChangeRecordRef::from(change);
+    let change = TransactionChangeRecordRef::from(change);
     transaction_change_value_capacity(&change)
 }
 

@@ -10,6 +10,7 @@ use crate::branch::{
 use crate::catalog::CatalogContext;
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
+    TransactionChangeRecordRef,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -381,6 +382,24 @@ where
         .expect("global branch control should load")
         .expect("global branch control should exist");
     let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
+    let change_id = ChangeId::for_test_label("benchmark-deterministic-mode");
+    ChangelogContext::new()
+        .stage_terminal_standalone_change(
+            &mut writes,
+            TransactionChangeRecordRef {
+                format_version: 2,
+                change_id,
+                account_id: crate::SYSTEM_ACCOUNT_ID,
+                entity_pk: &entity_pk,
+                schema_key: "lix_key_value",
+                file_id: None,
+                snapshot: snapshot.as_ref_slot(),
+                metadata: crate::json_store::JsonSlotRef::None,
+                created_at: timestamp,
+                origin_key: None,
+            },
+        )
+        .expect("deterministic mode change should stage");
     let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
     TrackedHeadContext::new()
         .writer(&read, &mut writes)
@@ -392,7 +411,7 @@ where
                 schema_key: "lix_key_value",
                 file_id: None,
                 entity_pk: &entity_pk,
-                change_id: None,
+                change_id: Some(change_id),
                 commit_id: None,
                 untracked: true,
                 deleted: false,

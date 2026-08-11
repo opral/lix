@@ -2535,10 +2535,10 @@ where
         .await?;
     let mut roots = TrackedHeadContext::new()
         .reader(store.clone())
-        .untracked_json_refs(&controls)
+        .untracked_change_ids(&controls)
         .await?
         .into_iter()
-        .map(GcRoot::CurrentPayload)
+        .map(GcRoot::StandaloneChange)
         .collect::<Vec<_>>();
     // Branch controls, not their public `lix_branch_ref` projection rows,
     // are the authoritative tracked-history roots.
@@ -2679,7 +2679,7 @@ where
         .iter()
         .filter_map(|root| match root {
             GcRoot::BranchHead(commit_id) => Some(*commit_id),
-            GcRoot::StandaloneChange(_) | GcRoot::CurrentPayload(_) => None,
+            GcRoot::StandaloneChange(_) => None,
         })
         .collect::<Vec<_>>();
     while let Some(commit_id) = pending.pop() {
@@ -3035,7 +3035,7 @@ where
         .iter()
         .filter_map(|root| match root {
             GcRoot::StandaloneChange(change_id) => Some(*change_id),
-            GcRoot::BranchHead(_) | GcRoot::CurrentPayload(_) => None,
+            GcRoot::BranchHead(_) => None,
         })
         .collect::<BTreeSet<_>>();
     if let Some(change_id) = standalone_root_ids
@@ -3049,13 +3049,7 @@ where
     }
 
     let mut live_change_ids = standalone_root_ids.clone();
-    let mut live_payload_hashes = roots
-        .iter()
-        .filter_map(|root| match root {
-            GcRoot::CurrentPayload(json_ref) => Some(*json_ref.as_hash_array()),
-            GcRoot::BranchHead(_) | GcRoot::StandaloneChange(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
+    let mut live_payload_hashes = BTreeSet::new();
     live_payload_hashes.extend(live_current_state_payload_hashes);
     for change_id in &standalone_root_ids {
         collect_change_payload_hashes(
@@ -3444,6 +3438,7 @@ mod tests {
     use crate::changelog::{
         ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext,
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
+        TransactionChangeRecordRef,
     };
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
@@ -7536,7 +7531,30 @@ mod tests {
         let snapshot_slot = snapshot.map_or(JsonSlot::None, JsonSlot::Ref);
         let timestamp =
             LixTimestamp::expect_parse("untracked GC owner timestamp", "2026-01-01T00:00:00Z");
+        let change_id = ChangeId::for_test_label(&format!(
+            "gc-untracked-owner-{entity_pk_value}-{}",
+            if snapshot.is_some() { "live" } else { "delete" }
+        ));
         let mut writes = storage_adapter.new_write_set();
+        if snapshot.is_some() {
+            ChangelogContext::new()
+                .stage_terminal_standalone_change(
+                    &mut writes,
+                    TransactionChangeRecordRef {
+                        format_version: 2,
+                        change_id,
+                        account_id: crate::SYSTEM_ACCOUNT_ID,
+                        entity_pk: &entity_pk,
+                        schema_key: "gc_untracked_owner",
+                        file_id: None,
+                        snapshot: snapshot_slot.as_ref_slot(),
+                        metadata: JsonSlotRef::None,
+                        created_at: timestamp,
+                        origin_key: None,
+                    },
+                )
+                .expect("untracked current-state change should stage");
+        }
         let mut coverage = WorkingDiffIndexCoverage::default();
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
@@ -7548,7 +7566,7 @@ mod tests {
                     schema_key: "gc_untracked_owner",
                     file_id: None,
                     entity_pk: &entity_pk,
-                    change_id: None,
+                    change_id: Some(change_id),
                     commit_id: None,
                     untracked: true,
                     deleted: snapshot.is_none(),

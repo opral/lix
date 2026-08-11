@@ -12793,9 +12793,9 @@ mod tests {
             live_untracked_row.snapshot_content.as_deref(),
             Some(r#"{"key":"untracked-programmatic","value":"untracked"}"#)
         );
-        assert_eq!(
-            live_untracked_row.change_id, None,
-            "ordinary untracked rows must not enter the changelog"
+        assert!(
+            live_untracked_row.change_id.is_some(),
+            "ordinary untracked rows must publish a standalone change"
         );
         assert_eq!(
             live_untracked_row.commit_id, None,

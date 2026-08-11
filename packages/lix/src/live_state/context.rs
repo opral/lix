@@ -1749,6 +1749,18 @@ mod tests {
         ChangeId::for_test_label(label)
     }
 
+    fn untracked_fixture_change_id(row: &MaterializedUntrackedStateRow) -> ChangeId {
+        ChangeId::for_test_label(&format!(
+            "untracked-fixture:{}:{}:{}:{}",
+            row.branch_id,
+            row.schema_key,
+            row.file_id.as_deref().unwrap_or("<none>"),
+            row.entity_pk
+                .as_json_array_text()
+                .expect("fixture primary key should encode")
+        ))
+    }
+
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
     }
@@ -2599,8 +2611,8 @@ mod tests {
 
         // A branch ref selects a fresh hot-state generation. Its tracked
         // portion is reconstructed from the immutable root and its untracked
-        // portion is materialized into the same snapshot; untracked rows have
-        // no changelog record.
+        // portion is materialized into the same snapshot; each durable
+        // untracked row owns one terminal standalone changelog record.
         for (branch_id, (head_commit_id, created_at, updated_at)) in branch_refs {
             let branch_rows = rows_by_branch.remove(&branch_id).unwrap_or_default();
             let head_commit_id_text = head_commit_id.to_string();
@@ -2654,7 +2666,7 @@ mod tests {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
-                    change_id: None,
+                    change_id: Some(untracked_fixture_change_id(row)),
                     commit_id: None,
                     untracked: true,
                     deleted: row.deleted,
@@ -2738,7 +2750,7 @@ mod tests {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
-                    change_id: None,
+                    change_id: Some(untracked_fixture_change_id(row)),
                     commit_id: None,
                     untracked: true,
                     deleted: row.deleted,
@@ -3370,7 +3382,7 @@ mod tests {
             Some("{\"value\":\"untracked-value\"}")
         );
         assert!(rows[0].untracked);
-        assert_eq!(rows[0].change_id, None);
+        assert!(rows[0].change_id.is_some());
 
         let loaded = live_state
             .reader(
@@ -3389,7 +3401,7 @@ mod tests {
             .expect("load should succeed")
             .expect("current row should be visible");
         assert!(loaded.untracked);
-        assert_eq!(loaded.change_id, None);
+        assert_eq!(loaded.change_id, rows[0].change_id);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked-value\"}")

@@ -286,7 +286,7 @@ struct BranchRefKey {
 ///
 /// This narrow convenience type keeps historical writers explicit. Normal
 /// serving publication converts it to [`CurrentStateDeltaRef`], which is also
-/// able to carry history-free untracked mutations.
+/// able to carry untracked mutations outside commit history.
 #[cfg(any(test, feature = "storage-benches"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedHeadDeltaRef<'a> {
@@ -325,7 +325,8 @@ impl<'a> TrackedHeadDeltaRef<'a> {
 /// One mutation of the authoritative current serving state.
 ///
 /// `tracked` mutations have both IDs and may create tombstones. `untracked`
-/// mutations have neither ID; deletion removes the member physically. This
+/// mutations carry a standalone change ID but no commit ID; deletion removes
+/// the member physically. This
 /// is deliberately the single write representation for the hot state plane,
 /// so callers never stage a separate untracked overlay.
 #[derive(Debug, Clone, Copy)]
@@ -404,12 +405,12 @@ impl<'a> CurrentStateDeltaRef<'a> {
 
     fn validate(self) -> Result<(), LixError> {
         match (self.untracked, self.change_id, self.commit_id, self.deleted) {
-            (false, Some(_), Some(_), _) | (true, None, None, false | true) => Ok(()),
+            (false, Some(_), Some(_), _) | (true, Some(_), None, false | true) => Ok(()),
             (false, _, _, _) => Err(head_value_error(
                 "tracked current-state mutation must carry change_id and commit_id",
             )),
             (true, _, _, _) => Err(head_value_error(
-                "untracked current-state mutation must not carry change_id or commit_id",
+                "untracked current-state mutation must carry change_id and no commit_id",
             )),
         }
     }
@@ -467,7 +468,7 @@ impl TrackedHeadContext {
     }
 
     /// Reclaims derived current-state generations that no durable branch
-    /// control can select and returns their history-free payload refs. Both
+    /// control can select and returns their terminal payload refs. Both
     /// the authoritative hot rows and their key-only file membership index are
     /// generation-scoped, so the control is the one ownership root for both
     /// spaces. The caller compares the returned refs with its complete live
@@ -475,7 +476,7 @@ impl TrackedHeadContext {
     ///
     /// A non-current control still owns its generation. Its tracked portion
     /// may use historical replay, but that same generation preserves the
-    /// branch's history-free untracked members until a fresh complete serving
+    /// branch's untracked members outside commit history until a fresh complete serving
     /// generation is published.
     #[cfg(test)]
     pub(crate) async fn stage_collect_stale_current_state_generations<S>(
@@ -1630,7 +1631,7 @@ fn append_head_value_parts(
         value.commit_id,
         value.deleted,
     ) {
-        (false, Some(_), Some(_), _) | (true, None, None, false) => {}
+        (false, Some(_), Some(_), _) | (true, Some(_), None, false) => {}
         (true, _, _, true) => {
             return Err(head_value_error(
                 "untracked current-state rows must be deleted physically",
@@ -1643,7 +1644,7 @@ fn append_head_value_parts(
         }
         (true, _, _, false) => {
             return Err(head_value_error(
-                "untracked current-state rows must not carry change_id or commit_id",
+                "untracked current-state rows must carry change_id and no commit_id",
             ));
         }
     }
@@ -1896,9 +1897,9 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
                 "untracked current-state rows must be deleted physically",
             ));
         }
-        if change_uuid != uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
+        if change_uuid == uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
             return Err(head_value_error(
-                "untracked current-state rows must use nil change and commit ids",
+                "untracked current-state rows must use a non-nil change id and nil commit id",
             ));
         }
         if working_diff_baseline != WorkingDiffBaseline::Disabled {
@@ -1911,7 +1912,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
                 "untracked current-state rows must not carry an columnar base coordinate",
             ));
         }
-        (None, None)
+        (Some(ChangeId::new(change_uuid)), None)
     } else {
         if change_uuid == uuid::Uuid::nil() || commit_uuid == uuid::Uuid::nil() {
             return Err(head_value_error(
@@ -5117,8 +5118,8 @@ mod tests {
         };
         let controls = vec![(branch_id.to_string(), active_control)];
 
-        let untracked = |snapshot| HeadValue {
-            change_id: None,
+        let untracked = |label, snapshot| HeadValue {
+            change_id: Some(ChangeId::for_test_label(label)),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -5129,10 +5130,18 @@ mod tests {
             columnar_base_coordinate: None,
         };
         let mut writes = StorageWriteSet::new();
-        stage_put(&mut writes, &active_identity, &untracked(active_snapshot))
-            .expect("stage active untracked hot row");
-        stage_put(&mut writes, &stale_identity, &untracked(stale_snapshot))
-            .expect("stage stale untracked hot row");
+        stage_put(
+            &mut writes,
+            &active_identity,
+            &untracked("active-untracked-change", active_snapshot),
+        )
+        .expect("stage active untracked hot row");
+        stage_put(
+            &mut writes,
+            &stale_identity,
+            &untracked("stale-untracked-change", stale_snapshot),
+        )
+        .expect("stage stale untracked hot row");
         stage_branch_head_control(&mut writes, branch_id, active_control)
             .expect("stage active branch control");
         storage
@@ -5148,10 +5157,13 @@ mod tests {
         );
         let rooted = TrackedHeadContext::new()
             .reader(read.clone())
-            .untracked_json_refs(&controls)
+            .untracked_change_ids(&controls)
             .await
-            .expect("discover active untracked payload roots");
-        assert_eq!(rooted, vec![active_snapshot]);
+            .expect("discover active untracked change roots");
+        assert_eq!(
+            rooted,
+            vec![ChangeId::for_test_label("active-untracked-change")]
+        );
 
         let mut gc_writes = StorageWriteSet::new();
         let stale_refs = TrackedHeadContext::new()
