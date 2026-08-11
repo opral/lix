@@ -3801,18 +3801,40 @@ fn decode_point_replay_commit_state_values(
 pub(crate) async fn scan_commit_state_manifest_commit_ids(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<CommitId>, LixError> {
-    let rows = scan_full_space(store, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE).await?;
-    rows.into_iter()
-        .map(|(key, _)| {
-            let bytes: [u8; 16] = key.0.as_ref().try_into().map_err(|_| {
+    // Key-only: the caller wants the commit ids, and a manifest body is the one
+    // thing this plane stores that is expensive to read.
+    let mut cursor = store
+        .begin_scan(
+            TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    let mut commit_ids = Vec::new();
+    loop {
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await?;
+        for entry in &page.entries {
+            let bytes: [u8; 16] = entry.key.0.as_ref().try_into().map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "commit state manifest key is not a commit id",
                 )
             })?;
-            Ok(CommitId::new(uuid::Uuid::from_bytes(bytes)))
-        })
-        .collect()
+            commit_ids.push(CommitId::new(uuid::Uuid::from_bytes(bytes)));
+        }
+        if !page.has_more {
+            break;
+        }
+    }
+    Ok(commit_ids)
 }
 
 pub(crate) async fn load_commit_state_manifests(
