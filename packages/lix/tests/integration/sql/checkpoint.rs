@@ -23,7 +23,7 @@ simulation_test!(
             )
             .await,
             vec![vec![
-                Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
+                Value::Text(initial_commit_id.clone()),
                 Value::Text(initial_commit_id.clone()),
                 Value::Boolean(true),
             ]]
@@ -114,11 +114,15 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT id, commit_id, lixcol_change_id, lixcol_global FROM lix_checkpoint",
+                &format!(
+                    "SELECT id, commit_id, lixcol_change_id, lixcol_global \
+                     FROM lix_checkpoint WHERE id = '{}'",
+                    receipt.commit_id
+                ),
             )
             .await,
             vec![vec![
-                Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
+                Value::Text(receipt.commit_id.clone()),
                 Value::Text(receipt.commit_id.clone()),
                 Value::Text(receipt.change_id.clone()),
                 Value::Boolean(true),
@@ -135,7 +139,7 @@ simulation_test!(
             .await,
             vec![vec![
                 Value::Text("lix_checkpoint".to_string()),
-                Value::Json(json!(["00000000-0000-7000-8000-000000000001"])),
+                Value::Json(json!([receipt.commit_id.clone()])),
             ]],
             "checkpoint publication must be a normal logical change"
         );
@@ -242,7 +246,7 @@ simulation_test!(
         assert_eq!(
             rows,
             vec![vec![
-                Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
+                Value::Text(sim.initial_commit_id().to_string()),
                 Value::Text(sim.initial_commit_id().to_string()),
             ]]
         );
@@ -255,7 +259,7 @@ simulation_test!(
 
         for sql in [
             "INSERT INTO lix_checkpoint (id, commit_id) \
-             VALUES ('00000000-0000-7000-8000-000000000001', 'fake')",
+             VALUES ('01930000-0000-7000-8000-000000000001', 'fake')",
             "UPDATE lix_checkpoint SET commit_id = 'fake'",
             "DELETE FROM lix_working_diff",
             "UPDATE lix_working_diff_by_branch SET diff_type = 'fake'",

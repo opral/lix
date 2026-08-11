@@ -1061,7 +1061,7 @@ mod tests {
             entity_pk: None,
             schema_key: crate::checkpoint::CHECKPOINT_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
-                "id": crate::checkpoint::CHECKPOINT_SINGLETON_ID,
+                "id": commit_id,
                 "commit_id": commit_id,
             }))),
             global: true,
@@ -1075,10 +1075,7 @@ mod tests {
 
         assert_eq!(
             normalized.entity_pk,
-            Some(
-                EntityPk::uuid_from_canonical(crate::checkpoint::CHECKPOINT_SINGLETON_ID)
-                    .expect("checkpoint singleton ID")
-            )
+            Some(EntityPk::uuid_from_canonical(commit_id).expect("checkpoint commit ID"))
         );
         assert!(
             catalog

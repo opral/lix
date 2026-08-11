@@ -10,7 +10,7 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
     CommitRecord,
 };
-use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, CHECKPOINT_SINGLETON_ID, checkpoint_snapshot};
+use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_snapshot};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
@@ -42,14 +42,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V62 replaces the branch-local checkpoint marker with one repository-global
-/// `lix_checkpoint` entity whose payload references the captured commit. The
-/// hard cut rejects repositories seeded with the old schema instead of
-/// silently exposing mixed checkpoint identities.
+/// V63 replaces the branch-local checkpoint marker with immutable,
+/// repository-global `lix_checkpoint` entities keyed by captured commit. The
+/// hard cut rejects repositories seeded with an older checkpoint identity
+/// model instead of silently exposing mixed checkpoint identities.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"global-checkpoint-entity.v62";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"global-checkpoint-entity.v63";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -209,8 +209,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let initial_checkpoint_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(CHECKPOINT_SINGLETON_ID)
-            .expect("checkpoint singleton ID is a canonical UUID"),
+        EntityPk::uuid_from_canonical(&initial_commit_id.to_string())
+            .expect("initial checkpoint commit ID is a canonical UUID"),
         CHECKPOINT_SCHEMA_KEY,
         checkpoint_snapshot(&initial_commit_id),
         timestamp,

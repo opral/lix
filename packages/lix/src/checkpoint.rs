@@ -22,32 +22,27 @@ const CHECKPOINT_RECORD_SCAN_PAGE_SIZE: usize = 1_024;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) type CheckpointCommitRecords = HashMap<CommitId, CommitGraphNode>;
 
-/// Stable identity of the one repository-global checkpoint cursor.
-///
-/// A checkpoint operation creates a new change of this entity. The referenced
-/// branch commit is payload because the checkpoint change itself belongs to a
-/// separate global commit published atomically in the same storage write.
-pub(crate) const CHECKPOINT_SINGLETON_ID: &str = "00000000-0000-7000-8000-000000000001";
-
 pub(crate) fn checkpoint_snapshot(commit_id: &CommitId) -> String {
+    let commit_id = commit_id.to_string();
     json!({
-        "id": CHECKPOINT_SINGLETON_ID,
-        "commit_id": commit_id.to_string(),
+        "id": commit_id.clone(),
+        "commit_id": commit_id,
     })
     .to_string()
 }
 
 pub(crate) fn checkpoint_stage_row(commit_id: &CommitId, change_id: String) -> TransactionWriteRow {
+    let commit_id = commit_id.to_string();
     TransactionWriteRow {
         entity_pk: Some(
-            EntityPk::uuid_from_canonical(CHECKPOINT_SINGLETON_ID)
-                .expect("checkpoint singleton ID is a canonical UUID"),
+            EntityPk::uuid_from_canonical(&commit_id)
+                .expect("checkpoint commit ID is a canonical UUID"),
         ),
         schema_key: CHECKPOINT_SCHEMA_KEY.into(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
-            "id": CHECKPOINT_SINGLETON_ID,
-            "commit_id": commit_id.to_string(),
+            "id": commit_id.clone(),
+            "commit_id": commit_id,
         }))),
         metadata: None,
         origin: None,

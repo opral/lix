@@ -1018,13 +1018,16 @@ simulation_test!(
             .await
             .expect("draft checkpoint should succeed");
         assert_eq!(
-            main.execute("SELECT commit_id FROM lix_checkpoint", &[])
-                .await
-                .expect("global checkpoint should be visible from main")
-                .rows()[0]
+            main.execute(
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = ?",
+                &[Value::Text(checkpoint.commit_id.clone())],
+            )
+            .await
+            .expect("global checkpoint should be visible from main")
+            .rows()[0]
                 .values(),
             &[Value::Text(checkpoint.commit_id.clone())],
-            "a checkpoint is one global entity inherited by every branch"
+            "a checkpoint is a global entity inherited by every branch"
         );
 
         let receipt = main
@@ -1046,19 +1049,219 @@ simulation_test!(
         );
 
         let checkpoints = main
-            .execute("SELECT commit_id FROM lix_checkpoint", &[])
+            .execute(
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = ?",
+                &[Value::Text(checkpoint.commit_id.clone())],
+            )
             .await
             .expect("global checkpoint should remain queryable");
         assert_eq!(
             checkpoints.len(),
             1,
-            "merge must not create another checkpoint entity change"
+            "merge must not duplicate the checkpoint entity"
         );
         assert_eq!(
             checkpoints.rows()[0].values(),
             &[Value::Text(checkpoint.commit_id)]
         );
         assert_key_value(&main, "checkpoint-merge-source", Some("\"draft\"")).await;
+    }
+);
+
+simulation_test!(
+    checkpoint_preserves_branch_fork_as_merge_ancestry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES \
+             ('checkpoint-fork-source', 'shared-source'), \
+             ('checkpoint-fork-target', 'shared-target')",
+            &[],
+        )
+        .await
+        .expect("shared rows should be inserted");
+        let fork_commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+        let checkpoint = main
+            .create_checkpoint()
+            .await
+            .expect("target checkpoint should succeed");
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-000000000001".to_string()),
+                name: "Recovered source".to_string(),
+                from_commit_id: Some(fork_commit_id.clone()),
+            })
+            .await
+            .expect("historical recovered head should remain branchable while pending");
+        assert_eq!(branch.commit_id, fork_commit_id);
+        let draft = sim.wrap_session(
+            engine
+                .open_session("01930000-0000-7000-8000-000000000001")
+                .await
+                .expect("recovered source session should open"),
+            &engine,
+        );
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'source' \
+                 WHERE key = 'checkpoint-fork-source'",
+                &[],
+            )
+            .await
+            .expect("source edit should succeed");
+        let source_commit_id = engine
+            .load_branch_head_commit_id("01930000-0000-7000-8000-000000000001")
+            .await
+            .expect("source head should load")
+            .expect("source head should exist");
+        main.execute(
+            "UPDATE lix_key_value SET value = 'target' \
+             WHERE key = 'checkpoint-fork-target'",
+            &[],
+        )
+        .await
+        .expect("target edit should succeed");
+
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            })
+            .await
+            .expect("disjoint changes should merge without conflicts");
+        assert_eq!(preview.base_commit_id, checkpoint.commit_id);
+        assert_eq!(preview.outcome, MergeBranchOutcome::MergeCommitted);
+        assert_eq!(preview.conflicts.len(), 0);
+        assert_eq!(
+            preview.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 0,
+                modified: 1,
+                removed: 0,
+            }
+        );
+
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            })
+            .await
+            .expect("disjoint changes should merge");
+        assert_eq!(receipt.base_commit_id, checkpoint.commit_id);
+        assert_key_value(&main, "checkpoint-fork-source", Some("\"source\"")).await;
+        assert_key_value(&main, "checkpoint-fork-target", Some("\"target\"")).await;
+
+        let global = sim.wrap_session(
+            engine
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        assert_eq!(
+            commit_parent_edges(&global, &checkpoint.commit_id).await,
+            vec![(sim.initial_commit_id().to_string(), 0)],
+            "checkpoint compaction must not retain the recovered interval as permanent ancestry",
+        );
+        assert_eq!(
+            commit_parent_edges(&global, &source_commit_id).await,
+            vec![(fork_commit_id, 0), (checkpoint.commit_id, 1)],
+            "the first source commit should consume serving context into canonical graph parents",
+        );
+    }
+);
+
+simulation_test!(
+    checkpoint_branch_bridge_preserves_true_conflict,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-bridge-conflict', 'base')",
+            &[],
+        )
+        .await
+        .expect("shared conflict row should insert");
+        let recovered_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("recovered head should load")
+            .expect("recovered head should exist");
+        let checkpoint = main
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed")
+            .commit_id;
+        main.create_branch(CreateBranchOptions {
+            id: Some("01930000-0000-7000-8000-000000000002".to_string()),
+            name: "Recovered conflict source".to_string(),
+            from_commit_id: Some(recovered_head.clone()),
+        })
+        .await
+        .expect("recovered conflict source should remain branchable");
+        let source = sim.wrap_session(
+            engine
+                .open_session("01930000-0000-7000-8000-000000000002")
+                .await
+                .expect("conflict source session should open"),
+            &engine,
+        );
+        source
+            .execute(
+                "UPDATE lix_key_value SET value = 'source' WHERE key = 'checkpoint-bridge-conflict'",
+                &[],
+            )
+            .await
+            .expect("source conflict edit should succeed");
+        let source_head = engine
+            .load_branch_head_commit_id("01930000-0000-7000-8000-000000000002")
+            .await
+            .expect("source conflict head should load")
+            .expect("source conflict head should exist");
+        main.execute(
+            "UPDATE lix_key_value SET value = 'target' WHERE key = 'checkpoint-bridge-conflict'",
+            &[],
+        )
+        .await
+        .expect("target conflict edit should succeed");
+
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000002".to_string(),
+            })
+            .await
+            .expect("true conflict preview should succeed");
+        assert_eq!(preview.base_commit_id, checkpoint);
+        assert_eq!(preview.conflicts.len(), 1);
+        assert_eq!(
+            commit_parent_edges(&main, &source_head).await,
+            vec![(recovered_head, 0), (checkpoint, 1)]
+        );
+        let error = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000002".to_string(),
+            })
+            .await
+            .expect_err("same-identity changes must still conflict");
+        assert_merge_conflict_error(&error);
+        assert_key_value(&main, "checkpoint-bridge-conflict", Some("\"target\"")).await;
     }
 );
 

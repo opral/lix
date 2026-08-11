@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_reclaims_the_superseded_physical_working_diff_epoch() {
+    async fn checkpoint_reclaims_working_diff_epochs_and_retains_checkpoint_entities() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1517,8 +1517,8 @@ mod tests {
         let after_second = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
         assert_eq!(
             after_second.entries.len(),
-            1,
-            "replacing the global checkpoint entity must not accumulate physical dirty epochs"
+            2,
+            "the second immutable checkpoint entity remains while the superseded branch epoch is reclaimed"
         );
         let logical = session
             .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
