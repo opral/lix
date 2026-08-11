@@ -2534,6 +2534,10 @@ simulation_test!(
             )
             .await
             .expect("working diff should load");
+        // The branch-local baseline stores only the before image's change id,
+        // so this net-empty answer is exactly the case that forces the reader
+        // to hydrate the referenced change record. A regression to change-id
+        // equality alone would report `modified` here.
         assert_eq!(
             rows.len(),
             0,
