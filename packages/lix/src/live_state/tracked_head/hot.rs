@@ -11004,9 +11004,25 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
     })
 }
 
+fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        scope
+            .len()
+            .saturating_add(encoded_key_bytes_len(schema_key.as_bytes()).unwrap_or(0)),
+    );
+    key.extend_from_slice(scope);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    key
+}
 
+#[cfg_attr(not(test), expect(dead_code))]
+struct HotDiffSegmentScope {
+    branch_id: String,
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+    digest: [u8; 32],
+}
 
-#[cfg(test)]
 fn decode_hot_diff_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
     if !bytes.starts_with(scope) {
         return Err(key_codec_error(
@@ -11053,17 +11069,6 @@ fn decode_hot_diff_segment_key(bytes: &[u8]) -> Result<HotDiffSegmentScope, LixE
         generation,
         digest,
     })
-}
-
-fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(
-        scope
-            .len()
-            .saturating_add(encoded_key_bytes_len(schema_key.as_bytes()).unwrap_or(0)),
-    );
-    key.extend_from_slice(scope);
-    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
-    key
 }
 
 fn visit_hot_diff_segment(
@@ -11126,6 +11131,7 @@ fn visit_hot_diff_segment(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -11239,9 +11245,6 @@ where
     }
     Ok(deleted)
 }
-
-
-
 
 #[cfg(test)]
 pub(crate) async fn stage_collect_stale_hot_diff_records<S>(
