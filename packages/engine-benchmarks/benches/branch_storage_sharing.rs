@@ -24,6 +24,7 @@
 #![allow(clippy::large_futures)]
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -111,7 +112,7 @@ fn main() {
 /// Backend-specific settling so `physical_bytes` samples SST state rather than
 /// a memtable.
 trait BenchBackend: Storage + Clone + Send + Sync + 'static {
-    fn settle(&self) -> impl std::future::Future<Output = ()>;
+    fn settle(&self) -> impl Future<Output = ()>;
 }
 
 impl BenchBackend for RocksDB {
