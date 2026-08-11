@@ -2536,6 +2536,13 @@ fn stage_incremental_collection_controls(
         if !dirty_scopes.contains(&(schema_key.clone(), file_id.clone())) {
             continue;
         }
+        // An exact-closure scope cannot be published incrementally: the
+        // ordered digest this path drops is exactly what proves absence there.
+        // `restage_exact_closure_collection_control` is its single writer, so
+        // staging here as well would be a duplicate mutation.
+        if scope_requires_exact_closure(branch_id, &schema_key, file_id.as_deref()) {
+            continue;
+        }
         stage_hot_collection_control(
             writes,
             branch_id,
@@ -12104,8 +12111,20 @@ mod tests {
     async fn collection_generation_fence_retires_stale_tracked_rows_but_not_untracked_rows() {
         const BRANCH_ID: &str = "fence-branch";
         const SCHEMA_KEY: &str = "fence_schema";
-        let old_generation = CommitId::for_test_label("fence-old-generation");
-        let generation = CommitId::for_test_label("fence-new-generation");
+        // The fence is a commit-ordered comparison, so the stale row's commit
+        // must sort strictly below the marker's. Sorting two labels makes that
+        // true regardless of how the labels hash.
+        let mut ordered = [
+            CommitId::for_test_label("fence-commit-a"),
+            CommitId::for_test_label("fence-commit-b"),
+        ];
+        ordered.sort();
+        let [old_generation, fence_commit] = ordered;
+        let generation = CommitId::for_test_label("fence-serving-generation");
+        assert_ne!(
+            generation, fence_commit,
+            "an active fence requires the control to name a different generation"
+        );
         let scope = crate::collection_generation::CollectionScopeRef {
             schema_key: SCHEMA_KEY,
             file_id: None,
@@ -12135,7 +12154,7 @@ mod tests {
             ),
             // History-free: the fence cannot speak about it.
             (untracked.clone(), encoded_test_hot_value(generation, true, false)),
-            (marker, encoded_test_hot_value(generation, false, false)),
+            (marker, encoded_test_hot_value(fence_commit, false, false)),
         ]);
 
         let storage = StorageAdapter::new(Memory::new());
