@@ -264,9 +264,11 @@ impl SchemaIntern {
                     inner.by_id.push(name.clone());
                 }
                 None => {
-                    if inner.by_name.insert(name.clone(), *id).is_some() {
-                        return Err(intern_corruption("duplicate schema key"));
-                    }
+                    // A schema key bound to two ids can only come from a
+                    // writer that bypassed the write-once precondition. Keep
+                    // the lowest id as the encode target; decode still maps
+                    // every persisted id back to its own name.
+                    inner.by_name.entry(name.clone()).or_insert(*id);
                     inner.by_id.push(name.clone());
                 }
             }

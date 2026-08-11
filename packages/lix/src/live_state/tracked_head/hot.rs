@@ -13145,10 +13145,7 @@ mod tests {
         let mut active_manifest = hot_scope_prefix("active-packed", active_generation);
         active_manifest.extend_from_slice(active_generation.as_uuid().as_bytes());
         let active_control = hot_scope_prefix("active-packed", active_generation);
-        let schema_id = storage
-            .schema_intern()
-            .assign("schema", &mut StorageWriteSet::new())
-            .expect("assign gc fixture schema id");
+        let schema_id = persist_test_schema_id(&storage, "schema").await;
         let active_index = packed_exclusive_schema_base_key(
             "active-packed",
             active_generation,
@@ -13990,6 +13987,27 @@ mod tests {
         );
     }
 
+    /// Assigns a schema id and commits its mapping row, so later reads that
+    /// reconcile the intern table against storage keep the assignment.
+    async fn persist_test_schema_id<StorageImpl>(
+        storage: &StorageAdapter<StorageImpl>,
+        schema_key: &str,
+    ) -> SchemaInternId
+    where
+        StorageImpl: crate::storage::Storage,
+    {
+        let mut writes = StorageWriteSet::new();
+        let schema_id = storage
+            .schema_intern()
+            .assign(schema_key, &mut writes)
+            .expect("assign fixture schema id");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish fixture schema mapping");
+        schema_id
+    }
+
     fn diff_identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {
         HeadIdentity {
             branch_id: branch_id.to_string(),
@@ -14581,10 +14599,7 @@ mod tests {
         let generation = CommitId::for_test_label("segmented-hot-diff-generation");
         let scope = encode_working_diff_scope_prefix("branch", checkpoint, generation);
         let storage = StorageAdapter::new(Memory::new());
-        let segment_schema_id = storage
-            .schema_intern()
-            .assign("schema", &mut StorageWriteSet::new())
-            .expect("assign segment schema id");
+        let segment_schema_id = persist_test_schema_id(&storage, "schema").await;
         let mut identity_key_bytes = Vec::new();
         let mut identity_puts = Vec::with_capacity(IDENTITY_COUNT);
         let mut expected_coverage = WorkingDiffIndexCoverage::default();
@@ -15218,10 +15233,7 @@ mod tests {
             .step_by(2)
             .cloned()
             .collect::<Vec<_>>();
-        storage
-            .schema_intern()
-            .assign("schema", &mut StorageWriteSet::new())
-            .expect("assign dense fixture schema id");
+        persist_test_schema_id(&storage, "schema").await;
         let requested_batch = FiniteHotIdentityBatchRef::new(
             storage.schema_intern(),
             "branch",
@@ -15279,10 +15291,7 @@ mod tests {
             .step_by(4)
             .cloned()
             .collect::<Vec<_>>();
-        storage
-            .schema_intern()
-            .assign("schema", &mut StorageWriteSet::new())
-            .expect("assign dense fixture schema id");
+        persist_test_schema_id(&storage, "schema").await;
         let requested_batch = FiniteHotIdentityBatchRef::new(
             storage.schema_intern(),
             "branch",
@@ -15343,10 +15352,7 @@ mod tests {
         let active_identity = diff_identity("active", active_generation, "active-row");
         let stale_identity = diff_identity("stale", stale_generation, "stale-row");
         let orphan_identity = diff_identity("deleted", orphan_generation, "orphan-row");
-        storage
-            .schema_intern()
-            .assign("schema", &mut StorageWriteSet::new())
-            .expect("assign diff segment schema id");
+        persist_test_schema_id(&storage, "schema").await;
         let (active_key, active_value) =
             single_hot_diff_segment(storage.schema_intern(), active_checkpoint, &active_identity);
         let (stale_key, stale_value) = single_hot_diff_segment(storage.schema_intern(), stale_checkpoint, &stale_identity);
