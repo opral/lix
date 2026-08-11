@@ -2254,18 +2254,7 @@ impl Document {
         // Multi-row sparse sets and dialect mutation use the exact cold
         // renderer. Every single-row content/delete/insert/reorder case above
         // stays local except an unterminated-EOF reorder.
-        let mut records = self.entity_records()?;
-        for change in changes {
-            let key = (&change.schema_key, &change.entity_pk);
-            records.retain(|record| (&record.schema_key, &record.entity_pk) != key);
-            if let Some(snapshot) = &change.snapshot {
-                records.push(EntityRecord {
-                    schema_key: change.schema_key.clone(),
-                    entity_pk: change.entity_pk.clone(),
-                    snapshot: snapshot.clone(),
-                });
-            }
-        }
+        let records = apply_entity_changes(self.entity_records()?, changes);
         let (document, mut edit) = Self::open_entities(records)?;
         edit.delete_len = u64::try_from(self.0.blob.len()).expect("file length fits u64");
         Ok((document, vec![edit]))
@@ -2712,6 +2701,38 @@ impl Document {
             usize::from(lower_location.is_some()) + usize::from(upper_location.is_some());
         ranks_between(lower, upper, 1).map(|mut ranks| (ranks.remove(0), rows_touched))
     }
+}
+
+/// Applies a transition batch with the same last-write-wins ordering as the
+/// sequential remove-and-append implementation, without rescanning the full
+/// document for every changed entity.
+fn apply_entity_changes(
+    mut records: Vec<EntityRecord>,
+    changes: &[EntityChange],
+) -> Vec<EntityRecord> {
+    let mut last_change_by_key = HashMap::<(&str, &[String]), usize>::with_capacity(changes.len());
+    for (index, change) in changes.iter().enumerate() {
+        last_change_by_key.insert(
+            (change.schema_key.as_str(), change.entity_pk.as_slice()),
+            index,
+        );
+    }
+    records.retain(|record| {
+        !last_change_by_key.contains_key(&(record.schema_key.as_str(), record.entity_pk.as_slice()))
+    });
+    records.extend(changes.iter().enumerate().filter_map(|(index, change)| {
+        (last_change_by_key.get(&(change.schema_key.as_str(), change.entity_pk.as_slice()))
+            == Some(&index))
+        .then(|| {
+            change.snapshot.as_ref().map(|snapshot| EntityRecord {
+                schema_key: change.schema_key.clone(),
+                entity_pk: change.entity_pk.clone(),
+                snapshot: snapshot.clone(),
+            })
+        })
+        .flatten()
+    }));
+    records
 }
 
 /// One-shot initial-import view for actors that will not be cached.
@@ -3431,7 +3452,162 @@ fn scan_rows(
 
 #[cfg(test)]
 mod cold_scan_tests {
-    use super::{ColdInitialImport, Dialect, scan_cold_rows, scan_rows};
+    use super::{
+        ChangeEffect, ColdInitialImport, Dialect, Document, EntityChange, EntityRecord,
+        IdNamespace, ROOT_ENTITY_PK, ROW_SCHEMA_KEY, RowLayout, RowSnapshot, TABLE_SCHEMA_KEY,
+        apply_entity_changes, canonical_row_snapshot, scan_cold_rows, scan_rows, table_snapshot,
+    };
+
+    fn row_id(ordinal: usize) -> String {
+        IdNamespace::from_namespace_bytes([0x5a; 12]).encode(ordinal as u64)
+    }
+
+    fn row_record(ordinal: usize, value: &str) -> EntityRecord {
+        let id = row_id(ordinal);
+        EntityRecord {
+            schema_key: ROW_SCHEMA_KEY.to_owned(),
+            entity_pk: vec![id.clone()],
+            snapshot: canonical_row_snapshot(&RowSnapshot {
+                id,
+                order_key: format!("{:016x}", ordinal * 2 + 1),
+                cells: vec![value.to_owned()],
+                layout: RowLayout::default(),
+            })
+            .expect("canonical row snapshot"),
+        }
+    }
+
+    fn table_record() -> EntityRecord {
+        EntityRecord {
+            schema_key: TABLE_SCHEMA_KEY.to_owned(),
+            entity_pk: vec![ROOT_ENTITY_PK.to_owned()],
+            snapshot: table_snapshot(Dialect::for_path(Some("/fixture.csv"))),
+        }
+    }
+
+    fn upsert(record: &EntityRecord) -> EntityChange {
+        EntityChange {
+            schema_key: record.schema_key.clone(),
+            entity_pk: record.entity_pk.clone(),
+            snapshot: Some(record.snapshot.clone()),
+            effect: ChangeEffect::Content,
+        }
+    }
+
+    fn delete(record: &EntityRecord) -> EntityChange {
+        EntityChange {
+            schema_key: record.schema_key.clone(),
+            entity_pk: record.entity_pk.clone(),
+            snapshot: None,
+            effect: ChangeEffect::Content,
+        }
+    }
+
+    fn apply_entity_changes_reference(
+        mut records: Vec<EntityRecord>,
+        changes: &[EntityChange],
+    ) -> Vec<EntityRecord> {
+        for change in changes {
+            let key = (&change.schema_key, &change.entity_pk);
+            records.retain(|record| (&record.schema_key, &record.entity_pk) != key);
+            if let Some(snapshot) = &change.snapshot {
+                records.push(EntityRecord {
+                    schema_key: change.schema_key.clone(),
+                    entity_pk: change.entity_pk.clone(),
+                    snapshot: snapshot.clone(),
+                });
+            }
+        }
+        records
+    }
+
+    #[test]
+    fn indexed_entity_changes_match_add_update_delete_reference_matrix() {
+        let initial = vec![
+            table_record(),
+            row_record(0, "old-a"),
+            row_record(1, "old-b"),
+        ];
+        let updated_a = row_record(0, "updated-a");
+        let added_c = row_record(2, "added-c");
+        let cases = vec![
+            vec![upsert(&added_c)],
+            vec![upsert(&updated_a)],
+            vec![delete(&initial[2])],
+            vec![upsert(&added_c), upsert(&updated_a), delete(&initial[2])],
+            vec![delete(&initial[1]), upsert(&updated_a), delete(&initial[1])],
+        ];
+
+        for changes in cases {
+            assert_eq!(
+                apply_entity_changes(initial.clone(), &changes),
+                apply_entity_changes_reference(initial.clone(), &changes)
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_entity_changes_preserve_duplicate_last_occurrence_order() {
+        let initial = vec![
+            table_record(),
+            row_record(0, "old-a"),
+            row_record(1, "old-b"),
+            row_record(2, "old-c"),
+        ];
+        let first_b = row_record(1, "first-b");
+        let added_d = row_record(3, "new-d");
+        let last_b = row_record(1, "last-b");
+        let changes = vec![
+            upsert(&first_b),
+            delete(&initial[1]),
+            upsert(&added_d),
+            upsert(&last_b),
+        ];
+
+        let result = apply_entity_changes(initial.clone(), &changes);
+        assert_eq!(result, apply_entity_changes_reference(initial, &changes));
+        assert_eq!(
+            result
+                .iter()
+                .skip(1)
+                .map(|record| record.entity_pk[0].clone())
+                .collect::<Vec<_>>(),
+            vec![row_id(2), row_id(3), row_id(1)]
+        );
+    }
+
+    #[test]
+    fn indexed_entity_changes_preserve_1500_conflict_outputs_and_render_parity() {
+        const CONFLICTS: usize = 1_500;
+        let mut initial = Vec::with_capacity(CONFLICTS + 1);
+        initial.push(table_record());
+        initial.extend((0..CONFLICTS).map(|ordinal| row_record(ordinal, "before")));
+        let changes = (0..CONFLICTS)
+            .map(|ordinal| upsert(&row_record(ordinal, "after")))
+            .collect::<Vec<_>>();
+
+        let indexed = apply_entity_changes(initial.clone(), &changes);
+        let reference = apply_entity_changes_reference(initial, &changes);
+        assert_eq!(indexed, reference);
+        assert_eq!(indexed.len(), CONFLICTS + 1);
+        assert_eq!(
+            indexed
+                .iter()
+                .skip(1)
+                .map(|record| record.entity_pk[0].as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            CONFLICTS
+        );
+
+        let (indexed_document, indexed_edit) =
+            Document::open_entities(indexed).expect("indexed render");
+        let (reference_document, reference_edit) =
+            Document::open_entities(reference).expect("reference render");
+        assert_eq!(indexed_document.bytes(), reference_document.bytes());
+        assert_eq!(indexed_edit, reference_edit);
+        assert_eq!(indexed_document.row_count(), CONFLICTS);
+    }
 
     #[test]
     fn flat_cold_scan_matches_general_row_and_field_layout() {
