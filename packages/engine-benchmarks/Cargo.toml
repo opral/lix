@@ -198,6 +198,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "working_diff_file_scope"
+path = "benches/working_diff_file_scope.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "slatedb_file_api"
 path = "benches/slatedb_file_api.rs"
 harness = false
