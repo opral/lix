@@ -6949,7 +6949,13 @@ where
                 },
             )?;
         }
-        stage_complete_hot_rows(self.writes, branch_id, new_generation, rows);
+        stage_complete_hot_rows(
+            self.writes,
+            schema_intern_of(self.store),
+            branch_id,
+            new_generation,
+            rows,
+        )?;
         JsonStoreWriter::stage_untracked_reclaim_candidates(
             self.writes,
             retired_untracked_json_refs
@@ -10460,10 +10466,6 @@ fn hot_scan_entries_fit_budget<'a>(
                 bytes
                     .saturating_add(identity.key.len())
                     .saturating_add(value.len())
-                    .saturating_add(match &identity.schema_key {
-                        HotScanString::Borrowed(_) => 0,
-                        HotScanString::Owned(value) => value.capacity(),
-                    })
                     .saturating_add(match &identity.file_id {
                         None | Some(HotScanString::Borrowed(_)) => 0,
                         Some(HotScanString::Owned(value)) => value.capacity(),

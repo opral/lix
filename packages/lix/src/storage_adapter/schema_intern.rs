@@ -221,8 +221,10 @@ impl SchemaIntern {
 fn stage_mapping_row(writes: &mut StorageWriteSet, id: u32, schema_key: &str) {
     writes.put_if_absent(
         SCHEMA_INTERN_SPACE,
-        Bytes::copy_from_slice(&id.to_be_bytes()),
-        Bytes::copy_from_slice(schema_key.as_bytes()),
+        crate::storage::Key(Bytes::copy_from_slice(&id.to_be_bytes())),
+        crate::storage::StoredValue {
+            bytes: Bytes::copy_from_slice(schema_key.as_bytes()),
+        },
     );
 }
 

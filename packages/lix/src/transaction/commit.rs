@@ -3971,6 +3971,8 @@ async fn stage_tracked_head(
             let certified_file_id = certified_fresh_plugin_file_id
                 .expect("deferred fresh hot publication requires its certificate");
             deferred_fresh_hot_plans.push(crate::live_state::DeferredFreshHotPlan::new(
+                crate::storage_adapter::schema_intern_of(read),
+                writes,
                 &root.branch_id,
                 parent_generation,
                 state_rows,
