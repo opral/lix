@@ -1,9 +1,7 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::{
-    CHUNK_ANCHOR_BYTES, MAX_BINARY_CAS_CHUNK_BYTES, chunk_ranges_with_chunking,
-};
+use crate::binary_cas::chunking::{CHUNK_ANCHOR_BYTES, MAX_BINARY_CAS_CHUNK_BYTES, chunk_ranges};
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, StorageBinaryCasDeltaBaseLayout,
     StorageBinaryCasDeltaSegment, decode_binary_cas_chunk, decode_binary_cas_manifest,
@@ -877,7 +875,7 @@ pub(in crate::binary_cas) async fn stage_upload_part_skipping_existing(
     // isolation reproduces exactly the boundaries a whole-buffer write of the
     // same file would choose. That is what keeps parts independent and lets up
     // to four of them complete out of order.
-    let ranges = chunk_ranges_with_chunking(bytes, BinaryCasChunking::default());
+    let ranges = chunk_ranges(bytes);
     let receipts = ranges
         .iter()
         .map(|&(start, end)| crate::binary_cas::BlobChunkReceipt {
@@ -4287,7 +4285,7 @@ mod tests {
         let data = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(data.clone());
         let blob_hash = payload.hash().expect("payload should have a hash");
-        let chunk_ranges = crate::binary_cas::chunking::chunk_ranges(&data);
+        let chunk_ranges = chunk_ranges(&data);
         assert!(chunk_ranges.len() > 1);
         let chunk_hashes = chunk_ranges
             .iter()
@@ -4715,7 +4713,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("result read should open");
-        let expected_hashes = crate::binary_cas::chunking::chunk_ranges(&after)
+        let expected_hashes = chunk_ranges(&after)
             .into_iter()
             .map(|(start, end)| BlobId::from_content(&after[start..end]).into_bytes())
             .collect::<Vec<_>>();
