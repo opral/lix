@@ -2107,6 +2107,13 @@ pub(crate) mod ownership_census {
         /// `serving_dependencies` as GC computes them: the authoring commit of
         /// every live tracked row in the serving generation.
         pub(crate) serving_dependencies: BTreeSet<CommitId>,
+        /// `physical_authorities` contributed by manifest selected-source chains.
+        pub(crate) selected_source_chain: BTreeSet<CommitId>,
+        /// `physical_dependencies` contributed by the point-replay debt chain.
+        pub(crate) replay_chain: BTreeSet<CommitId>,
+        /// `physical_dependencies` contributed by snapshot-root parents.
+        pub(crate) snapshot_parents: BTreeSet<CommitId>,
+        pub(crate) head_replay_depth: u16,
     }
 
     impl CurrentStateOwnershipCensus {
@@ -2132,6 +2139,91 @@ pub(crate) mod ownership_census {
         }
     }
 
+    /// Mirrors the manifest-driven arms of the GC retention closure so their
+    /// contributions can be attributed separately from live-row provenance.
+    async fn walk_manifest_closure<S>(
+        store: &S,
+        root: CommitId,
+        census: &mut CurrentStateOwnershipCensus,
+    ) -> Result<(), LixError>
+    where
+        S: StorageAdapterRead + Clone + Send + Sync,
+    {
+        let mut pending = vec![root];
+        let mut seen = BTreeSet::new();
+        let mut first = true;
+        while let Some(commit_id) = pending.pop() {
+            if !seen.insert(commit_id) {
+                continue;
+            }
+            let Some(manifest) =
+                crate::tracked_state::load_commit_state_manifest(store, commit_id).await?
+            else {
+                continue;
+            };
+            if first {
+                census.head_replay_depth = manifest.replay_debt.depth;
+                first = false;
+            }
+            if let Some(source) = manifest.mutations.selected_source_commit_id() {
+                census.selected_source_chain.insert(source);
+                pending.push(source);
+            }
+            if let Some(scoped) = manifest.current_state_scoped_ranges.as_ref()
+                && let Some(base) = scoped.serving_base_commit_id
+            {
+                census.snapshot_parents.insert(base);
+            }
+            if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
+                census.snapshot_parents.extend(
+                    snapshot_root
+                        .parent_roots
+                        .iter()
+                        .map(|parent| parent.commit_id),
+                );
+            }
+        }
+        // Point-replay debt chain from the root, mirroring
+        // `collect_active_point_replay_dependencies`.
+        let mut graph = crate::commit_graph::CommitGraphContext::new().reader(store.clone());
+        let mut current = root;
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(current) {
+                break;
+            }
+            let Some(manifest) =
+                crate::tracked_state::load_commit_state_manifest(store, current).await?
+            else {
+                break;
+            };
+            if manifest.replay_debt.depth == 0 {
+                break;
+            }
+            let fallback = manifest
+                .mutations
+                .replacement_generation
+                .as_ref()
+                .filter(|_| manifest.mutations.member_count != 0)
+                .map(|generation| {
+                    generation
+                        .fallback_commit_id
+                        .map(|bytes| CommitId::new(uuid::Uuid::from_bytes(bytes)))
+                });
+            let next = match fallback {
+                Some(fallback) => fallback,
+                None => match graph.load_node(&current).await? {
+                    Some(node) => node.parent_commit_ids.first().copied(),
+                    None => None,
+                },
+            };
+            let Some(next) = next else { break };
+            census.replay_chain.insert(next);
+            current = next;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn census<S>(store: &S) -> Result<CurrentStateOwnershipCensus, LixError>
     where
         S: StorageAdapterRead + Clone + Send + Sync,
@@ -2149,6 +2241,11 @@ pub(crate) mod ownership_census {
             .reader(store)
             .tracked_serving_commit_dependencies(&projections)
             .await?;
+        for (_, control) in &controls {
+            for root in control.tracked_reachability().chronology_roots.into_iter().flatten() {
+                walk_manifest_closure(store, root, &mut census).await?;
+            }
+        }
         let mut roots = Vec::new();
         for (branch_id, control) in controls {
             census.head_commit_id = Some(control.head_commit_id);
@@ -2351,6 +2448,17 @@ mod ownership_census_fixture {
             "CENSUS-SERVING depth={depth} phase={phase} serving_dependencies={} pre_checkpoint_serving_dependencies={serving_pre} pre_checkpoint_commits={}",
             report.serving_dependencies.len(),
             pre_checkpoint.len(),
+        );
+        let count_pre = |set: &BTreeSet<CommitId>| set.intersection(pre_checkpoint).count();
+        println!(
+            "CENSUS-MANIFEST depth={depth} phase={phase} head_replay_depth={} selected_source_chain={}/{} replay_chain={}/{} snapshot_parents={}/{} (pre_checkpoint/total)",
+            report.head_replay_depth,
+            count_pre(&report.selected_source_chain),
+            report.selected_source_chain.len(),
+            count_pre(&report.replay_chain),
+            report.replay_chain.len(),
+            count_pre(&report.snapshot_parents),
+            report.snapshot_parents.len(),
         );
     }
 
