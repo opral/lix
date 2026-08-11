@@ -32,7 +32,9 @@ struct ExecutionSlotValues {
 
 impl std::fmt::Debug for ExecutionSlots {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ExecutionSlots").finish_non_exhaustive()
+        formatter
+            .debug_struct("ExecutionSlots")
+            .finish_non_exhaustive()
     }
 }
 
@@ -53,10 +55,7 @@ impl ExecutionSlots {
         let mut values = self.lock();
         assign(&mut values.active_account_id, Some(active_account_id));
         assign(&mut values.active_branch_id, active_branch_id);
-        assign(
-            &mut values.active_branch_commit_id,
-            active_branch_commit_id,
-        );
+        assign(&mut values.active_branch_commit_id, active_branch_commit_id);
         values.functions = Some(functions);
     }
 

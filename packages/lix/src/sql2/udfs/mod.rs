@@ -43,9 +43,9 @@ pub(crate) fn register_execution_sql2_functions(ctx: &SessionContext, slots: Arc
     ctx.register_udf(ScalarUDF::from(
         lix_active_account_id::LixActiveAccountId::new(Arc::clone(&slots)),
     ));
-    ctx.register_udf(ScalarUDF::from(lix_active_branch_id::LixActiveBranchId::new(
-        Arc::clone(&slots),
-    )));
+    ctx.register_udf(ScalarUDF::from(
+        lix_active_branch_id::LixActiveBranchId::new(Arc::clone(&slots)),
+    ));
     ctx.register_udf(ScalarUDF::from(
         lix_active_branch_commit_id::LixActiveBranchCommitId::new(Arc::clone(&slots)),
     ));

@@ -97,10 +97,7 @@ async fn execution_functions_follow_a_branch_switch_on_a_reused_session() {
         .execute(ACTIVE_FACTS_SQL, &[])
         .await
         .expect("active facts should read after switching back");
-    assert_eq!(
-        text(&restored, "branch_id"),
-        Some(main_branch_id)
-    );
+    assert_eq!(text(&restored, "branch_id"), Some(main_branch_id));
     assert_eq!(text(&restored, "commit_id"), Some(before_commit));
 }
 
@@ -185,7 +182,10 @@ async fn a_reused_session_reads_rows_committed_after_its_plan_was_cached() {
 
     let sql = "SELECT key FROM lix_key_value WHERE key LIKE 'pooled-visibility-%' ORDER BY key";
     for round in 0..4 {
-        let rows = session.execute(sql, &[]).await.expect("read should execute");
+        let rows = session
+            .execute(sql, &[])
+            .await
+            .expect("read should execute");
         assert_eq!(
             rows.len(),
             round,

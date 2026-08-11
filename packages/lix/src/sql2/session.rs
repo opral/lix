@@ -9,13 +9,13 @@ use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
 
 use super::branch_ref::CachingBranchRefReader;
+use super::exec::statement_has_table_function;
 use super::planning_cache::PooledReadSession;
 use super::providers;
 use super::udfs::{
     ExecutionSlots, bind_execution_sql2_functions, register_execution_sql2_functions,
     register_static_sql2_functions,
 };
-use super::exec::statement_has_table_function;
 use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 
 pub(crate) async fn build_read_session<C>(

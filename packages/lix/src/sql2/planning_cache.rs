@@ -33,16 +33,27 @@ pub(crate) struct CachedReadPlan {
     pub(crate) expected_parameter_count: usize,
 }
 
-/// One reusable physical read template plus the optimized logical plan it was
+/// One reusable physical read template plus the leaf scan requests it was
 /// planned from.
 ///
-/// Both are stripped of snapshot-bound table providers. Keeping the optimized
-/// plan with the template is what makes a warm execution skip DataFusion's
-/// analyzer and logical optimizer entirely: the only work left is grafting the
-/// current snapshot's providers back on and re-planning the leaf scans.
+/// The template is stripped of snapshot-bound table providers, and the scan
+/// requests carry no provider at all — only the table name, projection,
+/// unnormalized filters and fetch that the optimizer settled on for this exact
+/// cache key. A warm execution therefore skips DataFusion's analyzer, logical
+/// optimizer and physical planner entirely: it resolves each table against the
+/// current session, replans just that leaf, and grafts it into the template.
 pub(crate) struct CachedPhysicalRead {
-    pub(crate) optimized: LogicalPlan,
+    pub(crate) scans: Vec<CachedScanRequest>,
     pub(crate) template: Arc<dyn ExecutionPlan>,
+}
+
+/// One leaf `TableScan` of a cached optimized plan, reduced to the arguments
+/// `TableProvider::scan_with_args` needs.
+pub(crate) struct CachedScanRequest {
+    pub(crate) table: datafusion::common::TableReference,
+    pub(crate) projection: Option<Vec<usize>>,
+    pub(crate) filters: Vec<datafusion::logical_expr::Expr>,
+    pub(crate) fetch: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -94,13 +105,6 @@ pub(crate) struct CachedUpdateLiteralShape {
     suffix_start: usize,
 }
 
-/// Bounded, engine-owned cache for snapshot-independent SQL planning templates.
-///
-/// Parsed statements depend only on the exact SQL text. Bound write plans also
-/// depend on the visible catalog and active branch because binding resolves
-/// public surfaces and injects branch scope. Cached DataFusion read plans are
-/// stripped of snapshot-bound providers and rebound to the current read
-/// session before execution.
 /// One DataFusion session borrowed from the engine's pool for the duration of
 /// one statement.
 ///
@@ -156,6 +160,13 @@ impl PooledReadSession {
     }
 }
 
+/// Bounded, engine-owned cache for snapshot-independent SQL planning templates.
+///
+/// Parsed statements depend only on the exact SQL text. Bound write plans also
+/// depend on the visible catalog and active branch because binding resolves
+/// public surfaces and injects branch scope. Cached DataFusion read plans are
+/// stripped of snapshot-bound providers and rebound to the current read
+/// session before execution.
 pub(crate) struct SqlPlanningCache<CatalogKey> {
     datafusion_state: SessionState,
     read_sessions: Mutex<Vec<PooledReadSession>>,
