@@ -4349,14 +4349,20 @@ async fn stage_tracked_head(
         // same generation they just published, in place.
         // `normal_branch_head_control` already advanced
         // `current_state_revision`, so the control CAS still fences this write.
-        if stage_untracked_separately {
+        if stage_untracked_separately && !untracked_deltas.is_empty() {
+            let mut untracked_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
                 .writer(read, writes)
-                .stage_untracked_current_state(
+                .stage_current_state_with_working_diff(
                     &root.branch_id,
+                    Some(generation),
                     generation,
                     &untracked_deltas,
                     &BTreeSet::new(),
+                    None,
+                    None,
+                    None,
+                    &mut untracked_coverage,
                 )
                 .await?;
         }
@@ -4435,15 +4441,23 @@ async fn stage_tracked_head(
                     "branch current-state revision overflowed",
                 )
             })?;
-        tracked_head
-            .writer(read, writes)
-            .stage_untracked_current_state(
-                branch_id,
-                control.tracked_generation,
-                &deltas,
-                &owned_absence_guards,
-            )
-            .await?;
+        if !deltas.is_empty() {
+            let mut untracked_coverage = WorkingDiffIndexCoverage::default();
+            tracked_head
+                .writer(read, writes)
+                .stage_current_state_with_working_diff(
+                    branch_id,
+                    Some(control.tracked_generation),
+                    control.tracked_generation,
+                    &deltas,
+                    &owned_absence_guards,
+                    None,
+                    None,
+                    None,
+                    &mut untracked_coverage,
+                )
+                .await?;
+        }
         control.current_state_revision = next_revision;
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, branch_id, control)?;
@@ -4931,13 +4945,19 @@ async fn stage_root_backed_branch_publication(
                 })
                 .collect()
         };
+        let mut untracked_coverage = WorkingDiffIndexCoverage::default();
         tracked_head
             .writer(read, writes)
-            .stage_untracked_current_state(
+            .stage_current_state_with_working_diff(
                 branch_id,
+                Some(control.tracked_generation),
                 control.tracked_generation,
                 &untracked_deltas,
                 &absence_guards,
+                None,
+                None,
+                None,
+                &mut untracked_coverage,
             )
             .await?;
         control.current_state_revision = revision;

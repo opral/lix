@@ -2634,6 +2634,92 @@ fn row_belongs_to_active_collection_generation(
     })
 }
 
+/// Collections whose *absence* is proven by an authenticated identity digest
+/// rather than by a point read returning nothing.
+///
+/// Today there is exactly one: the global branch's `lix_key_value`, which
+/// `functions::state::load_key_value_row` closes over to prove that a
+/// deterministic engine row is genuinely absent instead of silently missing.
+/// The digest is what makes that proof resistant to a same-count,
+/// different-identity substitution; a generation fence or a CAS cannot see
+/// that class of corruption.
+///
+/// The incremental control path deliberately drops the ordered digest, because
+/// it is order-dependent and cannot be maintained without rescanning. A
+/// publication touching one of these scopes therefore recomputes the complete
+/// control, which costs O(scope). That is why this set is kept as narrow as
+/// possible: bulk untracked state lives on ordinary branches under ordinary
+/// schemas and never pays it.
+fn scope_requires_exact_closure(branch_id: &str, schema_key: &str, file_id: Option<&str>) -> bool {
+    branch_id == crate::GLOBAL_BRANCH_ID
+        && schema_key == EXACT_CLOSURE_SCHEMA_KEY
+        && file_id.is_none()
+}
+
+const EXACT_CLOSURE_SCHEMA_KEY: &str = "lix_key_value";
+
+/// Recomputes the complete collection control for an exact-closure scope from
+/// its stored pre-image plus the values this publication is staging.
+///
+/// `staged` maps an identity in the scope to its new encoded value, or `None`
+/// when the publication removes it physically.
+async fn restage_exact_closure_collection_control(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    staged: &BTreeMap<HeadRowIdentity, Option<Bytes>>,
+) -> Result<(), LixError> {
+    let scope = crate::collection_generation::CollectionScopeRef {
+        schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+        file_id: None,
+    };
+    let filter = TrackedStateFilter {
+        schema_keys: vec![EXACT_CLOSURE_SCHEMA_KEY.to_owned()],
+        include_tombstones: true,
+        ..TrackedStateFilter::default()
+    };
+    let HotScanEntries::Decoded(entries) =
+        hot_scan_entries(store, branch_id, generation, &filter, None, None)
+            .await?
+            .expect("unbounded HOT scan cannot exhaust a byte budget")
+    else {
+        unreachable!("an unconstrained HOT scan cannot select the finite point-read route");
+    };
+    let mut rows: HotRowMap = BTreeMap::new();
+    for (identity, bytes) in entries {
+        rows.insert(identity.into_row_identity(), bytes);
+    }
+    // The publication's own values win over the stored pre-image.
+    for (identity, value) in staged {
+        match value {
+            Some(bytes) => {
+                rows.insert(identity.clone(), bytes.clone());
+            }
+            None => {
+                rows.remove(identity);
+            }
+        }
+    }
+    // Carry the scope's collection-generation marker, if any, so the
+    // recomputed control keeps the same active generation and fence.
+    let marker_identity = HeadRowIdentity {
+        schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+        entity_pk: EntityPk::single(crate::collection_generation::collection_scope_key(scope)),
+        file_id: None,
+    };
+    if let Some(marker) =
+        hot_load_primary_identity_bytes(store, std::slice::from_ref(&marker_identity))
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+    {
+        rows.insert(marker_identity, marker);
+    }
+    stage_complete_collection_controls(writes, branch_id, generation, &rows)
+}
+
 fn stage_complete_collection_controls(
     writes: &mut StorageWriteSet,
     branch_id: &str,
@@ -7488,6 +7574,42 @@ where
             collection_controls,
             certified_live_increments,
         )?;
+        // The incremental path above drops the ordered identity digest, which
+        // an exact-closure scope needs in order to prove absence. Recompute
+        // the one affected control from its pre-image plus the values staged
+        // here. Bounded by that scope, not by the branch's untracked
+        // population.
+        if sorted.iter().any(|delta| {
+            scope_requires_exact_closure(branch_id, delta.schema_key, delta.file_id)
+        }) {
+            let staged = sorted
+                .iter()
+                .zip(&next_value_ranges)
+                .filter(|(delta, _)| {
+                    scope_requires_exact_closure(branch_id, delta.schema_key, delta.file_id)
+                })
+                .map(|(delta, range)| {
+                    (
+                        HeadRowIdentity {
+                            schema_key: delta.schema_key.to_owned(),
+                            entity_pk: delta.entity_pk.clone(),
+                            file_id: delta.file_id.map(str::to_owned),
+                        },
+                        range
+                            .as_ref()
+                            .map(|range| next_value_bytes.slice(range.offset()..range.offset() + range.len())),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            restage_exact_closure_collection_control(
+                self.store,
+                self.writes,
+                branch_id,
+                generation,
+                &staged,
+            )
+            .await?;
+        }
 
         async {
             stage_hot_diff_batch(
