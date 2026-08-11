@@ -4430,6 +4430,44 @@ mod tests {
     }
 
     #[test]
+    fn immutable_journal_rejects_invalid_utf8_and_split_offsets() {
+        assert!(
+            ImmutableMutationJournalChunk::try_new_single_string_identities(
+                SchemaPlanId::for_test(0),
+                "schema".into(),
+                "branch".into(),
+                None,
+                vec![0xff],
+                vec![(0, 1)],
+                b"{}".to_vec(),
+                vec![(0, 2)],
+                None,
+                LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
+            )
+            .is_err(),
+            "the journal must reject an invalid identity arena"
+        );
+
+        let snapshots = "é".as_bytes().to_vec();
+        assert!(
+            ImmutableMutationJournalChunk::try_new_single_string_identities(
+                SchemaPlanId::for_test(0),
+                "schema".into(),
+                "branch".into(),
+                None,
+                b"ab".to_vec(),
+                vec![(0, 1), (1, 2)],
+                snapshots,
+                vec![(0, 1), (1, 2)],
+                None,
+                LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
+            )
+            .is_err(),
+            "the journal must reject snapshot offsets inside a UTF-8 scalar"
+        );
+    }
+
+    #[test]
     fn immutable_journal_large_snapshot_refs_support_more_than_u16_rows() {
         const ROW_COUNT: usize = 65_537;
         let mut identities = Vec::with_capacity(ROW_COUNT * 6);
