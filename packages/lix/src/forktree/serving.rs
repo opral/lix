@@ -22,7 +22,7 @@ use super::state::{
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
     apply_ordered_mutations_idempotent_inserts, delete_ordered_range, lookup_many_on_read,
-    lookup_on_read, scan_bounded_page_on_read, scan_page_on_read, scan_range_on_read,
+    lookup_on_read, replace_ordered_range, scan_bounded_page_on_read, scan_page_on_read,
     scan_ranges_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE};
@@ -5118,11 +5118,13 @@ where
 /// tree build.
 ///
 /// The caller supplies the complete, strictly ordered post-image for the
-/// range.  Entries outside the range retain their existing authenticated
-/// state-page references; entries inside it are never read or materialized.
-/// Consequently a collection replacement is `O(outside + replacement)` and
-/// does not perform one root-to-leaf path copy per row.  The returned root is
-/// the sole state authority and is authenticated by the semantic commit.
+/// range. Entries outside the range retain their authenticated subtree
+/// ObjectIds; covered interior subtrees are discarded by summary without
+/// reading their leaves. Replacement leaves are built once and only the two
+/// boundary paths and their ancestors are rewritten. Consequently the edit is
+/// `O(log N + replacement)` authenticated work rather than a full-state scan
+/// or one root-to-leaf copy per row. The returned root is the sole state
+/// authority and is authenticated by the semantic commit.
 pub(crate) async fn replace_state_tree_range<R>(
     root: ObjectId,
     lower: Vec<u8>,
@@ -5156,26 +5158,17 @@ where
     }
 
     let root = validate_root_on_read(root, "state", read).await?;
-    let mut entries =
-        scan_range_on_read(root.object_id, "state", None, Some(&lower), None, read).await?;
-    entries.reserve(replacement.len());
-    entries.extend(
+    let edit = replace_ordered_range(
+        root,
+        "state",
+        &lower,
+        upper.as_deref(),
         replacement
             .iter()
-            .map(|(key, value, _)| (key.clone(), value.clone())),
-    );
-    if let Some(upper) = upper.as_deref() {
-        entries.extend(
-            scan_range_on_read(root.object_id, "state", Some(upper), None, None, read).await?,
-        );
-    }
-    if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-        return Err(corruption(
-            "state-tree root replacement produced duplicate or unordered keys",
-        ));
-    }
-    let build = super::tree::build_state_tree(&entries)?;
-    let copied_nodes = build.objects.iter().count();
+            .map(|(key, value, _)| (key.as_slice(), value.as_slice())),
+        read,
+    )
+    .await?;
     let mut added_blob_roots = BTreeMap::new();
     let mut written_commit_ids = BTreeSet::new();
     let mut wrote_tombstone = false;
@@ -5191,13 +5184,13 @@ where
     }
     Ok(StateTreeEdit {
         base_root: root.object_id,
-        root: build.root.object_id,
-        entry_count: build.root.entry_count,
-        copied_nodes,
+        root: edit.root.object_id,
+        entry_count: edit.root.entry_count,
+        copied_nodes: edit.copied_nodes,
         added_blob_roots,
         wrote_tombstone,
         written_commit_ids,
-        objects: build.objects,
+        objects: edit.objects,
     })
 }
 

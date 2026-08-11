@@ -29,9 +29,10 @@ use super::object::{OBJECT_SPACE, ObjectDomain, encode_id, encode_object};
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_state_tree, diff_roots,
-    empty_receipt_tree, insert_receipt_part, lookup, scan_all, validate_branch_snapshot_ref_edge,
-    validate_change_catalog_back_edge, validate_commit_catalog_back_edge, validate_receipt_tree,
-    validate_upload_progress_tree, validate_upload_selector_progress,
+    empty_receipt_tree, insert_receipt_part, lookup, replace_ordered_range, scan_all,
+    validate_branch_snapshot_ref_edge, validate_change_catalog_back_edge,
+    validate_commit_catalog_back_edge, validate_receipt_tree, validate_upload_progress_tree,
+    validate_upload_selector_progress,
 };
 use super::view::SELECTOR_SPACE;
 use super::{
@@ -2915,6 +2916,82 @@ async fn state_root_diff_short_circuits_and_handles_sparse_changes() {
             .into_iter()
             .map(|(key, _)| key)
             .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn state_range_replace_copies_only_boundary_paths_and_reuses_interior_siblings() {
+    let original_rows = (0..10_000).map(|index| (index, 1)).collect::<Vec<_>>();
+    let original = build_diff_tree(&original_rows);
+    let storage = CountingStorage::new();
+    seed_diff_trees(&storage, &[&original]).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("range-replace read"),
+    );
+    storage.object_get_many.store(0, Ordering::Relaxed);
+
+    let replacement = diff_state_rows(&(4_000..6_000).map(|index| (index, 9)).collect::<Vec<_>>());
+    let lower = replacement.first().expect("replacement lower").0.clone();
+    let upper = diff_state_rows(&[(6_000, 1)])[0].0.clone();
+    let edit = replace_ordered_range(
+        original.root,
+        "state",
+        &lower,
+        Some(&upper),
+        replacement
+            .iter()
+            .map(|(key, value)| (key.as_slice(), value.as_slice())),
+        &read,
+    )
+    .await
+    .expect("authenticated path-copy range replacement");
+
+    assert!(
+        storage.object_get_many.load(Ordering::Relaxed) <= 8,
+        "a 10K replacement must load only the two boundary paths"
+    );
+    assert!(
+        edit.objects.iter().count() < original.objects.iter().count(),
+        "unaffected authenticated subtrees must be reused rather than rebuilt"
+    );
+    assert_eq!(edit.root.entry_count, 10_000);
+
+    let actual = scan_all(edit.root.object_id, "state", |id| {
+        edit.objects
+            .get(id)
+            .or_else(|| original.objects.get(id))
+            .cloned()
+            .ok_or_else(|| StorageError::Corruption(format!("spliced object {id} is absent")))
+    })
+    .expect("scan spliced authenticated tree");
+    let mut expected = diff_state_rows(
+        &(0..4_000)
+            .map(|index| (index, 1))
+            .chain((4_000..6_000).map(|index| (index, 9)))
+            .chain((6_000..10_000).map(|index| (index, 1)))
+            .collect::<Vec<_>>(),
+    );
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(actual, expected);
+
+    let out_of_range = diff_state_rows(&[(3_999, 7)]);
+    assert!(
+        replace_ordered_range(
+            original.root,
+            "state",
+            &lower,
+            Some(&upper),
+            out_of_range
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice())),
+            &read,
+        )
+        .await
+        .is_err(),
+        "an authenticated replacement must reject rows outside its certified range"
     );
 }
 
