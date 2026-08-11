@@ -131,21 +131,26 @@ impl SchemaIntern {
                 break;
             }
         }
-        let mut by_id: Vec<SharedStr> = Vec::with_capacity(rows.len());
-        let mut by_name: HashMap<SharedStr, u32> = HashMap::with_capacity(rows.len());
-        for (index, (id, name)) in rows.into_iter().enumerate() {
-            if id as usize != index {
+        let mut inner = self.inner.write().expect("schema intern lock poisoned");
+        // Merge instead of replace: assignments staged by this process before
+        // the first load (bootstrap staging) must survive, and the persisted
+        // rows must agree with them byte-for-byte wherever they overlap.
+        for (index, (id, name)) in rows.iter().enumerate() {
+            if *id as usize != index {
                 return Err(intern_corruption("id sequence"));
             }
-            if by_name.insert(name.clone(), id).is_some() {
-                return Err(intern_corruption("duplicate schema key"));
+            match inner.by_id.get(index) {
+                Some(existing) if existing == name => {}
+                Some(_) => return Err(intern_corruption("schema key assignment")),
+                None => {
+                    if inner.by_name.insert(name.clone(), *id).is_some() {
+                        return Err(intern_corruption("duplicate schema key"));
+                    }
+                    inner.by_id.push(name.clone());
+                }
             }
-            by_id.push(name);
         }
-        let mut inner = self.inner.write().expect("schema intern lock poisoned");
-        inner.loaded_len = by_id.len() as u32;
-        inner.by_id = by_id;
-        inner.by_name = by_name;
+        inner.loaded_len = inner.loaded_len.max(rows.len() as u32);
         Ok(())
     }
 

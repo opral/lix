@@ -868,10 +868,11 @@ where
 #[cfg(test)]
 fn stage_put(
     writes: &mut StorageWriteSet,
+    intern: &SchemaIntern,
     identity: &HeadIdentity,
     value: &HeadValue,
 ) -> Result<(), LixError> {
-    hot::stage_test_hot_value(writes, identity, value)
+    hot::stage_test_hot_value(writes, intern, identity, value)
 }
 
 fn working_diff_marker_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
@@ -3289,13 +3290,16 @@ mod tests {
         assert!(
             writes.contains_put(
                 HOT_ROW_SPACE,
-                &hot::encode_hot_row_key(&HeadIdentity {
-                    branch_id: branch_id.to_owned(),
-                    generation: checkpoint,
-                    schema_key: "schema".to_owned(),
-                    entity_pk: entity_pk.clone(),
-                    file_id: None,
-                }),
+                &hot::encode_hot_row_key(
+                    storage.schema_intern(),
+                    &HeadIdentity {
+                        branch_id: branch_id.to_owned(),
+                        generation: checkpoint,
+                        schema_key: "schema".to_owned(),
+                        entity_pk: entity_pk.clone(),
+                        file_id: None,
+                    },
+                ),
             ),
             "an identical dirty selected change must be rewritten clean"
         );
@@ -3325,13 +3329,16 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open no-op checkpoint epoch read");
-        let hot_key = hot::encode_hot_row_key(&HeadIdentity {
-            branch_id: branch_id.to_owned(),
-            generation: checkpoint,
-            schema_key: "schema".to_owned(),
-            entity_pk: entity_pk.clone(),
-            file_id: None,
-        });
+        let hot_key = hot::encode_hot_row_key(
+            storage.schema_intern(),
+            &HeadIdentity {
+                branch_id: branch_id.to_owned(),
+                generation: checkpoint,
+                schema_key: "schema".to_owned(),
+                entity_pk: entity_pk.clone(),
+                file_id: None,
+            },
+        );
         let value = PointReadPlan::new(HOT_ROW_SPACE, &[StorageKey(Bytes::from(hot_key))])
             .materialize(&read, StorageGetOptions::default())
             .await

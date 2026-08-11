@@ -11839,6 +11839,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         stage_hot_collection_control(
             &mut writes,
+            storage.schema_intern(),
             BRANCH_ID,
             generation,
             crate::collection_generation::CollectionScopeRef {
@@ -12054,14 +12055,21 @@ mod tests {
             entity_pk: &identity.entity_pk,
             file_id: None,
         };
+        let intern = SchemaIntern::new();
+        let mut intern_writes = StorageWriteSet::new();
+        let schema_id = intern
+            .assign(SCHEMA_KEY, &mut intern_writes)
+            .expect("assign test schema id");
         let key =
-            encode_hot_row_key_parts(BRANCH_ID, generation, SCHEMA_KEY, &identity.entity_pk, None);
+            encode_hot_row_key_parts(BRANCH_ID, generation, schema_id, &identity.entity_pk, None);
         let untracked = encoded_test_hot_value(generation, true, false);
         validate_exact_collection_member(
+            &intern,
             BRANCH_ID,
             generation,
             &scope_prefix,
             scope,
+            schema_id,
             missing_identity,
             true,
             &key,
@@ -12071,10 +12079,12 @@ mod tests {
 
         let tracked = encoded_test_hot_value(generation, false, false);
         let wrong_domain = validate_exact_collection_member(
+            &intern,
             BRANCH_ID,
             generation,
             &scope_prefix,
             scope,
+            schema_id,
             required_identity,
             true,
             &key,
@@ -12085,10 +12095,12 @@ mod tests {
 
         let tombstone = encoded_test_hot_value(generation, false, true);
         let tombstone_error = validate_exact_collection_member(
+            &intern,
             BRANCH_ID,
             generation,
             &scope_prefix,
             scope,
+            schema_id,
             required_identity,
             false,
             &key,
@@ -12101,10 +12113,12 @@ mod tests {
         malformed.pop();
         assert!(
             validate_exact_collection_member(
+                &intern,
                 BRANCH_ID,
                 generation,
                 &scope_prefix,
                 scope,
+                schema_id,
                 missing_identity,
                 true,
                 &malformed,
@@ -12118,7 +12132,7 @@ mod tests {
             .expect_err("raw and canonical encodings must match byte-for-byte");
         assert!(noncanonical_error.message.contains("non-canonical"));
 
-        let mut digest = CompleteHotCollectionDigest::new(BRANCH_ID, generation, scope);
+        let mut digest = CompleteHotCollectionDigest::new(BRANCH_ID, generation, schema_id, scope);
         digest
             .push(&identity, &key)
             .expect("first canonical identity should hash");
@@ -12135,11 +12149,12 @@ mod tests {
         let high_key = encode_hot_row_key_parts(
             BRANCH_ID,
             generation,
-            SCHEMA_KEY,
+            schema_id,
             &high_identity.entity_pk,
             None,
         );
-        let mut out_of_order = CompleteHotCollectionDigest::new(BRANCH_ID, generation, scope);
+        let mut out_of_order =
+            CompleteHotCollectionDigest::new(BRANCH_ID, generation, schema_id, scope);
         out_of_order
             .push(&high_identity, &high_key)
             .expect("first high identity should hash");
@@ -12176,9 +12191,10 @@ mod tests {
         }
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = StorageWriteSet::new();
-        stage_complete_collection_controls(&mut writes, BRANCH_ID, generation, &rows)
+        stage_complete_collection_controls(&mut writes, storage.schema_intern(), BRANCH_ID, generation, &rows)
             .expect("complete controls should stage");
-        stage_complete_hot_rows(&mut writes, BRANCH_ID, generation, rows);
+        stage_complete_hot_rows(&mut writes, storage.schema_intern(), BRANCH_ID, generation, rows)
+            .expect("stage complete hot rows");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -12247,9 +12263,10 @@ mod tests {
             encoded_test_hot_value(generation, false, false),
         )]);
         let mut writes = StorageWriteSet::new();
-        stage_complete_collection_controls(&mut writes, BRANCH_ID, generation, &marker_rows)
+        stage_complete_collection_controls(&mut writes, storage.schema_intern(), BRANCH_ID, generation, &marker_rows)
             .expect("authenticated empty control should stage");
-        stage_complete_hot_rows(&mut writes, BRANCH_ID, generation, marker_rows);
+        stage_complete_hot_rows(&mut writes, storage.schema_intern(), BRANCH_ID, generation, marker_rows)
+            .expect("stage complete hot rows");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -12331,6 +12348,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         stage_hot_collection_control(
             &mut writes,
+            storage.schema_intern(),
             BRANCH_ID,
             generation,
             scope,
@@ -12386,9 +12404,10 @@ mod tests {
         let memory = Memory::new();
         let storage = StorageAdapter::new(memory.clone());
         let mut writes = StorageWriteSet::new();
-        stage_complete_collection_controls(&mut writes, BRANCH_ID, generation, &rows)
+        stage_complete_collection_controls(&mut writes, storage.schema_intern(), BRANCH_ID, generation, &rows)
             .expect("base control should stage");
-        stage_complete_hot_rows(&mut writes, BRANCH_ID, generation, rows);
+        stage_complete_hot_rows(&mut writes, storage.schema_intern(), BRANCH_ID, generation, rows)
+            .expect("stage complete hot rows");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -12408,8 +12427,22 @@ mod tests {
             let storage = StorageAdapter::new(
                 Memory::from_snapshot(&snapshot).expect("reopen base closure fixture"),
             );
+            // Load the persisted intern table before resolving against it.
+            drop(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("warm up reopened intern table"),
+            );
+            let schema_id = storage
+                .schema_intern()
+                .resolve(SCHEMA_KEY)
+                .expect("reopened fixture must intern its schema key");
             let control_key = StorageKey(Bytes::from(hot_collection_control_key(
-                BRANCH_ID, generation, scope,
+                BRANCH_ID,
+                generation,
+                schema_id,
+                scope.file_id,
             )));
             let mut writes = StorageWriteSet::new();
             match label {
@@ -12423,6 +12456,7 @@ mod tests {
                 ),
                 "stale" => stage_hot_collection_control(
                     &mut writes,
+                    storage.schema_intern(),
                     BRANCH_ID,
                     generation,
                     scope,
@@ -12435,6 +12469,7 @@ mod tests {
                 .expect("stale control should encode"),
                 "no-digest" => stage_hot_collection_control(
                     &mut writes,
+                    storage.schema_intern(),
                     BRANCH_ID,
                     generation,
                     scope,
@@ -12447,6 +12482,7 @@ mod tests {
                 .expect("digest-free control should encode"),
                 "forged" => stage_hot_collection_control(
                     &mut writes,
+                    storage.schema_intern(),
                     BRANCH_ID,
                     generation,
                     scope,
@@ -12632,7 +12668,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         writes.delete(
             HOT_ROW_SPACE,
-            StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
+            StorageKey(Bytes::from(encode_hot_row_key(storage.schema_intern(), &HeadIdentity {
                 branch_id: crate::GLOBAL_BRANCH_ID.to_owned(),
                 generation,
                 schema_key: "lix_key_value".to_owned(),
@@ -12799,6 +12835,7 @@ mod tests {
         let mut fixture_writes = StorageWriteSet::new();
         stage_hot_collection_control(
             &mut fixture_writes,
+            storage.schema_intern(),
             BRANCH_ID,
             generation,
             crate::collection_generation::CollectionScopeRef {
@@ -12832,11 +12869,13 @@ mod tests {
         );
         stage_packed_exclusive_schema_base_ref(
             &mut fixture_writes,
+            storage.schema_intern(),
             BRANCH_ID,
             generation,
             SCHEMA_KEY,
             exclusive_head,
-        );
+            )
+            .expect("stage exclusive schema base ref");
         storage
             .commit_write_set(fixture_writes, StorageWriteOptions::default())
             .await
@@ -12939,6 +12978,7 @@ mod tests {
         let mut corrupt_writes = StorageWriteSet::new();
         stage_hot_collection_control(
             &mut corrupt_writes,
+            storage.schema_intern(),
             BRANCH_ID,
             parent_commit_id,
             crate::collection_generation::CollectionScopeRef {
@@ -13041,10 +13081,14 @@ mod tests {
         let mut active_manifest = hot_scope_prefix("active-packed", active_generation);
         active_manifest.extend_from_slice(active_generation.as_uuid().as_bytes());
         let active_control = hot_scope_prefix("active-packed", active_generation);
+        let schema_id = storage
+            .schema_intern()
+            .assign("schema", &mut StorageWriteSet::new())
+            .expect("assign gc fixture schema id");
         let active_index = packed_exclusive_schema_base_key(
             "active-packed",
             active_generation,
-            "schema",
+            schema_id,
             active_generation,
         );
         let mut stale_manifest = hot_scope_prefix("stale-packed", stale_generation);
@@ -13055,7 +13099,7 @@ mod tests {
         let stale_index = packed_exclusive_schema_base_key(
             "stale-packed",
             stale_generation,
-            "schema",
+            schema_id,
             stale_generation,
         );
         let mut writes = StorageWriteSet::new();
@@ -13230,12 +13274,16 @@ mod tests {
         let mut manifest_key = hot_scope_prefix(BRANCH_ID, generation);
         manifest_key.extend_from_slice(generation.as_uuid().as_bytes());
         let control_key = hot_scope_prefix(BRANCH_ID, generation);
+        let index_schema_id = storage
+            .schema_intern()
+            .resolve(SCHEMA_KEY)
+            .expect("seeded fixture must intern its schema key");
         let index_key =
-            packed_exclusive_schema_base_key(BRANCH_ID, generation, SCHEMA_KEY, generation);
+            packed_exclusive_schema_base_key(BRANCH_ID, generation, index_schema_id, generation);
         let mut fixture_writes = StorageWriteSet::new();
         fixture_writes.delete(
             HOT_ROW_SPACE,
-            StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
+            StorageKey(Bytes::from(encode_hot_row_key(storage.schema_intern(), &HeadIdentity {
                 branch_id: BRANCH_ID.to_owned(),
                 generation,
                 schema_key: SCHEMA_KEY.to_owned(),
@@ -13346,7 +13394,7 @@ mod tests {
         assert!(index[0].is_none());
         let hot = PointReadPlan::new(
             HOT_ROW_SPACE,
-            &[StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
+            &[StorageKey(Bytes::from(encode_hot_row_key(storage.schema_intern(), &HeadIdentity {
                 branch_id: BRANCH_ID.to_owned(),
                 generation,
                 schema_key: SCHEMA_KEY.to_owned(),
@@ -14071,7 +14119,12 @@ mod tests {
             .collect::<Vec<_>>();
         let branch_id = String::from("branch");
         let schema_key = String::from("schema");
+        let intern = SchemaIntern::new();
+        intern
+            .assign(&schema_key, &mut StorageWriteSet::new())
+            .expect("assign test schema id");
         let batch = FiniteHotIdentityBatchRef::new(
+            &intern,
             &branch_id,
             generation,
             &schema_key,
@@ -14115,11 +14168,15 @@ mod tests {
         let entity_pks = (0..ROW_COUNT)
             .map(|index| EntityPk::single(format!("entity-{index:05}")))
             .collect::<Vec<_>>();
+        let intern = SchemaIntern::new();
+        let schema_id = intern
+            .assign(schema_key, &mut StorageWriteSet::new())
+            .expect("assign test schema id");
         let capacity = entity_pks
             .iter()
             .try_fold(0_usize, |total, entity_pk| {
                 total.checked_add(
-                    encoded_hot_identity_key_len(scope.len(), schema_key, entity_pk, Some(file_id))
+                    encoded_hot_identity_key_len(scope.len(), entity_pk, Some(file_id))
                         .expect("test key size is representable"),
                 )
             })
@@ -14130,7 +14187,7 @@ mod tests {
             .map(|entity_pk| {
                 let start = key_bytes.len();
                 key_bytes.extend_from_slice(&scope);
-                write_key_string(&mut key_bytes, schema_key, KEY_PART_FINAL);
+                write_schema_id(&mut key_bytes, schema_id);
                 write_file_id(&mut key_bytes, Some(file_id));
                 write_entity_pk(&mut key_bytes, entity_pk);
                 start..key_bytes.len()
@@ -14141,7 +14198,7 @@ mod tests {
         let identities = ranges
             .into_iter()
             .map(|range| {
-                decode_hot_scan_row_key_in_scope(key_bytes.slice(range), &scope)
+                decode_hot_scan_row_key_in_scope(&intern, key_bytes.slice(range), &scope)
                     .expect("decode borrowed hot scan key")
             })
             .collect::<Vec<_>>();
@@ -14202,15 +14259,19 @@ mod tests {
         file_id: &str,
         value: &'static [u8],
     ) -> (HotScanIdentity, Bytes) {
+        let intern = SchemaIntern::new();
+        let schema_id = intern
+            .assign("schema", &mut StorageWriteSet::new())
+            .expect("assign adversarial schema id");
         let scope = hot_scope_prefix("branch", generation);
         let key = Bytes::from(encode_hot_row_key_parts(
             "branch",
             generation,
-            "schema",
+            schema_id,
             &EntityPk::single(entity_pk),
             Some(file_id),
         ));
-        let identity = decode_hot_scan_row_key_in_scope(key, &scope)
+        let identity = decode_hot_scan_row_key_in_scope(&intern, key, &scope)
             .expect("decode adversarial HOT scan identity");
         (identity, Bytes::from_static(value))
     }
@@ -14273,13 +14334,17 @@ mod tests {
         const BUDGET: usize = 4 * 1024 * 1024;
         let generation = CommitId::for_test_label("hot-scan-byte-budget");
         let scope = hot_scope_prefix("branch", generation);
+        let intern = SchemaIntern::new();
+        let schema_id = intern
+            .assign("schema", &mut StorageWriteSet::new())
+            .expect("assign tiny schema id");
         let tiny_rows = (0..TINY_ROW_COUNT)
             .map(|index| {
                 let entity_pk = EntityPk::single(format!("entity-{index:05}"));
                 let key = Bytes::from(encode_hot_row_key_parts(
-                    "branch", generation, "schema", &entity_pk, None,
+                    "branch", generation, schema_id, &entity_pk, None,
                 ));
-                let identity = decode_hot_scan_row_key_in_scope(key, &scope)
+                let identity = decode_hot_scan_row_key_in_scope(&intern, key, &scope)
                     .expect("decode tiny HOT scan identity");
                 (identity, Bytes::from_static(b"{}"))
             })
@@ -14292,10 +14357,10 @@ mod tests {
 
         let entity_pk = EntityPk::single("large");
         let key = Bytes::from(encode_hot_row_key_parts(
-            "branch", generation, "schema", &entity_pk, None,
+            "branch", generation, schema_id, &entity_pk, None,
         ));
-        let identity =
-            decode_hot_scan_row_key_in_scope(key, &scope).expect("decode large HOT scan identity");
+        let identity = decode_hot_scan_row_key_in_scope(&intern, key, &scope)
+            .expect("decode large HOT scan identity");
         let wide_rows = vec![(identity, Bytes::from(vec![0_u8; BUDGET]))];
         assert!(
             hot_scan_entries_fit_budget(HotScanEntries::Decoded(wide_rows), Some(BUDGET),)
@@ -14321,12 +14386,21 @@ mod tests {
                 file_id: Some("file\0id".to_string()),
             },
         ];
+        let intern = SchemaIntern::new();
+        let mut intern_writes = StorageWriteSet::new();
+        let schema_ids = identities
+            .iter()
+            .map(|identity| {
+                intern
+                    .assign(&identity.schema_key, &mut intern_writes)
+                    .expect("assign diff test schema id")
+            })
+            .collect::<Vec<_>>();
         let capacity = identities
             .iter()
             .try_fold(0_usize, |total, identity| {
                 total.checked_add(encoded_hot_identity_key_len(
                     scope.len(),
-                    &identity.schema_key,
                     &identity.entity_pk,
                     identity.file_id.as_deref(),
                 )?)
@@ -14336,11 +14410,12 @@ mod tests {
         let allocation = key_bytes.as_ptr();
         let ranges = identities
             .iter()
-            .map(|identity| {
+            .zip(&schema_ids)
+            .map(|(identity, schema_id)| {
                 append_hot_diff_key_parts(
                     &mut key_bytes,
                     &scope,
-                    &identity.schema_key,
+                    *schema_id,
                     &identity.entity_pk,
                     identity.file_id.as_deref(),
                 )
@@ -14352,8 +14427,8 @@ mod tests {
         assert_eq!(key_bytes.as_ptr(), allocation);
         assert_eq!(ranges[0].end, ranges[1].start);
         for (range, expected) in ranges.into_iter().zip(identities) {
-            let (decoded_checkpoint, decoded_identity) =
-                decode_hot_diff_key(&key_bytes[range]).expect("decode appended hot-diff key");
+            let (decoded_checkpoint, decoded_identity) = decode_hot_diff_key(&intern, &key_bytes[range])
+                .expect("decode appended hot-diff key");
             assert_eq!(decoded_checkpoint, checkpoint);
             assert_eq!(decoded_identity.branch_id, "branch");
             assert_eq!(decoded_identity.generation, generation);
@@ -14500,8 +14575,14 @@ mod tests {
             let segment_scope =
                 decode_hot_diff_segment_key(entry.key.0.as_ref()).expect("segment key");
             assert_eq!(segment_scope.digest, *blake3::hash(&bytes).as_bytes());
-            visit_hot_diff_segment(&bytes, &scope, &mut actual_coverage, |_| decoded += 1)
-                .expect("decode hot diff segment");
+            visit_hot_diff_segment(
+                storage.schema_intern(),
+                &bytes,
+                &scope,
+                &mut actual_coverage,
+                |_| decoded += 1,
+            )
+            .expect("decode hot diff segment");
         }
         assert_eq!(decoded, IDENTITY_COUNT);
         assert_eq!(actual_coverage, expected_coverage);
@@ -14542,13 +14623,26 @@ mod tests {
             columnar_base_coordinate: None,
         };
         let deltas = [&first, &second];
+        let intern = SchemaIntern::new();
+        let mut intern_writes = StorageWriteSet::new();
+        let schema_ids = deltas
+            .iter()
+            .map(|delta| {
+                intern
+                    .assign(delta.schema_key, &mut intern_writes)
+                    .expect("assign mutation test schema id")
+            })
+            .collect::<Vec<_>>();
         let capacity = encoded_hot_mutation_identity_capacity(scope.len(), &deltas)
             .expect("test identities have a representable encoded size");
         let mut key_bytes = Vec::with_capacity(capacity);
         let allocation = key_bytes.as_ptr();
         let ranges = deltas
             .iter()
-            .map(|delta| append_hot_mutation_identity(&mut key_bytes, &scope, delta))
+            .zip(&schema_ids)
+            .map(|(delta, schema_id)| {
+                append_hot_mutation_identity(&mut key_bytes, &scope, *schema_id, delta)
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(key_bytes.len(), capacity);
@@ -14569,6 +14663,7 @@ mod tests {
         for (range, delta) in ranges.iter().zip(deltas) {
             let row_start = range.row_key.offset();
             let row = decode_hot_row_key_in_scope(
+                &intern,
                 &key_bytes[row_start..row_start + range.row_key.len()],
                 &scope,
             )
@@ -14578,6 +14673,7 @@ mod tests {
             assert_eq!(row.file_id.as_deref(), delta.file_id);
 
             let scan_row = decode_hot_scan_row_key_in_scope(
+                &intern,
                 Bytes::copy_from_slice(&key_bytes[row_start..row_start + range.row_key.len()]),
                 &scope,
             )
@@ -14587,21 +14683,23 @@ mod tests {
             assert_eq!(scan_row.file_id(), delta.file_id);
             assert_eq!(
                 scan_row.owned_metadata_buffer_count(),
-                usize::from(delta.schema_key.contains('\0'))
-                    + usize::from(delta.file_id.is_some_and(|file_id| file_id.contains('\0'))),
-                "only escaped metadata should take an owned fallback"
+                usize::from(delta.file_id.is_some_and(|file_id| file_id.contains('\0'))),
+                "only an escaped file id should take an owned fallback"
             );
 
             if let Some(marker) = range.file_schema_key {
                 let marker_start = marker.offset();
+                let marker_schema_id = intern
+                    .resolve(delta.schema_key)
+                    .expect("marker schema id was assigned above");
                 assert_eq!(
                     &key_bytes[marker_start..marker_start + marker.len()],
-                    encode_hot_file_schema_key(&scope, delta.schema_key)
+                    encode_hot_file_schema_key(&scope, marker_schema_id)
                 );
             }
         }
 
-        let encoded = encode_hot_mutation_identities("branch", generation, &deltas);
+        let encoded = encode_hot_mutation_identities("branch", generation, &deltas, &schema_ids);
         assert_eq!(encoded.key_bytes.as_ref(), key_bytes);
         assert_eq!(encoded.key_ranges.len(), ranges.len());
         for (encoded, expected) in encoded.key_ranges.iter().zip(ranges) {
@@ -14978,7 +15076,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let delta_refs = deltas.iter().collect::<Vec<_>>();
-        let encoded = encode_hot_mutation_identities("branch", generation, &delta_refs);
+        let schema_ids = assign_delta_schema_ids(
+            storage.schema_intern(),
+            &mut StorageWriteSet::new(),
+            &delta_refs,
+        )
+        .expect("assign dense mutation schema ids");
+        let encoded = encode_hot_mutation_identities("branch", generation, &delta_refs, &schema_ids);
         let keys = encoded
             .key_ranges
             .iter()
@@ -15045,7 +15149,12 @@ mod tests {
             .step_by(2)
             .cloned()
             .collect::<Vec<_>>();
+        storage
+            .schema_intern()
+            .assign("schema", &mut StorageWriteSet::new())
+            .expect("assign dense fixture schema id");
         let requested_batch = FiniteHotIdentityBatchRef::new(
+            storage.schema_intern(),
             "branch",
             generation,
             "schema",
@@ -15060,7 +15169,7 @@ mod tests {
         for identity in &all_identities {
             writes.put(
                 HOT_ROW_SPACE,
-                StorageKey(Bytes::from(encode_hot_row_key(identity))),
+                StorageKey(Bytes::from(encode_hot_row_key(storage.schema_intern(), identity))),
                 StorageValue {
                     bytes: Bytes::from_static(b"row"),
                 },
@@ -15101,7 +15210,12 @@ mod tests {
             .step_by(4)
             .cloned()
             .collect::<Vec<_>>();
+        storage
+            .schema_intern()
+            .assign("schema", &mut StorageWriteSet::new())
+            .expect("assign dense fixture schema id");
         let requested_batch = FiniteHotIdentityBatchRef::new(
+            storage.schema_intern(),
             "branch",
             generation,
             "schema",
@@ -15116,7 +15230,7 @@ mod tests {
         for identity in &all_identities {
             writes.put(
                 HOT_ROW_SPACE,
-                StorageKey(Bytes::from(encode_hot_row_key(identity))),
+                StorageKey(Bytes::from(encode_hot_row_key(storage.schema_intern(), identity))),
                 StorageValue {
                     bytes: Bytes::from_static(b"row"),
                 },

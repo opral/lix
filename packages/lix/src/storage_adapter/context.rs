@@ -43,6 +43,12 @@ where
         }
     }
 
+    /// The adapter-lifetime schema-key interning table shared by every read
+    /// scope this adapter creates.
+    pub(crate) fn schema_intern(&self) -> &crate::storage_adapter::SchemaIntern {
+        self.schema_intern.intern()
+    }
+
     pub async fn begin_read(
         &self,
         opts: ReadOptions,
