@@ -2326,3 +2326,321 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    working_diff_first_branch_delete_of_existing_row_is_removed,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-delete', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        delete_key_value(&draft, "branch-delete").await;
+
+        let narrow = draft
+            .execute(
+                "SELECT diff_type, before_change_id FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"branch-delete\"]')",
+                &[],
+            )
+            .await
+            .expect("narrow working diff should load");
+        assert_eq!(
+            narrow.len(),
+            1,
+            "the deleted row must appear in the narrow working diff"
+        );
+        assert_eq!(
+            narrow.rows()[0].values()[0],
+            Value::Text("removed".to_string()),
+            "deleting a checkpointed row on a fresh branch must classify as removed, got {:?}",
+            narrow.rows()[0].values()
+        );
+
+        let broad = draft
+            .execute(
+                "SELECT entity_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                &[],
+            )
+            .await
+            .expect("broad working diff should load");
+        assert_eq!(
+            broad.len(),
+            1,
+            "the deleted row must also appear in the unfiltered working diff, got {:?}",
+            broad.rows().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>()
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_branch_edit_is_modified_for_broad_and_repeated_edits,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-broad-a', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-broad-b', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('branch-broad-new', 'new')",
+                &[],
+            )
+            .await
+            .expect("unrelated branch insert should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-broad-a'",
+                &[],
+            )
+            .await
+            .expect("first edit should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after-2' WHERE key = 'branch-broad-a'",
+                &[],
+            )
+            .await
+            .expect("second edit of the same row should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-broad-b'",
+                &[],
+            )
+            .await
+            .expect("edit of a second pre-existing row should succeed");
+
+        let rows = draft
+            .execute(
+                "SELECT entity_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                &[],
+            )
+            .await
+            .expect("broad working diff should load");
+        let actual = rows
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                vec![
+                    Value::Json(JsonValue::Array(vec![JsonValue::String(
+                        "branch-broad-a".to_string()
+                    )])
+                    .into()),
+                    Value::Text("modified".to_string()),
+                ],
+                vec![
+                    Value::Json(JsonValue::Array(vec![JsonValue::String(
+                        "branch-broad-b".to_string()
+                    )])
+                    .into()),
+                    Value::Text("modified".to_string()),
+                ],
+                vec![
+                    Value::Json(JsonValue::Array(vec![JsonValue::String(
+                        "branch-broad-new".to_string()
+                    )])
+                    .into()),
+                    Value::Text("added".to_string()),
+                ],
+            ],
+            "every branch-local edit of a checkpointed row must classify as modified"
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_restoring_the_checkpoint_payload_on_a_branch_is_net_empty,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-restore', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-restore'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'before' WHERE key = 'branch-restore'",
+                &[],
+            )
+            .await
+            .expect("restoring the checkpoint payload should succeed");
+
+        let rows = draft
+            .execute(
+                "SELECT entity_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(
+            rows.len(),
+            0,
+            "restoring the checkpoint payload must be net empty, got {:?}",
+            rows.rows().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>()
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_first_edit_after_switch_branch_of_existing_row_is_modified,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('switch-baseline', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+        let draft = create_draft(&engine, &main).await;
+        drop(draft);
+
+        main.switch_branch(SwitchBranchOptions {
+            branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            pinned_commit_id: None,
+        })
+        .await
+        .expect("switch should succeed");
+
+        main.execute(
+            "UPDATE lix_key_value SET value = 'after' WHERE key = 'switch-baseline'",
+            &[],
+        )
+        .await
+        .expect("first edit after switch should succeed");
+
+        let rows = main
+            .execute(
+                "SELECT diff_type, before_change_id FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"switch-baseline\"]')",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.rows()[0].values()[0],
+            Value::Text("modified".to_string()),
+            "the first edit after a branch switch must classify as modified, got {:?}",
+            rows.rows()[0].values()
+        );
+    }
+);
+
+simulation_test!(
+    checkpoint_after_first_branch_edit_keeps_the_edited_value,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-checkpoint', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'branch-checkpoint'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+        draft
+            .create_checkpoint()
+            .await
+            .expect("branch checkpoint should succeed");
+
+        assert_key_value(&draft, "branch-checkpoint", Some("\"after\"")).await;
+        let rows = draft
+            .execute(
+                "SELECT entity_pk FROM lix_working_diff WHERE schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("working diff should load");
+        assert_eq!(rows.len(), 0, "a fresh checkpoint has an empty working diff");
+    }
+);
