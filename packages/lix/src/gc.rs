@@ -2256,7 +2256,8 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
 
     use super::{
-        CheckpointGcState, CheckpointRecoveryRef, authenticated_control_commit_reachability,
+        CHECKPOINT_GC_STATE_SPACE, CheckpointGcState, CheckpointRecoveryRef,
+        authenticated_control_commit_reachability,
         derive_retirement_candidates, load_checkpoint_gc_state, load_recovery_ref,
         load_recovery_refs, resolve_pending_checkpoint_replacement, retirement_is_proven,
         stage_checkpoint_gc_state, stage_delete_recovery_ref, stage_recovery_ref_rotation,
@@ -4190,16 +4191,14 @@ mod tests {
         let new = CommitId::for_test_label("history-new");
         let active = BTreeSet::from([new]);
         let mut dependencies = BTreeSet::from([old]);
-        assert!(!retirement_is_proven(
-            old,
-            Some(new),
-            &active,
-            &dependencies
-        ));
+        assert!(!retirement_is_proven(old, &active, &dependencies));
         // Once history/diff/undo/redo/checkpoint pins release the old root,
-        // the delta is a valid physical-retirement proof.
+        // the derived candidate is a valid physical-retirement proof.
         dependencies.clear();
-        assert!(retirement_is_proven(old, Some(new), &active, &dependencies));
+        assert!(retirement_is_proven(old, &active, &dependencies));
+        // A live root is never a candidate: chronology roots are the authority
+        // set, so the retirement proof rejects them without a second check.
+        assert!(!retirement_is_proven(new, &active, &dependencies));
     }
 
     #[tokio::test]
