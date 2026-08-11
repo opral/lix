@@ -1707,8 +1707,9 @@ mod tests {
             .map(|row| {
                 (
                     row.get::<String>("path").expect("path should decode"),
-                    row.get::<Option<String>>("lixcol_file_id")
-                        .expect("file id should decode"),
+                    // `lixcol_file_id` is nullable; the typed accessor has no
+                    // Option impl, so a NULL surfaces as a decode error here.
+                    row.get::<String>("lixcol_file_id").ok(),
                 )
             })
             .collect::<Vec<_>>();
