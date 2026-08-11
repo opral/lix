@@ -93,6 +93,12 @@ async fn main() {
             let samples = parse_samples(arguments.get(1));
             idempotency_scenario(&samples).await;
         }
+        "idempotency_payload" => {
+            let samples = parse_samples(arguments.get(1));
+            let bytes = parse_usize(arguments.get(2), 65536);
+            let returning = arguments.get(3).map(String::as_str) != Some("plain");
+            idempotency_payload_scenario(&samples, bytes, returning).await;
+        }
         "uploads" => {
             let samples = parse_samples(arguments.get(1));
             let bytes = parse_usize(arguments.get(2), 4096);
@@ -367,6 +373,60 @@ async fn idempotency_scenario(samples: &[usize]) {
         1,
         &usage(&fixture.storage).await,
     );
+}
+
+/// The same replay ledger, measured for the request shape its 8 MiB cap exists
+/// for: a mutation whose `RETURNING` clause projects blob content.
+///
+/// A receipt stores the complete `ExecuteResult` — columns, every returned row
+/// value, `rows_affected` and notices — as `serde_json`. `plain` runs the same
+/// file write without `RETURNING`, so the difference between the two arms is
+/// exactly the cost of retaining a second copy of the response payload.
+async fn idempotency_payload_scenario(samples: &[usize], blob_bytes: usize, returning: bool) {
+    let fixture = Fixture::open().await;
+    let sql = if returning {
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) RETURNING id, path, content"
+    } else {
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)"
+    };
+    let mut issued = 0usize;
+    for &target in samples {
+        while issued < target {
+            let mut fingerprint = [0u8; 32];
+            fingerprint[..8].copy_from_slice(&(issued as u64).to_be_bytes());
+            fingerprint[8] = u8::from(returning);
+            let identity = ExecuteIdempotency::new(
+                Some("expv-principal".to_owned()),
+                format!("expv-key-{issued:012}"),
+                fingerprint,
+            );
+            let content = vec![b'a' + (issued % 26) as u8; blob_bytes];
+            Arc::clone(&fixture.session)
+                .execute_with_idempotency_and_options_and_metadata(
+                    sql.to_owned(),
+                    vec![
+                        Value::Text(format!("/expv/payload-{issued:012}.bin")),
+                        Value::Blob(Blob::from(content)),
+                    ],
+                    ExecuteOptions::default(),
+                    ExecuteStatementMetadata::default(),
+                    Some(identity),
+                )
+                .await
+                .expect("idempotent execute");
+            issued += 1;
+        }
+        report(
+            if returning {
+                "idempotency_payload_returning"
+            } else {
+                "idempotency_payload_plain"
+            },
+            "live",
+            target as u64,
+            &usage(&fixture.storage).await,
+        );
+    }
 }
 
 /// Resumable-upload receipts. `keep` leaves every uploaded file live; `delete`
