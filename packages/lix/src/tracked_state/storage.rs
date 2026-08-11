@@ -15451,7 +15451,7 @@ mod tests {
     #[tokio::test]
     async fn large_chunk_batch_stages_two_shared_arenas() {
         let store = StorageAdapter::new(Memory::new())
-            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .begin_read(StorageReadOptions::default())
             .await
             .expect("open empty snapshot");
         let chunk_count = 4_096;
