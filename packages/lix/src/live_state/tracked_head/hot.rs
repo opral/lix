@@ -10633,6 +10633,30 @@ fn encode_hot_diff_key_parts(
     key
 }
 
+/// Appends one dirty-row identity as a `HOT_DIFF` key (also used verbatim as
+/// the identity's coverage group key).
+///
+/// The component order after the scope — `schema_key ++ entity_pk ++ file_id`
+/// — deliberately does not mirror `HOT_ROW`'s `schema_key ++ file_id ++
+/// entity_pk`, and aligning them would buy nothing: no reader ever
+/// prefix-seeks `HOT_DIFF` below its `(branch, checkpoint, generation)`
+/// scope.
+///
+/// - `hot_working_diff_entries` must enumerate the entire scope to
+///   reconstruct the [`WorkingDiffIndexCoverage`] count/XOR proof before the
+///   sparse index may be trusted, so even file- or schema-filtered diff
+///   queries visit every entry and filter in memory. A sub-scope seek can
+///   never satisfy the proof.
+/// - Finite (schema + entity) diff queries bypass this space entirely and
+///   read the `working_diff_baseline` inline on primary `HOT_ROW` rows.
+/// - Batches of `HOT_DIFF_PACK_MIN_IDENTITIES` or more identities are packed
+///   into segments keyed by `scope ++ digest`; the identity components leave
+///   the key for the segment value altogether.
+///
+/// The order is therefore an arbitrary but load-bearing input to the
+/// coverage hash: every writer, the segment visitor, and the stored epoch
+/// coverage must produce these bytes identically. Change it only for a
+/// reason, and only everywhere at once.
 fn append_hot_diff_key_parts(
     key_bytes: &mut Vec<u8>,
     scope: &[u8],
