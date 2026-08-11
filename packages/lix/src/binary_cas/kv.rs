@@ -1845,12 +1845,13 @@ pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
-    bytes: &[u8],
-    precomputed_hash: Option<BlobId>,
+    payload: &crate::binary_cas::BlobPayload,
 ) -> Result<BlobWriteReceipt, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    let bytes = payload.bytes();
+    let precomputed_hash = payload.hash();
     if let Some(hash) = precomputed_hash
         && let Some(metadata) = load_metadata_many(store, &[hash])
             .await?
@@ -1874,13 +1875,13 @@ where
             layout: metadata.layout,
         });
     }
-    let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
+    let plan = prepare_blob_write(chunking, payload)?;
     let receipt = plan.receipt.clone();
     if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
         return Ok(receipt);
     }
 
-    let chunks = prepare_chunks(bytes, &plan);
+    let chunks = prepare_chunks(payload, &plan)?;
     let mut chunk_hashes_to_stage = missing_chunk_hashes(store, chunk_keys, &plan, &chunks).await?;
     stage_prepared_blob_write(writes, bytes, &plan, &chunks, |chunk_hash| {
         Ok(chunk_hashes_to_stage.remove(&chunk_hash))
@@ -2238,27 +2239,32 @@ fn normalize_delta_segments(segments: Vec<BlobDeltaSegment>) -> Vec<BlobDeltaSeg
 
 fn prepare_blob_write(
     chunking: BinaryCasChunking,
-    bytes: &[u8],
-    precomputed_hash: Option<BlobId>,
+    payload: &crate::binary_cas::BlobPayload,
 ) -> Result<BlobWritePlan, LixError> {
-    let blob_hash = precomputed_hash.unwrap_or_else(|| BlobId::from_content(bytes));
-    if cfg!(debug_assertions)
-        && precomputed_hash.is_some()
-        && BlobId::from_content(bytes) != blob_hash
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "binary CAS blob hash does not match blob contents".to_string(),
-        ));
-    }
+    let bytes = payload.bytes();
+    let blob_hash = payload
+        .hash()
+        .unwrap_or_else(|| BlobId::from_content(bytes));
     let (chunk_ranges, layout) = if bytes.is_empty() {
+        if !payload.chunks().is_empty() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "empty binary CAS payload unexpectedly has chunk receipts".to_string(),
+            ));
+        }
         (Vec::new(), BlobLayout::Empty)
     } else {
         let chunk_ranges = fastcdc_chunk_ranges_with_chunking(bytes, chunking);
+        if chunk_ranges.len() != payload.chunks().len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "binary CAS payload chunk receipts disagree with canonical chunking".to_string(),
+            ));
+        }
         let layout = match chunk_ranges.as_slice() {
             [] => unreachable!("non-empty blobs always have at least one chunk"),
-            [(start, end)] => BlobLayout::SingleChunk {
-                chunk_hash: ChunkHash::from_content(&bytes[*start..*end]),
+            [_] => BlobLayout::SingleChunk {
+                chunk_hash: payload.chunks()[0].hash,
             },
             _ => BlobLayout::Chunked {
                 chunk_count: u32::try_from(chunk_ranges.len()).map_err(|_| {
@@ -2285,23 +2291,31 @@ fn prepare_blob_write(
     })
 }
 
-fn prepare_chunks(bytes: &[u8], plan: &BlobWritePlan) -> Vec<PreparedChunk> {
+fn prepare_chunks(
+    payload: &crate::binary_cas::BlobPayload,
+    plan: &BlobWritePlan,
+) -> Result<Vec<PreparedChunk>, LixError> {
     if !matches!(plan.layout, BlobLayout::Chunked { .. }) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    plan.chunk_ranges
+    let chunks = plan
+        .chunk_ranges
         .iter()
-        .map(|&(start, end)| PreparedChunk {
+        .zip(payload.chunks())
+        .map(|(&(start, end), receipt)| PreparedChunk {
             start,
             end,
-            hash: if start == 0 && end == bytes.len() {
-                ChunkHash::from_content(bytes)
-            } else {
-                ChunkHash::from_content(&bytes[start..end])
-            },
+            hash: receipt.hash,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if chunks.len() != plan.chunk_ranges.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "binary CAS payload omitted canonical chunk receipts".to_string(),
+        ));
+    }
+    Ok(chunks)
 }
 
 fn stage_prepared_blob_write(
@@ -3801,8 +3815,8 @@ mod tests {
     #[test]
     fn every_non_empty_blob_is_out_of_line() {
         for size in [1, 32 * 1024, 128 * 1024] {
-            let bytes = vec![b'a'; size];
-            let plan = prepare_blob_write(BinaryCasChunking::default(), &bytes, None)
+            let payload = BlobPayload::from_bytes(vec![b'a'; size]);
+            let plan = prepare_blob_write(BinaryCasChunking::default(), &payload)
                 .expect("non-empty blob should plan");
             assert!(!plan.chunk_ranges.is_empty());
             assert!(matches!(
@@ -3924,7 +3938,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn existing_chunk_aware_writer_batches_persisted_chunk_checks_without_a_hash() {
+    async fn existing_chunk_aware_writer_batches_persisted_chunk_checks_from_payload_receipts() {
         let storage = StorageAdapter::new(Memory::new());
         let data = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(data.clone());
@@ -3945,6 +3959,15 @@ mod tests {
                 .expect("initial blob write should commit");
         }
 
+        // Keep the immutable chunks but remove the top-level manifest so the
+        // second publication must exercise the batched presence checks.
+        let mut remove_manifest = storage.new_write_set();
+        remove_manifest.delete(BINARY_CAS_MANIFEST_SPACE, key(manifest_key(blob_hash)));
+        storage
+            .commit_write_set(remove_manifest, StorageWriteOptions::default())
+            .await
+            .expect("manifest removal should commit");
+
         crate::binary_cas::metrics::reset_binary_cas_write_metrics();
         let store = storage
             .begin_read(StorageReadOptions::default())
@@ -3957,8 +3980,7 @@ mod tests {
             &mut writes,
             &mut HashSet::new(),
             &mut HashSet::new(),
-            &data,
-            None,
+            &payload,
         )
         .await
         .expect("repeat blob write should stage");

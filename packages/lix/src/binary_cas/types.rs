@@ -3,6 +3,7 @@ use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
 use crate::binary_cas::codec::BinaryChunkCodec;
 use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlobId([u8; 32]);
@@ -128,13 +129,32 @@ impl BlobSameLengthSplice {
 pub(crate) struct BlobPayload {
     bytes: crate::Blob,
     hash: Option<BlobId>,
+    chunks: Arc<[BlobChunkReceipt]>,
 }
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        let hash = (!bytes.is_empty()).then(|| BlobId::from_content(&bytes));
-        Self { bytes, hash }
+        let chunks = bytes
+            .chunks(MEDIA_CHUNK_BYTES)
+            .map(|chunk| BlobChunkReceipt {
+                hash: ChunkHash::from_content(chunk),
+                size_bytes: chunk.len() as u64,
+            })
+            .collect::<Arc<[_]>>();
+        let hash = match chunks.as_ref() {
+            [] => None,
+            [chunk] => Some(BlobId::from_single_chunk(chunk.hash)),
+            chunks => Some(BlobId::from_chunks(
+                bytes.len() as u64,
+                chunks.iter().map(|chunk| (chunk.hash, chunk.size_bytes)),
+            )),
+        };
+        Self {
+            bytes,
+            hash,
+            chunks,
+        }
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -147,6 +167,13 @@ impl BlobPayload {
 
     pub(crate) fn hash(&self) -> Option<BlobId> {
         self.hash
+    }
+
+    /// Canonical fixed-chunk identities derived from these exact immutable
+    /// bytes. Keeping the receipts inside the payload prevents CAS staging
+    /// from hashing every large-file chunk a second time.
+    pub(crate) fn chunks(&self) -> &[BlobChunkReceipt] {
+        &self.chunks
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -268,4 +295,34 @@ pub(crate) struct BinaryCasChunkView<'a> {
     pub(crate) uncompressed_len: u64,
     #[musli(bytes)]
     pub(crate) payload: &'a [u8],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_carries_exact_canonical_chunk_receipts() {
+        let bytes = (0..MEDIA_CHUNK_BYTES * 2 + 17)
+            .map(|index| (index as u8).wrapping_mul(31))
+            .collect::<Vec<_>>();
+        let payload = BlobPayload::from_bytes(bytes.clone());
+
+        assert_eq!(payload.chunks().len(), 3);
+        assert_eq!(payload.chunks()[0].size_bytes, MEDIA_CHUNK_BYTES as u64);
+        assert_eq!(payload.chunks()[1].size_bytes, MEDIA_CHUNK_BYTES as u64);
+        assert_eq!(payload.chunks()[2].size_bytes, 17);
+        assert_eq!(payload.hash(), Some(BlobId::from_content(&bytes)));
+        for (receipt, chunk) in payload.chunks().iter().zip(bytes.chunks(MEDIA_CHUNK_BYTES)) {
+            assert_eq!(receipt.hash, ChunkHash::from_content(chunk));
+            assert_eq!(receipt.size_bytes, chunk.len() as u64);
+        }
+
+        let clone = payload.clone();
+        assert!(std::ptr::eq(
+            payload.chunks().as_ptr(),
+            clone.chunks().as_ptr()
+        ));
+        assert_eq!(payload.bytes(), clone.bytes());
+    }
 }

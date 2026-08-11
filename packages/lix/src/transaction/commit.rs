@@ -5742,6 +5742,23 @@ async fn stage_tracked_roots(
             true,
         )
         .await?;
+        let all_new = plans
+            .iter()
+            .all(|plan| !staged_rebuild_plan_ids.contains(&plan.commit_id));
+        if all_new
+            && crate::tracked_state::try_stage_collapsed_rebuild_plans_with_writer(
+                &mut tracked_writer,
+                &plans,
+            )
+            .await?
+            .is_some()
+        {
+            // A collapsed replay stages only its terminal root. Intermediate
+            // plan IDs remain unstaged so another rebuild parent sharing this
+            // suffix can independently collapse against immutable authority.
+            staged_rebuild_plan_ids.insert(plans[0].commit_id);
+            continue;
+        }
         for plan in plans.iter().rev() {
             if staged_rebuild_plan_ids.insert(plan.commit_id) {
                 crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
