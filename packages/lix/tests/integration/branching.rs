@@ -2643,3 +2643,70 @@ simulation_test!(
         assert_eq!(rows.len(), 0, "a fresh checkpoint has an empty working diff");
     }
 );
+
+simulation_test!(
+    merging_a_first_branch_edit_reports_modified_and_lands_the_value,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-first-edit', 'before')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        let draft = create_draft(&engine, &main).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'merge-first-edit'",
+                &[],
+            )
+            .await
+            .expect("first branch edit should succeed");
+
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            })
+            .await
+            .expect("preview should succeed");
+        assert_eq!(
+            preview.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 0,
+                modified: 1,
+                removed: 0,
+            },
+            "merge preview must see the branch-local edit as a modification"
+        );
+
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+            })
+            .await
+            .expect("merge should succeed");
+        assert_eq!(
+            receipt.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 0,
+                modified: 1,
+                removed: 0,
+            },
+            "merge must record the branch-local edit as a modification"
+        );
+        assert_key_value(&main, "merge-first-edit", Some("\"after\"")).await;
+    }
+);
