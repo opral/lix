@@ -4174,7 +4174,7 @@ mod tests {
             &read,
             &mut writes,
             orphan.commit_id,
-            RetainedPhysicalState {
+            crate::tracked_state::RetainedPhysicalState {
                 mutation_nodes: &BTreeSet::new(),
                 scoped_nodes: &BTreeSet::new(),
                 native_parts: &BTreeSet::new(),
