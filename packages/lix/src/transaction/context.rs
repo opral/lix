@@ -220,7 +220,7 @@ use crate::wasm::{
     WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput,
     WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
 };
-use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
+use crate::{LixError, NullableKeyFilter, Value};
 
 mod cohort;
 
@@ -7430,7 +7430,7 @@ where
         sql: String,
         statement: DataFusionStatement,
         params: Vec<Value>,
-    ) -> Result<SqlQueryResult, LixError> {
+    ) -> Result<crate::sql2::SessionReadResult, LixError> {
         let read_store = self.opening_read();
         let active_branch_id = self.active_branch_id.clone();
         let live_state = Arc::clone(&self.live_state);
@@ -8140,7 +8140,8 @@ where
         let statement = crate::sql2::parse_statement(&query_sql)?;
         let result = self
             .execute_read_sql_statement(query_sql, statement, params)
-            .await?;
+            .await?
+            .into_sql_query_result()?;
         if result.columns.len() != 1 {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,

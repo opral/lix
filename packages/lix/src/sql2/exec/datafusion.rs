@@ -19,6 +19,7 @@ use crate::sql2::history_route::invalid_history_anchor_error;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
+use crate::common::RowArena;
 use crate::{GLOBAL_BRANCH_ID, LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::arrow::array::{
     Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
@@ -213,7 +214,10 @@ impl<'a> BatchRowCursor<'a> {
 /// RecordBatches until a caller actually requests row views; small/native
 /// routes continue to carry their already-materialized rows.
 pub(crate) enum SessionReadResult {
-    Rows(SqlQueryResult),
+    Rows {
+        rows: RowArena,
+        notices: Vec<LixNotice>,
+    },
     Columnar {
         fields: Vec<Field>,
         batches: std::sync::Arc<[RecordBatch]>,
@@ -222,9 +226,25 @@ pub(crate) enum SessionReadResult {
 }
 
 impl SessionReadResult {
+    /// Wraps an already-materialized result that arrived as owned row vectors.
+    ///
+    /// Only the native file readers and the late file-content hydration take
+    /// this route; everything else fills the arena straight from Arrow.
+    pub(crate) fn from_sql_query_result(result: SqlQueryResult) -> Self {
+        let columns: std::sync::Arc<[String]> = result.columns.into();
+        Self::Rows {
+            rows: RowArena::from_row_vectors(columns, result.rows),
+            notices: result.notices,
+        }
+    }
+
     pub(crate) fn into_sql_query_result(self) -> Result<SqlQueryResult, LixError> {
         match self {
-            Self::Rows(result) => Ok(result),
+            Self::Rows { rows, notices } => {
+                let mut result = rows.into_sql_query_result();
+                result.notices = notices;
+                Ok(result)
+            }
             Self::Columnar {
                 fields,
                 batches,
@@ -276,7 +296,9 @@ where
     C: SqlExecutionContext + ?Sized,
 {
     let session = prepare_read_session(ctx, std::slice::from_ref(&statement)).await?;
-    execute_read_statement_in_session_from_parsed(&session, sql, statement, params).await
+    execute_read_statement_in_session_from_parsed(&session, sql, statement, params)
+        .await
+        .and_then(SessionReadResult::into_sql_query_result)
 }
 
 pub(crate) async fn prepare_read_session<'ctx, C>(
@@ -315,7 +337,7 @@ pub(crate) async fn execute_read_statement_in_session_from_parsed(
     sql: &str,
     statement: DataFusionStatement,
     params: &[Value],
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<SessionReadResult, LixError> {
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
     let plan = create_logical_plan_in_session_from_parsed(session, sql, statement, params).await?;
@@ -326,9 +348,7 @@ pub(crate) async fn execute_read_statement_in_session_from_parsed(
             started.elapsed(),
         );
     }
-    execute_logical_plan(plan, params)
-        .await?
-        .into_sql_query_result()
+    execute_logical_plan(plan, params).await
 }
 
 pub(crate) async fn execute_read_statement_in_session_with_result(
@@ -562,7 +582,7 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     sql: &str,
     statement: DataFusionStatement,
     params: &[Value],
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<SessionReadResult, LixError> {
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
     let planning_environment = read_ctx.sql_planning_environment().await?;
@@ -574,9 +594,7 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
         SqlLogicalPlan::DataFusion(plan) => plan.session.clone(),
         _ => unreachable!("transaction reads are planned by DataFusion"),
     };
-    let result = execute_logical_plan(plan, params)
-        .await
-        .and_then(SessionReadResult::into_sql_query_result);
+    let result = execute_logical_plan(plan, params).await;
     if let Some((cache, _)) = planning_environment {
         cache.recycle_datafusion_read_session(session);
     }
@@ -1350,7 +1368,7 @@ async fn execute_logical_plan(
     }
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let mut result = query_result_from_batches(&result_fields, &batches)?;
+    let rows = row_arena_from_batches(&result_fields, &batches)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
         crate::sql_profile::record_phase(
@@ -1358,8 +1376,7 @@ async fn execute_logical_plan(
             started.elapsed(),
         );
     }
-    result.notices = notices;
-    Ok(SessionReadResult::Rows(result))
+    Ok(SessionReadResult::Rows { rows, notices })
 }
 
 #[cfg(feature = "storage-benches")]
@@ -2951,43 +2968,65 @@ pub(crate) fn query_result_from_batches(
     result_fields: &[Field],
     batches: &[RecordBatch],
 ) -> Result<SqlQueryResult, LixError> {
-    let result_columns = result_fields
-        .iter()
-        .map(|field| field.name().clone())
-        .collect::<Vec<_>>();
-    let mut rows =
-        Vec::<Vec<Value>>::with_capacity(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
-    for batch in batches {
-        append_batch_rows(result_fields, batch, &mut rows)?;
-    }
-
-    Ok(SqlQueryResult {
-        rows,
-        columns: result_columns.clone(),
-        notices: Vec::new(),
-    })
+    Ok(row_arena_from_batches(result_fields, batches)?.into_sql_query_result())
 }
 
-/// Appends one batch to `rows`, filling it column by column.
+/// Materializes every batch into one flat cell buffer.
 ///
-/// Rows are grown to their final width first, then each column is downcast once
-/// and written across every row. Reading a column top to bottom keeps both the
-/// Arrow side and the type dispatch out of the inner loop: the array kind is
-/// matched once per column instead of once per cell.
-fn append_batch_rows(
+/// This is the only Arrow → `Value` conversion on the read path. Cells are
+/// written straight into their final position in the arena, so a scan neither
+/// allocates a vector per row nor walks the result a second time to repackage
+/// it.
+pub(crate) fn row_arena_from_batches(
+    result_fields: &[Field],
+    batches: &[RecordBatch],
+) -> Result<RowArena, LixError> {
+    let columns: std::sync::Arc<[String]> = result_fields
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>()
+        .into();
+    let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let width = result_fields.len();
+    if width == 0 {
+        return Ok(RowArena::empty_rows(columns, row_count));
+    }
+    let mut values = Vec::<Value>::new();
+    values.resize(row_count * width, Value::Null);
+    let mut row_base = 0usize;
+    for batch in batches {
+        let batch_rows = batch.num_rows();
+        let window = &mut values[row_base * width..(row_base + batch_rows) * width];
+        fill_batch_window(result_fields, batch, window, width)?;
+        row_base += batch_rows;
+    }
+    Ok(RowArena::uniform(columns, values, width))
+}
+
+/// Fills one batch's slice of the arena column by column.
+///
+/// Each column is downcast once and then written down its stride. Reading a
+/// column top to bottom keeps both the Arrow side and the type dispatch out of
+/// the inner loop: the array kind is matched once per column instead of once
+/// per cell.
+fn fill_batch_window(
     result_fields: &[Field],
     batch: &RecordBatch,
-    rows: &mut Vec<Vec<Value>>,
+    window: &mut [Value],
+    width: usize,
 ) -> Result<(), LixError> {
-    let row_base = rows.len();
-    let column_count = batch.num_columns();
-    rows.resize_with(row_base + batch.num_rows(), || {
-        Vec::<Value>::with_capacity(column_count)
-    });
-    let batch_rows = &mut rows[row_base..];
+    if batch.num_columns() != width {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "SQL result batch carries {} columns but the result schema declares {width}",
+                batch.num_columns()
+            ),
+        ));
+    }
     for (column_index, array) in batch.columns().iter().enumerate() {
         let cursor = column_cursor(result_fields.get(column_index), array.as_ref())?;
-        cursor.append_column(batch_rows)?;
+        cursor.fill_column(window, width, column_index)?;
     }
     Ok(())
 }
@@ -3001,14 +3040,14 @@ pub(crate) fn row_values_from_batch(
     // Slicing is an offset adjustment, not a copy, so one row reuses exactly
     // the same column fill as a whole batch.
     let row = batch.slice(row_index, 1);
-    let mut rows = Vec::<Vec<Value>>::with_capacity(1);
-    append_batch_rows(result_fields, &row, &mut rows)?;
-    rows.pop().ok_or_else(|| {
-        LixError::new(
+    let arena = row_arena_from_batches(result_fields, std::slice::from_ref(&row))?;
+    if arena.row_count() == 0 {
+        return Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
             "result row index out of range",
-        )
-    })
+        ));
+    }
+    Ok(arena.row(0).to_vec())
 }
 
 /// One result column of one `RecordBatch`, already downcast to its concrete
@@ -3100,95 +3139,94 @@ fn downcast_column<'a, ArrayType: 'static>(
     })
 }
 
+/// Every arena cell this column owns, in row order.
+///
+/// The arena is row-major, so a column is a strided walk. Taking the stride
+/// once keeps the index arithmetic and its bounds check out of the cell loop.
+type ColumnSlots<'a> = std::iter::StepBy<std::slice::IterMut<'a, Value>>;
+
+fn column_slots(window: &mut [Value], width: usize, column_index: usize) -> ColumnSlots<'_> {
+    window[column_index..].iter_mut().step_by(width)
+}
+
 impl ColumnCursor<'_> {
-    /// Pushes this column's value onto every row of the batch.
+    /// Writes this column's value into every row of the batch window.
     ///
-    /// `rows` is exactly the batch's row window, so row `n` of the slice is row
-    /// `n` of the array.
-    fn append_column(&self, rows: &mut [Vec<Value>]) -> Result<(), LixError> {
+    /// `window` is exactly the batch's slice of the arena, so slot `n` of the
+    /// stride is row `n` of the array.
+    fn fill_column(
+        &self,
+        window: &mut [Value],
+        width: usize,
+        column_index: usize,
+    ) -> Result<(), LixError> {
+        let slots = column_slots(window, width, column_index);
         match self {
-            Self::Null => {
-                for row in rows.iter_mut() {
-                    row.push(Value::Null);
-                }
-            }
+            // The arena starts out null, so a null column is already written.
+            Self::Null => {}
             Self::Boolean(values) => {
-                for (row_index, row) in rows.iter_mut().enumerate() {
-                    row.push(if values.is_null(row_index) {
-                        Value::Null
-                    } else {
-                        Value::Boolean(values.value(row_index))
-                    });
+                for (row_index, slot) in slots.enumerate() {
+                    if !values.is_null(row_index) {
+                        *slot = Value::Boolean(values.value(row_index));
+                    }
                 }
             }
-            Self::Int8(values) => append_integers(values, rows),
-            Self::Int16(values) => append_integers(values, rows),
-            Self::Int32(values) => append_integers(values, rows),
-            Self::Int64(values) => append_integers(values, rows),
-            Self::UInt8(values) => append_integers(values, rows),
-            Self::UInt16(values) => append_integers(values, rows),
-            Self::UInt32(values) => append_integers(values, rows),
+            Self::Int8(values) => fill_integers(values, slots),
+            Self::Int16(values) => fill_integers(values, slots),
+            Self::Int32(values) => fill_integers(values, slots),
+            Self::Int64(values) => fill_integers(values, slots),
+            Self::UInt8(values) => fill_integers(values, slots),
+            Self::UInt16(values) => fill_integers(values, slots),
+            Self::UInt32(values) => fill_integers(values, slots),
             Self::UInt64(values) => {
-                for (row_index, row) in rows.iter_mut().enumerate() {
-                    row.push(if values.is_null(row_index) {
-                        Value::Null
-                    } else {
+                for (row_index, slot) in slots.enumerate() {
+                    if !values.is_null(row_index) {
                         let value = values.value(row_index);
-                        match i64::try_from(value) {
+                        *slot = match i64::try_from(value) {
                             Ok(value) => Value::Integer(value),
                             // Unsigned values past the signed range have no
                             // integer representation in a Lix row, so they are
                             // preserved exactly as decimal text.
                             Err(_) => Value::Text(value.to_string()),
-                        }
-                    });
+                        };
+                    }
                 }
             }
-            Self::Float32(values) => append_reals(values, rows)?,
-            Self::Float64(values) => append_reals(values, rows)?,
+            Self::Float32(values) => fill_reals(values, slots)?,
+            Self::Float64(values) => fill_reals(values, slots)?,
             Self::Utf8(values, kind) => {
-                for (row_index, row) in rows.iter_mut().enumerate() {
-                    row.push(if values.is_null(row_index) {
-                        Value::Null
-                    } else {
-                        text_value(values.value(row_index), *kind)
-                    });
+                for (row_index, slot) in slots.enumerate() {
+                    if !values.is_null(row_index) {
+                        *slot = text_value(values.value(row_index), *kind);
+                    }
                 }
             }
             Self::LargeUtf8(values, kind) => {
-                for (row_index, row) in rows.iter_mut().enumerate() {
-                    row.push(if values.is_null(row_index) {
-                        Value::Null
-                    } else {
-                        text_value(values.value(row_index), *kind)
-                    });
+                for (row_index, slot) in slots.enumerate() {
+                    if !values.is_null(row_index) {
+                        *slot = text_value(values.value(row_index), *kind);
+                    }
                 }
             }
             Self::Utf8View(values, kind) => {
-                for (row_index, row) in rows.iter_mut().enumerate() {
-                    row.push(if values.is_null(row_index) {
-                        Value::Null
-                    } else {
-                        text_value(values.value(row_index), *kind)
-                    });
+                for (row_index, slot) in slots.enumerate() {
+                    if !values.is_null(row_index) {
+                        *slot = text_value(values.value(row_index), *kind);
+                    }
                 }
             }
             Self::Binary(values) => {
-                for (row_index, row) in rows.iter_mut().enumerate() {
-                    row.push(if values.is_null(row_index) {
-                        Value::Null
-                    } else {
-                        Value::Blob(values.value(row_index).into())
-                    });
+                for (row_index, slot) in slots.enumerate() {
+                    if !values.is_null(row_index) {
+                        *slot = Value::Blob(values.value(row_index).into());
+                    }
                 }
             }
             Self::LargeBinary(values) => {
-                for (row_index, row) in rows.iter_mut().enumerate() {
-                    row.push(if values.is_null(row_index) {
-                        Value::Null
-                    } else {
-                        Value::Blob(values.value(row_index).into())
-                    });
+                for (row_index, slot) in slots.enumerate() {
+                    if !values.is_null(row_index) {
+                        *slot = Value::Blob(values.value(row_index).into());
+                    }
                 }
             }
         }
@@ -3196,34 +3234,30 @@ impl ColumnCursor<'_> {
     }
 }
 
-fn append_integers<NativeType>(values: &PrimitiveArray<NativeType>, rows: &mut [Vec<Value>])
+fn fill_integers<NativeType>(values: &PrimitiveArray<NativeType>, slots: ColumnSlots<'_>)
 where
     NativeType: ArrowPrimitiveType,
     NativeType::Native: Into<i64>,
 {
-    for (row_index, row) in rows.iter_mut().enumerate() {
-        row.push(if values.is_null(row_index) {
-            Value::Null
-        } else {
-            Value::Integer(values.value(row_index).into())
-        });
+    for (row_index, slot) in slots.enumerate() {
+        if !values.is_null(row_index) {
+            *slot = Value::Integer(values.value(row_index).into());
+        }
     }
 }
 
-fn append_reals<NativeType>(
+fn fill_reals<NativeType>(
     values: &PrimitiveArray<NativeType>,
-    rows: &mut [Vec<Value>],
+    slots: ColumnSlots<'_>,
 ) -> Result<(), LixError>
 where
     NativeType: ArrowPrimitiveType,
     NativeType::Native: Into<f64>,
 {
-    for (row_index, row) in rows.iter_mut().enumerate() {
-        row.push(if values.is_null(row_index) {
-            Value::Null
-        } else {
-            finite_query_float(values.value(row_index).into())?
-        });
+    for (row_index, slot) in slots.enumerate() {
+        if !values.is_null(row_index) {
+            *slot = finite_query_float(values.value(row_index).into())?;
+        }
     }
     Ok(())
 }

@@ -77,6 +77,7 @@ pub(crate) use exec::{
     execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
     prepare_path_value_replacement_program, prepare_path_value_replacement_row,
     prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
+    row_arena_from_batches,
     write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]

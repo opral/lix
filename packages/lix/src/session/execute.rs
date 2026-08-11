@@ -18,6 +18,7 @@ use crate::storage_adapter::{
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
+use crate::common::RowArena;
 use crate::{Blob, LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -181,28 +182,30 @@ impl ExecuteResult {
     }
 
     pub(crate) fn from_session_read_result(result: sql2::SessionReadSqlResult) -> Self {
-        match result.query {
-            sql2::SessionReadResult::Rows(result) => Self::from_sql_query_result(result),
+        Self::from_session_read_query(result.query)
+    }
+
+    pub(crate) fn from_session_read_query(query: sql2::SessionReadResult) -> Self {
+        match query {
+            sql2::SessionReadResult::Rows { rows, notices } => {
+                #[cfg(feature = "storage-benches")]
+                let started = crate::sql_profile::is_active().then(std::time::Instant::now);
+                let result = Self::from_row_arena(rows, 0, notices);
+                #[cfg(feature = "storage-benches")]
+                if let Some(started) = started {
+                    crate::sql_profile::record_phase(
+                        crate::sql_profile::Phase::PublicResultMaterialization,
+                        started.elapsed(),
+                    );
+                }
+                result
+            }
             sql2::SessionReadResult::Columnar {
                 fields,
                 batches,
                 notices,
             } => Self::from_columnar_result(fields, batches, notices),
         }
-    }
-
-    fn from_sql_query_result(result: SqlQueryResult) -> Self {
-        #[cfg(feature = "storage-benches")]
-        let started = crate::sql_profile::is_active().then(std::time::Instant::now);
-        let result = Self::from_query_parts(result.columns, result.rows, 0, result.notices);
-        #[cfg(feature = "storage-benches")]
-        if let Some(started) = started {
-            crate::sql_profile::record_phase(
-                crate::sql_profile::Phase::PublicResultMaterialization,
-                started.elapsed(),
-            );
-        }
-        result
     }
 
     fn from_sql_write_result(result: sql2::SqlWriteResult) -> Self {
@@ -247,11 +250,24 @@ impl ExecuteResult {
         notices: Vec<LixNotice>,
     ) -> Self {
         let columns: Arc<[String]> = columns.into();
-        let rows: Vec<Row> = rows
-            .into_iter()
-            .map(|values| Row {
-                columns: Arc::clone(&columns),
-                values,
+        Self::from_row_arena(
+            RowArena::from_row_vectors(columns, rows),
+            rows_affected,
+            notices,
+        )
+    }
+
+    /// Wraps one already-filled cell arena as a public result.
+    ///
+    /// Rows are views into the arena, so this only writes an index per row —
+    /// no per-row allocation and no second pass over the cells.
+    fn from_row_arena(arena: RowArena, rows_affected: u64, notices: Vec<LixNotice>) -> Self {
+        let columns = Arc::clone(arena.columns());
+        let arena = Arc::new(arena);
+        let rows: Vec<Row> = (0..arena.row_count())
+            .map(|index| Row {
+                arena: Arc::clone(&arena),
+                index,
             })
             .collect();
         Self {
@@ -336,7 +352,7 @@ impl ExecuteResult {
         let columns = self.columns();
         self.rows().iter().map(move |row| RowRef {
             columns,
-            values: row.values.as_slice(),
+            values: row.values(),
         })
     }
 
@@ -383,7 +399,7 @@ impl ExecuteResultBacking {
         };
         #[cfg(feature = "storage-benches")]
         let started = crate::sql_profile::is_active().then(std::time::Instant::now);
-        let result = sql2::query_result_from_batches(&columnar.fields, &columnar.batches)
+        let arena = sql2::row_arena_from_batches(&columnar.fields, &columnar.batches)
             .expect("columnar result was validated before public ownership transfer");
         #[cfg(feature = "storage-benches")]
         if let Some(started) = started {
@@ -392,45 +408,68 @@ impl ExecuteResultBacking {
                 started.elapsed(),
             );
         }
-        result
-            .rows
-            .into_iter()
-            .map(|values| Row {
-                columns: Arc::clone(&self.columns),
-                values,
+        let arena = Arc::new(arena);
+        (0..arena.row_count())
+            .map(|index| Row {
+                arena: Arc::clone(&arena),
+                index,
             })
             .collect()
     }
 }
 
 /// One owned row returned by a query.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// A row is a view into the shared cell arena its result set was materialized
+/// into, so cloning a row copies an index rather than the row's values.
+#[derive(Clone)]
 pub struct Row {
-    columns: Arc<[String]>,
-    values: Vec<Value>,
+    arena: Arc<RowArena>,
+    index: usize,
+}
+
+impl std::fmt::Debug for Row {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Row")
+            .field("columns", self.columns())
+            .field("values", &self.values())
+            .finish()
+    }
+}
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.columns() == other.columns() && self.values() == other.values()
+    }
 }
 
 impl Row {
     /// Returns the values in result-set column order.
     pub fn values(&self) -> &[Value] {
-        &self.values
+        self.arena.row(self.index)
+    }
+
+    fn columns(&self) -> &Arc<[String]> {
+        self.arena.columns()
     }
 
     /// Returns the value at `index`.
     pub fn get_index(&self, index: usize) -> Option<&Value> {
-        self.values.get(index)
+        self.values().get(index)
     }
 
     /// Returns the raw value for `column_name`, or an error when the column is absent.
     pub fn value(&self, column_name: &str) -> Result<&Value, LixError> {
         let index = self.column_index(column_name)?;
-        self.values.get(index).ok_or_else(|| {
+        let values = self.values();
+        values.get(index).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_COLUMN_NOT_FOUND,
                 format!(
                     "column '{}' points past row width {}; available columns: {}",
                     column_name,
-                    self.values.len(),
+                    values.len(),
                     self.available_columns()
                 ),
             )
@@ -446,7 +485,7 @@ impl Row {
     }
 
     fn column_index(&self, column_name: &str) -> Result<usize, LixError> {
-        self.columns
+        self.columns()
             .iter()
             .position(|column| column == column_name)
             .ok_or_else(|| {
@@ -462,10 +501,11 @@ impl Row {
     }
 
     fn available_columns(&self) -> String {
-        if self.columns.is_empty() {
+        let columns = self.columns();
+        if columns.is_empty() {
             "<none>".to_string()
         } else {
-            self.columns.join(", ")
+            columns.join(", ")
         }
     }
 }
@@ -2005,7 +2045,7 @@ where
                             &statement.params,
                         )
                         .await
-                        .map(ExecuteResult::from_sql_query_result)
+                        .map(ExecuteResult::from_session_read_query)
                         .map_err(|error| {
                             with_batch_statement_index(
                                 normalize_sql_surface_error(error, &statement.sql),
@@ -2157,7 +2197,7 @@ where
                             params,
                         )
                         .await
-                        .map(ExecuteResult::from_sql_query_result)
+                        .map(ExecuteResult::from_session_read_query)
                         .map_err(|error| normalize_sql_surface_error(error, sql))
                     };
                     let result = match telemetry.as_ref() {
@@ -2391,7 +2431,7 @@ where
             return Ok((
                 sql2::SessionReadSqlResult {
                     runtime_functions: None,
-                    query: sql2::SessionReadResult::Rows(query),
+                    query: sql2::SessionReadResult::from_sql_query_result(query),
                 },
                 file_view_mutations,
             ));
@@ -2458,7 +2498,7 @@ where
                 data_column_index,
             )
             .await?;
-            query.query = sql2::SessionReadResult::Rows(materialized);
+            query.query = sql2::SessionReadResult::from_sql_query_result(materialized);
         }
         drop(live_state);
         let file_view_mutations = file_view_collector
@@ -4431,7 +4471,7 @@ where
         sql2::BoundStatementRoute::Read => transaction
             .execute_read_sql_statement(sql.to_string(), statement, params.to_vec())
             .await
-            .map(ExecuteResult::from_sql_query_result),
+            .map(ExecuteResult::from_session_read_query),
     }
 }
 

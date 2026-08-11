@@ -5,6 +5,7 @@ pub(crate) mod identity;
 pub(crate) mod json_pointer;
 pub(crate) mod lix_path;
 pub(crate) mod metadata;
+pub(crate) mod row_arena;
 pub(crate) mod timestamp;
 pub(crate) mod types;
 pub(crate) mod wire;
@@ -22,6 +23,7 @@ pub(crate) use lix_path::{compose_directory_path, compose_file_path};
 pub(crate) use metadata::{
     parse_row_metadata, parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
 };
+pub(crate) use row_arena::RowArena;
 pub(crate) use timestamp::LixTimestamp;
 pub use types::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use wire::{WireQueryResult, WireValue};
