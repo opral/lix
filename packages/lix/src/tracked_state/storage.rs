@@ -10558,6 +10558,35 @@ pub(crate) async fn load_native_current_state_part_owners(
     Ok(commit_ids)
 }
 
+/// Per-row provenance of one native current-state part, for the ownership
+/// census. Unlike [`load_native_current_state_part_owners`] this keeps
+/// duplicates so rows can be attributed to their authoring commit.
+#[cfg(test)]
+pub(crate) async fn load_native_current_state_part_rows_for_census(
+    store: &(impl StorageAdapterRead + ?Sized),
+    digest: &[u8; 32],
+) -> Result<Vec<CommitId>, LixError> {
+    let keys = [StorageKey(Bytes::copy_from_slice(digest))];
+    let loaded = PointReadPlan::new(crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let Some(Some(StorageProjectedValue::FullValue(bytes))) = loaded.value.into_iter().next()
+    else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "census references a missing native data part",
+        ));
+    };
+    Ok(
+        crate::tracked_state::current_state_data_part::decode_current_state_data_part(
+            digest, &bytes,
+        )?
+        .into_iter()
+        .map(|row| row.value.commit_id)
+        .collect(),
+    )
+}
+
 /// Sweeps every content-addressed tracked-state plane down to a repository-wide
 /// live closure.
 ///

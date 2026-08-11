@@ -2073,3 +2073,247 @@ mod tests {
         );
     }
 }
+
+/// Read-only census of which commits own the live current state.
+///
+/// Investigation instrument for the current-state compaction question: it
+/// classifies every live scoped-range part by `source_kind` and reports the
+/// commits each part pins into the GC retention closure, so the "fraction of
+/// live rows owned by pre-checkpoint commits" can be measured directly instead
+/// of inferred.
+#[cfg(test)]
+pub(crate) mod ownership_census {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::LixError;
+    use crate::branch::BranchHeadControlContext;
+    use crate::changelog::CommitId;
+    use crate::storage_adapter::StorageAdapterRead;
+
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct CurrentStateOwnershipCensus {
+        pub(crate) parts_by_kind: BTreeMap<u8, u64>,
+        pub(crate) rows_by_kind: BTreeMap<u8, u64>,
+        pub(crate) fragmented_parts: u64,
+        /// Commits pinned as `physical_authorities` by kind 0/2 part ownership.
+        pub(crate) authority_owners: BTreeSet<CommitId>,
+        pub(crate) authority_owner_rows: BTreeMap<CommitId, u64>,
+        /// Commits pinned as `physical_dependencies` by kind 1 row provenance.
+        pub(crate) native_row_owners: BTreeSet<CommitId>,
+        pub(crate) native_row_owner_rows: BTreeMap<CommitId, u64>,
+        pub(crate) head_commit_id: Option<CommitId>,
+    }
+
+    impl CurrentStateOwnershipCensus {
+        pub(crate) fn total_rows(&self) -> u64 {
+            self.rows_by_kind.values().copied().sum()
+        }
+
+        pub(crate) fn pinned_commits(&self) -> BTreeSet<CommitId> {
+            self.authority_owners
+                .union(&self.native_row_owners)
+                .copied()
+                .collect()
+        }
+
+        /// Live rows whose pin names a commit in `older`.
+        pub(crate) fn rows_pinned_to(&self, older: &BTreeSet<CommitId>) -> u64 {
+            self.authority_owner_rows
+                .iter()
+                .chain(self.native_row_owner_rows.iter())
+                .filter(|(commit_id, _)| older.contains(commit_id))
+                .map(|(_, rows)| *rows)
+                .sum()
+        }
+    }
+
+    pub(crate) async fn census<S>(store: &S) -> Result<CurrentStateOwnershipCensus, LixError>
+    where
+        S: StorageAdapterRead + Clone + Send + Sync,
+    {
+        let controls = BranchHeadControlContext::new()
+            .reader(store.clone())
+            .scan()
+            .await?;
+        let mut census = CurrentStateOwnershipCensus::default();
+        let mut roots = Vec::new();
+        for (_, control) in controls {
+            census.head_commit_id = Some(control.head_commit_id);
+            let Some(manifest) =
+                crate::tracked_state::load_commit_state_manifest(store, control.head_commit_id)
+                    .await?
+            else {
+                continue;
+            };
+            if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
+                roots.push(root.tree.clone());
+            }
+        }
+        if roots.is_empty() {
+            return Ok(census);
+        }
+        let reachable = crate::tracked_state::validate_scoped_range_trees(store, &roots).await?;
+        let mut native_digests = BTreeSet::new();
+        for part in reachable.parts {
+            let descriptor =
+                crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
+            *census.parts_by_kind.entry(descriptor.source_kind).or_default() += 1;
+            *census.rows_by_kind.entry(descriptor.source_kind).or_default() +=
+                u64::from(descriptor.row_count);
+            if descriptor.fragmented {
+                census.fragmented_parts += 1;
+            }
+            match descriptor.source_kind {
+                0 | 2 => {
+                    let owner =
+                        CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+                    census.authority_owners.insert(owner);
+                    *census.authority_owner_rows.entry(owner).or_default() +=
+                        u64::from(descriptor.row_count);
+                }
+                1 => {
+                    native_digests.insert(descriptor.content_digest);
+                }
+                _ => {}
+            }
+        }
+        for digest in native_digests {
+            let rows = crate::tracked_state::load_native_current_state_part_rows_for_census(
+                store, &digest,
+            )
+            .await?;
+            for commit_id in rows {
+                census.native_row_owners.insert(commit_id);
+                *census.native_row_owner_rows.entry(commit_id).or_default() += 1;
+            }
+        }
+        Ok(census)
+    }
+}
+
+#[cfg(test)]
+mod ownership_census_fixture {
+    use std::collections::BTreeSet;
+
+    use super::ownership_census::census;
+    use crate::branch::BranchHeadControlContext;
+    use crate::changelog::CommitId;
+    use crate::storage_adapter::{
+        Memory, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
+    };
+    use crate::{Value, engine::Engine};
+
+    async fn head(storage: &StorageAdapter<Memory>) -> CommitId {
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("census head read should open"),
+        );
+        BranchHeadControlContext::new()
+            .reader(read)
+            .scan()
+            .await
+            .expect("census head scan should succeed")
+            .into_iter()
+            .map(|(_, control)| control.head_commit_id)
+            .next()
+            .expect("fixture has one branch")
+    }
+
+    async fn run_depth(pre: usize, post: usize) {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("census fixture should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("census fixture should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("census session should open");
+        let storage = StorageAdapter::new(backend.clone());
+        let schema = serde_json::json!({
+            "x-lix-key": "census_fixture",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("census schema should register");
+
+        let mut pre_checkpoint = BTreeSet::new();
+        pre_checkpoint.insert(head(&storage).await);
+        for row in 0..pre {
+            session
+                .execute(
+                    "INSERT INTO census_fixture (path, value) VALUES ($1, lix_json($2))",
+                    &[
+                        Value::Text(format!("/row/{row:05}")),
+                        Value::Text(format!(r#"{{"v":{row}}}"#)),
+                    ],
+                )
+                .await
+                .expect("census row should publish");
+            pre_checkpoint.insert(head(&storage).await);
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("census checkpoint should publish");
+        let checkpoint = head(&storage).await;
+        for row in 0..post {
+            session
+                .execute(
+                    "INSERT INTO census_fixture (path, value) VALUES ($1, lix_json($2))",
+                    &[
+                        Value::Text(format!("/post/{row:05}")),
+                        Value::Text(format!(r#"{{"v":{row}}}"#)),
+                    ],
+                )
+                .await
+                .expect("census post row should publish");
+        }
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("census read should open"),
+        );
+        let report = census(&read).await.expect("census should run");
+        let pinned = report.pinned_commits();
+        let pre_pinned = pinned.intersection(&pre_checkpoint).count();
+        let rows_pre = report.rows_pinned_to(&pre_checkpoint);
+        println!(
+            "CENSUS depth={pre} post={post} checkpoint={checkpoint} parts_by_kind={:?} rows_by_kind={:?} fragmented={} total_rows={} pinned_commits={} pre_checkpoint_pinned_commits={pre_pinned} pre_checkpoint_commits={} rows_pinned_to_pre_checkpoint={rows_pre} authority_owners={} native_row_owners={}",
+            report.parts_by_kind,
+            report.rows_by_kind,
+            report.fragmented_parts,
+            report.total_rows(),
+            pinned.len(),
+            pre_checkpoint.len(),
+            report.authority_owners.len(),
+            report.native_row_owners.len(),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "measurement instrument; run with --ignored --nocapture"]
+    async fn current_state_ownership_census_by_depth() {
+        for (pre, post) in [(8usize, 2usize), (24, 2), (64, 2), (128, 2), (256, 2)] {
+            run_depth(pre, post).await;
+        }
+    }
+}

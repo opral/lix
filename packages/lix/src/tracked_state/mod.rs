@@ -100,6 +100,8 @@ pub(crate) use storage::{
     RetainedPhysicalState, load_native_current_state_part_owners,
     stage_retire_commit_physical_state,
 };
+#[cfg(test)]
+pub(crate) use storage::load_native_current_state_part_rows_for_census;
 // The storage-space constants are what the space registry
 // (`crate::storage_spaces`) and its layout invariants are built from, so they
 // must be reachable whenever tests compile, not only under `storage-benches`.
