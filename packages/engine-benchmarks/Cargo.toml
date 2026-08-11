@@ -109,6 +109,11 @@ name = "cas_publication_epoch_qualification"
 path = "examples/cas_publication_epoch_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
+[[example]]
+name = "expY_untracked_mutation_scaling"
+path = "examples/expY_untracked_mutation_scaling.rs"
+required-features = ["storage-benches"]
+
 [[test]]
 name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"
