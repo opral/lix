@@ -4256,6 +4256,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_id_filter_pushes_an_exact_file_scope_into_scan() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "file_note",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["id", "body"]
+            }))
+            .expect("file-scoped schema should derive"),
+        );
+        let provider = super::EntitySpec::by_branch(
+            Arc::clone(&spec),
+            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+            empty_branch_ref(),
+            None,
+        );
+
+        let filter = eq_filter("lixcol_file_id", "file-a");
+        assert_eq!(
+            <super::EntitySpec as super::super::spec::TableSpec>::filter_pushdown(
+                &provider, &filter
+            ),
+            datafusion::logical_expr::TableProviderFilterPushDown::Exact,
+            "an exact file scope must not be left as a DataFusion residual"
+        );
+        let (_schema, request, row_filters) = provider
+            .plan_scan_parts(None, &[filter], None)
+            .await
+            .expect("file-scoped scan should plan");
+        assert_eq!(
+            request.filter.file_ids,
+            vec![crate::NullableKeyFilter::Value("file-a".to_string())]
+        );
+        assert!(
+            row_filters.is_empty(),
+            "lixcol_file_id is an identity column, not a payload row filter"
+        );
+
+        // An IN list is still one contiguous set of file prefixes.
+        let in_list = Expr::InList(datafusion::logical_expr::expr::InList::new(
+            Box::new(column("lixcol_file_id")),
+            vec![
+                Expr::Literal(ScalarValue::Utf8(Some("file-a".to_string())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("file-b".to_string())), None),
+            ],
+            false,
+        ));
+        let (_schema, request, _row_filters) = provider
+            .plan_scan_parts(None, &[in_list], None)
+            .await
+            .expect("file-scoped IN scan should plan");
+        assert_eq!(
+            request.filter.file_ids,
+            vec![
+                crate::NullableKeyFilter::Value("file-a".to_string()),
+                crate::NullableKeyFilter::Value("file-b".to_string()),
+            ]
+        );
+
+        // Contradictory scopes select nothing rather than every file.
+        let (_schema, request, _row_filters) = provider
+            .plan_scan_parts(
+                None,
+                &[
+                    eq_filter("lixcol_file_id", "file-a"),
+                    eq_filter("lixcol_file_id", "file-b"),
+                ],
+                None,
+            )
+            .await
+            .expect("contradictory file scopes should plan");
+        assert!(request.filter.file_ids.is_empty());
+        assert_eq!(request.filter.rows, crate::live_state::LiveStateRowFilter::None);
+
+        // Shapes the seek cannot represent stay unsupported so DataFusion keeps
+        // its residual instead of silently widening the scan.
+        assert_eq!(
+            <super::EntitySpec as super::super::spec::TableSpec>::filter_pushdown(
+                &provider,
+                &Expr::IsNull(Box::new(column("lixcol_file_id")))
+            ),
+            datafusion::logical_expr::TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            <super::EntitySpec as super::super::spec::TableSpec>::filter_pushdown(
+                &provider,
+                &Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(column("lixcol_file_id")),
+                    Operator::NotEq,
+                    Box::new(Expr::Literal(
+                        ScalarValue::Utf8(Some("file-a".to_string())),
+                        None
+                    )),
+                ))
+            ),
+            datafusion::logical_expr::TableProviderFilterPushDown::Unsupported
+        );
+    }
+
+    #[tokio::test]
     async fn integer_primary_key_filter_pushes_exact_identity_into_scan() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
