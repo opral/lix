@@ -2848,7 +2848,7 @@ mod tests {
         let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
-        let _released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
         stage_branch_head_control(&mut writes, "main", checkpoint_control)
             .expect("checkpoint control should stage");
         persist_replay_closure_fixture(
@@ -3026,7 +3026,7 @@ mod tests {
         let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
-        let _released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
         stage_branch_head_control(&mut writes, "main", checkpoint_control)
             .expect("scoped owner checkpoint control should stage");
         persist_replay_closure_fixture(
@@ -3059,6 +3059,7 @@ mod tests {
         );
         drop(read);
 
+        publish_branch_head_release(&storage, "main", released_control).await;
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
             released_plan
@@ -3219,7 +3220,7 @@ mod tests {
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
         let serving_generation = CommitId::for_test_label("native-row-serving-generation");
         checkpoint_control.tracked_generation = serving_generation;
-        let _released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -5817,6 +5818,23 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("replay fixture should commit");
+    }
+
+    /// Moves a branch head. With the reachability ledger gone this is the whole
+    /// publication a sweep needs to see: the superseded root is derived from the
+    /// new head's canonical parent links.
+    async fn publish_branch_head_release(
+        storage: &StorageAdapter<Memory>,
+        branch_id: &str,
+        new_control: BranchHeadControl,
+    ) {
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(&mut writes, branch_id, new_control)
+            .expect("released control should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("release should publish");
     }
 
     async fn run_ordinary_repository_gc(
