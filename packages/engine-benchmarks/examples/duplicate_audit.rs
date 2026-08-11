@@ -11,7 +11,7 @@
 //! duplicate_audit audit <dir>            # audit a settled SlateDB directory
 //! duplicate_audit run   <corpus> <dir>   # build, settle, then audit
 //! ```
-//! Corpora: `plain`, `edits`, `branches`, `media`, `gc`.
+//! Corpora: `plain`, `bigjson`, `edits`, `branches`, `media`, `gc`.
 //!
 //! Every corpus is seeded through `SessionContext` SQL so the audit observes
 //! exactly what an ordinary commit stages. Nothing here reaches into a
@@ -97,17 +97,31 @@ async fn build(corpus: &str, dir: &Path) {
 
     let rows = env_usize("LIX_AUDIT_ROWS", 10_000);
     let commit_rows = env_usize("LIX_AUDIT_COMMIT_ROWS", 500);
+    // `bigjson` pushes every payload past the inline threshold and repeats
+    // only ten distinct bodies, so the content-addressed JSON store carries
+    // the workload instead of the inline row encoding.
+    let shape = if corpus == "bigjson" {
+        RowShape {
+            pad: env_usize("LIX_AUDIT_JSON_PAD", 100),
+            bodies: env_usize("LIX_AUDIT_DISTINCT_BODIES", 10),
+        }
+    } else {
+        RowShape {
+            pad: env_usize("LIX_AUDIT_JSON_PAD", 1),
+            bodies: env_usize("LIX_AUDIT_DISTINCT_BODIES", usize::MAX),
+        }
+    };
     match corpus {
-        "plain" => {
-            seed_rows(&session, 0, rows, commit_rows, 0).await;
+        "plain" | "bigjson" => {
+            seed_rows(&session, shape, rows, commit_rows).await;
         }
         "edits" => {
-            seed_rows(&session, 0, rows, commit_rows, 0).await;
-            edit_rows(&session, env_usize("LIX_AUDIT_EDIT_ROUNDS", 20), 100, rows).await;
+            seed_rows(&session, shape, rows, commit_rows).await;
+            edit_rows(&session, shape, env_usize("LIX_AUDIT_EDIT_ROUNDS", 20), 100, rows).await;
         }
         "branches" => {
             let base = rows / 5;
-            seed_rows(&session, 0, base, commit_rows, 0).await;
+            seed_rows(&session, shape, base, commit_rows).await;
             for branch_index in 0..env_usize("LIX_AUDIT_BRANCHES", 4) {
                 let branch = session
                     .create_branch(CreateBranchOptions {
@@ -121,17 +135,17 @@ async fn build(corpus: &str, dir: &Path) {
                     .open_session(branch.id.clone())
                     .await
                     .expect("open audit branch session");
-                edit_rows(&branch_session, 3, 100, base).await;
+                edit_rows(&branch_session, shape, 3, 100, base).await;
             }
         }
         "media" => {
-            seed_rows(&session, 0, rows / 10, commit_rows, 0).await;
+            seed_rows(&session, shape, rows / 10, commit_rows).await;
             seed_media(&session, env_usize("LIX_AUDIT_FILES", 40)).await;
             edit_media(&session, env_usize("LIX_AUDIT_FILES", 40), 3).await;
         }
         "gc" => {
-            seed_rows(&session, 0, rows / 2, commit_rows, 0).await;
-            edit_rows(&session, 10, 100, rows / 2).await;
+            seed_rows(&session, shape, rows / 2, commit_rows).await;
+            edit_rows(&session, shape, 10, 100, rows / 2).await;
             seed_media(&session, env_usize("LIX_AUDIT_FILES", 20)).await;
             edit_media(&session, env_usize("LIX_AUDIT_FILES", 20), 3).await;
             let branch = session
@@ -146,7 +160,7 @@ async fn build(corpus: &str, dir: &Path) {
                 .open_session(branch.id.clone())
                 .await
                 .expect("open GC-disposable branch");
-            edit_rows(&branch_session, 5, 200, rows / 2).await;
+            edit_rows(&branch_session, shape, 5, 200, rows / 2).await;
             drop(branch_session);
             session
                 .execute(
@@ -201,27 +215,40 @@ where
         .expect("register audit schema");
 }
 
-/// A row payload with realistic redundancy: the same boilerplate object shape
-/// repeated with a distinct identity. Real workspaces look like this, and it
-/// is exactly the shape content addressing is supposed to exploit.
-fn row_json(index: usize, revision: usize) -> String {
-    format!(
-        r#"{{"revision":{revision},"index":{index},"status":"active","tags":["alpha","beta","gamma"],"note":"the quick brown fox jumps over the lazy dog"}}"#
-    )
+/// Row payload shape.
+///
+/// `pad` repeats a filler sentence. Past `JSON_INLINE_MAX_BYTES` (1 KiB) the
+/// payload stops being inlined into the row and reaches the content-addressed
+/// JSON store, so `pad` selects which plane the audit exercises. `bodies` caps
+/// how many *distinct* payload bodies exist: a real workspace repeats values,
+/// and repetition is exactly what content addressing is supposed to collapse.
+#[derive(Clone, Copy)]
+struct RowShape {
+    pad: usize,
+    bodies: usize,
+}
+
+impl RowShape {
+    fn json(self, index: usize, revision: usize) -> String {
+        format!(
+            r#"{{"revision":{revision},"index":{index},"status":"active","tags":["alpha","beta","gamma"],"body":{},"note":"{}"}}"#,
+            index % self.bodies,
+            "the quick brown fox jumps over the lazy dog. ".repeat(self.pad),
+        )
+    }
 }
 
 async fn seed_rows<S>(
     session: &SessionContext<S>,
-    first: usize,
+    shape: RowShape,
     rows: usize,
     commit_rows: usize,
-    revision: usize,
 ) where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut index = first;
-    while index < first + rows {
-        let end = (index + commit_rows).min(first + rows);
+    let mut index = 0;
+    while index < rows {
+        let end = (index + commit_rows).min(rows);
         let mut transaction = session.begin_transaction().await.expect("begin seed");
         while index < end {
             transaction
@@ -229,7 +256,7 @@ async fn seed_rows<S>(
                     "INSERT INTO audit_row (path, value) VALUES ($1, lix_json($2))",
                     &[
                         Value::Text(format!("/row/{index:08}")),
-                        Value::Text(row_json(index, revision)),
+                        Value::Text(shape.json(index, 0)),
                     ],
                 )
                 .await
@@ -244,6 +271,7 @@ async fn seed_rows<S>(
 /// unchanged neighbouring content, the duplicate accounting will show it.
 async fn edit_rows<S>(
     session: &SessionContext<S>,
+    shape: RowShape,
     rounds: usize,
     window: usize,
     live_rows: usize,
@@ -260,7 +288,7 @@ async fn edit_rows<S>(
                     "UPDATE audit_row SET value = lix_json($2) WHERE path = $1",
                     &[
                         Value::Text(format!("/row/{index:08}")),
-                        Value::Text(row_json(index, round)),
+                        Value::Text(shape.json(index, round)),
                     ],
                 )
                 .await
