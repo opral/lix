@@ -11929,75 +11929,6 @@ pub(crate) fn debug_verify_chunk_hash(
     Ok(())
 }
 
-/// Experiment-Q attribution tracing. Enabled only when the
-/// `LIX_TREE_CHUNK_TRACE` environment variable is set; emits one stderr line
-/// per staged tree chunk so an offline script can attribute per-commit bytes
-/// to node kind, depth, and encoding components.
-pub(crate) fn tree_chunk_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LIX_TREE_CHUNK_TRACE").is_some())
-}
-
-fn trace_hash_hex(hash: &[u8]) -> String {
-    hash.iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn trace_staged_chunk(hash: &[u8; TRACKED_STATE_HASH_BYTES], bytes: &[u8]) {
-    match decode_node_ref(bytes) {
-        Ok(DecodedNodeRef::Leaf(leaf)) => {
-            let mut key_raw = 0usize;
-            let mut value_raw = 0usize;
-            for index in 0..leaf.len() {
-                if let Ok(Some(entry)) = leaf.entry(index) {
-                    key_raw += entry.key.len();
-                    value_raw += entry.value.len();
-                }
-            }
-            eprintln!(
-                "TCTRACE chunk kind=leaf len={} entries={} key_raw={} value_raw={} hash={}",
-                bytes.len(),
-                leaf.len(),
-                key_raw,
-                value_raw,
-                trace_hash_hex(hash),
-            );
-        }
-        Ok(DecodedNodeRef::Internal(internal)) => {
-            let children = internal.children();
-            let mut first_key_raw = 0usize;
-            let mut last_key_raw = 0usize;
-            let mut child_hashes = String::with_capacity(children.len() * 17);
-            for child in children {
-                first_key_raw += child.first_key.len();
-                last_key_raw += child.last_key.len();
-                if !child_hashes.is_empty() {
-                    child_hashes.push(',');
-                }
-                child_hashes.push_str(&trace_hash_hex(&child.child_hash));
-            }
-            eprintln!(
-                "TCTRACE chunk kind=internal len={} children={} fk_raw={} lk_raw={} hash={} child_hashes={}",
-                bytes.len(),
-                children.len(),
-                first_key_raw,
-                last_key_raw,
-                trace_hash_hex(hash),
-                child_hashes,
-            );
-        }
-        Err(_) => {
-            eprintln!(
-                "TCTRACE chunk kind=undecodable len={} hash={}",
-                bytes.len(),
-                trace_hash_hex(hash),
-            );
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct TrackedStateChunkOverlay {
     chunks: HashMap<[u8; TRACKED_STATE_HASH_BYTES], Bytes>,
@@ -12095,10 +12026,6 @@ impl TrackedStateChunkOverlay {
                     "tracked-state transient chunk promotion lost its overlay bytes",
                 )
             })?;
-            if tree_chunk_trace_enabled() {
-                eprintln!("TCTRACE stage_selected len={}", bytes.len());
-                trace_staged_chunk(&hash, bytes);
-            }
             writes.put(
                 TRACKED_STATE_TREE_CHUNK_SPACE,
                 StorageKey(Bytes::copy_from_slice(&hash)),
@@ -12133,18 +12060,6 @@ impl TrackedStateChunkOverlay {
         if chunks.is_empty() {
             return Ok(());
         }
-        let trace = tree_chunk_trace_enabled();
-        if trace {
-            eprintln!(
-                "TCTRACE stage_call chunks={} bytes={}",
-                chunks.len(),
-                chunks
-                    .chunks()
-                    .iter()
-                    .map(|chunk| chunk.data_len)
-                    .sum::<usize>(),
-            );
-        }
         self.probe_durable_digests(store, chunks.chunks().iter().map(|chunk| chunk.hash))
             .await?;
         let mut key_arena =
@@ -12155,9 +12070,6 @@ impl TrackedStateChunkOverlay {
             // still reads a durable-skipped node through the overlay.
             self.chunks.insert(chunk.hash, chunks.chunk_data(*chunk));
             if self.known_durable.contains(&chunk.hash) {
-                if trace {
-                    eprintln!("TCTRACE skip_durable len={}", chunk.data_len);
-                }
                 continue;
             }
             let key_start = key_arena.len();
@@ -12166,9 +12078,6 @@ impl TrackedStateChunkOverlay {
                 key: BufferRange::new(key_start, TRACKED_STATE_HASH_BYTES),
                 value: BufferRange::new(chunk.data_start, chunk.data_len),
             });
-            if trace {
-                trace_staged_chunk(&chunk.hash, &chunks.chunk_data(*chunk));
-            }
         }
         if puts.is_empty() {
             return Ok(());

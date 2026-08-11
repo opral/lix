@@ -36,15 +36,6 @@ const BLOB_GC_FORCE_THRESHOLD: f64 = 0.5;
 const MUTABLE_COLUMN_FAMILY: &str = "default";
 const IMMUTABLE_COLUMN_FAMILY: &str = "lix-immutable-v1";
 
-/// Experiment-Q attribution tracing for tracked-state tree chunk puts.
-/// Enabled only when `LIX_TREE_CHUNK_TRACE` is set.
-const TREE_CHUNK_TRACE_SPACE_ID: u32 = 0x0004_0001;
-
-fn tree_chunk_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LIX_TREE_CHUNK_TRACE").is_some())
-}
-
 #[derive(Debug)]
 pub struct RocksDBFactory {
     temp_dir: TempDir,
@@ -482,44 +473,11 @@ impl StorageWrite for RocksDBWrite {
             let mut physical_key = Vec::with_capacity(max_key_bytes);
             let cf = column_family(&self.inner.db, space);
             let space_prefix = space.id.0.to_be_bytes();
-            let trace_tree_chunks =
-                space.id.0 == TREE_CHUNK_TRACE_SPACE_ID && tree_chunk_trace_enabled();
-            let mut trace_batch_entries = 0u64;
-            let mut trace_batch_bytes = 0u64;
-            let mut trace_durable_same_entries = 0u64;
-            let mut trace_durable_same_bytes = 0u64;
             for entry in entries.entries {
                 physical_key.clear();
                 physical_key.extend_from_slice(&space_prefix);
                 physical_key.extend_from_slice(&entry.key.0);
                 let value = stored_value_bytes(entry.value);
-                if trace_tree_chunks {
-                    trace_batch_entries += 1;
-                    trace_batch_bytes += value.len() as u64;
-                    let durable_same = self
-                        .inner
-                        .db
-                        .get_cf(cf, physical_key.as_slice())
-                        .ok()
-                        .flatten()
-                        .is_some_and(|existing| existing.as_slice() == value.as_ref());
-                    if durable_same {
-                        trace_durable_same_entries += 1;
-                        trace_durable_same_bytes += value.len() as u64;
-                    }
-                    let key_hex = entry
-                        .key
-                        .0
-                        .iter()
-                        .take(8)
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>();
-                    eprintln!(
-                        "TCTRACE rocks_put len={} durable_same={} key={key_hex}",
-                        value.len(),
-                        u8::from(durable_same),
-                    );
-                }
                 if space.value_semantics == ValueSemantics::Immutable {
                     if let Some(staged) = self.immutable_values.get(physical_key.as_slice()) {
                         if staged != &value {
@@ -549,11 +507,6 @@ impl StorageWrite for RocksDBWrite {
                 self.stats.written_bytes += value.len() as u64;
                 self.batch
                     .put_cf(cf, physical_key.as_slice(), value.as_ref());
-            }
-            if trace_tree_chunks {
-                eprintln!(
-                    "TCTRACE rocks_batch entries={trace_batch_entries} bytes={trace_batch_bytes} durable_same_entries={trace_durable_same_entries} durable_same_bytes={trace_durable_same_bytes}",
-                );
             }
             self.stats.storage_calls += 1;
             Ok(())
