@@ -2,9 +2,6 @@ use base64::Engine as _;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-const BASE64: base64::engine::general_purpose::GeneralPurpose =
-    base64::engine::general_purpose::STANDARD;
-
 use crate::storage_adapter::StorageSpaceId;
 use crate::storage_adapter::{
     StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
@@ -79,6 +76,9 @@ pub(crate) const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = StorageSpace:
     StorageSpaceId(0x0007_0005),
     "session.execute_idempotency_receipt.v1",
 );
+
+const BASE64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
 
 const RECEIPT_VERSION: u8 = 3;
 /// Keep the retry ledger bounded even when a mutation uses `RETURNING` with a
