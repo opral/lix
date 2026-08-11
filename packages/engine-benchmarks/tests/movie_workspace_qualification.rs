@@ -305,8 +305,8 @@ where
         ingest_started.elapsed()
     };
     let save_future = project_saves(saver, started);
-    let first_playback = playback(first_reader, started, 0);
-    let second_playback = playback(second_reader, started, PROXY_BYTES as u64 / 2);
+    let first_playback = playback(first_reader, started, 0, 1);
+    let second_playback = playback(second_reader, started, PROXY_BYTES as u64 / 2, 2);
     let (ingest_elapsed, mut save_latencies, first_late, second_late) =
         tokio::join!(ingest_future, save_future, first_playback, second_playback);
 
@@ -456,15 +456,19 @@ async fn playback<S>(
     session: Arc<SessionContext<S>>,
     schedule_start: tokio::time::Instant,
     initial_offset: u64,
+    stream: usize,
 ) -> usize
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let trace = std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE").is_some();
     let mut late = 0;
+    let mut read_latencies = Vec::with_capacity(STREAM_SAMPLES);
     for sample in 0..STREAM_SAMPLES {
         let deadline = schedule_start + PLAYBACK_READ_AHEAD + STREAM_PERIOD * (sample as u32 + 1);
         let offset = (initial_offset + sample as u64 * STREAM_READ_BYTES)
             % (PROXY_BYTES as u64 - STREAM_READ_BYTES);
+        let read_started = tokio::time::Instant::now();
         let read = session
             .read_file_content(
                 "/media/proxy.mov".to_owned(),
@@ -473,13 +477,42 @@ where
             .await
             .expect("read proxy range")
             .expect("proxy exists");
+        let finished = tokio::time::Instant::now();
+        let read_elapsed = finished - read_started;
+        read_latencies.push(read_elapsed);
         assert_eq!(read.content().len(), STREAM_READ_BYTES as usize);
-        if tokio::time::Instant::now() > deadline {
+        let is_late = finished > deadline;
+        if trace {
+            println!(
+                "movie_playback_sample,stream={stream},sample={sample},offset={offset},read_ms={:.3},slack_ms={:.3},late={is_late}",
+                read_elapsed.as_secs_f64() * 1000.0,
+                if is_late {
+                    -((finished - deadline).as_secs_f64() * 1000.0)
+                } else {
+                    (deadline - finished).as_secs_f64() * 1000.0
+                },
+            );
+        }
+        if is_late {
             late += 1;
         } else {
             tokio::time::sleep_until(deadline).await;
         }
     }
+    let mut sorted = read_latencies.clone();
+    sorted.sort_unstable();
+    let pick = |num: usize| sorted[(sorted.len() * num / 100).min(sorted.len() - 1)];
+    println!(
+        "movie_playback_latency,stream={stream},samples={},late={late},read_min_ms={:.3},read_p50_ms={:.3},read_p90_ms={:.3},read_p95_ms={:.3},read_p99_ms={:.3},read_max_ms={:.3},budget_ms={:.3}",
+        sorted.len(),
+        sorted[0].as_secs_f64() * 1000.0,
+        pick(50).as_secs_f64() * 1000.0,
+        pick(90).as_secs_f64() * 1000.0,
+        pick(95).as_secs_f64() * 1000.0,
+        pick(99).as_secs_f64() * 1000.0,
+        sorted[sorted.len() - 1].as_secs_f64() * 1000.0,
+        STREAM_PERIOD.as_secs_f64() * 1000.0,
+    );
     late
 }
 
