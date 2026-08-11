@@ -363,31 +363,8 @@ impl ImmutableValueStore {
                         .into_iter()
                         .zip(plan.placements)
                         .map(|((index, requested), fragments)| {
-                            let mut encoded = BytesMut::with_capacity(requested.len());
-                            for (span_index, range) in fragments {
-                                let span = spans
-                                    .get(span_index)
-                                    .and_then(Option::as_ref)
-                                    .ok_or_else(|| {
-                                        StorageError::Corruption(
-                                            "immutable segment read omitted a requested extent"
-                                                .to_string(),
-                                        )
-                                    })?;
-                                if range.end > span.len() {
-                                    return Err(StorageError::Corruption(
-                                        "immutable segment extent is truncated".to_string(),
-                                    ));
-                                }
-                                encoded.extend_from_slice(&span[range]);
-                            }
-                            if encoded.len() != requested.len() {
-                                return Err(StorageError::Corruption(
-                                    "immutable extents did not reconstruct the requested value"
-                                        .to_string(),
-                                ));
-                            }
-                            Ok((index, encoded.freeze()))
+                            materialize_immutable_request(&spans, &requested, &fragments)
+                                .map(|value| (index, value))
                         })
                         .collect::<Result<Vec<_>, StorageError>>()
                 }
@@ -453,6 +430,53 @@ impl ImmutableValueStore {
         }
         Ok(())
     }
+}
+
+fn materialize_immutable_request(
+    spans: &[Option<Bytes>],
+    requested: &Range<usize>,
+    fragments: &[(usize, Range<usize>)],
+) -> Result<Bytes, StorageError> {
+    if let [(span_index, range)] = fragments {
+        let span = spans
+            .get(*span_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                StorageError::Corruption(
+                    "immutable segment read omitted a requested extent".to_string(),
+                )
+            })?;
+        if range.end > span.len() || range.len() != requested.len() {
+            return Err(StorageError::Corruption(
+                "immutable segment extent is truncated".to_string(),
+            ));
+        }
+        return Ok(span.slice(range.clone()));
+    }
+
+    let mut encoded = BytesMut::with_capacity(requested.len());
+    for (span_index, range) in fragments {
+        let span = spans
+            .get(*span_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                StorageError::Corruption(
+                    "immutable segment read omitted a requested extent".to_string(),
+                )
+            })?;
+        if range.end > span.len() {
+            return Err(StorageError::Corruption(
+                "immutable segment extent is truncated".to_string(),
+            ));
+        }
+        encoded.extend_from_slice(&span[range.clone()]);
+    }
+    if encoded.len() != requested.len() {
+        return Err(StorageError::Corruption(
+            "immutable extents did not reconstruct the requested value".to_string(),
+        ));
+    }
+    Ok(encoded.freeze())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4691,6 +4715,32 @@ mod tests {
         let range = segment.values[0].1.clone();
         let bytes = Bytes::from(segment.frames.into_iter().collect::<PutPayload>());
         (segment.id, bytes, range)
+    }
+
+    #[test]
+    fn single_immutable_extent_reuses_the_fetched_span() {
+        let span = Bytes::from_static(b"0123456789");
+        let expected_ptr = span.slice(2..5).as_ptr();
+        let value = materialize_immutable_request(&[Some(span)], &(100..103), &[(0, 2..5)])
+            .expect("materialize one immutable extent");
+
+        assert_eq!(value, Bytes::from_static(b"234"));
+        assert_eq!(value.as_ptr(), expected_ptr);
+    }
+
+    #[test]
+    fn fragmented_immutable_extents_still_reconstruct_one_value() {
+        let value = materialize_immutable_request(
+            &[
+                Some(Bytes::from_static(b"abc")),
+                Some(Bytes::from_static(b"def")),
+            ],
+            &(100..104),
+            &[(0, 1..3), (1, 0..2)],
+        )
+        .expect("materialize fragmented immutable extents");
+
+        assert_eq!(value, Bytes::from_static(b"bcde"));
     }
 
     #[test]
