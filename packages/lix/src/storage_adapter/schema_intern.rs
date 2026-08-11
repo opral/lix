@@ -193,13 +193,11 @@ impl SchemaIntern {
             }
             inner.loaded_len = start.saturating_add(confirmed);
             if exhausted {
-                // Assignments past the durable end never committed.
-                let keep = inner.loaded_len as usize;
-                if inner.by_id.len() > keep {
-                    for stale in inner.by_id.split_off(keep) {
-                        inner.by_name.remove(&stale);
-                    }
-                }
+                // Ids past the durable end are this process's own pending
+                // assignments, staged in a write set that has not committed
+                // yet. They are kept: nothing durable references them, and
+                // their commit carries a key-absent precondition, so a racing
+                // publisher makes that commit retry rather than split the id.
                 return Ok(());
             }
             if confirmed < Self::TAIL_PROBE_WIDTH {
@@ -274,13 +272,8 @@ impl SchemaIntern {
             }
         }
         inner.loaded_len = rows.len() as u32;
-        // Anything past the persisted end was staged by an uncommitted write
-        // set; drop it so ids are never reused for two schema keys.
-        if inner.by_id.len() > rows.len() {
-            for stale in inner.by_id.split_off(rows.len()) {
-                inner.by_name.remove(&stale);
-            }
-        }
+        // Ids past the persisted end stay: they belong to a write set this
+        // process has staged but not yet committed (see `probe_tail`).
         Ok(())
     }
 
