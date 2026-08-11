@@ -499,7 +499,11 @@ where
             return Ok(());
         }
         let mut coverage = WorkingDiffIndexCoverage::default();
-        self.stage_current_state_with_working_diff(
+        // Boxed for the same reason the tracked staging call sites are: this
+        // sits on the commit path, and leaving the future inline pushes
+        // auto-trait resolution over the recursion limit for callers that
+        // require `Send`.
+        Box::pin(self.stage_current_state_with_working_diff(
             branch_id,
             Some(generation),
             generation,
@@ -509,7 +513,7 @@ where
             None,
             None,
             &mut coverage,
-        )
+        ))
         .await?;
         Ok(())
     }
