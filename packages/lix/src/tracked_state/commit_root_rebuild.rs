@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::LixError;
 use crate::changelog::{
@@ -7,7 +7,6 @@ use crate::changelog::{
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
-use crate::tracked_state::TrackedStateDeltaRef;
 use crate::tracked_state::context::{
     TrackedStateContext, TrackedStateRootRebuilder, TrackedStateTransientRebuildState,
     TrackedStateWriteReport, TrackedStateWriter,
@@ -17,6 +16,9 @@ use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
+use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateKey};
+
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 /// Owned delta used only by explicit commit-root rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +369,81 @@ where
     writer
         .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
         .await
+}
+
+/// Collapses one contiguous rootless first-parent replay interval into its
+/// canonical terminal root.
+///
+/// Rootless commit roots are transient implementation details: immutable
+/// commit-delta authority remains the source of every mutation, while only the
+/// terminal root is needed as the parent of the publication being assembled.
+/// Applying the latest authenticated delta for each key once changes replay
+/// from O(H * D * log N) frontier rewrites to O(H * D + U * log N), where U is
+/// the number of unique keys in the interval.
+///
+/// File-descriptor deletion has ordered cascade semantics, so those uncommon
+/// intervals stay on the canonical sequential algorithm.
+pub(crate) async fn try_stage_collapsed_rebuild_plans_with_writer<S>(
+    writer: &mut TrackedStateWriter<'_, S>,
+    plans: &[CommitRootRebuildPlan],
+) -> Result<Option<TrackedStateWriteReport>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    if plans.len() < 2 {
+        return Ok(None);
+    }
+    for pair in plans.windows(2) {
+        if pair[0].parent_commit_id != Some(pair[1].commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state collapsed rebuild plans are not one first-parent interval",
+            ));
+        }
+    }
+    if plans
+        .iter()
+        .flat_map(|plan| &plan.deltas)
+        .any(|delta| delta.deleted && delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+    {
+        return Ok(None);
+    }
+
+    let mut terminal_by_key = BTreeMap::<TrackedStateKey, CommitRootRebuildDelta>::new();
+    for plan in plans.iter().rev() {
+        for delta in &plan.deltas {
+            terminal_by_key.insert(
+                TrackedStateKey {
+                    schema_key: delta.schema_key.clone(),
+                    file_id: delta.file_id.clone(),
+                    entity_pk: delta.entity_pk.clone(),
+                },
+                delta.clone(),
+            );
+        }
+    }
+    let deltas = terminal_by_key
+        .values()
+        .map(|delta| TrackedStateDeltaRef {
+            schema_key: &delta.schema_key,
+            file_id: delta.file_id.as_deref(),
+            entity_pk: &delta.entity_pk,
+            change_id: delta.change_id,
+            commit_id: delta.commit_id,
+            deleted: delta.deleted,
+            created_at: delta.created_at,
+            updated_at: delta.updated_at,
+        })
+        .collect::<Vec<_>>();
+    let terminal_commit_id = plans[0].commit_id.to_string();
+    let base_commit_id = plans
+        .last()
+        .and_then(|plan| plan.parent_commit_id)
+        .map(|commit_id| commit_id.to_string());
+    writer
+        .stage_commit_root(&terminal_commit_id, base_commit_id.as_deref(), deltas)
+        .await
+        .map(Some)
 }
 
 fn first_parent_commit_id(commit: &CommitRecord) -> Option<CommitId> {
