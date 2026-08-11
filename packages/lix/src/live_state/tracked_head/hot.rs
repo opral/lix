@@ -12055,7 +12055,7 @@ mod tests {
             entity_pk: &identity.entity_pk,
             file_id: None,
         };
-        let intern = SchemaIntern::new();
+        let intern = SchemaIntern::default();
         let mut intern_writes = StorageWriteSet::new();
         let schema_id = intern
             .assign(SCHEMA_KEY, &mut intern_writes)
@@ -14120,7 +14120,7 @@ mod tests {
             .collect::<Vec<_>>();
         let branch_id = String::from("branch");
         let schema_key = String::from("schema");
-        let intern = SchemaIntern::new();
+        let intern = SchemaIntern::default();
         intern
             .assign(&schema_key, &mut StorageWriteSet::new())
             .expect("assign test schema id");
@@ -14169,7 +14169,7 @@ mod tests {
         let entity_pks = (0..ROW_COUNT)
             .map(|index| EntityPk::single(format!("entity-{index:05}")))
             .collect::<Vec<_>>();
-        let intern = SchemaIntern::new();
+        let intern = SchemaIntern::default();
         let schema_id = intern
             .assign(schema_key, &mut StorageWriteSet::new())
             .expect("assign test schema id");
@@ -14260,7 +14260,7 @@ mod tests {
         file_id: &str,
         value: &'static [u8],
     ) -> (HotScanIdentity, Bytes) {
-        let intern = SchemaIntern::new();
+        let intern = SchemaIntern::default();
         let schema_id = intern
             .assign("schema", &mut StorageWriteSet::new())
             .expect("assign adversarial schema id");
@@ -14335,7 +14335,7 @@ mod tests {
         const BUDGET: usize = 4 * 1024 * 1024;
         let generation = CommitId::for_test_label("hot-scan-byte-budget");
         let scope = hot_scope_prefix("branch", generation);
-        let intern = SchemaIntern::new();
+        let intern = SchemaIntern::default();
         let schema_id = intern
             .assign("schema", &mut StorageWriteSet::new())
             .expect("assign tiny schema id");
@@ -14387,7 +14387,7 @@ mod tests {
                 file_id: Some("file\0id".to_string()),
             },
         ];
-        let intern = SchemaIntern::new();
+        let intern = SchemaIntern::default();
         let mut intern_writes = StorageWriteSet::new();
         let schema_ids = identities
             .iter()
@@ -14628,7 +14628,7 @@ mod tests {
             columnar_base_coordinate: None,
         };
         let deltas = [&first, &second];
-        let intern = SchemaIntern::new();
+        let intern = SchemaIntern::default();
         let mut intern_writes = StorageWriteSet::new();
         let schema_ids = deltas
             .iter()

@@ -72,7 +72,7 @@ struct SchemaInternInner {
 
 /// Engine-lifetime schema-key interning table for the hot serving plane.
 #[derive(Default)]
-pub(crate) struct SchemaIntern {
+pub struct SchemaIntern {
     inner: RwLock<SchemaInternInner>,
 }
 
@@ -89,10 +89,6 @@ impl std::fmt::Debug for SchemaIntern {
 
 impl SchemaIntern {
     const UNMAPPED_RAW: u32 = u32::MAX;
-
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
 
     /// Loads the persisted table once per adapter, replacing any prior
     /// in-memory state.
@@ -243,7 +239,7 @@ fn intern_corruption(what: &str) -> StorageError {
 /// snapshot the caller is about to use, so every read or write scope observes
 /// a table at least as new as its own storage view.
 #[derive(Debug, Default)]
-pub(crate) struct SchemaInternHandle {
+pub struct SchemaInternHandle {
     intern: SchemaIntern,
     loaded: tokio::sync::OnceCell<()>,
 }
@@ -270,7 +266,7 @@ mod tests {
 
     #[test]
     fn assignment_is_sequential_and_stable() {
-        let intern = SchemaIntern::new();
+        let intern = SchemaIntern::default();
         let mut writes = StorageWriteSet::default();
         let first = intern.assign("lix_key_value", &mut writes).expect("assign");
         let second = intern.assign("json_pointer", &mut writes).expect("assign");

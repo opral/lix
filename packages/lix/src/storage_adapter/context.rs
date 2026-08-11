@@ -45,6 +45,7 @@ where
 
     /// The adapter-lifetime schema-key interning table shared by every read
     /// scope this adapter creates.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn schema_intern(&self) -> &crate::storage_adapter::SchemaIntern {
         self.schema_intern.intern()
     }

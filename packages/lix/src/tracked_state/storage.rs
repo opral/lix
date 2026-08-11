@@ -12103,7 +12103,7 @@ impl<S> StorageAdapterRead for TrackedStateStagedRead<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    fn schema_intern(&self) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+    fn schema_intern(&self) -> &Arc<crate::storage_adapter::SchemaInternHandle> {
         self.store.schema_intern()
     }
 
@@ -13272,7 +13272,7 @@ mod tests {
     where
         R: crate::storage_adapter::StorageAdapterRead,
     {
-        fn schema_intern(&self) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+        fn schema_intern(&self) -> &Arc<crate::storage_adapter::SchemaInternHandle> {
             self.inner.schema_intern()
         }
 
