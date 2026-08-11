@@ -1078,28 +1078,6 @@ where
     .await
 }
 
-/// Derives this sweep's retirement candidates.
-///
-/// This replaces the `gc.reachability_delta.v1` publication ledger. That ledger
-/// stored one ~439 B row per branch-head publication recording an `old_root ->
-/// new_root` transition so a later sweep would know which commit had been
-/// superseded. The manifest plane already states the same thing and states it
-/// better: a commit owns a manifest exactly while it owns physical state, and
-/// [`crate::tracked_state::stage_retire_commit_physical_state`] deletes it. So
-/// the inventory *is* the outstanding-work list, it shrinks as work completes,
-/// and it needs no publication-time write at all.
-///
-/// Deliberately not a walk from refs. A commit can stop being reachable from
-/// any ref while still owning physical state — every commit of a deleted branch
-/// is in that position — and a refs walk cannot name those at all. Liveness
-/// still comes only from refs: this list is filtered against the authenticated
-/// retention closure, and nothing here is ever treated as a root.
-///
-/// The list is unordered on purpose. The ledger consumed a queue in
-/// publication order and stopped at the first blocked row, so one permanently
-/// live root at the head — genesis always is one, because engine-bootstrap rows
-/// authored at init stay live and keep naming it — froze every younger
-/// candidate behind it forever. Here a pinned candidate holds back only itself.
 /// Every commit reachable from the authenticated roots through canonical parent
 /// links.
 ///
@@ -1132,6 +1110,28 @@ where
     Ok(reachable)
 }
 
+/// Derives this sweep's retirement candidates.
+///
+/// This replaces the `gc.reachability_delta.v1` publication ledger. That ledger
+/// stored one ~439 B row per branch-head publication recording an `old_root ->
+/// new_root` transition so a later sweep would know which commit had been
+/// superseded. The manifest plane already states the same thing and states it
+/// better: a commit owns a manifest exactly while it owns physical state, and
+/// [`crate::tracked_state::stage_retire_commit_physical_state`] deletes it. So
+/// the inventory *is* the outstanding-work list, it shrinks as work completes,
+/// and it needs no publication-time write at all.
+///
+/// Deliberately not a walk from refs. A commit can stop being reachable from
+/// any ref while still owning physical state — every commit of a deleted branch
+/// is in that position — and a refs walk cannot name those at all. Liveness
+/// still comes only from refs: this list is filtered against the authenticated
+/// retention closure, and nothing here is ever treated as a root.
+///
+/// The list is unordered on purpose. The ledger consumed a queue in
+/// publication order and stopped at the first blocked row, so one permanently
+/// live root at the head — genesis always is one, because engine-bootstrap rows
+/// authored at init stay live and keep naming it — froze every younger
+/// candidate behind it forever. Here a pinned candidate holds back only itself.
 async fn derive_retirement_candidates<S>(store: &S) -> Result<Vec<CommitId>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
@@ -1147,11 +1147,14 @@ where
 /// Content-addressed tree/CAS orphan repair is intentionally an offline path;
 /// out-of-band JSON is reclaimed here only from explicit ownership-loss
 /// candidates.
-/// Ordinary GC derives its candidates from the canonical commit graph.
-/// Branch-head controls and checkpoint recovery refs are the complete
-/// active-root set; the walk from those roots through canonical parent links,
-/// plus the exact point-replay dependency closure, is the only reachability
-/// implementation. Full-space inventory discovery remains forbidden.
+/// Ordinary GC derives its candidates from the physical manifest inventory and
+/// proves liveness only from refs: branch-head controls and checkpoint recovery
+/// refs are the complete active-root set, and the walk from those roots through
+/// canonical parent links, plus the exact point-replay dependency closure, is
+/// the only reachability implementation. Semantic *inventory* discovery — a
+/// changelog or commit-space scan that rediscovers liveness — remains
+/// forbidden; the manifest scan is an inventory of the physical state being
+/// collected, never a source of retention.
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn stage_repository_gc<S>(
     store: S,
