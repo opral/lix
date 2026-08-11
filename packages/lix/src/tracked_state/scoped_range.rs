@@ -2912,6 +2912,10 @@ mod tests {
     where
         R: StorageAdapterRead,
     {
+        fn schema_intern(&self) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+            self.inner.schema_intern()
+        }
+
         fn snapshot_cache_key(&self) -> Option<u128> {
             self.inner.snapshot_cache_key()
         }

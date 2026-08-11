@@ -350,6 +350,33 @@ impl StorageWriteSet {
             .stage_put(key.0, value.bytes);
     }
 
+    /// Stages a put unless a byte-identical `(key, value)` put is already
+    /// staged in the same space. Intended for tiny write-once mapping rows
+    /// that several staging passes may repeat within one write set; the check
+    /// is a linear scan over the space's staged puts, so keep it away from
+    /// high-volume lanes.
+    pub(crate) fn put_if_absent<S, K, V>(&mut self, space: S, key: K, value: V)
+    where
+        S: IntoStorageSpace,
+        K: IntoStorageKey,
+        V: IntoStorageValue,
+    {
+        let space = space.into_storage_space();
+        let key = key.into_storage_key();
+        let value = value.into_storage_value();
+        let group = self.group_mut(space);
+        let already_staged = group.puts.iter().any(|put| {
+            group.key_bytes(put.key) == key.0.as_ref()
+                && group.value_bytes(put.value) == value.bytes.as_ref()
+        });
+        if already_staged {
+            return;
+        }
+        self.stats.staged_puts += 1;
+        self.stats.written_bytes += value.bytes.len() as u64;
+        self.group_mut(space).stage_put(key.0, value.bytes);
+    }
+
     /// Stages a batch of content-addressed puts with one lookup pass over the
     /// already staged lane.
     ///

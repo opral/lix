@@ -130,7 +130,8 @@ pub(crate) struct DeferredFreshHotPlan {
     generation: CommitId,
     checkpoint_commit_id: Option<CommitId>,
     row_indices: Vec<usize>,
-    file_schema_keys: Vec<String>,
+    file_schema_keys: Vec<(String, SchemaInternId)>,
+    schema_ids: std::collections::HashMap<String, SchemaInternId>,
     put_count: u64,
     written_bytes: u64,
     backend_capacity_hint_bytes: usize,
@@ -138,6 +139,8 @@ pub(crate) struct DeferredFreshHotPlan {
 
 impl DeferredFreshHotPlan {
     pub(crate) fn new(
+        intern: &SchemaIntern,
+        writes: &mut StorageWriteSet,
         branch_id: &str,
         generation: CommitId,
         state_rows: &dyn DeferredFreshHotRows,
@@ -162,6 +165,7 @@ impl DeferredFreshHotPlan {
         let mut put_count = 0_u64;
         let mut coverage_key = Vec::new();
         let mut file_schema_keys = BTreeSet::new();
+        let mut schema_ids = std::collections::HashMap::new();
         for &row_index in row_indices {
             let row = state_rows.row(row_index);
             let delta =
@@ -172,13 +176,17 @@ impl DeferredFreshHotPlan {
                     "deferred fresh hot publication requires live rows",
                 ));
             }
-            let key_len = encoded_hot_identity_key_len(
-                scope.len(),
-                delta.schema_key,
-                delta.entity_pk,
-                delta.file_id,
-            )
-            .ok_or_else(|| head_value_error("deferred fresh hot key length overflowed"))?;
+            let schema_id = match schema_ids.get(delta.schema_key) {
+                Some(schema_id) => *schema_id,
+                None => {
+                    let schema_id = intern.assign(delta.schema_key, writes)?;
+                    schema_ids.insert(delta.schema_key.to_owned(), schema_id);
+                    schema_id
+                }
+            };
+            let key_len =
+                encoded_hot_identity_key_len(scope.len(), delta.entity_pk, delta.file_id)
+                    .ok_or_else(|| head_value_error("deferred fresh hot key length overflowed"))?;
             let value_len = checked_add_hot_next_value_capacity(
                 0,
                 &delta,
@@ -207,7 +215,7 @@ impl DeferredFreshHotPlan {
                 let range = append_hot_diff_key_parts(
                     &mut coverage_key,
                     diff_scope,
-                    delta.schema_key,
+                    schema_id,
                     delta.entity_pk,
                     delta.file_id,
                 );
@@ -227,15 +235,10 @@ impl DeferredFreshHotPlan {
                     .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
             }
         }
-        for schema_key in &file_schema_keys {
-            let marker_len = scope
-                .len()
-                .checked_add(encoded_key_bytes_len(schema_key.as_bytes()).ok_or_else(|| {
-                    head_value_error("deferred fresh hot schema marker length overflowed")
-                })?)
-                .ok_or_else(|| {
-                    head_value_error("deferred fresh hot schema marker length overflowed")
-                })?;
+        for _schema_key in &file_schema_keys {
+            let marker_len = scope.len().checked_add(SCHEMA_INTERN_ID_BYTES).ok_or_else(|| {
+                head_value_error("deferred fresh hot schema marker length overflowed")
+            })?;
             backend_capacity_hint_bytes = backend_capacity_hint_bytes
                 .checked_add(marker_len)
                 .and_then(|capacity| capacity.checked_add(16))
@@ -247,12 +250,22 @@ impl DeferredFreshHotPlan {
                 .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
         }
         *coverage = next_coverage;
+        let file_schema_keys = file_schema_keys
+            .into_iter()
+            .map(|schema_key: String| {
+                let schema_id = *schema_ids
+                    .get(schema_key.as_str())
+                    .expect("file schema keys originate from assigned deltas");
+                (schema_key, schema_id)
+            })
+            .collect();
         Ok(Self {
             branch_id: branch_id.to_owned(),
             generation,
             checkpoint_commit_id,
             row_indices: row_indices.to_vec(),
-            file_schema_keys: file_schema_keys.into_iter().collect(),
+            file_schema_keys,
+            schema_ids,
             put_count,
             written_bytes,
             backend_capacity_hint_bytes,
@@ -313,9 +326,9 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                             .plan
                             .file_schema_keys
                             .iter()
-                            .map(|schema_key| PutEntry {
+                            .map(|(_, schema_id)| PutEntry {
                                 key: StorageKey(Bytes::from(encode_hot_file_schema_key(
-                                    &scope, schema_key,
+                                    &scope, *schema_id,
                                 ))),
                                 value: StorageValue {
                                     bytes: Bytes::new(),
@@ -348,23 +361,13 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
         for &row_index in indices {
             let delta = self.state_rows.row(row_index).delta;
             key_capacity = key_capacity.saturating_add(
-                encoded_hot_identity_key_len(
-                    scope.len(),
-                    delta.schema_key,
-                    delta.entity_pk,
-                    delta.file_id,
-                )
-                .unwrap_or(0),
+                encoded_hot_identity_key_len(scope.len(), delta.entity_pk, delta.file_id)
+                    .unwrap_or(0),
             );
             if let Some(diff_scope) = diff_scope.as_deref() {
                 key_capacity = key_capacity.saturating_add(
-                    encoded_hot_identity_key_len(
-                        diff_scope.len(),
-                        delta.schema_key,
-                        delta.entity_pk,
-                        delta.file_id,
-                    )
-                    .unwrap_or(0),
+                    encoded_hot_identity_key_len(diff_scope.len(), delta.entity_pk, delta.file_id)
+                        .unwrap_or(0),
                 );
             }
             value_capacity = checked_add_hot_next_value_capacity(
@@ -383,7 +386,17 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
             Vec::with_capacity(diff_scope.as_ref().map_or(0, |_| indices.len()));
         for &row_index in indices {
             let delta = self.state_rows.row(row_index).delta;
-            key_ranges.push(append_hot_mutation_identity(&mut key_bytes, &scope, &delta));
+            let schema_id = *self
+                .plan
+                .schema_ids
+                .get(delta.schema_key)
+                .expect("deferred fresh hot schemas were assigned at plan time");
+            key_ranges.push(append_hot_mutation_identity(
+                &mut key_bytes,
+                &scope,
+                schema_id,
+                &delta,
+            ));
             value_ranges.push(
                 append_head_value(
                     &mut value_bytes,
@@ -404,7 +417,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                 diff_key_ranges.push(append_hot_diff_key_parts(
                     &mut key_bytes,
                     diff_scope,
-                    delta.schema_key,
+                    schema_id,
                     delta.entity_pk,
                     delta.file_id,
                 ));
@@ -1868,11 +1881,13 @@ impl CompleteHotCollectionDigest {
     fn new(
         branch_id: &str,
         branch_generation: CommitId,
+        schema_id: SchemaInternId,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Self {
         let mut canonical = blake3::Hasher::new();
         canonical.update(COMPLETE_HOT_COLLECTION_DIGEST_DOMAIN);
-        let scope_key = hot_collection_control_key(branch_id, branch_generation, scope);
+        let scope_key =
+            hot_collection_control_key(branch_id, branch_generation, schema_id, scope.file_id);
         canonical.update(&(scope_key.len() as u64).to_le_bytes());
         canonical.update(&scope_key);
         Self {
@@ -2108,11 +2123,12 @@ struct PackedCollectionIncrement {
 fn hot_collection_control_key(
     branch_id: &str,
     branch_generation: CommitId,
-    scope: crate::collection_generation::CollectionScopeRef<'_>,
+    schema_id: SchemaInternId,
+    file_id: Option<&str>,
 ) -> Vec<u8> {
     let mut key = hot_scope_prefix(branch_id, branch_generation);
-    write_key_string(&mut key, scope.schema_key, KEY_PART_FINAL);
-    write_file_id(&mut key, scope.file_id);
+    write_schema_id(&mut key, schema_id);
+    write_file_id(&mut key, file_id);
     key
 }
 
@@ -2172,17 +2188,34 @@ async fn load_hot_collection_control(
     }
 }
 
+/// Read-side control key: an unmapped schema has no hot rows and therefore no
+/// control record, so resolution misses mean "absent", never an error.
+fn resolve_hot_collection_control_key(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    branch_generation: CommitId,
+    scope: crate::collection_generation::CollectionScopeRef<'_>,
+) -> Option<Vec<u8>> {
+    let schema_id = schema_intern_of(store).resolve(scope.schema_key)?;
+    Some(hot_collection_control_key(
+        branch_id,
+        branch_generation,
+        schema_id,
+        scope.file_id,
+    ))
+}
+
 async fn load_stored_hot_collection_control(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     branch_generation: CommitId,
     scope: crate::collection_generation::CollectionScopeRef<'_>,
 ) -> Result<Option<HotCollectionControl>, LixError> {
-    let key = StorageKey(Bytes::from(hot_collection_control_key(
-        branch_id,
-        branch_generation,
-        scope,
-    )));
+    let Some(key) = resolve_hot_collection_control_key(store, branch_id, branch_generation, scope)
+    else {
+        return Ok(None);
+    };
+    let key = StorageKey(Bytes::from(key));
     let value = PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &[key])
         .materialize(store, StorageGetOptions::default())
         .await?
@@ -2209,18 +2242,20 @@ async fn load_hot_collection_visibility_control(
     branch_generation: CommitId,
     scope: crate::collection_generation::CollectionScopeRef<'_>,
 ) -> Result<HotCollectionControl, LixError> {
-    let key = StorageKey(Bytes::from(hot_collection_control_key(
-        branch_id,
-        branch_generation,
-        scope,
-    )));
-    let value = PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &[key])
-        .materialize(store, StorageGetOptions::default())
-        .await?
-        .value
-        .into_iter()
-        .next()
-        .flatten();
+    let value = match resolve_hot_collection_control_key(store, branch_id, branch_generation, scope)
+    {
+        Some(key) => {
+            let key = StorageKey(Bytes::from(key));
+            PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &[key])
+                .materialize(store, StorageGetOptions::default())
+                .await?
+                .value
+                .into_iter()
+                .next()
+                .flatten()
+        }
+        None => None,
+    };
     let Some(value) = value else {
         // Visibility does not need the immutable root's exact count.
         return Ok(HotCollectionControl {
@@ -2322,50 +2357,63 @@ async fn load_stored_hot_collection_controls(
     branch_generation: CommitId,
     scopes: &[crate::collection_generation::CollectionScopeRef<'_>],
 ) -> Result<Vec<Option<HotCollectionControl>>, LixError> {
-    let keys = scopes
+    let resolved_keys = scopes
         .iter()
         .copied()
-        .map(|scope| {
-            StorageKey(Bytes::from(hot_collection_control_key(
-                branch_id,
-                branch_generation,
-                scope,
-            )))
-        })
+        .map(|scope| resolve_hot_collection_control_key(store, branch_id, branch_generation, scope))
         .collect::<Vec<_>>();
-    let values = PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?
-        .value;
-    values
+    let keys = resolved_keys
+        .iter()
+        .flatten()
+        .map(|key| StorageKey(Bytes::copy_from_slice(key)))
+        .collect::<Vec<_>>();
+    let mut values = if keys.is_empty() {
+        Vec::new()
+    } else {
+        PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?
+            .value
+    }
+    .into_iter();
+    resolved_keys
         .into_iter()
-        .map(|value| match value {
-            Some(value) => {
-                let StorageProjectedValue::FullValue(bytes) = value else {
-                    return Err(head_value_error(
-                        "hot collection-control batch read unexpectedly omitted its value",
-                    ));
-                };
-                storage_codec::decode("hot collection control", &bytes).map(Some)
+        .map(|key| {
+            let value = match key {
+                Some(_) => values.next().flatten(),
+                None => None,
+            };
+            match value {
+                Some(value) => {
+                    let StorageProjectedValue::FullValue(bytes) = value else {
+                        return Err(head_value_error(
+                            "hot collection-control batch read unexpectedly omitted its value",
+                        ));
+                    };
+                    storage_codec::decode("hot collection control", &bytes).map(Some)
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
         })
         .collect()
 }
 
 fn stage_hot_collection_control(
     writes: &mut StorageWriteSet,
+    intern: &SchemaIntern,
     branch_id: &str,
     branch_generation: CommitId,
     scope: crate::collection_generation::CollectionScopeRef<'_>,
     control: HotCollectionControl,
 ) -> Result<(), LixError> {
+    let schema_id = intern.assign(scope.schema_key, writes)?;
     writes.put(
         HOT_COLLECTION_CONTROL_SPACE,
         StorageKey(Bytes::from(hot_collection_control_key(
             branch_id,
             branch_generation,
-            scope,
+            schema_id,
+            scope.file_id,
         ))),
         StorageValue {
             bytes: Bytes::from(storage_codec::encode("hot collection control", &control)?),
@@ -2425,6 +2473,7 @@ async fn load_incremental_collection_controls(
 
 fn stage_incremental_collection_controls(
     writes: &mut StorageWriteSet,
+    intern: &SchemaIntern,
     branch_id: &str,
     branch_generation: CommitId,
     deltas: &[&CurrentStateDeltaRef<'_>],
@@ -2540,6 +2589,7 @@ fn stage_incremental_collection_controls(
         }
         stage_hot_collection_control(
             writes,
+            intern,
             branch_id,
             branch_generation,
             CollectionScopeRef {
@@ -2606,6 +2656,7 @@ fn row_belongs_to_active_collection_generation(
 
 fn stage_complete_collection_controls(
     writes: &mut StorageWriteSet,
+    intern: &SchemaIntern,
     branch_id: &str,
     branch_generation: CommitId,
     rows: &HotRowMap,
@@ -2698,28 +2749,29 @@ fn stage_complete_collection_controls(
         }
     }
 
-    let mut digests = controls
-        .keys()
-        .map(|(schema_key, file_id)| {
-            (
-                (schema_key.clone(), file_id.clone()),
-                CompleteHotCollectionDigest::new(
-                    branch_id,
-                    branch_generation,
-                    CollectionScopeRef {
-                        schema_key,
-                        file_id: file_id.as_deref(),
-                    },
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut digests = BTreeMap::new();
+    for (schema_key, file_id) in controls.keys() {
+        let schema_id = intern.assign(schema_key, writes)?;
+        digests.insert(
+            (schema_key.clone(), file_id.clone()),
+            CompleteHotCollectionDigest::new(
+                branch_id,
+                branch_generation,
+                schema_id,
+                CollectionScopeRef {
+                    schema_key,
+                    file_id: file_id.as_deref(),
+                },
+            ),
+        );
+    }
     for ((schema_key, file_id), identities) in physical_buckets {
+        let schema_id = intern.assign(&schema_key, writes)?;
         for identity in identities {
             let canonical_key = encode_hot_row_key_parts(
                 branch_id,
                 branch_generation,
-                &identity.schema_key,
+                schema_id,
                 &identity.entity_pk,
                 identity.file_id.as_deref(),
             );
@@ -2745,6 +2797,7 @@ fn stage_complete_collection_controls(
         );
         stage_hot_collection_control(
             writes,
+            intern,
             branch_id,
             branch_generation,
             CollectionScopeRef {
@@ -2809,20 +2862,20 @@ fn materialized_columnar_overlay_admission_bytes(
 fn packed_exclusive_schema_base_prefix(
     branch_id: &str,
     generation: CommitId,
-    schema_key: &str,
+    schema_id: SchemaInternId,
 ) -> Vec<u8> {
     let mut prefix = hot_scope_prefix(branch_id, generation);
-    write_key_string(&mut prefix, schema_key, KEY_PART_MORE);
+    write_schema_id(&mut prefix, schema_id);
     prefix
 }
 
 fn packed_exclusive_schema_base_key(
     branch_id: &str,
     generation: CommitId,
-    schema_key: &str,
+    schema_id: SchemaInternId,
     commit_id: CommitId,
 ) -> Vec<u8> {
-    let mut key = packed_exclusive_schema_base_prefix(branch_id, generation, schema_key);
+    let mut key = packed_exclusive_schema_base_prefix(branch_id, generation, schema_id);
     key.reserve(16);
     key.extend_from_slice(commit_id.as_uuid().as_bytes());
     key
@@ -2834,7 +2887,10 @@ async fn packed_exclusive_schema_base_refs(
     generation: CommitId,
     schema_key: &str,
 ) -> Result<Vec<PackedExclusiveSchemaBaseRef>, LixError> {
-    let prefix = packed_exclusive_schema_base_prefix(branch_id, generation, schema_key);
+    let Some(schema_id) = schema_intern_of(store).resolve(schema_key) else {
+        return Ok(Vec::new());
+    };
+    let prefix = packed_exclusive_schema_base_prefix(branch_id, generation, schema_id);
     let range = StoragePrefix {
         bytes: Bytes::copy_from_slice(&prefix),
     }
@@ -2875,20 +2931,23 @@ async fn packed_exclusive_schema_base_refs(
 
 fn stage_packed_exclusive_schema_base_ref(
     writes: &mut StorageWriteSet,
+    intern: &SchemaIntern,
     branch_id: &str,
     generation: CommitId,
     schema_key: &str,
     commit_id: CommitId,
-) {
+) -> Result<(), LixError> {
+    let schema_id = intern.assign(schema_key, writes)?;
     writes.put(
         PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
         StorageKey(Bytes::from(packed_exclusive_schema_base_key(
-            branch_id, generation, schema_key, commit_id,
+            branch_id, generation, schema_id, commit_id,
         ))),
         StorageValue {
             bytes: Bytes::from_static(&[1]),
         },
     );
+    Ok(())
 }
 
 async fn packed_current_base_refs(
@@ -3249,8 +3308,12 @@ async fn scan_root_current_base_rows_for_merge(
                 .entries;
         } else {
             for schema_key in &request.filter.schema_keys {
+                // An unmapped schema has no control records.
+                let Some(schema_id) = schema_intern_of(store).resolve(schema_key) else {
+                    continue;
+                };
                 let mut prefix = hot_scope_prefix(branch_id, generation);
-                write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
+                write_schema_id(&mut prefix, schema_id);
                 let range = StoragePrefix {
                     bytes: Bytes::from(prefix),
                 }
@@ -4451,51 +4514,60 @@ where
             }
         }
 
+        let intern = schema_intern_of(&self.store);
+        let schema_id = intern.resolve(scope.schema_key);
         let scope_prefix = hot_scope_prefix(branch_id, branch_generation);
-        let mut selected_prefix = scope_prefix.clone();
-        write_key_string(&mut selected_prefix, scope.schema_key, KEY_PART_FINAL);
-        if let Some(file_id) = scope.file_id {
-            write_file_id(&mut selected_prefix, Some(file_id));
-        }
-        let range = StoragePrefix {
-            bytes: Bytes::from(selected_prefix),
-        }
-        .to_range()?;
-        let mut digest = CompleteHotCollectionDigest::new(branch_id, branch_generation, scope);
         let mut actual = 0_u64;
-        let mut cursor = self
-            .store
-            .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
-            .await?;
-        loop {
-            let page = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+        let mut digest = None;
+        if let Some(schema_id) = schema_id {
+            let mut selected_prefix = scope_prefix.clone();
+            write_schema_id(&mut selected_prefix, schema_id);
+            if let Some(file_id) = scope.file_id {
+                write_file_id(&mut selected_prefix, Some(file_id));
+            }
+            let range = StoragePrefix {
+                bytes: Bytes::from(selected_prefix),
+            }
+            .to_range()?;
+            let mut scoped_digest =
+                CompleteHotCollectionDigest::new(branch_id, branch_generation, schema_id, scope);
+            let mut cursor = self
+                .store
+                .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
                 .await?;
-            for entry in page.entries {
-                let raw_key = entry.key.0;
-                let raw_value = full_value_bytes(entry.value)?;
-                let identity = validate_exact_collection_member(
-                    branch_id,
-                    branch_generation,
-                    &scope_prefix,
-                    scope,
-                    required_identity,
-                    expected_untracked,
-                    raw_key.as_ref(),
-                    raw_value.as_ref(),
-                )?;
-                if let Some(identity) = identity {
-                    digest.push(&identity, raw_key.as_ref())?;
-                    actual = actual
-                        .checked_add(1)
-                        .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
+            loop {
+                let page = cursor
+                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                    .await?;
+                for entry in page.entries {
+                    let raw_key = entry.key.0;
+                    let raw_value = full_value_bytes(entry.value)?;
+                    let identity = validate_exact_collection_member(
+                        intern,
+                        branch_id,
+                        branch_generation,
+                        &scope_prefix,
+                        scope,
+                        schema_id,
+                        required_identity,
+                        expected_untracked,
+                        raw_key.as_ref(),
+                        raw_value.as_ref(),
+                    )?;
+                    if let Some(identity) = identity {
+                        scoped_digest.push(&identity, raw_key.as_ref())?;
+                        actual = actual.checked_add(1).ok_or_else(|| {
+                            head_value_error("hot collection live count exceeds u64")
+                        })?;
+                    }
+                }
+                if !page.has_more {
+                    break;
                 }
             }
-            if !page.has_more {
-                break;
-            }
+            digest = Some(scoped_digest);
         }
-        let actual_digest = digest.finish();
+        let actual_digest = digest.map(CompleteHotCollectionDigest::finish);
 
         let Some(control) = control else {
             if allow_bootstrap_absence && actual == 0 {
@@ -4512,7 +4584,7 @@ where
                 scope.schema_key, control.live_count
             )));
         }
-        if control.ordered_identity_digest != Some(actual_digest) {
+        if control.ordered_identity_digest != actual_digest {
             return Err(head_value_error(format!(
                 "selected collection '{}' identity digest does not match its canonical members",
                 scope.schema_key
@@ -4652,26 +4724,28 @@ where
         control: BranchHeadControl,
         schema_key: &str,
     ) -> Result<bool, LixError> {
-        let mut prefix = hot_scope_prefix(branch_id, control.tracked_generation);
-        write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
-        let range = StoragePrefix {
-            bytes: Bytes::from(prefix),
-        }
-        .to_range()?;
-        let mut cursor = self
-            .store
-            .begin_scan(
-                HOT_ROW_SPACE,
-                range,
-                StorageBeginScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    ..StorageBeginScanOptions::default()
-                },
-            )
-            .await?;
-        let page = cursor.next_page(1).await?;
-        if !page.entries.is_empty() {
-            return Ok(true);
+        if let Some(schema_id) = schema_intern_of(&self.store).resolve(schema_key) {
+            let mut prefix = hot_scope_prefix(branch_id, control.tracked_generation);
+            write_schema_id(&mut prefix, schema_id);
+            let range = StoragePrefix {
+                bytes: Bytes::from(prefix),
+            }
+            .to_range()?;
+            let mut cursor = self
+                .store
+                .begin_scan(
+                    HOT_ROW_SPACE,
+                    range,
+                    StorageBeginScanOptions {
+                        projection: StorageCoreProjection::KeyOnly,
+                        ..StorageBeginScanOptions::default()
+                    },
+                )
+                .await?;
+            let page = cursor.next_page(1).await?;
+            if !page.entries.is_empty() {
+                return Ok(true);
+            }
         }
         if packed_current_base_has_schema(
             &self.store,
@@ -6206,11 +6280,12 @@ where
         );
         stage_packed_exclusive_schema_base_ref(
             self.writes,
+            schema_intern_of(self.store),
             branch_id,
             generation,
             schema_key,
             new_head,
-        );
+        )?;
         self.writes.put(
             PACKED_CURRENT_BASE_CONTROL_SPACE,
             StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation))),
@@ -6427,6 +6502,7 @@ where
         }
         stage_hot_collection_control(
             self.writes,
+            schema_intern_of(self.store),
             branch_id,
             generation,
             crate::collection_generation::CollectionScopeRef {
@@ -6670,6 +6746,7 @@ where
             }
             stage_hot_collection_control(
                 self.writes,
+                schema_intern_of(self.store),
                 branch_id,
                 generation,
                 crate::collection_generation::CollectionScopeRef {
@@ -6692,11 +6769,12 @@ where
         if let Some(schema_key) = exclusive_schema_key {
             stage_packed_exclusive_schema_base_ref(
                 self.writes,
+                schema_intern_of(self.store),
                 branch_id,
                 generation,
                 schema_key,
                 new_head,
-            );
+            )?;
         }
         self.writes.put(
             PACKED_CURRENT_BASE_CONTROL_SPACE,
@@ -6832,7 +6910,13 @@ where
         let has_key_value_scope = rows
             .keys()
             .any(|identity| identity.schema_key == KEY_VALUE_SCHEMA_KEY);
-        stage_complete_collection_controls(self.writes, branch_id, new_generation, &rows)?;
+        stage_complete_collection_controls(
+            self.writes,
+            schema_intern_of(self.store),
+            branch_id,
+            new_generation,
+            &rows,
+        )?;
         // Deterministic runtime state performs required point reads in this
         // engine-owned collection. A complete untracked generation must
         // therefore authenticate its empty set as well as its present rows;
@@ -6842,8 +6926,11 @@ where
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
             };
+            let key_value_schema_id =
+                schema_intern_of(self.store).assign(KEY_VALUE_SCHEMA_KEY, self.writes)?;
             stage_hot_collection_control(
                 self.writes,
+                schema_intern_of(self.store),
                 branch_id,
                 new_generation,
                 scope,
@@ -6851,7 +6938,13 @@ where
                     active_generation: new_generation,
                     live_count: 0,
                     ordered_identity_digest: Some(
-                        CompleteHotCollectionDigest::new(branch_id, new_generation, scope).finish(),
+                        CompleteHotCollectionDigest::new(
+                            branch_id,
+                            new_generation,
+                            key_value_schema_id,
+                            scope,
+                        )
+                        .finish(),
                     ),
                 },
             )?;
@@ -7137,6 +7230,7 @@ where
             }
             stage_hot_bootstrap(
                 self.writes,
+                schema_intern_of(self.store),
                 branch_id,
                 generation,
                 parent_rows.unwrap_or_default(),
@@ -7149,13 +7243,14 @@ where
             return Ok(generation);
         }
 
+        let schema_ids = assign_delta_schema_ids(schema_intern_of(self.store), self.writes, &sorted)?;
         let identities = {
             let _span = tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.materialization.hot.identities"
             )
             .entered();
-            encode_hot_mutation_identities(branch_id, generation, &sorted)
+            encode_hot_mutation_identities(branch_id, generation, &sorted, &schema_ids)
         };
         // Mutation validation must use primary rows rather than the file-id
         // projection. The projection is an equally-valued read accelerator,
@@ -7437,7 +7532,8 @@ where
         } else {
             (sorted, previous_values, created_ats)
         };
-        let identities = encode_hot_mutation_identities(branch_id, generation, &sorted);
+        let schema_ids = assign_delta_schema_ids(schema_intern_of(self.store), self.writes, &sorted)?;
+        let identities = encode_hot_mutation_identities(branch_id, generation, &sorted, &schema_ids);
         let unmatched_guards = if absence_guards_validated || absence_guards.is_empty() {
             BTreeSet::new()
         } else {
@@ -7472,7 +7568,6 @@ where
                 .try_fold(0_usize, |total, delta| {
                     total.checked_add(encoded_hot_identity_key_len(
                         scope.len(),
-                        delta.schema_key,
                         delta.entity_pk,
                         delta.file_id,
                     )?)
@@ -7512,8 +7607,10 @@ where
                 "lix.perf.materialization.hot.values"
             )
             .entered();
-            for (delta, (created_at, previous)) in
-                sorted.iter().zip(created_ats.iter().zip(&previous_values))
+            for ((delta, schema_id), (created_at, previous)) in sorted
+                .iter()
+                .zip(&schema_ids)
+                .zip(created_ats.iter().zip(&previous_values))
             {
                 // Ordinary commits have no active checkpoint, so their baseline
                 // is always disabled. Do not decode the row a second time merely
@@ -7542,7 +7639,7 @@ where
                         diff_scope
                             .as_deref()
                             .expect("a newly dirty hot row requires an active checkpoint"),
-                        delta.schema_key,
+                        *schema_id,
                         delta.entity_pk,
                         delta.file_id,
                     );
@@ -7572,6 +7669,7 @@ where
         let next_value_bytes = Bytes::from(next_value_bytes);
         stage_incremental_collection_controls(
             self.writes,
+            schema_intern_of(self.store),
             branch_id,
             generation,
             &sorted,
@@ -7689,8 +7787,20 @@ where
             }
         }
 
-        stage_complete_collection_controls(self.writes, branch_id, generation, &rows)?;
-        stage_complete_hot_rows(self.writes, branch_id, generation, rows);
+        stage_complete_collection_controls(
+            self.writes,
+            schema_intern_of(self.store),
+            branch_id,
+            generation,
+            &rows,
+        )?;
+        stage_complete_hot_rows(
+            self.writes,
+            schema_intern_of(self.store),
+            branch_id,
+            generation,
+            rows,
+        )?;
         JsonStoreWriter::stage_untracked_reclaim_candidates(
             self.writes,
             retired_untracked_json_refs
@@ -7745,12 +7855,12 @@ async fn stage_incremental_file_delete_cascades(
         hot_load_file_scope_identities(store, branch_id, generation, &cascades).await?;
     let values = hot_load_primary_identity_bytes(store, &identities).await?;
     let scope = hot_scope_prefix(branch_id, generation);
+    let intern = schema_intern_of(store);
     let key_capacity = identities
         .iter()
         .try_fold(0_usize, |total, identity| {
             let key_len = encoded_hot_identity_key_len(
                 scope.len(),
-                &identity.schema_key,
                 &identity.entity_pk,
                 identity.file_id.as_deref(),
             )?;
@@ -7771,7 +7881,6 @@ async fn stage_incremental_file_delete_cascades(
             .try_fold(0_usize, |total, identity| {
                 total.checked_add(encoded_hot_identity_key_len(
                     scope.len(),
-                    &identity.schema_key,
                     &identity.entity_pk,
                     identity.file_id.as_deref(),
                 )?)
@@ -7802,13 +7911,12 @@ async fn stage_incremental_file_delete_cascades(
         if (cascade.untracked && !existing.untracked) || existing.deleted {
             continue;
         }
+        let schema_id = intern.resolve(&identity.schema_key).ok_or_else(|| {
+            head_value_error("decoded cascade identity names an unmapped schema key")
+        })?;
         let row_start = mutations.key_bytes.len();
         mutations.key_bytes.extend_from_slice(&scope);
-        write_key_string(
-            &mut mutations.key_bytes,
-            &identity.schema_key,
-            KEY_PART_FINAL,
-        );
+        write_schema_id(&mut mutations.key_bytes, schema_id);
         write_file_id(&mut mutations.key_bytes, identity.file_id.as_deref());
         write_entity_pk(&mut mutations.key_bytes, &identity.entity_pk);
         let row_key = BufferRange::new(row_start, mutations.key_bytes.len() - row_start);
@@ -7828,7 +7936,7 @@ async fn stage_incremental_file_delete_cascades(
                 diff_scope
                     .as_deref()
                     .expect("new cascade dirty row requires active checkpoint"),
-                &identity.schema_key,
+                schema_id,
                 &identity.entity_pk,
                 identity.file_id.as_deref(),
             );
@@ -8354,13 +8462,19 @@ fn encode_hot_mutation_identities(
     branch_id: &str,
     generation: CommitId,
     deltas: &[&CurrentStateDeltaRef<'_>],
+    schema_ids: &[SchemaInternId],
 ) -> EncodedHotMutationIdentities {
     let scope = hot_scope_prefix(branch_id, generation);
     let encoded_capacity = encoded_hot_mutation_identity_capacity(scope.len(), deltas).unwrap_or(0);
     let mut encoded = Vec::with_capacity(encoded_capacity);
     let mut key_ranges = Vec::with_capacity(deltas.len());
-    for delta in deltas {
-        key_ranges.push(append_hot_mutation_identity(&mut encoded, &scope, delta));
+    for (delta, schema_id) in deltas.iter().zip(schema_ids) {
+        key_ranges.push(append_hot_mutation_identity(
+            &mut encoded,
+            &scope,
+            *schema_id,
+            delta,
+        ));
     }
     EncodedHotMutationIdentities {
         key_bytes: Bytes::from(encoded),
@@ -8373,14 +8487,9 @@ fn encoded_hot_mutation_identity_capacity(
     deltas: &[&CurrentStateDeltaRef<'_>],
 ) -> Option<usize> {
     deltas.iter().try_fold(0_usize, |total, delta| {
-        let key_len = encoded_hot_identity_key_len(
-            scope_len,
-            delta.schema_key,
-            delta.entity_pk,
-            delta.file_id,
-        )?;
+        let key_len = encoded_hot_identity_key_len(scope_len, delta.entity_pk, delta.file_id)?;
         let marker_len = if delta.file_id.is_some() {
-            scope_len.checked_add(encoded_key_bytes_len(delta.schema_key.as_bytes())?)?
+            scope_len.checked_add(SCHEMA_INTERN_ID_BYTES)?
         } else {
             0
         };
@@ -8391,11 +8500,12 @@ fn encoded_hot_mutation_identity_capacity(
 fn append_hot_mutation_identity(
     encoded: &mut Vec<u8>,
     scope: &[u8],
+    schema_id: SchemaInternId,
     delta: &CurrentStateDeltaRef<'_>,
 ) -> EncodedHotMutationIdentityRanges {
     let row_start = encoded.len();
     encoded.extend_from_slice(scope);
-    write_key_string(encoded, delta.schema_key, KEY_PART_FINAL);
+    write_schema_id(encoded, schema_id);
     write_file_id(encoded, delta.file_id);
     write_entity_pk(encoded, delta.entity_pk);
     let row_key = BufferRange::new(row_start, encoded.len() - row_start);
@@ -8403,13 +8513,36 @@ fn append_hot_mutation_identity(
     let file_schema_key = delta.file_id.map(|_| {
         let marker_start = encoded.len();
         encoded.extend_from_slice(scope);
-        write_key_string(encoded, delta.schema_key, KEY_PART_FINAL);
+        write_schema_id(encoded, schema_id);
         BufferRange::new(marker_start, encoded.len() - marker_start)
     });
     EncodedHotMutationIdentityRanges {
         row_key,
         file_schema_key,
     }
+}
+
+/// Assigns one interned schema id per delta, staging any first-use mapping
+/// rows into the same write set the deltas will land in.
+fn assign_delta_schema_ids(
+    intern: &SchemaIntern,
+    writes: &mut StorageWriteSet,
+    deltas: &[&CurrentStateDeltaRef<'_>],
+) -> Result<Vec<SchemaInternId>, LixError> {
+    let mut cached: Option<(&str, SchemaInternId)> = None;
+    deltas
+        .iter()
+        .map(|delta| {
+            if let Some((schema_key, schema_id)) = cached
+                && schema_key == delta.schema_key
+            {
+                return Ok(schema_id);
+            }
+            let schema_id = intern.assign(delta.schema_key, writes)?;
+            cached = Some((delta.schema_key, schema_id));
+            Ok(schema_id)
+        })
+        .collect()
 }
 
 async fn hot_load_primary_mutation_identity_refs(
@@ -8775,12 +8908,13 @@ fn buffer_range(range: &Range<usize>) -> BufferRange {
 
 fn stage_complete_hot_rows(
     writes: &mut StorageWriteSet,
+    intern: &SchemaIntern,
     branch_id: &str,
     generation: CommitId,
     rows: HotRowMap,
-) {
+) -> Result<(), LixError> {
     if rows.is_empty() {
-        return;
+        return Ok(());
     }
     let scope = hot_scope_prefix(branch_id, generation);
     let file_schema_keys = rows
@@ -8790,22 +8924,15 @@ fn stage_complete_hot_rows(
         .collect::<BTreeSet<_>>();
     let value_capacity = rows.values().map(Bytes::len).sum();
     let marker_key_capacity = file_schema_keys
-        .iter()
-        .map(|schema_key| {
-            scope
-                .len()
-                .saturating_add(encoded_key_bytes_len(schema_key.as_bytes()).unwrap_or(0))
-        })
-        .sum::<usize>();
+        .len()
+        .saturating_mul(scope.len().saturating_add(SCHEMA_INTERN_ID_BYTES));
     let key_capacity = rows
         .len()
         .saturating_mul(scope.len() + 32)
         .saturating_add(
             rows.keys()
                 .map(|identity| {
-                    identity
-                        .schema_key
-                        .len()
+                    SCHEMA_INTERN_ID_BYTES
                         .saturating_add(identity.entity_pk.estimated_heap_bytes())
                         .saturating_add(
                             identity
@@ -8821,14 +8948,23 @@ fn stage_complete_hot_rows(
     let mut value_bytes = Vec::with_capacity(value_capacity);
     let mut row_puts = Vec::with_capacity(rows.len());
     let mut file_puts = Vec::with_capacity(file_schema_keys.len());
+    let mut cached_schema: Option<(String, SchemaInternId)> = None;
     for (identity, value) in rows {
         let value_start = value_bytes.len();
         value_bytes.extend_from_slice(value.as_ref());
         let value = BufferRange::new(value_start, value_bytes.len() - value_start);
 
+        let schema_id = match &cached_schema {
+            Some((schema_key, schema_id)) if *schema_key == identity.schema_key => *schema_id,
+            _ => {
+                let schema_id = intern.assign(&identity.schema_key, writes)?;
+                cached_schema = Some((identity.schema_key.clone(), schema_id));
+                schema_id
+            }
+        };
         let row_start = key_bytes.len();
         key_bytes.extend_from_slice(&scope);
-        write_key_string(&mut key_bytes, &identity.schema_key, KEY_PART_FINAL);
+        write_schema_id(&mut key_bytes, schema_id);
         write_file_id(&mut key_bytes, identity.file_id.as_deref());
         write_entity_pk(&mut key_bytes, &identity.entity_pk);
         row_puts.push(EncodedPut {
@@ -8837,9 +8973,10 @@ fn stage_complete_hot_rows(
         });
     }
     for schema_key in file_schema_keys {
+        let schema_id = intern.assign(&schema_key, writes)?;
         let file_start = key_bytes.len();
         key_bytes.extend_from_slice(&scope);
-        write_key_string(&mut key_bytes, &schema_key, KEY_PART_FINAL);
+        write_schema_id(&mut key_bytes, schema_id);
         file_puts.push(EncodedPut {
             key: BufferRange::new(file_start, key_bytes.len() - file_start),
             value: BufferRange::new(0, 0),
@@ -8863,11 +9000,13 @@ fn stage_complete_hot_rows(
                 .expect("complete hot file ranges originate in the supplied encoded buffers");
         writes.stage_encoded_batch(HOT_FILE_SPACE, file_batch);
     }
+    Ok(())
 }
 
 #[cfg(test)]
 pub(super) fn stage_test_hot_value(
     writes: &mut StorageWriteSet,
+    intern: &SchemaIntern,
     identity: &HeadIdentity,
     value: &HeadValue,
 ) -> Result<(), LixError> {
@@ -8879,12 +9018,12 @@ pub(super) fn stage_test_hot_value(
         },
         Bytes::from(encode_head_value(&value.as_ref())?),
     )]);
-    stage_complete_hot_rows(writes, &identity.branch_id, identity.generation, rows);
-    Ok(())
+    stage_complete_hot_rows(writes, intern, &identity.branch_id, identity.generation, rows)
 }
 
 fn stage_hot_bootstrap(
     writes: &mut StorageWriteSet,
+    intern: &SchemaIntern,
     branch_id: &str,
     generation: CommitId,
     parent_rows: Vec<MaterializedTrackedStateRow>,
@@ -9034,8 +9173,8 @@ fn stage_hot_bootstrap(
             );
         }
     }
-    stage_complete_collection_controls(writes, branch_id, generation, &rows)?;
-    stage_complete_hot_rows(writes, branch_id, generation, rows);
+    stage_complete_collection_controls(writes, intern, branch_id, generation, &rows)?;
+    stage_complete_hot_rows(writes, intern, branch_id, generation, rows)?;
     JsonStoreWriter::stage_untracked_reclaim_candidates(
         writes,
         retired_untracked_json_refs
@@ -9113,14 +9252,19 @@ impl EncodedHotPointKeys {
 }
 
 fn encode_hot_point_keys(
+    intern: &SchemaIntern,
     branch_id: &str,
     generation: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
 ) -> EncodedHotPointKeys {
-    encode_hot_point_keys_with(branch_id, generation, keys.len(), |index| keys[index])
+    encode_hot_point_keys_with(intern, branch_id, generation, keys.len(), |index| keys[index])
 }
 
+/// Point-read keys resolve schemas without allocating: a schema with no
+/// interned id encodes the reserved `UNMAPPED` id, which no persisted key can
+/// carry, so the probe reads as absent.
 fn encode_hot_point_keys_with<'a>(
+    intern: &SchemaIntern,
     branch_id: &str,
     generation: CommitId,
     key_count: usize,
@@ -9129,18 +9273,28 @@ fn encode_hot_point_keys_with<'a>(
     let scope = hot_scope_prefix(branch_id, generation);
     let planned_capacity = (0..key_count).try_fold(0_usize, |total, index| {
         let key = key_at(index);
-        let primary_len =
-            encoded_hot_identity_key_len(scope.len(), key.schema_key, key.entity_pk, key.file_id)?;
+        let primary_len = encoded_hot_identity_key_len(scope.len(), key.entity_pk, key.file_id)?;
         total.checked_add(primary_len)
     });
     let capacity = planned_capacity.unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
     let mut ranges = Vec::with_capacity(key_count);
+    let mut cached_schema: Option<(&str, SchemaInternId)> = None;
     for index in 0..key_count {
         let key = key_at(index);
+        let schema_id = match cached_schema {
+            Some((schema_key, schema_id)) if schema_key == key.schema_key => schema_id,
+            _ => {
+                let schema_id = intern
+                    .resolve(key.schema_key)
+                    .unwrap_or(SchemaInternId::UNMAPPED);
+                cached_schema = Some((key.schema_key, schema_id));
+                schema_id
+            }
+        };
         let primary_start = bytes.len();
         bytes.extend_from_slice(&scope);
-        write_key_string(&mut bytes, key.schema_key, KEY_PART_FINAL);
+        write_schema_id(&mut bytes, schema_id);
         write_file_id(&mut bytes, key.file_id);
         write_entity_pk(&mut bytes, key.entity_pk);
         let primary = BufferRange::new(primary_start, bytes.len() - primary_start);
@@ -9176,6 +9330,7 @@ struct FiniteHotIdentityBatchRef<'a> {
 
 impl<'a> FiniteHotIdentityBatchRef<'a> {
     fn new(
+        intern: &SchemaIntern,
         branch_id: &'a str,
         generation: CommitId,
         schema_key: &'a str,
@@ -9194,7 +9349,7 @@ impl<'a> FiniteHotIdentityBatchRef<'a> {
             }
         }
         let encoded =
-            encode_hot_point_keys_with(branch_id, generation, identities.len(), |index| {
+            encode_hot_point_keys_with(intern, branch_id, generation, identities.len(), |index| {
                 TrackedStateKeyRef {
                     schema_key,
                     entity_pk: identities[index].entity_pk,
@@ -9239,7 +9394,9 @@ struct FiniteHotEntryBatchRef<'a> {
 #[derive(Debug)]
 struct HotScanIdentity {
     key: Bytes,
-    schema_key: HotScanString,
+    /// Resolved from the interned schema id in the key; shares the intern
+    /// table's buffer, so repeated rows alias one allocation.
+    schema_key: SharedStr,
     entity_pk: EntityPk,
     file_id: Option<HotScanString>,
 }
@@ -9297,7 +9454,7 @@ impl HotScanString {
 
 impl HotScanIdentity {
     fn schema_key(&self) -> &str {
-        self.schema_key.as_str(&self.key)
+        self.schema_key.as_str()
     }
 
     fn file_id(&self) -> Option<&str> {
@@ -9329,7 +9486,7 @@ impl HotScanIdentity {
             file_id,
         } = self;
         HeadRowIdentity {
-            schema_key: schema_key.into_string(&key),
+            schema_key: schema_key.as_str().to_owned(),
             entity_pk,
             file_id: file_id.map(|file_id| file_id.into_string(&key)),
         }
@@ -9337,12 +9494,11 @@ impl HotScanIdentity {
 
     #[cfg(test)]
     fn owned_metadata_buffer_count(&self) -> usize {
-        usize::from(self.schema_key.owns_fallback_buffer())
-            + usize::from(
-                self.file_id
-                    .as_ref()
-                    .is_some_and(HotScanString::owns_fallback_buffer),
-            )
+        usize::from(
+            self.file_id
+                .as_ref()
+                .is_some_and(HotScanString::owns_fallback_buffer),
+        )
     }
 }
 
@@ -9447,6 +9603,7 @@ fn filter_hot_scan_entries_by_collection_generation(
 }
 
 fn hot_exact_identity_batches<'a>(
+    intern: &SchemaIntern,
     branch_id: &'a str,
     generation: CommitId,
     filter: &'a TrackedStateFilter,
@@ -9479,6 +9636,7 @@ fn hot_exact_identity_batches<'a>(
         .into_iter()
         .map(|schema_key| {
             FiniteHotIdentityBatchRef::new(
+                intern,
                 branch_id,
                 generation,
                 schema_key,
@@ -9599,7 +9757,7 @@ async fn hot_load_identity_ref_bytes(
     if identities.is_empty() {
         return Ok(Vec::new());
     }
-    let encoded = encode_hot_point_keys(branch_id, generation, identities);
+    let encoded = encode_hot_point_keys(schema_intern_of(store), branch_id, generation, identities);
     let keys = (0..identities.len())
         .map(|index| encoded.primary_key(index))
         .collect::<Vec<_>>();
@@ -9632,7 +9790,12 @@ async fn hot_load_primary_identity_bytes(
             entity_pk: &identity.entity_pk,
         })
         .collect::<Vec<_>>();
-    let encoded = encode_hot_point_keys(scope.branch_id.as_str(), scope.generation, &identities);
+    let encoded = encode_hot_point_keys(
+        schema_intern_of(store),
+        scope.branch_id.as_str(),
+        scope.generation,
+        &identities,
+    );
     let keys = (0..identities.len())
         .map(|index| encoded.primary_key(index))
         .collect::<Vec<_>>();
@@ -9672,7 +9835,7 @@ async fn hot_load_file_scope_identities(
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
         for entry in page.entries {
-            let row = decode_hot_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
+            let row = decode_hot_row_key_in_scope(schema_intern_of(store), entry.key.0.as_ref(), &scope)?;
             if !row
                 .file_id
                 .as_ref()
@@ -9797,8 +9960,11 @@ async fn hot_working_diff_entries(
                 {
                     return Ok(None);
                 }
-                let Ok(identity) = decode_hot_diff_key_in_scope(entry.key.0.as_ref(), &scope)
-                else {
+                let Ok(identity) = decode_hot_diff_key_in_scope(
+                    schema_intern_of(store),
+                    entry.key.0.as_ref(),
+                    &scope,
+                ) else {
                     return Ok(None);
                 };
                 if matches_filter(&identity, filter) {
@@ -9821,8 +9987,12 @@ async fn hot_working_diff_entries(
             if segment_scope.digest != *blake3::hash(&bytes).as_bytes() {
                 return Ok(None);
             }
-            let decoded =
-                visit_hot_diff_segment(&bytes, &scope, &mut actual_coverage, |identity| {
+            let decoded = visit_hot_diff_segment(
+                schema_intern_of(store),
+                &bytes,
+                &scope,
+                &mut actual_coverage,
+                |identity| {
                     if matches_filter(&identity, filter) {
                         selected.insert(
                             HeadIdentity {
@@ -10125,7 +10295,8 @@ async fn hot_scan_entries<'a>(
     // single MultiGet only when this schema has no file-backed members; if it
     // does, fall through to the complete primary-prefix route so UPDATE and
     // DELETE still see every candidate member.
-    if let Some(identities) = hot_exact_identity_batches(branch_id, generation, filter) {
+    let intern = schema_intern_of(store);
+    if let Some(identities) = hot_exact_identity_batches(intern, branch_id, generation, filter) {
         let may_use_null_point_batch = !filter.file_ids.is_empty()
             || !hot_schema_has_file_members(store, branch_id, generation, &filter.schema_keys)
                 .await?;
@@ -10140,7 +10311,7 @@ async fn hot_scan_entries<'a>(
     // The authoritative hot index is file-first, so filesystem queries such as
     // `WHERE file_id = ?` read one contiguous hydrated range without a second
     // value projection or random point-read hydration.
-    if let Some(prefixes) = hot_file_scan_prefixes(branch_id, generation, filter) {
+    if let Some(prefixes) = hot_file_scan_prefixes(intern, branch_id, generation, filter) {
         let entries = HotScanEntries::Decoded(
             scan_hot_file_entries(store, branch_id, generation, prefixes, filter, limit).await?,
         );
@@ -10148,16 +10319,27 @@ async fn hot_scan_entries<'a>(
     }
 
     let scope = hot_scope_prefix(branch_id, generation);
-    let mut prefixes = hot_row_scan_prefixes(&scope, filter);
+    let mut prefixes = hot_row_scan_prefixes(intern, &scope, filter);
     prefixes.sort();
     prefixes.dedup();
     let mut rows = Vec::new();
     let mut saw_file_backed_row = false;
     let mut retained_bytes = 0_usize;
-    // A fixed file bucket has the same physical and logical order. Every
-    // broader file domain must defer LIMIT until file-first storage order has
+    // Interned schema ids order physically by allocation, not by schema-key
+    // string, so any scan that can observe more than one schema must restore
+    // canonical `(schema, entity_pk, file_id)` order before rows or LIMIT
+    // become visible. Only a single pinned schema keeps physical order usable.
+    let single_schema_scan = {
+        let mut schema_keys = filter.schema_keys.iter().collect::<Vec<_>>();
+        schema_keys.sort_unstable();
+        schema_keys.dedup();
+        schema_keys.len() == 1
+    };
+    // A fixed file bucket within one schema has the same physical and logical
+    // order. Every broader domain must defer LIMIT until storage order has
     // been restored to canonical `(schema, entity_pk, file_id)` order.
-    let physical_limit = limit.filter(|_| hot_filter_has_one_fixed_file_bucket(filter));
+    let physical_limit =
+        limit.filter(|_| single_schema_scan && hot_filter_has_one_fixed_file_bucket(filter));
     for prefix in prefixes {
         let range = StoragePrefix {
             bytes: Bytes::from(prefix),
@@ -10169,7 +10351,7 @@ async fn hot_scan_entries<'a>(
         loop {
             let remaining = physical_limit.map(|limit| limit.saturating_sub(rows.len()));
             if matches!(remaining, Some(0)) {
-                let rows = if saw_file_backed_row {
+                let rows = if saw_file_backed_row || !single_schema_scan {
                     canonicalize_hot_scan_rows(rows, limit)?
                 } else {
                     rows
@@ -10181,7 +10363,7 @@ async fn hot_scan_entries<'a>(
                 .await?;
             for entry in page.entries {
                 let encoded_key_bytes = entry.key.0.len();
-                let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                let identity = decode_hot_scan_row_key_in_scope(intern, entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
                     saw_file_backed_row |= identity.file_id().is_some();
                     let value = full_value_bytes(entry.value)?;
@@ -10195,7 +10377,7 @@ async fn hot_scan_entries<'a>(
                     }
                     rows.push((identity, value));
                     if physical_limit.is_some_and(|limit| rows.len() >= limit) {
-                        let rows = if saw_file_backed_row {
+                        let rows = if saw_file_backed_row || !single_schema_scan {
                             canonicalize_hot_scan_rows(rows, limit)?
                         } else {
                             rows
@@ -10209,7 +10391,7 @@ async fn hot_scan_entries<'a>(
             }
         }
     }
-    if saw_file_backed_row {
+    if saw_file_backed_row || !single_schema_scan {
         rows = canonicalize_hot_scan_rows(rows, limit)?;
     } else if let Some(limit) = limit {
         rows.truncate(limit);
@@ -10387,22 +10569,29 @@ async fn hot_scan_dense_encoded_key_range<'a>(
     }
 }
 
-fn hot_row_scan_prefixes(scope: &[u8], filter: &TrackedStateFilter) -> Vec<Vec<u8>> {
+fn hot_row_scan_prefixes(
+    intern: &SchemaIntern,
+    scope: &[u8],
+    filter: &TrackedStateFilter,
+) -> Vec<Vec<u8>> {
     if filter.schema_keys.is_empty() {
         return vec![scope.to_vec()];
     }
     filter
         .schema_keys
         .iter()
-        .map(|schema_key| {
+        .filter_map(|schema_key| {
+            // An unmapped schema has no interned id and therefore no rows.
+            let schema_id = intern.resolve(schema_key)?;
             let mut prefix = scope.to_vec();
-            write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
-            prefix
+            write_schema_id(&mut prefix, schema_id);
+            Some(prefix)
         })
         .collect()
 }
 
 fn hot_file_scan_prefixes(
+    intern: &SchemaIntern,
     branch_id: &str,
     generation: CommitId,
     filter: &TrackedStateFilter,
@@ -10419,12 +10608,16 @@ fn hot_file_scan_prefixes(
     }
     let mut prefixes = Vec::with_capacity(filter.schema_keys.len() * filter.file_ids.len());
     for schema_key in &filter.schema_keys {
+        // An unmapped schema has no interned id and therefore no rows.
+        let Some(schema_id) = intern.resolve(schema_key) else {
+            continue;
+        };
         for file_id in &filter.file_ids {
             let NullableKeyFilter::Value(file_id) = file_id else {
                 unreachable!("file-id projection predicate was checked above");
             };
             let mut prefix = hot_scope_prefix(branch_id, generation);
-            write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
+            write_schema_id(&mut prefix, schema_id);
             write_file_id(&mut prefix, Some(file_id));
             prefixes.push(prefix);
         }
@@ -10457,7 +10650,8 @@ async fn scan_hot_file_entries(
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
             for entry in page.entries {
-                let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                let identity =
+                    decode_hot_scan_row_key_in_scope(schema_intern_of(store), entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
                     rows.push((identity, full_value_bytes(entry.value)?));
                 }
@@ -10497,8 +10691,11 @@ async fn hot_schema_has_file_member(
     generation: CommitId,
     schema_key: &str,
 ) -> Result<bool, LixError> {
+    let Some(schema_id) = schema_intern_of(store).resolve(schema_key) else {
+        return Ok(false);
+    };
     let scope = hot_scope_prefix(branch_id, generation);
-    let key = StorageKey(Bytes::from(encode_hot_file_schema_key(&scope, schema_key)));
+    let key = StorageKey(Bytes::from(encode_hot_file_schema_key(&scope, schema_id)));
     let values = PointReadPlan::new(HOT_FILE_SPACE, &[key])
         .materialize(
             store,
@@ -10515,11 +10712,14 @@ fn hot_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
 }
 
 #[cfg(test)]
-pub(super) fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
+pub(super) fn encode_hot_row_key(intern: &SchemaIntern, identity: &HeadIdentity) -> Vec<u8> {
+    let schema_id = intern
+        .resolve(&identity.schema_key)
+        .expect("test schema key must be interned before encoding its hot key");
     encode_hot_row_key_parts(
         &identity.branch_id,
         identity.generation,
-        &identity.schema_key,
+        schema_id,
         &identity.entity_pk,
         identity.file_id.as_deref(),
     )
@@ -10528,28 +10728,30 @@ pub(super) fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
 fn encode_hot_row_key_parts(
     branch_id: &str,
     generation: CommitId,
-    schema_key: &str,
+    schema_id: SchemaInternId,
     entity_pk: &EntityPk,
     file_id: Option<&str>,
 ) -> Vec<u8> {
     let mut key = hot_scope_prefix(branch_id, generation);
-    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    write_schema_id(&mut key, schema_id);
     write_file_id(&mut key, file_id);
     write_entity_pk(&mut key, entity_pk);
     key
 }
 
 fn validate_exact_collection_member(
+    intern: &SchemaIntern,
     branch_id: &str,
     branch_generation: CommitId,
     scope_prefix: &[u8],
     scope: crate::collection_generation::CollectionScopeRef<'_>,
+    schema_id: SchemaInternId,
     required_identity: TrackedStateKeyRef<'_>,
     expected_untracked: bool,
     raw_key: &[u8],
     raw_value: &[u8],
 ) -> Result<Option<HeadRowIdentity>, LixError> {
-    let identity = decode_hot_row_key_in_scope(raw_key, scope_prefix)?;
+    let identity = decode_hot_row_key_in_scope(intern, raw_key, scope_prefix)?;
     if identity.schema_key != scope.schema_key
         || scope
             .file_id
@@ -10562,7 +10764,7 @@ fn validate_exact_collection_member(
     let canonical = encode_hot_row_key_parts(
         branch_id,
         branch_generation,
-        &identity.schema_key,
+        schema_id,
         &identity.entity_pk,
         identity.file_id.as_deref(),
     );
@@ -10605,12 +10807,19 @@ fn validate_canonical_exact_collection_key(
 }
 
 #[cfg(test)]
-fn encode_hot_diff_key(checkpoint_commit_id: CommitId, identity: &HeadIdentity) -> Vec<u8> {
+fn encode_hot_diff_key(
+    intern: &SchemaIntern,
+    checkpoint_commit_id: CommitId,
+    identity: &HeadIdentity,
+) -> Vec<u8> {
+    let schema_id = intern
+        .resolve(&identity.schema_key)
+        .expect("test schema key must be interned before encoding its hot diff key");
     encode_hot_diff_key_parts(
         &identity.branch_id,
         checkpoint_commit_id,
         identity.generation,
-        &identity.schema_key,
+        schema_id,
         &identity.entity_pk,
         identity.file_id.as_deref(),
     )
@@ -10621,28 +10830,28 @@ fn encode_hot_diff_key_parts(
     branch_id: &str,
     checkpoint_commit_id: CommitId,
     generation: CommitId,
-    schema_key: &str,
+    schema_id: SchemaInternId,
     entity_pk: &EntityPk,
     file_id: Option<&str>,
 ) -> Vec<u8> {
     let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
     let mut key = Vec::with_capacity(
-        encoded_hot_identity_key_len(scope.len(), schema_key, entity_pk, file_id).unwrap_or(0),
+        encoded_hot_identity_key_len(scope.len(), entity_pk, file_id).unwrap_or(0),
     );
-    append_hot_diff_key_parts(&mut key, &scope, schema_key, entity_pk, file_id);
+    append_hot_diff_key_parts(&mut key, &scope, schema_id, entity_pk, file_id);
     key
 }
 
 fn append_hot_diff_key_parts(
     key_bytes: &mut Vec<u8>,
     scope: &[u8],
-    schema_key: &str,
+    schema_id: SchemaInternId,
     entity_pk: &EntityPk,
     file_id: Option<&str>,
 ) -> Range<usize> {
     let start = key_bytes.len();
     key_bytes.extend_from_slice(scope);
-    write_key_string(key_bytes, schema_key, KEY_PART_FINAL);
+    write_schema_id(key_bytes, schema_id);
     write_entity_pk(key_bytes, entity_pk);
     write_file_id(key_bytes, file_id);
     start..key_bytes.len()
@@ -10650,7 +10859,6 @@ fn append_hot_diff_key_parts(
 
 fn encoded_hot_identity_key_len(
     scope_len: usize,
-    schema_key: &str,
     entity_pk: &EntityPk,
     file_id: Option<&str>,
 ) -> Option<usize> {
@@ -10659,7 +10867,7 @@ fn encoded_hot_identity_key_len(
         None => 0,
     };
     scope_len
-        .checked_add(encoded_key_bytes_len(schema_key.as_bytes())?)?
+        .checked_add(SCHEMA_INTERN_ID_BYTES)?
         .checked_add(encoded_entity_pk_len(entity_pk)?)?
         .checked_add(1)?
         .checked_add(file_id_len)
@@ -10691,20 +10899,19 @@ fn encoded_key_bytes_len(value: &[u8]) -> Option<usize> {
         .checked_add(2)
 }
 
-fn decode_hot_scan_row_key_in_scope(key: Bytes, scope: &[u8]) -> Result<HotScanIdentity, LixError> {
+fn decode_hot_scan_row_key_in_scope(
+    intern: &SchemaIntern,
+    key: Bytes,
+    scope: &[u8],
+) -> Result<HotScanIdentity, LixError> {
     if !key.starts_with(scope) {
         return Err(key_codec_error(
             "hot row does not begin with its scanned scope",
         ));
     }
     let mut offset = scope.len();
-    let (schema_key, schema_terminator) =
-        read_hot_scan_key_string(&key, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot row schema key has an invalid terminator",
-        ));
-    }
+    let schema_id = read_schema_id(key.as_ref(), &mut offset)?;
+    let schema_key = intern.name(schema_id)?;
     let file_id = read_hot_scan_file_id(&key, &mut offset)?;
     let entity_pk = read_hot_scan_entity_pk(&key, &mut offset)?;
     if offset != key.len() {
@@ -10924,19 +11131,19 @@ fn read_hot_scan_shared_bytes(
         .map(|(value, terminator)| (Bytes::from(value), terminator))
 }
 
-fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
+fn decode_hot_row_key_in_scope(
+    intern: &SchemaIntern,
+    bytes: &[u8],
+    scope: &[u8],
+) -> Result<HeadRowIdentity, LixError> {
     if !bytes.starts_with(scope) {
         return Err(key_codec_error(
             "hot row does not begin with its scanned scope",
         ));
     }
     let mut offset = scope.len();
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot row schema key has an invalid terminator",
-        ));
-    }
+    let schema_id = read_schema_id(bytes, &mut offset)?;
+    let schema_key = intern.name(schema_id)?.as_str().to_owned();
     let file_id = read_file_id(bytes, &mut offset)?;
     let entity_pk = read_entity_pk(bytes, &mut offset)?;
     if offset != bytes.len() {
@@ -10959,29 +11166,20 @@ fn decode_hot_row_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
         ));
     }
     let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot row schema key has an invalid terminator",
-        ));
-    }
+    let schema_id = read_schema_id(bytes, &mut offset)?;
     let file_id = read_file_id(bytes, &mut offset)?;
     let entity_pk = read_entity_pk(bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(key_codec_error("hot row key has trailing bytes"));
     }
-    let _ = (schema_key, entity_pk, file_id);
+    let _ = (schema_id, entity_pk, file_id);
     Ok((branch_id, generation))
 }
 
-fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(
-        scope
-            .len()
-            .saturating_add(encoded_key_bytes_len(schema_key.as_bytes()).unwrap_or(0)),
-    );
+fn encode_hot_file_schema_key(scope: &[u8], schema_id: SchemaInternId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(scope.len().saturating_add(SCHEMA_INTERN_ID_BYTES));
     key.extend_from_slice(scope);
-    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    write_schema_id(&mut key, schema_id);
     key
 }
 
@@ -10995,16 +11193,11 @@ fn decode_hot_file_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
         ));
     }
     let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot file schema key has an invalid terminator",
-        ));
-    }
+    let schema_id = read_schema_id(bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(key_codec_error("hot file schema key has trailing bytes"));
     }
-    let _ = schema_key;
+    let _ = schema_id;
     Ok((branch_id, generation))
 }
 
@@ -11016,19 +11209,19 @@ struct HotDiffSegmentScope {
     digest: [u8; 32],
 }
 
-fn decode_hot_diff_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
+fn decode_hot_diff_key_in_scope(
+    intern: &SchemaIntern,
+    bytes: &[u8],
+    scope: &[u8],
+) -> Result<HeadRowIdentity, LixError> {
     if !bytes.starts_with(scope) {
         return Err(key_codec_error(
             "hot diff row does not begin with its scanned scope",
         ));
     }
     let mut offset = scope.len();
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot diff row schema key has an invalid terminator",
-        ));
-    }
+    let schema_id = read_schema_id(bytes, &mut offset)?;
+    let schema_key = intern.name(schema_id)?.as_str().to_owned();
     let entity_pk = read_entity_pk(bytes, &mut offset)?;
     let file_id = read_file_id(bytes, &mut offset)?;
     if offset != bytes.len() {
@@ -11065,6 +11258,7 @@ fn decode_hot_diff_segment_key(bytes: &[u8]) -> Result<HotDiffSegmentScope, LixE
 }
 
 fn visit_hot_diff_segment(
+    intern: &SchemaIntern,
     bytes: &[u8],
     scope: &[u8],
     coverage: &mut WorkingDiffIndexCoverage,
@@ -11115,7 +11309,7 @@ fn visit_hot_diff_segment(
         coverage
             .add_encoded_group_key(&full_key)
             .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
-        visit(decode_hot_diff_key_in_scope(&full_key, scope)?);
+        visit(decode_hot_diff_key_in_scope(intern, &full_key, scope)?);
         offset = suffix_end;
     }
     if offset != bytes.len() {
@@ -11125,7 +11319,10 @@ fn visit_hot_diff_segment(
 }
 
 #[cfg(test)]
-fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixError> {
+fn decode_hot_diff_key(
+    intern: &SchemaIntern,
+    bytes: &[u8],
+) -> Result<(CommitId, HeadIdentity), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
     if branch_terminator != KEY_PART_FINAL {
@@ -11135,12 +11332,8 @@ fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixErro
     }
     let checkpoint_commit_id = read_generation(bytes, &mut offset)?;
     let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot diff schema key has an invalid terminator",
-        ));
-    }
+    let schema_id = read_schema_id(bytes, &mut offset)?;
+    let schema_key = intern.name(schema_id)?.as_str().to_owned();
     let entity_pk = read_entity_pk(bytes, &mut offset)?;
     let file_id = read_file_id(bytes, &mut offset)?;
     if offset != bytes.len() {
@@ -11357,7 +11550,10 @@ where
             .await?;
         for entry in page.entries {
             let keep = match full_value_bytes(entry.value) {
-                Ok(bytes) if bytes.is_empty() => decode_hot_diff_key(entry.key.0.as_ref())
+                Ok(bytes) if bytes.is_empty() => decode_hot_diff_key(
+                    schema_intern_of(store),
+                    entry.key.0.as_ref(),
+                )
                     .is_ok_and(|(checkpoint_commit_id, identity)| {
                         active.get(&identity.branch_id).is_some_and(|scope| {
                             scope.checkpoint_commit_id == checkpoint_commit_id
@@ -11379,7 +11575,14 @@ where
                         );
                         let mut coverage = WorkingDiffIndexCoverage::default();
                         segment_scope.digest == *blake3::hash(&bytes).as_bytes()
-                            && visit_hot_diff_segment(&bytes, &scope, &mut coverage, |_| {}).is_ok()
+                            && visit_hot_diff_segment(
+                                schema_intern_of(store),
+                                &bytes,
+                                &scope,
+                                &mut coverage,
+                                |_| {},
+                            )
+                            .is_ok()
                     })
                 }
                 _ => false,
@@ -11735,6 +11938,10 @@ mod tests {
     }
 
     impl<R: StorageAdapterRead> StorageAdapterRead for CountingRead<R> {
+        fn schema_intern(&self) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+            self.inner.schema_intern()
+        }
+
         fn snapshot_cache_key(&self) -> Option<u128> {
             self.inner.snapshot_cache_key()
         }
@@ -11766,6 +11973,10 @@ mod tests {
     }
 
     impl<R: StorageAdapterRead> StorageAdapterRead for JsonCountingRead<R> {
+        fn schema_intern(&self) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+            self.inner.schema_intern()
+        }
+
         fn snapshot_cache_key(&self) -> Option<u128> {
             self.inner.snapshot_cache_key()
         }

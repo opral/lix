@@ -56,9 +56,10 @@ use crate::live_state::{
     MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
-    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageSpace,
-    StorageSpaceId, StorageValue, StorageWriteSet,
+    PointReadPlan, SCHEMA_INTERN_ID_BYTES, SchemaIntern, SchemaInternId, StorageAdapterRead,
+    StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix,
+    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    schema_intern_of,
 };
 use crate::storage_codec;
 use crate::tracked_state::{
@@ -964,6 +965,26 @@ fn write_file_id(out: &mut Vec<u8>, file_id: Option<&str>) {
 
 fn write_key_string(out: &mut Vec<u8>, value: &str, terminator: u8) {
     write_key_bytes(out, value.as_bytes(), terminator);
+}
+
+/// Fixed-width interned schema id. Unlike escaped strings, the id needs no
+/// terminator: it always occupies exactly `SCHEMA_INTERN_ID_BYTES` at a fixed
+/// offset, so prefix-freedom holds structurally.
+fn write_schema_id(out: &mut Vec<u8>, schema_id: SchemaInternId) {
+    out.extend_from_slice(&schema_id.to_be_bytes());
+}
+
+fn read_schema_id(bytes: &[u8], offset: &mut usize) -> Result<SchemaInternId, LixError> {
+    let end = offset
+        .checked_add(SCHEMA_INTERN_ID_BYTES)
+        .ok_or_else(|| key_codec_error("schema id offset overflow"))?;
+    let id = bytes
+        .get(*offset..end)
+        .ok_or_else(|| key_codec_error("is truncated before schema id"))?;
+    let mut raw = [0_u8; SCHEMA_INTERN_ID_BYTES];
+    raw.copy_from_slice(id);
+    *offset = end;
+    Ok(SchemaInternId(u32::from_be_bytes(raw)))
 }
 
 fn write_key_bytes(out: &mut Vec<u8>, value: &[u8], terminator: u8) {

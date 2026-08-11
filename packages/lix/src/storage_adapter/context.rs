@@ -20,6 +20,7 @@ use super::spaces::{
 #[derive(Clone, Debug)]
 pub struct StorageAdapter<StorageImpl = Memory> {
     storage: StorageImpl,
+    schema_intern: std::sync::Arc<crate::storage_adapter::SchemaInternHandle>,
 }
 
 #[expect(missing_debug_implementations)]
@@ -36,17 +37,27 @@ where
     StorageImpl: Storage,
 {
     pub fn new(storage: StorageImpl) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            schema_intern: std::sync::Arc::default(),
+        }
     }
 
     pub async fn begin_read(
         &self,
         opts: ReadOptions,
     ) -> Result<StorageAdapterReadScope<StorageImpl::Read<'_>>, StorageError> {
-        self.storage
-            .begin_read(opts)
-            .await
-            .map(StorageAdapterReadScope::new)
+        let scope = self.storage.begin_read(opts).await.map(|read| {
+            StorageAdapterReadScope::new_with_intern(
+                read,
+                std::sync::Arc::clone(&self.schema_intern),
+            )
+        })?;
+        // The intern table is a strict superset of every id reachable through
+        // this snapshot: it loads here, through this same snapshot, before the
+        // caller observes any hot-plane key.
+        self.schema_intern.ensure_loaded(&scope).await?;
+        Ok(scope)
     }
 
     pub fn new_write_set(&self) -> StorageWriteSet {
@@ -274,6 +285,10 @@ impl<R> StorageAdapterRead for StorageAdapterReadTransaction<R>
 where
     R: crate::storage::StorageRead,
 {
+    fn schema_intern(&self) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+        self.read.schema_intern()
+    }
+
     fn get_many(
         &self,
         requests: &[crate::storage::GetManyRequest<'_>],
@@ -331,6 +346,10 @@ impl<StorageImpl> StorageAdapterRead for StorageAdapterWriteTransaction<'_, Stor
 where
     StorageImpl: Storage,
 {
+    fn schema_intern(&self) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+        self.read.schema_intern()
+    }
+
     fn get_many(
         &self,
         requests: &[crate::storage::GetManyRequest<'_>],

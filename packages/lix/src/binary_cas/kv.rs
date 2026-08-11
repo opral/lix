@@ -2740,6 +2740,10 @@ mod tests {
     where
         R: StorageAdapterRead,
     {
+        fn schema_intern(&self) -> &std::sync::Arc<crate::storage_adapter::SchemaInternHandle> {
+            self.inner.schema_intern()
+        }
+
         async fn get_many(
             &self,
             requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],

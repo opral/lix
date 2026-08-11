@@ -18,6 +18,7 @@ mod point;
 mod read_scope;
 #[cfg(test)]
 mod reader;
+mod schema_intern;
 mod spaces;
 mod stats;
 mod write_set;
@@ -43,8 +44,11 @@ pub(crate) use crate::storage::{PutBatch, PutEntry};
 pub use context::StorageAdapter;
 pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
-pub(crate) use read_scope::SharedStorageAdapterRead;
+pub(crate) use read_scope::{SharedStorageAdapterRead, schema_intern_of};
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
+pub(crate) use schema_intern::{
+    SCHEMA_INTERN_ID_BYTES, SCHEMA_INTERN_SPACE, SchemaIntern, SchemaInternHandle, SchemaInternId,
+};
 pub(crate) use spaces::{
     REVISION_KEY_BINARY_CAS_EPOCH, REVISION_KEY_CATALOG, REVISION_KEY_FILESYSTEM_PATH,
     REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE, load_revision, load_revisions, revision_key,
