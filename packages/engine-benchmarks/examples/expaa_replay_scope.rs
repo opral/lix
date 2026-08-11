@@ -41,6 +41,13 @@ async fn main() {
         .next()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10);
+    // Checkpoints re-home live rows onto one commit and parent the previous
+    // checkpoint directly, so they are a candidate natural resume point. Pass a
+    // non-zero interval to test whether they bound the replay set on their own.
+    let checkpoint_every = args
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
     assert!(commits >= 2, "need at least two commits to measure growth");
 
     let directory = tempfile::tempdir().expect("create RocksDB directory");
@@ -61,18 +68,28 @@ async fn main() {
     let _ = take_root_replay_cost_attribution();
 
     let mut latencies = Vec::with_capacity(commits);
+    let mut checkpoints = 0_usize;
     let run_start = Instant::now();
     for index in 0..commits {
         let start = Instant::now();
         commit_batch(&session, index, rows_per_commit).await;
         latencies.push(start.elapsed());
+        if checkpoint_every > 0 && (index + 1) % checkpoint_every == 0 {
+            session
+                .create_checkpoint()
+                .await
+                .expect("checkpoint should publish");
+            checkpoints += 1;
+        }
     }
     let wall = run_start.elapsed();
 
     let accounting = take_root_replay_accounting();
     let attribution = take_root_replay_cost_attribution();
 
-    println!("expAA_replay_scope commits={commits} rows_per_commit={rows_per_commit}");
+    println!(
+        "expAA_replay_scope commits={commits} rows_per_commit={rows_per_commit} checkpoint_every={checkpoint_every} checkpoints={checkpoints}"
+    );
     println!("wall_ms {:.1}", wall.as_secs_f64() * 1000.0);
     println!(
         "boundaries {} plans_loaded {} plans_staged {} max_plans_in_one_boundary {}",
