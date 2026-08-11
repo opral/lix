@@ -11976,6 +11976,96 @@ mod tests {
         .expect("explicit empty control should authenticate an empty scope");
     }
 
+    /// A collection-generation fence retires every tracked member older than
+    /// the marker. Untracked rows carry no `commit_id`, so the commit-ordered
+    /// comparison that implements the fence is false for them; once tracked
+    /// and untracked rows share one serving generation, a tracked collection
+    /// replacement would silently delete the branch's history-free rows in the
+    /// same schema scope unless they are exempt.
+    #[tokio::test]
+    async fn collection_generation_fence_retires_stale_tracked_rows_but_not_untracked_rows() {
+        const BRANCH_ID: &str = "fence-branch";
+        const SCHEMA_KEY: &str = "fence_schema";
+        let old_generation = CommitId::for_test_label("fence-old-generation");
+        let generation = CommitId::for_test_label("fence-new-generation");
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: SCHEMA_KEY,
+            file_id: None,
+        };
+
+        let stale_tracked = HeadRowIdentity {
+            schema_key: SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single("stale-tracked"),
+            file_id: None,
+        };
+        let untracked = HeadRowIdentity {
+            schema_key: SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single("live-untracked"),
+            file_id: None,
+        };
+        let marker = HeadRowIdentity {
+            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single(crate::collection_generation::collection_scope_key(scope)),
+            file_id: None,
+        };
+
+        let rows = HotRowMap::from([
+            // Older than the fence: must be retired.
+            (
+                stale_tracked,
+                encoded_test_hot_value(old_generation, false, false),
+            ),
+            // History-free: the fence cannot speak about it.
+            (untracked.clone(), encoded_test_hot_value(generation, true, false)),
+            (marker, encoded_test_hot_value(generation, false, false)),
+        ]);
+
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = StorageWriteSet::new();
+        stage_complete_collection_controls(&mut writes, BRANCH_ID, generation, &rows)
+            .expect("fence controls should stage");
+        stage_complete_hot_rows(&mut writes, BRANCH_ID, generation, rows);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fence fixture should publish");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fence fixture should read");
+        let reader = HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+        };
+        let batch = reader
+            .scan_live_batch_for_generation(
+                BRANCH_ID,
+                generation,
+                None,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![SCHEMA_KEY.to_owned()],
+                        ..TrackedStateFilter::default()
+                    },
+                    read_columns: TrackedStateReadColumns::default(),
+                    limit: None,
+                },
+            )
+            .await
+            .expect("fenced scope should scan");
+
+        let surviving = batch
+            .iter()
+            .map(|row| (row.entity_pk().clone(), row.untracked()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            surviving,
+            vec![(EntityPk::single("live-untracked"), true)],
+            "the fence must retire the stale tracked row and keep the untracked row"
+        );
+    }
+
     #[tokio::test]
     async fn exact_collection_closure_distinguishes_bootstrap_from_published_missing_digest() {
         const BRANCH_ID: &str = "closure-bootstrap-branch";
