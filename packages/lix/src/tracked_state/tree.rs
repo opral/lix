@@ -631,6 +631,7 @@ impl TrackedStateTree {
         chunks: &mut PendingChunkBatchBuilder,
     ) -> Result<FrontierRewrite, LixError> {
         let first_key = events.first().map_or(&[][..], |event| event.key.as_ref());
+        let last_key = events.last().map_or(&[][..], |event| event.key.as_ref());
         let start = children
             .iter()
             .position(|child| child.last_key.as_ref() >= first_key)
@@ -707,7 +708,7 @@ impl TrackedStateTree {
                 let mut candidate_chunks = PendingChunkBatchBuilder::default();
                 let candidate = self.build_leaf_level(merged, &mut candidate_chunks);
                 if let Some((generated, existing)) =
-                    first_resync_index(&candidate, &children[start..], first_key)
+                    first_resync_index(&candidate, &children[start..], last_key)
                 {
                     for summary in &candidate[..generated] {
                         chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
@@ -751,6 +752,7 @@ impl TrackedStateTree {
         chunks: &mut PendingChunkBatchBuilder,
     ) -> Result<FrontierRewrite, LixError> {
         let first_key = events.first().map_or(&[][..], |event| event.key.as_ref());
+        let last_key = events.last().map_or(&[][..], |event| event.key.as_ref());
         let start = children
             .iter()
             .position(|child| child.last_key.as_ref() >= first_key)
@@ -816,7 +818,7 @@ impl TrackedStateTree {
                     &mut candidate_chunks,
                 );
                 if let Some((generated, existing)) =
-                    first_resync_index(&candidate, &children[start..], first_key)
+                    first_resync_index(&candidate, &children[start..], last_key)
                 {
                     for summary in &candidate[..generated] {
                         chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
@@ -2402,12 +2404,13 @@ fn estimate_internal_chunk_size(
 fn first_resync_index(
     generated: &[ChildSummary],
     existing: &[ChildSummary],
-    mutation_key: &[u8],
+    last_mutation_key: &[u8],
 ) -> Option<(usize, usize)> {
     for (generated_index, generated) in generated.iter().enumerate() {
-        // A matching old chunk before the mutation key is only unchanged
-        // prefix; resync is only valid after the mutation has been emitted.
-        if generated.first_key.as_ref() <= mutation_key {
+        // A matching old chunk before the final mutation key is only an
+        // unchanged gap within the frontier. Resync is valid only after every
+        // mutation in the batch has been emitted.
+        if generated.first_key.as_ref() <= last_mutation_key {
             continue;
         }
         if let Some(existing_index) = existing.iter().position(|existing| generated == existing) {
@@ -4129,6 +4132,55 @@ mod tests {
             );
             current = fast.root_id;
         }
+    }
+
+    #[tokio::test]
+    async fn batch_frontier_does_not_resync_between_mutations() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 128,
+            min_chunk_bytes: 64,
+            max_chunk_bytes: 256,
+        });
+        let initial = (0..256)
+            .map(|index| {
+                mutation_owned(
+                    key("schema", None, &format!("entity-{index:04}")),
+                    value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
+                )
+            })
+            .collect::<Vec<_>>();
+        let base = apply_mutations_for_test(&tree, &storage, None, initial, None)
+            .await
+            .expect("base should build");
+        let first_key = key("schema", None, "entity-0010");
+        let first_value = value("first-updated", Some("{\"updated\":10}"));
+        let last_key = key("schema", None, "entity-0240");
+        let last_value = value("last-updated", Some("{\"updated\":240}"));
+        let updated = apply_mutations_for_test(
+            &tree,
+            &storage,
+            Some(&base.root_id),
+            vec![
+                mutation(&first_key, &first_value),
+                mutation(&last_key, &last_value),
+            ],
+            None,
+        )
+        .await
+        .expect("batch frontier should apply");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+
+        assert_eq!(
+            tree.get_many(&read, &updated.root_id, &[first_key, last_key])
+                .await
+                .expect("updated rows should load"),
+            vec![Some(first_value), Some(last_value)],
+        );
+        assert_eq!(updated.row_count, base.row_count);
     }
 
     #[test]
