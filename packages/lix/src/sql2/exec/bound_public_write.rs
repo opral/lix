@@ -750,7 +750,13 @@ async fn try_execute_entity_update_batch(
             if columns.primary_keys.is_null(row_index) {
                 return Ok(None);
             }
-            EntityPk::single(columns.primary_keys.value(row_index).to_owned())
+            let Ok(entity_pk) = EntityPk::from_external_parts(
+                vec![columns.primary_keys.value(row_index).to_owned()],
+                &spec.primary_key_component_types,
+            ) else {
+                return Ok(None);
+            };
+            entity_pk
         } else {
             let params = parameter_batch_row_values(parameter_batch, row_index)
                 .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
@@ -758,7 +764,13 @@ async fn try_execute_entity_update_batch(
                 let Some(Value::Text(value)) = params.get(param_index) else {
                     return Ok(None);
                 };
-                EntityPk::single(value.clone())
+                let Ok(entity_pk) = EntityPk::from_external_parts(
+                    vec![value.clone()],
+                    &spec.primary_key_component_types,
+                ) else {
+                    return Ok(None);
+                };
+                entity_pk
             } else {
                 let Some(mut row_entity_pks) = bound_entity_pks_from_primary_key_predicate(
                     &spec,
@@ -3326,7 +3338,9 @@ pub(crate) fn prepare_path_value_replacement_program(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
 ) -> Option<PreparedPathValueReplacementProgram> {
-    if spec.has_inter_row_constraints
+    if spec.primary_key_component_types.as_slice()
+        != [crate::entity_pk::EntityPkComponentType::String]
+        || spec.has_inter_row_constraints
         || !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
         || plan.bound.returning.is_some()

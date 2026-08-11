@@ -128,7 +128,7 @@ where
                     "untracked state is no longer supported",
                 ));
             }
-            Ok(view
+            let slots = view
                 .branch_range(
                     &branch_id,
                     lower.as_deref(),
@@ -143,6 +143,9 @@ where
                     branch_id: branch_id.to_string(),
                 })
                 .filter(|slot| request.filter.include_tombstones || !slot_is_deleted(slot))
+                .collect();
+            Ok(filter_slots_by_file_id(slots, &request.filter.file_ids)?
+                .into_iter()
                 .take(request.limit.unwrap_or(usize::MAX))
                 .collect())
         },
@@ -168,7 +171,7 @@ where
                     "untracked state is no longer supported",
                 ));
             }
-            Ok(view
+            let slots = view
                 .branch_range(
                     &branch_id,
                     lower.as_deref(),
@@ -183,6 +186,9 @@ where
                     branch_id: branch_id.to_string(),
                 })
                 .filter(|slot| request.filter.include_tombstones || !slot_is_deleted(slot))
+                .collect();
+            Ok(filter_slots_by_file_id(slots, &request.filter.file_ids)?
+                .into_iter()
                 .take(request.limit.unwrap_or(usize::MAX))
                 .collect())
         },
@@ -191,7 +197,51 @@ where
 }
 
 fn range_source_options(request: &EntityScanRequest) -> (Option<usize>, bool) {
-    (request.limit, request.filter.include_tombstones)
+    (
+        request
+            .filter
+            .file_ids
+            .is_empty()
+            .then_some(request.limit)
+            .flatten(),
+        request.filter.include_tombstones,
+    )
+}
+
+fn filter_slots_by_file_id(
+    slots: Vec<EntityStateSlot>,
+    file_ids: &[crate::NullableKeyFilter<String>],
+) -> Result<Vec<EntityStateSlot>, LixError> {
+    if file_ids.is_empty()
+        || file_ids
+            .iter()
+            .any(|filter| matches!(filter, crate::NullableKeyFilter::Any))
+    {
+        return Ok(slots);
+    }
+    slots
+        .into_iter()
+        .filter_map(|slot| {
+            let key = match &slot {
+                EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                    decode_state_key(&row.key)
+                }
+            };
+            match key {
+                Ok(key) => file_ids
+                    .iter()
+                    .any(|filter| match filter {
+                        crate::NullableKeyFilter::Null => key.file_id.is_none(),
+                        crate::NullableKeyFilter::Value(file_id) => {
+                            key.file_id.as_deref() == Some(file_id.as_str())
+                        }
+                        crate::NullableKeyFilter::Any => true,
+                    })
+                    .then_some(Ok(slot)),
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
 }
 
 async fn scan_slots_by_branches<F, Fut>(
@@ -554,5 +604,78 @@ pub(crate) fn row_snapshot(row: &StateRow) -> Option<&str> {
     match &row.value.cell {
         StateCell::Value(value) => Some(value.as_ref()),
         StateCell::Null | StateCell::Tombstone => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::{LixTimestamp, SharedStr};
+    use crate::forktree::{StateValue, encode_state_key};
+    use crate::state::StateRowSource;
+
+    fn row(file_id: Option<&str>) -> EntityStateSlot {
+        let entity_pk = EntityPk::single("shared-plugin-row");
+        EntityStateSlot::Tracked(StateRow {
+            key: encode_state_key(StateKeyRef {
+                schema_key: "plugin_row",
+                file_id,
+                entity_pk: &entity_pk,
+            }),
+            value: StateValue {
+                change_id: ChangeId::for_test_label("entity-file-filter-change"),
+                commit_id: CommitId::for_test_label("entity-file-filter-commit"),
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                cell: StateCell::Value(SharedStr::from("{}")),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source: StateRowSource::Branch,
+        })
+    }
+
+    #[test]
+    fn file_filter_selects_one_owner_before_limit_for_shared_plugin_identity() {
+        let request = EntityScanRequest {
+            filter: EntityScanFilter {
+                file_ids: vec![crate::NullableKeyFilter::Value("file-b".to_string())],
+                ..EntityScanFilter::default()
+            },
+            limit: Some(1),
+            ..EntityScanRequest::default()
+        };
+        assert_eq!(range_source_options(&request).0, None);
+        let selected = filter_slots_by_file_id(
+            vec![row(Some("file-a")), row(Some("file-b"))],
+            &request.filter.file_ids,
+        )
+        .expect("authenticated file-owner filter");
+        assert_eq!(selected.len(), 1);
+        let key = match &selected[0] {
+            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                decode_state_key(&row.key).expect("typed state key")
+            }
+        };
+        assert_eq!(key.file_id.as_deref(), Some("file-b"));
+    }
+
+    #[test]
+    fn file_filter_rejects_malformed_authenticated_key() {
+        let mut malformed = row(Some("file-a"));
+        match &mut malformed {
+            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                row.key = vec![0xff];
+            }
+        }
+        assert!(
+            filter_slots_by_file_id(
+                vec![malformed],
+                &[crate::NullableKeyFilter::Value("file-a".to_string())],
+            )
+            .is_err()
+        );
     }
 }
