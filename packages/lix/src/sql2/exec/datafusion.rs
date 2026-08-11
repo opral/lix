@@ -3306,8 +3306,8 @@ mod tests {
 
     use super::{
         SqlExecutionContext, SqlWriteExecutionContext, build_write_session_with_options,
-        execute_sql, row_values_from_batch, write_provider_selection, write_session_options,
-        write_target_table_name,
+        execute_sql, query_result_from_batches, row_values_from_batch, write_provider_selection,
+        write_session_options, write_target_table_name,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
