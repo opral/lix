@@ -2394,8 +2394,13 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_propertyless_update_schema \
-                 (lixcol_metadata, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json('{\"phase\":\"before\"}'), false, false)",
+                 (lixcol_entity_pk, lixcol_metadata, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                   lix_json('[\"propertyless-row\"]'),\
+                   lix_json('{\"phase\":\"before\"}'),\
+                   false,\
+                   false\
+                 )",
                 &[],
             )
             .await
@@ -2405,7 +2410,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_propertyless_update_schema \
                  SET lixcol_metadata = lix_json('{\"phase\":\"after\"}') \
-                 WHERE lixcol_entity_pk = lix_json('[]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"propertyless-row\"]')",
                 &[],
             )
             .await
@@ -2416,7 +2421,7 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM engine_propertyless_update_schema \
-                     WHERE lixcol_entity_pk = lix_json('[]')",
+                     WHERE lixcol_entity_pk = lix_json('[\"propertyless-row\"]')",
                     &[],
                 )
                 .await
