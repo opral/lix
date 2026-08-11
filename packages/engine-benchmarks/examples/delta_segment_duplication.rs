@@ -70,6 +70,13 @@ async fn main() {
         .next()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10_000);
+    // Rows touched by one workload commit. The segment plane only receives a
+    // commit whose mutation count clears the ordered-part geometry, so the edit
+    // width is the variable that decides whether this plane is exercised at all.
+    let window = arguments
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| (rows / 100).max(1));
     let selected = arguments.next().map(|value| {
         value
             .split(',')
@@ -84,11 +91,11 @@ async fn main() {
         {
             continue;
         }
-        run_workload(workload, rows).await;
+        run_workload(workload, rows, window).await;
     }
 }
 
-async fn run_workload(workload: &str, rows: usize) {
+async fn run_workload(workload: &str, rows: usize, window: usize) {
     let directory = tempfile::tempdir().expect("create duplication-audit directory");
     let storage = RocksDB::open(directory.path()).expect("open duplication-audit RocksDB");
     Engine::initialize(storage.clone())
@@ -104,7 +111,6 @@ async fn run_workload(workload: &str, rows: usize) {
     register_schema(&main).await;
     seed_rows(&main, rows).await;
 
-    let window = (rows / 100).max(1);
     apply_workload(&engine, &main, workload, window).await;
 
     storage.flush().expect("flush duplication-audit RocksDB");
