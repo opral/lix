@@ -2362,6 +2362,66 @@ simulation_test!(
 );
 
 simulation_test!(
+    propertyless_entity_metadata_update_keeps_internal_snapshot_projection,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                   lix_json('{\"x-lix-key\":\"engine_propertyless_update_schema\",\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}'),\
+                   false,\
+                   false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("propertyless schema should register");
+
+        session
+            .execute(
+                "INSERT INTO engine_propertyless_update_schema \
+                 (lixcol_metadata, lixcol_global, lixcol_untracked) \
+                 VALUES (lix_json('{\"phase\":\"before\"}'), false, false)",
+                &[],
+            )
+            .await
+            .expect("propertyless entity should insert");
+
+        session
+            .execute(
+                "UPDATE engine_propertyless_update_schema \
+                 SET lixcol_metadata = lix_json('{\"phase\":\"after\"}') \
+                 WHERE lixcol_entity_pk = lix_json('[]')",
+                &[],
+            )
+            .await
+            .expect("metadata-only update should retain its internal source snapshot");
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT lixcol_metadata \
+                     FROM engine_propertyless_update_schema \
+                     WHERE lixcol_entity_pk = lix_json('[]')",
+                    &[],
+                )
+                .await
+                .expect("updated propertyless entity should remain readable"),
+            vec![vec![Value::Json(json!({"phase": "after"}))]],
+        );
+    }
+);
+
+simulation_test!(
     typed_entity_update_preserves_absent_optional_non_nullable_fields,
     |sim| async move {
         let engine = sim.boot_engine().await;

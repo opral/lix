@@ -417,7 +417,23 @@ impl EntitySpec {
         returning: Option<DmlReturning>,
     ) -> Result<PlannedDml> {
         reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
-        let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
+        let (schema, mut request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
+        // UPDATE needs the complete source snapshot even when the public
+        // entity schema has no projected properties (for example, a
+        // metadata-only update on a propertyless schema). Keep that internal
+        // dependency on the retained live-state scan rather than exposing a
+        // raw snapshot column through SQL.
+        if !request
+            .projection
+            .columns
+            .iter()
+            .any(|column| column == "snapshot_content")
+        {
+            request
+                .projection
+                .columns
+                .push("snapshot_content".to_string());
+        }
         let batch_projection = EntityBatchProjection::for_request(&request);
         let update_snapshots = Arc::new(Mutex::new(BTreeMap::new()));
         let source = row_source(
