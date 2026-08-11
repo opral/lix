@@ -3862,7 +3862,8 @@ where
             .copied()
             .collect::<Vec<_>>();
         self.chunk_overlay
-            .stage_selected_chunks(self.writes, promoted.iter().copied())?;
+            .stage_selected_chunks(self.store, self.writes, promoted.iter().copied())
+            .await?;
         for hash in promoted {
             self.transient_chunk_hashes.remove(&hash);
         }

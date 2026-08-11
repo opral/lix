@@ -12001,11 +12001,50 @@ fn trace_staged_chunk(hash: &[u8; TRACKED_STATE_HASH_BYTES], bytes: &[u8]) {
 #[derive(Debug, Default)]
 pub(crate) struct TrackedStateChunkOverlay {
     chunks: HashMap<[u8; TRACKED_STATE_HASH_BYTES], Bytes>,
+    /// Chunk digests this writer has proven are already durable at its read
+    /// snapshot. The space is content-addressed, so a present key is the same
+    /// bytes by construction and re-writing it is a no-op the backend cannot
+    /// elide for a mutable space.
+    known_durable: HashSet<[u8; TRACKED_STATE_HASH_BYTES]>,
 }
 
 impl TrackedStateChunkOverlay {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Records which of `hashes` are already durable, using one presence-only
+    /// batched point read. Digests already proven durable are not probed again.
+    async fn probe_durable_digests(
+        &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        hashes: impl IntoIterator<Item = [u8; TRACKED_STATE_HASH_BYTES]>,
+    ) -> Result<(), LixError> {
+        let candidates = hashes
+            .into_iter()
+            .filter(|hash| !self.known_durable.contains(hash))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let keys = candidates
+            .iter()
+            .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+            .collect::<Vec<_>>();
+        let requests = [StorageGetManyRequest {
+            space: TRACKED_STATE_TREE_CHUNK_SPACE,
+            keys: &keys,
+            opts: StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        }];
+        let result = exact_get_many(store, &requests).await?;
+        for (hash, value) in candidates.into_iter().zip(result.values) {
+            if value.is_some() {
+                self.known_durable.insert(hash);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn staged_chunk(&self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) -> Option<&[u8]> {
@@ -12016,12 +12055,24 @@ impl TrackedStateChunkOverlay {
         self.chunks.keys().copied()
     }
 
-    pub(crate) fn stage_selected_chunks(
-        &self,
+    pub(crate) async fn stage_selected_chunks(
+        &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         hashes: impl IntoIterator<Item = [u8; TRACKED_STATE_HASH_BYTES]>,
     ) -> Result<(), LixError> {
+        let hashes = hashes.into_iter().collect::<Vec<_>>();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        // Transient chunks live only in the overlay, so the durable probe must
+        // run against the digests themselves rather than the staged-chunk map.
+        self.probe_durable_digests(store, hashes.iter().copied())
+            .await?;
         for hash in hashes {
+            if self.known_durable.contains(&hash) {
+                continue;
+            }
             let bytes = self.chunks.get(&hash).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -12047,13 +12098,24 @@ impl TrackedStateChunkOverlay {
         self.chunks.get(hash).cloned()
     }
 
-    pub(crate) fn stage_chunks(
+    /// Stages the chunks this rewrite produced, skipping any digest already
+    /// durable at the writer's read snapshot.
+    ///
+    /// The tracked-state tree is content-addressed, so an existing key is
+    /// necessarily the same bytes. A mutable storage space has no
+    /// already-present skip of its own (RocksDB's lives behind
+    /// `ValueSemantics::Immutable`; SlateDB's mutable path writes straight into
+    /// its overlay), so without this filter a root rewrite that re-derives an
+    /// ancestor's nodes pays the full write-set, WAL, memtable and compaction
+    /// cost for bytes that are already on disk.
+    pub(crate) async fn stage_chunks(
         &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         chunks: &PendingChunkBatch,
-    ) {
+    ) -> Result<(), LixError> {
         if chunks.is_empty() {
-            return;
+            return Ok(());
         }
         let trace = tree_chunk_trace_enabled();
         if trace {
@@ -12067,10 +12129,21 @@ impl TrackedStateChunkOverlay {
                     .sum::<usize>(),
             );
         }
+        self.probe_durable_digests(store, chunks.chunks().iter().map(|chunk| chunk.hash))
+            .await?;
         let mut key_arena =
             Vec::with_capacity(chunks.len().saturating_mul(TRACKED_STATE_HASH_BYTES));
         let mut puts = Vec::with_capacity(chunks.len());
         for chunk in chunks.chunks() {
+            // Overlay residency is independent of staging: an in-flight rewrite
+            // still reads a durable-skipped node through the overlay.
+            self.chunks.insert(chunk.hash, chunks.chunk_data(*chunk));
+            if self.known_durable.contains(&chunk.hash) {
+                if trace {
+                    eprintln!("TCTRACE skip_durable len={}", chunk.data_len);
+                }
+                continue;
+            }
             let key_start = key_arena.len();
             key_arena.extend_from_slice(&chunk.hash);
             puts.push(EncodedPut {
@@ -12080,7 +12153,9 @@ impl TrackedStateChunkOverlay {
             if trace {
                 trace_staged_chunk(&chunk.hash, &chunks.chunk_data(*chunk));
             }
-            self.chunks.insert(chunk.hash, chunks.chunk_data(*chunk));
+        }
+        if puts.is_empty() {
+            return Ok(());
         }
         let batch = EncodedMutationBatch::try_new(
             Bytes::from(key_arena),
@@ -12090,6 +12165,7 @@ impl TrackedStateChunkOverlay {
         )
         .expect("tracked-state chunk batch descriptors must match their arenas");
         writes.stage_content_addressed_encoded_batch(TRACKED_STATE_TREE_CHUNK_SPACE, batch);
+        Ok(())
     }
 }
 
@@ -15372,8 +15448,12 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn large_chunk_batch_stages_two_shared_arenas() {
+    #[tokio::test]
+    async fn large_chunk_batch_stages_two_shared_arenas() {
+        let store = StorageAdapter::new(Memory::new())
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await
+            .expect("open empty snapshot");
         let chunk_count = 4_096;
         let mut data_arena = Vec::with_capacity(chunk_count * 64);
         let mut descriptors = Vec::with_capacity(chunk_count);
@@ -15390,7 +15470,10 @@ mod tests {
         let chunks = PendingChunkBatch::from_parts(Bytes::from(data_arena), descriptors);
         let mut writes = StorageWriteSet::new();
         let mut overlay = TrackedStateChunkOverlay::new();
-        overlay.stage_chunks(&mut writes, &chunks);
+        overlay
+            .stage_chunks(&store, &mut writes, &chunks)
+            .await
+            .expect("stage chunks against an empty durable store");
 
         let arena = writes.arena_stats();
         assert_eq!(arena.put_descriptors, chunk_count);
