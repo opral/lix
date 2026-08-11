@@ -96,7 +96,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    checkpoint_gc_keeps_commits_referenced_by_another_branch,
+    checkpoint_gc_keeps_then_reclaims_recovered_branch_interval,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -121,9 +121,11 @@ simulation_test!(
         .await
         .expect("protected interval update should succeed");
         let protected_head = branch_head(&engine, sim.main_branch_id()).await;
-        main.create_checkpoint()
+        let compacted_checkpoint = main
+            .create_checkpoint()
             .await
-            .expect("checkpoint retaining the first interval should succeed");
+            .expect("checkpoint retaining the first interval should succeed")
+            .commit_id;
 
         main.create_branch(CreateBranchOptions {
             id: Some("01920000-0000-7000-8000-000000000510".to_string()),
@@ -132,6 +134,25 @@ simulation_test!(
         })
         .await
         .expect("branch should be created from the recoverable auto-commit");
+        let protected = sim.wrap_session(
+            engine
+                .open_session("01920000-0000-7000-8000-000000000510")
+                .await
+                .expect("protected branch session should open"),
+            &engine,
+        );
+        protected
+            .execute(
+                "UPDATE lix_key_value SET value = 'protected-source' WHERE key = 'branch-gc-key'",
+                &[],
+            )
+            .await
+            .expect("first source commit should consume the checkpoint bridge");
+        let source_head = branch_head(&engine, "01920000-0000-7000-8000-000000000510").await;
+        assert_eq!(
+            commit_parent_edges(&main, &source_head).await,
+            vec![(protected_head.clone(), 0), (compacted_checkpoint, 1),],
+        );
         advance_to_next_gc(&main, 1).await;
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('main-after-branch', 'main')",
@@ -145,13 +166,6 @@ simulation_test!(
 
         assert_commits(&main, &[&protected_first, &protected_head], true).await;
 
-        let protected = sim.wrap_session(
-            engine
-                .open_session("01920000-0000-7000-8000-000000000510")
-                .await
-                .expect("protected branch session should open"),
-            &engine,
-        );
         let state = protected
             .execute(
                 "SELECT value FROM lix_key_value WHERE key = 'branch-gc-key'",
@@ -161,8 +175,24 @@ simulation_test!(
             .expect("protected branch state should remain readable");
         assert_eq!(
             state.rows()[0].values(),
-            &[Value::Json(json!("protected-head"))]
+            &[Value::Json(json!("protected-source"))]
         );
+
+        drop(protected);
+        main.execute(
+            "DELETE FROM lix_branch WHERE id = '01920000-0000-7000-8000-000000000510'",
+            &[],
+        )
+        .await
+        .expect("protected branch should delete");
+        for _ in 0..CHECKPOINT_GC_INTERVAL {
+            main.create_checkpoint()
+                .await
+                .expect("post-delete GC checkpoint should succeed");
+        }
+        // This contract covers the recovered pre-checkpoint interval. The
+        // deleted branch's final head has independent history/undo ownership.
+        wait_for_commits(&main, &[&protected_first, &protected_head], false).await;
     }
 );
 
@@ -462,6 +492,34 @@ async fn branch_head(engine: &lix::integration::Engine, branch_id: &str) -> Stri
         .await
         .expect("branch head should load")
         .expect("branch head should exist")
+}
+
+async fn commit_parent_edges(
+    session: &support::simulation_test::engine::SimSession,
+    commit_id: &str,
+) -> Vec<(String, i64)> {
+    session
+        .execute(
+            &format!(
+                "SELECT parent_id, parent_order FROM lix_commit_edge \
+                 WHERE child_id = '{commit_id}' ORDER BY parent_order"
+            ),
+            &[],
+        )
+        .await
+        .expect("commit parent edges should read")
+        .rows()
+        .iter()
+        .map(|row| {
+            let Value::Text(parent_id) = &row.values()[0] else {
+                panic!("parent id should be text");
+            };
+            let Value::Integer(parent_order) = row.values()[1] else {
+                panic!("parent order should be integer");
+            };
+            (parent_id.clone(), parent_order)
+        })
+        .collect()
 }
 
 async fn assert_commits(

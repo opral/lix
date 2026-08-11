@@ -43,10 +43,15 @@ where
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
         self.with_write_transaction_lending(async move |transaction| {
-            let branch_id = options
-                .id
-                .unwrap_or_else(|| transaction.functions().call_uuid_v7().to_string());
-            let source_head = if let Some(from_commit_id) = options.from_commit_id {
+            let CreateBranchOptions {
+                id,
+                name,
+                from_commit_id,
+            } = options;
+            let branch_id =
+                id.unwrap_or_else(|| transaction.functions().call_uuid_v7().to_string());
+            let explicit_historical_source = from_commit_id.is_some();
+            let source_head = if let Some(from_commit_id) = from_commit_id {
                 let from_commit_id = BranchLifecycle::parse_commit_id(
                     &from_commit_id,
                     BranchOperation::CreateBranch,
@@ -74,11 +79,7 @@ where
             };
 
             let mut rows = RawWriteBatch::with_capacity(2);
-            rows.push(branch_descriptor_stage_row(
-                &branch_id,
-                &options.name,
-                false,
-            ));
+            rows.push(branch_descriptor_stage_row(&branch_id, &name, false));
             rows.push(branch_ref_stage_row(&branch_id, &source_head));
             transaction
                 .stage_write(TransactionWrite::Rows {
@@ -86,10 +87,16 @@ where
                     rows,
                 })
                 .await?;
+            if explicit_historical_source {
+                transaction.stage_branch_checkpoint_replacement_resolution(
+                    branch_id.clone(),
+                    source_head,
+                )?;
+            }
 
             Ok(CreateBranchReceipt {
                 id: branch_id,
-                name: options.name,
+                name,
                 hidden: false,
                 commit_id: source_head.to_string(),
             })
