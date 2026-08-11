@@ -129,8 +129,8 @@ async fn commits_scenario(samples: &[usize], rows_per_commit: usize, gc_rounds: 
             .await
             .expect("commit repository GC");
         println!(
-            "expv_gc,scenario=commits,round={round},commits={committed},staged_deletes={},swept_commits={}",
-            result.staged_deletes, result.swept_commits
+            "expv_gc,scenario=commits,round={round},commits={committed},staged_deletes={},swept_commits={},plan_us={},commit_us={}",
+            result.staged_deletes, result.swept_commits, result.plan_us, result.commit_us
         );
         report(
             "commits",
@@ -304,8 +304,8 @@ async fn checkpoint_then_gc_scenario(commits: usize, rows_per_commit: usize, gc_
             .await
             .expect("commit repository GC");
         println!(
-            "expv_gc,scenario=checkpoint_then_gc,round={round},commits={commits},staged_deletes={},swept_commits={}",
-            result.staged_deletes, result.swept_commits
+            "expv_gc,scenario=checkpoint_then_gc,round={round},commits={commits},staged_deletes={},swept_commits={},plan_us={},commit_us={}",
+            result.staged_deletes, result.swept_commits, result.plan_us, result.commit_us
         );
         report(
             "checkpoint_then_gc",
