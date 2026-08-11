@@ -6619,7 +6619,6 @@ mod tests {
             &read,
             &mut writes,
             &BTreeMap::new(),
-            &BTreeMap::new(),
             &PreparedStateBatch::new(),
             &[],
             &BTreeMap::from([(branch_id.to_owned(), target)]),
