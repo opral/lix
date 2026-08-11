@@ -1220,36 +1220,34 @@ where
         .await?;
 
     // Retire the derived candidates. Nothing here is ordered and nothing is
-    // capped: a candidate that is still pinned holds back only itself.
-    //
-    // The one coupling that must survive is between the two planes. A commit
-    // leaves the derived inventory the moment its manifest goes, so its
-    // canonical projection must go in the same pass or never — retiring the
-    // projection of a commit that still owns physical state would strand that
-    // state instead.
+    // capped: a candidate that is still pinned holds back only itself, and the
+    // two planes prove retirement independently. The ledger could do neither —
+    // it consumed a queue in publication order and stopped at the first blocked
+    // row, so one permanently live root at the head froze every younger
+    // candidate behind it forever.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
     for commit_id in candidates {
+        if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
+            && reclaimed_semantic_commits.insert(commit_id)
+        {
+            crate::changelog::stage_delete_commit_projection(&store, writes, commit_id).await?;
+        }
         if blocked_physical_dependency_ids.contains(&commit_id) {
             continue;
         }
-        if !reclaimed_commits.insert(commit_id) {
-            continue;
-        }
-        crate::tracked_state::stage_retire_commit_physical_state(
-            &store,
-            writes,
-            commit_id,
-            RetainedPhysicalState {
-                mutation_nodes: &active_mutation_nodes,
-                scoped_nodes: &active_scoped_nodes,
-                native_parts: &active_current_parts,
-            },
-        )
-        .await?;
-        if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids) {
-            crate::changelog::stage_delete_commit_projection(&store, writes, commit_id).await?;
-            reclaimed_semantic_commits.insert(commit_id);
+        if reclaimed_commits.insert(commit_id) {
+            crate::tracked_state::stage_retire_commit_physical_state(
+                &store,
+                writes,
+                commit_id,
+                RetainedPhysicalState {
+                    mutation_nodes: &active_mutation_nodes,
+                    scoped_nodes: &active_scoped_nodes,
+                    native_parts: &active_current_parts,
+                },
+            )
+            .await?;
         }
     }
     if !reclaimed_semantic_commits.is_empty() {
