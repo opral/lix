@@ -3611,6 +3611,7 @@ mod tests {
         let row_identity = identity(branch_id, generation, "row");
         stage_put(
             &mut writes,
+            storage.schema_intern(),
             &row_identity,
             &HeadValue {
                 change_id: Some(ChangeId::for_test_label("change")),
@@ -3627,6 +3628,7 @@ mod tests {
         .expect("stage v3 row");
         stage_put(
             &mut writes,
+            storage.schema_intern(),
             &identity(branch_id, generation, "deleted"),
             &HeadValue {
                 change_id: Some(ChangeId::for_test_label("deleted-change")),
@@ -3781,6 +3783,7 @@ mod tests {
             };
             stage_put(
                 &mut writes,
+                storage.schema_intern(),
                 &identity,
                 &HeadValue {
                     change_id: Some(ChangeId::for_test_label(entity)),
@@ -4171,6 +4174,7 @@ mod tests {
         for (index, identity) in identities.iter().rev().enumerate() {
             stage_put(
                 &mut writes,
+                storage.schema_intern(),
                 identity,
                 &head_value(&format!("change-{index}"), head),
             )
@@ -4231,7 +4235,7 @@ mod tests {
             columnar_base_coordinate: None,
         };
         let mut writes = StorageWriteSet::new();
-        stage_put(&mut writes, &identity, &value).expect("stage row");
+        stage_put(&mut writes, storage.schema_intern(), &identity, &value).expect("stage row");
         stage_test_current_control(&mut writes, "branch", head, generation, None)
             .expect("stage current control");
         storage
@@ -4394,6 +4398,7 @@ mod tests {
         ] {
             stage_put(
                 &mut writes,
+                storage.schema_intern(),
                 &HeadIdentity {
                     branch_id: branch_id.to_string(),
                     generation,
@@ -4517,6 +4522,7 @@ mod tests {
         let mut initial_writes = StorageWriteSet::new();
         stage_put(
             &mut initial_writes,
+            storage.schema_intern(),
             &HeadIdentity {
                 branch_id: branch_id.to_string(),
                 generation,
@@ -4529,6 +4535,7 @@ mod tests {
         .expect("stage target hot row");
         stage_put(
             &mut initial_writes,
+            storage.schema_intern(),
             &HeadIdentity {
                 branch_id: branch_id.to_string(),
                 generation,
@@ -4653,6 +4660,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         stage_put(
             &mut writes,
+            storage.schema_intern(),
             &identity,
             &head_value("first-change", generation),
         )
@@ -4901,7 +4909,7 @@ mod tests {
         tombstone.snapshot = JsonSlot::None;
         tombstone.metadata = JsonSlot::None;
         let mut writes = StorageWriteSet::new();
-        stage_put(&mut writes, &identity, &tombstone).expect("stage existing tombstone");
+        stage_put(&mut writes, storage.schema_intern(), &identity, &tombstone).expect("stage existing tombstone");
         stage_test_current_control(&mut writes, branch_id, generation, generation, None)
             .expect("stage existing current control");
         storage
@@ -5157,9 +5165,9 @@ mod tests {
             columnar_base_coordinate: None,
         };
         let mut writes = StorageWriteSet::new();
-        stage_put(&mut writes, &active_identity, &untracked(active_snapshot))
+        stage_put(&mut writes, storage.schema_intern(), &active_identity, &untracked(active_snapshot))
             .expect("stage active untracked hot row");
-        stage_put(&mut writes, &stale_identity, &untracked(stale_snapshot))
+        stage_put(&mut writes, storage.schema_intern(), &stale_identity, &untracked(stale_snapshot))
             .expect("stage stale untracked hot row");
         stage_branch_head_control(&mut writes, branch_id, active_control)
             .expect("stage active branch control");

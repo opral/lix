@@ -14017,6 +14017,7 @@ mod tests {
     }
 
     fn single_hot_diff_segment(
+        intern: &SchemaIntern,
         checkpoint_commit_id: CommitId,
         identity: &HeadIdentity,
     ) -> (Vec<u8>, Vec<u8>) {
@@ -14025,7 +14026,7 @@ mod tests {
             checkpoint_commit_id,
             identity.generation,
         );
-        let full_key = encode_hot_diff_key(checkpoint_commit_id, identity);
+        let full_key = encode_hot_diff_key(intern, checkpoint_commit_id, identity);
         let suffix = full_key
             .strip_prefix(scope.as_slice())
             .expect("encoded hot diff identity starts with its scope");
@@ -14515,6 +14516,11 @@ mod tests {
         let checkpoint = CommitId::for_test_label("segmented-hot-diff-checkpoint");
         let generation = CommitId::for_test_label("segmented-hot-diff-generation");
         let scope = encode_working_diff_scope_prefix("branch", checkpoint, generation);
+        let storage = StorageAdapter::new(Memory::new());
+        let segment_schema_id = storage
+            .schema_intern()
+            .assign("schema", &mut StorageWriteSet::new())
+            .expect("assign segment schema id");
         let mut identity_key_bytes = Vec::new();
         let mut identity_puts = Vec::with_capacity(IDENTITY_COUNT);
         let mut expected_coverage = WorkingDiffIndexCoverage::default();
@@ -14523,7 +14529,7 @@ mod tests {
             let key = append_hot_diff_key_parts(
                 &mut identity_key_bytes,
                 &scope,
-                "schema",
+                segment_schema_id,
                 &entity_pk,
                 Some("file.md"),
             );
@@ -14544,7 +14550,6 @@ mod tests {
             "ten thousand short identities should require at most three bounded segments"
         );
 
-        let storage = StorageAdapter::new(Memory::new());
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -15274,11 +15279,15 @@ mod tests {
         let active_identity = diff_identity("active", active_generation, "active-row");
         let stale_identity = diff_identity("stale", stale_generation, "stale-row");
         let orphan_identity = diff_identity("deleted", orphan_generation, "orphan-row");
+        storage
+            .schema_intern()
+            .assign("schema", &mut StorageWriteSet::new())
+            .expect("assign diff segment schema id");
         let (active_key, active_value) =
-            single_hot_diff_segment(active_checkpoint, &active_identity);
-        let (stale_key, stale_value) = single_hot_diff_segment(stale_checkpoint, &stale_identity);
+            single_hot_diff_segment(storage.schema_intern(), active_checkpoint, &active_identity);
+        let (stale_key, stale_value) = single_hot_diff_segment(storage.schema_intern(), stale_checkpoint, &stale_identity);
         let (orphan_key, orphan_value) =
-            single_hot_diff_segment(orphan_checkpoint, &orphan_identity);
+            single_hot_diff_segment(storage.schema_intern(), orphan_checkpoint, &orphan_identity);
 
         let mut writes = StorageWriteSet::new();
         stage_tracked_working_diff_epoch(
