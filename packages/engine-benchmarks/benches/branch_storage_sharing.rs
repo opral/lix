@@ -254,6 +254,19 @@ bytes_per_changed_row={:.2},seed_ms={:.3},scenario_ms={:.3}",
         scenario_elapsed.as_secs_f64() * 1_000.0,
     );
 
+    if scenario == "base" {
+        for (name, counts) in &base.spaces {
+            if counts.rows == 0 {
+                continue;
+            }
+            println!(
+                "branch_sharing_base_space,rep={repetition},backend={backend},rows={rows},\
+space={name},base_rows={},base_key_bytes={},base_value_bytes={}",
+                counts.rows, counts.key_bytes, counts.value_bytes,
+            );
+        }
+    }
+
     let mut names: Vec<&'static str> = base.spaces.keys().copied().collect();
     for name in after.spaces.keys() {
         if !names.contains(name) {
