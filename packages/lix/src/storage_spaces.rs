@@ -12,9 +12,7 @@
 //! covered by all of them the moment it is registered, and an unregistered
 //! space is caught by [`tests::every_declared_space_is_registered`].
 
-use crate::storage_adapter::StorageSpace;
-#[cfg(test)]
-use crate::storage_adapter::StorageSpaceId;
+use crate::storage_adapter::{StorageSpace, StorageSpaceId, ValueSemantics};
 
 /// Every storage space a repository can physically contain, in space-id order.
 ///
@@ -61,11 +59,79 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
     crate::session::UPLOAD_STATE_SPACE,
     crate::session::UPLOAD_MANIFEST_LEAF_SPACE,
-    crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
-    crate::gc::CHECKPOINT_GC_STATE_SPACE,
-    crate::gc::GC_REACHABILITY_DELTA_SPACE,
-    crate::gc::GC_REACHABILITY_QUEUE_SPACE,
+    // `gc.rs` declares these four through the checked constructors rather than
+    // `StorageSpace::declare`, so referencing its constants here would make
+    // `may_declare` read a registry it is in the middle of evaluating. The
+    // rows are stated here instead and `tests::gc_spaces_match_the_registry`
+    // pins the module's constants to them.
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0001),
+        "checkpoint.recovery_ref.v3",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0002),
+        "checkpoint.gc_state.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0003),
+        "gc.reachability_delta.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0004),
+        "gc.reachability_queue.v1",
+        ValueSemantics::Mutable,
+    ),
 ];
+
+/// Space ids the constructor check cannot reject yet.
+///
+/// `gc.rs` re-declares `0x0004_002b` (`tracked_state.commit_state_manifest.v7`)
+/// as mutable so a retention test can delete and overwrite an authority the
+/// engine publishes write-once. Every other engine test states that need
+/// through `StorageSpace::mutable_view_for_corruption_test`, which does not go
+/// through the checked constructors at all. `gc.rs` is owned by the in-flight
+/// GC ledger redesign and is not edited this cycle, so this one id keeps the
+/// weaker, test-enforced treatment: it is reported by
+/// [`tests::no_registered_space_id_is_declared_with_two_value_semantics`], and
+/// [`tests::the_unchecked_ids_are_exactly_the_known_disagreements`] fails the
+/// moment the site goes away and this list becomes stale.
+const UNCHECKED_SPACE_IDS: &[u32] = &[0x0004_002b];
+
+/// Whether a space id may be declared with `semantics`.
+///
+/// Unregistered ids are unconstrained: adapter and conformance suites reuse
+/// small ids such as `SpaceId(7)` for both semantics, and bench-owned spaces
+/// live in `0x00ff_....`, which the registry never allocates.
+pub(crate) const fn may_declare(id: StorageSpaceId, semantics: ValueSemantics) -> bool {
+    let mut index = 0;
+    while index < UNCHECKED_SPACE_IDS.len() {
+        if UNCHECKED_SPACE_IDS[index] == id.0 {
+            return true;
+        }
+        index += 1;
+    }
+    let mut index = 0;
+    while index < ALL_STORAGE_SPACES.len() {
+        let space = ALL_STORAGE_SPACES[index];
+        if space.id.0 == id.0 {
+            return same_semantics(space.value_semantics, semantics);
+        }
+        index += 1;
+    }
+    true
+}
+
+/// `ValueSemantics` derives `PartialEq`, which is not usable in const context.
+const fn same_semantics(left: ValueSemantics, right: ValueSemantics) -> bool {
+    matches!(
+        (left, right),
+        (ValueSemantics::Mutable, ValueSemantics::Mutable)
+            | (ValueSemantics::Immutable, ValueSemantics::Immutable)
+    )
+}
 
 /// Space ids that belonged to spaces this protocol has cut.
 ///
@@ -211,7 +277,14 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         let mut unregistered = Vec::new();
         for (path, source) in engine_sources() {
-            for id in declared_space_ids(&source) {
+            if path.ends_with("storage_spaces.rs") {
+                // This file quotes the constructors it is scanning for.
+                continue;
+            }
+            for site in construction_sites(&source) {
+                let Some(id) = literal_space_id(&site.id_expression) else {
+                    continue;
+                };
                 if !registered.contains(&id) {
                     unregistered.push(format!("0x{id:08x} in {path}"));
                 }
@@ -224,10 +297,218 @@ mod tests {
         );
     }
 
+    /// A space id has exactly one value semantics, and this registry is where
+    /// it is decided.
+    ///
+    /// This is the invariant with the sharpest physical consequences, because
+    /// both adapters *place* data by the declaration rather than merely
+    /// annotating it. RocksDB routes immutable spaces to a separate column
+    /// family (`rocksdb.rs:253-265`). SlateDB moves immutable values out of
+    /// the LSM entirely into per-publication object segments and leaves only a
+    /// locator behind (`slatedb.rs:3395-3460`). A space presented as mutable
+    /// on one call path and immutable on another therefore writes one physical
+    /// location and reads another: on RocksDB the write lands in a column
+    /// family the read never opens, and on SlateDB the raw value overwrites
+    /// the locator at the same key and the next read hands those bytes to
+    /// `decode_immutable_locator`.
+    ///
+    /// That last case is why this guard exists rather than a comment. A
+    /// benchmark wrote plain bytes to `0x0005_0003` as a mutable space — the
+    /// id this registry declares immutable as `binary_cas.chunk` — and the
+    /// accounting scan failed with
+    /// `Corruption("immutable segment locator is invalid")`. It presented as
+    /// data corruption and was a semantics mismatch.
+    ///
+    /// `StorageSpace::mutable` and `::immutable` reject a registered id with
+    /// the other semantics at compile time, so what remains for this scan is
+    /// the ids in [`UNCHECKED_SPACE_IDS`], which the constructors let through,
+    /// and calls whose id is only known at run time.
+    ///
+    /// The scan covers the whole workspace, not just this crate, because that
+    /// benchmark is not in this crate. Ids the registry does not own are
+    /// ignored: adapter and conformance suites legitimately reuse small ids
+    /// such as `SpaceId(7)` for both semantics, and bench-owned spaces live in
+    /// `0x00ff_....`, which the registry never allocates.
+    /// Sites the checked constructors cannot reject, because their id is in
+    /// [`UNCHECKED_SPACE_IDS`].
+    ///
+    /// `gc.rs` re-declares the immutable commit-state manifest space as
+    /// mutable so a retention test can delete and overwrite an authority the
+    /// engine publishes write-once. Every other engine test states that need
+    /// through `StorageSpace::mutable_view_for_corruption_test`; this file is
+    /// owned by the in-flight GC ledger redesign and is left alone this cycle.
+    /// The list is exact, so this also fails once the redesign removes the
+    /// site and the entry goes stale.
+    const KNOWN_DISAGREEMENTS: &[(&str, u32)] = &[("lix/src/gc.rs", 0x0004_002b)];
+
+    #[test]
+    fn no_registered_space_id_is_declared_with_two_value_semantics() {
+        let registry = ALL_STORAGE_SPACES
+            .iter()
+            .map(|space| (space.id.0, *space))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            registry.len(),
+            ALL_STORAGE_SPACES.len(),
+            "the registry itself must map each space id to exactly one space",
+        );
+
+        let sources = workspace_sources();
+        let constants = space_id_constants(&sources);
+        let mut disagreements = Vec::new();
+        let mut agreeing_registered_ids = std::collections::BTreeSet::new();
+        for (path, source) in &sources {
+            if path.ends_with("lix/src/storage_spaces.rs") {
+                // This file quotes the constructors it is scanning for.
+                continue;
+            }
+            for site in construction_sites(source) {
+                let Some(id) = resolve_space_id(&site.id_expression, &constants) else {
+                    continue;
+                };
+                let Some(space) = registry.get(&id) else {
+                    continue;
+                };
+                if space.value_semantics == site.semantics {
+                    agreeing_registered_ids.insert(id);
+                } else {
+                    disagreements.push((
+                        path.clone(),
+                        id,
+                        format!(
+                            "{path}:{} declares 0x{id:08x} ({}) as {:?}; the registry declares it {:?}",
+                            site.line, space.name, site.semantics, space.value_semantics,
+                        ),
+                    ));
+                }
+            }
+        }
+
+        assert_eq!(
+            agreeing_registered_ids.len(),
+            ALL_STORAGE_SPACES.len(),
+            "the scan resolved only {} of {} registered spaces, so it is not \
+             reading the sources it claims to check",
+            agreeing_registered_ids.len(),
+            ALL_STORAGE_SPACES.len(),
+        );
+
+        let observed = disagreements
+            .iter()
+            .map(|(path, id, _)| (path.as_str(), *id))
+            .collect::<std::collections::BTreeSet<_>>();
+        let known = KNOWN_DISAGREEMENTS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            observed,
+            known,
+            "value-semantics disagreements changed.\n  found:\n    {}\n  \
+             a new entry is a defect: declare the space once here and read it \
+             back (`storage_bench::storage_space_by_id`, \
+             `storage_bench::storage_space_by_name`) or, for a corruption test \
+             inside this crate, use \
+             `StorageSpace::mutable_view_for_corruption_test`.\n  a missing \
+             entry means KNOWN_DISAGREEMENTS is stale and must shrink.",
+            disagreements
+                .iter()
+                .map(|(_, _, message)| message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n    "),
+        );
+    }
+
+    /// The compile-time check and the source scan must cover the same gap.
+    ///
+    /// Every id exempted from [`may_declare`] is a place where a disagreement
+    /// compiles, so it must be a place the scan reports. Pinning both lists to
+    /// each other means neither can be widened quietly, and both go away in
+    /// the same commit.
+    #[test]
+    fn the_unchecked_ids_are_exactly_the_known_disagreements() {
+        assert_eq!(
+            UNCHECKED_SPACE_IDS.iter().copied().collect::<Vec<_>>(),
+            KNOWN_DISAGREEMENTS
+                .iter()
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>(),
+            "UNCHECKED_SPACE_IDS holes and KNOWN_DISAGREEMENTS must describe \
+             the same sites",
+        );
+    }
+
+    /// `gc.rs` declares its four spaces through the checked constructors, so
+    /// the registry states their rows itself rather than referencing them.
+    ///
+    /// `may_declare` proves the semantics agree at compile time. Names are not
+    /// part of that check, so they are pinned here: a space name is what
+    /// layout accounting and every storage report key on.
+    #[test]
+    fn gc_spaces_match_the_registry() {
+        for space in [
+            crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+            crate::gc::CHECKPOINT_GC_STATE_SPACE,
+            crate::gc::GC_REACHABILITY_DELTA_SPACE,
+            crate::gc::GC_REACHABILITY_QUEUE_SPACE,
+        ] {
+            let row = ALL_STORAGE_SPACES
+                .iter()
+                .find(|candidate| candidate.id == space.id)
+                .unwrap_or_else(|| panic!("{space} is not registered"));
+            assert_eq!(space, *row, "{space} disagrees with its registry row");
+        }
+    }
+
+    /// One `StorageSpace` constructor call found in a source file.
+    struct ConstructionSite {
+        offset: usize,
+        line: usize,
+        /// The first argument, verbatim minus whitespace. It is only sometimes
+        /// a literal — `SOME_SPACE.id` and named `SpaceId` constants are the
+        /// two indirections real declarations use.
+        id_expression: String,
+        semantics: ValueSemantics,
+    }
+
     fn engine_sources() -> Vec<(String, String)> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let sources = rust_sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+        assert!(!sources.is_empty(), "engine sources should be readable");
+        sources
+    }
+
+    /// Every workspace Rust source, keyed by its path below `packages/`.
+    ///
+    /// Benchmarks, qualification harnesses and adapter suites all construct
+    /// storage spaces, and the failure this guard exists for happened in a
+    /// benchmark, so a scan scoped to this crate would have missed it.
+    fn workspace_sources() -> Vec<(String, String)> {
+        let packages = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the lix crate lives below the packages directory")
+            .to_path_buf();
         let mut sources = Vec::new();
-        let mut pending = vec![root];
+        for entry in std::fs::read_dir(&packages)
+            .expect("the packages directory should be readable")
+            .flatten()
+        {
+            for subdirectory in ["src", "tests", "benches", "examples"] {
+                for (path, source) in rust_sources(&entry.path().join(subdirectory)) {
+                    let relative = std::path::Path::new(&path)
+                        .strip_prefix(&packages)
+                        .ok()
+                        .map(|path| path.display().to_string());
+                    sources.push((relative.unwrap_or(path), source));
+                }
+            }
+        }
+        assert!(!sources.is_empty(), "workspace sources should be readable");
+        sources
+    }
+
+    fn rust_sources(root: &std::path::Path) -> Vec<(String, String)> {
+        let mut sources = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
             let Ok(entries) = std::fs::read_dir(&directory) else {
                 continue;
@@ -243,34 +524,182 @@ mod tests {
                 }
             }
         }
-        assert!(!sources.is_empty(), "engine sources should be readable");
         sources
     }
 
-    /// Extracts the id of every `StorageSpace::mutable(StorageSpaceId(0x..)`
-    /// or `::immutable(...)` constructor in one source file.
-    fn declared_space_ids(source: &str) -> Vec<u32> {
-        let mut ids = Vec::new();
-        for constructor in ["StorageSpace::mutable(", "StorageSpace::immutable("] {
-            let mut rest = source;
-            while let Some(offset) = rest.find(constructor) {
-                rest = &rest[offset + constructor.len()..];
-                // Every declaration writes its id literal immediately after
-                // the constructor. Bounding the window keeps a constructor
-                // that does not carry one from stealing an unrelated id.
-                let window = &rest[..rest.len().min(96)];
-                let Some(literal) = window
-                    .split_once("SpaceId(0x")
-                    .map(|(_, tail)| tail)
-                    .and_then(|tail| tail.split(')').next())
-                else {
+    /// Every `StorageSpace` constructor call in one source file.
+    ///
+    /// `declare` states a pairing and carries its semantics as a third
+    /// argument; `mutable` and `immutable` carry it in the name. All three are
+    /// collected, so the scan can both find the registry's own declarations
+    /// and check every use against them.
+    fn construction_sites(source: &str) -> Vec<ConstructionSite> {
+        let mut sites = Vec::new();
+        for (constructor, declared) in [
+            ("StorageSpace::mutable(", Some(ValueSemantics::Mutable)),
+            ("StorageSpace::immutable(", Some(ValueSemantics::Immutable)),
+            ("StorageSpace::declare(", None),
+        ] {
+            let mut cursor = 0;
+            while let Some(offset) = source[cursor..].find(constructor) {
+                let start = cursor + offset;
+                let arguments_start = start + constructor.len();
+                cursor = arguments_start;
+                let Some(arguments) = call_arguments(&source[arguments_start..]) else {
                     continue;
                 };
-                if let Ok(id) = u32::from_str_radix(&literal.replace('_', ""), 16) {
-                    ids.push(id);
-                }
+                let Some(id_expression) = arguments.first() else {
+                    continue;
+                };
+                let semantics = match declared {
+                    Some(semantics) => semantics,
+                    // `declare(id, name, ValueSemantics::…)`.
+                    None => match arguments.get(2).map(String::as_str) {
+                        Some(argument) if argument.ends_with("ValueSemantics::Mutable") => {
+                            ValueSemantics::Mutable
+                        }
+                        Some(argument) if argument.ends_with("ValueSemantics::Immutable") => {
+                            ValueSemantics::Immutable
+                        }
+                        _ => continue,
+                    },
+                };
+                sites.push(ConstructionSite {
+                    offset: start,
+                    line: source[..start].matches('\n').count() + 1,
+                    id_expression: id_expression.clone(),
+                    semantics,
+                });
             }
         }
-        ids
+        // Each constructor is scanned in its own pass, so restore source
+        // order: callers that take the first site mean the first one written.
+        sites.sort_by_key(|site| site.offset);
+        sites
+    }
+
+    /// The top-level arguments of a call, given the text after its `(`.
+    ///
+    /// Whitespace is squeezed out so a declaration wrapped across lines reads
+    /// the same as one that fits on a single line.
+    fn call_arguments(source: &str) -> Option<Vec<String>> {
+        let mut arguments = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0_usize;
+        for byte in source.bytes() {
+            match byte {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' if depth > 0 => depth -= 1,
+                b')' | b']' => {
+                    if !current.is_empty() {
+                        arguments.push(current);
+                    }
+                    return Some(arguments);
+                }
+                b',' if depth == 0 => {
+                    arguments.push(std::mem::take(&mut current));
+                    continue;
+                }
+                _ => {}
+            }
+            if !byte.is_ascii_whitespace() {
+                current.push(char::from(byte));
+            }
+        }
+        None
+    }
+
+    /// Space ids declared as named constants, so `SOME_SPACE.id` resolves.
+    ///
+    /// A name declared twice with different ids is dropped rather than
+    /// guessed at; the site that used it is then simply not checked.
+    fn space_id_constants(sources: &[(String, String)]) -> BTreeMap<String, u32> {
+        let mut resolved: BTreeMap<String, Option<u32>> = BTreeMap::new();
+        for (_, source) in sources {
+            let mut rest = source.as_str();
+            while let Some(offset) = rest.find("const ") {
+                rest = &rest[offset + "const ".len()..];
+                let Some((declaration, value)) = rest.split_once('=') else {
+                    break;
+                };
+                let Some((name, declared_type)) = declaration.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim();
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                {
+                    continue;
+                }
+                let Some((expression, _)) = value.split_once(';') else {
+                    continue;
+                };
+                let id = match declared_type.trim() {
+                    "SpaceId" | "StorageSpaceId" => literal_space_id(
+                        &expression.split_whitespace().collect::<String>(),
+                    ),
+                    "StorageSpace" => construction_sites(expression)
+                        .first()
+                        .and_then(|site| literal_space_id(&site.id_expression)),
+                    _ => continue,
+                };
+                let Some(id) = id else {
+                    continue;
+                };
+                resolved
+                    .entry(name.to_string())
+                    .and_modify(|existing| {
+                        if *existing != Some(id) {
+                            *existing = None;
+                        }
+                    })
+                    .or_insert(Some(id));
+            }
+        }
+        resolved
+            .into_iter()
+            .filter_map(|(name, id)| id.map(|id| (name, id)))
+            .collect()
+    }
+
+    /// `SpaceId(0x…)` written out in full. Decimal ids belong to adapter and
+    /// conformance scaffolding, which the registry does not own.
+    fn literal_space_id(expression: &str) -> Option<u32> {
+        let expression = expression.trim();
+        let open = expression.find('(')?;
+        let constructor = expression[..open].rsplit("::").next()?;
+        if constructor != "SpaceId" && constructor != "StorageSpaceId" {
+            return None;
+        }
+        let digits = expression
+            .strip_suffix(')')?
+            .get(open + 1..)?
+            .trim()
+            .strip_prefix("0x")?;
+        u32::from_str_radix(&digits.replace('_', ""), 16).ok()
+    }
+
+    /// Resolves the id argument of one construction site, through the two
+    /// indirections real declarations use: `SOME_SPACE.id`, and a named
+    /// `SpaceId` constant.
+    fn resolve_space_id(expression: &str, constants: &BTreeMap<String, u32>) -> Option<u32> {
+        if let Some(id) = literal_space_id(expression) {
+            return Some(id);
+        }
+        let name = expression
+            .strip_suffix(".id")
+            .unwrap_or(expression)
+            .rsplit("::")
+            .next()?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return None;
+        }
+        constants.get(name).copied()
     }
 }

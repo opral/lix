@@ -8,18 +8,22 @@ use crate::storage_adapter::{
     MAX_SCAN_PAGE_ROWS, Storage, StorageBeginScanOptions, StorageCoreProjection,
     StorageGetManyRequest, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition,
     StorageProjectedValue, StorageReadOptions, StorageSpace, StorageSpaceId, StorageValue,
-    StorageWriteOptions, exact_get_many,
+    StorageWriteOptions, ValueSemantics, exact_get_many,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError};
 
 use super::SessionContext;
 
-pub(crate) const UPLOAD_STATE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0007_0006), "session.file_upload.v2");
-pub(crate) const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const UPLOAD_STATE_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0007_0006),
+    "session.file_upload.v2",
+    ValueSemantics::Mutable,
+);
+pub(crate) const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0007_0007),
     "session.file_upload_manifest_leaf.v2",
+    ValueSemantics::Mutable,
 );
 pub const FILE_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_UPLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024;

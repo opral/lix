@@ -420,17 +420,18 @@ async fn inventory<B: Storage + Clone>(database: &B, name: &str) -> Vec<(Vec<u8>
     space_inventory(&read, name).await
 }
 
-fn storage_space(name: &str, semantics: ValueSemantics) -> StorageSpace {
-    let (id, canonical_name) = layout_space_catalog()
+/// The registered space for one name, value semantics included.
+///
+/// The semantics used to be a parameter of this helper, which made the caller
+/// a second authority for a fact the engine registry already owns. Both
+/// adapters place data by that declaration, so a caller that named the wrong
+/// one corrupted a different physical location than the one under test.
+fn storage_space(name: &str) -> StorageSpace {
+    let (id, _) = layout_space_catalog()
         .into_iter()
         .find(|(_, candidate)| *candidate == name)
         .unwrap_or_else(|| panic!("unknown storage space '{name}'"));
-    match semantics {
-        ValueSemantics::Mutable => StorageSpace::mutable(lix::storage::SpaceId(id), canonical_name),
-        ValueSemantics::Immutable => {
-            StorageSpace::immutable(lix::storage::SpaceId(id), canonical_name)
-        }
-    }
+    lix::storage_bench::storage_space_by_id(id)
 }
 
 async fn corrupt_every_mutable_value<B: Storage + Clone>(database: &B, name: &str, offset: usize) {
@@ -438,7 +439,12 @@ async fn corrupt_every_mutable_value<B: Storage + Clone>(database: &B, name: &st
     assert!(!entries.is_empty(), "corruption target '{name}' is empty");
     let storage = StorageAdapter::new(database.clone());
     let mut writes = storage.new_write_set();
-    let space = storage_space(name, ValueSemantics::Mutable);
+    let space = storage_space(name);
+    assert_eq!(
+        space.value_semantics,
+        ValueSemantics::Mutable,
+        "{name} is not a mutable space; overwriting it in place is not how it is published"
+    );
     for (key, mut value) in entries {
         assert!(offset < value.len(), "corruption offset for '{name}'");
         value[offset] ^= 1;
@@ -470,7 +476,12 @@ async fn replace_immutable_value_with_corruption<B: Storage + Clone>(
     assert!(offset < value.len(), "corruption offset for '{name}'");
     value[offset] ^= 1;
     let storage = StorageAdapter::new(database.clone());
-    let space = storage_space(name, ValueSemantics::Immutable);
+    let space = storage_space(name);
+    assert_eq!(
+        space.value_semantics,
+        ValueSemantics::Immutable,
+        "{name} is not an immutable space; the delete-then-republish dance is unnecessary"
+    );
     let key = StorageKey(Bytes::copy_from_slice(target_key));
     let mut deletion = storage.new_write_set();
     deletion.delete(space, key.clone());

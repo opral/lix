@@ -26,7 +26,7 @@ use crate::storage_adapter::Storage;
 use crate::storage_adapter::{PointReadPlan, SharedStorageAdapterRead, StorageAdapterRead};
 use crate::storage_adapter::{
     StorageAdapter, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
-    StorageSpaceId, StorageWriteSet,
+    StorageSpaceId, StorageWriteSet, ValueSemantics,
 };
 use crate::tracked_state::{
     CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
@@ -45,8 +45,11 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 /// V65 removes per-row ChangeId copies from directly addressable immutable
 /// mutation leaves. The hard cut rejects repositories whose packed history
 /// predates that physical authority instead of retaining a second decoder.
-pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
+pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0004_0011),
+    "repository.protocol.v1",
+    ValueSemantics::Mutable,
+);
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"direct-change-id-leaf.v65";
 

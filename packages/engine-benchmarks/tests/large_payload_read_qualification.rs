@@ -1078,22 +1078,21 @@ where
     S: Storage,
 {
     CasLayout {
-        manifest: space_accounting(storage, MANIFEST_SPACE, false).await,
-        manifest_chunk: space_accounting(storage, MANIFEST_CHUNK_SPACE, false).await,
-        payload: space_accounting(storage, PAYLOAD_SPACE, true).await,
-        presence: space_accounting(storage, PRESENCE_SPACE, false).await,
+        manifest: space_accounting(storage, MANIFEST_SPACE).await,
+        manifest_chunk: space_accounting(storage, MANIFEST_CHUNK_SPACE).await,
+        payload: space_accounting(storage, PAYLOAD_SPACE).await,
+        presence: space_accounting(storage, PRESENCE_SPACE).await,
     }
 }
 
-async fn space_accounting<S>(storage: &S, id: SpaceId, immutable: bool) -> SpaceAccounting
+async fn space_accounting<S>(storage: &S, id: SpaceId) -> SpaceAccounting
 where
     S: Storage,
 {
-    let space = if immutable {
-        StorageSpace::immutable(id, "qualification.binary_cas_payload")
-    } else {
-        StorageSpace::mutable(id, "qualification.binary_cas_metadata")
-    };
+    // A space id has exactly one value semantics and the engine registry is
+    // where it is declared; guessing it here scans a different physical
+    // location than the engine wrote.
+    let space = lix::storage_bench::storage_space_by_id(id.0);
     let read = storage
         .begin_read(ReadOptions::default())
         .await

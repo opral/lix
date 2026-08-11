@@ -4,8 +4,8 @@ use crate::json_store::types::{
     JsonLoadBatch, JsonLoadRequestRef, JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::storage_adapter::{
-    BufferRange, EncodedMutationBatch, EncodedPut, StorageAdapterRead, StorageSpace,
-    StorageSpaceId, StorageWriteSet,
+    BufferRange, EncodedMutationBatch, EncodedPut, StorageAdapterRead, StorageSpace, StorageSpaceId,
+    StorageWriteSet, ValueSemantics,
 };
 #[cfg(test)]
 use crate::storage_adapter::{
@@ -23,9 +23,10 @@ use std::collections::HashSet;
 /// with the complete live-payload set before it deletes the JSON value.
 pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_NAMESPACE: &str =
     "json_store.untracked_reclaim_candidate.v1";
-pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0002_0002),
     UNTRACKED_JSON_RECLAIM_CANDIDATE_NAMESPACE,
+    ValueSemantics::Mutable,
 );
 
 const UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE: &[u8] = b"\x01";
