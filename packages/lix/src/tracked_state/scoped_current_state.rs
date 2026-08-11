@@ -2501,6 +2501,57 @@ mod ownership_census_fixture {
         );
     }
 
+    /// Same census against a CSV-file workload, which is the path that can
+    /// publish columnar (`source_kind` 2) and complete-replacement
+    /// (`source_kind` 0) current-state parts.
+    async fn run_file_depth(files: usize) {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("file census fixture should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("file census fixture should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("file census session should open");
+        let storage = StorageAdapter::new(backend.clone());
+        let mut pre_checkpoint = BTreeSet::new();
+        pre_checkpoint.insert(head(&storage).await);
+        for file in 0..files {
+            let body = (0..32)
+                .map(|row| format!("{file},{row},value-{row}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            session
+                .execute(
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                    &[
+                        Value::Text(format!("/census/{file:05}.csv")),
+                        Value::Blob(format!("id,row,value\n{body}\n").into_bytes().into()),
+                    ],
+                )
+                .await
+                .expect("file census row should publish");
+            pre_checkpoint.insert(head(&storage).await);
+        }
+        report_census(&storage, files, "file-before-checkpoint", &pre_checkpoint).await;
+        session
+            .create_checkpoint()
+            .await
+            .expect("file census checkpoint should publish");
+        report_census(&storage, files, "file-after-checkpoint", &pre_checkpoint).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "measurement instrument; run with --ignored --nocapture"]
+    async fn current_state_ownership_census_for_files() {
+        for files in [8usize, 32, 100] {
+            run_file_depth(files).await;
+        }
+    }
+
     #[tokio::test]
     #[ignore = "measurement instrument; run with --ignored --nocapture"]
     async fn current_state_ownership_census_by_depth() {
