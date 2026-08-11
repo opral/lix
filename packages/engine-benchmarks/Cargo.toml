@@ -44,6 +44,7 @@ ahash = "0.8"
 async-trait = "0.1"
 blake3 = "1"
 bytes = "1"
+fastcdc = "3"
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -68,6 +69,10 @@ required-features = ["storage-benches", "slatedb"]
 name = "revision_pack_oracle"
 path = "examples/revision_pack_oracle.rs"
 required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "chunking_oracle"
+path = "examples/chunking_oracle.rs"
 
 [[example]]
 name = "cas_sharing"
