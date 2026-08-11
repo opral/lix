@@ -33,8 +33,7 @@ use crate::changelog::{
     CommitLoadRequest, load_change_records, materialize_known_change_payloads,
 };
 use crate::checkpoint::{
-    CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_history_from_head, checkpoint_marker_stage_row,
-    latest_checkpoint_at_head,
+    CHECKPOINT_SCHEMA_KEY, checkpoint_commit_id_at_head, checkpoint_stage_row,
 };
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::{LixTimestamp, SharedStr};
@@ -6303,6 +6302,17 @@ where
         }
         let staged = self.staged_writes.staging_overlay()?;
         let validation_index = prepared_writes.validation_index();
+        let staged_commit_ids = prepared_writes
+            .commit_change_refs_by_branch
+            .values()
+            .map(|refs| refs.commit_id)
+            .chain(
+                prepared_writes
+                    .intermediate_commits
+                    .iter()
+                    .map(|commit| commit.change_refs.commit_id),
+            )
+            .collect::<BTreeSet<_>>();
         for scope in validation_index.schema_scopes() {
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_branch();
@@ -6316,7 +6326,8 @@ where
                 &branch_prepared_writes,
                 schema_catalog,
                 &live_state,
-            );
+            )
+            .with_staged_commit_ids(staged_commit_ids.clone());
             if self.trust_filesystem_planner {
                 validation_input = validation_input.with_trusted_filesystem_planner();
             }
@@ -7404,6 +7415,31 @@ where
             .await
     }
 
+    /// Returns the private compaction cursor bound to this transaction's
+    /// retained opening read and the caller-observed branch head.
+    pub(crate) async fn checkpoint_commit_id_at_head(
+        &mut self,
+        branch_id: &str,
+        head_commit_id: CommitId,
+    ) -> Result<CommitId, LixError> {
+        checkpoint_commit_id_at_head(self.opening_read(), branch_id, head_commit_id).await
+    }
+
+    pub(crate) async fn is_current_checkpoint_commit(
+        &mut self,
+        branch_id: &str,
+        commit_id: CommitId,
+    ) -> Result<bool, LixError> {
+        let control = BranchHeadControlContext::new()
+            .reader(self.opening_read())
+            .load(branch_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::branch_not_found(branch_id, "resolve undo checkpoint boundary", "branch")
+            })?;
+        Ok(control.working_diff_checkpoint_commit_id == Some(commit_id))
+    }
+
     /// Creates a commit-graph reader scoped to this write transaction.
     pub(crate) async fn commit_graph_reader(
         &mut self,
@@ -7780,27 +7816,9 @@ where
             .load_branch_head(&branch_id)
             .await?
             .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
-        let direct_checkpoint = {
-            let mut tracked = self.tracked_state_reader().await;
-            latest_checkpoint_at_head(&mut tracked, &head_commit_id, &branch_id).await?
-        };
-        let previous_checkpoint_commit_id = match direct_checkpoint {
-            Some(commit_id) => commit_id,
-            None => {
-                let mut graph = self.commit_graph_reader().await;
-                checkpoint_history_from_head(&mut graph, &head_commit_id)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("branch '{branch_id}' has no checkpoint baseline"),
-                        )
-                    })?
-                    .commit_id
-            }
-        };
+        let previous_checkpoint_commit_id = self
+            .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
+            .await?;
         let diff = {
             let mut tracked = self.tracked_state_reader().await;
             tracked
@@ -7824,7 +7842,7 @@ where
         let mut selected_source_membership_exact = true;
         let mut unselected_source_membership_exact = true;
         for entry in diff.entries.into_iter().filter(|entry| {
-            entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY
+            entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
                 && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
         }) {
             let diff_id = crate::tracked_state::encode_diff_id(
@@ -7872,13 +7890,6 @@ where
         }
 
         let checkpoint_commit_id = if unselected.is_empty() {
-            let mut marker_rows = RawWriteBatch::with_capacity(1);
-            marker_rows.push(checkpoint_marker_stage_row(&branch_id));
-            self.stage_write(TransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows: marker_rows,
-            })
-            .await?;
             self.stage_checkpoint_commit(
                 branch_id.clone(),
                 previous_checkpoint_commit_id,
@@ -7893,11 +7904,6 @@ where
                 previous_checkpoint_commit_id,
                 selected,
             )?;
-            let mut marker_rows = RawWriteBatch::with_capacity(1);
-            marker_rows.push(checkpoint_marker_stage_row(&branch_id));
-            let marker = self.prepare_transaction_rows(marker_rows).await?;
-            self.staged_writes
-                .stage_intermediate_rows(checkpoint_commit_id, marker)?;
             self.staged_writes
                 .stage_selected_commit_change_refs(branch_id.clone(), unselected)?;
             self.staged_writes
@@ -7914,6 +7920,17 @@ where
                 })?;
             checkpoint_commit_id.to_string()
         };
+        let checkpoint_commit = CommitId::parse_lix(&checkpoint_commit_id, "checkpoint commit id")?;
+        let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
+        checkpoint_rows.push(checkpoint_stage_row(
+            &checkpoint_commit,
+            self.functions.call_uuid_v7().to_string(),
+        ));
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows: checkpoint_rows,
+        })
+        .await?;
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected: diff_ids.len() as u64,
             commit_id: Some(checkpoint_commit_id),

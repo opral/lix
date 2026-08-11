@@ -74,6 +74,7 @@ pub(crate) async fn register_entity_providers<S>(
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Option<Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>>,
     query_source: Option<SqlHistoryQuerySource<S>>,
+    checkpoint_history_query_source: Option<SqlHistoryQuerySource<S>>,
     catalog: &PublicCatalog,
     include_write_surfaces: bool,
     selection: &ProviderSelection,
@@ -116,8 +117,14 @@ where
                 )?;
             }
             PublicSurfaceKind::EntityHistory { schema_key } => {
+                let selected_query_source =
+                    if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY {
+                        checkpoint_history_query_source.as_ref()
+                    } else {
+                        query_source.as_ref()
+                    };
                 let (Some(commit_graph), Some(query_source)) =
-                    (commit_graph.as_ref(), query_source.as_ref())
+                    (commit_graph.as_ref(), selected_query_source)
                 else {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -3562,7 +3569,6 @@ mod tests {
         for schema_key in [
             "lix_binary_blob_ref",
             "lix_change",
-            "lix_checkpoint_marker",
             "lix_undo_redo_marker",
             "lix_collection_generation",
             "lix_directory_descriptor",
@@ -3572,6 +3578,7 @@ mod tests {
             assert!(!schema_exposed_as_entity_history_surface(schema_key));
         }
         assert!(schema_exposed_as_entity_surface("project_message"));
+        assert!(schema_exposed_as_entity_surface("lix_checkpoint"));
     }
 
     #[test]

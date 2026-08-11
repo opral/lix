@@ -1,0 +1,38 @@
+{
+  "x-lix-key": "lix_checkpoint",
+  "description": "The repository-global checkpoint cursor. Each checkpoint operation creates a new change of this singleton and references the branch commit containing the checkpointed state.",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/commit_id"
+      ],
+      "references": {
+        "schemaKey": "lix_commit",
+        "properties": [
+          "/id"
+        ]
+      }
+    }
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Stable repository-global checkpoint singleton identifier."
+    },
+    "commit_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Commit containing the state captured by this checkpoint."
+    }
+  },
+  "required": [
+    "id",
+    "commit_id"
+  ],
+  "additionalProperties": false
+}

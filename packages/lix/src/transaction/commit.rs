@@ -17,7 +17,6 @@ use crate::changelog::{
     ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
     CommitRecord, CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
 };
-use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
@@ -576,6 +575,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         }
     }
 
+    let checkpoint_commit_ids = prepared_writes
+        .checkpoint_publications
+        .iter()
+        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
+        .collect::<BTreeSet<_>>();
     let staged_delta_index = Box::pin(stage_tracked_commit_delta_index(
         read,
         &mut writes,
@@ -590,6 +594,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &insert_selection,
         &replacement_generations,
         &ordered_replacements,
+        &checkpoint_commit_ids,
     ))
     .await?;
 
@@ -2048,6 +2053,7 @@ async fn stage_tracked_commit_delta_index(
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
+    checkpoint_commit_ids: &BTreeSet<CommitId>,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
@@ -2331,10 +2337,9 @@ async fn stage_tracked_commit_delta_index(
                 "lix.perf.commit_delta_selected_sources"
             );
         }
-        let is_checkpoint_commit = state_row_indices.iter().any(|&row_index| {
-            state_rows.row(row_index).schema_key.as_str() == CHECKPOINT_MARKER_SCHEMA_KEY
-        });
+        let is_checkpoint_commit = checkpoint_commit_ids.contains(&root.commit_id);
         let selected_source_alias = if certified_root_rows.is_empty()
+            && !state_row_indices.is_empty()
             && is_checkpoint_commit
             && selected_members_by_source.len() == 1
         {
@@ -4928,6 +4933,15 @@ async fn stage_root_backed_branch_publication(
         generation,
         head_commit_id,
     );
+    stage_tracked_working_diff_epoch(
+        writes,
+        branch_id,
+        TrackedWorkingDiffEpoch {
+            checkpoint_commit_id: head_commit_id,
+            generation,
+            coverage: WorkingDiffIndexCoverage::default(),
+        },
+    )?;
     let mut control = BranchHeadControl {
         head_commit_id,
         tracked_generation: generation,
@@ -4936,7 +4950,10 @@ async fn stage_root_backed_branch_publication(
             .unwrap_or(generation),
         current_state_revision: previous_control
             .map_or(0, |control| control.current_state_revision),
-        working_diff_checkpoint_commit_id: None,
+        // A branch is born at a complete authenticated root. Its private
+        // working interval therefore starts at that exact head; no logical
+        // checkpoint entity or history scan is needed to recover the cursor.
+        working_diff_checkpoint_commit_id: Some(head_commit_id),
         created_at: target.created_at,
         updated_at: target.updated_at,
         ref_change_id: target.ref_change_id,
@@ -5119,7 +5136,11 @@ async fn stage_branch_head_control_publications(
                                 })?,
                             None => 0,
                         },
-                        working_diff_checkpoint_commit_id: None,
+                        // Explicit lifecycle moves keep the branch's private
+                        // compaction baseline. New branches take the dedicated
+                        // root-backed path above and start clean at their head.
+                        working_diff_checkpoint_commit_id: existing
+                            .and_then(|control| control.working_diff_checkpoint_commit_id),
                         created_at: existing
                             .map_or(target.created_at, |control| control.created_at),
                         updated_at: target.updated_at,
@@ -7161,6 +7182,7 @@ mod tests {
             &PreparedInsertSelection::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeSet::new(),
         )
         .await
         .expect("mixed certified delta should stage");

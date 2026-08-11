@@ -414,7 +414,7 @@ simulation_test!(
             "lix_branch_descriptor",
             "lix_branch_ref",
             "lix_change",
-            "lix_checkpoint_marker",
+            "lix_checkpoint",
             "lix_commit",
             "lix_commit_edge",
             "lix_directory_descriptor",
@@ -447,7 +447,6 @@ simulation_test!(
             "lix_registered_schema",
             "lix_registered_schema_by_branch",
             "lix_checkpoint",
-            "lix_checkpoint_by_branch",
             "lix_working_diff",
             "lix_working_diff_by_branch",
             "lix_file_working_diff",
@@ -464,7 +463,7 @@ simulation_test!(
             .execute(
                 "SELECT function_name \
                  FROM information_schema.table_functions \
-                 WHERE function_name IN ('lix_key_value_history', 'lix_registered_schema_history') \
+                 WHERE function_name IN ('lix_checkpoint_history', 'lix_key_value_history', 'lix_registered_schema_history') \
                  GROUP BY function_name \
                  ORDER BY function_name",
                 &[],
@@ -474,12 +473,12 @@ simulation_test!(
         assert_rows_eq(
             history_functions,
             vec![
+                vec![Value::Text("lix_checkpoint_history".to_string())],
                 vec![Value::Text("lix_key_value_history".to_string())],
                 vec![Value::Text("lix_registered_schema_history".to_string())],
             ],
         );
         for surface_name in [
-            "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",

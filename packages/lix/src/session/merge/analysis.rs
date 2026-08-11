@@ -66,8 +66,8 @@ where
             .diff_commits(&base_commit_id, &target_commit_id, &request)
             .await?
     };
-    exclude_internal_checkpoint_markers(&mut source_diff);
-    exclude_internal_checkpoint_markers(&mut target_diff);
+    exclude_checkpoint_entities(&mut source_diff);
+    exclude_checkpoint_entities(&mut target_diff);
 
     let outcome = if commits.base_commit_id == commits.source_commit_id {
         MergeOutcome::AlreadyUpToDate
@@ -110,9 +110,9 @@ where
     })
 }
 
-fn exclude_internal_checkpoint_markers(diff: &mut TrackedStateDiff) {
+fn exclude_checkpoint_entities(diff: &mut TrackedStateDiff) {
     diff.entries.retain(|entry| {
-        entry.identity.schema_key() != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+        entry.identity.schema_key() != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
             && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
     });
 }
