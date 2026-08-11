@@ -4,10 +4,11 @@ mod branch_scope;
 mod catalog;
 mod change_materialization;
 mod context;
+mod dialect;
 mod dml;
-mod entity_batch;
-mod entity_columnar_layout;
-mod entity_projection;
+mod row_batch;
+mod row_columnar_layout;
+mod row_projection;
 mod error;
 mod exec;
 mod file_view;
@@ -40,25 +41,26 @@ pub(crate) use bind::{
     statement_has_durable_runtime_function,
 };
 pub(crate) use catalog::{
-    EntityColumnType, EntitySurfaceSpec, PublicCatalog, derive_entity_surface_spec_from_schema,
-    entity_visible_fields,
+    PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec, PublicCatalog,
+    derive_schema_surface_spec_from_schema, row_visible_fields,
 };
 pub(crate) use change_materialization::MaterializedChange;
+pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
     CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
     DiffCommandOutcome, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextBranchRefReader, WriteContextLiveStateReader,
+    WriteContextBranchRefReader, WriteContextHotStateReader,
 };
-pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
-pub(crate) use entity_columnar_layout::{
-    ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ENTITY_COLUMNAR_ENTITY_PK_FIELD,
-    ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
-    ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, EncodedEntityRowGroups, EntityColumnarRowRef,
-    EntityRowGroupLocations, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
-    encode_registered_entity_row_groups, encode_unclustered_registered_entity_row_groups,
+pub(crate) use row_batch::{CurrentRowSnapshotReader, RowSnapshotReader};
+pub(crate) use row_columnar_layout::{
+    ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ROW_COLUMNAR_ROW_PK_FIELD,
+    ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
+    ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, EncodedRowGroups, RowColumnarRowRef,
+    RowGroupLocations, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
+    encode_registered_row_groups, encode_unclustered_registered_row_groups,
 };
-pub(crate) use entity_projection::EntityProjectionDecoder;
+pub(crate) use row_projection::RowProjectionDecoder;
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]
 pub(crate) use exec::{
@@ -84,11 +86,11 @@ pub(crate) use exec::{
     WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,
     execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
     execute_write_logical_plan_with_mode_and_trace_result,
-    execute_write_logical_plan_with_mode_result, take_certified_entity_insert_batch_executions,
-    take_certified_entity_insert_parameter_batch_executions,
+    execute_write_logical_plan_with_mode_result, take_certified_row_insert_batch_executions,
+    take_certified_row_insert_parameter_batch_executions,
     take_certified_generation_identity_replacements,
     take_certified_replacement_parameter_batch_executions,
-    take_certified_single_path_value_replacements, take_entity_update_parameter_batch_executions,
+    take_certified_single_path_value_replacements, take_row_update_parameter_batch_executions,
 };
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
@@ -96,13 +98,16 @@ pub(crate) use file_view::{
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
 pub(crate) use planning_cache::{
-    CachedReadPlan, CachedUpdateLiteralShape, PhysicalReadPlanCacheKey, SqlPlanningCache,
+    CachedPhysicalRead, CachedReadPlan, CachedScanRequest, CachedUpdateLiteralShape,
+    PhysicalReadPlanCacheKey, PooledReadSession, SqlPlanningCache,
 };
 pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
-    execute_exact_lix_file_root_listing, execute_fast_lix_file_path_writes,
+    execute_exact_lix_file_root_listing, execute_exact_schema_batch_read,
+    execute_exact_schema_point_read,
+    execute_fast_lix_file_path_writes,
     execute_fast_lix_file_prepared_path_write,
 };
 pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};

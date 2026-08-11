@@ -28,7 +28,7 @@ use crate::sql2::SqlWriteContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::exec::datafusion::LIX_INSERT_COLUMN_OMITTED_METADATA_KEY;
 use crate::sql2::write_normalization::{insert_column_is_omitted, mark_omitted_insert_columns};
-use crate::transaction::types::{
+use crate::transaction_types::{
     RawWriteBatch, TransactionFileContent, TransactionWrite, TransactionWriteMode,
 };
 

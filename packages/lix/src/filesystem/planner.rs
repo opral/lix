@@ -10,10 +10,10 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::common::{LixPath, compose_file_path};
-use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef,
+use crate::row_pk::RowPk;
+use crate::hot_state::{
+    HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateRow,
+    MaterializedHotStateRowRef,
 };
 
 use super::keys::{
@@ -22,8 +22,8 @@ use super::keys::{
 use super::visibility::VisibleFilesystem;
 use super::{DirectoryPathRecord, derive_directory_paths};
 #[cfg(test)]
-use crate::transaction::types::TransactionWriteRow;
-use crate::transaction::types::{
+use crate::transaction_types::TransactionWriteRow;
+use crate::transaction_types::{
     FileContent, LogicalPrimaryKey, RawWriteBatch, TransactionFileContent, TransactionJson,
     TransactionWriteOperation, TransactionWriteOrigin,
 };
@@ -99,7 +99,7 @@ impl FilesystemDescriptorKey {
     }
 
     pub(crate) fn from_live_row(
-        row: &MaterializedLiveStateRow,
+        row: &MaterializedHotStateRow,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -112,7 +112,7 @@ impl FilesystemDescriptorKey {
     }
 
     pub(crate) fn from_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+        row: MaterializedHotStateRowRef<'_>,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -125,7 +125,7 @@ impl FilesystemDescriptorKey {
     }
 
     pub(crate) fn from_file_descriptor_live_row(
-        row: &MaterializedLiveStateRow,
+        row: &MaterializedHotStateRow,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -138,7 +138,7 @@ impl FilesystemDescriptorKey {
     }
 
     pub(crate) fn from_file_descriptor_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+        row: MaterializedHotStateRowRef<'_>,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -228,14 +228,14 @@ impl FilesystemBlobRefKey {
     }
 
     pub(crate) fn from_live_row(
-        row: &MaterializedLiveStateRow,
+        row: &MaterializedHotStateRow,
         blob_ref_id: impl Into<String>,
     ) -> Self {
         Self(FilesystemDescriptorKey::from_live_row(row, blob_ref_id))
     }
 
     pub(crate) fn from_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+        row: MaterializedHotStateRowRef<'_>,
         blob_ref_id: impl Into<String>,
     ) -> Self {
         Self(FilesystemDescriptorKey::from_live_row_ref(row, blob_ref_id))
@@ -755,7 +755,7 @@ impl DirectoryPathResolver {
         rows.set_origin(
             row_index,
             Some(TransactionWriteOrigin {
-                surface: crate::transaction::types::shared_origin_surface("filesystem path parent"),
+                surface: crate::transaction_types::shared_origin_surface("filesystem path parent"),
                 operation: TransactionWriteOperation::Update,
                 primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(directory_id))),
             }),
@@ -1402,7 +1402,7 @@ pub(crate) fn plan_recursive_directory_delete(
 }
 
 pub(crate) fn directory_path_resolvers_from_state_batch(
-    rows: &crate::live_state::MaterializedLiveStateBatch,
+    rows: &crate::hot_state::MaterializedHotStateBatch,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
@@ -1480,13 +1480,13 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
     Ok(resolvers)
 }
 
-pub(crate) async fn directory_path_resolvers_from_live_state(
-    live_state: Arc<dyn LiveStateReader>,
+pub(crate) async fn directory_path_resolvers_from_hot_state(
+    hot_state: Arc<dyn HotStateReader>,
     branch_binding: Option<&str>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
-    let rows = live_state
-        .scan_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
+    let rows = hot_state
+        .scan_batch(&HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec![
                     DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
                     FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -1568,6 +1568,108 @@ pub(crate) fn directory_path_resolvers_from_path_index(
     Ok(resolvers)
 }
 
+/// Seeds directory path resolvers from **only the ancestor chains** of the
+/// paths a statement is about to write, instead of from every entry in the
+/// filesystem path index.
+///
+/// Planning a path write consults the resolver at exactly two kinds of key:
+/// `(parent_id, segment_name)` along the path's own ancestor chain, and
+/// `(directory_id, leaf_name)` for the leaf uniqueness reservation. Nothing
+/// else in the repository can be observed, so seeding the whole index makes
+/// the cost of creating one file linear in the number of resident files *and*
+/// directories. This walks `depth` prefixes per write with an O(log n) index
+/// lookup each.
+///
+/// The leaf path is seeded too, so whatever already occupies the target name —
+/// a file or a directory — is still rejected by the resolver's own uniqueness
+/// check rather than slipping past it.
+pub(crate) fn directory_path_resolvers_for_paths<'a>(
+    index: &super::path_index::FilesystemPathIndex,
+    paths: impl IntoIterator<Item = &'a LixPath>,
+    branch_binding: Option<&str>,
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let mut seeds = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
+    let mut files = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
+    let mut seen_paths = BTreeSet::<String>::new();
+
+    let absorb =
+        |entry: &super::path_index::FilesystemPathEntry,
+         seeds: &mut BTreeMap<String, BTreeMap<String, DirectoryDescriptorSeed>>,
+         files: &mut BTreeMap<String, Vec<(Option<String>, String, String)>>| {
+            let key = &entry.key;
+            let storage_branch_id = if key.global() {
+                GLOBAL_BRANCH_ID
+            } else {
+                key.branch_id()
+            };
+            let resolver_key = filesystem_storage_scope_key(
+                storage_branch_id,
+                key.global(),
+                key.is_untracked(),
+                key.file_id(),
+            );
+            match entry.kind {
+                super::path_index::FilesystemPathKind::Directory => {
+                    seeds.entry(resolver_key).or_default().insert(
+                        entry.id().to_string(),
+                        DirectoryDescriptorSeed {
+                            id: entry.id().to_string(),
+                            parent_id: entry.parent_id.clone(),
+                            name: entry.name.clone(),
+                        },
+                    );
+                }
+                super::path_index::FilesystemPathKind::File => {
+                    files.entry(resolver_key).or_default().push((
+                        entry.parent_id.clone(),
+                        entry.name.clone(),
+                        entry.id().to_string(),
+                    ));
+                }
+            }
+        };
+
+    for path in paths {
+        let segments = path.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
+        if segments.is_empty() {
+            continue;
+        }
+        // Ancestor directories, then the leaf itself. Directory and file
+        // entries share the same unsuffixed path spelling in the index, so one
+        // lookup per prefix returns whichever kind occupies it — which is what
+        // makes the leaf lookup a namespace-conflict check as well.
+        for depth in 1..=segments.len() {
+            let prefix = directory_path_from_segments(&segments[..depth]);
+            if !seen_paths.insert(prefix.clone()) {
+                continue;
+            }
+            for entry in index.exact_entries(&prefix) {
+                absorb(&entry, &mut seeds, &mut files);
+            }
+        }
+    }
+
+    let mut resolvers = BTreeMap::new();
+    for (resolver_key, records) in seeds {
+        let scoped_files = files.remove(&resolver_key).unwrap_or_default();
+        resolvers.insert(
+            resolver_key,
+            DirectoryPathResolver::from_existing_descriptors(records.into_values(), scoped_files)?,
+        );
+    }
+    for (resolver_key, scoped_files) in files {
+        resolvers.insert(
+            resolver_key,
+            DirectoryPathResolver::from_existing_descriptors(std::iter::empty(), scoped_files)?,
+        );
+    }
+    if let Some(branch_id) = branch_binding {
+        let key = filesystem_storage_scope_key(branch_id, false, false, None);
+        resolvers.entry(key).or_default();
+    }
+    Ok(resolvers)
+}
+
 pub(crate) fn filesystem_storage_scope_key(
     branch_id: &str,
     global: bool,
@@ -1602,35 +1704,35 @@ impl DirectoryPathRecord for DirectoryDescriptorSeed {
 
 fn append_state_row(
     rows: &mut RawWriteBatch,
-    entity_pk: String,
+    row_pk: String,
     schema_key: &str,
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) {
-    append_partial_state_row(rows, Some(entity_pk), schema_key, snapshot, context);
+    append_partial_state_row(rows, Some(row_pk), schema_key, snapshot, context);
 }
 
 fn append_partial_state_row(
     rows: &mut RawWriteBatch,
-    entity_pk: Option<String>,
+    row_pk: Option<String>,
     schema_key: &str,
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) {
-    let derived_entity_pk = entity_pk.map(|value| {
+    let derived_row_pk = row_pk.map(|value| {
         if snapshot.is_none() {
-            EntityPk::uuid_from_canonical(&value)
+            RowPk::uuid_from_canonical(&value)
                 .expect("filesystem tombstones target validated UUID identities")
         } else {
             // These builders are schema-aware: filesystem descriptor and
             // materialization IDs are declared UUID primary keys. Preserve an
             // invalid caller value only until normalization can return the
             // public schema-validation error instead of panicking.
-            EntityPk::uuid_from_canonical(&value).unwrap_or_else(|_| EntityPk::single(value))
+            RowPk::uuid_from_canonical(&value).unwrap_or_else(|_| RowPk::single(value))
         }
     });
     rows.push_parts(
-        derived_entity_pk,
+        derived_row_pk,
         schema_key.into(),
         context.file_id.map(Into::into),
         snapshot.map(TransactionJson::from_value_unchecked),
@@ -1648,11 +1750,38 @@ fn append_partial_state_row(
 
 fn append_tombstone_row(
     rows: &mut RawWriteBatch,
-    entity_pk: String,
+    row_pk: String,
     schema_key: &str,
     context: FilesystemRowContext,
 ) {
-    append_state_row(rows, entity_pk, schema_key, None, context);
+    append_state_row(rows, row_pk, schema_key, None, context);
+}
+
+/// Durability lanes whose children a directory delete in `context` may reach.
+///
+/// A directory delete crosses the durability lane *downward*: deleting a
+/// tracked directory also removes the untracked children beneath it, while an
+/// untracked delete never reaches tracked children. This is the same asymmetry
+/// the file -> rows cascade already applies one level down (see
+/// `apply_incremental_file_delete_cascade` and
+/// `apply_complete_file_delete_cascade` in `hot_state::tracked_head::hot`,
+/// both spelled `if (cascade.untracked && !existing.untracked) { continue }`).
+///
+/// Without the downward crossing a tracked directory delete leaves untracked
+/// descendants pointing at a parent that no longer exists, which makes
+/// `FilesystemPathIndex::from_live_batch` fail for the whole branch.
+fn cascading_child_contexts(context: &FilesystemRowContext) -> Vec<FilesystemRowContext> {
+    if context.untracked {
+        vec![context.clone()]
+    } else {
+        vec![
+            context.clone(),
+            FilesystemRowContext {
+                untracked: true,
+                ..context.clone()
+            },
+        ]
+    }
 }
 
 fn collect_recursive_directory_delete(
@@ -1662,34 +1791,43 @@ fn collect_recursive_directory_delete(
     rows: &mut RawWriteBatch,
     count: &mut u64,
 ) {
-    if let Some(child_ids) = visible_filesystem
-        .directory_children_by_parent_id
-        .get(&Some(FilesystemDescriptorKey::from_context(
-            context,
-            directory_id,
-        )))
-    {
-        for child_id in child_ids {
-            collect_recursive_directory_delete(child_id, visible_filesystem, context, rows, count);
-        }
-    }
+    // Children are addressed by *their own* lane, and every row planned for a
+    // child must carry that lane too — never the deleting directory's.
+    // `has_blob_ref` and `plan_file_delete` both key off `context.untracked`,
+    // so reusing the parent's context here would look up an untracked child's
+    // blob ref in the tracked lane, find nothing, skip the blob-ref tombstone,
+    // and leak the very blob this cascade exists to release.
+    for child_context in cascading_child_contexts(context) {
+        let child_key = FilesystemDescriptorKey::from_context(&child_context, directory_id);
 
-    if let Some(files) =
-        visible_filesystem
+        if let Some(child_ids) = visible_filesystem
+            .directory_children_by_parent_id
+            .get(&Some(child_key.clone()))
+        {
+            for child_id in child_ids {
+                collect_recursive_directory_delete(
+                    child_id,
+                    visible_filesystem,
+                    &child_context,
+                    rows,
+                    count,
+                );
+            }
+        }
+
+        if let Some(files) = visible_filesystem
             .files_by_directory_id
-            .get(&Some(FilesystemDescriptorKey::from_context(
-                context,
-                directory_id,
-            )))
-    {
-        for file_id in files {
-            let plan = plan_file_delete(FileDeleteInput {
-                file_id: file_id.clone(),
-                has_blob_ref: visible_filesystem.has_blob_ref(context, file_id),
-                context: context.clone(),
-            });
-            rows.append(plan.rows);
-            *count += plan.count;
+            .get(&Some(child_key))
+        {
+            for file_id in files {
+                let plan = plan_file_delete(FileDeleteInput {
+                    file_id: file_id.clone(),
+                    has_blob_ref: visible_filesystem.has_blob_ref(&child_context, file_id),
+                    context: child_context.clone(),
+                });
+                rows.append(plan.rows);
+                *count += plan.count;
+            }
         }
     }
 
@@ -1712,7 +1850,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey};
-    use crate::transaction::types::{RawWriteBatch, TransactionJson};
+    use crate::transaction_types::{RawWriteBatch, TransactionJson};
 
     use super::{
         BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
@@ -1725,8 +1863,8 @@ mod tests {
     use crate::common::LixPath;
     use crate::filesystem::VisibleFilesystem;
     use crate::{
-        entity_pk::EntityPk,
-        live_state::{MaterializedLiveStateBatch, MaterializedLiveStateRow},
+        row_pk::RowPk,
+        hot_state::{MaterializedHotStateBatch, MaterializedHotStateRow},
     };
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -1734,8 +1872,8 @@ mod tests {
         move || ids.next().expect("test id should exist").to_string()
     }
 
-    fn uuid_pk(value: &str) -> EntityPk {
-        EntityPk::uuid_from_canonical(value).expect("fixture ID should be a canonical UUID")
+    fn uuid_pk(value: &str) -> RowPk {
+        RowPk::uuid_from_canonical(value).expect("fixture ID should be a canonical UUID")
     }
 
     #[test]
@@ -1766,12 +1904,12 @@ mod tests {
         );
         assert_eq!(rows.shared_origin_count(), 0);
         assert_eq!(
-            rows.row(0).entity_pk,
+            rows.row(0).row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-000000000000")),
             "the first directory identity must remain a typed UUID"
         );
         assert_eq!(
-            rows.row(ROW_COUNT - 1).entity_pk,
+            rows.row(ROW_COUNT - 1).row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-00000000270f")),
             "the last directory identity must remain a typed UUID"
         );
@@ -1798,7 +1936,7 @@ mod tests {
         leaf_id: Option<String>,
         context: FilesystemRowContext,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<crate::transaction::types::TransactionWriteRow>, crate::LixError> {
+    ) -> Result<Vec<crate::transaction_types::TransactionWriteRow>, crate::LixError> {
         let parsed = LixPath::try_from_directory_path(directory_path)?;
         let key = super::path_resolver_key(&context);
         with_resolver_map(resolver, key, |resolvers| {
@@ -1863,7 +2001,7 @@ mod tests {
         });
 
         assert_eq!(
-            row.entity_pk,
+            row.row_pk,
             Some(uuid_pk("01920000-0000-7000-8000-0000000000d3"))
         );
         assert_eq!(row.schema_key, "lix_directory_descriptor");
@@ -1884,7 +2022,7 @@ mod tests {
         });
 
         assert_eq!(
-            row.entity_pk,
+            row.row_pk,
             Some(uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(row.schema_key, "lix_file_descriptor");
@@ -1907,7 +2045,7 @@ mod tests {
         .expect("blob ref row should build");
 
         assert_eq!(
-            row.entity_pk,
+            row.row_pk,
             Some(uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -2460,7 +2598,7 @@ mod tests {
             name: "docs".to_string(),
             context: context.clone(),
         });
-        assert_eq!(directory_row.entity_pk, None);
+        assert_eq!(directory_row.row_pk, None);
         assert_eq!(directory_row.schema_key, "lix_directory_descriptor");
         assert!(
             directory_row
@@ -2482,7 +2620,7 @@ mod tests {
             name: "readme.md".to_string(),
             context: context.clone(),
         });
-        assert_eq!(file_row.entity_pk, None);
+        assert_eq!(file_row.row_pk, None);
         assert_eq!(file_row.schema_key, "lix_file_descriptor");
         assert!(
             file_row
@@ -2590,7 +2728,7 @@ mod tests {
 
     #[test]
     fn directory_path_resolvers_from_state_batch_derives_nested_paths() {
-        let rows = MaterializedLiveStateBatch::from_rows(vec![
+        let rows = MaterializedHotStateBatch::from_rows(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2625,7 +2763,7 @@ mod tests {
 
     #[test]
     fn directory_path_resolvers_from_state_batch_handles_parent_cycles() {
-        let rows = MaterializedLiveStateBatch::from_rows(vec![
+        let rows = MaterializedHotStateBatch::from_rows(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000a3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2681,7 +2819,7 @@ mod tests {
             ),
         ];
 
-        let rows = MaterializedLiveStateBatch::from_rows(rows);
+        let rows = MaterializedHotStateBatch::from_rows(rows);
         let resolvers = super::directory_path_resolvers_from_state_batch(&rows)
             .expect("scoped rows should seed distinct resolvers");
 
@@ -2766,7 +2904,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be planned");
         assert_eq!(
-            descriptor.entity_pk,
+            descriptor.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -2781,7 +2919,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be planned");
         assert_eq!(
-            blob_ref.entity_pk,
+            blob_ref.row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -2815,7 +2953,7 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(
-            plan.rows.row(0).entity_pk,
+            plan.rows.row(0).row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d3"))
         );
         assert_eq!(plan.rows.row(0).schema_key, "lix_directory_descriptor");
@@ -2835,7 +2973,7 @@ mod tests {
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(plan.rows.row(0).schema_key, "lix_directory_descriptor");
         assert_eq!(
-            plan.rows.row(0).entity_pk,
+            plan.rows.row(0).row_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000e3"))
         );
         assert_eq!(plan.rows.row(0).snapshot, None);
@@ -2891,11 +3029,11 @@ mod tests {
                 .map(|row| {
                     (
                         row.schema_key.as_str(),
-                        row.entity_pk
+                        row.row_pk
                             .as_ref()
-                            .expect("planned recursive delete row should carry entity_pk")
+                            .expect("planned recursive delete row should carry row_pk")
                             .as_single_string_owned()
-                            .expect("planned recursive delete row should project entity_pk"),
+                            .expect("planned recursive delete row should project row_pk"),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -2925,32 +3063,205 @@ mod tests {
         assert!(plan.rows.iter().all(|row| row.snapshot.is_none()));
     }
 
+    fn untracked_branch_context(branch_id: &str) -> FilesystemRowContext {
+        FilesystemRowContext {
+            untracked: true,
+            ..FilesystemRowContext::active_branch(branch_id)
+        }
+    }
+
+    fn planned_delete_rows(plan: &super::FilesystemDeletePlan) -> Vec<(String, String, bool)> {
+        plan.rows
+            .iter()
+            .map(|row| {
+                (
+                    row.schema_key.as_str().to_string(),
+                    row.row_pk
+                        .as_ref()
+                        .expect("planned recursive delete row should carry row_pk")
+                        .as_single_string_owned()
+                        .expect("planned recursive delete row should project row_pk"),
+                    row.untracked,
+                )
+            })
+            .collect()
+    }
+
+    /// A tracked directory delete crosses the lane downward: untracked
+    /// descendants are tombstoned too, each in its own lane, blob refs
+    /// included. Leaving them behind orphans rows whose parent is gone and
+    /// makes the branch's whole filesystem path index fail to build.
+    #[test]
+    fn recursive_tracked_directory_delete_reaches_untracked_children() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let tracked = FilesystemRowContext::active_branch(branch_id);
+        let untracked = untracked_branch_context(branch_id);
+        let root = "01920000-0000-7000-8000-0000000000d3";
+        let untracked_directory = "01920000-0000-7000-8000-000000000103";
+        let tracked_file = "01920000-0000-7000-8000-000000000152";
+        let untracked_file = "01920000-0000-7000-8000-0000000000d2";
+        let nested_untracked_file = "01920000-0000-7000-8000-000000000160";
+
+        let mut directory_children_by_parent_id = BTreeMap::new();
+        directory_children_by_parent_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&untracked, root)),
+            BTreeSet::from([untracked_directory.to_string()]),
+        );
+
+        let mut files_by_directory_id = BTreeMap::new();
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&tracked, root)),
+            BTreeSet::from([tracked_file.to_string()]),
+        );
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&untracked, root)),
+            BTreeSet::from([untracked_file.to_string()]),
+        );
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(
+                &untracked,
+                untracked_directory,
+            )),
+            BTreeSet::from([nested_untracked_file.to_string()]),
+        );
+
+        let visible_filesystem = VisibleFilesystem {
+            directory_children_by_parent_id,
+            files_by_directory_id,
+            blob_refs_by_key: BTreeSet::from([FilesystemBlobRefKey::from_context(
+                &untracked,
+                untracked_file,
+            )]),
+        };
+
+        let plan =
+            super::plan_recursive_directory_delete(root, &visible_filesystem, tracked.clone());
+
+        assert_eq!(plan.count, 5);
+        assert_eq!(
+            planned_delete_rows(&plan),
+            vec![
+                (
+                    "lix_file_descriptor".to_string(),
+                    tracked_file.to_string(),
+                    false
+                ),
+                (
+                    "lix_file_descriptor".to_string(),
+                    nested_untracked_file.to_string(),
+                    true
+                ),
+                (
+                    "lix_directory_descriptor".to_string(),
+                    untracked_directory.to_string(),
+                    true
+                ),
+                (
+                    "lix_file_descriptor".to_string(),
+                    untracked_file.to_string(),
+                    true
+                ),
+                // The blob ref must be planned in the child's own lane; keying
+                // it off the deleting directory's tracked context would miss it
+                // and leak the blob.
+                (
+                    "lix_binary_blob_ref".to_string(),
+                    untracked_file.to_string(),
+                    true
+                ),
+                (
+                    "lix_directory_descriptor".to_string(),
+                    root.to_string(),
+                    false
+                ),
+            ]
+        );
+        assert!(plan.rows.iter().all(|row| row.snapshot.is_none()));
+    }
+
+    /// The lane crossing is one-directional. An untracked directory delete is
+    /// history-free branch state and must never tombstone tracked rows, which
+    /// mirrors `(cascade.untracked && !existing.untracked) => skip` in the
+    /// file-backed cascade.
+    #[test]
+    fn recursive_untracked_directory_delete_leaves_tracked_children() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let tracked = FilesystemRowContext::active_branch(branch_id);
+        let untracked = untracked_branch_context(branch_id);
+        let root = "01920000-0000-7000-8000-0000000000d3";
+        let tracked_child_directory = "01920000-0000-7000-8000-000000000103";
+        let tracked_file = "01920000-0000-7000-8000-000000000152";
+        let untracked_file = "01920000-0000-7000-8000-0000000000d2";
+
+        let mut directory_children_by_parent_id = BTreeMap::new();
+        directory_children_by_parent_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&tracked, root)),
+            BTreeSet::from([tracked_child_directory.to_string()]),
+        );
+
+        let mut files_by_directory_id = BTreeMap::new();
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&tracked, root)),
+            BTreeSet::from([tracked_file.to_string()]),
+        );
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&untracked, root)),
+            BTreeSet::from([untracked_file.to_string()]),
+        );
+
+        let visible_filesystem = VisibleFilesystem {
+            directory_children_by_parent_id,
+            files_by_directory_id,
+            blob_refs_by_key: BTreeSet::new(),
+        };
+
+        let plan =
+            super::plan_recursive_directory_delete(root, &visible_filesystem, untracked.clone());
+
+        assert_eq!(plan.count, 2);
+        assert_eq!(
+            planned_delete_rows(&plan),
+            vec![
+                (
+                    "lix_file_descriptor".to_string(),
+                    untracked_file.to_string(),
+                    true
+                ),
+                (
+                    "lix_directory_descriptor".to_string(),
+                    root.to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
     fn live_directory_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         snapshot_content: &str,
-    ) -> MaterializedLiveStateRow {
-        live_directory_row_with_scope(entity_pk, branch_id, false, false, None, snapshot_content)
+    ) -> MaterializedHotStateRow {
+        live_directory_row_with_scope(row_pk, branch_id, false, false, None, snapshot_content)
     }
 
     fn live_directory_row_with_scope(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         global: bool,
         untracked: bool,
         file_id: Option<String>,
         snapshot_content: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: EntityPk::single(entity_pk),
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: RowPk::single(row_pk),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id,
             snapshot_content: Some(snapshot_content.into()),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global,
             untracked,
             created_at: LixTimestamp::expect_parse(

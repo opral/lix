@@ -1,5 +1,5 @@
 use crate::changelog::ChangeId;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 #[cfg(test)]
 use crate::tracked_state::TrackedStateDiffIdentity;
 use crate::tracked_state::{
@@ -46,7 +46,7 @@ impl<'a> MergeConflictRow<'a> {
     }
 
     pub(crate) fn kind(self) -> MergeConflictKind {
-        MergeConflictKind::SameEntityChanged
+        MergeConflictKind::SameRowChanged
     }
 
     #[cfg(test)]
@@ -58,8 +58,8 @@ impl<'a> MergeConflictRow<'a> {
         self.tracked.identity.schema_key()
     }
 
-    pub(crate) fn entity_pk(self) -> &'a EntityPk {
-        self.tracked.identity.entity_pk()
+    pub(crate) fn row_pk(self) -> &'a RowPk {
+        self.tracked.identity.row_pk()
     }
 
     pub(crate) fn file_id(self) -> Option<&'a str> {
@@ -81,7 +81,7 @@ impl<'a> MergeConflictRow<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeConflictKind {
-    SameEntityChanged,
+    SameRowChanged,
 }
 
 /// One side-column view in a conflict batch row.
@@ -138,7 +138,7 @@ mod tests {
         let identity = TrackedStateDiffIdentity::from_key(TrackedStateKey {
             schema_key: "schema".to_owned(),
             file_id: Some("file".to_owned()),
-            entity_pk: EntityPk::single("entity"),
+            row_pk: RowPk::single("row"),
         });
         let target_row = row(identity.clone(), "target");
         let source_row = row(identity.clone(), "source");

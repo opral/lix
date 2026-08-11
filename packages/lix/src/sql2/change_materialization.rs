@@ -1,6 +1,6 @@
 use crate::changelog::ChangeRecord;
 use crate::common::SharedStr;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{LixError, parse_row_metadata};
@@ -15,7 +15,7 @@ use crate::{LixError, parse_row_metadata};
 pub(crate) struct MaterializedChange {
     pub(crate) id: String,
     pub(crate) account_id: String,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
@@ -65,7 +65,7 @@ where
         crate::commit_graph::CommitGraphChange {
             id: change.change_id,
             account_id: change.account_id,
-            entity_pk: change.entity_pk,
+            row_pk: change.row_pk,
             schema_key: change.schema_key,
             file_id: change.file_id,
             snapshot: change.snapshot,
@@ -104,7 +104,7 @@ where
     Ok(MaterializedChange {
         id: change.id.to_string(),
         account_id: change.account_id,
-        entity_pk: change.entity_pk,
+        row_pk: change.row_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot_content,
@@ -157,7 +157,7 @@ mod tests {
     use crate::changelog::ChangeId;
     use crate::commit_graph::CommitGraphChange;
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::json_store::{
         JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
     };
@@ -169,7 +169,7 @@ mod tests {
         CommitGraphChange {
             id: ChangeId::for_test_label("change-projection"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            entity_pk: EntityPk::single("entity-1"),
+            row_pk: RowPk::single("row-1"),
             schema_key: "example".to_string(),
             file_id: Some("file-1".to_string()),
             snapshot,

@@ -1,13 +1,9 @@
-//! Immutable, projection-addressable Arrow row groups.
+//! Immutable, projection-addressable Arrow groups.
 //!
 //! This module owns a generic physical format. It deliberately knows nothing
 //! about SQL plans, current-state visibility, or commit publication. Callers
 //! provide a stable 16-byte owner and publish the returned immutable writes
 //! inside their own atomic visibility transaction.
-
-// This intentionally lands before its publication/read-path integration. Its
-// crate-private API is exercised by the codec and storage tests below.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -26,7 +22,7 @@ use crate::LixError;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, StorageAdapterRead,
     StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace, StorageSpaceId,
-    StorageValue, StorageWriteSet,
+    StorageValue, StorageWriteSet, ValueSemantics,
 };
 
 pub(crate) const ROW_GROUP_MAX_ROWS: usize = 64 * 1024;
@@ -41,13 +37,15 @@ pub(crate) struct RowGroupRowLocation {
     pub(crate) group_index: u32,
     pub(crate) row_index: u32,
 }
-pub(crate) const ROW_GROUP_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
+pub(crate) const ROW_GROUP_MANIFEST_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0029),
-    "entity.columnar_row_group_manifest.v1",
+    "row.columnar_row_group_manifest.v1",
+    ValueSemantics::Immutable,
 );
-pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::immutable(
+pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_002a),
-    "entity.columnar_row_group_column.v1",
+    "row.columnar_row_group_column.v1",
+    ValueSemantics::Immutable,
 );
 
 const MANIFEST_MAGIC: &[u8; 8] = b"LXRGM004";
@@ -209,6 +207,9 @@ impl RowGroupManifest {
             .sum()
     }
 
+    /// Only the codec tests reconstruct the full Arrow schema; every read path
+    /// projects columns through `row_group_projected_schema` instead.
+    #[cfg(test)]
     pub(crate) fn schema(&self) -> SchemaRef {
         let fields = self.fields.iter().map(|field| {
             Field::new(&field.name, field.data_type.to_arrow(), field.nullable)
@@ -329,18 +330,27 @@ pub(crate) struct EncodedRowGroupSet {
 }
 
 impl EncodedRowGroupSet {
+    #[cfg(test)]
     fn column_bytes(&self, column: &EncodedColumn) -> &[u8] {
         let start = column.value.offset();
         &self.column_values[start..start + column.value.len()]
     }
 }
 
+/// Whole-set load result. Production readers stream one group at a time via
+/// `load_row_group_batch`; only the codec/storage tests materialize every
+/// group at once.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedRowGroupSet {
     pub(crate) manifest: RowGroupManifest,
     pub(crate) batches: Vec<RecordBatch>,
 }
 
+/// Encodes a whole set in one shot. The commit path stages pre-encoded groups
+/// through `stage_row_group_set`; this whole-set encoder is a test fixture
+/// helper only.
+#[cfg(test)]
 pub(crate) fn encode_row_group_set(
     namespace: impl Into<String>,
     schema: SchemaRef,
@@ -527,6 +537,7 @@ pub(crate) async fn stage_delete_row_group_set(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn load_row_group_set(
     store: &(impl StorageAdapterRead + ?Sized),
     id: RowGroupSetId,

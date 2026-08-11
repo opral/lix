@@ -1,6 +1,6 @@
 {
   "key": "plugin_excalidraw",
-  "match": {
+  "file_match": {
     "path_glob": "*.excalidraw",
     "content": "text"
   },

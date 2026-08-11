@@ -1,14 +1,14 @@
 use crate::LixError;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::checkpoint::CHECKPOINT_SCHEMA_KEY;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
 use crate::tracked_state::{
     TrackedStateIndexValue, TrackedStateKey, descriptor_dependency_cascade_file_ids,
 };
 use crate::transaction::Transaction;
-use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
+use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 use crate::undo_redo::{
     UNDO_REDO_MARKER_SCHEMA_KEY, UndoRedoKind, UndoRedoMarker, marker_stage_row,
 };
@@ -89,7 +89,7 @@ where
     } else {
         load_commit_delta(transaction, target).await?
     };
-    let outcome = apply_state_diff(transaction, head, parent, target, false, &target_delta).await?;
+    let outcome = apply_state_diff(transaction, head, parent, false, &target_delta).await?;
     let inverse_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -149,7 +149,7 @@ where
     only_parent(&target_record.parent_commit_ids, target, "redo")?;
 
     let target_delta = load_commit_delta(transaction, target).await?;
-    let outcome = apply_state_diff(transaction, head, target, target, true, &target_delta).await?;
+    let outcome = apply_state_diff(transaction, head, target, true, &target_delta).await?;
     let replay_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -207,7 +207,7 @@ where
     for row in marker_delta.iter().filter(|row| !row.value().deleted) {
         let key = row.key_ref();
         match key.schema_key {
-            UNDO_REDO_MARKER_SCHEMA_KEY if key.entity_pk == &local_operation_key.entity_pk => {
+            UNDO_REDO_MARKER_SCHEMA_KEY if key.row_pk == &local_operation_key.row_pk => {
                 has_local_operation = true;
             }
             UNDO_REDO_MARKER_SCHEMA_KEY => has_foreign_operation = true,
@@ -232,7 +232,7 @@ where
 }
 
 fn semantic_key(branch_id: &str) -> Result<TrackedStateKey, LixError> {
-    let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+    let branch_pk = RowPk::uuid_from_canonical(branch_id).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PARAM,
             format!("undo branch id must be a canonical UUID: {error}"),
@@ -241,7 +241,7 @@ fn semantic_key(branch_id: &str) -> Result<TrackedStateKey, LixError> {
     Ok(TrackedStateKey {
         schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
         file_id: None,
-        entity_pk: branch_pk,
+        row_pk: branch_pk,
     })
 }
 
@@ -338,7 +338,7 @@ async fn operation_marker_at<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let branch_pk = EntityPk::uuid_from_canonical(branch_id)
+    let branch_pk = RowPk::uuid_from_canonical(branch_id)
         .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, error.to_string()))?;
     let rows = {
         let mut tracked = transaction.tracked_state_reader().await;
@@ -348,7 +348,7 @@ where
                 &[TrackedStateKey {
                     schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    entity_pk: branch_pk,
+                    row_pk: branch_pk,
                 }],
                 &ChangeRecordProjection::from_columns(&[
                     "commit_id".to_string(),
@@ -453,15 +453,12 @@ async fn apply_state_diff<S>(
     transaction: &mut Transaction<S>,
     current: CommitId,
     desired: CommitId,
-    target: CommitId,
     desired_is_target: bool,
     target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
 ) -> Result<crate::sql2::DiffCommandOutcome, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    reject_untracked_descriptor_cascade(transaction, target_delta, desired_is_target, target)
-        .await?;
     let cascade_file_ids = descriptor_dependency_cascade_file_ids(target_delta)?;
     let keys = if cascade_file_ids.is_empty() {
         target_delta
@@ -494,56 +491,6 @@ where
         .await
 }
 
-async fn reject_untracked_descriptor_cascade<S>(
-    transaction: &mut Transaction<S>,
-    target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
-    desired_is_target: bool,
-    target: CommitId,
-) -> Result<(), LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let removes_descriptor = |value: &TrackedStateIndexValue| {
-        if desired_is_target {
-            value.deleted
-        } else {
-            !value.deleted
-        }
-    };
-    let mut file_ids = Vec::new();
-    let mut removes_directory = false;
-    for (key, value) in target_delta {
-        if !removes_descriptor(value) {
-            continue;
-        }
-        match key.schema_key.as_str() {
-            "lix_file_descriptor" => {
-                file_ids.push(key.entity_pk.as_single_string_owned().map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("undo/redo file descriptor identity is invalid: {error}"),
-                    )
-                })?)
-            }
-            "lix_directory_descriptor" => removes_directory = true,
-            _ => {}
-        }
-    }
-    let has_dependency = transaction
-        .has_untracked_file_scoped_rows(&file_ids)
-        .await?
-        || (removes_directory && transaction.has_untracked_rows().await?);
-    if has_dependency {
-        return Err(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "cannot undo/redo commit '{target}' because removing its file or directory would delete untracked state"
-            ),
-        ));
-    }
-    Ok(())
-}
-
 async fn stage_marker<S>(
     transaction: &mut Transaction<S>,
     marker: UndoRedoMarker,
@@ -564,8 +511,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value as JsonValue;
-
     use super::{load_commit_delta, load_node, only_parent};
     use crate::engine::Engine;
     use crate::sql2::SqlWriteExecutionContext;
@@ -586,7 +531,7 @@ mod tests {
     async fn setup() -> crate::session::SessionContext<Memory> {
         setup_engine()
             .await
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session opens")
     }
@@ -605,7 +550,7 @@ mod tests {
             .and_then(|row| row.get::<Value>("value").ok())
             .and_then(|value| match value {
                 Value::Text(value) => Some(value),
-                Value::Json(JsonValue::String(value)) => Some(value),
+                Value::Jsonb(value) => value.as_json_string(),
                 _ => None,
             })
     }
@@ -777,10 +722,7 @@ mod tests {
     #[tokio::test]
     async fn branch_forked_at_checkpoint_starts_at_an_undo_floor() {
         let engine = setup_engine().await;
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("session opens");
+        let session = engine.open_session().await.expect("session opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('before-fork', 'kept')",
@@ -800,7 +742,7 @@ mod tests {
             })
             .await
             .expect("branch creates");
-        let fork = engine.open_session(branch.id).await.expect("fork opens");
+        let fork = engine.open_session_at(branch.id).await.expect("fork opens");
 
         let error = fork
             .undo()
@@ -813,10 +755,7 @@ mod tests {
     #[tokio::test]
     async fn branch_forked_at_undo_commit_resets_undo_history() {
         let engine = setup_engine().await;
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("session opens");
+        let session = engine.open_session().await.expect("session opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('abandoned', 'change')",
@@ -833,7 +772,7 @@ mod tests {
             })
             .await
             .expect("branch creates");
-        let fork = engine.open_session(branch.id).await.expect("fork opens");
+        let fork = engine.open_session_at(branch.id).await.expect("fork opens");
 
         let error = fork
             .undo()
@@ -1056,8 +995,15 @@ mod tests {
         );
     }
 
+    /// The mixed state that made undo lossy can no longer be created.
+    ///
+    /// This test used to write an untracked row into a *tracked* file and then
+    /// assert that `undo` refused to proceed — a guard
+    /// (`reject_untracked_descriptor_cascade`) standing in for an invariant the
+    /// engine did not enforce. PR D enforces the invariant at the write, so the
+    /// INSERT is now rejected and the guard has nothing left to catch.
     #[tokio::test]
-    async fn undo_file_creation_rejects_deleting_untracked_file_state() {
+    async fn untracked_row_cannot_be_owned_by_a_tracked_file() {
         let session = setup().await;
         session
             .upsert_file_content("/owned.txt".into(), Blob::from("tracked".as_bytes()))
@@ -1071,31 +1017,33 @@ mod tests {
             Value::Text(value) => value,
             value => panic!("expected text file id, got {value:?}"),
         };
-        session
+        let error = session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_file_id, lixcol_untracked) \
                  VALUES ('file-ui', 'open', $1, true)",
                 &[Value::Text(file_id)],
             )
             .await
-            .expect("untracked file state writes");
-
-        let error = session
-            .undo()
-            .await
-            .expect_err("undo must not cascade untracked state");
+            .expect_err("an untracked row must not be owned by a tracked file");
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert_eq!(value(&session, "file-ui").await.as_deref(), Some("open"));
-        assert_eq!(
+        assert!(
+            error.message.contains("which exists but is tracked"),
+            "the rejection must name the file's lane, got: {}",
+            error.message
+        );
+
+        // With the mixed state unreachable, undo is ordinary again: it removes
+        // the file it created, and there is no untracked state to strand.
+        session.undo().await.expect("undo removes the tracked file");
+        assert!(
             session
                 .read_file_content("/owned.txt".into(), None)
                 .await
                 .expect("file reads")
-                .expect("file remains")
-                .content()
-                .as_ref(),
-            b"tracked"
+                .is_none(),
+            "undo must remove the file its target commit created"
         );
+        assert_eq!(value(&session, "file-ui").await, None);
     }
 
     #[tokio::test]
@@ -1105,10 +1053,7 @@ mod tests {
             .await
             .expect("storage initializes");
         let engine = Engine::new(storage).await.expect("engine opens");
-        let first = engine
-            .open_workspace_session()
-            .await
-            .expect("first session opens");
+        let first = engine.open_session().await.expect("first session opens");
         first
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('durable', 'yes')",
@@ -1121,7 +1066,7 @@ mod tests {
         drop(first);
 
         let reopened = engine
-            .open_session(branch_id)
+            .open_session_at(branch_id)
             .await
             .expect("fresh pinned session opens");
         reopened.redo().await.expect("redo survives session loss");
@@ -1135,10 +1080,7 @@ mod tests {
             .await
             .expect("storage initializes");
         let engine = Engine::new(storage).await.expect("engine opens");
-        let main = engine
-            .open_workspace_session()
-            .await
-            .expect("main session opens");
+        let main = engine.open_session().await.expect("main session opens");
         let draft = main
             .create_branch(CreateBranchOptions {
                 id: Some("01930000-0000-7000-8000-000000000099".to_string()),
@@ -1148,7 +1090,7 @@ mod tests {
             .await
             .expect("draft creates");
         let draft_session = engine
-            .open_session(draft.id.clone())
+            .open_session_at(draft.id.clone())
             .await
             .expect("draft session opens");
         draft_session

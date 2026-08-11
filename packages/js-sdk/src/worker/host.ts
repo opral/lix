@@ -125,17 +125,6 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix().activeBranchId();
 			case "activeAccountId":
 				return requiredLix().activeAccountId();
-			case "clientState.entries":
-				return requiredClientStateMethod("clientStateEntries")();
-			case "clientState.get":
-				return requiredClientStateMethod("clientStateGet")(operation.key);
-			case "clientState.set":
-				return requiredClientStateMethod("clientStateSet")(
-					operation.key,
-					operation.value,
-				);
-			case "clientState.delete":
-				return requiredClientStateMethod("clientStateDelete")(operation.key);
 			case "createBranch":
 				return requiredLix().createBranch(operation.options);
 			case "createCheckpoint":
@@ -154,16 +143,6 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix().importFilesystemPaths(operation.paths);
 			case "syncDiskToLix":
 				return requiredLix().syncDiskToLix();
-			case "exportSnapshot": {
-				const lix = requiredLix();
-				const exportSnapshot = lix.exportSnapshot;
-				if (!exportSnapshot) {
-					throw workerStateError(
-						"The open Lix storage does not support snapshot export",
-					);
-				}
-				return exportSnapshot.call(lix);
-			}
 			case "observe": {
 				const events = await requiredLix().observe(
 					operation.sql,
@@ -196,22 +175,6 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 	function requiredLix(): LixBinding {
 		if (!lix) throw workerStateError("Lix worker is closed");
 		return lix;
-	}
-
-	function requiredClientStateMethod<
-		Key extends
-			| "clientStateEntries"
-			| "clientStateGet"
-			| "clientStateSet"
-			| "clientStateDelete",
-	>(key: Key): NonNullable<LixBinding[Key]> {
-		const method = requiredLix()[key];
-		if (!method) {
-			throw workerStateError(
-				"The open Lix binding does not support typed client state",
-			);
-		}
-		return method.bind(requiredLix()) as NonNullable<LixBinding[Key]>;
 	}
 
 	function requiredTransaction(transactionId: number): LixTransactionBinding {

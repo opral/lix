@@ -47,7 +47,7 @@ The exact API names might still change. The important part is that the flow work
 
 - open a Lix
 - create a version
-- write entities with CRUD operations
+- write rows with CRUD operations
 - switch versions
 - merge a version
 
@@ -55,9 +55,9 @@ That is the product surface for the MVP.
 
 Files are not in the `v0.6` MVP on purpose.
 
-A file write fans out into entity writes. A Word document, JSON file, or spreadsheet save can become thousands of inserts. That means the file API can only be as fast as the entity layer underneath it. The 10k inserts benchmark measures that layer.
+A file write fans out into row writes. A Word document, JSON file, or spreadsheet save can become thousands of inserts. That means the file API can only be as fast as the row layer underneath it. The 10k inserts benchmark measures that layer.
 
-Most apps and agents should write entities directly anyway. They should update a paragraph, cell, or property, not re-serialize a whole document. The file API comes after CRUD because it is built on the same semantic write path.
+Most apps and agents should write rows directly anyway. They should update a paragraph, cell, or property, not re-serialize a whole document. The file API comes after CRUD because it is built on the same semantic write path.
 
 The first preview is published on npm:
 
@@ -71,7 +71,7 @@ npm install @lix-js/sdk@0.6.0-preview.2
 
 [Last month](/blog/march-2026-update) we found the next bottleneck: semantic writes.
 
-The blob path was already fast. The semantic path was not. Writing one file can fan out into thousands of entities, and the April goal was to get **10k entity inserts under 100ms**.
+The blob path was already fast. The semantic path was not. Writing one file can fan out into thousands of rows, and the April goal was to get **10k row inserts under 100ms**.
 
 The number is not random. A semantic file is not one row:
 
@@ -133,7 +133,7 @@ DataFusion is an Apache Arrow SQL query engine. It gives Lix SQL parsing, planni
 
 The decision is not "SQLite bad, custom database good." Reusing a query engine is still the right idea. The mistake would be building one from scratch when DataFusion exists.
 
-That is the control Lix needs: from incoming query, through registered entity rows, versions, history, branch visibility, merge inputs, and file projections, down to the raw storage layer.
+That is the control Lix needs: from incoming query, through registered rows, versions, history, branch visibility, merge inputs, and file projections, down to the raw storage layer.
 
 SQLite does not go away. It can still provide physical storage. The change is that SQLite no longer defines the query and storage shape of Lix state.
 
@@ -168,7 +168,7 @@ This also changes the portability story. Earlier posts framed portability as "an
 
 March had three April goals:
 
-1. 10k entity inserts under 100ms
+1. 10k row inserts under 100ms
 2. prolly trees for cheap branching
 3. workload testing with the semantic layer on
 
@@ -187,6 +187,6 @@ The acceptance criteria:
 
 The 1.5x number is the guardrail for the storage abstraction. It is not the final product latency target. It checks that the abstraction itself is not the bottleneck. If storage is close to SQLite's baseline, Lix can ship the MVP and keep optimizing query/runtime logic above it incrementally.
 
-Files follow after CRUD because file writes fan out into the same entity writes.
+Files follow after CRUD because file writes fan out into the same row writes.
 
 Everything else is secondary.

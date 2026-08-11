@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lix::wasm::{
-    WasmByteOutputsHandle, WasmChangeCursorHandle, WasmChangePage, WasmComponentActor,
-    WasmComponentFactory, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage,
-    WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate, WasmLimits,
-    WasmOpenEntitiesInput, WasmOpenFileInput, WasmRuntime, WasmTransitionHandle,
-    WasmTransitionLimits,
+use lix::plugin::runtime::{
+    PluginCapabilities, WasmByteOutputsHandle, WasmChangeCursorHandle, WasmChangePage,
+    WasmComponentActor, WasmComponentFactory, WasmDocumentHandle, WasmEditCursorHandle,
+    WasmEditPage, WasmFileTransition, WasmFileUpdate, WasmOpenFileInput, WasmOpenRowsInput,
+    WasmRowTransition, WasmRowUpdate, WasmRuntime, WasmTransitionHandle, WasmTransitionLimits,
 };
+use lix::wasm::WasmLimits;
 use lix::{LixError, open_lix};
 
 struct EmbeddingRuntime;
@@ -19,6 +19,7 @@ impl WasmRuntime for EmbeddingRuntime {
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
+        _capabilities: PluginCapabilities,
     ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
         Ok(Arc::new(EmbeddingFactory))
     }
@@ -34,17 +35,17 @@ impl WasmComponentFactory for EmbeddingFactory {
     }
 }
 
-// Keep the complete actor method boundary reachable from `lix::wasm`.
+// Keep the complete actor method boundary reachable from `lix::plugin::runtime`.
 #[allow(dead_code)]
 fn actor_contract_types_are_public(
     _: WasmTransitionLimits,
     _: WasmOpenFileInput,
-    _: WasmOpenEntitiesInput,
+    _: WasmOpenRowsInput,
     _: WasmFileUpdate,
-    _: WasmEntityUpdate,
+    _: WasmRowUpdate,
     _: WasmDocumentHandle,
     _: WasmFileTransition,
-    _: WasmEntityTransition,
+    _: WasmRowTransition,
     _: WasmTransitionHandle,
     _: WasmChangeCursorHandle,
     _: WasmEditCursorHandle,
@@ -52,6 +53,28 @@ fn actor_contract_types_are_public(
     _: WasmChangePage,
     _: WasmEditPage,
 ) {
+}
+
+#[test]
+fn public_sdk_opens_writes_and_reads_without_a_tokio_runtime() {
+    futures_lite::future::block_on(async {
+        let lix = open_lix().await.expect("open Lix under plain block_on");
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('executor', CAST('true' AS JSONB))",
+            &[],
+        )
+        .await
+        .expect("write under plain block_on");
+        let result = lix
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'executor'",
+                &[],
+            )
+            .await
+            .expect("read under plain block_on");
+        assert_eq!(result.rows().len(), 1);
+        lix.close().await.expect("close under plain block_on");
+    });
 }
 
 #[tokio::test]

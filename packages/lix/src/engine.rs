@@ -6,13 +6,13 @@ use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
+use crate::hot_state::HotStateContext;
+use crate::hot_state::HotStateRowRequest;
 use crate::init::InitReceipt;
-use crate::live_state::LiveStateContext;
-use crate::live_state::LiveStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::plugin::{
+use crate::plugin::runtime::{
     DEFAULT_MAX_LIVE_PLUGIN_STORES, DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost,
 };
 use crate::session::SessionContext;
@@ -26,16 +26,15 @@ use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
-use crate::wasm::WasmTransitionCounters;
-use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
+use crate::plugin::runtime::WasmTransitionCounters;
+use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
-#[expect(missing_debug_implementations)]
-pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
+pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
     tracked_state: Arc<TrackedStateContext>,
-    live_state: Arc<LiveStateContext>,
+    hot_state: Arc<HotStateContext>,
     branch_ctx: Arc<BranchContext>,
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
@@ -49,8 +48,7 @@ pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memor
     telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
-#[expect(missing_debug_implementations)]
-pub struct EngineOptions {
+pub(crate) struct EngineOptions {
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     plugin_max_memory_bytes: u64,
@@ -69,16 +67,16 @@ impl Default for EngineOptions {
 }
 
 impl EngineOptions {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_wasm_runtime(mut self, wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
+    pub(crate) fn with_wasm_runtime(mut self, wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
         self.wasm_runtime = Some(wasm_runtime);
         self
     }
 
-    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
+    pub(crate) fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
         self.telemetry = Some(telemetry);
         self
     }
@@ -93,9 +91,9 @@ impl EngineOptions {
     /// 1.875 GiB before host-side document state. Cached actors, active
     /// existing-document transaction leases, pending publications, cold-open
     /// candidates, and upgrade preflight Stores consume the same
-    /// workspace-wide budget. Completed publications may retire their Stores
+    /// repository-wide budget. Completed publications may retire their Stores
     /// under pressure and cold-open again after commit.
-    pub fn with_plugin_resource_limits(
+    pub(crate) fn with_plugin_resource_limits(
         mut self,
         max_memory_bytes: u64,
         max_live_stores: usize,
@@ -115,7 +113,7 @@ where
     /// Initialization is a storage lifecycle operation, separate from runtime
     /// construction. Call this before `Engine::new(...)` for a brand-new
     /// storage.
-    pub async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
+    pub(crate) async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
         let storage = StorageAdapter::new(storage);
 
         crate::init::initialize(storage, &TrackedStateContext::new()).await
@@ -129,12 +127,13 @@ where
     /// Deterministic runtime sequencing is serialized within this Engine
     /// context. Independently constructing multiple Engine values over the same
     /// cloned storage is outside that MVP runtime-sharing boundary.
-    pub async fn new(storage: StorageImpl) -> Result<Self, LixError> {
+    pub(crate) async fn new(storage: StorageImpl) -> Result<Self, LixError> {
         Self::new_with_options(storage, EngineOptions::new()).await
     }
 
     /// Creates an engine with a WASM component runtime for installed plugins.
-    pub async fn new_with_wasm_runtime(
+    #[allow(dead_code)]
+    pub(crate) async fn new_with_wasm_runtime(
         storage: StorageImpl,
         wasm_runtime: Arc<dyn WasmRuntime>,
     ) -> Result<Self, LixError> {
@@ -145,7 +144,7 @@ where
         .await
     }
 
-    pub async fn new_with_options(
+    pub(crate) async fn new_with_options(
         storage: StorageImpl,
         options: EngineOptions,
     ) -> Result<Self, LixError> {
@@ -161,12 +160,12 @@ where
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let commit_graph = CommitGraphContext::new();
-        let live_state = Arc::new(LiveStateContext::new(
+        let hot_state = Arc::new(HotStateContext::new(
             tracked_state.as_ref().clone(),
             commit_graph,
         ));
         let branch_ctx = Arc::new(BranchContext::new());
-        assert_initialized(storage.clone(), live_state.as_ref()).await?;
+        assert_initialized(storage.clone(), hot_state.as_ref()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
         // execution-scoped SQL context, optionally wrapped by a transaction
@@ -182,7 +181,7 @@ where
             binary_cas: Arc::new(BinaryCasContext::new()),
             storage,
             tracked_state,
-            live_state,
+            hot_state,
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
             sql_planning_cache: Arc::new(SqlPlanningCache::default()),
@@ -204,8 +203,8 @@ where
     ///
     /// This is the public engine-level form of the typed `branch_ref` context:
     /// callers should not need to know that branch heads are represented as
-    /// untracked `lix_branch_ref` rows in live_state.
-    pub async fn load_branch_head_commit_id(
+    /// untracked `lix_branch_ref` rows in hot_state.
+    pub(crate) async fn load_branch_head_commit_id(
         &self,
         branch_id: &str,
     ) -> Result<Option<String>, LixError> {
@@ -223,26 +222,26 @@ where
         Ok(result)
     }
 
-    pub async fn open_session(
+    pub(crate) async fn open_session_at(
         &self,
         active_branch_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
-        self.open_session_with_account(active_branch_id, crate::ANONYMOUS_ACCOUNT_ID)
+        self.open_session_at_with_account(active_branch_id, crate::ANONYMOUS_ACCOUNT_ID)
             .await
     }
 
-    pub async fn open_session_with_account(
+    pub(crate) async fn open_session_at_with_account(
         &self,
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
         let active_account_id = active_account_id.into();
         self.validate_active_account(&active_account_id).await?;
-        SessionContext::open(
+        SessionContext::open_at(
             active_branch_id.into(),
             active_account_id,
             self.storage(),
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
@@ -259,21 +258,21 @@ where
         .await
     }
 
-    pub async fn open_workspace_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
-        self.open_workspace_session_with_account(crate::ANONYMOUS_ACCOUNT_ID)
+    pub(crate) async fn open_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
+        self.open_session_with_account(crate::ANONYMOUS_ACCOUNT_ID)
             .await
     }
 
-    pub async fn open_workspace_session_with_account(
+    pub(crate) async fn open_session_with_account(
         &self,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
         let active_account_id = active_account_id.into();
         self.validate_active_account(&active_account_id).await?;
-        SessionContext::open_workspace(
+        SessionContext::open_default(
             active_account_id,
             self.storage(),
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
@@ -293,14 +292,16 @@ where
     /// Returns process-local work accumulated by completed v2 transitions on
     /// this engine. The snapshot is shared by every session cloned from it.
     #[doc(hidden)]
-    pub fn plugin_transition_counters(&self) -> WasmTransitionCounters {
+    #[allow(dead_code)]
+    pub(crate) fn plugin_transition_counters(&self) -> WasmTransitionCounters {
         self.plugin_host.transition_counters()
     }
 
     /// Resets the process-local v2 transition aggregate used by profiling and
-    /// invariant tests. This does not mutate durable workspace state.
+    /// invariant tests. This does not mutate durable repository state.
     #[doc(hidden)]
-    pub fn reset_plugin_transition_counters(&self) {
+    #[allow(dead_code)]
+    pub(crate) fn reset_plugin_transition_counters(&self) {
         self.plugin_host.reset_transition_counters();
     }
 
@@ -313,7 +314,10 @@ where
     /// heads restore content-addressed chunks only after their immutable root
     /// metadata passes a full changelog coverage audit. Rootless heads receive
     /// the same audit transiently and remain bounded-replay layouts.
-    pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
+    pub(crate) async fn rebuild_tracked_state_for_branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<(), LixError> {
         let head_commit_id = self
             .load_branch_head_commit_id(branch_id)
             .await?
@@ -369,7 +373,7 @@ where
     }
 
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
-        let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
+        let account_pk = RowPk::uuid_from_canonical(account_id).map_err(|_| {
             LixError::new(
                 "LIX_INVALID_ACCOUNT_ID",
                 format!("active account id '{account_id}' is not a canonical UUID"),
@@ -381,12 +385,12 @@ where
                 .await?,
         );
         let row = self
-            .live_state
+            .hot_state
             .reader(read)
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: "lix_account".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: account_pk,
+                row_pk: account_pk,
                 file_id: NullableKeyFilter::Null,
             })
             .await?
@@ -420,7 +424,7 @@ where
 
 async fn assert_initialized<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
-    live_state: &LiveStateContext,
+    hot_state: &HotStateContext,
 ) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -432,12 +436,12 @@ where
         // spaces keep their physical IDs across hard layout cuts, so an old
         // group value could otherwise be decoded before we reject it.
         crate::init::RepositoryProtocolStatus::Current => {
-            let reader = live_state.reader(read);
+            let reader = hot_state.reader(read);
             let initialized = reader
-                .load_row(&LiveStateRowRequest {
+                .load_row(&HotStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    entity_pk: EntityPk::single("lix_id"),
+                    row_pk: RowPk::single("lix_id"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await?
@@ -480,7 +484,7 @@ async fn repository_has_changelog_commit(
             },
         )
         .await?;
-    Ok(!cursor.next_page(1).await?.entries.is_empty())
+    Ok(!cursor.next_page(1).await?.is_empty())
 }
 
 fn not_initialized_error() -> LixError {
@@ -504,7 +508,7 @@ mod tests {
     async fn scan_test_space(
         read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
         space: StorageSpace,
-    ) -> crate::storage_adapter::StorageScanChunk {
+    ) -> Vec<crate::storage_adapter::StorageReadEntry> {
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }
@@ -514,30 +518,23 @@ mod tests {
             .begin_scan(space, range, StorageBeginScanOptions::default())
             .await
             .expect("begin test scan");
-        cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await
-            .expect("read test scan page")
+        cursor.collect_all().await.expect("read test scan page")
     }
 
     async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
         let schema = json!({
-            "x-lix-key": "json_pointer",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_pointer",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         assert_eq!(
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), $2, false)",
+                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), $2, false)",
                     &[
                         crate::Value::Text(schema.to_string()),
                         crate::Value::Boolean(global),
@@ -711,6 +708,30 @@ mod tests {
 
         let Err(error) = Engine::new(storage).await else {
             panic!("V61 checkpoint-marker repositories must fail closed");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
+    async fn predecessor_v64_direct_change_id_leaf_protocol_is_rejected() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"myers-first-parent-jump.v64"[..],
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("V64 protocol marker should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("V64 packed-history repositories must fail closed");
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
     }
@@ -961,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_fast_path_serves_broad_sql_rows() {
+    async fn tracked_row_fast_path_serves_broad_sql_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -969,15 +990,12 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         assert_eq!(
             session
                 .execute(
-                    "INSERT INTO json_pointer (path, value) VALUES ('/a', lix_json('{\"n\":1}')), ('/b', lix_json('{\"n\":2}')), ('/c', lix_json('{\"n\":3}'))",
+                    "INSERT INTO json_pointer (path, value) VALUES ('/a', CAST('{\"n\":1}' AS JSONB)), ('/b', CAST('{\"n\":2}' AS JSONB)), ('/c', CAST('{\"n\":3}' AS JSONB))",
                     &[],
                 )
                 .await
@@ -1010,7 +1028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_provider_preserves_canonical_primary_key_order() {
+    async fn tracked_row_provider_preserves_canonical_primary_key_order() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1018,22 +1036,19 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
 
         // These values exercise the order-preserving tracked-head codec's
         // edge cases: empty strings, embedded NULs, control bytes, and UTF-8.
         // Compare equivalent orderings to exercise provider projection and
         // DataFusion ordering over the tracked-head primary-key codec.
-        let paths = ["", "\0", "a", "a\0", "a\u{1}", "z", "é"];
+        let paths = ["", "a", "a\u{1}", "z", "é"];
         for (index, path) in paths.iter().enumerate() {
             assert_eq!(
                 session
                     .execute(
-                        "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))",
+                        "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))",
                         &[
                             crate::Value::Text((*path).to_string()),
                             crate::Value::Text(json!({"index": index}).to_string()),
@@ -1083,7 +1098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_public_fast_path_falls_back_for_staged_transaction_rows() {
+    async fn tracked_row_public_fast_path_falls_back_for_staged_transaction_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1091,14 +1106,11 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ('/committed', lix_json('{\"source\":\"tracked\"}'))",
+                "INSERT INTO json_pointer (path, value) VALUES ('/committed', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1110,7 +1122,7 @@ mod tests {
             .expect("transaction should open");
         transaction
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ('/staged', lix_json('{\"source\":\"staged\"}'))",
+                "INSERT INTO json_pointer (path, value) VALUES ('/staged', CAST('{\"source\":\"staged\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1134,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_state_group_serves_mixed_tracked_and_untracked_entity_rows() {
+    async fn current_state_group_serves_mixed_tracked_and_untracked_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1142,27 +1154,24 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/tracked', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/tracked', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
-            .expect("write tracked entity row");
+            .expect("write tracked row");
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/untracked', lix_json('{\"source\":\"untracked\"}'), true)",
+                 VALUES ('/untracked', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                 &[],
             )
             .await
-            .expect("write untracked entity row");
+            .expect("write untracked row");
 
         let rows = session
             .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
@@ -1180,7 +1189,7 @@ mod tests {
         let error = session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/tracked', lix_json('{\"source\":\"collision\"}'), true)",
+                 VALUES ('/tracked', CAST('{\"source\":\"collision\"}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1190,7 +1199,7 @@ mod tests {
         let error = session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/untracked', lix_json('{\"source\":\"collision\"}'))",
+                 VALUES ('/untracked', CAST('{\"source\":\"collision\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1201,7 +1210,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/tracked', lix_json('{\"source\":\"tracked-upsert\"}'), true) \
+                     VALUES ('/tracked', CAST('{\"source\":\"tracked-upsert\"}' AS JSONB), true) \
                      ON CONFLICT (path) DO UPDATE SET value = excluded.value",
                     &[],
                 )
@@ -1214,7 +1223,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/untracked', lix_json('{\"source\":\"untracked-upsert\"}'), false) \
+                     VALUES ('/untracked', CAST('{\"source\":\"untracked-upsert\"}' AS JSONB), false) \
                      ON CONFLICT (path) DO UPDATE SET value = excluded.value",
                     &[],
                 )
@@ -1272,7 +1281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untracked_public_entity_write_is_history_free_and_diff_invisible() {
+    async fn untracked_public_row_write_is_history_free_and_diff_invisible() {
         let storage = Memory::new();
         let receipt = Engine::initialize(storage.clone())
             .await
@@ -1280,10 +1289,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
 
         let head_before = engine
@@ -1317,7 +1323,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/history-free', lix_json('{\"source\":\"untracked\"}'), true)",
+                     VALUES ('/history-free', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                     &[],
                 )
                 .await
@@ -1363,6 +1369,643 @@ mod tests {
         );
     }
 
+    /// The two working-diff read paths in `hot_working_diff_entries` must
+    /// answer identically for every row state a branch can actually reach.
+    ///
+    /// The broad path enumerates the sparse `HOT_DIFF` index and then loads
+    /// each dirty identity's primary row; the finite `schema_key + row_pk`
+    /// path skips that index entirely and reads the primary rows directly.
+    /// They treat an untracked or absent primary row differently — the broad
+    /// path fails closed to canonical replay, the finite path skips the row —
+    /// so this walks every reachable shape (clean, modified, removed,
+    /// added, added-then-removed, untracked, untracked-recycled-as-tracked,
+    /// never-existed) and asserts the finite answer equals the broad answer
+    /// restricted to that identity.
+    #[tokio::test]
+    async fn working_diff_finite_bypass_and_index_scan_agree_on_every_row_state() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine.open_session().await.expect("session should open");
+        register_json_pointer_schema(&session).await;
+
+        for path in ["/clean", "/modified", "/removed", "/recycled-source"] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value) VALUES ($1, CAST('{\"v\":0}' AS JSONB))",
+                    &[crate::Value::Text(path.to_string())],
+                )
+                .await
+                .expect("pre-checkpoint tracked row should commit");
+        }
+        session
+            .execute(
+                "DELETE FROM json_pointer WHERE path = '/recycled-source'",
+                &[],
+            )
+            .await
+            .expect("pre-checkpoint delete should commit");
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish a clean working state");
+
+        session
+            .execute(
+                "UPDATE json_pointer SET value = CAST('{\"v\":1}' AS JSONB) WHERE path = '/modified'",
+                &[],
+            )
+            .await
+            .expect("modify should dirty the row");
+        session
+            .execute("DELETE FROM json_pointer WHERE path = '/removed'", &[])
+            .await
+            .expect("delete should dirty the row");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) VALUES ('/added', CAST('{\"v\":1}' AS JSONB))",
+                &[],
+            )
+            .await
+            .expect("insert should dirty a new identity");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/added-then-removed', CAST('{\"v\":1}' AS JSONB))",
+                &[],
+            )
+            .await
+            .expect("insert should dirty a new identity");
+        session
+            .execute(
+                "DELETE FROM json_pointer WHERE path = '/added-then-removed'",
+                &[],
+            )
+            .await
+            .expect("delete of a post-checkpoint insert should commit");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/untracked', CAST('{\"v\":1}' AS JSONB), true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should commit");
+
+        // Physically removing a HOT primary row is only reachable through an
+        // untracked delete (`CurrentStateDelta::physically_deletes` is
+        // `untracked && deleted`). Exercise that, then re-insert the identity
+        // as tracked so a dirty row exists whose HOT slot was previously
+        // vacated.
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/recycled', CAST('{\"v\":1}' AS JSONB), true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should commit");
+        session
+            .execute("DELETE FROM json_pointer WHERE path = '/recycled'", &[])
+            .await
+            .expect("untracked delete should physically remove the hot row");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/recycled', CAST('{\"v\":2}' AS JSONB))",
+                &[],
+            )
+            .await
+            .expect("tracked insert should reuse the vacated identity");
+
+        // The invariant that makes the two paths equivalent: retention is
+        // immutable while a physical member exists, so a dirty tracked row can
+        // never become untracked or vanish under its own `HOT_DIFF` entry.
+        let retention_flip = session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/modified', CAST('{\"v\":9}' AS JSONB), true)",
+                &[],
+            )
+            .await;
+        assert!(
+            retention_flip.is_err(),
+            "an untracked write must not take over a dirty tracked identity"
+        );
+
+        use std::sync::atomic::Ordering;
+        let hits = &crate::hot_state::WORKING_DIFF_PATH_HITS;
+        let index_before = hits.index_scan.load(Ordering::Relaxed);
+        let broad = session
+            .execute(
+                "SELECT row_pk, diff_type FROM lix_working_diff \
+                 WHERE schema_key = 'json_pointer' ORDER BY row_pk",
+                &[],
+            )
+            .await
+            .expect("broad working-diff read should execute");
+        assert!(
+            hits.index_scan.load(Ordering::Relaxed) > index_before,
+            "the schema-only working-diff read must take the HOT_DIFF index path"
+        );
+        let broad_rows = broad
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<serde_json::Value>("row_pk")
+                        .expect("row_pk should decode")
+                        .to_string(),
+                    row.get::<String>("diff_type")
+                        .expect("diff_type should decode"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            broad_rows,
+            vec![
+                ("[\"/added\"]".to_string(), "added".to_string()),
+                ("[\"/modified\"]".to_string(), "modified".to_string()),
+                ("[\"/recycled\"]".to_string(), "added".to_string()),
+                ("[\"/removed\"]".to_string(), "removed".to_string()),
+            ],
+            "the index-driven working diff must classify every reachable shape"
+        );
+
+        for path in [
+            "/clean",
+            "/modified",
+            "/removed",
+            "/added",
+            "/added-then-removed",
+            "/untracked",
+            "/recycled",
+            "/recycled-source",
+            "/never-existed",
+        ] {
+            let requested_row_pk = format!("[\"{path}\"]");
+            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let finite = session
+                .execute(
+                    "SELECT row_pk, diff_type FROM lix_working_diff \
+                     WHERE schema_key = 'json_pointer' AND row_pk = CAST($1 AS JSONB) \
+                     ORDER BY row_pk",
+                    &[crate::Value::Text(requested_row_pk.clone())],
+                )
+                .await
+                .expect("finite working-diff read should execute");
+            assert!(
+                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                "the finite working-diff read for {path} must take the primary-row bypass"
+            );
+            let finite_rows = finite
+                .rows()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<serde_json::Value>("row_pk")
+                            .expect("row_pk should decode")
+                            .to_string(),
+                        row.get::<String>("diff_type")
+                            .expect("diff_type should decode"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = broad_rows
+                .iter()
+                .filter(|(row_pk, _)| row_pk == &requested_row_pk)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                finite_rows, expected,
+                "the finite working-diff bypass disagrees with the index scan for {path}"
+            );
+        }
+    }
+
+    /// A file-scoped working-diff read skips the `HOT_DIFF` index and its
+    /// scope-global coverage proof, enumerating primary `HOT_ROW` rows through
+    /// the file-first prefix seek instead. That is only sound if the primary
+    /// rows are the complete authority for every dirty identity in the file, so
+    /// this asserts the file-scoped answer equals the unfiltered index-driven
+    /// answer restricted to that file — across every reachable row state, and
+    /// for both the bare `file_id` shape (whose schema domain is resolved from
+    /// the `FILE_SPACE` markers) and the `file_id + schema_key` shape.
+    #[tokio::test]
+    async fn file_scoped_working_diff_bypass_matches_the_index_scan() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine.open_session().await.expect("session should open");
+        register_json_pointer_schema(&session).await;
+
+        let files = [
+            "66696c65-0000-8000-8000-000000000000",
+            "66696c65-0001-8000-8000-000000000001",
+        ];
+        for (index, file) in files.iter().enumerate() {
+            session
+                .execute(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ($1, $2, CAST($3 AS BYTEA))",
+                    &[
+                        crate::Value::Text((*file).to_string()),
+                        crate::Value::Text(format!("/f{index}.txt")),
+                        crate::Value::Text("seed".to_string()),
+                    ],
+                )
+                .await
+                .expect("file should insert");
+        }
+
+        // Pre-checkpoint rows: one per reachable post-checkpoint fate, spread
+        // over both files and the null-file bucket.
+        for (path, file) in [
+            ("/clean", Some(files[0])),
+            ("/modified", Some(files[0])),
+            ("/removed", Some(files[0])),
+            ("/clean-b", Some(files[1])),
+            ("/modified-b", Some(files[1])),
+            ("/modified-none", None),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, CAST('{\"v\":0}' AS JSONB), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("pre-checkpoint row should insert");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish a clean working state");
+
+        session
+            .execute(
+                "UPDATE json_pointer SET value = CAST('{\"v\":1}' AS JSONB) \
+                 WHERE path IN ('/modified', '/modified-b', '/modified-none')",
+                &[],
+            )
+            .await
+            .expect("modify should dirty the rows");
+        session
+            .execute("DELETE FROM json_pointer WHERE path = '/removed'", &[])
+            .await
+            .expect("delete should dirty the row");
+        for (path, file) in [("/added", Some(files[0])), ("/added-b", Some(files[1]))] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, CAST('{\"v\":1}' AS JSONB), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("post-checkpoint insert should dirty a new identity");
+        }
+        // Dirty the file itself, not just rows inside it. This puts a row of a
+        // *different* schema into file 0's diff, which is the case the bare
+        // `file_id` shape must cover and the `file_id + schema_key` shape must
+        // not. Without it both shapes would return the same json_pointer rows
+        // and the `FILE_SPACE` schema-domain resolution would go unexercised.
+        session
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
+                &[
+                    crate::Value::Text("changed".to_string()),
+                    crate::Value::Text(files[0].to_string()),
+                ],
+            )
+            .await
+            .expect("file content update should dirty the file descriptor");
+
+        // An untracked row cannot live inside a tracked file — file ownership
+        // validation requires a row and its owning file to share one lane — so
+        // the untracked case is only reachable in the null-file bucket. It is
+        // still worth carrying: the bypass must classify it as "no diff entry"
+        // and the unfiltered index scan must agree.
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/untracked', CAST('{\"v\":1}' AS JSONB), true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should commit");
+
+        type DiffRow = (String, String, Option<String>, String);
+        fn collect(result: &crate::ExecuteResult) -> Vec<DiffRow> {
+            let mut rows = result
+                .rows()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<String>("schema_key")
+                            .expect("schema_key should decode"),
+                        row.get::<serde_json::Value>("row_pk")
+                            .expect("row_pk should decode")
+                            .to_string(),
+                        // `file_id` is nullable; a NULL surfaces as a decode
+                        // error through the typed accessor.
+                        row.get::<String>("file_id").ok(),
+                        row.get::<String>("diff_type")
+                            .expect("diff_type should decode"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        }
+        const COLUMNS: &str = "SELECT row_pk, schema_key, file_id, diff_type \
+                               FROM lix_working_diff";
+
+        use std::sync::atomic::Ordering;
+        let hits = &crate::hot_state::WORKING_DIFF_PATH_HITS;
+
+        let index_before = hits.index_scan.load(Ordering::Relaxed);
+        let broad = collect(
+            &session
+                .execute(COLUMNS, &[])
+                .await
+                .expect("unfiltered working-diff read should execute"),
+        );
+        assert!(
+            hits.index_scan.load(Ordering::Relaxed) > index_before,
+            "the unfiltered working-diff read must take the HOT_DIFF index path"
+        );
+        assert!(
+            broad
+                .iter()
+                .any(|(schema, _, file, kind)| schema == "json_pointer"
+                    && file.as_deref() == Some(files[0])
+                    && kind == "removed"),
+            "fixture should produce a removed row inside the probed file"
+        );
+
+        for file in files {
+            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let scoped = collect(
+                &session
+                    .execute(
+                        &format!("{COLUMNS} WHERE file_id = $1"),
+                        &[crate::Value::Text(file.to_string())],
+                    )
+                    .await
+                    .expect("file-scoped working-diff read should execute"),
+            );
+            assert!(
+                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                "the file-scoped working-diff read for {file} must take the primary-row bypass"
+            );
+            let want = broad
+                .iter()
+                .filter(|(_, _, row_file, _)| row_file.as_deref() == Some(file))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                scoped, want,
+                "the file-scoped working-diff bypass disagrees with the index scan for {file}"
+            );
+
+            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let scoped_schema = collect(
+                &session
+                    .execute(
+                        &format!("{COLUMNS} WHERE file_id = $1 AND schema_key = $2"),
+                        &[
+                            crate::Value::Text(file.to_string()),
+                            crate::Value::Text("json_pointer".to_string()),
+                        ],
+                    )
+                    .await
+                    .expect("file+schema working-diff read should execute"),
+            );
+            assert!(
+                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                "the file+schema working-diff read for {file} must take the primary-row bypass"
+            );
+            let want_schema = want
+                .iter()
+                .filter(|(schema, _, _, _)| schema == "json_pointer")
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                scoped_schema, want_schema,
+                "the file+schema working-diff bypass disagrees with the index scan for {file}"
+            );
+            if file == files[0] {
+                // The dirtied file descriptor proves the bare `file_id` shape
+                // resolved a schema domain wider than the one predicate-named
+                // schema, rather than silently answering json_pointer only.
+                assert!(
+                    want.len() > want_schema.len(),
+                    "fixture should put a non-json_pointer schema in {file}'s diff, \
+                     otherwise the FILE_SPACE schema-domain resolution is untested"
+                );
+            }
+        }
+    }
+
+    /// `WHERE lixcol_file_id = $1` is now an exact provider constraint, so
+    /// DataFusion drops its residual filter and the answer rests entirely on
+    /// `HotStateFilter::file_ids`. Rows can live in four authorities — the
+    /// branch-local `HOT_ROW` overlay, a packed current base, a certified
+    /// row batch, and the root current base — and a file-scoped seek is
+    /// only sound if every one of them applies the same filter. The checkpoint
+    /// in the middle republishes the generation, so rows written before and
+    /// after it reach the read through different authorities.
+    #[tokio::test]
+    async fn file_scoped_row_read_matches_the_unfiltered_scan() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine.open_session().await.expect("session should open");
+        register_json_pointer_schema(&session).await;
+
+        let files = [
+            "66696c65-0000-8000-8000-000000000000",
+            "66696c65-0001-8000-8000-000000000001",
+        ];
+        for (index, file) in files.iter().enumerate() {
+            session
+                .execute(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ($1, $2, CAST($3 AS BYTEA))",
+                    &[
+                        crate::Value::Text((*file).to_string()),
+                        crate::Value::Text(format!("/f{index}.txt")),
+                        crate::Value::Text("seed".to_string()),
+                    ],
+                )
+                .await
+                .expect("file should insert");
+        }
+
+        let mut expected: Vec<(String, Option<String>)> = Vec::new();
+        for (path, file) in [
+            ("/a0", Some(files[0])),
+            ("/a1", Some(files[0])),
+            ("/b0", Some(files[1])),
+            ("/none", None),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, CAST('{\"v\":0}' AS JSONB), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("pre-checkpoint row should insert");
+            expected.push((path.to_string(), file.map(str::to_string)));
+        }
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should republish the generation");
+
+        for (path, file) in [
+            ("/a2", Some(files[0])),
+            ("/b1", Some(files[1])),
+            ("/none2", None),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, CAST('{\"v\":1}' AS JSONB), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("post-checkpoint row should insert");
+            expected.push((path.to_string(), file.map(str::to_string)));
+        }
+        expected.sort();
+
+        let all = session
+            .execute("SELECT path, lixcol_file_id FROM json_pointer", &[])
+            .await
+            .expect("unfiltered scan should execute");
+        let mut all_rows = all
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("path").expect("path should decode"),
+                    // `lixcol_file_id` is nullable; the typed accessor has no
+                    // Option impl, so a NULL surfaces as a decode error here.
+                    row.get::<String>("lixcol_file_id").ok(),
+                )
+            })
+            .collect::<Vec<_>>();
+        all_rows.sort();
+        assert_eq!(all_rows, expected, "fixture should read back unfiltered");
+
+        for file in files {
+            let filtered = session
+                .execute(
+                    "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 ORDER BY path",
+                    &[crate::Value::Text(file.to_string())],
+                )
+                .await
+                .expect("file-scoped read should execute");
+            let filtered_rows = filtered
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("path should decode"))
+                .collect::<Vec<_>>();
+            let mut want = expected
+                .iter()
+                .filter(|(_, row_file)| row_file.as_deref() == Some(file))
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            want.sort();
+            assert_eq!(
+                filtered_rows, want,
+                "file-scoped row read must return exactly the rows in {file}"
+            );
+        }
+
+        let in_list = session
+            .execute(
+                "SELECT path FROM json_pointer \
+                 WHERE lixcol_file_id IN ($1, $2) ORDER BY path",
+                &[
+                    crate::Value::Text(files[0].to_string()),
+                    crate::Value::Text(files[1].to_string()),
+                ],
+            )
+            .await
+            .expect("file-scoped IN read should execute");
+        let mut want_in = expected
+            .iter()
+            .filter(|(_, row_file)| row_file.is_some())
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        want_in.sort();
+        assert_eq!(
+            in_list
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("path should decode"))
+                .collect::<Vec<_>>(),
+            want_in
+        );
+
+        let point = session
+            .execute(
+                "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 AND path = '/a2'",
+                &[crate::Value::Text(files[0].to_string())],
+            )
+            .await
+            .expect("file + primary key read should execute");
+        assert_eq!(point.rows().len(), 1);
+
+        let contradiction = session
+            .execute(
+                "SELECT path FROM json_pointer WHERE lixcol_file_id = $1 AND path = '/b0'",
+                &[crate::Value::Text(files[0].to_string())],
+            )
+            .await
+            .expect("contradictory file + primary key read should execute");
+        assert!(
+            contradiction.rows().is_empty(),
+            "a row must not be visible through another file's scope"
+        );
+    }
+
     #[tokio::test]
     async fn untracked_state_survives_checkpoint_and_next_tracked_write() {
         let storage = Memory::new();
@@ -1372,15 +2015,12 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/checkpointed', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/checkpointed', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1412,22 +2052,22 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/workspace', lix_json('{\"source\":\"untracked\"}'), true)",
+                 VALUES ('/repository', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                 &[],
             )
             .await
             .expect("untracked row should write against the complete hot state");
-        let workspace_row = session
+        let repository_row = session
             .execute(
-                "SELECT value FROM json_pointer WHERE path = '/workspace'",
+                "SELECT value FROM json_pointer WHERE path = '/repository'",
                 &[],
             )
             .await
             .expect("untracked row should read from the complete hot state");
         assert_eq!(
-            workspace_row.rows()[0]
+            repository_row.rows()[0]
                 .get::<serde_json::Value>("value")
-                .expect("workspace value should decode"),
+                .expect("repository value should decode"),
             json!({"source": "untracked"})
         );
 
@@ -1435,7 +2075,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/after-checkpoint', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/after-checkpoint', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1449,12 +2089,12 @@ mod tests {
                 .iter()
                 .map(|row| row.get::<String>("path").expect("row path"))
                 .collect::<Vec<_>>(),
-            ["/after-checkpoint", "/checkpointed", "/workspace"]
+            ["/after-checkpoint", "/checkpointed", "/repository"]
         );
     }
 
     #[tokio::test]
-    async fn checkpoint_reclaims_working_diff_epochs_and_retains_checkpoint_entities() {
+    async fn checkpoint_reclaims_working_diff_epochs_and_retains_checkpoint_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1462,15 +2102,12 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/dirty', lix_json('{\"value\":\"before-checkpoint\"}'))",
+                 VALUES ('/dirty', CAST('{\"value\":\"before-checkpoint\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1481,11 +2118,11 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("working-diff inventory read should open");
-        let before_sparse = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
+        let before_sparse = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         let before_packed =
-            scan_test_space(&read, crate::live_state::PACKED_CURRENT_BASE_SPACE).await;
+            scan_test_space(&read, crate::hot_state::PACKED_CURRENT_BASE_SPACE).await;
         assert!(
-            !before_sparse.entries.is_empty() || !before_packed.entries.is_empty(),
+            !before_sparse.is_empty() || !before_packed.is_empty(),
             "tracked mutation must persist a sparse or packed physical dirty epoch"
         );
         drop(read);
@@ -1499,11 +2136,63 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("post-checkpoint inventory read should open");
-        let after = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
+        let before_gc = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
+        assert!(
+            before_gc.len() > 1,
+            "checkpoint rotation must not synchronously scan and delete the superseded sparse epoch"
+        );
+        let logical = session
+            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
+            .await
+            .expect("post-checkpoint logical diff should execute");
         assert_eq!(
-            after.entries.len(),
+            logical.rows()[0]
+                .get::<i64>("entries")
+                .expect("working-diff count should be numeric"),
+            0,
+            "the superseded physical epoch must be unreachable immediately"
+        );
+        assert_eq!(
+            before_gc.len(),
+            3,
+            "the first checkpoint leaves the two superseded branch index records for GC"
+        );
+        drop(read);
+
+        let read = SharedStorageAdapterRead::new(
+            adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("working-diff GC read should open"),
+        );
+        let mut gc_writes = adapter.new_write_set();
+        let mut gc_preconditions = Vec::new();
+        crate::gc::stage_repository_gc_with_preconditions(
+            read,
+            &mut gc_writes,
+            &mut gc_preconditions,
+        )
+            .await
+            .expect("repository GC should collect superseded sparse epochs");
+        adapter
+            .commit_write_set(
+                gc_writes,
+                StorageWriteOptions {
+                    preconditions: gc_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("working-diff GC should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-GC inventory read should open");
+        let after_gc = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
+        assert_eq!(
+            after_gc.len(),
             1,
-            "the superseded branch epoch must be reclaimed; only the repository-global checkpoint entity may remain dirty"
+            "GC must reclaim the superseded branch epoch; only the repository-global checkpoint row may remain dirty"
         );
         drop(read);
         session
@@ -1514,16 +2203,16 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("second checkpoint inventory read should open");
-        let after_second = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
+        let after_second = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
-            after_second.entries.len(),
+            after_second.len(),
             2,
-            "the second immutable checkpoint entity remains while the superseded branch epoch is reclaimed"
+            "the second immutable checkpoint row remains while the superseded branch epoch is reclaimed"
         );
         let logical = session
             .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
             .await
-            .expect("post-checkpoint logical diff should execute");
+            .expect("second post-checkpoint logical diff should execute");
         assert_eq!(
             logical.rows()[0]
                 .get::<i64>("entries")
@@ -1533,7 +2222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_public_fast_path_falls_back_for_global_tracked_rows() {
+    async fn tracked_row_public_fast_path_falls_back_for_global_tracked_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1542,23 +2231,20 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let global_session = engine
-            .open_session(GLOBAL_BRANCH_ID)
+            .open_session_at(GLOBAL_BRANCH_ID)
             .await
             .expect("global session should open");
         register_global_json_pointer_schema(&global_session).await;
         global_session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('/global', lix_json('{\"source\":\"global\"}'), true, false)",
+                 VALUES ('/global', CAST('{\"source\":\"global\"}' AS JSONB), true, false)",
                 &[],
             )
             .await
-            .expect("write global tracked entity row");
+            .expect("write global tracked row");
 
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         let rows = session
             .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
@@ -1575,7 +2261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_fast_path_keeps_synthesized_branch_refs_generic() {
+    async fn tracked_row_fast_path_keeps_synthesized_branch_refs_generic() {
         let storage = Memory::new();
         let receipt = Engine::initialize(storage.clone())
             .await
@@ -1583,10 +2269,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
+        let session = engine.open_session().await.expect("session should open");
 
         let rows = session
             .execute("SELECT id, commit_id FROM lix_branch_ref ORDER BY id", &[])
@@ -1615,9 +2298,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read initialized hot rows");
-        let hot_rows = scan_test_space(&read, crate::live_state::HOT_ROW_SPACE)
-            .await
-            .entries;
+        let hot_rows = scan_test_space(&read, crate::hot_state::ROW_SPACE).await;
         assert!(
             !hot_rows.is_empty(),
             "initialized repository must have hot rows"
@@ -1631,7 +2312,7 @@ mod tests {
         );
         for hot_row in hot_rows {
             writes.put(
-                crate::live_state::HOT_ROW_SPACE,
+                crate::hot_state::ROW_SPACE,
                 hot_row.key,
                 StorageValue {
                     bytes: Bytes::from_static(b"predecessor-head-bytes"),
@@ -1684,5 +2365,516 @@ mod tests {
             panic!("initialization must not overwrite a predecessor protocol");
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    /// The hot index plane's write half: a schema registration publishes a
+    /// witness for each declared column, and ordinary inserts publish one entry
+    /// per row per declared column.
+    ///
+    /// Also pins the shape of what is *not* indexed. `locale` is declared by
+    /// nothing, so it gets no entries and the collection scan keeps serving it.
+    #[tokio::test]
+    async fn declared_columns_publish_index_entries_and_a_witness() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("engine should open");
+        let session = engine.open_session().await.expect("session should open");
+        for schema in [
+            json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "index_probe_parent",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+            }),
+            json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "index_probe_child",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false },
+                    { "name": "locale", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": "index_probe_parent", "columns": ["id"] }
+                }],
+            }),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        session
+            .execute(
+                "INSERT INTO index_probe_parent (id) VALUES ('parent-0')",
+                &[],
+            )
+            .await
+            .expect("parent should insert");
+        for index in 0..3 {
+            session
+                .execute(
+                    r#"INSERT INTO index_probe_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+
+        assert_eq!(
+            hot_index_record_counts(&storage).await,
+            (1, 3),
+            "expected one witness for the one declared column and one entry per child row"
+        );
+    }
+
+    /// The two schemas the index tests drive: a parent keyed only by its
+    /// primary key, and a child declaring a foreign key onto it. The foreign
+    /// key is what makes `parent_id` an indexed column.
+    fn index_probe_schemas(parent: &str, child: &str) -> [serde_json::Value; 2] {
+        [
+            json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": parent,
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+            }),
+            json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": child,
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false },
+                    { "name": "locale", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": { "schema_key": parent, "columns": ["id"] }
+                }],
+            }),
+        ]
+    }
+
+    async fn open_index_probe_session() -> (Memory, SessionContext<Memory>) {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("engine should open");
+        let session = engine.open_session().await.expect("session should open");
+        (storage, session)
+    }
+
+    async fn hot_index_record_counts(storage: &Memory) -> (usize, usize) {
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read the index plane");
+        let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE).await;
+        let witnesses = entries
+            .iter()
+            .filter(|entry| match &entry.value {
+                crate::storage::ProjectedValue::FullValue(bytes) => !bytes.starts_with(b"["),
+                crate::storage::ProjectedValue::KeyOnly => true,
+            })
+            .count();
+        (witnesses, entries.len() - witnesses)
+    }
+
+    /// The witness carries how many entries the plane has published, which is
+    /// what sizes the degradation budget. It must count every published entry
+    /// in the generation, not just this commit's.
+    async fn hot_index_published_count(storage: &Memory) -> u64 {
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read the index plane");
+        let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE).await;
+        let mut total = 0;
+        for entry in &entries {
+            let crate::storage::ProjectedValue::FullValue(bytes) = &entry.value else {
+                continue;
+            };
+            if bytes.starts_with(b"[") {
+                continue;
+            }
+            let count: [u8; 8] = bytes.as_ref().try_into().expect("witness carries a u64");
+            total += u64::from_be_bytes(count);
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn the_index_witness_accumulates_its_published_entry_count() {
+        let (storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("counted_parent", "counted_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        session
+            .execute("INSERT INTO counted_parent (id) VALUES ('parent-0')", &[])
+            .await
+            .expect("parent should insert");
+        assert_eq!(hot_index_published_count(&storage).await, 0);
+        for index in 0..4 {
+            session
+                .execute(
+                    r#"INSERT INTO counted_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+        assert_eq!(
+            hot_index_published_count(&storage).await,
+            4,
+            "the count must span commits, not restart at each one"
+        );
+        // A delete publishes no entry — the plane is put-only — so the count
+        // stands still while the collection shrinks. That divergence is
+        // exactly what the budget measures.
+        session
+            .execute("DELETE FROM counted_child WHERE id = 'child-0'", &[])
+            .await
+            .expect("child should delete");
+        assert_eq!(hot_index_published_count(&storage).await, 4);
+    }
+
+    /// Past the budget the lookup abandons the index and the caller's ordinary
+    /// scan serves instead. The route is deliberately invisible in the result,
+    /// so what this pins is that it stays invisible: the same rows, through a
+    /// bucket far past the budget, with live rows, superseded rows and deleted
+    /// rows all present.
+    #[tokio::test]
+    async fn a_bucket_past_the_budget_still_answers_exactly() {
+        let (storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("degraded_parent", "degraded_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        for parent in ["parent-0", "parent-1"] {
+            session
+                .execute(
+                    "INSERT INTO degraded_parent (id) VALUES ($1)",
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("parent should insert");
+        }
+        const ROWS: usize = 200;
+        let values = (0..ROWS)
+            .map(|index| format!("('child-{index}', 'parent-0', 'en')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!(r#"INSERT INTO degraded_child (id, "parent_id", locale) VALUES {values}"#),
+                &[],
+            )
+            .await
+            .expect("children should insert");
+        // Move half off `parent-0` and delete a quarter, so the `parent-0`
+        // bucket holds every identity while only a quarter still match.
+        let moved = (0..ROWS / 2)
+            .map(|index| format!("'child-{index}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!(
+                    r#"UPDATE degraded_child SET "parent_id" = 'parent-1' WHERE id IN ({moved})"#
+                ),
+                &[],
+            )
+            .await
+            .expect("children should move");
+        let deleted = (ROWS / 2..ROWS * 3 / 4)
+            .map(|index| format!("'child-{index}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("DELETE FROM degraded_child WHERE id IN ({deleted})"),
+                &[],
+            )
+            .await
+            .expect("children should delete");
+
+        let published = hot_index_published_count(&storage).await;
+        assert!(
+            published > 64,
+            "the fixture must push the plane past the budget floor, published {published}"
+        );
+
+        async fn ids(session: &SessionContext<Memory>, parent: &str) -> Vec<String> {
+            let rows = session
+                .execute(
+                    r#"SELECT id FROM degraded_child WHERE "parent_id" = $1 ORDER BY id"#,
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("declared-column read should succeed");
+            rows.rows()
+                .iter()
+                .map(|row| match &row.values()[0] {
+                    crate::Value::Text(id) => id.clone(),
+                    other => panic!("unexpected id value {other:?}"),
+                })
+                .collect()
+        }
+
+        let mut expected_zero = (ROWS * 3 / 4..ROWS)
+            .map(|index| format!("child-{index}"))
+            .collect::<Vec<_>>();
+        expected_zero.sort();
+        assert_eq!(ids(&session, "parent-0").await, expected_zero);
+        let mut expected_one = (0..ROWS / 2)
+            .map(|index| format!("child-{index}"))
+            .collect::<Vec<_>>();
+        expected_one.sort();
+        assert_eq!(ids(&session, "parent-1").await, expected_one);
+    }
+
+    /// Entries are candidates, never answers. A row whose indexed value moves
+    /// leaves its old entry behind, and the caller's own predicate is what
+    /// rejects it — so the moved row must disappear from the old value's
+    /// result and appear under the new one.
+    #[tokio::test]
+    async fn superseded_index_entries_are_rejected_and_no_match_is_ever_lost() {
+        let (_storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("stale_parent", "stale_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        for parent in ["parent-0", "parent-1"] {
+            session
+                .execute(
+                    "INSERT INTO stale_parent (id) VALUES ($1)",
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("parent should insert");
+        }
+        for index in 0..3 {
+            session
+                .execute(
+                    r#"INSERT INTO stale_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+
+        async fn count(session: &SessionContext<Memory>, parent: &str) -> usize {
+            session
+                .execute(
+                    r#"SELECT id FROM stale_child WHERE "parent_id" = $1"#,
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("declared-column read should succeed")
+                .len()
+        }
+
+        assert_eq!(count(&session, "parent-0").await, 3);
+        assert_eq!(count(&session, "parent-1").await, 0);
+
+        session
+            .execute(
+                r#"UPDATE stale_child SET "parent_id" = 'parent-1' WHERE id = 'child-1'"#,
+                &[],
+            )
+            .await
+            .expect("child should move to the other parent");
+
+        assert_eq!(
+            count(&session, "parent-0").await,
+            2,
+            "the superseded entry under the old value must be rejected on read"
+        );
+        assert_eq!(
+            count(&session, "parent-1").await,
+            1,
+            "the moved row must be found under its new value"
+        );
+
+        session
+            .execute("DELETE FROM stale_child WHERE id = 'child-0'", &[])
+            .await
+            .expect("child should delete");
+        assert_eq!(
+            count(&session, "parent-0").await,
+            1,
+            "a deleted row leaves its entry behind and must not resurface"
+        );
+    }
+
+    /// A checkpoint publication reuses its branch's serving generation, so the
+    /// index plane — which is keyed by that generation — survives it intact.
+    ///
+    /// This is the explicit choice, not an accident: republishing the whole
+    /// index at checkpoint time would make checkpoints O(collection). Because
+    /// the generation is reused, there is nothing to copy. The test exists so
+    /// that a future change minting a fresh generation at checkpoint time
+    /// fails here instead of silently returning no rows.
+    #[tokio::test]
+    async fn a_checkpoint_keeps_the_declared_column_index_serving() {
+        let (_storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("ckpt_parent", "ckpt_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        session
+            .execute("INSERT INTO ckpt_parent (id) VALUES ('parent-0')", &[])
+            .await
+            .expect("parent should insert");
+        for index in 0..3 {
+            session
+                .execute(
+                    r#"INSERT INTO ckpt_child (id, "parent_id", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish");
+
+        let rows = session
+            .execute(
+                r#"SELECT id FROM ckpt_child WHERE "parent_id" = 'parent-0'"#,
+                &[],
+            )
+            .await
+            .expect("declared-column read should succeed");
+        assert_eq!(
+            rows.len(),
+            3,
+            "the index must keep serving across a checkpoint publication"
+        );
+
+        session
+            .execute(
+                r#"INSERT INTO ckpt_child (id, "parent_id", locale) VALUES ('child-3', 'parent-0', 'en')"#,
+                &[],
+            )
+            .await
+            .expect("post-checkpoint child should insert");
+        let rows = session
+            .execute(
+                r#"SELECT id FROM ckpt_child WHERE "parent_id" = 'parent-0'"#,
+                &[],
+            )
+            .await
+            .expect("declared-column read should succeed");
+        assert_eq!(
+            rows.len(),
+            4,
+            "rows written after the checkpoint must join the same index"
+        );
+    }
+
+    /// The unique validator now probes the index instead of scanning the
+    /// collection. The probe must reject a duplicate exactly as the scan did,
+    /// and must keep accepting a value that only the staged row holds.
+    #[tokio::test]
+    async fn the_unique_probe_still_rejects_committed_duplicates() {
+        let (_storage, session) = open_index_probe_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                &[crate::Value::Text(
+                    json!({
+                        "$schema": "https://lix.dev/schema-v1.json",
+                        "key": "probe_unique",
+                        "columns": [
+                            { "name": "id", "type": "text", "nullable": false },
+                            { "name": "slug", "type": "text", "nullable": false },
+                        ],
+                        "primary_key": ["id"],
+                        "unique": [["slug"]],
+                    })
+                    .to_string(),
+                )],
+            )
+            .await
+            .expect("schema should register");
+        for index in 0..8 {
+            session
+                .execute(
+                    "INSERT INTO probe_unique (id, slug) VALUES ($1, $2)",
+                    &[
+                        crate::Value::Text(format!("row-{index}")),
+                        crate::Value::Text(format!("slug-{index}")),
+                    ],
+                )
+                .await
+                .expect("row should insert");
+        }
+
+        let error = session
+            .execute(
+                "INSERT INTO probe_unique (id, slug) VALUES ('row-dup', 'slug-3')",
+                &[],
+            )
+            .await
+            .expect_err("a committed duplicate must still be rejected");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+
+        session
+            .execute(
+                "INSERT INTO probe_unique (id, slug) VALUES ('row-8', 'slug-8')",
+                &[],
+            )
+            .await
+            .expect("a fresh value must still be accepted");
+        assert_eq!(
+            session
+                .execute("SELECT id FROM probe_unique", &[])
+                .await
+                .expect("read")
+                .len(),
+            9
+        );
     }
 }

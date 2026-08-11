@@ -5,9 +5,9 @@ export class Value {
 	readonly kind: LixValue["kind"];
 	readonly #raw: LixValue;
 
-	private constructor(raw: LixValue) {
+	private constructor(raw: LixValue, clone = true) {
 		validateExplicitValue(raw);
-		this.#raw = cloneValue(raw);
+		this.#raw = clone ? cloneValue(raw) : raw;
 		this.kind = this.#raw.kind;
 	}
 
@@ -31,8 +31,12 @@ export class Value {
 		return new Value({ kind: "text", value });
 	}
 
-	static json(value: JsonValue) {
-		return new Value({ kind: "json", value });
+	static jsonb(value: JsonValue) {
+		return new Value({ kind: "jsonb", value });
+	}
+
+	static timestamptz(value: string) {
+		return new Value({ kind: "timestamptz", value });
 	}
 
 	static blob(value: Uint8Array) {
@@ -44,7 +48,11 @@ export class Value {
 	}
 
 	static _fromNative(value: LixValue) {
-		return new Value(value);
+		// Native execute results are newly materialized for this result set. Keep
+		// the native value as-is and defer the defensive copy until toJS(). This
+		// avoids cloning every structured result once during row wrapping and
+		// again when callers read it.
+		return new Value(value, false);
 	}
 
 	_toNative() {
@@ -137,7 +145,7 @@ export function normalizeParam(
 			);
 		}
 		assertJsonSerializable(value, seen, index);
-		return { kind: "json", value };
+		return { kind: "jsonb", value };
 	}
 	throw invalidParam(
 		index,
@@ -154,7 +162,8 @@ function unwrapValue(value: LixValue): unknown {
 		case "integer":
 		case "real":
 		case "text":
-		case "json":
+		case "timestamptz":
+		case "jsonb":
 			return cloneJsonValue(value.value);
 		case "blob":
 			return new Uint8Array(value.value);
@@ -272,9 +281,14 @@ function validateExplicitValue(value: LixValue) {
 				);
 			}
 			return;
-		case "json":
+		case "jsonb":
 			assertJsonSerializable(value.value, new WeakSet(), 0);
 			return;
+		case "timestamptz":
+			if (typeof value.value === "string" && !Number.isNaN(Date.parse(value.value))) {
+				return;
+			}
+			break;
 		case "blob":
 			if (value.value instanceof Uint8Array) return;
 			break;
@@ -288,8 +302,8 @@ function cloneValue(value: LixValue): LixValue {
 	if (value.kind === "blob") {
 		return { kind: "blob", value: new Uint8Array(value.value) };
 	}
-	if (value.kind === "json") {
-		return { kind: "json", value: cloneJsonValue(value.value) };
+	if (value.kind === "jsonb") {
+		return { kind: "jsonb", value: cloneJsonValue(value.value) };
 	}
 	return value;
 }

@@ -12,21 +12,21 @@ use crate::changelog::{
 };
 use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_snapshot};
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-use crate::live_state::{
+use crate::hot_state::{
     CurrentStateDeltaRef, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_tracked_working_diff_epoch,
 };
+use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::schema::{
-    registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
+    registered_schema_row_pk, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{PointReadPlan, SharedStorageAdapterRead, StorageAdapterRead};
 use crate::storage_adapter::{
     StorageAdapter, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
-    StorageSpaceId, StorageWriteSet,
+    StorageSpaceId, StorageWriteSet, ValueSemantics,
 };
 use crate::tracked_state::{
     CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
@@ -37,19 +37,36 @@ use serde_json::json;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ID_KEY: &str = "lix_id";
-const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
+pub(crate) const DEFAULT_BRANCH_KEY: &str = "lix_default_branch_id";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V63 replaces the branch-local checkpoint marker with immutable,
-/// repository-global `lix_checkpoint` entities keyed by captured commit. The
-/// hard cut rejects repositories seeded with an older checkpoint identity
-/// model instead of silently exposing mixed checkpoint identities.
-pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
+/// V66 makes the repository default branch a tracked bootstrap fact and
+/// removes the mutable repository-branch selector. The hard cut rejects older
+/// repositories instead of inferring or migrating the removed selector.
+pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0004_0011),
+    "repository.protocol.v1",
+    ValueSemantics::Mutable,
+);
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"global-checkpoint-entity.v63";
+/// v67 adds `CommitRecord::touched_scope_digest`.
+///
+/// This bump is **not** cosmetic. `CommitRecord` is `#[musli(packed)]`, so a
+/// v66 record cannot be decoded by a v67 reader — the failure would otherwise
+/// surface deep inside graph traversal as an opaque codec error instead of at
+/// open, where `unsupported_repository_protocol_error` tells the operator to
+/// recreate the repository. Every hard cut to a persisted record shape has to
+/// move this value with it.
+///
+/// `v68` is a single bump covering both of this round's format changes:
+/// the `CurrentStatePartSource` enum with `LOCATOR_PAYLOAD_VERSION` 3 -> 4,
+/// and `StoredCheckpointGcState` 3 -> 6 fields with
+/// `CHECKPOINT_GC_STATE_FORMAT_VERSION` 1 -> 2. Every record is
+/// `#[musli(packed)]`, so one bump carries any number of shape changes at no
+/// extra cost to the user, who recreates the repository once either way.
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v68";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -101,13 +118,11 @@ pub(crate) fn unsupported_repository_protocol_error() -> LixError {
 ///
 /// Tracked bootstrap facts go to the changelog. Moving heads are seeded in
 /// the direct current-state control plane and retain a standalone immutable
-/// branch-ref ledger change; ordinary untracked data shares the same current
-/// state generation without creating a changelog fact.
+/// branch-ref ledger change.
 pub(crate) struct InitSeedPlan {
     commit: InitSeedCommit,
     changes: Vec<InitSeedChange>,
     branch_controls: Vec<InitBranchHeadControl>,
-    untracked_rows: Vec<InitSeedLiveRow>,
     pub(crate) receipt: InitReceipt,
 }
 
@@ -123,7 +138,7 @@ struct InitSeedCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitSeedChange {
     id: ChangeId,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: String,
     snapshot_content: String,
     created_at: LixTimestamp,
@@ -132,7 +147,7 @@ struct InitSeedChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitSeedLiveRow {
     id: ChangeId,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: String,
     snapshot_content: String,
     created_at: LixTimestamp,
@@ -169,7 +184,7 @@ pub struct InitReceipt {
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
     let main_branch_id = functions.call_uuid_v7().to_string();
     let lix_id = functions.call_uuid_v7().to_string();
-    let initial_commit_id = CommitId::from(functions.call_uuid_v7());
+    let initial_commit_id = CommitId::with_change_address_space(functions.call_uuid_v7());
     let timestamp = functions.call_timestamp();
 
     let mut registered_schema_changes = Vec::new();
@@ -177,7 +192,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         let key = schema_key_from_definition(schema)?;
         registered_schema_changes.push(canonical_change(
             functions.call_uuid_v7(),
-            registered_schema_entity_pk(&key.schema_key)?,
+            registered_schema_row_pk(&key.schema_key)?,
             REGISTERED_SCHEMA_KEY,
             registered_schema_snapshot(schema)?,
             timestamp,
@@ -186,7 +201,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let global_branch_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(GLOBAL_BRANCH_ID)
+        RowPk::uuid_from_canonical(GLOBAL_BRANCH_ID)
             .expect("global branch sentinel is a canonical UUID"),
         BRANCH_DESCRIPTOR_SCHEMA_KEY,
         branch_descriptor_snapshot(GLOBAL_BRANCH_ID, "global", true)?,
@@ -194,7 +209,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let main_branch_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(&main_branch_id)
+        RowPk::uuid_from_canonical(&main_branch_id)
             .expect("generated main branch ID is a canonical UUID"),
         BRANCH_DESCRIPTOR_SCHEMA_KEY,
         branch_descriptor_snapshot(&main_branch_id, "main", false)?,
@@ -202,14 +217,14 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let kv_lix_id_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::single(LIX_ID_KEY),
+        RowPk::single(LIX_ID_KEY),
         KEY_VALUE_SCHEMA_KEY,
         key_value_snapshot(LIX_ID_KEY, &lix_id)?,
         timestamp,
     );
     let initial_checkpoint_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(&initial_commit_id.to_string())
+        RowPk::uuid_from_canonical(&initial_commit_id.to_string())
             .expect("initial checkpoint commit ID is a canonical UUID"),
         CHECKPOINT_SCHEMA_KEY,
         checkpoint_snapshot(&initial_commit_id),
@@ -217,7 +232,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let system_account_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
+        RowPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
             .expect("system account ID is a canonical UUID"),
         "lix_account",
         account_snapshot(crate::SYSTEM_ACCOUNT_ID, "System", "system")?,
@@ -225,7 +240,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let anonymous_account_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(crate::ANONYMOUS_ACCOUNT_ID)
+        RowPk::uuid_from_canonical(crate::ANONYMOUS_ACCOUNT_ID)
             .expect("anonymous account ID is a canonical UUID"),
         "lix_account",
         account_snapshot(crate::ANONYMOUS_ACCOUNT_ID, "Anonymous", "anonymous")?,
@@ -253,7 +268,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             tracked_generation: initial_commit_id,
-            untracked_generation: initial_commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
@@ -274,7 +288,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             tracked_generation: initial_commit_id,
-            untracked_generation: initial_commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
@@ -284,11 +297,11 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         },
         branch_ref_change: main_branch_ref_change,
     };
-    let workspace_branch_row = untracked_row(
+    let default_branch_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::single(WORKSPACE_BRANCH_KEY),
+        RowPk::single(DEFAULT_BRANCH_KEY),
         KEY_VALUE_SCHEMA_KEY,
-        key_value_snapshot(WORKSPACE_BRANCH_KEY, &main_branch_id)?,
+        key_value_snapshot(DEFAULT_BRANCH_KEY, &main_branch_id)?,
         timestamp,
     );
 
@@ -300,13 +313,13 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
                 global_branch_descriptor_change,
                 main_branch_descriptor_change,
                 kv_lix_id_change,
+                default_branch_change,
                 initial_checkpoint_change,
                 system_account_change,
                 anonymous_account_change,
             ])
             .collect(),
         branch_controls: vec![global_branch_control, main_branch_control],
-        untracked_rows: vec![workspace_branch_row],
         receipt: InitReceipt {
             lix_id,
             global_branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -320,7 +333,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 ///
 /// The pure seed planner decides which bootstrap facts exist. This function is
 /// only responsible for durably writing those facts to their owning stores:
-/// changelog for tracked changes, and live_state for the serving state
+/// changelog for tracked changes, and hot_state for the serving state
 /// plus untracked moving refs.
 pub(crate) async fn initialize<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
@@ -352,11 +365,24 @@ where
         .collect::<Vec<_>>();
 
     stage_init_json_payloads(&mut writes, &plan)?;
+    // The genesis commit's delta members are exactly the authored seed
+    // changes, so its touched-scope digest is derivable here without waiting
+    // for the mutation inventory staged further below. Publishing it matters:
+    // every history traversal reaches the genesis commit, so leaving it
+    // undigested would put one unavoidable replay-state load in every read.
+    let init_touched_scopes = authored_changes
+        .iter()
+        .map(|change| crate::changelog::CommitScopeKey {
+            schema_key: change.schema_key.clone(),
+            file_id: change.file_id.clone(),
+        })
+        .collect::<Vec<_>>();
     stage_init_changelog_commit(
         &mut read,
         &mut writes,
         &plan,
         branch_ref_ledger_changes.clone(),
+        &init_touched_scopes,
     )
     .await?;
 
@@ -366,7 +392,7 @@ where
             .map(|change| TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: plan.commit.id,
                 deleted: change.snapshot.is_none(),
@@ -437,7 +463,7 @@ where
             .map(|change| CurrentStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: Some(change.change_id),
                 commit_id: Some(plan.commit.id),
                 untracked: false,
@@ -455,22 +481,6 @@ where
             let mut head_deltas = tracked_head_deltas.clone();
             if branch.branch_id != GLOBAL_BRANCH_ID {
                 head_deltas.retain(|delta| delta.schema_key != CHECKPOINT_SCHEMA_KEY);
-            }
-            if branch.branch_id == GLOBAL_BRANCH_ID {
-                head_deltas.extend(plan.untracked_rows.iter().map(|row| CurrentStateDeltaRef {
-                    schema_key: &row.schema_key,
-                    file_id: None,
-                    entity_pk: &row.entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: false,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                    snapshot: crate::json_store::JsonSlotRef::Inline(&row.snapshot_content),
-                    metadata: crate::json_store::JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }));
             }
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
@@ -502,7 +512,7 @@ where
         }
     }
     crate::catalog::stage_catalog_revision(&mut writes);
-    crate::gc::stage_reachability_queue_seed(&mut writes)?;
+    crate::account::stage_account_revision(&mut writes);
     stage_repository_protocol(&mut writes);
 
     storage
@@ -548,7 +558,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         format_version: 1,
         change_id: change.id,
         account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
-        entity_pk: change.entity_pk.clone(),
+        row_pk: change.row_pk.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&change.snapshot_content),
@@ -563,7 +573,7 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord
         format_version: 2,
         change_id: row.id,
         account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
-        entity_pk: row.entity_pk.clone(),
+        row_pk: row.row_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&row.snapshot_content),
@@ -587,11 +597,6 @@ fn stage_init_json_payloads(
             .iter()
             .map(|change| change.snapshot_content.as_str())
             .chain(
-                plan.untracked_rows
-                    .iter()
-                    .map(|row| row.snapshot_content.as_str()),
-            )
-            .chain(
                 plan.branch_controls
                     .iter()
                     .map(|branch| branch.branch_ref_change.snapshot_content.as_str()),
@@ -607,13 +612,16 @@ async fn stage_init_changelog_commit(
     writes: &mut StorageWriteSet,
     plan: &InitSeedPlan,
     changes: Vec<ChangeRecord>,
+    touched_scopes: &[crate::changelog::CommitScopeKey],
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        format_version: 2,
+        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(touched_scopes),
+        format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
-        change_id: plan.commit.change_id,
+        first_parent_jump_commit_id: plan.commit.id,
+        first_parent_jump_span: 0,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,
     };
@@ -624,25 +632,6 @@ async fn stage_init_changelog_commit(
             changes,
         })
         .await
-}
-
-fn untracked_row(
-    id: uuid::Uuid,
-    entity_pk: EntityPk,
-    schema_key: &str,
-    snapshot_content: String,
-    timestamp: LixTimestamp,
-) -> InitSeedLiveRow {
-    InitSeedLiveRow {
-        id: ChangeId::from(id),
-        entity_pk,
-        schema_key: schema_key.to_string(),
-        snapshot_content,
-        created_at: timestamp,
-        updated_at: timestamp,
-        global: true,
-        branch_id: GLOBAL_BRANCH_ID.to_string(),
-    }
 }
 
 /// The direct control owns a branch ref's current visibility, while this
@@ -656,7 +645,7 @@ fn branch_ref_ledger_change(
 ) -> Result<InitSeedLiveRow, LixError> {
     Ok(InitSeedLiveRow {
         id: ChangeId::from(id),
-        entity_pk: EntityPk::uuid_from_canonical(branch_id)
+        row_pk: RowPk::uuid_from_canonical(branch_id)
             .expect("seed branch IDs are canonical UUIDs"),
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
         snapshot_content: branch_ref_snapshot(branch_id, commit_id)?,
@@ -669,14 +658,14 @@ fn branch_ref_ledger_change(
 
 fn canonical_change(
     id: uuid::Uuid,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: &str,
     snapshot_content: String,
     created_at: LixTimestamp,
 ) -> InitSeedChange {
     InitSeedChange {
         id: ChangeId::from(id),
-        entity_pk,
+        row_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
         created_at,
@@ -715,7 +704,9 @@ fn account_snapshot(id: &str, name: &str, kind: &str) -> Result<String, LixError
 }
 
 fn registered_schema_snapshot(schema: &serde_json::Value) -> Result<String, LixError> {
+    let schema_key = schema_key_from_definition(schema)?;
     encode_snapshot(json!({
+        "schema_key": schema_key.schema_key,
         "value": schema,
     }))
 }
@@ -741,15 +732,19 @@ mod tests {
     use crate::tracked_state::TrackedStateContext;
 
     #[test]
-    fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
+    fn plan_init_seed_returns_tracked_repository_bootstrap_changes() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 6);
-        assert_eq!(plan.untracked_rows.len(), 1);
+        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 7);
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
-        assert_eq!(plan.receipt.initial_commit_id, test_uuid(3));
+        // The initial commit id reserves its low 32 bits for packed change
+        // ordinals like every other commit id, so it is not the raw v7 value.
+        assert_eq!(
+            plan.receipt.initial_commit_id,
+            "01920000-0000-7000-8000-000300000000"
+        );
     }
 
     #[test]
@@ -773,7 +768,7 @@ mod tests {
             .iter()
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 7);
         let first_seed_change_id = test_uuid(4);
         assert!(change_ids.contains(&first_seed_change_id));
         assert!(!change_ids.contains(&plan.commit.change_id.to_string()));
@@ -804,27 +799,21 @@ mod tests {
         );
         assert!(registered_schema_changes.iter().any(|change| {
             snapshot(change)
-                .pointer("/value/x-lix-key")
+                .pointer("/value/key")
                 .and_then(JsonValue::as_str)
                 == Some(REGISTERED_SCHEMA_KEY)
         }));
         assert!(registered_schema_changes.iter().any(|change| {
             snapshot(change)
-                .pointer("/value/x-lix-key")
+                .pointer("/value/key")
                 .and_then(JsonValue::as_str)
                 == Some(KEY_VALUE_SCHEMA_KEY)
         }));
     }
 
     #[test]
-    fn plan_init_seed_keeps_branch_heads_out_of_untracked_state() {
+    fn plan_init_seed_keeps_branch_heads_out_of_tracked_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
-        assert_eq!(plan.untracked_rows.len(), 1);
-        assert!(
-            plan.untracked_rows
-                .iter()
-                .all(|row| row.schema_key != "lix_branch_ref")
-        );
         assert!(
             plan.changes
                 .iter()
@@ -847,23 +836,21 @@ mod tests {
     }
 
     #[test]
-    fn plan_init_seed_workspace_branch_points_to_main_branch() {
+    fn plan_init_seed_tracks_default_branch_pointing_to_main() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
-        let workspace_row = plan
-            .untracked_rows
+        let default_branch_change = plan
+            .changes
             .iter()
-            .find(|row| {
-                row.schema_key == KEY_VALUE_SCHEMA_KEY
-                    && row.entity_pk == EntityPk::single(WORKSPACE_BRANCH_KEY)
+            .find(|change| {
+                change.schema_key == KEY_VALUE_SCHEMA_KEY
+                    && change.row_pk == RowPk::single(DEFAULT_BRANCH_KEY)
             })
-            .expect("workspace branch row should exist");
+            .expect("tracked default branch change should exist");
 
-        assert_eq!(workspace_row.branch_id, GLOBAL_BRANCH_ID);
-        assert!(workspace_row.global);
-        let snapshot = untracked_snapshot(workspace_row);
+        let snapshot = snapshot(default_branch_change);
         assert_eq!(
             snapshot.get("key").and_then(JsonValue::as_str),
-            Some(WORKSPACE_BRANCH_KEY)
+            Some(DEFAULT_BRANCH_KEY)
         );
         assert_eq!(
             snapshot.get("value").and_then(JsonValue::as_str),
@@ -897,7 +884,7 @@ mod tests {
         };
 
         assert_eq!(record.commit_id, receipt.initial_commit_id);
-        let commit_change_id = record.change_id.clone();
+        let commit_change_id = record.change_id();
         let membership_read = storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
             .await
@@ -906,9 +893,9 @@ mod tests {
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
                 .expect("initial commit membership should load");
-        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 7);
         assert!(
-            !change_refs.contains(&record.change_id),
+            !change_refs.contains(&record.change_id()),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
         );
 

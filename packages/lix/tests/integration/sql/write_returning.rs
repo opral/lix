@@ -3,21 +3,18 @@ use lix::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
-    registered_entity_returning_uses_generated_postimages_for_insert_update_and_upsert,
+    registered_row_returning_uses_generated_postimages_for_insert_update_and_upsert,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"returning_task\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
                 &[],
             )
             .await
@@ -29,7 +26,7 @@ simulation_test!(
                 &[Value::Text("Created through RETURNING".to_string())],
             )
             .await
-            .expect("registered entity INSERT RETURNING should succeed");
+            .expect("registered row INSERT RETURNING should succeed");
         assert_eq!(inserted.rows_affected(), 1);
         assert_eq!(inserted.columns(), ["id", "title"]);
         let [Value::Text(id), Value::Text(title)] = inserted.rows()[0].values() else {
@@ -49,7 +46,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("multi-row entity INSERT RETURNING * should succeed");
+            .expect("multi-row INSERT RETURNING * should succeed");
         assert_eq!(wildcard.rows_affected(), 2);
         assert_eq!(wildcard.rows().len(), 2);
         assert!(
@@ -71,7 +68,7 @@ simulation_test!(
                 ],
             )
             .await
-            .expect("registered entity UPDATE RETURNING should succeed");
+            .expect("registered row UPDATE RETURNING should succeed");
         assert_eq!(updated.rows_affected(), 1);
         assert_eq!(
             updated.columns(),
@@ -118,7 +115,7 @@ simulation_test!(
                 ],
             )
             .await
-            .expect("entity UPSERT RETURNING should expose its postimage");
+            .expect("row UPSERT RETURNING should expose its postimage");
         assert_eq!(upserted.rows_affected(), 1);
         assert_rows_eq(
             upserted,
@@ -146,16 +143,16 @@ simulation_test!(
         let by_branch = session
             .execute(
                 "INSERT INTO returning_task_by_branch (id, title, lixcol_branch_id) \
-                 VALUES ('returning-by-branch', 'By branch', $1) \
+                 VALUES ('01920000-0000-7000-8000-000000000002', 'By branch', $1) \
                  RETURNING id, title, lixcol_branch_id",
                 &[Value::Text(sim.main_branch_id().to_string())],
             )
             .await
-            .expect("by-branch entity INSERT RETURNING should succeed");
+            .expect("by-branch row INSERT RETURNING should succeed");
         assert_rows_eq(
             by_branch,
             vec![vec![
-                Value::Text("returning-by-branch".to_string()),
+                Value::Text("01920000-0000-7000-8000-000000000002".to_string()),
                 Value::Text("By branch".to_string()),
                 Value::Text(sim.main_branch_id().to_string()),
             ]],
@@ -168,10 +165,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -466,17 +460,14 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"atomic_returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"atomic_returning_task\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
                 &[],
             )
             .await
@@ -487,7 +478,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("atomic-returning entity seed should succeed");
+            .expect("atomic-returning row seed should succeed");
         session
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ('/42', CAST('byte-01' AS BYTEA))",
@@ -515,7 +506,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"checkpoint_after_returning_error\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"checkpoint_after_returning_error\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
                 &[],
             )
             .await
@@ -554,7 +545,7 @@ simulation_test!(
             )]],
         );
 
-        // Entity audit fields require the direct executor's staged postimage
+        // Row audit fields require the direct executor's staged postimage
         // path too. Keep the same cast to prove it is rolled back by the
         // shared statement checkpoint rather than a provider-specific guard.
         let error = transaction
@@ -565,7 +556,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("staged entity RETURNING cast should fail");
+            .expect_err("staged row RETURNING cast should fail");
         assert_eq!(error.code, "LIX_TYPE_MISMATCH");
         assert_rows_eq(
             transaction
@@ -574,7 +565,7 @@ simulation_test!(
                     &[],
                 )
                 .await
-                .expect("failed entity RETURNING should restore the postimage"),
+                .expect("failed row RETURNING should restore the postimage"),
             vec![vec![
                 Value::Text("task".to_string()),
                 Value::Text("42".to_string()),
@@ -599,7 +590,7 @@ simulation_test!(
                     &[],
                 )
                 .await
-                .expect("failed entity RETURNING must not persist"),
+                .expect("failed row RETURNING must not persist"),
             vec![vec![
                 Value::Text("task".to_string()),
                 Value::Text("42".to_string()),
@@ -625,10 +616,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -637,7 +625,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"deterministic_returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"deterministic_returning_task\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
                 &[],
             )
             .await
@@ -645,7 +633,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
+                 VALUES ('lix_deterministic_mode', CAST('{\"enabled\":true}' AS JSONB), true, true)",
                 &[],
             )
             .await

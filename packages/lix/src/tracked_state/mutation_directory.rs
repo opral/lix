@@ -12,21 +12,441 @@ use bytes::Bytes;
 
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
-    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet, ValueSemantics,
 };
 use crate::{LixError, storage_codec};
 
 use super::types::CommitStateMutationPart;
 
-pub(crate) const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace = StorageSpace::immutable(
+pub(crate) const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_002d),
     "tracked_state.commit_mutation_directory_node.v1",
+    ValueSemantics::Immutable,
 );
 
 const NODE_MAGIC: &[u8] = b"LXMD1";
 const NODE_HASH_CONTEXT: &str = "lix commit mutation directory node v1";
 const ROOT_HASH_CONTEXT: &str = "lix commit mutation directory root v1";
 const FANOUT: usize = 128;
+
+// A pass-through counting allocator, test builds only.  It delegates every
+// call to `System` (which is what this crate already used, since it declares
+// no allocator otherwise) and counts only while a measurement scope is open
+// on the *current thread*, so a parallel sibling test cannot contaminate it.
+#[cfg(test)]
+mod alloc_census {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+        static ALLOCS: Cell<u64> = const { Cell::new(0) };
+        static BYTES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) struct Counting;
+
+    fn bump(size: usize) {
+        let _ = ON.try_with(|on| {
+            if on.get() {
+                let _ = ALLOCS.try_with(|counter| counter.set(counter.get().saturating_add(1)));
+                let _ = BYTES.try_with(|counter| {
+                    counter.set(counter.get().saturating_add(size as u64))
+                });
+            }
+        });
+    }
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            bump(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            bump(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            bump(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    /// Whether allocation counting is armed on this thread.  The decode census
+    /// consults this so its own bookkeeping never lands in a measured count.
+    pub(super) fn armed() -> bool {
+        ON.try_with(|on| on.get()).unwrap_or(false)
+    }
+
+    /// Runs `body` with allocation counting armed on this thread and returns
+    /// `(output, allocations, allocated_bytes)`.
+    pub(super) fn measure<T>(body: impl FnOnce() -> T) -> (T, u64, u64) {
+        let _ = ALLOCS.try_with(|counter| counter.set(0));
+        let _ = BYTES.try_with(|counter| counter.set(0));
+        let _ = ON.try_with(|on| on.set(true));
+        let output = body();
+        let _ = ON.try_with(|on| on.set(false));
+        let allocs = ALLOCS.try_with(|counter| counter.get()).unwrap_or(0);
+        let bytes = BYTES.try_with(|counter| counter.get()).unwrap_or(0);
+        (output, allocs, bytes)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: alloc_census::Counting = alloc_census::Counting;
+
+/// Prototype of the seekable node layout ("LXMD2").
+///
+/// A v1 node is one `musli(packed)` record: decoding it materializes every
+/// entry in the node, including an owned `Vec<u8>` per key bound, before the
+/// reader can find the single entry a point read wants.  A v2 node keeps the
+/// same information but stores it as fixed-stride tables over the node's own
+/// bytes, so a point read binary-searches the key table in place and decodes
+/// exactly one entry.
+///
+/// Layout, all little-endian:
+/// ```text
+///   0  magic "LXMD2"        (5)
+///   5  kind                 (1)   0 = leaf, 1 = internal
+///   6  layout               (1)
+///   7  level                (2)
+///   9  count                (4)   entries/children in this node
+///  13  entry_count          (4)   leaf entries under this node
+///  17  direct_row_count     (8)
+///  25  key_off[2*count + 1] (4 each)  alternating first_key/last_key bounds
+///      fixed[count]         (leaf: 2 bytes; internal: 44 bytes)
+///      key_region
+/// ```
+/// The node summary a parent authenticates (`first_key`, `last_key`,
+/// `entry_count`, `direct_row_count`) is readable from the header and the two
+/// outermost key slots, so validating a loaded node is O(1) rather than a walk
+/// over every entry.
+///
+/// The prototype covers `LAYOUT_BOUNDED_DIRECT` with no replacement part -
+/// the shape a cold point read actually traverses.  The other three layouts
+/// carry no key bytes at all and route by index, which the same cumulative
+/// tables serve.
+#[cfg(test)]
+pub(crate) mod seekable_prototype {
+    use super::*;
+
+    pub(crate) const V2_MAGIC: &[u8] = b"LXMD2";
+    const HEADER: usize = 25;
+    const LEAF_STRIDE: usize = 2; // direct_row_count u16
+    const INTERNAL_STRIDE: usize = 44; // node_id[32] + cum_entry_count u32 + cum_direct_rows u64
+
+    fn put_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn header(
+        out: &mut Vec<u8>,
+        kind: u8,
+        layout: u8,
+        level: u16,
+        count: u32,
+        entry_count: u32,
+        direct_row_count: u64,
+    ) {
+        out.extend_from_slice(V2_MAGIC);
+        out.push(kind);
+        out.push(layout);
+        out.extend_from_slice(&level.to_le_bytes());
+        put_u32(out, count);
+        put_u32(out, entry_count);
+        out.extend_from_slice(&direct_row_count.to_le_bytes());
+    }
+
+    /// Encodes a bounded leaf in the v2 layout.
+    pub(crate) fn encode_leaf(layout: u8, entries: &[(Vec<u8>, Vec<u8>, u16)]) -> Vec<u8> {
+        let count = entries.len();
+        let direct_row_count: u64 = entries.iter().map(|entry| u64::from(entry.2)).sum();
+        let mut out = Vec::new();
+        header(
+            &mut out,
+            0,
+            layout,
+            0,
+            count as u32,
+            count as u32,
+            direct_row_count,
+        );
+        let mut key_offsets = Vec::with_capacity(2 * count + 1);
+        let mut cursor = 0u32;
+        for (first_key, last_key, _) in entries {
+            key_offsets.push(cursor);
+            cursor += first_key.len() as u32;
+            key_offsets.push(cursor);
+            cursor += last_key.len() as u32;
+        }
+        key_offsets.push(cursor);
+        for offset in &key_offsets {
+            put_u32(&mut out, *offset);
+        }
+        for (_, _, direct_rows) in entries {
+            out.extend_from_slice(&direct_rows.to_le_bytes());
+        }
+        for (first_key, last_key, _) in entries {
+            out.extend_from_slice(first_key);
+            out.extend_from_slice(last_key);
+        }
+        out
+    }
+
+    /// Encodes an internal node in the v2 layout.  Children carry cumulative
+    /// entry and row counts so index routing is a binary search rather than a
+    /// prefix-sum walk over every child.
+    pub(crate) fn encode_internal(
+        layout: u8,
+        level: u16,
+        children: &[(Vec<u8>, Vec<u8>, [u8; 32], u32, u64)],
+    ) -> Vec<u8> {
+        let count = children.len();
+        let entry_count: u32 = children.iter().map(|child| child.3).sum();
+        let direct_row_count: u64 = children.iter().map(|child| child.4).sum();
+        let mut out = Vec::new();
+        header(
+            &mut out,
+            1,
+            layout,
+            level,
+            count as u32,
+            entry_count,
+            direct_row_count,
+        );
+        let mut key_offsets = Vec::with_capacity(2 * count + 1);
+        let mut cursor = 0u32;
+        for (first_key, last_key, ..) in children {
+            key_offsets.push(cursor);
+            cursor += first_key.len() as u32;
+            key_offsets.push(cursor);
+            cursor += last_key.len() as u32;
+        }
+        key_offsets.push(cursor);
+        for offset in &key_offsets {
+            put_u32(&mut out, *offset);
+        }
+        let mut cum_entries = 0u32;
+        let mut cum_rows = 0u64;
+        for (_, _, node_id, child_entries, child_rows) in children {
+            cum_entries += child_entries;
+            cum_rows += child_rows;
+            out.extend_from_slice(node_id);
+            put_u32(&mut out, cum_entries);
+            out.extend_from_slice(&cum_rows.to_le_bytes());
+        }
+        for (first_key, last_key, ..) in children {
+            out.extend_from_slice(first_key);
+            out.extend_from_slice(last_key);
+        }
+        out
+    }
+
+    /// A borrowed view over an encoded node.  Constructing one copies nothing.
+    #[derive(Clone, Copy)]
+    pub(crate) struct NodeView<'a> {
+        bytes: &'a [u8],
+        count: usize,
+        kind: u8,
+    }
+
+    /// Counts the bytes a lookup actually reads out of the node.
+    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Touched {
+        pub(crate) bytes: usize,
+        pub(crate) key_compares: usize,
+    }
+
+    impl<'a> NodeView<'a> {
+        pub(crate) fn new(bytes: &'a [u8], touched: &mut Touched) -> Result<Self, LixError> {
+            if bytes.len() < HEADER || !bytes.starts_with(V2_MAGIC) {
+                return Err(directory_error("node has an unsupported format"));
+            }
+            touched.bytes += HEADER;
+            let kind = bytes[5];
+            let count = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+            if count == 0 || count > FANOUT {
+                return Err(directory_error("node shape is invalid"));
+            }
+            Ok(Self { bytes, count, kind })
+        }
+
+        fn stride(&self) -> usize {
+            if self.kind == 0 {
+                LEAF_STRIDE
+            } else {
+                INTERNAL_STRIDE
+            }
+        }
+
+        fn key_region(&self) -> usize {
+            HEADER + 4 * (2 * self.count + 1) + self.stride() * self.count
+        }
+
+        fn key_offset(&self, slot: usize) -> usize {
+            let at = HEADER + 4 * slot;
+            u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap()) as usize
+        }
+
+        /// `bound`: 0 = first_key, 1 = last_key.
+        fn key(&self, index: usize, bound: usize, touched: &mut Touched) -> &'a [u8] {
+            let slot = 2 * index + bound;
+            let start = self.key_offset(slot);
+            let end = self.key_offset(slot + 1);
+            touched.bytes += 8 + (end - start);
+            let base = self.key_region();
+            &self.bytes[base + start..base + end]
+        }
+
+        /// Returns the index of the entry whose `[first_key, last_key]` range
+        /// contains `probe`, reading only the key slots the binary search
+        /// visits.  No allocation.
+        pub(crate) fn seek(&self, probe: &[u8], touched: &mut Touched) -> Option<usize> {
+            let mut low = 0usize;
+            let mut high = self.count;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                touched.key_compares += 1;
+                if self.key(mid, 0, touched) <= probe {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            if low == 0 {
+                return None;
+            }
+            let index = low - 1;
+            touched.key_compares += 1;
+            if probe <= self.key(index, 1, touched) {
+                Some(index)
+            } else {
+                None
+            }
+        }
+
+        /// The node summary a parent authenticates, read in O(1) from the
+        /// header and the two outermost key slots.  The v1 reader recomputes
+        /// the same four values by walking every entry in the node.
+        pub(crate) fn summary(
+            &self,
+            touched: &mut Touched,
+        ) -> (&'a [u8], &'a [u8], u32, u64) {
+            touched.bytes += 12;
+            let entry_count =
+                u32::from_le_bytes(self.bytes[13..17].try_into().unwrap());
+            let direct_row_count =
+                u64::from_le_bytes(self.bytes[17..25].try_into().unwrap());
+            let first_key = self.key(0, 0, touched);
+            let last_key = self.key(self.count - 1, 1, touched);
+            (first_key, last_key, entry_count, direct_row_count)
+        }
+
+        /// Rejects a node whose *touched* key region is not strictly ordered.
+        /// Under v1 this is enforced for the whole node at decode time by
+        /// `validate_stored_entries`; under v2 the unvisited region is left to
+        /// the content digest and the authenticated parent, and what the
+        /// reader touches is checked here.
+        pub(crate) fn check_local_order(
+            &self,
+            index: usize,
+            touched: &mut Touched,
+        ) -> Result<(), LixError> {
+            let first_key = self.key(index, 0, touched);
+            let last_key = self.key(index, 1, touched);
+            if first_key.is_empty() || first_key > last_key {
+                return Err(directory_error("bounded entries overlap or are unordered"));
+            }
+            if index + 1 < self.count {
+                let next_first = self.key(index + 1, 0, touched);
+                if last_key >= next_first {
+                    return Err(directory_error("bounded entries overlap or are unordered"));
+                }
+            }
+            Ok(())
+        }
+
+        /// Reads one child summary.  Fixed stride, so this is random access
+        /// with no decoding; the only copy is the 32-byte node id, which goes
+        /// on the stack.
+        pub(crate) fn child(
+            &self,
+            index: usize,
+            touched: &mut Touched,
+        ) -> ([u8; 32], u32, u64) {
+            let at = HEADER + 4 * (2 * self.count + 1) + INTERNAL_STRIDE * index;
+            touched.bytes += INTERNAL_STRIDE;
+            let mut node_id = [0u8; 32];
+            node_id.copy_from_slice(&self.bytes[at..at + 32]);
+            let cum_entries = u32::from_le_bytes(self.bytes[at + 32..at + 36].try_into().unwrap());
+            let cum_rows = u64::from_le_bytes(self.bytes[at + 36..at + 44].try_into().unwrap());
+            let (prev_entries, prev_rows) = if index == 0 {
+                (0, 0)
+            } else {
+                let prev = at - INTERNAL_STRIDE;
+                touched.bytes += 12;
+                (
+                    u32::from_le_bytes(self.bytes[prev + 32..prev + 36].try_into().unwrap()),
+                    u64::from_le_bytes(self.bytes[prev + 36..prev + 44].try_into().unwrap()),
+                )
+            };
+            (node_id, cum_entries - prev_entries, cum_rows - prev_rows)
+        }
+
+        /// Routes an entry index to the child that owns it, by binary search
+        /// on the cumulative counts.  This is the path the keyless layouts
+        /// (compact replacement, direct rows) take; v1 walks every child.
+        pub(crate) fn seek_entry_index(
+            &self,
+            entry_index: u32,
+            touched: &mut Touched,
+        ) -> Option<usize> {
+            let mut low = 0usize;
+            let mut high = self.count;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let at = HEADER + 4 * (2 * self.count + 1) + INTERNAL_STRIDE * mid + 32;
+                touched.bytes += 4;
+                let cum = u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap());
+                if cum <= entry_index {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            (low < self.count).then_some(low)
+        }
+
+        /// Materializes exactly one leaf entry.
+        pub(crate) fn leaf_entry(
+            &self,
+            index: usize,
+            touched: &mut Touched,
+        ) -> MutationDirectoryEntry {
+            let first_key = self.key(index, 0, touched).to_vec();
+            let last_key = self.key(index, 1, touched).to_vec();
+            let at = HEADER + 4 * (2 * self.count + 1) + LEAF_STRIDE * index;
+            touched.bytes += LEAF_STRIDE;
+            let direct_row_count =
+                u16::from_le_bytes(self.bytes[at..at + LEAF_STRIDE].try_into().unwrap());
+            MutationDirectoryEntry::Bounded {
+                part: CommitStateMutationPart {
+                    first_key,
+                    last_key,
+                    replacement_part: None,
+                },
+                direct_row_count,
+            }
+        }
+    }
+}
 const MAX_NODE_BYTES: usize = 16 * 1024 * 1024;
 
 #[cfg(any(test, feature = "storage-benches"))]
@@ -122,6 +542,11 @@ pub(crate) mod test_read_accounting {
         pub(crate) not_owned_absent_inline: u64,
         pub(crate) not_owned_part_index: u64,
         pub(crate) not_owned_local_row: u64,
+        pub(crate) node_decodes: u64,
+        pub(crate) node_decode_bytes: u64,
+        pub(crate) node_decode_entries: u64,
+        pub(crate) node_decode_key_bytes: u64,
+        pub(crate) node_decode_allocs: u64,
     }
 
     tokio::task_local! {
@@ -208,6 +633,22 @@ pub(crate) mod test_read_accounting {
     pub(crate) fn record_not_owned_part_index(rows: usize) {
         update(|state| {
             state.not_owned_part_index = state.not_owned_part_index.saturating_add(rows as u64);
+        });
+    }
+
+    pub(crate) fn record_node_decode(
+        payload_bytes: usize,
+        entries: usize,
+        key_bytes: usize,
+        allocs: usize,
+    ) {
+        update(|state| {
+            state.node_decodes = state.node_decodes.saturating_add(1);
+            state.node_decode_bytes = state.node_decode_bytes.saturating_add(payload_bytes as u64);
+            state.node_decode_entries = state.node_decode_entries.saturating_add(entries as u64);
+            state.node_decode_key_bytes =
+                state.node_decode_key_bytes.saturating_add(key_bytes as u64);
+            state.node_decode_allocs = state.node_decode_allocs.saturating_add(allocs as u64);
         });
     }
 
@@ -1674,8 +2115,57 @@ fn decode_node(bytes: &[u8]) -> Result<StoredNode, LixError> {
         return Err(directory_error("node exceeds its size bound"));
     }
     let node = storage_codec::decode("commit mutation directory node", payload)?;
+    #[cfg(test)]
+    census_node_decode(payload.len(), &node);
     validate_node(&node)?;
     Ok(node)
+}
+
+/// Records exactly what decoding one directory node materialized.  The
+/// allocation count is the number of heap allocations musli performs for the
+/// node: one for the entry/child vector plus, per bounded entry or child, one
+/// for `first_key` and one for `last_key`.
+#[cfg(test)]
+fn census_node_decode(payload_bytes: usize, node: &StoredNode) {
+    if alloc_census::armed() {
+        return;
+    }
+    let (entries, key_bytes, allocs) = match node {
+        StoredNode::Leaf { entries, .. } => {
+            let mut key_bytes = 0usize;
+            let mut allocs = 1usize;
+            for entry in entries {
+                if let StoredEntry::Bounded {
+                    first_key,
+                    last_key,
+                    replacement_part,
+                    ..
+                } = entry
+                {
+                    key_bytes += first_key.len() + last_key.len();
+                    allocs += 2;
+                    if let Some(part) = replacement_part.as_ref() {
+                        let _ = part;
+                        allocs += 1;
+                    }
+                }
+            }
+            (entries.len(), key_bytes, allocs)
+        }
+        StoredNode::Internal { children, .. } => {
+            let key_bytes: usize = children
+                .iter()
+                .map(|child| child.first_key.len() + child.last_key.len())
+                .sum();
+            let allocs = 1 + children
+                .iter()
+                .filter(|child| !child.first_key.is_empty() || !child.last_key.is_empty())
+                .count()
+                * 2;
+            (children.len(), key_bytes, allocs)
+        }
+    };
+    test_read_accounting::record_node_decode(payload_bytes, entries, key_bytes, allocs);
 }
 
 fn validate_node(node: &StoredNode) -> Result<(), LixError> {
@@ -2159,6 +2649,400 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
+
+    /// Measurement probe: what one single-key point read costs, as a function
+    /// of directory entry count.  Deterministic counts only - no timing.
+    ///
+    /// Both arms of every size run inside one `#[test]` so the task-local
+    /// census cannot be contaminated by a sibling test.
+    #[tokio::test]
+    #[ignore = "measurement probe, not a gate"]
+    async fn dirnode_point_read_cost_curve() {
+        const KEY_LEN: usize = 27;
+
+        fn wide_entry(index: u32) -> MutationDirectoryEntry {
+            let mut first_key = vec![0u8; KEY_LEN];
+            let mut last_key = vec![0u8; KEY_LEN];
+            first_key[..8].copy_from_slice(&(u64::from(index) * 2).to_be_bytes());
+            last_key[..8].copy_from_slice(&(u64::from(index) * 2 + 1).to_be_bytes());
+            MutationDirectoryEntry::Bounded {
+                part: CommitStateMutationPart {
+                    first_key,
+                    last_key,
+                    replacement_part: None,
+                },
+                direct_row_count: 7,
+            }
+        }
+
+        println!(
+            "DIRNODE_CURVE entries,height,total_node_bytes,decodes,bytes,entries_decoded,key_bytes,allocs,bytes_per_decode,allocs_per_decode"
+        );
+        for entry_count in [2u32, 8, 32, 64, 128, 256, 512, 2048, 8192, 16384] {
+            let entries = (0..entry_count).map(wide_entry).collect::<Vec<_>>();
+            let built = build_mutation_directory(LAYOUT_BOUNDED_DIRECT, &entries).unwrap();
+            let total_node_bytes: usize =
+                built.node_bytes().values().map(|bytes| bytes.len()).sum();
+            let (_storage, read) = stored_directory(&built).await;
+
+            // Probe the middle entry so the answer is one run, every level.
+            let mut probe = vec![0u8; KEY_LEN];
+            probe[..8].copy_from_slice(&(u64::from(entry_count / 2) * 2).to_be_bytes());
+            let points = vec![Bytes::from(probe)];
+
+            // Two reps per size: a count lane must be shown to be stable
+            // before one rep is treated as enough.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (plan, accounting) = test_read_accounting::scope(async {
+                    load_mutation_part_read_plan(
+                        &read,
+                        &built.root,
+                        MutationDirectoryReadSelection::SortedUniquePoints(&points),
+                    )
+                    .await
+                })
+                .await;
+                let plan = plan.unwrap();
+                assert_eq!(plan.len(), 1, "probe must select exactly one entry");
+                seen.push(accounting);
+            }
+            assert_eq!(
+                seen[0], seen[1],
+                "point-read census is not deterministic at {entry_count} entries"
+            );
+            let a = seen[0];
+            println!(
+                "DIRNODE_CURVE {},{},{},{},{},{},{},{},{:.2},{:.2}",
+                entry_count,
+                built.root.tree_height,
+                total_node_bytes,
+                a.node_decodes,
+                a.node_decode_bytes,
+                a.node_decode_entries,
+                a.node_decode_key_bytes,
+                a.node_decode_allocs,
+                a.node_decode_bytes as f64 / a.node_decodes as f64,
+                a.node_decode_allocs as f64 / a.node_decodes as f64,
+            );
+        }
+    }
+
+    /// Measurement probe: one point lookup inside one node, v1 record versus
+    /// the v2 seekable layout.  Same entry data, same answer, both arms
+    /// measured by the same thread-local allocation counter.
+    #[test]
+    #[ignore = "measurement probe, not a gate"]
+    fn dirnode_point_lookup_v1_vs_v2() {
+        use super::seekable_prototype::{NodeView, Touched, encode_leaf};
+
+        const KEY_LEN: usize = 27;
+
+        fn keys(index: u32) -> (Vec<u8>, Vec<u8>) {
+            let mut first_key = vec![0u8; KEY_LEN];
+            let mut last_key = vec![0u8; KEY_LEN];
+            first_key[..8].copy_from_slice(&(u64::from(index) * 2).to_be_bytes());
+            last_key[..8].copy_from_slice(&(u64::from(index) * 2 + 1).to_be_bytes());
+            (first_key, last_key)
+        }
+
+        println!(
+            "DIRNODE_AB entries,v1_node_bytes,v2_node_bytes,v1_read_bytes,v1_allocs,v1_alloc_bytes,v2_read_bytes,v2_key_compares,v2_allocs,v2_alloc_bytes"
+        );
+        println!(
+            "DIRNODE_INTERNAL entries,v1_node_bytes,v2_node_bytes,v1_read_bytes,v1_allocs,v1_alloc_bytes,v2_read_bytes,v2_allocs,v2_alloc_bytes"
+        );        println!(
+            "DIRNODE_WRITE entries,v1_node_bytes,v2_node_bytes,v1_encode_allocs,v1_encode_alloc_bytes,v2_encode_allocs,v2_encode_alloc_bytes"
+        );
+        for entry_count in [2u32, 8, 32, 64, 128] {
+            let raw = (0..entry_count)
+                .map(|index| {
+                    let (first_key, last_key) = keys(index);
+                    (first_key, last_key, 7u16)
+                })
+                .collect::<Vec<_>>();
+
+            let stored_entries = raw
+                .iter()
+                .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
+                    first_key: first_key.clone(),
+                    last_key: last_key.clone(),
+                    replacement_part: None,
+                    direct_row_count: *direct_row_count,
+                })
+                .collect::<Vec<_>>();
+            let v1_node = StoredNode::Leaf {
+                layout: LAYOUT_BOUNDED_DIRECT,
+                entries: stored_entries,
+            };
+            let v1_bytes = encode_node(&v1_node).unwrap();
+            let v1_payload = v1_bytes.len() - NODE_MAGIC.len();
+            let v2_bytes = encode_leaf(LAYOUT_BOUNDED_DIRECT, &raw);
+
+            let target = entry_count / 2;
+            let probe = keys(target).0;
+
+            // Arm v1: decode the whole node, then walk it for the one entry -
+            // exactly what `load_mutation_part_read_plan` does at a leaf.
+            let ((v1_answer, v1_index), v1_allocs, v1_alloc_bytes) =
+                alloc_census::measure(|| {
+                    let node = decode_node(&v1_bytes).unwrap();
+                    let StoredNode::Leaf { entries, .. } = node else {
+                        unreachable!("leaf");
+                    };
+                    let mut found = None;
+                    for (index, entry) in entries.into_iter().enumerate() {
+                        if stored_entry_first_key(&entry) <= probe.as_slice()
+                            && probe.as_slice() <= stored_entry_last_key(&entry)
+                        {
+                            found = Some((runtime_entry(entry).unwrap(), index));
+                            break;
+                        }
+                    }
+                    found.unwrap()
+                });
+
+            // Arm v2: binary-search the key table in place, decode one entry.
+            let mut touched = Touched::default();
+            let ((v2_answer, v2_index), v2_allocs, v2_alloc_bytes) =
+                alloc_census::measure(|| {
+                    let view = NodeView::new(&v2_bytes, &mut touched).unwrap();
+                    let index = view.seek(&probe, &mut touched).unwrap();
+                    (view.leaf_entry(index, &mut touched), index)
+                });
+
+            assert_eq!(v1_index, target as usize, "v1 found the wrong entry");
+            assert_eq!(v2_index, target as usize, "v2 found the wrong entry");
+            assert_eq!(v1_answer, v2_answer, "arms disagree at {entry_count} entries");
+
+            println!(
+                "DIRNODE_AB {},{},{},{},{},{},{},{},{},{}",
+                entry_count,
+                v1_bytes.len(),
+                v2_bytes.len(),
+                v1_payload,
+                v1_allocs,
+                v1_alloc_bytes,
+                touched.bytes,
+                touched.key_compares,
+                v2_allocs,
+                v2_alloc_bytes,
+            );
+
+            // Write side.  Warm reads decode nothing, so the only way this
+            // layout can cost steady-state throughput is at commit, where
+            // every node is encoded once.  Inputs for both arms are built
+            // before the measured region so only the encode is counted.
+            let write_node = StoredNode::Leaf {
+                layout: LAYOUT_BOUNDED_DIRECT,
+                entries: raw
+                    .iter()
+                    .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
+                        first_key: first_key.clone(),
+                        last_key: last_key.clone(),
+                        replacement_part: None,
+                        direct_row_count: *direct_row_count,
+                    })
+                    .collect(),
+            };
+            let (v1_out, v1_enc_allocs, v1_enc_alloc_bytes) =
+                alloc_census::measure(|| encode_node(&write_node).unwrap());
+            let (v2_out, v2_enc_allocs, v2_enc_alloc_bytes) =
+                alloc_census::measure(|| encode_leaf(LAYOUT_BOUNDED_DIRECT, &raw));
+            assert_eq!(v1_out.len(), v1_bytes.len());
+            assert_eq!(v2_out.len(), v2_bytes.len());
+            // Internal-node arm: the other half of a height-2 point read.
+            let child_ids = (0..entry_count)
+                .map(|index| {
+                    // Non-zero fill: `validate_node` rejects an all-zero
+                    // child node id, which index 0 would otherwise produce.
+                    let mut node_id = [0xABu8; 32];
+                    node_id[..4].copy_from_slice(&index.to_be_bytes());
+                    node_id
+                })
+                .collect::<Vec<_>>();
+            let internal_children = raw
+                .iter()
+                .zip(&child_ids)
+                .map(|((first_key, last_key, _), node_id)| {
+                    (first_key.clone(), last_key.clone(), *node_id, 128u32, 128u64)
+                })
+                .collect::<Vec<_>>();
+            let v1_internal = StoredNode::Internal {
+                layout: LAYOUT_BOUNDED_DIRECT,
+                level: 1,
+                children: internal_children
+                    .iter()
+                    .map(|(first_key, last_key, node_id, entries, rows)| StoredChild {
+                        first_key: first_key.clone(),
+                        last_key: last_key.clone(),
+                        node_id: *node_id,
+                        entry_count: *entries,
+                        direct_row_count: *rows,
+                        level: 0,
+                        layout: LAYOUT_BOUNDED_DIRECT,
+                    })
+                    .collect(),
+            };
+            let v1_internal_bytes = encode_node(&v1_internal).unwrap();
+            let v2_internal_bytes =
+                seekable_prototype::encode_internal(LAYOUT_BOUNDED_DIRECT, 1, &internal_children);
+
+            let ((v1_child, v1_child_index), v1_int_allocs, v1_int_alloc_bytes) =
+                alloc_census::measure(|| {
+                    let node = decode_node(&v1_internal_bytes).unwrap();
+                    let StoredNode::Internal { children, .. } = node else {
+                        unreachable!("internal");
+                    };
+                    let mut preceding = 0u32;
+                    let mut found = None;
+                    for (index, child) in children.into_iter().enumerate() {
+                        if child.first_key.as_slice() <= probe.as_slice()
+                            && probe.as_slice() <= child.last_key.as_slice()
+                        {
+                            found = Some(((child.node_id, child.entry_count, preceding), index));
+                            break;
+                        }
+                        preceding += child.entry_count;
+                    }
+                    found.unwrap()
+                });
+
+            let mut int_touched = Touched::default();
+            let ((v2_child, v2_child_index), v2_int_allocs, v2_int_alloc_bytes) =
+                alloc_census::measure(|| {
+                    let view = NodeView::new(&v2_internal_bytes, &mut int_touched).unwrap();
+                    let index = view.seek(&probe, &mut int_touched).unwrap();
+                    let (node_id, entries, _) = view.child(index, &mut int_touched);
+                    ((node_id, entries, 128 * index as u32), index)
+                });
+
+            assert_eq!(v1_child_index, v2_child_index, "internal arms disagree on index");
+            assert_eq!(v1_child, v2_child, "internal arms disagree on child");
+
+            // The keyless layouts route by entry index instead of by key.
+            // Both routings must select the same child.
+            let index_view = NodeView::new(&v2_internal_bytes, &mut Touched::default()).unwrap();
+            assert_eq!(
+                index_view.seek_entry_index(
+                    128 * v2_child_index as u32 + 5,
+                    &mut Touched::default()
+                ),
+                Some(v2_child_index),
+                "index routing disagrees with key routing"
+            );
+
+            println!(
+                "DIRNODE_INTERNAL {},{},{},{},{},{},{},{},{}",
+                entry_count,
+                v1_internal_bytes.len(),
+                v2_internal_bytes.len(),
+                v1_internal_bytes.len() - NODE_MAGIC.len(),
+                v1_int_allocs,
+                v1_int_alloc_bytes,
+                int_touched.bytes,
+                v2_int_allocs,
+                v2_int_alloc_bytes,
+            );
+
+            println!(
+                "DIRNODE_WRITE {},{},{},{},{},{},{}",
+                entry_count,
+                v1_out.len(),
+                v2_out.len(),
+                v1_enc_allocs,
+                v1_enc_alloc_bytes,
+                v2_enc_allocs,
+                v2_enc_alloc_bytes,
+            );
+        }
+    }
+
+    /// The v2 reader must vouch for exactly what the v1 reader vouches for.
+    ///
+    /// This is a real gate, not a probe: it fails if the O(1) header-read
+    /// summary ever diverges from the walked summary `node_summary_ref`
+    /// computes, and it fails if a malformed key range inside the region the
+    /// reader touches is accepted.
+    #[test]
+    fn dirnode_v2_summary_matches_walked_summary_and_rejects_touched_disorder() {
+        use super::seekable_prototype::{NodeView, Touched, encode_leaf};
+
+        const KEY_LEN: usize = 27;
+
+        fn keys(index: u32) -> (Vec<u8>, Vec<u8>) {
+            let mut first_key = vec![0u8; KEY_LEN];
+            let mut last_key = vec![0u8; KEY_LEN];
+            first_key[..8].copy_from_slice(&(u64::from(index) * 2).to_be_bytes());
+            last_key[..8].copy_from_slice(&(u64::from(index) * 2 + 1).to_be_bytes());
+            (first_key, last_key)
+        }
+
+        for entry_count in [1u32, 2, 8, 128] {
+            let raw = (0..entry_count)
+                .map(|index| {
+                    let (first_key, last_key) = keys(index);
+                    (first_key, last_key, 7u16)
+                })
+                .collect::<Vec<_>>();
+            let v1_node = StoredNode::Leaf {
+                layout: LAYOUT_BOUNDED_DIRECT,
+                entries: raw
+                    .iter()
+                    .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
+                        first_key: first_key.clone(),
+                        last_key: last_key.clone(),
+                        replacement_part: None,
+                        direct_row_count: *direct_row_count,
+                    })
+                    .collect(),
+            };
+            let node_id = [7u8; 32];
+            let walked = node_summary_ref(&v1_node, node_id).unwrap();
+
+            let v2_bytes = encode_leaf(LAYOUT_BOUNDED_DIRECT, &raw);
+            let mut touched = Touched::default();
+            let view = NodeView::new(&v2_bytes, &mut touched).unwrap();
+            let (first_key, last_key, count, direct_rows) = view.summary(&mut touched);
+
+            assert_eq!(first_key, walked.first_key, "first_key at {entry_count}");
+            assert_eq!(last_key, walked.last_key, "last_key at {entry_count}");
+            assert_eq!(count, walked.entry_count, "entry_count at {entry_count}");
+            assert_eq!(
+                direct_rows, walked.direct_row_count,
+                "direct_row_count at {entry_count}"
+            );
+
+            // Reading the summary must stay O(1): it may not grow with the
+            // number of entries in the node.
+            assert!(
+                touched.bytes < 200,
+                "summary read touched {} bytes at {entry_count} entries",
+                touched.bytes
+            );
+
+            // Every entry the reader touches is order-checked.
+            for index in 0..entry_count as usize {
+                view.check_local_order(index, &mut Touched::default())
+                    .unwrap();
+            }
+        }
+
+        // A node whose touched region is out of order must be refused.
+        let (first_key, last_key) = keys(5);
+        let (later_first, later_last) = keys(9);
+        let disordered = vec![
+            (later_first, later_last, 7u16),
+            (first_key, last_key, 7u16),
+        ];
+        let bad = encode_leaf(LAYOUT_BOUNDED_DIRECT, &disordered);
+        let mut touched = Touched::default();
+        let view = NodeView::new(&bad, &mut touched).unwrap();
+        assert!(
+            view.check_local_order(0, &mut touched).is_err(),
+            "out-of-order touched entries must be rejected"
+        );
+    }
 
     fn bounded_entry(index: u32) -> MutationDirectoryEntry {
         let first_key = index.saturating_mul(10).to_be_bytes().to_vec();

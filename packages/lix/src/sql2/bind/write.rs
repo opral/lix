@@ -35,7 +35,7 @@ pub(crate) struct BoundReturningItem {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundWriteTarget {
-    Entity(EntityWriteSurface),
+    Row(RowWriteSurface),
     File(FileWriteSurface),
     Directory(DirectoryWriteSurface),
     Branch,
@@ -43,7 +43,7 @@ pub(crate) enum BoundWriteTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum EntityWriteSurface {
+pub(crate) enum RowWriteSurface {
     Base { schema_key: String },
     ByBranch { schema_key: String },
 }

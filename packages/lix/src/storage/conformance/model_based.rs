@@ -200,20 +200,21 @@ where
             )
             .await
             .map_err(|error| format!("{label}: begin full scan in {space:?} failed: {error}"))?;
-        let chunk = cursor
+        let (chunk, chunk_has_more) = cursor
             .next_page(usize::MAX)
             .await
-            .map_err(|error| format!("{label}: full scan in {space:?} failed: {error}"))?;
-        let actual = chunk_entries(&chunk.entries);
+            .map_err(|error| format!("{label}: full scan in {space:?} failed: {error}"))?
+            .into_parts();
+        let actual = chunk_entries(&chunk);
         let expected = model
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
-        if actual != expected || chunk.has_more {
+        if actual != expected || chunk_has_more {
             return Err(format!(
                 "{label}: full scan in {space:?} mismatch: expected {expected:?} with \
                  has_more=false, got {actual:?} with has_more={}",
-                chunk.has_more
+                chunk_has_more
             ));
         }
     }
@@ -280,10 +281,11 @@ where
         )
         .await
         .map_err(|error| format!("{label}: begin randomized scan failed: {error}"))?;
-    let chunk = cursor
+    let (chunk, chunk_has_more) = cursor
         .next_page(limit_rows)
         .await
-        .map_err(|error| format!("{label}: randomized scan failed: {error}"))?;
+        .map_err(|error| format!("{label}: randomized scan failed: {error}"))?
+        .into_parts();
     let eligible = scan_model
         .iter()
         .filter(|(key, _)| {
@@ -299,13 +301,13 @@ where
         .collect::<Vec<_>>();
     let expected_has_more = limit_rows != 0 && eligible.len() > limit_rows;
     let expected_scan = eligible.into_iter().take(limit_rows).collect::<Vec<_>>();
-    if chunk.entries != expected_scan || chunk.has_more != expected_has_more {
+    if chunk != expected_scan || chunk_has_more != expected_has_more {
         return Err(format!(
             "{label}: randomized scan in {scan_space:?} mismatch for range {range:?}, \
              resume_after {resume_after:?}, limit {limit_rows}, projection {projection:?}: \
              expected {expected_scan:?} with has_more={expected_has_more}, got {:?} with \
              has_more={}",
-            chunk.entries, chunk.has_more
+            chunk, chunk_has_more
         ));
     }
 

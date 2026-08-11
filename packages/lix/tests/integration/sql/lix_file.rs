@@ -12,7 +12,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -151,7 +151,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -215,7 +215,7 @@ simulation_test!(
                     "SELECT file_id \
                      FROM lix_change \
                      WHERE schema_key = 'lix_directory_descriptor' \
-                       AND entity_pk = lix_json('[\"{directory_id}\"]') \
+                       AND row_pk = CAST('[\"{directory_id}\"]' AS JSONB) \
                      ORDER BY created_at"
                 ),
             )
@@ -316,7 +316,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -379,7 +379,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -416,7 +416,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let missing = sim.wrap_session(
             engine
-                .open_session("missing-file-branch")
+                .open_session_at("missing-file-branch")
                 .await
                 .expect("a pinned session may open before its branch is resolved"),
             &engine,
@@ -440,7 +440,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -460,7 +460,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -481,7 +481,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -586,7 +586,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -611,7 +611,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -666,7 +666,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -719,7 +719,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -780,7 +780,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -865,7 +865,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -882,6 +882,20 @@ simulation_test!(
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.message.contains("path segment must not contain '/'"));
+
+        let traversal = session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name) \
+                 VALUES ('66696c65-2d73-8c61-8368-000000000001', NULL, '..')",
+                &[],
+            )
+            .await
+            .expect_err("file name must not be a traversal segment");
+
+        assert!(
+            traversal.message.contains("cannot be '.' or '..'"),
+            "{traversal}"
+        );
     }
 );
 
@@ -891,7 +905,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -933,7 +947,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -956,7 +970,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1012,7 +1026,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1053,7 +1067,7 @@ simulation_test!(
             .execute(
                 "SELECT schema_key \
              FROM lix_change \
-             WHERE entity_pk = lix_json('[\"66696c65-2d72-8561-846d-650000000000\"]') \
+             WHERE row_pk = CAST('[\"66696c65-2d72-8561-846d-650000000000\"]' AS JSONB) \
                AND schema_key IN ('lix_file_descriptor', 'lix_binary_blob_ref') \
              ORDER BY schema_key",
                 &[],
@@ -1089,7 +1103,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1147,7 +1161,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1205,7 +1219,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1245,7 +1259,7 @@ simulation_test!(lix_file_content_is_not_nullable, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1270,7 +1284,7 @@ simulation_test!(lix_file_insert_rejects_null_content, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1315,7 +1329,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1342,15 +1356,6 @@ simulation_test!(
                 "INSERT INTO lix_file (id, path, content) \
                  VALUES ('626f6f6c-2d64-8174-812d-66696c650000', '/bool.bin', true)",
             ),
-            (
-                "74657874-2d66-856e-8374-696f6e2d6400",
-                "INSERT INTO lix_file (id, path, content) \
-                 VALUES (\
-                   '74657874-2d66-856e-8374-696f6e2d6400',\
-                   '/text-function.bin',\
-                   lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')\
-                 )",
-            ),
         ] {
             let error = session
                 .execute(sql, &[])
@@ -1360,7 +1365,7 @@ simulation_test!(
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
             assert_eq!(
                 error.hint(),
-                Some("Use CAST(? AS BYTEA) with a text parameter for file contents."),
+                Some("Use CAST($1 AS BYTEA) with a text parameter for file contents."),
                 "{id}"
             );
         }
@@ -1370,7 +1375,6 @@ simulation_test!(
                 "SELECT id FROM lix_file \
                  WHERE id IN (\
                    '74657874-2d64-8174-812d-66696c650000',\
-                   '74657874-2d66-856e-8374-696f6e2d6400',\
                    '696e742d-6461-8461-8d66-696c65000000',\
                    '666c6f61-742d-8461-8461-2d66696c6500',\
                    '626f6f6c-2d64-8174-812d-66696c650000'\
@@ -1389,7 +1393,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1406,7 +1410,7 @@ simulation_test!(
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         assert_eq!(
             error.hint(),
-            Some("Use CAST(? AS BYTEA) with a text parameter for file contents.")
+            Some("Use CAST($1 AS BYTEA) with a text parameter for file contents.")
         );
 
         let result = session
@@ -1426,7 +1430,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1455,7 +1459,7 @@ simulation_test!(
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
             assert_eq!(
                 error.hint(),
-                Some("Use CAST(? AS BYTEA) with a text parameter for file contents."),
+                Some("Use CAST($1 AS BYTEA) with a text parameter for file contents."),
                 "{id}"
             );
         }
@@ -1468,7 +1472,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1552,12 +1556,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_accepts_anonymous_path_and_content_parameters,
+    lix_file_insert_accepts_numbered_path_and_content_parameters,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1565,43 +1569,43 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES (?, ?, ?)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text("616e6f6e-796d-8f75-832d-706172616d00".to_string()),
-                    Value::Text("/anonymous-param.bin".to_string()),
-                    Value::Blob(b"anonymous".to_vec().into()),
+                    Value::Text("/numbered-param.bin".to_string()),
+                    Value::Blob(b"numbered".to_vec().into()),
                 ],
             )
             .await
-            .expect("anonymous parameter insert should succeed");
+            .expect("numbered parameter insert should succeed");
         assert_eq!(insert_result.rows_affected(), 1);
 
         let result = session
             .execute(
-                "SELECT path, content FROM lix_file WHERE id = ?",
+                "SELECT path, content FROM lix_file WHERE id = $1",
                 &[Value::Text(
                     "616e6f6e-796d-8f75-832d-706172616d00".to_string(),
                 )],
             )
             .await
-            .expect("anonymous parameter read should succeed");
+            .expect("numbered parameter read should succeed");
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("/anonymous-param.bin".to_string()),
-                Value::Blob(b"anonymous".to_vec().into()),
+                Value::Text("/numbered-param.bin".to_string()),
+                Value::Blob(b"numbered".to_vec().into()),
             ]],
         );
     }
 );
 
 simulation_test!(
-    lix_file_anonymous_content_parameter_keeps_strict_blob_validation,
+    lix_file_numbered_content_parameter_keeps_strict_blob_validation,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1609,15 +1613,15 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES (?, ?, ?)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text("616e6f6e-796d-8f75-832d-746578742d00".to_string()),
-                    Value::Text("/anonymous-text-data.bin".to_string()),
+                    Value::Text("/numbered-text-data.bin".to_string()),
                     Value::Text("not binary".to_string()),
                 ],
             )
             .await
-            .expect_err("anonymous non-binary data parameter should be rejected");
+            .expect_err("numbered non-binary data parameter should be rejected");
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
     }
 );
@@ -1628,7 +1632,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1659,7 +1663,7 @@ simulation_test!(
                 "SELECT id \
              FROM lix_change \
              WHERE schema_key = 'lix_binary_blob_ref' \
-               AND entity_pk = lix_json('[\"656d7074-792d-8461-8461-2d66696c6500\"]')",
+               AND row_pk = CAST('[\"656d7074-792d-8461-8461-2d66696c6500\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -1674,7 +1678,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1706,7 +1710,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1748,7 +1752,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1788,7 +1792,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1822,7 +1826,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1872,7 +1876,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1902,7 +1906,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1937,7 +1941,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1963,7 +1967,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1996,7 +2000,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2032,7 +2036,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2057,7 +2061,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2112,7 +2116,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2148,7 +2152,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2198,7 +2202,7 @@ simulation_test!(lix_file_path_update_preserves_content, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -2269,7 +2273,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2359,7 +2363,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2461,7 +2465,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2564,7 +2568,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2620,7 +2624,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2628,10 +2632,6 @@ simulation_test!(
 
         for (id, assignment) in [
             ("75706461-7465-8d74-8578-742d66696c00", "'hello'"),
-            (
-                "75706461-7465-8d74-8578-742d66756e00",
-                "lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')",
-            ),
             ("75706461-7465-8d69-8e74-2d66696c6500", "12345"),
             ("75706461-7465-8d66-8c6f-61742d666900", "1.5"),
             ("75706461-7465-8d62-8f6f-6c2d66696c00", "true"),
@@ -2663,7 +2663,6 @@ simulation_test!(
                 "SELECT id, content FROM lix_file \
                  WHERE id IN (\
                    '75706461-7465-8d74-8578-742d66696c00',\
-                   '75706461-7465-8d74-8578-742d66756e00',\
                    '75706461-7465-8d69-8e74-2d66696c6500',\
                    '75706461-7465-8d66-8c6f-61742d666900',\
                    '75706461-7465-8d62-8f6f-6c2d66696c00'\
@@ -2693,10 +2692,6 @@ simulation_test!(
                     Value::Text("75706461-7465-8d74-8578-742d66696c00".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
-                vec![
-                    Value::Text("75706461-7465-8d74-8578-742d66756e00".to_string()),
-                    Value::Blob(b"hello".to_vec().into()),
-                ],
             ],
         );
     }
@@ -2708,7 +2703,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2776,7 +2771,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2818,7 +2813,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2836,7 +2831,7 @@ simulation_test!(
                 &[
                     Value::Text("/equal-metadata.bin".to_string()),
                     Value::Blob(b"before".to_vec().into()),
-                    Value::Json(metadata.clone()),
+                    Value::Jsonb(metadata.clone().into()),
                 ],
             )
             .await
@@ -2858,7 +2853,7 @@ simulation_test!(
                 &[
                     Value::Text("/equal-metadata.bin".to_string()),
                     Value::Blob(b"after".to_vec().into()),
-                    Value::Json(metadata.clone()),
+                    Value::Jsonb(metadata.clone().into()),
                 ],
             )
             .await
@@ -2878,7 +2873,10 @@ simulation_test!(
             .expect("updated file should load");
         assert_eq!(
             current.rows()[0].values(),
-            &[Value::Blob(b"after".to_vec().into()), Value::Json(metadata),]
+            &[
+                Value::Blob(b"after".to_vec().into()),
+                Value::Jsonb(metadata.into()),
+            ]
         );
         assert_eq!(
             file_descriptor_event_count(&session, &commit_id, file_id).await,
@@ -2893,7 +2891,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2909,7 +2907,7 @@ simulation_test!(
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
                     Value::Blob(b"one".to_vec().into()),
-                    Value::Json(json!({"version": 1})),
+                    Value::Jsonb(json!({"version": 1}).into()),
                 ],
             )
             .await
@@ -2931,7 +2929,7 @@ simulation_test!(
                 &[
                     Value::Text("/changed-metadata.bin".to_string()),
                     Value::Blob(b"two".to_vec().into()),
-                    Value::Json(json!({"version": 2})),
+                    Value::Jsonb(json!({"version": 2}).into()),
                 ],
             )
             .await
@@ -3021,19 +3019,20 @@ async fn file_descriptor_event_count(
     let Some(row) = result.rows().first() else {
         return 0;
     };
-    let Value::Json(source_changes) = row
+    let Value::Jsonb(source_changes) = row
         .get::<Value>("lixcol_source_changes")
         .expect("file history source changes should decode")
     else {
         panic!("file history source changes should be JSON");
     };
+    let source_changes = source_changes.to_value();
     source_changes
         .as_array()
         .expect("file history source changes should be an array")
         .iter()
         .filter(|source| {
             source["schema_key"] == json!("lix_file_descriptor")
-                && source["entity_pk"] == json!([file_id])
+                && source["row_pk"] == json!([file_id])
         })
         .count()
 }
@@ -3044,7 +3043,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3071,7 +3070,7 @@ simulation_test!(
                 "SELECT id \
                  FROM lix_change \
                  WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"616c7265-6164-892d-856d-7074792d6600\"]')",
+                   AND row_pk = CAST('[\"616c7265-6164-892d-856d-7074792d6600\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -3084,7 +3083,7 @@ simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -3136,7 +3135,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3177,7 +3176,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3239,7 +3238,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3306,7 +3305,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3356,7 +3355,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3406,7 +3405,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3447,7 +3446,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3487,7 +3486,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3546,7 +3545,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3602,7 +3601,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3635,7 +3634,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3660,7 +3659,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3695,7 +3694,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3748,7 +3747,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3778,7 +3777,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -3920,7 +3919,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -4031,14 +4030,14 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("transaction session should open"),
             &engine,
         );
         let other_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("other session should open"),
             &engine,
@@ -4124,7 +4123,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -4138,7 +4137,7 @@ simulation_test!(
         .expect("draft branch should create");
         let draft = main.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-00000000000a")
+                .open_session_at("01930000-0000-7000-8000-00000000000a")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -4162,7 +4161,7 @@ simulation_test!(
 
         let transaction_session = main.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("transaction session should open"),
             &engine,

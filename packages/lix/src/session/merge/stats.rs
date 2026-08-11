@@ -108,16 +108,16 @@ fn identities_are_strictly_sorted<'a>(
 }
 
 fn missing_source_entry(identity: &TrackedStateDiffIdentity) -> LixError {
-    let entity_pk = identity
-        .entity_pk()
+    let row_pk = identity
+        .row_pk()
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity pk>".to_string());
+        .unwrap_or_else(|_| "<invalid row pk>".to_string());
     LixError::new(
         "LIX_ERROR_UNKNOWN",
         format!(
-            "merge analysis could not find source diff entry for source schema '{}' entity '{}'",
+            "merge analysis could not find source diff entry for source schema '{}' row '{}'",
             identity.schema_key(),
-            entity_pk
+            row_pk
         ),
     )
 }
@@ -163,7 +163,7 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::tracked_state::{
         TrackedStateDiffEntry, TrackedStateDiffRow, TrackedStateKey, TrackedStateMergePick,
     };
@@ -176,7 +176,7 @@ mod tests {
                 .map(|index| TrackedStateKey {
                     schema_key: "shared_schema".to_string(),
                     file_id: Some("shared_file".to_string()),
-                    entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                    row_pk: RowPk::single(format!("row-{index:05}")),
                 })
                 .collect(),
         )

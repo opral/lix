@@ -13,9 +13,9 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix | Version control system and SQL database in one";
+    const title = "Lix | Repository backend for AI products";
     const description =
-      "AI applications span files, a SQL database, and version control. Lix combines those three requirements in one system, avoiding three separate layers of infrastructure that need to be kept in sync.";
+      "Repository backend for AI products. Files for agents, a SQL database for your app, and version control over both, in one embeddable system.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({

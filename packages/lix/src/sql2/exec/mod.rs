@@ -77,7 +77,7 @@ pub(crate) use datafusion::{
     DataFusionLogicalPlan as SqlDataFusionLogicalPlan, SessionReadResult, SessionReadSqlResult,
     execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,
     execute_transaction_read_statement_from_parsed, prepare_read_session,
-    prepare_read_session_at_head, query_result_from_batches,
+    prepare_read_session_at_head, query_result_from_batches, statement_has_table_function,
 };
 #[cfg(test)]
 pub(crate) use write::{
@@ -145,9 +145,9 @@ pub(crate) fn append_path_value_replacement_snapshot_text(
 
 #[cfg(test)]
 pub(crate) use bound_public_write::{
-    take_certified_entity_insert_batch_executions,
-    take_certified_entity_insert_parameter_batch_executions,
+    take_certified_row_insert_batch_executions,
+    take_certified_row_insert_parameter_batch_executions,
     take_certified_generation_identity_replacements,
     take_certified_replacement_parameter_batch_executions,
-    take_certified_single_path_value_replacements, take_entity_update_parameter_batch_executions,
+    take_certified_single_path_value_replacements, take_row_update_parameter_batch_executions,
 };

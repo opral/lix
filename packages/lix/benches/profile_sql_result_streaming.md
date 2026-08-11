@@ -6,7 +6,7 @@ Every mode uses the same fixture and SQL statement, and the profile scope
 includes snapshot acquisition, execution, and result consumption.
 
 The fixture query is an unordered `UNION ALL` over eight distinct registered
-entity tables. Do not add a global `ORDER BY` when measuring early stop: a sort
+row tables. Do not add a global `ORDER BY` when measuring early stop: a sort
 must consume all input before it can emit a first batch and would intentionally
 hide cancellation. Distinct child tables create independent DataFusion output
 batches so Lix's identical-scan cache cannot merge them back into one eager

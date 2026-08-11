@@ -11,12 +11,13 @@ Lix has pluggable storage. A storage adapter decides where the bytes live. The L
 | Adapter            | Available in     | Use for                                        |
 | ------------------ | ---------------- | ---------------------------------------------- |
 | `Memory` (default) | JavaScript, Rust | tests, demos, and ephemeral work               |
-| `LocalFilesystem`  | JavaScript, Rust | a local directory synchronized with Lix        |
+| `IndexedDbStorage` | JavaScript       | persistent local browser repositories          |
+| `FilesystemStorage`  | JavaScript, Rust | a local directory synchronized with Lix        |
 | `RocksDB`          | Rust             | native embedded persistence                    |
 | `SlateDB`          | Rust             | object storage, for example S3                 |
-| Remote server      | any client       | shared workspaces; the server owns persistence |
+| Remote server      | any client       | shared repositories; the server owns persistence |
 
-In JavaScript, `LocalFilesystem` requires Node.js. The default `Memory` storage also works in browsers.
+In JavaScript, `FilesystemStorage` requires Node.js. The default `Memory` storage and `IndexedDbStorage` work in browsers.
 
 ## In-memory (default)
 
@@ -32,31 +33,65 @@ await lix.close();
 
 ## Local filesystem
 
-Persist a directory as a Lix workspace with `LocalFilesystem`:
+Persist a directory as a Lix repository with `FilesystemStorage`:
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "/var/data/workspace",
-    syncAllFiles: true,
-  }),
+  storage: new FilesystemStorage({ path: "/var/data/repository" }),
 });
 ```
 
-Lix stores its repository state in `<workspace>/.lix/.internal` and synchronizes workspace files. Reopen the same path to resume the existing state.
+Lix stores its repository state in `<repository>/.lix/.internal` and synchronizes repository files. Reopen the same path to resume the existing state.
 
-Two options change this behavior:
+In Rust, open the storage, pass it to Lix, then start synchronization on that
+repository:
 
-- `lixDir` stores the repository state outside the workspace. The workspace does not receive a `.lix` directory.
-- `syncAllFiles: false` starts without importing files. Import exact file paths with `storage.importPaths(["notes/today.md"])`.
+```rust
+use lix::open_lix;
+use lix_storage_filesystem::FilesystemStorage;
+
+let storage = FilesystemStorage::new("./repository").open()?;
+let lix = open_lix().with_storage(storage.clone()).await?;
+storage.start_sync(&lix).await?;
+
+storage.sync_disk_to_lix().await?;
+storage.stop_sync().await?;
+```
+
+`FilesystemStorage` owns synchronization after `start_sync()` returns. Calling
+`stop_sync()` is optional for normal applications and recommended for tests, or
+before reopening the same directory immediately. Dropping the final storage
+or repository instance performs a best-effort shutdown.
+
+Pass `syncAllFiles: false` to begin with no regular repository files and import
+selected paths with `storage.importPaths(paths)`.
+
+## IndexedDB
+
+Persist a complete local browser repository across reloads with
+`IndexedDbStorage`:
+
+```ts
+import { IndexedDbStorage, openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  storage: new IndexedDbStorage({ name: "atelier" }),
+});
+```
+
+The name identifies one Lix database within the current browser origin. Only
+one Lix handle may open that database name at a time, including from other tabs.
+IndexedDB commits use the same transactional storage boundary as native Lix
+storage.
 
 Filesystem sync handles regular files only. Symbolic links and other special entries are not imported.
 
 ## Remote server
 
-Connect to a hosted workspace with `server`:
+Connect to a hosted repository with `server`:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -64,14 +99,14 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix({
   server: {
     mode: "remote",
-    url: "https://example.com/workspaces/acme",
+    url: "https://example.com/repositories/acme",
   },
 });
 ```
 
 The client needs no local storage option. Files, SQL rows, and branches live on the server.
 
-For S3, the server runs Lix with the Rust SlateDB storage backed by an S3-compatible object store and exposes the workspace through the [Lix server protocol](https://github.com/opral/lix/blob/main/packages/server-protocol/README.md). Clients do not pass S3 to `openLix()`.
+For S3, the server runs Lix with the Rust `SlateDB` storage on an S3-compatible object store. The server exposes the repository through the [Lix Server Protocol](./server-protocol.md). See [Hosting](./hosting.md). Clients do not pass S3 to `openLix()`.
 
 ```text
 JS client ── HTTP ──▶ Lix server ──▶ SlateDB ──▶ S3
@@ -102,4 +137,4 @@ let report = run_storage_conformance(&factory).await;
 report.assert_no_failures();
 ```
 
-PostgreSQL, IndexedDB, OPFS, Cloudflare D1, and similar targets need such a custom implementation.
+PostgreSQL, OPFS, Cloudflare D1, and similar targets need such a custom implementation.

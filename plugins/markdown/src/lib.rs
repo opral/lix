@@ -1,16 +1,17 @@
-//! Markdown support for the fused Component API v1.
+//! Markdown support for the row-first Component API v1.
 #![allow(dead_code)]
 
 mod core;
 mod markdown_file;
 mod model;
+mod order_key;
 mod schemas;
 
 use core::{
-    ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, EntityRecord, FileEdit, IdNamespace,
-    NODE_SCHEMA_KEY, PluginError,
+    ArenaMarkdownBlock, ChangeEffect, Document, FileEdit, IdNamespace, NODE_SCHEMA_KEY,
+    PluginError, RowChange, RowRecord,
 };
-use lix_plugin_api as sdk;
+use lix::plugin as sdk;
 use serde_json::Value;
 
 struct MarkdownPlugin;
@@ -26,56 +27,60 @@ const BLOCK_INDEX_ENTRY_BYTES: u32 = 28;
 const BLOCK_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_BLOCK_SHIFT_RECORDS: usize = 4096;
 
-impl sdk::Plugin for MarkdownPlugin {
-    fn cold_file_changed(
-        update: &mut sdk::ColdUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
-    ) -> sdk::Result<()> {
-        let accepted = update.before.read_all()?;
-        let mut records = Vec::new();
-        while let Some(entity) = update.entities.next()? {
-            records.push(EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
-            });
-        }
-        let (document, _) = Document::open_entities(records, Some(accepted)).map_err(core_error)?;
-        let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
-        let inserts = update
-            .edits
-            .iter()
-            .map(|edit| edit.insert.clone())
-            .collect::<Vec<_>>();
-        let splices = update
-            .edits
-            .iter()
-            .zip(&inserts)
-            .map(|(edit, insert)| FileEdit {
-                offset: edit.offset,
-                delete_len: edit.delete_len,
-                insert,
-            })
-            .collect::<Vec<_>>();
-        let (document, mut changes) = document
-            .file_changed(&splices, namespace)
-            .map_err(core_error)?;
-        strip_duplicated_lexical_fallback(&mut changes)?;
-        store_markdown_state(sink, &document)?;
-        emit_changes(changes, update.creates, Some(0), sink)?;
-        Ok(())
+fn cold_parse_changes(
+    update: &mut sdk::ParseChangesInput<'_>,
+    sink: &mut sdk::RowChangeOutput<'_, '_>,
+) -> sdk::Result<()> {
+    let accepted = update.before.read_all()?;
+    let mut records = Vec::new();
+    let rows = update
+        .rows
+        .as_mut()
+        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+    while let Some(row) = rows.next()? {
+        records.push(RowRecord {
+            schema_key: row.schema_key,
+            row_pk: row.row_pk,
+            snapshot: row.snapshot,
+        });
     }
+    let (document, _) = Document::open_rows(records, Some(accepted)).map_err(core_error)?;
+    let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
+    let inserts = update
+        .file_edits
+        .iter()
+        .map(|edit| edit.insert.clone())
+        .collect::<Vec<_>>();
+    let splices = update
+        .file_edits
+        .iter()
+        .zip(&inserts)
+        .map(|(edit, insert)| FileEdit {
+            offset: edit.offset,
+            delete_len: edit.delete_len,
+            insert,
+        })
+        .collect::<Vec<_>>();
+    let (document, mut changes) = document
+        .file_changed(&splices, namespace)
+        .map_err(core_error)?;
+    strip_duplicated_lexical_fallback(&mut changes)?;
+    store_markdown_state(sink, &document)?;
+    emit_changes(changes, update.creates, Some(0), sink)?;
+    Ok(())
+}
 
-    fn entities_changed(
-        update: &mut sdk::EntityUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
+impl sdk::FileProjection for MarkdownPlugin {
+    fn serialize_changes(
+        mut update: sdk::SerializeChangesInput<'_>,
+        sink: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
-        while let Some(change) = update.changes.next()? {
-            changes.push(EntityChange {
+        while let Some(change) = update.row_changes.next()? {
+            changes.push(RowChange {
                 schema_key: change.schema_key,
-                entity_pk: change.entity_pk,
+                row_pk: change.row_pk,
                 snapshot: change.snapshot,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
@@ -84,81 +89,62 @@ impl sdk::Plugin for MarkdownPlugin {
             });
         }
         let document = load_markdown_document(&update.before, before.clone())?;
-        let (successor, edits) = document.entities_changed(changes).map_err(core_error)?;
-        sink.replace_file(&apply_edits(before, &edits)?)?;
+        let (successor, edits) = document.rows_changed(changes).map_err(core_error)?;
+        for edit in edits {
+            sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
+        }
         store_rendered_markdown_state(&update.before, sink, &successor)?;
         Ok(())
     }
 
-    fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn serialize(
+        mut input: sdk::SerializeInput<'_>,
+        sink: &mut sdk::FileOutput<'_, '_>,
+    ) -> sdk::Result<()> {
         let mut records = Vec::new();
-        while let Some(entity) = input.entities.next()? {
-            records.push(EntityRecord {
-                schema_key: entity.schema_key,
-                entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot,
+        while let Some(row) = input.rows.next()? {
+            records.push(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             });
         }
         let accepted = input
-            .accepted
+            .before
             .as_ref()
             .map(sdk::Snapshot::read_all)
             .transpose()?;
-        let (document, _) = Document::open_entities(records, accepted).map_err(core_error)?;
+        let (document, _) = Document::open_rows(records, accepted).map_err(core_error)?;
         store_markdown_state(sink, &document)?;
-        if input.accepted.is_none() {
-            sink.replace_file(&document.bytes())?;
-        }
-        Ok(())
+        sink.write(&document.bytes())
     }
 
-    fn resolve_conflict(conflict: sdk::EntityConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
-        let Some(b) = conflict.b.as_ref() else {
-            return Ok(sdk::ConflictResolution::Delete);
-        };
-        if conflict.schema_key != NODE_SCHEMA_KEY {
-            return Ok(sdk::ConflictResolution::TakeB);
-        }
-        let (Some(base), Some(a)) = (&conflict.base, &conflict.a) else {
-            return Ok(sdk::ConflictResolution::TakeB);
-        };
-        if base.len() > 64 * 1024 || a.len() > 64 * 1024 || b.len() > 64 * 1024 {
-            return Ok(sdk::ConflictResolution::TakeB);
-        }
-        let base = base.read()?;
-        let a = a.read()?;
-        let b = b.read()?;
-        let resolved =
-            Document::resolve_entity_conflict(Some(base.clone()), Some(a.clone()), Some(b.clone()));
-        Ok(match resolved {
-            None => sdk::ConflictResolution::Delete,
-            Some(resolved) if resolved == b => sdk::ConflictResolution::TakeB,
-            Some(resolved) if resolved == a => sdk::ConflictResolution::TakeA,
-            Some(resolved) if resolved == base => sdk::ConflictResolution::TakeBase,
-            Some(resolved) => sdk::ConflictResolution::Replace(resolved),
-        })
-    }
-
-    fn open(input: &sdk::OpenFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
-        let bytes = input.accepted.read_all()?;
+    fn parse(input: sdk::ParseInput<'_>, sink: &mut sdk::RowOutput<'_, '_>) -> sdk::Result<()> {
+        let bytes = input.file.read_all()?;
         let namespace = IdNamespace::from_namespace_bytes(input.creates.namespace_bytes());
         let (document, mut changes) =
-            Document::open_file(bytes, Some(input.path.as_str()), namespace).map_err(core_error)?;
+            Document::open_file(bytes, Some(input.path), namespace).map_err(core_error)?;
         strip_duplicated_lexical_fallback(&mut changes)?;
         store_markdown_state(sink, &document)?;
         emit_changes(changes, input.creates, None, sink)?;
         Ok(())
     }
 
-    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn parse_changes(
+        mut update: sdk::ParseChangesInput<'_>,
+        sink: &mut sdk::RowChangeOutput<'_, '_>,
+    ) -> sdk::Result<()> {
+        if update.before.state_len(ROOT_STATE)?.is_none() {
+            return cold_parse_changes(&mut update, sink);
+        }
         let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
         let inserts = update
-            .edits
+            .file_edits
             .iter()
             .map(|edit| edit.insert.clone())
             .collect::<Vec<_>>();
         let splices = update
-            .edits
+            .file_edits
             .iter()
             .zip(&inserts)
             .map(|(edit, insert)| FileEdit {
@@ -168,9 +154,10 @@ impl sdk::Plugin for MarkdownPlugin {
             })
             .collect::<Vec<_>>();
         if update.before_path == update.after_path
-            && let [edit] = update.edits.as_slice()
+            && update.file_edits.iter().len() == 1
+            && let Some(edit) = update.file_edits.iter().next()
             && let Some((changes, root, block_key, block, shifts)) =
-                sparse_block_change(update, edit, &inserts[0], namespace)?
+                sparse_block_change(&update, edit, &inserts[0], namespace)?
         {
             sink.put_state(ROOT_STATE, &root)?;
             sink.put_state(&block_key, &block)?;
@@ -212,9 +199,46 @@ impl sdk::Plugin for MarkdownPlugin {
     }
 }
 
+impl sdk::ColumnMerger for MarkdownPlugin {
+    fn merge(input: sdk::ColumnMerge<'_>) -> sdk::Result<sdk::ColumnMergeResult> {
+        if input.row.schema_key != NODE_SCHEMA_KEY || input.column != "payload_json" {
+            return Ok(sdk::ColumnMergeResult::UseLww);
+        }
+        if [input.base.len(), input.a.len(), input.b.len()]
+            .into_iter()
+            .flatten()
+            .any(|length| length > 64 * 1024)
+        {
+            return Ok(sdk::ColumnMergeResult::UseLww);
+        }
+        let base = input.rows.base.read()?;
+        let a = input.rows.a.read()?;
+        let b = input.rows.b.read()?;
+        let Some(resolved) = Document::resolve_row_conflict(Some(base), Some(a), Some(b.clone()))
+        else {
+            return Ok(sdk::ColumnMergeResult::UseLww);
+        };
+        if resolved == b {
+            return Ok(sdk::ColumnMergeResult::UseLww);
+        }
+        let row: Value = serde_json::from_slice(&resolved).map_err(|error| {
+            sdk::Error::invalid_input(format!("invalid merged Markdown row: {error}"))
+        })?;
+        let value = row.get("payload_json").ok_or_else(|| {
+            sdk::Error::invalid_input("merged Markdown row has no payload_json column")
+        })?;
+        let encoded = serde_json::to_vec(value).map_err(|error| {
+            sdk::Error::internal(format!("encode merged Markdown payload_json: {error}"))
+        })?;
+        Ok(sdk::ColumnMergeResult::Replace(
+            sdk::OwnedColumnValue::json(encoded),
+        ))
+    }
+}
+
 fn store_rendered_markdown_state(
     before: &sdk::Snapshot<'_>,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl StateOutput,
     document: &Document,
 ) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
@@ -262,7 +286,7 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
     Ok(bytes)
 }
 
-fn store_markdown_state(successor: &sdk::Output, document: &Document) -> sdk::Result<()> {
+fn store_markdown_state(successor: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
     successor.put_state(ROOT_STATE, &root)?;
     let encoded = encode_blocks(&blocks)?;
@@ -276,10 +300,10 @@ fn store_markdown_state(successor: &sdk::Output, document: &Document) -> sdk::Re
     Ok(())
 }
 
-type SparseBlockResult = (Vec<EntityChange>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type SparseBlockResult = (Vec<RowChange>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn sparse_block_change(
-    update: &sdk::FileUpdate<'_>,
+    update: &sdk::ParseChangesInput<'_>,
     edit: &sdk::FileEdit,
     insert: &[u8],
     namespace: IdNamespace,
@@ -687,7 +711,7 @@ fn core_error(error: PluginError) -> sdk::Error {
     }
 }
 
-fn strip_duplicated_lexical_fallback(changes: &mut [EntityChange]) -> sdk::Result<()> {
+fn strip_duplicated_lexical_fallback(changes: &mut [RowChange]) -> sdk::Result<()> {
     for change in changes {
         let Some(snapshot) = &mut change.snapshot else {
             continue;
@@ -739,47 +763,97 @@ fn strip_duplicated_lexical_fallback(changes: &mut [EntityChange]) -> sdk::Resul
 }
 
 fn emit_changes(
-    changes: impl IntoIterator<Item = EntityChange>,
+    changes: impl IntoIterator<Item = RowChange>,
     creates: sdk::CreateContext,
     create_from_ordinal: Option<u32>,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl MutationOutput,
 ) -> sdk::Result<()> {
     for change in changes {
         match change.snapshot {
             Some(snapshot) => {
                 let local_ref = change
-                    .entity_pk
+                    .row_pk
                     .first()
-                    .filter(|_| change.entity_pk.len() == 1)
+                    .filter(|_| change.row_pk.len() == 1)
                     .and_then(|id| local_ref(creates, id))
                     .filter(|ordinal| {
                         create_from_ordinal.is_none_or(|minimum| *ordinal >= minimum)
                     });
                 if let Some(local_ref) = local_ref {
-                    sink.entity(sdk::EntityMutation::Create {
-                        schema_key: &change.schema_key,
-                        local_ref,
-                        snapshot: &snapshot,
-                    })?;
+                    sink.create(&change.schema_key, local_ref, &snapshot)?;
                 } else {
-                    sink.entity(sdk::EntityMutation::Upsert {
-                        schema_key: &change.schema_key,
-                        entity_pk: &change.entity_pk,
-                        snapshot: &snapshot,
-                        effect: match change.effect {
+                    sink.upsert(
+                        &change.schema_key,
+                        &change.row_pk,
+                        &snapshot,
+                        match change.effect {
                             ChangeEffect::Content => sdk::ChangeEffect::Content,
                             ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
                         },
-                    })?;
+                    )?;
                 }
             }
-            None => sink.entity(sdk::EntityMutation::Delete {
-                schema_key: &change.schema_key,
-                entity_pk: &change.entity_pk,
-            })?,
+            None => sink.delete(&change.schema_key, &change.row_pk)?,
         }
     }
     Ok(())
+}
+
+trait StateOutput {
+    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
+    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
+}
+macro_rules! impl_state_output {
+    ($type:ty) => {
+        impl StateOutput for $type {
+            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
+                <$type>::put_state(self, key, value)
+            }
+            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
+                <$type>::delete_state(self, key)
+            }
+        }
+    };
+}
+impl_state_output!(sdk::RowOutput<'_, '_>);
+impl_state_output!(sdk::RowChangeOutput<'_, '_>);
+impl_state_output!(sdk::FileOutput<'_, '_>);
+impl_state_output!(sdk::FileEditOutput<'_, '_>);
+
+trait MutationOutput {
+    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()>;
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[String],
+        snapshot: &[u8],
+        effect: sdk::ChangeEffect,
+    ) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+}
+impl MutationOutput for sdk::RowOutput<'_, '_> {
+    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
+        self.create(s, l, v)
+    }
+    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], _: sdk::ChangeEffect) -> sdk::Result<()> {
+        self.upsert(s, k, v)
+    }
+    fn delete(&mut self, _: &str, _: &[String]) -> sdk::Result<()> {
+        Err(sdk::Error::invalid_input(
+            "initial Markdown parse produced a deletion",
+        ))
+    }
+}
+impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
+    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
+        self.create(s, l, v)
+    }
+    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], e: sdk::ChangeEffect) -> sdk::Result<()> {
+        self.upsert(s, k, v, e)
+    }
+    fn delete(&mut self, s: &str, k: &[String]) -> sdk::Result<()> {
+        self.delete(s, k)
+    }
 }
 
 fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
@@ -792,7 +866,10 @@ fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api::export_plugin!(MarkdownPlugin);
+lix::plugin::export_capabilities! {
+    column_merger: MarkdownPlugin,
+    file_projection: MarkdownPlugin,
+}
 
 #[cfg(test)]
 mod tests {

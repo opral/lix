@@ -1,54 +1,23 @@
 use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::mem::size_of;
+#[cfg(test)]
 use std::ops::Range;
-
-use ahash::RandomState;
-use bytes::Bytes;
 
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeRecordProjection, CommitId, MaterializedChangePayload,
     materialize_known_change_payloads,
 };
-use crate::common::{LixTimestamp, SharedStr};
-use crate::entity_pk::EntityPk;
+use crate::common::{LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder};
+use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
 
-#[derive(Debug, Default)]
-struct TrackedStateStringDictionary {
-    bytes: Bytes,
-    ranges: Vec<Range<u32>>,
-    #[cfg(test)]
-    arena_allocation_count: usize,
-    #[cfg(test)]
-    arena_large_allocation_count: usize,
-}
-
-impl TrackedStateStringDictionary {
-    fn get(&self, ordinal: u32) -> &str {
-        let range = self
-            .ranges
-            .get(ordinal as usize)
-            .expect("tracked-state string ordinal belongs to this batch");
-        let range = range.start as usize..range.end as usize;
-        // SAFETY: the builder appends complete `str` values and records their
-        // exact boundaries in one immutable allocation.
-        unsafe { std::str::from_utf8_unchecked(&self.bytes[range]) }
-    }
-
-    fn shared(&self, ordinal: u32) -> SharedStr {
-        let value = self.get(ordinal);
-        SharedStr::from_utf8_slice(self.bytes.clone(), value)
-            .expect("tracked-state dictionary value points into its byte arena")
-    }
-}
-
 #[derive(Debug)]
 struct MaterializedTrackedStateDescriptor {
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: u32,
     file_id: Option<u32>,
     snapshot_content: Option<SharedStr>,
@@ -68,7 +37,7 @@ struct MaterializedTrackedStateDescriptor {
 /// The legacy owned row is constructed only by an explicit terminal adapter.
 #[derive(Debug, Default)]
 pub(crate) struct MaterializedTrackedStateBatch {
-    strings: TrackedStateStringDictionary,
+    strings: StringDictionary,
     rows: Vec<MaterializedTrackedStateDescriptor>,
 }
 
@@ -116,7 +85,7 @@ impl MaterializedTrackedStateBatch {
             })?;
             builder.push(
                 TrackedStateKey {
-                    entity_pk: row.entity_pk,
+                    row_pk: row.row_pk,
                     schema_key: row.schema_key,
                     file_id: row.file_id,
                 },
@@ -136,15 +105,15 @@ impl MaterializedTrackedStateBatch {
 
     #[cfg(test)]
     pub(crate) fn dictionary_entry_count(&self) -> usize {
-        self.strings.ranges.len()
+        self.strings.len()
     }
 
     #[cfg(test)]
     pub(crate) fn large_buffer_count(&self, threshold: usize) -> usize {
         [
             self.rows.capacity() * size_of::<MaterializedTrackedStateDescriptor>(),
-            self.strings.bytes.len(),
-            self.strings.ranges.len() * size_of::<Range<u32>>(),
+            self.strings.byte_len(),
+            self.strings.len() * size_of::<Range<u32>>(),
         ]
         .into_iter()
         .filter(|bytes| *bytes >= threshold)
@@ -153,12 +122,12 @@ impl MaterializedTrackedStateBatch {
 
     #[cfg(test)]
     pub(crate) fn dictionary_arena_allocation_count(&self) -> usize {
-        self.strings.arena_allocation_count
+        self.strings.arena_allocation_count()
     }
 
     #[cfg(test)]
     pub(crate) fn dictionary_arena_large_allocation_count(&self) -> usize {
-        self.strings.arena_large_allocation_count
+        self.strings.arena_large_allocation_count()
     }
 }
 
@@ -174,8 +143,8 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
         &self.batch.rows[self.index]
     }
 
-    pub(crate) fn entity_pk(self) -> &'a EntityPk {
-        &self.descriptor().entity_pk
+    pub(crate) fn row_pk(self) -> &'a RowPk {
+        &self.descriptor().row_pk
     }
 
     pub(crate) fn schema_key(self) -> &'a str {
@@ -229,7 +198,7 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
     /// Converts into the legacy DTO only at a terminal compatibility boundary.
     pub(crate) fn to_owned(self) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
-            entity_pk: self.entity_pk().clone(),
+            row_pk: self.row_pk().clone(),
             schema_key: self.schema_key().to_owned(),
             file_id: self.file_id().map(str::to_owned),
             snapshot_content: self.snapshot_content().cloned(),
@@ -316,220 +285,8 @@ impl MaterializedTrackedStateExactBatch {
     }
 }
 
-const NO_STRING_ORDINAL: u32 = u32::MAX;
-const SMALL_STRING_DICTIONARY_LIMIT: usize = 32;
-const SMALL_STRING_ARENA_BYTES: usize = 1024;
-#[cfg(test)]
-const LARGE_STRING_ALLOCATION_BYTES: usize = 32 * 1024;
-
-enum TrackedStateStringLookup {
-    Small,
-    Hashed(HashMap<u64, u32, RandomState>),
-}
-
-/// Arena-first dictionary builder for historical row identities.
-///
-/// Hash buckets retain compact ordinals into `ranges`; collision chains are
-/// another flat ordinal column. No distinct schema/file value owns a `String`,
-/// and finishing transfers the UTF-8 arena into `Bytes` without recopying it.
-struct TrackedStateStringDictionaryBuilder {
-    bytes: Vec<u8>,
-    ranges: Vec<Range<u32>>,
-    collision_next: Vec<u32>,
-    lookup: TrackedStateStringLookup,
-    hash_builder: RandomState,
-    expected_entry_capacity: usize,
-    maximum_entry_capacity: usize,
-    max_string_len: usize,
-    exact_byte_capacity: bool,
-    #[cfg(test)]
-    arena_allocation_count: usize,
-    #[cfg(test)]
-    arena_large_allocation_count: usize,
-}
-
-impl TrackedStateStringDictionaryBuilder {
-    fn with_capacity(entry_capacity: usize, byte_capacity: usize) -> Self {
-        let expected_entry_capacity = entry_capacity.max(1);
-        Self {
-            bytes: Vec::with_capacity(byte_capacity),
-            ranges: Vec::with_capacity(entry_capacity),
-            collision_next: Vec::with_capacity(entry_capacity),
-            lookup: TrackedStateStringLookup::Small,
-            hash_builder: RandomState::with_seeds(0, 0, 0, 0),
-            expected_entry_capacity,
-            maximum_entry_capacity: expected_entry_capacity,
-            max_string_len: 0,
-            exact_byte_capacity: byte_capacity != 0,
-            #[cfg(test)]
-            arena_allocation_count: usize::from(byte_capacity != 0),
-            #[cfg(test)]
-            arena_large_allocation_count: usize::from(
-                byte_capacity >= LARGE_STRING_ALLOCATION_BYTES,
-            ),
-        }
-    }
-
-    fn intern(&mut self, value: &str) -> u32 {
-        if !matches!(&self.lookup, TrackedStateStringLookup::Small) {
-            return self.intern_hashed(value);
-        }
-        if let Some(ordinal) = self.find_linear(value) {
-            return ordinal;
-        }
-        if self.ranges.len() == SMALL_STRING_DICTIONARY_LIMIT {
-            self.promote_to_hashed(value.len());
-            self.intern_hashed(value)
-        } else {
-            self.append_small(value)
-        }
-    }
-
-    fn find_linear(&self, value: &str) -> Option<u32> {
-        self.ranges
-            .iter()
-            .position(|range| {
-                &self.bytes[range.start as usize..range.end as usize] == value.as_bytes()
-            })
-            .map(|ordinal| {
-                u32::try_from(ordinal).expect("tracked-state string dictionary ordinal exceeds u32")
-            })
-    }
-
-    fn intern_hashed(&mut self, value: &str) -> u32 {
-        let hash = self.hash_builder.hash_one(value.as_bytes());
-        let mut candidate = match &self.lookup {
-            TrackedStateStringLookup::Small => {
-                unreachable!("hashed tracked-state dictionary must be promoted")
-            }
-            TrackedStateStringLookup::Hashed(lookup) => lookup.get(&hash).copied(),
-        };
-        while let Some(ordinal) = candidate {
-            let range = &self.ranges[ordinal as usize];
-            if &self.bytes[range.start as usize..range.end as usize] == value.as_bytes() {
-                return ordinal;
-            }
-            let next = self.collision_next[ordinal as usize];
-            candidate = (next != NO_STRING_ORDINAL).then_some(next);
-        }
-
-        self.append_hashed(value, hash)
-    }
-
-    fn append_small(&mut self, value: &str) -> u32 {
-        let ordinal = self.append_bytes(value);
-        self.collision_next.push(NO_STRING_ORDINAL);
-        ordinal
-    }
-
-    fn append_hashed(&mut self, value: &str, hash: u64) -> u32 {
-        let previous_head = match &self.lookup {
-            TrackedStateStringLookup::Small => {
-                unreachable!("hashed tracked-state dictionary must be promoted")
-            }
-            TrackedStateStringLookup::Hashed(lookup) => {
-                lookup.get(&hash).copied().unwrap_or(NO_STRING_ORDINAL)
-            }
-        };
-        let ordinal = self.append_bytes(value);
-        self.collision_next.push(previous_head);
-        let TrackedStateStringLookup::Hashed(lookup) = &mut self.lookup else {
-            unreachable!("hashed tracked-state dictionary must remain promoted")
-        };
-        lookup.insert(hash, ordinal);
-        ordinal
-    }
-
-    fn append_bytes(&mut self, value: &str) -> u32 {
-        self.max_string_len = self.max_string_len.max(value.len());
-        let required = self
-            .bytes
-            .len()
-            .checked_add(value.len())
-            .expect("tracked-state string dictionary byte count overflow");
-        self.ensure_arena_capacity(required);
-        let start = u32::try_from(self.bytes.len())
-            .expect("tracked-state string dictionary exceeds u32 bytes");
-        self.bytes.extend_from_slice(value.as_bytes());
-        let end = u32::try_from(self.bytes.len())
-            .expect("tracked-state string dictionary exceeds u32 bytes");
-        let ordinal = u32::try_from(self.ranges.len())
-            .expect("tracked-state string dictionary exceeds u32 entries");
-        assert_ne!(
-            ordinal, NO_STRING_ORDINAL,
-            "tracked-state string dictionary reserves the terminal u32 ordinal"
-        );
-        self.ranges.push(start..end);
-        ordinal
-    }
-
-    fn ensure_arena_capacity(&mut self, required: usize) {
-        if required <= self.bytes.capacity() {
-            return;
-        }
-        let projected = match &self.lookup {
-            TrackedStateStringLookup::Small => SMALL_STRING_ARENA_BYTES,
-            TrackedStateStringLookup::Hashed(_) => self
-                .maximum_entry_capacity
-                .saturating_mul(self.max_string_len),
-        };
-        let target = required.max(projected);
-        self.bytes.reserve_exact(target - self.bytes.len());
-        #[cfg(test)]
-        {
-            self.arena_allocation_count += 1;
-            self.arena_large_allocation_count +=
-                usize::from(target >= LARGE_STRING_ALLOCATION_BYTES);
-        }
-    }
-
-    fn promote_to_hashed(&mut self, incoming_len: usize) {
-        self.max_string_len = self.max_string_len.max(incoming_len);
-        let projected_entries = self
-            .expected_entry_capacity
-            .max(self.ranges.len().saturating_add(1));
-        let projected_bytes = projected_entries.saturating_mul(self.max_string_len);
-        if !self.exact_byte_capacity && projected_bytes > self.bytes.capacity() {
-            self.bytes.reserve_exact(projected_bytes - self.bytes.len());
-            #[cfg(test)]
-            {
-                self.arena_allocation_count += 1;
-                self.arena_large_allocation_count +=
-                    usize::from(projected_bytes >= LARGE_STRING_ALLOCATION_BYTES);
-            }
-        }
-
-        let mut lookup = HashMap::with_capacity_and_hasher(
-            projected_entries,
-            RandomState::with_seeds(0, 0, 0, 1),
-        );
-        for ordinal in 0..self.ranges.len() {
-            let ordinal = u32::try_from(ordinal)
-                .expect("tracked-state string dictionary ordinal exceeds u32");
-            let range = &self.ranges[ordinal as usize];
-            let hash = self
-                .hash_builder
-                .hash_one(&self.bytes[range.start as usize..range.end as usize]);
-            self.collision_next[ordinal as usize] =
-                lookup.insert(hash, ordinal).unwrap_or(NO_STRING_ORDINAL);
-        }
-        self.lookup = TrackedStateStringLookup::Hashed(lookup);
-    }
-
-    fn finish(self) -> TrackedStateStringDictionary {
-        TrackedStateStringDictionary {
-            bytes: Bytes::from(self.bytes),
-            ranges: self.ranges,
-            #[cfg(test)]
-            arena_allocation_count: self.arena_allocation_count,
-            #[cfg(test)]
-            arena_large_allocation_count: self.arena_large_allocation_count,
-        }
-    }
-}
-
 struct MaterializedTrackedStateBatchBuilder {
-    strings: TrackedStateStringDictionaryBuilder,
+    strings: StringDictionaryBuilder,
     rows: Vec<MaterializedTrackedStateDescriptor>,
 }
 
@@ -545,9 +302,13 @@ impl MaterializedTrackedStateBatchBuilder {
         dictionary_byte_capacity: usize,
     ) -> Self {
         Self {
-            strings: TrackedStateStringDictionaryBuilder::with_capacity(
+            // The canonical plane sizes its dictionary directly, so it has no
+            // separate rows × identity-columns projection to offer.
+            strings: StringDictionaryBuilder::with_capacity(
+                0,
                 dictionary_entry_capacity,
                 dictionary_byte_capacity,
+                dictionary_byte_capacity != 0,
             ),
             rows: Vec::with_capacity(row_count),
         }
@@ -571,7 +332,7 @@ impl MaterializedTrackedStateBatchBuilder {
         let schema_key = self.intern_owned(key.schema_key);
         let file_id = key.file_id.map(|file_id| self.intern_owned(file_id));
         self.rows.push(MaterializedTrackedStateDescriptor {
-            entity_pk: key.entity_pk,
+            row_pk: key.row_pk,
             schema_key,
             file_id,
             snapshot_content,
@@ -594,7 +355,7 @@ impl MaterializedTrackedStateBatchBuilder {
         let schema_key = self.intern_str(key.schema_key);
         let file_id = key.file_id.map(|file_id| self.intern_str(file_id));
         self.rows.push(MaterializedTrackedStateDescriptor {
-            entity_pk: key.entity_pk.clone(),
+            row_pk: key.row_pk.clone(),
             schema_key,
             file_id,
             snapshot_content,
@@ -625,11 +386,15 @@ where
 {
     let mut by_commit = BTreeMap::<CommitId, Vec<(TrackedStateKey, ChangeId, LixTimestamp)>>::new();
     for (key, value) in entries.filter(|(_, value)| !value.deleted) {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_materialize_owned_key(
+            key.schema_key.len() + key.file_id.map_or(0, str::len),
+        );
         by_commit.entry(value.commit_id).or_default().push((
             TrackedStateKey {
                 schema_key: key.schema_key.to_owned(),
                 file_id: key.file_id.map(str::to_owned),
-                entity_pk: key.entity_pk.clone(),
+                row_pk: key.row_pk.clone(),
             },
             value.change_id,
             value.updated_at,
@@ -653,10 +418,12 @@ where
                     ),
                 )
             })?;
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_materialize_reverify_row();
             if record.change_id != change_id
                 || record.schema_key != key.schema_key
                 || record.file_id != key.file_id
-                || record.entity_pk != key.entity_pk
+                || record.row_pk != key.row_pk
                 || record.snapshot.is_none()
                 || record.created_at != updated_at
             {
@@ -710,7 +477,7 @@ where
                 TrackedStateKeyRef {
                     schema_key: &key.schema_key,
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 },
                 value,
             )
@@ -728,7 +495,7 @@ where
                 TrackedStateKeyRef {
                     schema_key: key.schema_key.as_str(),
                     file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
+                    row_pk: &key.row_pk,
                 },
                 value.change_id,
             )?
@@ -805,7 +572,7 @@ fn shared_payload_fields(
     })?;
     if let Some(identity) = payload.identity.as_ref()
         && (identity.schema_key != key.schema_key
-            || identity.entity_pk != *key.entity_pk
+            || identity.row_pk != *key.row_pk
             || identity.file_id.as_deref() != key.file_id)
     {
         return Err(LixError::new(
@@ -822,11 +589,135 @@ fn shared_payload_fields(
 mod tests {
     use super::*;
     use crate::changelog::MaterializedChangeIdentity;
-    use crate::entity_pk::{EntityPk, EntityPkComponent};
+    use crate::row_pk::{RowPk, RowPkComponent};
 
-    fn integer_entity_pk(value: i64) -> EntityPk {
-        EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Integer(value)])
-            .expect("one integer is a valid entity primary key")
+    fn integer_row_pk(value: i64) -> RowPk {
+        RowPk::from_components(smallvec::smallvec![RowPkComponent::Integer(value)])
+            .expect("one integer is a valid row primary key")
+    }
+
+    /// Which `RowPk` shapes survive the JSON identity round trip that the
+    /// **columnar** commit-delta route uses to match a row.
+    ///
+    /// `materialize_index_payloads` re-checks `schema_key`/`file_id`/`row_pk`
+    /// on every fetched row. On the packed route that check is
+    /// `decode(encode(K)) == K`, guaranteed by the byte-equality assert in
+    /// `find_commit_delta_entry_index`. The columnar route
+    /// (`load_columnar_owned_entries`) has no such assert: it matches on
+    /// `as_json_array_text` and rebuilds the identity with
+    /// `from_json_array_text`, and `untyped_component_from_json_value` maps
+    /// every JSON string back to `RowPkComponent::String`.
+    ///
+    /// So `Uuid` and `Bytes` components do **not** survive, and on a route that
+    /// admitted them the re-check would reject a correctly-fetched row. This
+    /// test pins exactly where that boundary is; the companion test below pins
+    /// the gate that keeps those shapes off the columnar route entirely.
+    #[test]
+    fn only_string_and_integer_row_pk_components_survive_the_json_identity_round_trip() {
+        fn round_trips(row_pk: &RowPk) -> bool {
+            let text = row_pk
+                .as_json_array_text()
+                .expect("identity should encode as JSON");
+            let decoded =
+                RowPk::from_json_array_text(&text).expect("identity should decode from JSON");
+            decoded == *row_pk
+        }
+
+        let string_pk =
+            RowPk::from_components(smallvec::smallvec![RowPkComponent::String("row-0".into())])
+                .expect("one string is a valid row primary key");
+        assert!(
+            round_trips(&string_pk),
+            "a single-string identity must survive; it is the only shape the columnar \
+             staging gate admits"
+        );
+
+        assert!(
+            round_trips(&integer_row_pk(42)),
+            "an integer identity survives as a JSON number"
+        );
+
+        let composite = RowPk::from_components(smallvec::smallvec![
+            RowPkComponent::String("left".into()),
+            RowPkComponent::String("right".into())
+        ])
+        .expect("two strings are a valid row primary key");
+        assert!(round_trips(&composite), "composite strings survive");
+
+        let uuid_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Uuid(
+            *uuid::Uuid::from_u128(7).as_bytes()
+        )])
+        .expect("one uuid is a valid row primary key");
+        assert!(
+            !round_trips(&uuid_pk),
+            "a uuid identity must NOT survive the JSON round trip -- it returns as a \
+             String component. If this ever starts passing, the columnar identity \
+             re-check stops being load-bearing and this test should be re-read, not deleted."
+        );
+
+        let bytes_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Bytes(
+            bytes::Bytes::from_static(&[1, 2, 3])
+        )])
+        .expect("one byte string is a valid row primary key");
+        assert!(
+            !round_trips(&bytes_pk),
+            "a bytes identity must NOT survive the JSON round trip -- it returns as a \
+             base64 String component"
+        );
+    }
+
+    /// The gate that makes the above safe.
+    ///
+    /// `try_stage_lossless_columnar_mutations` refuses to stage a commit
+    /// columnar unless **every** row's identity passes
+    /// `RowPk::as_single_string()`, which accepts exactly one
+    /// `RowPkComponent::String`. That is the same predicate, asserted
+    /// directly: the shapes the JSON round trip loses are precisely the shapes
+    /// that can never reach the columnar route.
+    #[test]
+    fn the_columnar_staging_gate_rejects_every_identity_shape_the_json_round_trip_loses() {
+        let string_pk =
+            RowPk::from_components(smallvec::smallvec![RowPkComponent::String("row-0".into())])
+                .expect("one string is a valid row primary key");
+        assert_eq!(
+            string_pk
+                .as_single_string()
+                .expect("a single string identity is columnar-eligible"),
+            "row-0"
+        );
+
+        let uuid_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Uuid(
+            *uuid::Uuid::from_u128(7).as_bytes()
+        )])
+        .expect("one uuid is a valid row primary key");
+        assert!(
+            uuid_pk.as_single_string().is_err(),
+            "a uuid identity must be refused by the columnar staging gate"
+        );
+
+        let bytes_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Bytes(
+            bytes::Bytes::from_static(&[1, 2, 3])
+        )])
+        .expect("one byte string is a valid row primary key");
+        assert!(
+            bytes_pk.as_single_string().is_err(),
+            "a bytes identity must be refused by the columnar staging gate"
+        );
+
+        assert!(
+            integer_row_pk(42).as_single_string().is_err(),
+            "an integer identity is refused too, so the columnar route never sees one"
+        );
+
+        let composite = RowPk::from_components(smallvec::smallvec![
+            RowPkComponent::String("left".into()),
+            RowPkComponent::String("right".into())
+        ])
+        .expect("two strings are a valid row primary key");
+        assert!(
+            composite.as_single_string().is_err(),
+            "a composite identity is refused"
+        );
     }
 
     fn index_value(index: usize) -> TrackedStateIndexValue {
@@ -842,6 +733,159 @@ mod tests {
         }
     }
 
+    /// The constructed case for the columnar identity round trip.
+    ///
+    /// Arm A uses a single-string primary key, which the staging gate admits,
+    /// and asserts the columnar route actually served the rows. Without that
+    /// assertion arm B proves nothing: "no columnar rows" would be
+    /// indistinguishable from "the test never built a columnar commit".
+    ///
+    /// Arm B declares the same schema with `"format": "uuid"` on the primary
+    /// key, which makes the identity an `RowPkComponent::Uuid` — the shape
+    /// that does not survive the JSON round trip. It must read back correctly
+    /// **and** never take the columnar route. If a future change widens the
+    /// staging gate, arm B's rows would be fetched through a JSON identity
+    /// match, the re-check in `materialize_index_payloads` would reject them,
+    /// and this test fails instead of the read failing in production.
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn a_uuid_primary_key_never_reaches_the_columnar_commit_delta_route() {
+        use crate::engine::Engine;
+        use crate::storage_adapter::Memory;
+        use serde_json::json;
+
+        // The dense columnar lane is only taken by a *certified parameter
+        // batch* of at least `TYPED_CERTIFIED_INSERT_MIN_ROWS` (32,768) rows;
+        // below that `certified_row_insert_parameter_batch` falls to the raw
+        // lane, which carries no encoded row groups, and
+        // `try_stage_lossless_columnar_mutations` then sees no dense write set.
+        // A smaller fixture silently produces no columnar commit at all, which
+        // is why arm A asserts engagement rather than assuming it.
+        const ROWS: usize = 32 * 1024;
+
+        // The census counters are process-global and the CI suite runs tests in
+        // parallel, so these assertions are thresholds against this test's own
+        // row count rather than equalities. Measured: inside the full suite the
+        // uuid arm read `columnar=2` from a concurrent test, which failed an
+        // `== 0` assertion while the isolated run read 0. A stray handful of
+        // rows cannot reach 32,768, so the thresholds stay decisive without
+        // being flaky.
+
+        async fn run(schema_key: &str, uuid_pk: bool) -> (u64, u64, usize) {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("engine should initialize");
+            let engine = Engine::new(storage.clone())
+                .await
+                .expect("engine should open");
+            let session = engine.open_session().await.expect("session should open");
+
+            let schema = json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": schema_key,
+                "columns": [
+                    { "name": "id", "type": if uuid_pk { "uuid" } else { "text" }, "nullable": false },
+                    { "name": "locale", "type": "text", "nullable": false }
+                ],
+                "primary_key": ["id"]
+            });
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+
+            let sql = format!("INSERT INTO {schema_key} (id, locale) VALUES ($1, $2)");
+            let statements = (0..ROWS)
+                .map(|index| crate::session::ExecuteBatchStatement {
+                    label: None,
+                    sql: sql.clone(),
+                    params: vec![
+                        crate::Value::Text(if uuid_pk {
+                            uuid::Uuid::from_u128(index as u128 + 1).to_string()
+                        } else {
+                            format!("row-{index:07}")
+                        }),
+                        // Distinct per row: `derive_row_groups` refuses
+                        // the columnar layout when a non-key string column has
+                        // 2..=64 distinct values, so a flag column here would
+                        // also silently defeat the fixture.
+                        crate::Value::Text(format!("loc-{index:07}")),
+                    ],
+                })
+                .collect::<Vec<_>>();
+            session
+                .execute_batch(&statements)
+                .await
+                .expect("the certified parameter batch should insert");
+
+            // Rotate onto a branch so the read is served from a root current
+            // base and must fetch payloads from the owning commit delta.
+            let branch = session
+                .create_branch(crate::CreateBranchOptions {
+                    id: None,
+                    name: format!("e52-columnar-{schema_key}"),
+                    from_commit_id: None,
+                })
+                .await
+                .expect("branch should create");
+            session
+                .switch_branch(crate::SwitchBranchOptions {
+                    branch_id: branch.id.clone(),
+                })
+                .await
+                .expect("branch should switch");
+
+            let _ = crate::storage_bench::take_tracked_key_allocation_census();
+            let rows = session
+                .execute(
+                    &format!("SELECT id FROM {schema_key} WHERE locale = 'loc-0000000'"),
+                    &[],
+                )
+                .await
+                .expect("the rotated scan must succeed, not reject its own payload");
+            let census = crate::storage_bench::take_tracked_key_allocation_census();
+            (
+                census.commit_delta_columnar_rows,
+                census.commit_delta_rows_loaded,
+                rows.len(),
+            )
+        }
+
+        let (string_columnar, string_packed, string_rows) = run("colstr", false).await;
+        println!(
+            "columnar_identity | string_pk columnar={string_columnar} packed={string_packed} rows={string_rows}"
+        );
+        assert_eq!(string_rows, 1, "the string-pk arm must answer one row");
+        assert!(
+            string_columnar >= ROWS as u64,
+            "arm A must actually reach the columnar route, otherwise arm B proves nothing \
+             (columnar={string_columnar} packed={string_packed})"
+        );
+
+        let (uuid_columnar, uuid_packed, uuid_rows) = run("coluuid", true).await;
+        println!(
+            "columnar_identity | uuid_pk columnar={uuid_columnar} packed={uuid_packed} rows={uuid_rows}"
+        );
+        assert_eq!(
+            uuid_rows, 1,
+            "the uuid-pk arm must answer one row -- a rejected payload would surface here"
+        );
+        assert!(
+            uuid_packed >= ROWS as u64,
+            "every row of the uuid arm must be fetched through the packed route \
+             (columnar={uuid_columnar} packed={uuid_packed})"
+        );
+        assert!(
+            uuid_columnar < ROWS as u64,
+            "a uuid primary key must never be served by the columnar route, whose identity \
+             match cannot round-trip it (columnar={uuid_columnar} packed={uuid_packed})"
+        );
+    }
+
     #[test]
     fn ten_thousand_rows_share_identity_dictionary_and_constant_batch_buffers() {
         const ROW_COUNT: usize = 10_000;
@@ -849,13 +893,13 @@ mod tests {
         let metadata = SharedStr::from_static(r#"{"impact":"format"}"#);
         let mut builder = MaterializedTrackedStateBatchBuilder::with_capacity(ROW_COUNT);
         for index in 0..ROW_COUNT {
-            let entity_pk =
-                integer_entity_pk(i64::try_from(index).expect("test row index fits i64"));
+            let row_pk =
+                integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
             builder.push_ref(
                 TrackedStateKeyRef {
                     schema_key: "shared_schema",
                     file_id: Some("shared_file"),
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                 },
                 index_value(index),
                 Some(snapshot.clone()),
@@ -908,14 +952,14 @@ mod tests {
         let mut builder =
             MaterializedTrackedStateBatchBuilder::with_capacities(ROW_COUNT, ROW_COUNT * 2, 0);
         for index in 0..ROW_COUNT {
-            let entity_pk =
-                integer_entity_pk(i64::try_from(index).expect("test row index fits i64"));
+            let row_pk =
+                integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
             let file_id = format!("file-{index:05}");
             builder.push_ref(
                 TrackedStateKeyRef {
                     schema_key: "shared_schema",
                     file_id: Some(file_id.as_str()),
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                 },
                 index_value(index),
                 None,
@@ -960,7 +1004,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "message".to_owned(),
                 file_id: Some("file.md".to_owned()),
-                entity_pk: integer_entity_pk(7),
+                row_pk: integer_row_pk(7),
             },
             index_value(0),
             Some(SharedStr::from_static(r#"{"id":7}"#)),
@@ -974,7 +1018,7 @@ mod tests {
         let first = exact.row(0).expect("first duplicate");
         assert!(exact.row(1).is_none());
         let duplicate = exact.row(2).expect("second duplicate");
-        assert_eq!(first.entity_pk(), duplicate.entity_pk());
+        assert_eq!(first.row_pk(), duplicate.row_pk());
         assert_eq!(first.schema_key().as_ptr(), duplicate.schema_key().as_ptr());
         assert!(
             first
@@ -996,13 +1040,13 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: schema_key.to_owned(),
             file_id: Some("file.md".to_owned()),
-            entity_pk: EntityPk::single("entity"),
+            row_pk: RowPk::single("row"),
         };
-        let snapshot = SharedStr::from(r#"{"id":"entity"}"#.to_owned());
+        let snapshot = SharedStr::from(r#"{"id":"row"}"#.to_owned());
         let payload = MaterializedChangePayload {
             identity: Some(MaterializedChangeIdentity {
                 schema_key: "message".to_owned(),
-                entity_pk: EntityPk::single("entity"),
+                row_pk: RowPk::single("row"),
                 file_id: Some("file.md".to_owned()),
             }),
             snapshot_content: Some(snapshot.clone()),
@@ -1023,7 +1067,7 @@ mod tests {
         let key_ref = TrackedStateKeyRef {
             schema_key: key.schema_key.as_str(),
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         };
         let first = shared_payload_fields(&payloads, key_ref, change_id)
             .expect("first payload use")
@@ -1047,7 +1091,7 @@ mod tests {
             TrackedStateKeyRef {
                 schema_key: key.schema_key.as_str(),
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             },
             change_id,
         )

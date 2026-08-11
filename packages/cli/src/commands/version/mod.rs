@@ -137,8 +137,7 @@ mod tests {
             Some(Value::Text(value)) => {
                 serde_json::from_str::<String>(value).unwrap_or_else(|_| value.clone())
             }
-            Some(Value::Json(serde_json::Value::String(value))) => value.clone(),
-            Some(Value::Json(value)) => value.to_string(),
+            Some(Value::Jsonb(value)) => value.as_json_string().unwrap_or_else(|| value.to_string()),
             Some(Value::Integer(value)) => value.to_string(),
             other => panic!("expected text-like value, got {other:?}"),
         }

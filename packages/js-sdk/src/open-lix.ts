@@ -1,81 +1,21 @@
-import {
-	localFilesystemAlreadyOpen,
-	localFilesystemNotOpen,
-} from "./errors.js";
 import type { LixBinding } from "./binding-types.js";
-import {
-	ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
-	ACTIVE_BRANCH_CLIENT_STATE_KEY,
-	openClientState,
-	openStoredClientState,
-} from "./client-state.js";
 import { Lix } from "./lix.js";
-import type {
-	LixSnapshotStorage,
-	LocalFilesystemOptions,
-	OpenLixOptions,
-} from "./types.js";
+import { isLixStorage, type LixStorage } from "./storage-adapter.js";
+import type { IndexedDbStorageOptions, OpenLixOptions } from "./types.js";
 
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
 
-const openLocalFilesystems = new WeakMap<LocalFilesystem, LixBinding | null>();
+const openStorages = new WeakSet<LixStorage>();
+const openIndexedDbStorageNames = new Set<string>();
 
-export class LocalFilesystem {
-	readonly path: string;
-	readonly lixDir: string | undefined;
-	readonly syncAllFiles: boolean;
+export class IndexedDbStorage {
+	readonly name: string;
 
-	constructor(options: LocalFilesystemOptions) {
-		if (
-			!options ||
-			typeof options.path !== "string" ||
-			options.path.length === 0
-		) {
-			throw new TypeError("LocalFilesystem requires a non-empty path");
+	constructor(options: IndexedDbStorageOptions) {
+		if (!options || typeof options.name !== "string" || options.name.length === 0) {
+			throw new TypeError("IndexedDbStorage requires a non-empty name");
 		}
-		if (
-			options.lixDir !== undefined &&
-			(typeof options.lixDir !== "string" || options.lixDir.length === 0)
-		) {
-			throw new TypeError("LocalFilesystem lixDir must be a non-empty string");
-		}
-		if (typeof options.syncAllFiles !== "boolean") {
-			throw new TypeError("LocalFilesystem syncAllFiles must be a boolean");
-		}
-		this.path = options.path;
-		this.lixDir = options.lixDir;
-		this.syncAllFiles = options.syncAllFiles;
-	}
-
-	async importPaths(paths: readonly string[]): Promise<void> {
-		if (!Array.isArray(paths)) {
-			throw new TypeError("importPaths() paths must be an array");
-		}
-		for (const path of paths) {
-			if (typeof path !== "string" || path.length === 0) {
-				throw new TypeError(
-					"importPaths() paths must contain non-empty strings",
-				);
-			}
-			if (path.endsWith("/")) {
-				throw new TypeError(
-					"importPaths() paths must not end with a trailing slash",
-				);
-			}
-		}
-		await this.client("importPaths").importFilesystemPaths([...paths]);
-	}
-
-	async syncDiskToLix(): Promise<void> {
-		return this.client("syncDiskToLix").syncDiskToLix();
-	}
-
-	private client(operation: string): LixBinding {
-		const client = openLocalFilesystems.get(this);
-		if (!client) {
-			throw localFilesystemNotOpen(operation);
-		}
-		return client;
+		this.name = options.name;
 	}
 }
 
@@ -97,48 +37,10 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	}
 	if (options.server !== undefined) {
 		const { openRemoteLixBinding } = await import("./remote/client.js");
-		if (options.storage === undefined) {
-			return new Lix(await openRemoteLixBinding(options.server));
+		if ("storage" in options && options.storage !== undefined) {
+			throw new TypeError("openLix() remote mode does not accept storage");
 		}
-		assertSnapshotStorage(options.storage);
-		const clientState = await openStoredClientState({
-			storage: options.storage,
-			namespace: remoteClientStateNamespace(options.server.url),
-		});
-
-		const restoredBranchId = clientState.get<string>(
-			ACTIVE_BRANCH_CLIENT_STATE_KEY,
-		);
-		const restoredAccountId = clientState.get<string>(
-			ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
-		);
-		let remoteBinding: LixBinding | undefined;
-		try {
-			try {
-				remoteBinding = await openRemoteLixBinding(options.server, {
-					initialActiveBranchId: restoredBranchId,
-					initialActiveAccountId: restoredAccountId,
-				});
-			} catch (error) {
-				if (!restoredBranchId || !isBranchNotFoundError(error)) throw error;
-				remoteBinding = await openRemoteLixBinding(options.server, {
-					initialActiveAccountId: restoredAccountId,
-				});
-			}
-			const activeBranchId = await remoteBinding.activeBranchId();
-			const activeAccountId = await remoteBinding.activeAccountId();
-			if (activeBranchId !== restoredBranchId) {
-				await clientState.set(ACTIVE_BRANCH_CLIENT_STATE_KEY, activeBranchId);
-			}
-			if (activeAccountId !== restoredAccountId) {
-				await clientState.set(ACTIVE_ACCOUNT_CLIENT_STATE_KEY, activeAccountId);
-			}
-			return new Lix(remoteBinding, clientState);
-		} catch (error) {
-			await remoteBinding?.close().catch(() => undefined);
-			await clientState.close().catch(() => undefined);
-			throw error;
-		}
+		return new Lix(await openRemoteLixBinding(options.server));
 	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
@@ -150,89 +52,66 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			),
 		);
 	}
-	if (options.storage instanceof LocalFilesystem) {
+	if (isLixStorage(options.storage)) {
 		const storage = options.storage;
-		if (openLocalFilesystems.has(storage)) {
-			throw localFilesystemAlreadyOpen();
+		if (openStorages.has(storage)) {
+			throw storageAlreadyOpen();
 		}
-		openLocalFilesystems.set(storage, null);
+		openStorages.add(storage);
+		let binding: LixBinding | undefined;
+		const disconnect = () => {
+			storage.lixStorage.connect(undefined);
+			openStorages.delete(storage);
+		};
 		try {
-			const binding = await openLixWorkerBinding(
-				{
-					kind: "localFilesystem",
-					path: storage.path,
-					lixDir: storage.lixDir,
-					syncAllFiles: storage.syncAllFiles,
-				},
-				() => openLocalFilesystems.delete(storage),
+			binding = await openLixWorkerBinding(
+				storage.lixStorage.config,
+				disconnect,
 				options.telemetry,
 			);
-			openLocalFilesystems.set(storage, binding);
+			storage.lixStorage.connect({
+				importFilesystemPaths: (paths) =>
+					binding!.importFilesystemPaths(paths),
+				syncDiskToLix: () => binding!.syncDiskToLix(),
+			});
 			return new Lix(binding);
 		} catch (error) {
-			openLocalFilesystems.delete(storage);
+			disconnect();
+			await binding?.close().catch(() => undefined);
 			throw error;
 		}
 	}
-	if (isSnapshotStorage(options.storage)) {
-		const { openPersistentLixWorkerBinding } =
-			await import("./worker/client.js");
-		const binding = await openPersistentLixWorkerBinding({
-			storage: options.storage,
-			namespace: "local",
-			telemetry: options.telemetry,
-		});
+	if (options.storage instanceof IndexedDbStorage) {
+		const storage = options.storage;
+		const databaseName = storage.name;
+		if (openIndexedDbStorageNames.has(databaseName)) {
+			throw new Error("IndexedDbStorage is already open");
+		}
+		openIndexedDbStorageNames.add(databaseName);
+		let binding: LixBinding | undefined;
 		try {
-			const clientState = await openClientState({ binding });
-			return new Lix(binding, clientState);
+			binding = await openLixWorkerBinding(
+				{ kind: "indexedDb", name: databaseName },
+				() => openIndexedDbStorageNames.delete(databaseName),
+				options.telemetry,
+			);
+			return new Lix(binding);
 		} catch (error) {
-			await binding.close().catch(() => undefined);
+			openIndexedDbStorageNames.delete(databaseName);
+			await binding?.close().catch(() => undefined);
 			throw error;
 		}
 	}
 	throw new TypeError(
-		"openLix() requires storage to be LocalFilesystem or a Lix snapshot storage adapter",
+		"openLix() requires a Lix storage adapter or IndexedDbStorage",
 	);
 }
 
-function isSnapshotStorage(value: unknown): value is LixSnapshotStorage {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		typeof (value as Partial<LixSnapshotStorage>).load === "function" &&
-		typeof (value as Partial<LixSnapshotStorage>).save === "function"
-	);
-}
-
-function assertSnapshotStorage(
-	value: unknown,
-): asserts value is LixSnapshotStorage {
-	if (!isSnapshotStorage(value)) {
-		throw new TypeError(
-			"openLix() remote storage must implement load() and save()",
-		);
-	}
-}
-
-function remoteClientStateNamespace(value: string | URL): string {
-	let url: URL;
-	try {
-		url = new URL(value);
-	} catch {
-		throw new TypeError("openLix() remote server url must be an absolute URL");
-	}
-	url.pathname = url.pathname.replace(/\/$/, "");
-	url.search = "";
-	url.hash = "";
-	return `remote:${url.href}`;
-}
-
-function isBranchNotFoundError(
-	error: unknown,
-): error is Error & { code: "LIX_BRANCH_NOT_FOUND" } {
-	return (
-		error instanceof Error &&
-		"code" in error &&
-		error.code === "LIX_BRANCH_NOT_FOUND"
-	);
+function storageAlreadyOpen(): Error & { code: string } {
+	const error = new Error(
+		"openLix() storage is already open; close the existing Lix or create a new storage adapter",
+	) as Error & { code: string };
+	error.name = "LixError";
+	error.code = "LIX_STORAGE_IN_USE";
+	return error;
 }

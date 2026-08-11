@@ -5,6 +5,7 @@ pub(crate) mod identity;
 pub(crate) mod json_pointer;
 pub(crate) mod lix_path;
 pub(crate) mod metadata;
+pub(crate) mod string_dictionary;
 pub(crate) mod timestamp;
 pub(crate) mod types;
 pub(crate) mod wire;
@@ -14,16 +15,21 @@ pub(crate) use exact_batch::{ExactBatch, ExactValue};
 pub use execution_metadata::{
     ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,
 };
-pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
+pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
 pub(crate) use identity::{json_pointer_get, validate_non_empty_identity_value};
-pub(crate) use json_pointer::{format_json_pointer, parse_json_pointer, top_level_property_name};
+pub(crate) use json_pointer::format_json_pointer;
+#[cfg(test)]
+pub(crate) use json_pointer::parse_json_pointer;
 pub use lix_path::{LixPath, validate_lix_path_segment};
 pub(crate) use lix_path::{compose_directory_path, compose_file_path};
 pub(crate) use metadata::{
     parse_row_metadata, parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
 };
+pub(crate) use string_dictionary::{
+    FastHashBuilder, StringDictionary, StringDictionaryBuilder, fast_hash_builder,
+};
 pub(crate) use timestamp::LixTimestamp;
-pub use types::{Blob, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
+pub use types::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use wire::{WireQueryResult, WireValue};
 
 /// Renders a JSON value through the public SQL string-column coercion.

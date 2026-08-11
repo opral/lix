@@ -6,7 +6,7 @@ simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -15,7 +15,7 @@ simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_key_value (key, value) \
-             VALUES ('kv-json', lix_json('{\"nested\":{\"flag\":true,\"items\":[1,\"two\",null]}}'))",
+             VALUES ('kv-json', CAST('{\"nested\":{\"flag\":true,\"items\":[1,\"two\",null]}}' AS JSONB))",
             &[],
         )
         .await
@@ -32,19 +32,19 @@ simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
 });
 
 simulation_test!(
-    lix_key_value_persisted_tracked_entity_scan_preserves_canonical_json_through_global_branch_merge,
+    lix_key_value_persisted_tracked_row_scan_preserves_canonical_json_through_global_branch_merge,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
         let global_session = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -57,7 +57,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global) \
                  VALUES ('kv-canonical-persisted-global', \
-                         lix_json('{ \"z\": { \"b\": 2, \"a\": 1 }, \"a\": [3, 2] }'), true)",
+                         CAST('{ \"z\": { \"b\": 2, \"a\": 1 }, \"a\": [3, 2] }' AS JSONB), true)",
                 &[],
             )
             .await
@@ -66,14 +66,14 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
                  VALUES ('kv-canonical-persisted-active', \
-                         lix_json('{ \"z\": { \"d\": 4, \"c\": 3 }, \"a\": [5, 4] }'))",
+                         CAST('{ \"z\": { \"d\": 4, \"c\": 3 }, \"a\": [5, 4] }' AS JSONB))",
                 &[],
             )
             .await
             .expect("tracked active insert should succeed");
 
         let result = session
-            // LIKE deliberately routes through the broad EntitySpec scan rather
+            // LIKE deliberately routes through the broad SchemaSpec scan rather
             // than the exact-primary-key native executor.
             .execute(
                 "SELECT key, CONCAT(value, '') AS value_text FROM lix_key_value \
@@ -81,7 +81,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("broad tracked entity scan should succeed");
+            .expect("broad tracked row scan should succeed");
         assert_eq!(
             result
                 .rows()
@@ -107,7 +107,7 @@ simulation_test!(lix_key_value_duplicate_insert_rejects, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -154,7 +154,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -206,7 +206,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -248,7 +248,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -291,14 +291,14 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
         let global_session = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -349,7 +349,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -394,5 +394,8 @@ fn assert_single_text(result: ExecuteResult, expected: &str) {
     assert_eq!(row_set.len(), 1);
     let expected_json = serde_json::from_str::<serde_json::Value>(expected)
         .expect("expected value should be valid JSON");
-    assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json)]);
+    assert_eq!(
+        row_set.rows()[0].values(),
+        &[Value::Jsonb(expected_json.into())]
+    );
 }

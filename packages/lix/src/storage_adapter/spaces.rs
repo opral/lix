@@ -2,14 +2,111 @@ use std::ops::Bound;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-#[cfg(test)]
-use crate::storage::StorageError;
-use crate::storage::{Key, KeyRange, SpaceId, StorageSpace};
+use crate::storage::{
+    CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue, SpaceId,
+    StorageError, StorageSpace, ValueSemantics,
+};
+use crate::storage_adapter::{StorageAdapterRead, exact_get_many};
 
-pub(crate) const MUTATION_REVISION_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0007_0001), "observe.mutation_revision");
-pub(crate) const TRACKED_MUTATION_REVISION_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0007_0004), "transaction.tracked_revision");
+/// The single storage space holding every "something changed here" revision
+/// singleton.
+///
+/// Physical keys are `4-byte-BE space id ++ logical key`, so one space with
+/// one-byte logical keys puts all revision singletons in adjacent physical
+/// keys. That is one SST block, one hot-key write region, and one batched
+/// point read instead of one read per singleton.
+///
+/// Every key holds an opaque uuid-v7 token whose only meaningful operation is
+/// equality: "did this fact change since I read it".
+pub(crate) const REVISION_SPACE: StorageSpace = StorageSpace::declare(
+    SpaceId(0x0007_0000),
+    "lix.revision.v1",
+    ValueSemantics::Mutable,
+);
+
+/// Active-account visibility token. Rotated only by a commit that writes an
+/// account row or moves a branch ref, so an ordinary CRUD commit leaves it
+/// alone and a disabled account rotates it.
+pub(crate) const REVISION_KEY_ACCOUNT: &[u8] = b"a";
+/// Binary-CAS reclamation token. Rotated only by an authenticated CAS sweep,
+/// and asserted unchanged by every CAS publisher, so a publisher that planned
+/// against payload rows a sweep then deleted cannot commit.
+pub(crate) const REVISION_KEY_BINARY_CAS_RECLAMATION: &[u8] = b"b";
+/// Binary-CAS publication token. Rewritten by every CAS publisher without a
+/// precondition on itself — publishers are mutually independent — and asserted
+/// unchanged by every sweep, so a sweep whose reachability plan predates a
+/// concurrent publication cannot commit.
+pub(crate) const REVISION_KEY_BINARY_CAS_PUBLICATION: &[u8] = b"p";
+/// `json_store` reclamation token. Rotated only by an authenticated payload
+/// sweep, and asserted unchanged by every payload publisher.
+///
+/// Deliberately a second pair rather than a reuse of the binary-CAS pair: the
+/// two planes have different publisher sets and different sweeps, and sharing
+/// one token would make a media upload abort a JSON sweep and a JSON write
+/// abort a CAS sweep for no reachability reason.
+pub(crate) const REVISION_KEY_JSON_STORE_RECLAMATION: &[u8] = b"j";
+/// `json_store` publication token. Rewritten by every payload publisher with no
+/// precondition on itself — publishers are mutually independent — and asserted
+/// unchanged by every payload sweep.
+pub(crate) const REVISION_KEY_JSON_STORE_PUBLICATION: &[u8] = b"k";
+/// Registered-schema catalog visibility token.
+pub(crate) const REVISION_KEY_CATALOG: &[u8] = b"c";
+/// Filesystem path-index cache-freshness token.
+pub(crate) const REVISION_KEY_FILESYSTEM_PATH: &[u8] = b"f";
+/// Any-storage-mutation token consumed by `observe`.
+pub(crate) const REVISION_KEY_MUTATION: &[u8] = b"m";
+/// Tracked-state mutation token used as the transaction snapshot fence.
+pub(crate) const REVISION_KEY_TRACKED_MUTATION: &[u8] = b"t";
+
+pub(crate) fn revision_key(key: &'static [u8]) -> Key {
+    Key(Bytes::from_static(key))
+}
+
+/// Loads `N` revision singletons with one batched point read against one space.
+///
+/// Callers that need more than one revision in the same read scope must use
+/// this instead of issuing separate point reads: the whole reason the
+/// singletons share a space is that the backend can serve them from one
+/// lookup over one contiguous key region.
+pub(crate) async fn load_revisions<R, const N: usize>(
+    read: &R,
+    keys: [&'static [u8]; N],
+) -> Result<[Option<Bytes>; N], StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let keys: [Key; N] = keys.map(revision_key);
+    let result = exact_get_many(
+        read,
+        &[GetManyRequest {
+            space: REVISION_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }],
+    )
+    .await?;
+    let mut values = result.values.into_iter();
+    Ok(std::array::from_fn(|_| {
+        values.next().flatten().and_then(|value| match value {
+            ProjectedValue::FullValue(bytes) => Some(bytes),
+            ProjectedValue::KeyOnly => None,
+        })
+    }))
+}
+
+/// Loads exactly one revision singleton.
+pub(crate) async fn load_revision<R>(
+    read: &R,
+    key: &'static [u8],
+) -> Result<Option<Bytes>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let [value] = load_revisions(read, [key]).await?;
+    Ok(value)
+}
 
 impl StorageSpace {
     pub const fn physical_prefix(&self) -> [u8; 4] {

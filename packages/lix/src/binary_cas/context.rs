@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 
 use crate::LixError;
-use crate::binary_cas::BinaryCasChunking;
 use crate::binary_cas::{
     BlobBytesBatch, BlobChunkReceipt, BlobEditSplice, BlobId, BlobPayload, BlobRangeBytes,
     BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt,
@@ -73,15 +72,11 @@ fn materialize_blob_range(
 /// The context does not own storage. Callers explicitly provide a KV store via
 /// `reader(...)` or `writer_skipping_existing_chunks(...)`, keeping storage and
 /// transaction ownership at the execution layer.
-pub(crate) struct BinaryCasContext {
-    chunking: BinaryCasChunking,
-}
+pub(crate) struct BinaryCasContext;
 
 impl BinaryCasContext {
     pub(crate) fn new() -> Self {
-        Self {
-            chunking: BinaryCasChunking::default(),
-        }
+        Self
     }
 
     pub(crate) fn prepared_manifest_is_staged(
@@ -112,7 +107,7 @@ impl BinaryCasContext {
     where
         S: StorageAdapterRead + ?Sized,
     {
-        ExistingChunkAwareBinaryCasWriter::new(store, writes, self.chunking)
+        ExistingChunkAwareBinaryCasWriter::new(store, writes)
     }
 }
 
@@ -162,7 +157,6 @@ where
 {
     store: &'a S,
     writes: &'a mut StorageWriteSet,
-    chunking: BinaryCasChunking,
     blob_hashes: HashSet<[u8; 32]>,
     chunk_keys: HashSet<Vec<u8>>,
 }
@@ -171,11 +165,10 @@ impl<'a, S> ExistingChunkAwareBinaryCasWriter<'a, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    fn new(store: &'a S, writes: &'a mut StorageWriteSet, chunking: BinaryCasChunking) -> Self {
+    fn new(store: &'a S, writes: &'a mut StorageWriteSet) -> Self {
         Self {
             store,
             writes,
-            chunking,
             blob_hashes: HashSet::new(),
             chunk_keys: HashSet::new(),
         }
@@ -186,22 +179,20 @@ where
         payload: &BlobPayload,
     ) -> Result<BlobWriteReceipt, LixError> {
         crate::binary_cas::kv::stage_blob_write_skipping_existing_chunks(
-            self.chunking,
             self.store,
             self.writes,
             &mut self.blob_hashes,
             &mut self.chunk_keys,
-            payload.bytes(),
-            payload.hash(),
+            payload,
         )
         .await
     }
 
-    pub(crate) async fn stage_fixed_part(
+    pub(crate) async fn stage_upload_part(
         &mut self,
         bytes: &[u8],
     ) -> Result<Vec<BlobChunkReceipt>, LixError> {
-        crate::binary_cas::kv::stage_fixed_part_skipping_existing(
+        crate::binary_cas::kv::stage_upload_part_skipping_existing(
             self.store,
             self.writes,
             &mut self.chunk_keys,
@@ -210,11 +201,11 @@ where
         .await
     }
 
-    pub(crate) fn stage_fixed_manifest(
+    pub(crate) fn stage_upload_manifest(
         &mut self,
         chunks: &[BlobChunkReceipt],
     ) -> Result<BlobWriteReceipt, LixError> {
-        crate::binary_cas::kv::stage_fixed_manifest(self.writes, chunks)
+        crate::binary_cas::kv::stage_upload_manifest(self.writes, chunks)
     }
 
     /// Stages a normal file payload, opportunistically retaining unchanged

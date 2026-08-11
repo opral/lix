@@ -8,7 +8,7 @@
 //!
 //! Slash path shape:
 //!
-//! - Non-root paths never end with `/`; entity kind is carried by the typed
+//! - Non-root paths never end with `/`; row kind is carried by the typed
 //!   file or directory surface rather than encoded in path text.
 //! - Empty, `.`, and `..` segments are rejected because they do not name stable
 //!   Lix filesystem entries.

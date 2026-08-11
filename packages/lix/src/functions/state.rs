@@ -5,17 +5,17 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
     BranchHeadControlContext, branch_head_control_precondition, stage_branch_head_control,
-    untracked_lifecycle_generation,
 };
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
+use crate::hot_state::{
+    CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain, MaterializedHotStateRow,
+    TrackedHeadContext,
+};
 use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
-};
-use crate::live_state::{
-    CurrentStateDeltaRef, LiveStateReadDomain, MaterializedLiveStateRow, TrackedHeadContext,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
@@ -33,8 +33,9 @@ const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 /// is engine-owned global state and has no changelog or commit history.
 pub(crate) async fn load_mode(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicMode, LixError> {
-    let Some(row) = load_key_value_row(read, DETERMINISTIC_MODE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, cache, DETERMINISTIC_MODE_KEY).await? else {
         return Ok(DeterministicMode::disabled());
     };
     let value = key_value_payload(&row, DETERMINISTIC_MODE_KEY)?;
@@ -47,8 +48,9 @@ pub(crate) async fn load_mode(
 /// execution starts at sequence zero.
 pub(crate) async fn load_sequence(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicSequence, LixError> {
-    let Some(row) = load_key_value_row(read, DETERMINISTIC_SEQUENCE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, cache, DETERMINISTIC_SEQUENCE_KEY).await? else {
         return Ok(DeterministicSequence::uninitialized());
     };
     let value = key_value_payload(&row, DETERMINISTIC_SEQUENCE_KEY)?;
@@ -64,8 +66,8 @@ pub(crate) async fn stage_sequence(
     writes: &mut StorageWriteSet,
     sequence: DeterministicSequence,
     timestamp: LixTimestamp,
-    _change_id: ChangeId,
-) -> Result<StoragePrecondition, LixError> {
+    change_id: ChangeId,
+) -> Result<Vec<StoragePrecondition>, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
         "value": sequence.highest_seen,
@@ -77,7 +79,7 @@ pub(crate) async fn stage_sequence(
         )
     })?;
     let snapshot = NormalizedJson::from_arc_unchecked(Arc::from(snapshot_content.as_str()));
-    let entity_pk = EntityPk::single(DETERMINISTIC_SEQUENCE_KEY);
+    let row_pk = RowPk::single(DETERMINISTIC_SEQUENCE_KEY);
     let mut observations = BranchHeadControlContext::new()
         .reader(read)
         .load_observed(&[GLOBAL_BRANCH_ID.to_string()])
@@ -89,31 +91,32 @@ pub(crate) async fn stage_sequence(
             "global branch control is missing while staging deterministic state",
         )
     })?;
+    let mut preconditions = Vec::with_capacity(2);
     JsonStoreContext::new().writer().stage_batch(
         writes,
         JsonWritePlacementRef::OutOfBand,
         [NormalizedJsonRef::from(&snapshot)],
     )?;
+    // This lane commits its own write set, outside the ordinary commit path's
+    // fence, so it takes the publisher half itself.
+    crate::json_store::stage_json_publication_fence(read, writes, &mut preconditions).await?;
     let snapshot_slot = JsonSlot::from_json(snapshot.as_str());
     let next_revision = control
         .next_current_state_revision()?
         .current_state_revision;
-    let next_generation = untracked_lifecycle_generation(
-        GLOBAL_BRANCH_ID,
-        control.untracked_generation,
-        next_revision,
-    );
     TrackedHeadContext::new()
         .writer(read, writes)
-        .stage_untracked_generation(
+        .stage_untracked_current_state(
             GLOBAL_BRANCH_ID,
-            control.untracked_generation,
-            next_generation,
+            control.tracked_generation,
             &[CurrentStateDeltaRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
-                entity_pk: &entity_pk,
-                change_id: None,
+                row_pk: &row_pk,
+                // The caller already minted this id for the sequence row; this
+                // lane stages the head directly, so it must carry it rather
+                // than relying on the prepared-row path to supply one.
+                change_id: Some(change_id),
                 commit_id: None,
                 untracked: true,
                 deleted: false,
@@ -130,17 +133,21 @@ pub(crate) async fn stage_sequence(
     // change. Merely restaging the old control would let two writers both
     // satisfy the same CAS after the first write, losing one group update.
     let mut next_control = control;
-    next_control.untracked_generation = next_generation;
     next_control.current_state_revision = next_revision;
     next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
     stage_branch_head_control(writes, GLOBAL_BRANCH_ID, next_control)?;
-    branch_head_control_precondition(GLOBAL_BRANCH_ID, observation.raw_token)
+    preconditions.push(branch_head_control_precondition(
+        GLOBAL_BRANCH_ID,
+        observation.raw_token,
+    )?);
+    Ok(preconditions)
 }
 
 async fn load_key_value_row(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
     key: &str,
-) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+) -> Result<Option<MaterializedHotStateRow>, LixError> {
     let Some(control) = BranchHeadControlContext::new()
         .reader(read)
         .load(GLOBAL_BRANCH_ID)
@@ -148,59 +155,81 @@ async fn load_key_value_row(
     else {
         return Ok(None);
     };
-    let keys = [TrackedStateKey {
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-        entity_pk: EntityPk::single(key),
-        file_id: None,
-    }];
-    let projection = ChangeRecordProjection {
-        snapshot_content: true,
-        metadata: false,
-    };
-    let reader = TrackedHeadContext::new().reader(read);
-    let key_refs = keys
-        .iter()
-        .map(|key| TrackedStateKeyRef {
-            schema_key: key.schema_key.as_str(),
-            entity_pk: &key.entity_pk,
-            file_id: key.file_id.as_deref(),
-        })
-        .collect::<Vec<_>>();
-    let rows = reader
-        .load_projected_live_batch_refs_for_domain(
-            GLOBAL_BRANCH_ID,
-            control,
-            &key_refs,
-            &projection,
-            LiveStateReadDomain::Untracked,
-        )
-        .await?;
-    let Some(row) = rows.row(0) else {
-        reader
-            .validate_exact_collection_closure(
+    // The control is the fence, not just the read's input: it is republished
+    // under a CAS by every write to this plane, so an unchanged control means
+    // the row below — and the collection closure validated with it — cannot
+    // have moved.
+    if let Some(cache) = cache
+        && let Some(row) = cache.get(control, key)
+    {
+        return Ok(row);
+    }
+    // Deliberately one function, not two. Extracting the canonical read into
+    // its own `async fn` would add a poll frame to a path that runs inside
+    // `Transaction::open`, and this codebase's async future-size budget is
+    // tight enough that the sign of such a change cannot be assumed. The
+    // labelled block gives the same early-exit shape with no extra future.
+    let row = 'resolved: {
+        let keys = [TrackedStateKey {
+            schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+            row_pk: RowPk::single(key),
+            file_id: None,
+        }];
+        let projection = ChangeRecordProjection {
+            snapshot_content: true,
+            metadata: false,
+        };
+        let reader = TrackedHeadContext::new().reader(read);
+        let key_refs = keys
+            .iter()
+            .map(|key| TrackedStateKeyRef {
+                schema_key: key.schema_key.as_str(),
+                row_pk: &key.row_pk,
+                file_id: key.file_id.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        let rows = reader
+            .load_projected_live_batch_refs_for_domain(
                 GLOBAL_BRANCH_ID,
-                control.untracked_generation,
-                crate::collection_generation::CollectionScopeRef {
-                    schema_key: KEY_VALUE_SCHEMA_KEY,
-                    file_id: None,
-                },
-                key_refs[0],
-                LiveStateReadDomain::Untracked,
-                control.current_state_revision == 0,
+                control,
+                &key_refs,
+                &projection,
+                HotStateReadDomain::Untracked,
             )
             .await?;
-        return Ok(None);
+        let Some(row) = rows.row(0) else {
+            reader
+                .validate_exact_collection_closure(
+                    GLOBAL_BRANCH_ID,
+                    control.tracked_generation,
+                    crate::collection_generation::CollectionScopeRef {
+                        schema_key: KEY_VALUE_SCHEMA_KEY,
+                        file_id: None,
+                    },
+                    key_refs[0],
+                    HotStateReadDomain::Untracked,
+                    control.current_state_revision == 0,
+                )
+                .await?;
+            break 'resolved None;
+        };
+        if !row.untracked() || row.deleted() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "deterministic key-value row '{key}' is not a live untracked authority member"
+                ),
+            ));
+        }
+        Some(row.to_owned())
     };
-    if !row.untracked() || row.deleted() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("deterministic key-value row '{key}' is not a live untracked authority member"),
-        ));
+    if let Some(cache) = cache {
+        cache.insert(control, key, row.clone());
     }
-    Ok(Some(row.to_owned()))
+    Ok(row)
 }
 
-fn key_value_payload(row: &MaterializedLiveStateRow, key: &str) -> Result<JsonValue, LixError> {
+fn key_value_payload(row: &MaterializedHotStateRow, key: &str) -> Result<JsonValue, LixError> {
     let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -266,7 +295,7 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 #[cfg(test)]
 mod tests {
     use crate::NullableKeyFilter;
-    use crate::live_state::{LiveStateContext, LiveStateRowRequest};
+    use crate::hot_state::{HotStateContext, HotStateRowRequest};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{
         Memory, StorageBeginScanOptions, StorageKey, StorageProjectedValue, StorageReadOptions,
@@ -275,8 +304,8 @@ mod tests {
 
     use super::*;
 
-    fn live_state_context() -> LiveStateContext {
-        LiveStateContext::new(
+    fn hot_state_context() -> HotStateContext {
+        HotStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
@@ -290,7 +319,7 @@ mod tests {
             .await
             .expect("read should open");
 
-        let mode = load_mode(&read).await.expect("missing mode should decode");
+        let mode = load_mode(&read, None).await.expect("missing mode should decode");
 
         assert_eq!(mode, DeterministicMode::disabled());
     }
@@ -313,7 +342,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let mode = load_mode(&read).await.expect("valid mode should decode");
+        let mode = load_mode(&read, None).await.expect("valid mode should decode");
 
         assert_eq!(
             mode,
@@ -333,7 +362,7 @@ mod tests {
             .await
             .expect("read should open");
 
-        let sequence = load_sequence(&read)
+        let sequence = load_sequence(&read, None)
             .await
             .expect("missing sequence should decode");
 
@@ -386,17 +415,16 @@ mod tests {
         .expect("valid empty prefix");
         let mut cursor = read
             .begin_scan(
-                crate::live_state::HOT_ROW_SPACE,
+                crate::hot_state::ROW_SPACE,
                 range,
                 StorageBeginScanOptions::default(),
             )
             .await
             .expect("selected HOT member scan should begin");
         let mut rows = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .collect_all()
             .await
-            .expect("selected HOT members should scan")
-            .entries;
+            .expect("selected HOT members should scan");
         assert_eq!(
             rows.len(),
             1,
@@ -422,9 +450,9 @@ mod tests {
         drop(read);
 
         let mut corrupt = storage.new_write_set();
-        corrupt.delete(crate::live_state::HOT_ROW_SPACE, sequence_member.key);
+        corrupt.delete(crate::hot_state::ROW_SPACE, sequence_member.key);
         corrupt.put(
-            crate::live_state::HOT_ROW_SPACE,
+            crate::hot_state::ROW_SPACE,
             StorageKey(bytes::Bytes::from(unrelated_key)),
             StorageValue {
                 bytes: sequence_value,
@@ -439,7 +467,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("corrupt sequence storage should read");
-        let error = load_sequence(&read)
+        let error = load_sequence(&read, None)
             .await
             .expect_err("missing selected sequence member must fail closed");
         assert!(
@@ -465,7 +493,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sequence = load_sequence(&read)
+        let sequence = load_sequence(&read, None)
             .await
             .expect("valid sequence should decode");
 
@@ -476,7 +504,7 @@ mod tests {
     #[tokio::test]
     async fn write_sequence_persists_untracked_global_key_value() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
 
         let mut writes = storage.new_write_set();
@@ -498,17 +526,17 @@ mod tests {
             .await
             .expect("sequence should commit");
 
-        let reader = live_state.reader(
+        let reader = hot_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("read should open"),
         );
         let row = reader
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
+                row_pk: RowPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -516,7 +544,14 @@ mod tests {
             .expect("sequence row should exist");
         assert!(row.untracked);
         assert!(row.global);
-        assert_eq!(row.change_id, None);
+        // The id the caller handed `stage_sequence` must survive to the head.
+        // Asserting the exact supplied label — rather than merely `is_some()` —
+        // is what proves this lane carries the caller's id instead of inventing
+        // one of its own.
+        assert_eq!(
+            row.change_id,
+            Some(ChangeId::for_test_label("sequence-change-7"))
+        );
         assert_eq!(row.commit_id, None);
         assert_eq!(
             row.snapshot_content.as_deref(),
@@ -530,7 +565,7 @@ mod tests {
             "value": value,
         }))
         .expect("snapshot should serialize");
-        let entity_pk = EntityPk::single(key);
+        let row_pk = RowPk::single(key);
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -546,22 +581,16 @@ mod tests {
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
-        let next_generation = untracked_lifecycle_generation(
-            GLOBAL_BRANCH_ID,
-            control.untracked_generation,
-            next_control.current_state_revision,
-        );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_untracked_generation(
+            .stage_untracked_current_state(
                 GLOBAL_BRANCH_ID,
-                control.untracked_generation,
-                next_generation,
+                control.tracked_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
-                    entity_pk: &entity_pk,
-                    change_id: None,
+                    row_pk: &row_pk,
+                    change_id: Some(ChangeId::for_test_label("functions-state-sequence")),
                     commit_id: None,
                     untracked: true,
                     deleted: false,
@@ -575,7 +604,6 @@ mod tests {
             )
             .await
             .expect("test key-value current row should stage");
-        next_control.untracked_generation = next_generation;
         next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
         stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
             .expect("global control should publish current state");

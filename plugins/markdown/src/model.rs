@@ -1,4 +1,4 @@
-use lix_order_key::OrderKey;
+use crate::order_key::OrderKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;

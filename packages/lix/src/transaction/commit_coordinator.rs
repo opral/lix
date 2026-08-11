@@ -2,8 +2,6 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use tokio::sync::{Semaphore, oneshot};
 use tracing::Instrument as _;
 
@@ -18,8 +16,6 @@ use crate::storage_adapter::Storage;
 
 const COMMIT_QUEUE_CAPACITY: usize = 256;
 const COMMIT_COHORT_CAPACITY: usize = 256;
-const COMMIT_GATHER_WINDOW: Duration = Duration::from_millis(2);
-
 struct CommitRequest<StorageImpl>
 where
     StorageImpl: Storage + 'static,
@@ -129,21 +125,9 @@ where
     #[cfg(not(target_family = "wasm"))]
     fn spawn_driver(&self) -> Result<(), LixError> {
         let coordinator = self.clone();
-        let runtime = tokio::runtime::Handle::current();
-        std::thread::Builder::new()
-            .name("lix-commit-coordinator".to_owned())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || {
-                std::thread::sleep(COMMIT_GATHER_WINDOW);
-                runtime.block_on(coordinator.drive());
-            })
-            .map(|_| ())
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("start transaction commit coordinator: {error}"),
-                )
-            })
+        crate::background_task::spawn("lix-commit-coordinator", move || async move {
+            coordinator.drive().await;
+        })
     }
 
     fn enqueue(&self, request: CommitRequest<StorageImpl>) -> bool {

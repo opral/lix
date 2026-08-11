@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -11,6 +11,7 @@ import {
 	updateCargoToml,
 	updateChangelog,
 	updatePackageVersion,
+	validateCargoLockstepVersions,
 } from "./release.mjs";
 
 test("bumpVersion applies semver changes", () => {
@@ -131,67 +132,113 @@ test("updateChangelog inserts new entries after heading", () => {
 	);
 });
 
-test("updateCargoToml leaves independently released Rust packages untouched", () => {
+test("updateCargoToml bumps every lockstep Rust package and exact dependency pin", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
 	mkdirSync(join(root, "packages", "js-sdk"), { recursive: true });
-	mkdirSync(join(root, "packages", "rs-sdk-tests"), { recursive: true });
-	mkdirSync(join(root, "packages", "server-protocol"), { recursive: true });
+	mkdirSync(join(root, "packages", "lix"), { recursive: true });
+	mkdirSync(join(root, "packages", "storage-rocksdb"), { recursive: true });
+	mkdirSync(join(root, "packages", "storage-slatedb"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
-		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_rocksdb = { path = "packages/rocksdb-storage", version = "0.6.2" }\nlix_storage_slatedb = { path = "packages/slatedb-storage", version = "0.6.2" }\nlix = { path = "packages/lix", version = "0.6.2" }\n`,
+		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_rocksdb = { path = "packages/storage-rocksdb", version = "=0.6.2" }\nlix_storage_slatedb = { path = "packages/storage-slatedb", version = "=0.6.2" }\nlix = { path = "packages/lix", version = "=0.6.2" }\n`,
+	);
+	writeFileSync(
+		join(root, "packages", "lix", "Cargo.toml"),
+		`[package]\nname = "lix"\nversion.workspace = true\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "js-sdk", "Cargo.toml"),
-		`[package]\nname = "lix_js_sdk"\nversion.workspace = true\n\n[dependencies]\nlix = { path = "../lix", version = "0.6.2", default-features = false }\n`,
+		`[package]\nname = "lix_js_sdk"\nversion.workspace = true\n\n[dependencies]\nlix = { path = "../lix", version = "=0.6.2", default-features = false }\n`,
 	);
 	writeFileSync(
-		join(root, "packages", "rs-sdk-tests", "Cargo.toml"),
-		`[package]\nname = "lix_tests"\nversion = "0.6.2"\n\n[dependencies]\nlix = { path = "../lix", version = "0.6.2", default-features = false }\n`,
+		join(root, "packages", "storage-rocksdb", "Cargo.toml"),
+		`[package]\nname = "lix-storage-rocksdb"\nversion.workspace = true\n\n[dependencies]\nlix = { path = "../lix", version = "=0.6.2", default-features = false }\n`,
 	);
 	writeFileSync(
-		join(root, "packages", "server-protocol", "Cargo.toml"),
-		`[package]\nname = "lix-server-protocol"\nversion.workspace = true\n\n[dependencies]\nlix = { path = "../lix", version = "0.6.2", default-features = false }\n`,
+		join(root, "packages", "storage-slatedb", "Cargo.toml"),
+		`[package]\nname = "lix-storage-slatedb"\nversion.workspace = true\n`,
 	);
 
 	updateCargoToml(root, "0.7.0");
 
 	const rootCargoToml = readFileSync(join(root, "Cargo.toml"), "utf8");
 	assert.match(rootCargoToml, /\[workspace\.package\]\nversion = "0\.7\.0"/);
-	assert.match(rootCargoToml, /lix_storage_rocksdb = \{ path = "packages\/rocksdb-storage", version = "0\.6\.2"/);
-	assert.match(rootCargoToml, /lix_storage_slatedb = \{ path = "packages\/slatedb-storage", version = "0\.6\.2"/);
-	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
-	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /version = "0\.6\.2"/);
-	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
-	assert.match(readFileSync(join(root, "packages", "server-protocol", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
+	assert.match(rootCargoToml, /lix_storage_rocksdb = \{ path = "packages\/storage-rocksdb", version = "=0\.7\.0"/);
+	assert.match(rootCargoToml, /lix_storage_slatedb = \{ path = "packages\/storage-slatedb", version = "=0\.7\.0"/);
+	assert.match(rootCargoToml, /lix = \{ path = "packages\/lix", version = "=0\.7\.0"/);
+	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "=0\.7\.0"/);
+	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /version\.workspace = true/);
+	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "=0\.7\.0"/);
+	assert.doesNotThrow(() => validateCargoLockstepVersions(root, "0.7.0"));
 });
 
-test("updateCargoToml updates requirements for workspace-versioned packages", () => {
+test("lockstep preflight reports every partial Cargo version bump", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
-	mkdirSync(join(root, "packages", "plugin-api"), { recursive: true });
-	mkdirSync(join(root, "packages", "lix"), { recursive: true });
+	for (const packageName of ["app", "binding-a", "binding-b"]) {
+		mkdirSync(join(root, "packages", packageName), { recursive: true });
+	}
 	writeFileSync(
 		join(root, "Cargo.toml"),
-		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_plugin_api = { path = "packages/plugin-api", version = "0.6.2" }\nlix = { path = "packages/lix", version = "0.6.2" }\n`,
+		`[workspace.package]\nversion = "0.12.0"\n`,
 	);
 	writeFileSync(
-		join(root, "packages", "plugin-api", "Cargo.toml"),
-		`[package]\nname = "lix_plugin_api"\nversion.workspace = true\n`,
+		join(root, "packages", "app", "Cargo.toml"),
+		`[package]\nname = "app"\nversion.workspace = true\n\n[dependencies]\nbinding-a = {\n\tpath = "../binding-a",\n\tversion = "=0.11.0",\n}\n\n[dependencies.binding-b]\npath = "../binding-b"\nversion = "=0.10.0"\n`,
 	);
+	for (const packageName of ["binding-a", "binding-b"]) {
+		writeFileSync(
+			join(root, "packages", packageName, "Cargo.toml"),
+			`[package]\nname = "${packageName}"\nversion.workspace = true\n`,
+		);
+	}
+
+	assert.throws(
+		() => validateCargoLockstepVersions(root),
+		(error) => {
+			assert.match(error.message, /binding-a requires =0\.11\.0, expected =0\.12\.0/);
+			assert.match(error.message, /binding-b requires =0\.10\.0, expected =0\.12\.0/);
+			return true;
+		},
+	);
+
+	updateCargoToml(root, "0.12.0");
+	assert.doesNotThrow(() => validateCargoLockstepVersions(root));
+});
+
+test("updateCargoToml restores every manifest after a commit failure", () => {
+	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
+	for (const packageName of ["app", "binding"]) {
+		mkdirSync(join(root, "packages", packageName), { recursive: true });
+	}
+	const rootManifest = `[workspace.package]\nversion = "0.11.0"\n`;
+	const appManifest = `[package]\nname = "app"\nversion.workspace = true\n\n[dependencies]\nbinding = { path = "../binding", version = "=0.11.0" }\n`;
+	writeFileSync(join(root, "Cargo.toml"), rootManifest);
+	writeFileSync(join(root, "packages", "app", "Cargo.toml"), appManifest);
 	writeFileSync(
-		join(root, "packages", "lix", "Cargo.toml"),
-		`[package]\nname = "lix"\nversion = "0.6.2"\n`,
+		join(root, "packages", "binding", "Cargo.toml"),
+		`[package]\nname = "binding"\nversion.workspace = true\n`,
 	);
 
-	updateCargoToml(root, "0.7.0");
-
-	const rootCargoToml = readFileSync(join(root, "Cargo.toml"), "utf8");
-	assert.match(rootCargoToml, /lix_plugin_api = \{ path = "packages\/plugin-api", version = "0\.7\.0"/);
-	assert.match(rootCargoToml, /lix = \{ path = "packages\/lix", version = "0\.6\.2"/);
+	let commits = 0;
+	assert.throws(
+		() =>
+			updateCargoToml(root, "0.12.0", {
+				renameManifest(source, destination) {
+					commits += 1;
+					if (commits === 2) throw new Error("injected commit failure");
+					renameSync(source, destination);
+				},
+			}),
+		/injected commit failure/,
+	);
+	assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), rootManifest);
+	assert.equal(readFileSync(join(root, "packages", "app", "Cargo.toml"), "utf8"), appManifest);
 });
 
 test("updatePackageVersion pins native optional dependencies", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
 	mkdirSync(join(root, "packages", "js-sdk"), { recursive: true });
+	mkdirSync(join(root, "packages", "storage-filesystem"), { recursive: true });
 	writeFileSync(
 		join(root, "packages", "js-sdk", "package.json"),
 		`${JSON.stringify({ name: "@lix-js/sdk", version: "0.6.0" }, null, "\t")}\n`,
@@ -217,6 +264,14 @@ test("updatePackageVersion pins native optional dependencies", () => {
 			"\t",
 		)}\n`,
 	);
+	writeFileSync(
+		join(root, "packages", "storage-filesystem", "package.json"),
+		`${JSON.stringify({ name: "@lix-js/storage-filesystem", version: "0.1.0", peerDependencies: { "@lix-js/sdk": "^0.6.0" } }, null, "\t")}\n`,
+	);
+	writeFileSync(
+		join(root, "packages", "storage-filesystem", "package-lock.json"),
+		`${JSON.stringify({ name: "@lix-js/storage-filesystem", version: "0.1.0", lockfileVersion: 3, packages: { "": { name: "@lix-js/storage-filesystem", version: "0.1.0", peerDependencies: { "@lix-js/sdk": "^0.6.0" } } } }, null, "\t")}\n`,
+	);
 
 	updatePackageVersion(root, "0.7.0");
 
@@ -229,4 +284,14 @@ test("updatePackageVersion pins native optional dependencies", () => {
 		lock.packages["node_modules/@lix-js/sdk-linux-x64"].resolved,
 		"https://registry.npmjs.org/@lix-js/sdk-linux-x64/-/sdk-linux-x64-0.7.0.tgz",
 	);
+	const storagePackage = JSON.parse(
+		readFileSync(join(root, "packages", "storage-filesystem", "package.json"), "utf8"),
+	);
+	const storageLock = JSON.parse(
+		readFileSync(join(root, "packages", "storage-filesystem", "package-lock.json"), "utf8"),
+	);
+	assert.equal(storagePackage.version, "0.7.0");
+	assert.equal(storagePackage.peerDependencies["@lix-js/sdk"], "0.7.0");
+	assert.equal(storageLock.version, "0.7.0");
+	assert.equal(storageLock.packages[""].peerDependencies["@lix-js/sdk"], "0.7.0");
 });

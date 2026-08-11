@@ -10,7 +10,6 @@ mod predicate;
 mod traits;
 mod types;
 
-pub use crate::handle::open_storage_engine as open_engine;
 pub use cursor::{ScanCursor, StorageScanSource};
 pub use error::{
     Capability, Precondition, PreconditionFailure, PreconditionItemSupport,
@@ -27,5 +26,5 @@ pub use types::{
     EncodedMutationBatchError, EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key,
     KeyRange, MAX_SCAN_PAGE_ROWS, Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency,
     ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SnapshotRef, SpaceId,
-    StorageSpace, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    StorageSpace, StoredValue, ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
 };

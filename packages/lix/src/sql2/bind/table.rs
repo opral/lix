@@ -115,7 +115,6 @@ pub(crate) fn bind_public_column_ref(
 #[cfg(test)]
 mod tests {
     use datafusion::sql::sqlparser::ast::{SetExpr, Statement, TableFactor};
-    use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use serde_json::json;
 
@@ -142,37 +141,37 @@ mod tests {
     }
 
     #[test]
-    fn base_entity_table_does_not_expose_branch_column() {
+    fn base_row_table_does_not_expose_branch_column() {
         let catalog = catalog();
         let table = bind_public_table(&catalog, &table_name("SELECT * FROM test_state_schema"))
-            .expect("base entity table should bind");
+            .expect("base row table should bind");
 
         assert!(matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityBase { .. }
+            PublicSurfaceKind::SchemaBase { .. }
         ));
         assert!(require_public_column(&table, "name").is_ok());
         let error = require_public_column(&table, "lixcol_branch_id")
-            .expect_err("base entity surface should not expose branch column");
+            .expect_err("base schema surface should not expose branch column");
         assert!(error.message.contains("does not exist"));
     }
 
     #[test]
-    fn by_branch_entity_exposes_lixcol_branch_id_without_branch_id_alias() {
+    fn by_branch_row_exposes_lixcol_branch_id_without_branch_id_alias() {
         let catalog = catalog();
         let table = bind_public_table(
             &catalog,
             &table_name("SELECT * FROM test_state_schema_by_branch"),
         )
-        .expect("by-branch entity table should bind");
+        .expect("by-branch row table should bind");
 
         assert!(matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityByBranch { .. }
+            PublicSurfaceKind::SchemaByBranch { .. }
         ));
         assert!(require_public_column(&table, "lixcol_branch_id").is_ok());
         let error = require_public_column(&table, "branch_id")
-            .expect_err("by-branch entity surface should not alias branch_id");
+            .expect_err("by-branch schema surface should not alias branch_id");
         assert!(error.message.contains("does not exist"));
     }
 
@@ -202,10 +201,12 @@ mod tests {
     #[test]
     fn catalog_rejects_runtime_schema_in_reserved_namespace_before_surface_collision() {
         let error = PublicCatalog::from_visible_schemas(&[json!({
-            "x-lix-key": "lix_file",
-            "properties": {
-                "id": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "lix_file",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         })])
         .expect_err("the complete lix_* runtime namespace should be rejected");
 
@@ -214,16 +215,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_uses_validated_entity_surface_derivation() {
-        let catalog = PublicCatalog::from_visible_schemas(&[json!({
-            "x-lix-key": "bad_entity",
-            "properties": {
-                "value": { "type": "null" }
-            }
+    fn catalog_uses_validated_schema_surface_derivation() {
+        let error = PublicCatalog::from_visible_schemas(&[json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "bad_row",
+            "columns": [
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["value"],
         })])
-        .expect("invalid entity schemas should match provider behavior and be skipped");
-
-        assert!(catalog.surface("bad_entity").is_none());
+        .expect_err("Schema v1 rejects unsupported primary-key types");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
 
     #[test]
@@ -346,49 +348,52 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_entity_history_surface_uses_provider_history_column_names() {
+    fn dynamic_row_history_surface_uses_provider_history_column_names() {
         let catalog = catalog();
         let table = bind_public_table(
             &catalog,
             &table_name("SELECT * FROM test_state_schema_history()"),
         )
-        .expect("entity history surface should bind");
+        .expect("schema history surface should bind");
 
         assert!(matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityHistory { .. }
+            PublicSurfaceKind::SchemaHistory { .. }
         ));
-        assert!(require_public_column(&table, "lixcol_entity_pk").is_ok());
-        assert!(require_public_column(&table, "lixcol_snapshot_content").is_ok());
+        assert!(require_public_column(&table, "lixcol_row_pk").is_ok());
+        assert!(require_public_column(&table, "lixcol_snapshot_content").is_err());
     }
 
     #[test]
-    fn dynamic_entity_file_id_is_public_and_insert_only() {
+    fn dynamic_row_file_id_is_public_and_insert_only() {
         let catalog = catalog();
         let table = bind_public_table(&catalog, &table_name("SELECT * FROM test_state_schema"))
-            .expect("entity surface should bind");
+            .expect("schema surface should bind");
 
         assert!(require_public_column(&table, "lixcol_file_id").is_ok());
         assert!(require_writable_column(&table, "lixcol_file_id", BoundWriteOp::Insert).is_ok());
         let error = require_writable_column(&table, "lixcol_file_id", BoundWriteOp::Update)
-            .expect_err("entity file id should remain immutable after insert");
+            .expect_err("row file id should remain immutable after insert");
         assert!(error.message.contains("is not writable"));
     }
 
     fn catalog() -> PublicCatalog {
         PublicCatalog::from_visible_schemas(&[json!({
-            "x-lix-key": "test_state_schema",
-            "properties": {
-                "id": { "type": "string" },
-                "name": { "type": "string" },
-                "lixcol_internal": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "test_state_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "name", "type": "text", "nullable": true },
+                { "name": "lixcol_internal", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
         })])
         .expect("test catalog")
     }
 
     fn table_name(sql: &str) -> ObjectName {
-        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let mut statements =
+            Parser::parse_sql(&crate::sql2::dialect::lix_sql_dialect(), sql).expect("parse SQL");
         let Some(Statement::Query(query)) = statements.pop() else {
             panic!("expected query");
         };

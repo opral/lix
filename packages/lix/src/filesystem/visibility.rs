@@ -4,8 +4,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::LixError;
-use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+use crate::hot_state::{
+    HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
 };
 
 use super::keys::{
@@ -15,7 +15,7 @@ use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRo
 
 /// Execution-visible filesystem metadata decoded from live-state rows.
 ///
-/// The helper intentionally depends only on `LiveStateReader`. In engine
+/// The helper intentionally depends only on `HotStateReader`. In engine
 /// write execution that context may include staged rows, so filesystem planning
 /// sees pending writes without reaching into write-execution internals.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -30,27 +30,27 @@ impl VisibleFilesystem {
     /// Loads filesystem rows for a single branch from execution-visible live
     /// state and builds lookup indexes used by filesystem write planning.
     pub(crate) async fn load(
-        live_state: Arc<dyn LiveStateReader>,
+        hot_state: Arc<dyn HotStateReader>,
         branch_id: &str,
     ) -> Result<Self, LixError> {
-        let rows = live_state
-            .scan_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+        let rows = hot_state
+            .scan_batch(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec![
                         DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
                         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                         BLOB_REF_SCHEMA_KEY.to_string(),
                     ],
                     branch_ids: vec![branch_id.to_string()],
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
+                ..HotStateScanRequest::default()
             })
             .await?;
         Self::from_live_batch(&rows)
     }
 
-    pub(crate) fn from_live_batch(rows: &MaterializedLiveStateBatch) -> Result<Self, LixError> {
+    pub(crate) fn from_live_batch(rows: &MaterializedHotStateBatch) -> Result<Self, LixError> {
         let mut visible = Self::default();
 
         for row in rows.iter() {
@@ -145,8 +145,8 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemDescriptorKey, FilesystemRowContext};
-    use crate::live_state::{
-        LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateRow,
+    use crate::hot_state::{
+        HotStateReader, HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateRow,
     };
 
     use super::{
@@ -155,14 +155,14 @@ mod tests {
     };
 
     fn visible_filesystem_from_rows(
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<MaterializedHotStateRow>,
     ) -> Result<VisibleFilesystem, LixError> {
-        VisibleFilesystem::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
+        VisibleFilesystem::from_live_batch(&MaterializedHotStateBatch::from_rows(rows))
     }
 
     #[tokio::test]
     async fn load_uses_expected_scan_filter() {
-        let reader = Arc::new(RecordingLiveStateReader {
+        let reader = Arc::new(RecordingHotStateReader {
             rows: vec![
                 directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -230,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn nested_directories_resolve_correctly() {
         let filesystem = VisibleFilesystem::load(
-            live_state(vec![
+            hot_state(vec![
                 directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
@@ -265,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn files_attach_to_directory_ids() {
         let filesystem = VisibleFilesystem::load(
-            live_state(vec![file_row(
+            hot_state(vec![file_row(
                 "01920000-0000-7000-8000-0000000000d2",
                 r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":"01920000-0000-7000-8000-000000000313","name":"readme.md"}"#,
             )]),
@@ -287,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn blob_refs_attach_to_file_ids() {
         let filesystem = VisibleFilesystem::load(
-            live_state(vec![blob_ref_row(
+            hot_state(vec![blob_ref_row(
                 "01920000-0000-7000-8000-0000000000d2",
                 r#"{"id":"01920000-0000-7000-8000-0000000000d2","blob_hash":"abc123","size_bytes":5}"#,
             )]),
@@ -374,33 +374,33 @@ mod tests {
         );
     }
 
-    fn live_state(rows: Vec<MaterializedLiveStateRow>) -> Arc<dyn LiveStateReader> {
-        Arc::new(RowsLiveStateReader { rows })
+    fn hot_state(rows: Vec<MaterializedHotStateRow>) -> Arc<dyn HotStateReader> {
+        Arc::new(RowsHotStateReader { rows })
     }
 
-    struct RecordingLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
-        last_request: Mutex<Option<LiveStateScanRequest>>,
+    struct RecordingHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
+        last_request: Mutex<Option<HotStateScanRequest>>,
     }
 
     #[async_trait]
-    impl LiveStateReader for RecordingLiveStateReader {
+    impl HotStateReader for RecordingHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             *self
                 .last_request
                 .lock()
                 .expect("recorded request lock should not be poisoned") = Some(request.clone());
-            Ok(MaterializedLiveStateBatch::from_rows(
+            Ok(MaterializedHotStateBatch::from_rows(
                 self.rows
                     .iter()
                     .filter(|row| {
@@ -419,24 +419,24 @@ mod tests {
         }
     }
 
-    struct RowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct RowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for RowsLiveStateReader {
+    impl HotStateReader for RowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            Ok(MaterializedLiveStateBatch::from_rows(
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            Ok(MaterializedHotStateBatch::from_rows(
                 self.rows
                     .iter()
                     .filter(|row| {
@@ -455,9 +455,9 @@ mod tests {
         }
     }
 
-    fn directory_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
+    fn directory_row(row_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
         live_row(
-            entity_pk,
+            row_pk,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             None,
             Some(snapshot_content),
@@ -465,9 +465,9 @@ mod tests {
         )
     }
 
-    fn file_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
+    fn file_row(row_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
         live_row(
-            entity_pk,
+            row_pk,
             FILE_DESCRIPTOR_SCHEMA_KEY,
             None,
             Some(snapshot_content),
@@ -475,11 +475,11 @@ mod tests {
         )
     }
 
-    fn blob_ref_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
+    fn blob_ref_row(row_pk: &str, snapshot_content: &str) -> MaterializedHotStateRow {
         live_row(
-            entity_pk,
+            row_pk,
             BLOB_REF_SCHEMA_KEY,
-            Some(entity_pk.to_string()),
+            Some(row_pk.to_string()),
             Some(snapshot_content),
             "01920000-0000-7000-8000-0000000000a1",
         )
@@ -493,22 +493,22 @@ mod tests {
     }
 
     fn live_row(
-        entity_pk: &str,
+        row_pk: &str,
         schema_key: &str,
         file_id: Option<String>,
         snapshot_content: Option<&str>,
         branch_id: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: crate::row_pk::RowPk::single(row_pk),
             schema_key: schema_key.to_string(),
             file_id,
             snapshot_content: snapshot_content.map(Into::into),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse(

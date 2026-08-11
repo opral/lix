@@ -1,24 +1,33 @@
 {
-  "Overview": [
+  "Start": [
     { "path": "./what-is-lix.md", "label": "What is Lix?" },
+    { "path": "./comparison-to-git.md", "label": "Comparison to Git" },
     { "path": "./getting-started.md", "label": "Getting Started" },
-    { "path": "./lix-for-ai-agents.md", "label": "Lix for AI Agents" },
-    { "path": "./comparison-to-git.md", "label": "Comparison to Git" }
+    { "path": "./javascript-quickstart.md", "label": "JavaScript Quickstart" },
+    { "path": "./rust-quickstart.md", "label": "Rust Quickstart" }
   ],
   "Concepts": [
     { "path": "./schemas.md", "label": "Schemas" },
-    { "path": "./semantic-changes.md", "label": "Semantic Changes" },
-    { "path": "./versions.md", "label": "Branches & Merging" },
-    { "path": "./checkpoints.md", "label": "Checkpoints" },
-    { "path": "./diff-commands.md", "label": "Diff Commands" },
-    { "path": "./history.md", "label": "Change History" },
-    { "path": "./surfaces.md", "label": "SQL Surfaces" }
-  ],
-  "Guides": [
+    { "path": "./diffs.md", "label": "Diffs" },
+    { "path": "./files-and-media.md", "label": "Files and Media" },
+    { "path": "./branching.md", "label": "Branching" },
+    { "path": "./history.md", "label": "History" },
+    {
+      "path": "./realtime-collaboration.md",
+      "label": "Real-time Collaboration"
+    },
     { "path": "./persistence.md", "label": "Persistence and Storage" }
   ],
+  "Guides": [
+    { "path": "./lix-for-ai-agents.md", "label": "Lix for AI Agents" },
+    { "path": "./hosting.md", "label": "Hosting" }
+  ],
   "Reference": [
+    { "path": "./checkpoints.md", "label": "Checkpoints" },
+    { "path": "./diff-commands.md", "label": "Diff Commands" },
+    { "path": "./surfaces.md", "label": "SQL Surfaces" },
     { "path": "./js-api-reference.md", "label": "JavaScript API" },
-    { "path": "./sql-functions.md", "label": "SQL Functions" }
+    { "path": "./sql-functions.md", "label": "SQL Functions" },
+    { "path": "./server-protocol.md", "label": "Server Protocol" }
   ]
 }

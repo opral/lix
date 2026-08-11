@@ -22,28 +22,28 @@ console.log(result.rows[0]?.get("message"));
 await lix.close();
 ```
 
-## Remote workspaces
+## Remote repositories
 
-Use the same Lix client as a thin client against a hosted workspace:
+Use the same Lix client as a thin client against a hosted repository:
 
 ```ts
 const lix = await openLix({
-	server: {
-		mode: "remote",
-		url: "https://lixray.com/@namespace/workspace",
-		headers: async () => ({
-			Authorization: `Bearer ${await accessToken()}`,
-		}),
-	},
+  server: {
+    mode: "remote",
+    url: "https://example.com/repositories/acme",
+    headers: async () => ({
+      Authorization: `Bearer ${await accessToken()}`,
+    }),
+  },
 });
 
 const files = lix.observe("SELECT path FROM lix_file ORDER BY path");
 const initial = await files.next();
 
-await lix.execute(
-	"INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-	["/hello.txt", new TextEncoder().encode("hello")],
-);
+await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
+  "/hello.txt",
+  new TextEncoder().encode("hello"),
+]);
 const update = await files.next();
 
 files.close();
@@ -55,59 +55,29 @@ open a local engine. Dynamic headers are resolved for every request and
 observation reconnect. An injected `fetch` can route requests through a service
 binding or another authorized server-side transport.
 
-Browser clients can opt into private, durable client state with the local
-storage adapter:
-
-```ts
-import { openLix } from "@lix-js/sdk";
-import { LocalStorage } from "@lix-js/sdk/local-storage-adapter";
-
-const lix = await openLix({
-	server: {
-		mode: "remote",
-		url: "https://lixray.com/@namespace/workspace",
-	},
-	storage: new LocalStorage(),
-});
-
-const previousUiState = lix.clientState.get("atelier-ui");
-await lix.clientState.set("atelier-ui", { sidebar: "history" });
-```
-
-`lix.clientState` is hydrated before `openLix()` resolves, so reads are
-synchronous. Its JSON values and the client's active branch are stored in a
-private local Lix snapshot; workspace SQL continues to execute only on the
-server. Reopening the same remote URL with the same storage restores both. Each
-remote server session is branch-pinned, so switching one client does not switch
-another client.
-
-After a remote branch switch succeeds, saving that branch as the next-reopen
-preference is best effort: a client-storage failure does not turn the completed
-server switch into a rejected operation. Explicit `lix.clientState.set()` and
-`.delete()` calls report durability failures to their caller. Because the local
-Rust transaction has already committed, `get()` continues to expose that live
-session value; a later successful snapshot save can make it durable.
+Remote server sessions are branch-pinned, so switching one client does not
+switch another client. Browser-local application state belongs to the
+application rather than the remote Lix handle.
 
 Filesystem sync uses native Node.js dependencies:
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "./workspace",
-		syncAllFiles: true,
-	}),
+  storage: new FilesystemStorage({ path: "./repository" }),
 });
 
 await lix.execute(
-	"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-	["/hello.txt", new TextEncoder().encode("world")],
+  "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+  ["/hello.txt", new TextEncoder().encode("world")],
 );
 
-const result = await lix.execute("SELECT content FROM lix_file WHERE path = $1", [
-	"/hello.txt",
-]);
+const result = await lix.execute(
+  "SELECT content FROM lix_file WHERE path = $1",
+  ["/hello.txt"],
+);
 const bytes = result.rows[0]?.value("content").asBytes();
 
 console.log(bytes && new TextDecoder().decode(bytes));
@@ -140,8 +110,8 @@ const draft = await lix.createBranch({ name: "Draft" });
 
 await lix.switchBranch({ branchId: draft.id });
 await lix.execute(
-	"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-	["/status.txt", new TextEncoder().encode("draft")],
+  "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+  ["/status.txt", new TextEncoder().encode("draft")],
 );
 
 await lix.switchBranch({ branchId: main });
@@ -155,35 +125,39 @@ const merge = await lix.mergeBranch({ sourceBranchId: draft.id });
 const tx = await lix.beginTransaction();
 
 try {
-	await tx.execute(
-		"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-		["/a.txt", new TextEncoder().encode("1")],
-	);
-	await tx.execute(
-		"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-		["/b.txt", new TextEncoder().encode("2")],
-	);
-	await tx.commit();
+  await tx.execute(
+    "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+    ["/a.txt", new TextEncoder().encode("1")],
+  );
+  await tx.execute(
+    "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+    ["/b.txt", new TextEncoder().encode("2")],
+  );
+  await tx.commit();
 } catch (error) {
-	await tx.rollback();
-	throw error;
+  await tx.rollback();
+  throw error;
 }
 ```
 
 ## Notes
 
-- `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
-- Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
-- Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
-- In browsers, local mode and remote mode with client storage load the Rust
-  engine as WebAssembly. Supplying a snapshot storage adapter persists that
-  local Lix; in remote mode, the local engine contains only client state.
-- `LocalFilesystem` is Node.js-only. Constructing it is safe in
+- `openLix()` opens a fresh in-memory Lix. Install `@lix-js/storage-filesystem` and pass `new FilesystemStorage({ path })` for a filesystem repository directory backed by `<path>/.lix/.internal/rocksdb`.
+- In browsers, pass `new IndexedDbStorage({ name })` to persist a complete local Lix across reloads.
+- Only one Lix handle may open an IndexedDB storage name at a time, including across browser tabs.
+- Pass `syncAllFiles: false` to start filesystem sync with no regular repository files, then call `storage.importPaths(["notes/today.md"])` on the `FilesystemStorage` instance to sync selected files. Imported paths are exact repository-relative file paths, not directories or globs.
+- In browsers, local mode and remote mode with IndexedDB storage load the Rust
+  engine as WebAssembly. In remote mode, the local engine contains only client
+  state.
+- `FilesystemStorage` is Node.js-only. Constructing it is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.
 - The package uses conditional ESM imports internally: Node.js resolves the
   native N-API binding, while browsers and other runtimes resolve the portable
   WebAssembly binding. Vite follows this split without consumer configuration.
+- If the native addon cannot load in Node.js, in-memory Lix instances fall back
+  to the bundled WebAssembly engine. Filesystem storage and Component API v1
+  plugin execution still require the native addon.
 - Every browser `openLix()` owns one dedicated worker, so database work does
   not block the page's main thread. Node.js uses the native binding's actor.
 - Node.js executes installed Component API v1 plugins with the Rust SDK's
@@ -206,8 +180,9 @@ try {
   Hosts that apply one policy to every response can use
   `script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'` globally
   instead. Worker-scoped headers keep those permissions out of the page.
+
 - SQL parameters use normal JavaScript values: `string`, finite `number`, `boolean`, `Uint8Array`, `null`, JSON-compatible arrays, and JSON-compatible plain objects.
-- Use `Value.integer(...)`, `Value.real(...)`, `Value.text(...)`, `Value.json(...)`, or `Value.blob(...)` only when you need to pass an explicit native Lix value.
+- Use `Value.integer(...)`, `Value.real(...)`, `Value.text(...)`, `Value.jsonb(...)`, `Value.timestamptz(...)`, or `Value.blob(...)` only when you need to pass an explicit native Lix value.
 
 ## Browser development
 

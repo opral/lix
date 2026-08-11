@@ -1,64 +1,58 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "x-lix-key": "markdown_node",
-  "x-lix-primary-key": ["/id"],
-  "x-lix-foreign-keys": [
-    {
-      "properties": ["/parent_id"],
-      "references": {
-        "schemaKey": "markdown_node",
-        "properties": ["/id"]
-      }
-    }
-  ],
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "markdown_node",
   "description": "A durable node in the authoritative GitHub Flavored Markdown syntax graph. Structural children are linked by parent_id and order_key; text-bearing leaves embed their inline AST.",
-  "type": "object",
-  "properties": {
-    "id": {
-      "type": "string",
-      "format": "uuid",
-      "x-lix-default": "lix_uuid_v7()",
+  "columns": [
+    {
+      "name": "format_json",
+      "type": "text",
+      "nullable": false,
+      "description": "Canonical JSON text for render-effective Markdown spelling choices. A document node may also carry a validated base64 lexical fallback for accepted noncanonical source bytes."
+    },
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false,
+      "default_expression": "uuidv7()",
       "description": "Stable UUIDv7 node primary key assigned by Lix on create."
     },
-    "kind": {
-      "type": "string",
-      "enum": [
-        "document",
-        "frontmatter",
-        "paragraph",
-        "heading",
-        "thematic_break",
-        "block_quote",
-        "list",
-        "list_item",
-        "code_block",
-        "html_block",
-        "definition",
-        "footnote_definition",
-        "table",
-        "table_column",
-        "table_row",
-        "table_cell"
-      ]
+    {
+      "name": "kind",
+      "type": "text",
+      "nullable": false
     },
-    "parent_id": {
-      "type": ["string", "null"],
-      "minLength": 1
-    },
-    "order_key": {
-      "type": ["string", "null"],
-      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$",
+    {
+      "name": "order_key",
+      "type": "text",
+      "nullable": true,
       "description": "Sibling position. Equal keys are legal and are deterministically ordered by id."
     },
-    "payload_json": {
-      "type": "string",
-      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because the durable entity profile does not admit JSON number nodes."
+    {
+      "name": "parent_id",
+      "type": "uuid",
+      "nullable": true
     },
-    "format_json": {
-      "type": "string",
-      "description": "Canonical JSON text for render-effective Markdown spelling choices. A document node may also carry a validated base64 lexical fallback for accepted noncanonical source bytes."
+    {
+      "name": "payload_json",
+      "type": "text",
+      "nullable": false,
+      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because the durable row profile does not admit JSON number nodes."
     }
-  },
-  "required": ["id", "kind", "parent_id", "order_key", "payload_json", "format_json"],
-  "additionalProperties": false
+  ],
+  "primary_key": [
+    "id"
+  ],
+  "foreign_keys": [
+    {
+      "columns": [
+        "parent_id"
+      ],
+      "references": {
+        "schema_key": "markdown_node",
+        "columns": [
+          "id"
+        ]
+      }
+    }
+  ]
 }

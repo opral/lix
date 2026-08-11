@@ -14,12 +14,14 @@ use super::common::{extract_json_path, json_text_value, scalar_inputs};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct LixJsonGetText {
     signature: Signature,
+    name: &'static str,
 }
 
 impl LixJsonGetText {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(name: &'static str) -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
+            name,
         }
     }
 }
@@ -30,7 +32,7 @@ impl ScalarUDFImpl for LixJsonGetText {
     }
 
     fn name(&self) -> &'static str {
-        "lix_json_get_text"
+        self.name
     }
 
     fn signature(&self) -> &Signature {
@@ -43,7 +45,7 @@ impl ScalarUDFImpl for LixJsonGetText {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.len() < 2 {
-            return plan_err!("lix_json_get_text requires at least 2 arguments");
+            return plan_err!("JSONB ->> requires 2 arguments");
         }
 
         let scalar_inputs = scalar_inputs(&args.args);
@@ -80,11 +82,11 @@ mod tests {
     #[tokio::test]
     async fn returns_unwrapped_text() {
         assert_eq!(
-            single_text("SELECT lix_json_get_text('{\"name\":\"Ada\"}', 'name')").await,
+            single_text("SELECT __lix_json_get_text('{\"name\":\"Ada\"}', 'name')").await,
             Some("Ada".to_string())
         );
         assert_eq!(
-            single_text("SELECT lix_json_get_text('{\"active\":true}', 'active')").await,
+            single_text("SELECT __lix_json_get_text('{\"active\":true}', 'active')").await,
             Some("true".to_string())
         );
     }
@@ -92,7 +94,7 @@ mod tests {
     #[tokio::test]
     async fn missing_path_returns_null() {
         assert_eq!(
-            single_text("SELECT lix_json_get_text('{\"name\":\"Ada\"}', 'missing')").await,
+            single_text("SELECT __lix_json_get_text('{\"name\":\"Ada\"}', 'missing')").await,
             None
         );
     }

@@ -11,7 +11,7 @@ use super::types::{
     CommitRecord, RebuildIndexStats,
 };
 use crate::LixError;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{StorageAdapter, StorageReadOptions, StorageWriteSetStats};
 
@@ -160,7 +160,7 @@ pub enum BenchChangeLookup {
 
 #[derive(Clone, Copy, Debug)]
 pub struct BenchDecodedAppendIndex {
-    objects: usize,
+    pub objects: usize,
 }
 
 pub fn append_1c_1ch() -> Result<BenchAppend, LixError> {
@@ -173,38 +173,6 @@ pub fn append_1c_100ch() -> Result<BenchAppend, LixError> {
 
 pub fn append_1c_1000ch() -> Result<BenchAppend, LixError> {
     direct_append_with_shape("bench-1c-1000ch", 1, 1_000)
-}
-
-pub fn append_100c_1000ch() -> Result<BenchAppend, LixError> {
-    direct_append_with_shape("bench-100c-1000ch", 100, 1_000)
-}
-
-pub fn append_1c_1000ch_small_inline_payloads() -> Result<BenchAppend, LixError> {
-    append_1c_1000ch()
-}
-
-pub fn append_1c_1000ch_large_inline_payloads() -> Result<BenchAppend, LixError> {
-    append_1c_1000ch()
-}
-
-pub fn append_1c_1000ch_external_payload_refs() -> Result<BenchAppend, LixError> {
-    append_1c_1000ch()
-}
-
-pub fn append_1c_1000ch_clustered_keys() -> Result<BenchAppend, LixError> {
-    append_1c_1000ch()
-}
-
-pub fn append_1c_1000ch_random_keys() -> Result<BenchAppend, LixError> {
-    append_1c_1000ch()
-}
-
-pub fn append_100c_1000ch_reused_keys_across_commits() -> Result<BenchAppend, LixError> {
-    append_100c_1000ch()
-}
-
-pub fn append_change_ref_fanout(fanout: usize) -> Result<BenchAppend, LixError> {
-    direct_append_with_shape("bench-fanout", fanout.max(1), fanout.max(1))
 }
 
 pub fn append_with_shape(
@@ -227,12 +195,15 @@ pub fn append_ordered_commits(
         let commit_index = first_commit_index
             .checked_add(offset)
             .ok_or_else(|| LixError::unknown("ordered benchmark commit index overflow"))?;
+        let commit_id = CommitId::with_change_address_space(ordered_bench_uuid(commit_index, 0));
         append.commits.push(CommitRecord {
-            format_version: 2,
-            commit_id: CommitId::new(ordered_bench_uuid(commit_index, 0)),
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 4,
+            commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -249,13 +220,23 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
     append.commits.reserve(commit_count);
     let mut parent_commit_id = None;
     for commit_index in 0..commit_count {
-        let commit_id = CommitId::new(ordered_bench_uuid(commit_index, 0));
+        let commit_id = CommitId::with_change_address_space(ordered_bench_uuid(commit_index, 0));
+        let parent_commit_ids = parent_commit_id.into_iter().collect::<Vec<_>>();
+        let parent = append.commits.last();
+        let parent_jump = parent.map(|parent| {
+            &append.commits[usize::try_from(parent.generation - parent.first_parent_jump_span)
+                .expect("benchmark jump generation fits usize")]
+        });
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            super::next_first_parent_jump(commit_id, &parent_commit_ids, parent, parent_jump)?;
         append.commits.push(CommitRecord {
-            format_version: 2,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 4,
             commit_id,
             generation: u64::try_from(commit_index).expect("benchmark commit index fits u64"),
-            parent_commit_ids: parent_commit_id.into_iter().collect(),
-            change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
+            parent_commit_ids,
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -267,12 +248,15 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
     Ok(BenchAppend { append })
 }
 
-pub fn append_1c_with_commit_change_id(
-    name: &str,
-    commit_change_id: &str,
-) -> Result<BenchAppend, LixError> {
+/// Builds a one-commit append whose commit — and therefore whose derived
+/// commit change id — is pinned to `commit_label`.
+///
+/// A commit's change id is `commit_id` at ordinal zero of its own change
+/// address space, so pinning the commit id pins both.
+pub fn append_1c_with_commit_id(name: &str, commit_label: &str) -> Result<BenchAppend, LixError> {
     let mut append = direct_append_with_shape(name, 1, 1)?;
-    append.append.commits[0].change_id = ChangeId::for_test_label(commit_change_id);
+    append.append.commits[0].commit_id =
+        CommitId::with_change_address_space(*CommitId::for_test_label(commit_label).as_uuid());
     Ok(append)
 }
 
@@ -281,16 +265,6 @@ pub fn corpus_100append_100c_1000ch() -> Result<BenchCorpus, LixError> {
         .map(|index| direct_append_with_shape(&format!("bench-corpus-{index}"), 1, 10))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BenchCorpus::from_append_batches(append_batches))
-}
-
-pub fn append_size_stats(append: &BenchAppend) -> Result<BenchSizeStats, LixError> {
-    let encoded_append_bytes = encode_bench_append(append)?.len();
-    Ok(BenchSizeStats {
-        encoded_append_bytes,
-        direct_commit_record_value_bytes: append.commit_count() * 96,
-        direct_change_record_value_bytes: append.change_count() * 96,
-        inline_payload_bytes: 0,
-    })
 }
 
 pub fn encode_bench_append(append: &BenchAppend) -> Result<Vec<u8>, LixError> {
@@ -324,20 +298,11 @@ pub fn view_bench_append(bytes: &[u8]) -> Result<usize, LixError> {
     Ok(bytes.len())
 }
 
-pub fn canonicalize_bench_append(append: BenchAppend) -> Result<BenchAppend, LixError> {
-    Ok(append)
-}
-
 pub fn validate_bench_append_shape(append: &BenchAppend) -> Result<(), LixError> {
     if append.append.commits.is_empty() {
         return Err(LixError::unknown("bench changelog append has no commits"));
     }
     Ok(())
-}
-
-pub fn decode_bench_append_index(bytes: &[u8]) -> Result<BenchDecodedAppendIndex, LixError> {
-    let append = decode_bench_append(bytes)?;
-    build_decoded_append_index(&append)
 }
 
 pub fn build_decoded_append_index(
@@ -348,52 +313,7 @@ pub fn build_decoded_append_index(
     })
 }
 
-pub fn locate_first_commit_with_decoded_index(
-    _append: &BenchAppend,
-    index: &BenchDecodedAppendIndex,
-) -> Result<usize, LixError> {
-    Ok(index.objects.min(1))
-}
-
-pub fn locate_first_change_with_decoded_index(
-    _append: &BenchAppend,
-    index: &BenchDecodedAppendIndex,
-) -> Result<usize, LixError> {
-    Ok(index.objects.min(1))
-}
-
-pub fn locate_last_change_with_decoded_index(
-    _append: &BenchAppend,
-    index: &BenchDecodedAppendIndex,
-) -> Result<usize, LixError> {
-    Ok(index.objects)
-}
-
-pub fn resolve_inline_payloads(_append: &BenchAppend) -> Result<usize, LixError> {
-    Ok(0)
-}
-
-pub fn build_direct_commit_record_entries(append: &BenchAppend) -> Result<usize, LixError> {
-    Ok(append.commit_count())
-}
-
 pub fn build_direct_change_record_entries(append: &BenchAppend) -> Result<usize, LixError> {
-    Ok(append.change_count())
-}
-
-pub fn project_first_change_to_logical(append: &BenchAppend) -> Result<usize, LixError> {
-    Ok(append.change_ids().first().map(String::len).unwrap_or(0))
-}
-
-pub fn validate_first_commit_checksum(_append: &BenchAppend) -> Result<(), LixError> {
-    Ok(())
-}
-
-pub fn validate_first_change_checksum(_append: &BenchAppend) -> Result<(), LixError> {
-    Ok(())
-}
-
-pub fn validate_publication_closure(append: &BenchAppend) -> Result<usize, LixError> {
     Ok(append.change_count())
 }
 
@@ -536,17 +456,6 @@ where
     load_changes_with_lookup(store, change_ids, BenchChangeLookup::Record).await
 }
 
-pub async fn load_changes_direct_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
-    store: &BenchStore<StorageImpl>,
-    change_ids: &[S],
-    lookup: BenchChangeLookup,
-) -> Result<usize, LixError>
-where
-    StorageImpl: BenchStorage + Sync,
-{
-    load_changes_with_lookup(store, change_ids, lookup).await
-}
-
 pub async fn prepare_rebuild_store<StorageImpl>(
     storage: StorageImpl,
     corpus: &BenchCorpus,
@@ -585,20 +494,23 @@ fn direct_append_with_shape(
     let mut next_change = 0usize;
     for commit_index in 0..commit_count {
         let commit_id = format!("{name}-commit-{commit_index}");
-        let commit_change_id = format!("{commit_id}:commit");
-        let typed_commit_id = CommitId::for_test_label(&commit_id);
+        // Real commits are minted through `with_change_address_space`; fixtures
+        // must match or their derived commit change id lands inside the packed
+        // change range.
+        let typed_commit_id =
+            CommitId::with_change_address_space(*CommitId::for_test_label(&commit_id).as_uuid());
         let remaining = change_count.saturating_sub(next_change);
         let take = remaining.min(changes_per_commit);
         for _ in 0..take {
             let change_id = format!("{name}-change-{next_change}");
             let typed_change_id = ChangeId::for_test_label(&change_id);
-            let entity_pk = EntityPk::single(format!("entity-{next_change}"));
+            let row_pk = RowPk::single(format!("row-{next_change}"));
             append.changes.push(ChangeRecord {
                 format_version: 1,
                 change_id: typed_change_id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 schema_key: "message".to_string(),
-                entity_pk: entity_pk.clone(),
+                row_pk: row_pk.clone(),
                 file_id: None,
                 snapshot: crate::json_store::JsonSlot::from_json(&format!(
                     "{{\"value\":{next_change}}}"
@@ -613,11 +525,13 @@ fn direct_append_with_shape(
             next_change += 1;
         }
         append.commits.push(CommitRecord {
-            format_version: 2,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 4,
             commit_id: typed_commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            change_id: ChangeId::for_test_label(&commit_change_id),
+            first_parent_jump_commit_id: typed_commit_id,
+            first_parent_jump_span: 0,
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -805,12 +719,15 @@ mod tests {
 
         assert_eq!(commits.len(), 3);
         assert!(commits.windows(2).all(|pair| {
-            pair[0].commit_id < pair[1].commit_id && pair[0].change_id < pair[1].change_id
+            pair[0].commit_id < pair[1].commit_id && pair[0].change_id() < pair[1].change_id()
         }));
+        // The commit change id is the commit id at ordinal zero of the commit's
+        // own change address space, so the two ids now agree by construction and
+        // the fixture only has to prove the commit ids are v7 and distinct.
         assert!(commits.iter().all(|commit| {
             commit.commit_id.as_uuid().get_version_num() == 7
-                && commit.change_id.as_uuid().get_version_num() == 7
-                && commit.commit_id.as_uuid() != commit.change_id.as_uuid()
+                && commit.change_id().as_uuid() == commit.commit_id.as_uuid()
+                && commit.commit_id.as_uuid().as_bytes()[12..] == [0; 4]
         }));
     }
 }

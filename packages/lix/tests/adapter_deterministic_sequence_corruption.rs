@@ -1,7 +1,7 @@
 use std::ops::Bound;
 
 use bytes::Bytes;
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::{
     BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
     ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
@@ -9,7 +9,7 @@ use lix::storage::{
 };
 
 const HOT_ROW_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0004_001b), "live_state.hot_row.v21");
+    StorageSpace::mutable(SpaceId(0x0004_001b), "hot_state.row.v21");
 const SEQUENCE_IDENTITY: &[u8] = b"lix_deterministic_sequence_number";
 const UNRELATED_IDENTITY: &[u8] = b"lix_unrelated_sequence_substitute";
 
@@ -17,35 +17,29 @@ pub async fn initialize_with_deterministic_mode<S>(storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("storage should initialize");
-    let engine = Engine::new(storage).await.expect("engine should open");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("workspace session should open");
-    session
-        .execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-             VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
-            &[],
-        )
-        .await
-        .expect("deterministic mode should enable without publishing a sequence row");
+        .expect("repository should open");
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+             VALUES ('lix_deterministic_mode', CAST('{\"enabled\":true}' AS JSONB), true, true)",
+        &[],
+    )
+    .await
+    .expect("deterministic mode should enable without publishing a sequence row");
 }
 
 pub async fn assert_next_uuid<S>(storage: S, suffix: &str)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage).await.expect("engine should reopen");
-    let session = engine
-        .open_workspace_session()
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("workspace session should reopen");
-    let result = session
-        .execute("SELECT lix_uuid_v7() AS value", &[])
+        .expect("repository should reopen");
+    let result = lix
+        .execute("SELECT uuidv7() AS value", &[])
         .await
         .expect("valid deterministic authority should produce the next UUID");
     let value = result.rows()[0]
@@ -79,16 +73,16 @@ where
         .await
         .expect("HOT member scan should begin");
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(lix::storage::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("HOT members should scan");
+            .expect("HOT members should scan")
+            .into_parts();
         sequence_entries.extend(
-            page.entries
-                .into_iter()
+            page.into_iter()
                 .filter(|entry| contains_subslice(entry.key.0.as_ref(), SEQUENCE_IDENTITY)),
         );
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -139,15 +133,12 @@ pub async fn assert_missing_sequence_member_fails_closed<S>(storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
         .expect("member-corrupt repository should open structurally");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("member-corrupt session should open");
-    let error = session
-        .execute("SELECT lix_uuid_v7()", &[])
+    let error = lix
+        .execute("SELECT uuidv7()", &[])
         .await
         .expect_err("missing selected sequence member must fail closed");
     assert!(

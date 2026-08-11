@@ -26,13 +26,13 @@ use crate::common::{json_pointer_get, validate_row_metadata};
 #[cfg(test)]
 use crate::domain::DomainFileScope;
 use crate::domain::{Domain, DomainRowIdentity, committed_row_ref_is_exact_branch_scoped};
-use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateReadDomain, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateRowRef,
+use crate::row_pk::{RowPk, RowPkError, canonical_json_text};
+use crate::hot_state::{
+    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
+    HotStateReadDomain, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
+    MaterializedHotStateRowRef,
 };
-use crate::plugin::PLUGIN_OWNER_KEY;
+use crate::plugin::runtime::PLUGIN_OWNER_KEY;
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
 use crate::schema::{
@@ -44,9 +44,10 @@ use crate::transaction::staging::{
     PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
 };
 #[cfg(test)]
-use crate::transaction::types::TransactionWriteOrigin;
-use crate::transaction::types::{
-    PreparedStateBatch, PreparedStateRowRef, TransactionWriteOperation,
+use crate::transaction_types::TransactionWriteOrigin;
+use crate::transaction_types::{
+    PreparedStateBatch, PreparedStateRowRef, StagedIndexRow, StagedIndexValues,
+    TransactionWriteOperation,
 };
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -63,7 +64,7 @@ const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a PreparedWriteValidationSet<'a>,
     schema_catalog: &'a CatalogSnapshot,
-    live_state: &'a dyn LiveStateReader,
+    hot_state: &'a dyn HotStateReader,
     staged_commit_ids: BTreeSet<CommitId>,
     trust_filesystem_planner: bool,
 }
@@ -72,12 +73,12 @@ impl<'a> TransactionValidationInput<'a> {
     pub(crate) fn new(
         staged_writes: &'a PreparedWriteValidationSet<'a>,
         schema_catalog: &'a CatalogSnapshot,
-        live_state: &'a dyn LiveStateReader,
+        hot_state: &'a dyn HotStateReader,
     ) -> Self {
         Self {
             staged_writes,
             schema_catalog,
-            live_state,
+            hot_state,
             staged_commit_ids: BTreeSet::new(),
             trust_filesystem_planner: false,
         }
@@ -100,14 +101,14 @@ impl<'a> TransactionValidationInput<'a> {
     fn from_visible_schemas_for_tests(
         staged_writes: &'a PreparedWriteSet,
         visible_schemas: &'a [JsonValue],
-        live_state: &'a dyn LiveStateReader,
+        hot_state: &'a dyn HotStateReader,
     ) -> Self {
         let catalog = Box::leak(Box::new(
             CatalogSnapshot::from_visible_schemas(visible_schemas)
                 .expect("test schema catalog should build"),
         ));
         let validation_set = Box::leak(Box::new(staged_writes.validation_set_for_tests()));
-        Self::new(validation_set, catalog, live_state)
+        Self::new(validation_set, catalog, hot_state)
     }
 }
 
@@ -116,15 +117,15 @@ impl<'a> TransactionValidationInput<'a> {
 /// The ordinary case remains dense and therefore retains only the batch
 /// owner. A defensive post-scan filter allocates one compact ordinal column
 /// after the first rejected row; it never rebuilds rows or their payloads.
-struct CommittedLiveStateRows {
-    batch: MaterializedLiveStateBatch,
+struct CommittedHotStateRows {
+    batch: MaterializedHotStateBatch,
     selected: Option<Vec<u32>>,
 }
 
-impl CommittedLiveStateRows {
+impl CommittedHotStateRows {
     fn select(
-        batch: MaterializedLiveStateBatch,
-        mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
+        batch: MaterializedHotStateBatch,
+        mut keep: impl FnMut(MaterializedHotStateRowRef<'_>) -> bool,
     ) -> Result<Self, LixError> {
         u32::try_from(batch.len()).map_err(|_| {
             LixError::new(
@@ -166,14 +167,14 @@ impl CommittedLiveStateRows {
             .map_or_else(|| self.batch.len(), Vec::len)
     }
 
-    fn iter(&self) -> CommittedLiveStateRowsIter<'_> {
-        CommittedLiveStateRowsIter {
+    fn iter(&self) -> CommittedHotStateRowsIter<'_> {
+        CommittedHotStateRowsIter {
             rows: self,
             next: 0,
         }
     }
 
-    fn row(&self, index: usize) -> MaterializedLiveStateRowRef<'_> {
+    fn row(&self, index: usize) -> MaterializedHotStateRowRef<'_> {
         let batch_index = self
             .selected
             .as_ref()
@@ -181,7 +182,7 @@ impl CommittedLiveStateRows {
         self.batch.row(batch_index)
     }
 
-    fn first(&self) -> Option<MaterializedLiveStateRowRef<'_>> {
+    fn first(&self) -> Option<MaterializedHotStateRowRef<'_>> {
         self.iter().next()
     }
 
@@ -191,13 +192,13 @@ impl CommittedLiveStateRows {
     }
 }
 
-struct CommittedLiveStateRowsIter<'a> {
-    rows: &'a CommittedLiveStateRows,
+struct CommittedHotStateRowsIter<'a> {
+    rows: &'a CommittedHotStateRows,
     next: usize,
 }
 
-impl<'a> Iterator for CommittedLiveStateRowsIter<'a> {
-    type Item = MaterializedLiveStateRowRef<'a>;
+impl<'a> Iterator for CommittedHotStateRowsIter<'a> {
+    type Item = MaterializedHotStateRowRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next == self.rows.len() {
@@ -218,19 +219,19 @@ impl<'a> Iterator for CommittedLiveStateRowsIter<'a> {
     }
 }
 
-impl ExactSizeIterator for CommittedLiveStateRowsIter<'_> {}
+impl ExactSizeIterator for CommittedHotStateRowsIter<'_> {}
 
 async fn scan_committed_constraint_rows(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
     schema_keys: Vec<String>,
-    entity_pks: Vec<EntityPk>,
+    row_pks: Vec<RowPk>,
     include_tombstones: bool,
-) -> Result<CommittedLiveStateRows, LixError> {
-    let request = LiveStateScanRequest {
-        filter: LiveStateFilter {
+) -> Result<CommittedHotStateRows, LixError> {
+    let request = HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: schema_keys.clone(),
-            entity_pks: entity_pks.clone(),
+            row_pks: row_pks.clone(),
             branch_ids: vec![domain.branch_id().to_string()],
             file_ids: domain.file_filters(),
             untracked: Some(domain.untracked()),
@@ -239,29 +240,68 @@ async fn scan_committed_constraint_rows(
         },
         ..Default::default()
     };
-    let batch = live_state
+    let batch = hot_state
         .scan_domain_batch(
             &request,
             if domain.untracked() {
-                LiveStateReadDomain::Untracked
+                HotStateReadDomain::Untracked
             } else {
-                LiveStateReadDomain::Tracked
+                HotStateReadDomain::Tracked
             },
         )
         .await?;
-    CommittedLiveStateRows::select(batch, |row| {
+    CommittedHotStateRows::select(batch, |row| {
         domain.contains_ref(row)
             && (schema_keys.is_empty() || schema_keys.iter().any(|key| key == row.schema_key()))
-            && (entity_pks.is_empty() || entity_pks.contains(row.entity_pk()))
+            && (row_pks.is_empty() || row_pks.contains(row.row_pk()))
+    })
+}
+
+/// The tracked committed rows of one collection whose declared column equals a
+/// value, resolved through the hot index plane when it can serve the column.
+///
+/// The index resolves to candidate identities inside the live-state reader; if
+/// the collection has no completeness witness the reader silently keeps its
+/// ordinary scan, so this is an access-path choice and never a semantic one.
+/// The caller re-checks every returned row's actual value.
+async fn scan_committed_constraint_rows_by_declared_column(
+    hot_state: &dyn HotStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    declared_column_eq: crate::hot_state::DeclaredColumnEq,
+) -> Result<CommittedHotStateRows, LixError> {
+    let request = HotStateScanRequest {
+        filter: HotStateFilter {
+            schema_keys: vec![schema_key.to_string()],
+            branch_ids: vec![domain.branch_id().to_string()],
+            file_ids: domain.file_filters(),
+            untracked: Some(domain.untracked()),
+            declared_column_eq: Some(declared_column_eq),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let batch = hot_state
+        .scan_domain_batch(
+            &request,
+            if domain.untracked() {
+                HotStateReadDomain::Untracked
+            } else {
+                HotStateReadDomain::Tracked
+            },
+        )
+        .await?;
+    CommittedHotStateRows::select(batch, |row| {
+        domain.contains_ref(row) && row.schema_key() == schema_key
     })
 }
 
 async fn scan_committed_canonical_rows(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
     schema_key: &str,
-    entity_pks: Vec<EntityPk>,
-) -> Result<CommittedLiveStateRows, LixError> {
+    row_pks: Vec<RowPk>,
+) -> Result<CommittedHotStateRows, LixError> {
     let file_id = match domain.file_filters().as_slice() {
         [] => None,
         [NullableKeyFilter::Null] => None,
@@ -273,66 +313,57 @@ async fn scan_committed_canonical_rows(
             ));
         }
     };
-    let requested_entity_pks = entity_pks.clone();
-    let rows = entity_pks
+    let requested_row_pks = row_pks.clone();
+    let rows = row_pks
         .into_iter()
-        .map(|entity_pk| LiveStateExactRowRequest {
+        .map(|row_pk| HotStateExactRowRequest {
             schema_key: schema_key.to_string(),
             branch_id: domain.branch_id().to_string(),
-            entity_pk,
+            row_pk,
             file_id: file_id.clone(),
         })
         .collect::<Vec<_>>();
-    let projection = LiveStateProjection {
+    let projection = HotStateProjection {
         columns: vec![
             "schema_key".to_string(),
-            "entity_pk".to_string(),
+            "row_pk".to_string(),
             "file_id".to_string(),
             "deleted".to_string(),
             "untracked".to_string(),
         ],
     };
-    // Probe the two authenticated selectors independently. Each request is
+    // One plane means one row per identity, so a single retention-agnostic
+    // probe already returns whichever member owns the identity. The request is
     // exactly K identities and therefore remains bounded by the directory
     // point-read path; no schema or `All` expansion is permitted here.
-    let tracked = live_state
-        .load_exact_batch(&LiveStateExactBatchRequest {
-            rows: rows.clone(),
-            projection: projection.clone(),
-            untracked: Some(false),
-            include_tombstones: false,
-        })
-        .await?;
-    let untracked = live_state
-        .load_exact_batch(&LiveStateExactBatchRequest {
+    let batch = hot_state
+        .load_exact_batch(&HotStateExactBatchRequest {
             rows,
             projection,
-            untracked: Some(true),
+            untracked: None,
             include_tombstones: false,
         })
-        .await?;
-    let mut rows = tracked.into_present_batch().into_rows();
-    rows.extend(untracked.into_present_batch().into_rows());
-    let batch = MaterializedLiveStateBatch::from_rows(rows);
-    CommittedLiveStateRows::select(batch, |row| {
+        .await?
+        .into_present_batch();
+    CommittedHotStateRows::select(batch, |row| {
         domain.contains_canonical_ref(row)
             && row.schema_key() == schema_key
-            && requested_entity_pks.contains(row.entity_pk())
+            && requested_row_pks.contains(row.row_pk())
     })
 }
 
 async fn load_committed_constraint_rows(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
     schema_key: &str,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     include_tombstones: bool,
-) -> Result<CommittedLiveStateRows, LixError> {
+) -> Result<CommittedHotStateRows, LixError> {
     scan_committed_constraint_rows(
-        live_state,
+        hot_state,
         domain,
         vec![schema_key.to_string()],
-        vec![entity_pk],
+        vec![row_pk],
         include_tombstones,
     )
     .await
@@ -351,7 +382,7 @@ async fn load_committed_constraint_rows(
 /// coalesced staged write set.
 pub(crate) async fn validate_prepared_writes(
     input: TransactionValidationInput<'_>,
-) -> Result<(), LixError> {
+) -> Result<StagedIndexValues, LixError> {
     validate_foreign_key_definitions(input.schema_catalog)?;
     let staged_rows = input.staged_writes.rows().collect::<Vec<_>>();
     let constraint_rows = input.staged_writes.constraint_rows().collect::<Vec<_>>();
@@ -370,13 +401,22 @@ pub(crate) async fn validate_prepared_writes(
                 "lix.perf.validation.insert_identities"
             ))
             .await?;
-        return Ok(());
+        // Extraction is skipped here, and that is sound rather than lucky.
+        // Every row on this path carries `!requires_transaction_validation`,
+        // which `normalization.rs` grants only when the schema declares no
+        // uniques and no foreign keys — precisely the schemas whose
+        // `indexed_columns` is empty — or when `constraints_unchanged` proves
+        // an UPDATE assigned none of the primary key, uniques, or foreign-key
+        // local properties, a strict superset of the indexed columns. See
+        // `declared_column_rows_never_bypass_extraction`.
+        return Ok(StagedIndexValues::default());
     }
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut validated_constraint_rows =
         BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
     let mut file_owner_validator = FileOwnerReferenceValidator::default();
     let mut staged_snapshots = Vec::new();
+    let mut index_extractor = StagedIndexExtractor::new(input.schema_catalog);
     for row in &constraint_rows {
         let row = *row;
         let Some(snapshot) = row.snapshot_json() else {
@@ -414,6 +454,13 @@ pub(crate) async fn validate_prepared_writes(
                 validate_primary_key_identity(row, schema_plan, snapshot)?;
             }
             pending_constraints.remember_foreign_key_references(row, schema_plan, snapshot)?;
+            // The hot index plane's values are lifted out here, where the
+            // snapshot is already a parsed `JsonValue` that validation owns.
+            // Commit therefore receives them pre-extracted and never decodes a
+            // snapshot again — `StageJson::value()` panics after this point on
+            // purpose, and routing around it with a second
+            // `serde_json::from_str` was a whole extra parse of every row.
+            index_extractor.observe(row, snapshot);
             staged_snapshots.push((row, schema_plan, snapshot));
         } else {
             pending_constraints.remember_tombstone(row);
@@ -466,7 +513,94 @@ pub(crate) async fn validate_prepared_writes(
             "lix.perf.validation.filesystem_namespace"
         ))
         .await?;
-    Ok(())
+    Ok(index_extractor.finish())
+}
+
+/// Lifts declared-column values out of snapshots validation has already
+/// parsed, so the commit-time hot index hook needs no JSON decode of its own.
+///
+/// Schema surface specs are derived once per schema key and memoized, because
+/// a bulk insert visits one schema thousands of times.
+struct StagedIndexExtractor<'a> {
+    schema_catalog: &'a CatalogSnapshot,
+    specs: BTreeMap<String, Option<std::sync::Arc<crate::sql2::SchemaSurfaceSpec>>>,
+    values: StagedIndexValues,
+}
+
+impl<'a> StagedIndexExtractor<'a> {
+    fn new(schema_catalog: &'a CatalogSnapshot) -> Self {
+        Self {
+            schema_catalog,
+            specs: BTreeMap::new(),
+            values: StagedIndexValues::default(),
+        }
+    }
+
+    fn observe(&mut self, row: PreparedValidationRow<'_>, snapshot: &JsonValue) {
+        if row.schema_key() == REGISTERED_SCHEMA_KEY {
+            // A schema registration is the moment a collection's index is
+            // complete for free: no row can exist for a schema that is not
+            // registered yet, so an empty index is a correct index and the
+            // witness costs one key per declared column. The registration
+            // row's `value` column carries the schema document itself.
+            let registered = snapshot.get("value").unwrap_or(snapshot);
+            if let Ok(spec) = crate::sql2::derive_schema_surface_spec_from_schema(registered) {
+                for column in &spec.indexed_columns {
+                    self.values
+                        .registered_collections
+                        .insert((spec.schema_key.clone(), column.ordinal));
+                }
+            }
+            return;
+        }
+        let schema_catalog = self.schema_catalog;
+        let spec = self
+            .specs
+            .entry(row.schema_key().to_owned())
+            .or_insert_with(|| {
+                schema_catalog
+                    .schema(row.schema_key())
+                    .and_then(|schema| {
+                        crate::sql2::derive_schema_surface_spec_from_schema(schema).ok()
+                    })
+                    .map(std::sync::Arc::new)
+            })
+            .clone();
+        let Some(spec) = spec else {
+            return;
+        };
+        if spec.indexed_columns.is_empty() {
+            return;
+        }
+        let PreparedValidationRow::State(state_row) = row;
+        self.values.rows.push(StagedIndexRow {
+            branch_id: state_row.branch_id.clone(),
+            schema_key: state_row.schema_key.clone(),
+            row_pk: state_row.row_pk.clone(),
+            columns: spec
+                .indexed_columns
+                .iter()
+                .map(|column| (column.ordinal, hot_index_value(snapshot, column)))
+                .collect(),
+        });
+    }
+
+    fn finish(self) -> StagedIndexValues {
+        self.values
+    }
+}
+
+/// The two JSON scalar shapes the index plane has an order-preserving key
+/// encoding for. Everything else stays on the collection scan.
+fn hot_index_value(
+    snapshot: &JsonValue,
+    column: &crate::sql2::SchemaIndexedColumn,
+) -> Option<crate::hot_state::HotIndexValue> {
+    match snapshot.get(&column.name)? {
+        JsonValue::String(value) => Some(crate::hot_state::HotIndexValue::String(value.clone())),
+        JsonValue::Number(value) => value.as_i64().map(crate::hot_state::HotIndexValue::Integer),
+        _ => None,
+    }
 }
 
 fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<'_>]) -> bool {
@@ -488,7 +622,7 @@ fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<
 /// Returns whether every prepared row carries the same tracked, row-local
 /// validation certificate that the per-schema validation path recognizes.
 ///
-/// Normal tracked entity writes reach commit with this certificate. Checking
+/// Normal tracked row writes reach commit with this certificate. Checking
 /// it before constructing the validation index avoids allocating one wrapper
 /// and BTreeMap entry per row only to discover every schema scope can skip
 /// validation independently.
@@ -581,7 +715,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
             FILE_DESCRIPTOR_SCHEMA_KEY => {
                 if row.file_id.map(crate::common::SharedStr::as_str)
                     != Some(file_content.file_id.as_str())
-                    || row.entity_pk.as_single_string_owned().ok().as_deref()
+                    || row.row_pk.as_single_string_owned().ok().as_deref()
                         != Some(file_content.file_id.as_str())
                     || !filesystem_planner_validated_insert(&PreparedValidationRow::State(row))
                     || descriptor.replace((row_index, row)).is_some()
@@ -596,7 +730,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
                 // remains a public INSERT under the outer file INSERT mode.
                 if row.file_id.map(crate::common::SharedStr::as_str)
                     != Some(file_content.file_id.as_str())
-                    || row.entity_pk.as_single_string_owned().ok().as_deref()
+                    || row.row_pk.as_single_string_owned().ok().as_deref()
                         != Some(file_content.file_id.as_str())
                     || !(row.origin.is_none() || plugin_reconciliation_update(row))
                     || row.facts.requires_transaction_validation
@@ -618,7 +752,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
                 }
                 if row.schema_key == "lix_key_value"
                     && row
-                        .entity_pk
+                        .row_pk
                         .as_single_string()
                         .is_ok_and(|key| key == PLUGIN_OWNER_KEY)
                 {
@@ -701,7 +835,7 @@ async fn validate_directory_descriptor_parent_graph(
 ) -> Result<(), LixError> {
     let scopes = staged_directory_descriptor_scopes(staged_rows);
     for scope in scopes {
-        let mut parents = committed_directory_parent_map(input.live_state, &scope).await?;
+        let mut parents = committed_directory_parent_map(input.hot_state, &scope).await?;
         apply_staged_directory_parent_rows(constraint_rows, &scope, &mut parents)?;
         validate_directory_parent_map(&scope, &parents)?;
     }
@@ -728,10 +862,10 @@ async fn validate_registered_schema_identity_is_canonical(
         reject_reserved_schema_namespace(&key)?;
 
         let committed_rows = load_committed_constraint_rows(
-            input.live_state,
+            input.hot_state,
             &pending_row.domain().with_exact_file_scope(None),
             REGISTERED_SCHEMA_KEY,
-            pending_row.entity_pk().clone(),
+            pending_row.row_pk().clone(),
             false,
         )
         .await?;
@@ -784,13 +918,13 @@ fn staged_directory_descriptor_scopes(
 }
 
 async fn committed_directory_parent_map(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     scope: &DirectoryDescriptorScope,
 ) -> Result<BTreeMap<String, Option<String>>, LixError> {
     let mut parents = BTreeMap::new();
     for domain in scope.domain.directory_parent_domains() {
         let rows = scan_committed_constraint_rows(
-            live_state,
+            hot_state,
             &domain,
             vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
             Vec::new(),
@@ -813,7 +947,7 @@ async fn committed_directory_parent_map(
 }
 
 fn committed_directory_row_is_in_domain(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     _scope: &DirectoryDescriptorScope,
     domain: &Domain,
 ) -> bool {
@@ -832,7 +966,7 @@ fn apply_staged_directory_parent_rows(
         {
             continue;
         }
-        let id = row.entity_pk().as_single_string_owned()?;
+        let id = row.row_pk().as_single_string_owned()?;
         let Some(snapshot) = row.snapshot_json() else {
             parents.remove(&id);
             continue;
@@ -917,27 +1051,27 @@ fn optional_snapshot_string(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct FilesystemNamespaceIdentity {
     schema_key: String,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FilesystemNamespaceOccupant {
     Directory {
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         parent_id: Option<String>,
         name: String,
     },
     File {
-        entity_pk: EntityPk,
+        row_pk: RowPk,
         directory_id: Option<String>,
         entry_name: String,
     },
 }
 
 impl FilesystemNamespaceOccupant {
-    fn entity_pk(&self) -> &EntityPk {
+    fn row_pk(&self) -> &RowPk {
         match self {
-            Self::Directory { entity_pk, .. } | Self::File { entity_pk, .. } => entity_pk,
+            Self::Directory { row_pk, .. } | Self::File { row_pk, .. } => row_pk,
         }
     }
 
@@ -976,7 +1110,7 @@ async fn validate_filesystem_namespace(
             continue;
         }
         let mut occupants =
-            committed_filesystem_namespace_occupants(input.live_state, &domain).await?;
+            committed_filesystem_namespace_occupants(input.hot_state, &domain).await?;
         apply_staged_filesystem_namespace_rows(staged_rows, &domain, &mut occupants)?;
         validate_filesystem_namespace_occupants(&domain, occupants)?;
     }
@@ -1033,7 +1167,7 @@ async fn filesystem_namespace_domain_changed(
                 && insert.row.untracked == row.untracked()
                 && insert.row.file_id.map(crate::common::SharedStr::as_str) == row.file_id()
                 && insert.row.schema_key == row.schema_key()
-                && insert.row.entity_pk == row.entity_pk()
+                && insert.row.row_pk == row.row_pk()
         })
     {
         return Ok(true);
@@ -1042,10 +1176,10 @@ async fn filesystem_namespace_domain_changed(
         return Ok(true);
     };
     let committed_rows = load_committed_constraint_rows(
-        input.live_state,
+        input.hot_state,
         domain,
         row.schema_key(),
-        row.entity_pk().clone(),
+        row.row_pk().clone(),
         false,
     )
     .await?;
@@ -1091,9 +1225,9 @@ fn filesystem_planner_validated_insert(row: &PreparedValidationRow<'_>) -> bool 
         && primary_key.columns[0] == "id"
         && primary_key.values.len() == 1
         && row
-            .entity_pk()
+            .row_pk()
             .as_single_string_owned()
-            .is_ok_and(|entity_pk| primary_key.values[0] == entity_pk)
+            .is_ok_and(|row_pk| primary_key.values[0] == row_pk)
 }
 
 fn staged_filesystem_namespace_domains(
@@ -1111,11 +1245,11 @@ fn staged_filesystem_namespace_domains(
 }
 
 async fn committed_filesystem_namespace_occupants(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
 ) -> Result<BTreeMap<FilesystemNamespaceIdentity, FilesystemNamespaceOccupant>, LixError> {
     let rows = scan_committed_constraint_rows(
-        live_state,
+        hot_state,
         domain,
         vec![
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -1138,7 +1272,7 @@ async fn committed_filesystem_namespace_occupants(
 }
 
 fn committed_filesystem_row_is_in_domain(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     domain: &Domain,
 ) -> bool {
     (row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
@@ -1164,7 +1298,7 @@ fn apply_staged_filesystem_namespace_rows(
         }
         let identity = FilesystemNamespaceIdentity {
             schema_key: row.schema_key().to_string(),
-            entity_pk: row.entity_pk().clone(),
+            row_pk: row.row_pk().clone(),
         };
         let Some(snapshot) = row.snapshot_json() else {
             occupants.remove(&identity);
@@ -1179,20 +1313,20 @@ fn apply_staged_filesystem_namespace_rows(
 }
 
 fn filesystem_namespace_occupant_from_live_row(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
 ) -> Result<Option<(FilesystemNamespaceIdentity, FilesystemNamespaceOccupant)>, LixError> {
     let Some(snapshot_content) = row.snapshot_content().map(|snapshot| snapshot.as_str()) else {
         return Ok(None);
     };
     let identity = FilesystemNamespaceIdentity {
         schema_key: row.schema_key().to_owned(),
-        entity_pk: row.entity_pk().clone(),
+        row_pk: row.row_pk().clone(),
     };
     let occupant = match row.schema_key() {
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-            directory_namespace_occupant(row.entity_pk(), snapshot_content)?
+            directory_namespace_occupant(row.row_pk(), snapshot_content)?
         }
-        FILE_DESCRIPTOR_SCHEMA_KEY => file_namespace_occupant(row.entity_pk(), snapshot_content)?,
+        FILE_DESCRIPTOR_SCHEMA_KEY => file_namespace_occupant(row.row_pk(), snapshot_content)?,
         _ => return Ok(None),
     };
     Ok(Some((identity, occupant)))
@@ -1204,9 +1338,9 @@ fn filesystem_namespace_occupant_from_staged_row(
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
     match row.schema_key() {
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-            directory_namespace_occupant_from_value(row.entity_pk(), snapshot)
+            directory_namespace_occupant_from_value(row.row_pk(), snapshot)
         }
-        FILE_DESCRIPTOR_SCHEMA_KEY => file_namespace_occupant_from_value(row.entity_pk(), snapshot),
+        FILE_DESCRIPTOR_SCHEMA_KEY => file_namespace_occupant_from_value(row.row_pk(), snapshot),
         _ => Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
@@ -1218,31 +1352,31 @@ fn filesystem_namespace_occupant_from_staged_row(
 }
 
 fn directory_namespace_occupant(
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     snapshot_content: &str,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
     let snapshot = parse_directory_descriptor_snapshot(snapshot_content)?;
     Ok(FilesystemNamespaceOccupant::Directory {
-        entity_pk: entity_pk.clone(),
+        row_pk: row_pk.clone(),
         parent_id: snapshot.parent_id,
         name: snapshot.name,
     })
 }
 
 fn directory_namespace_occupant_from_value(
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     snapshot: &JsonValue,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
     let snapshot = directory_descriptor_snapshot_from_value(snapshot)?;
     Ok(FilesystemNamespaceOccupant::Directory {
-        entity_pk: entity_pk.clone(),
+        row_pk: row_pk.clone(),
         parent_id: snapshot.parent_id,
         name: snapshot.name,
     })
 }
 
 fn file_namespace_occupant(
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     snapshot_content: &str,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
     let snapshot =
@@ -1253,19 +1387,19 @@ fn file_namespace_occupant(
             )
         })?;
     Ok(FilesystemNamespaceOccupant::File {
-        entity_pk: entity_pk.clone(),
+        row_pk: row_pk.clone(),
         directory_id: snapshot.directory_id,
         entry_name: snapshot.name,
     })
 }
 
 fn file_namespace_occupant_from_value(
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
     snapshot: &JsonValue,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
     let snapshot = file_descriptor_snapshot_from_value(snapshot)?;
     Ok(FilesystemNamespaceOccupant::File {
-        entity_pk: entity_pk.clone(),
+        row_pk: row_pk.clone(),
         directory_id: snapshot.directory_id,
         entry_name: snapshot.name,
     })
@@ -1302,13 +1436,13 @@ fn filesystem_namespace_conflict_error(
 ) -> LixError {
     let parent = parent_id.as_deref().unwrap_or("<root>");
     let existing_id = existing
-        .entity_pk()
+        .row_pk()
         .as_single_string_owned()
-        .unwrap_or_else(|_| "<non-string-entity-pk>".to_string());
+        .unwrap_or_else(|_| "<non-string-row-pk>".to_string());
     let conflicting_id = conflicting
-        .entity_pk()
+        .row_pk()
         .as_single_string_owned()
-        .unwrap_or_else(|_| "<non-string-entity-pk>".to_string());
+        .unwrap_or_else(|_| "<non-string-row-pk>".to_string());
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
@@ -1405,14 +1539,14 @@ async fn validate_committed_insert_identities(
     pending_constraints: Option<&PendingConstraintIndexes>,
 ) -> Result<(), LixError> {
     validate_committed_insert_identity_entries(
-        input.live_state,
+        input.hot_state,
         input.staged_writes.inserts().filter(|insert| {
             // `PreparedWriteValidationSet::inserts` and `constraint_rows`
             // contain the same exact schema scope. Building pending constraints
             // records one identity target for every non-tombstone constraint
             // row, so probing that owned identity vector for every insert is
             // equivalent to this column check but turns a large batch into
-            // O(n²) entity-primary-key comparisons.
+            // O(n²) row-primary-key comparisons.
             pending_constraints.is_none() || insert.row.snapshot.is_some()
         }),
         pending_constraints,
@@ -1427,7 +1561,7 @@ async fn validate_committed_insert_identities(
 /// identity absence is a committed-state property and must still be checked
 /// against the coherent transaction snapshot.
 pub(crate) async fn validate_certified_tracked_insert_identities(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     prepared_writes: &PreparedWriteSet,
 ) -> Result<(), LixError> {
     if let Some((_facts, schema_key, branch_id)) = prepared_writes
@@ -1441,7 +1575,7 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
             schema_key,
             file_id: None,
         };
-        if live_state
+        if hot_state
             .collection_generation(branch_id, scope)
             .await?
             .is_some_and(|generation| generation.live_count == 0)
@@ -1463,7 +1597,7 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
             schema_key: first.row.schema_key,
             file_id: first.row.file_id.map(crate::common::SharedStr::as_str),
         };
-        if live_state
+        if hot_state
             .collection_generation(first.row.branch_id, scope)
             .await?
             .is_some_and(|generation| generation.live_count == 0)
@@ -1476,7 +1610,7 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
         }
     }
     validate_committed_insert_identity_entries(
-        live_state,
+        hot_state,
         prepared_writes
             .insert_selection
             .iter(&prepared_writes.state_rows),
@@ -1488,11 +1622,11 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
 /// Retains public INSERT absence semantics for a structural fresh-file import
 /// without rebuilding its full transaction validation index.
 pub(crate) async fn validate_certified_fresh_plugin_file_import(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     certificate: FreshPluginFileImportCertificate<'_>,
 ) -> Result<(), LixError> {
     validate_committed_insert_identity_entries(
-        live_state,
+        hot_state,
         certificate.insert_selection.iter(certificate.state_rows),
         None,
     )
@@ -1500,7 +1634,7 @@ pub(crate) async fn validate_certified_fresh_plugin_file_import(
 }
 
 async fn validate_committed_insert_identity_entries<'a, I>(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     entries: I,
     pending_constraints: Option<&PendingConstraintIndexes>,
 ) -> Result<(), LixError>
@@ -1511,7 +1645,7 @@ where
     checks.sort_unstable_by(|left, right| {
         insert_scope_key(*left)
             .cmp(&insert_scope_key(*right))
-            .then_with(|| left.row.entity_pk.cmp(right.row.entity_pk))
+            .then_with(|| left.row.row_pk.cmp(right.row.row_pk))
             .then_with(|| left.row_index.cmp(&right.row_index))
     });
 
@@ -1530,12 +1664,12 @@ where
             first.row.untracked,
             first.row.file_id.map(ToString::to_string),
         );
-        let entity_pks = group
+        let row_pks = group
             .iter()
-            .map(|insert| insert.row.entity_pk.clone())
+            .map(|insert| insert.row.row_pk.clone())
             .collect::<Vec<_>>();
         let committed_rows =
-            scan_committed_canonical_rows(live_state, &domain, first.row.schema_key, entity_pks)
+            scan_committed_canonical_rows(hot_state, &domain, first.row.schema_key, row_pks)
                 .await?;
         let mut committed_ordinals = committed_rows
             .iter()
@@ -1549,8 +1683,8 @@ where
         committed_ordinals.sort_unstable_by(|&left, &right| {
             committed_rows
                 .row(left)
-                .entity_pk()
-                .cmp(committed_rows.row(right).entity_pk())
+                .row_pk()
+                .cmp(committed_rows.row(right).row_pk())
         });
 
         let mut committed_cursor = 0usize;
@@ -1558,8 +1692,8 @@ where
             while committed_cursor < committed_ordinals.len()
                 && committed_rows
                     .row(committed_ordinals[committed_cursor])
-                    .entity_pk()
-                    < insert.row.entity_pk
+                    .row_pk()
+                    < insert.row.row_pk
             {
                 committed_cursor += 1;
             }
@@ -1567,7 +1701,7 @@ where
                 continue;
             };
             let committed_row = committed_rows.row(committed_ordinal);
-            if committed_row.entity_pk() != insert.row.entity_pk {
+            if committed_row.row_pk() != insert.row.row_pk {
                 continue;
             }
             if committed_row.untracked() != domain.untracked() {
@@ -1585,8 +1719,8 @@ where
                     LixError::new(
                         LixError::CODE_UNIQUE,
                         format!(
-                            "cannot insert {requested} row for schema '{}' entity_pk {:?}: a canonical {existing} row already exists; delete it first",
-                            insert.row.schema_key, insert.row.entity_pk,
+                            "cannot insert {requested} row for schema '{}' row_pk {:?}: a canonical {existing} row already exists; delete it first",
+                            insert.row.schema_key, insert.row.row_pk,
                         ),
                     ),
                     insert.statement_index,
@@ -1597,7 +1731,7 @@ where
                     LixError::CODE_UNIQUE,
                     duplicate_insert_identity_message(
                         insert.row.schema_key,
-                        insert.row.entity_pk,
+                        insert.row.row_pk,
                         None,
                         insert.origin,
                     ),
@@ -1659,7 +1793,7 @@ async fn validate_branch_ref_delete_restrictions(
             let descriptor_identity = DomainRowIdentity::in_domain(
                 source_domain,
                 BRANCH_DESCRIPTOR_SCHEMA_KEY,
-                tombstone.identity.entity_pk_owned(),
+                tombstone.identity.row_pk_owned(),
             );
             if pending_constraints.tombstones_target_identity(&descriptor_identity) {
                 continue;
@@ -1672,10 +1806,10 @@ async fn validate_branch_ref_delete_restrictions(
             }
 
             let descriptor_rows = load_committed_constraint_rows(
-                input.live_state,
+                input.hot_state,
                 descriptor_identity.domain(),
                 descriptor_identity.schema_key(),
-                descriptor_identity.entity_pk_owned(),
+                descriptor_identity.row_pk_owned(),
                 false,
             )
             .await?;
@@ -1704,10 +1838,10 @@ fn branch_ref_delete_restriction_error(
         format!(
             "cannot delete '{}' row '{}' in branch '{}' because matching '{}' row '{}' would remain without a branch ref",
             ref_identity.schema_key(),
-            ref_identity.entity_pk().as_single_string_owned()?,
+            ref_identity.row_pk().as_single_string_owned()?,
             ref_identity.domain().branch_id(),
             descriptor_identity.schema_key(),
-            descriptor_identity.entity_pk().as_single_string_owned()?,
+            descriptor_identity.row_pk().as_single_string_owned()?,
         ),
     ))
 }
@@ -1730,7 +1864,7 @@ impl PendingFileDescriptorIndex {
             if row.schema_key() != FILE_DESCRIPTOR_SCHEMA_KEY {
                 continue;
             }
-            if row.entity_pk().as_single_string_owned().is_ok() {
+            if row.row_pk().as_single_string_owned().is_ok() {
                 let state = if (*row).snapshot_json().is_some() {
                     PendingFileDescriptorState::Present
                 } else {
@@ -1747,12 +1881,12 @@ impl PendingFileDescriptorIndex {
         domain: &Domain,
         file_id: &str,
     ) -> Option<PendingFileDescriptorState> {
-        let entity_pk = EntityPk::uuid_from_canonical(file_id).ok()?;
+        let row_pk = RowPk::uuid_from_canonical(file_id).ok()?;
         self.by_identity
             .get(&DomainRowIdentity::in_domain(
                 domain.with_exact_file_scope(Some(file_id.to_string())),
                 FILE_DESCRIPTOR_SCHEMA_KEY,
-                entity_pk,
+                row_pk,
             ))
             .copied()
     }
@@ -1800,11 +1934,34 @@ impl FileOwnerReferenceValidator {
                 continue;
             }
             if self
-                .committed_file_descriptor_exists_in_domain(input.live_state, domain, file_id)
+                .committed_file_descriptor_exists_in_domain(input.hot_state, domain, file_id)
                 .await?
             {
                 return Ok(());
             }
+        }
+
+        // The file exists, just in the other lane. Saying "missing file_id" for
+        // a file that `SELECT * FROM lix_file` plainly returns sends people
+        // looking for the wrong bug, so name the actual mismatch and both
+        // lanes. This covers each direction: an untracked row pointing at a
+        // tracked file, and a tracked row pointing at an untracked file.
+        let other_lane = row_domain.with_untracked(!row.untracked());
+        let exists_in_other_lane =
+            match pending_file_descriptors.state_in_domain(&other_lane, file_id) {
+                Some(PendingFileDescriptorState::Present) => true,
+                Some(PendingFileDescriptorState::Tombstone) => false,
+                None => {
+                    self.committed_file_descriptor_exists_in_domain(
+                        input.hot_state,
+                        &other_lane,
+                        file_id,
+                    )
+                    .await?
+                }
+            };
+        if exists_in_other_lane {
+            return Err(lane_mismatched_file_owner_error(row, file_id)?);
         }
 
         Err(missing_file_owner_reference_error(row, file_id)?)
@@ -1812,7 +1969,7 @@ impl FileOwnerReferenceValidator {
 
     async fn committed_file_descriptor_exists_in_domain(
         &mut self,
-        live_state: &dyn LiveStateReader,
+        hot_state: &dyn HotStateReader,
         domain: &Domain,
         file_id: &str,
     ) -> Result<bool, LixError> {
@@ -1825,7 +1982,7 @@ impl FileOwnerReferenceValidator {
             return Ok(*exists);
         }
         let exists =
-            committed_file_descriptor_exists_in_domain(live_state, &descriptor_domain, file_id)
+            committed_file_descriptor_exists_in_domain(hot_state, &descriptor_domain, file_id)
                 .await?;
         self.committed_descriptor_exists.insert(key, exists);
         Ok(exists)
@@ -1833,18 +1990,18 @@ impl FileOwnerReferenceValidator {
 }
 
 async fn committed_file_descriptor_exists_in_domain(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     descriptor_domain: &Domain,
     file_id: &str,
 ) -> Result<bool, LixError> {
-    let Ok(entity_pk) = EntityPk::uuid_from_canonical(file_id) else {
+    let Ok(row_pk) = RowPk::uuid_from_canonical(file_id) else {
         return Ok(false);
     };
     let rows = load_committed_constraint_rows(
-        live_state,
+        hot_state,
         descriptor_domain,
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        entity_pk.clone(),
+        row_pk.clone(),
         false,
     )
     .await?;
@@ -1853,8 +2010,31 @@ async fn committed_file_descriptor_exists_in_domain(
     };
     Ok(row.snapshot_content().is_some()
         && row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
-        && row.entity_pk() == &entity_pk
+        && row.row_pk() == &row_pk
         && row.file_id() == Some(file_id))
+}
+
+fn lane_mismatched_file_owner_error(
+    row: PreparedValidationRow<'_>,
+    file_id: &str,
+) -> Result<LixError, LixError> {
+    let lane = |untracked: bool| if untracked { "untracked" } else { "tracked" };
+    let row_lane = lane(row.untracked());
+    let file_lane = lane(!row.untracked());
+    Ok(LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "file ownership validation failed for schema '{}': {row_lane} row '{}' references file_id '{}', which exists but is {file_lane}, on branch '{}'",
+            row.schema_key(),
+            row.row_pk().as_json_array_text()?,
+            file_id,
+            row.branch_id()
+        ),
+    )
+    .with_hint(
+        "A row and the file that owns it must share one lane. Write the row as \
+         lixcol_untracked = <the file's own value>, or move the file to the row's lane.",
+    ))
 }
 
 fn missing_file_owner_reference_error(
@@ -1864,14 +2044,14 @@ fn missing_file_owner_reference_error(
     Ok(LixError::new(
         LixError::CODE_FILE_NOT_FOUND,
             format!(
-                "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for branch '{}'",
+                "file ownership validation failed for schema '{}': row '{}' references missing file_id '{}' in effective file scope for branch '{}'",
                 row.schema_key(),
-                row.entity_pk().as_json_array_text()?,
+                row.row_pk().as_json_array_text()?,
                 file_id,
                 row.branch_id()
             ),
     )
-    .with_hint("Insert a row into lix_file with this id first, or use null for a global entity."))
+    .with_hint("Insert a row into lix_file with this id first, or use null for a global row."))
 }
 
 fn validate_staged_row_shape(row: PreparedValidationRow<'_>) -> Result<(), LixError> {
@@ -2047,15 +2227,15 @@ fn validate_primary_key_identity(
         .primary_key_component_types
         .as_deref()
         .expect("primary-key paths and component types are compiled together");
-    let derived = EntityPk::from_primary_key_plan(snapshot, primary_key_paths, component_types)
+    let derived = RowPk::from_primary_key_plan(snapshot, primary_key_paths, component_types)
         .map_err(|error| primary_key_identity_error(row, primary_key_paths, error))?;
-    if row.entity_pk() != &derived {
+    if row.row_pk() != &derived {
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
             format!(
-                "primary-key constraint violation on schema '{}': entity_pk '{}' does not match derived primary key '{}'",
+                "primary-key constraint violation on schema '{}': row_pk '{}' does not match derived primary key '{}'",
                 row.schema_key(),
-                row.entity_pk().as_json_array_text()?,
+                row.row_pk().as_json_array_text()?,
                 derived.as_json_array_text()?
             ),
         ));
@@ -2065,7 +2245,7 @@ fn validate_primary_key_identity(
 
 #[derive(Default)]
 struct PendingConstraintIndexes {
-    unique_values: BTreeMap<PendingUniqueKey, EntityPk>,
+    unique_values: BTreeMap<PendingUniqueKey, RowPk>,
     identity_targets: HashSet<DomainRowIdentity>,
     fk_targets: BTreeMap<PendingForeignKeyTargetKey, Vec<PendingForeignKeyTarget>>,
     fk_references: BTreeMap<PendingForeignKeyReferenceTarget, Vec<PendingForeignKeyReference>>,
@@ -2124,11 +2304,11 @@ impl PendingConstraintIndexes {
                 pointer_group: unique_paths.clone(),
                 value,
             };
-            if let Some(existing_entity_pk) = self
+            if let Some(existing_row_pk) = self
                 .unique_values
-                .insert(key.clone(), row.entity_pk().clone())
+                .insert(key.clone(), row.row_pk().clone())
             {
-                if existing_entity_pk != *row.entity_pk() {
+                if existing_row_pk != *row.row_pk() {
                     return Err(LixError::new(
                         LixError::CODE_UNIQUE,
                         format!(
@@ -2136,8 +2316,8 @@ impl PendingConstraintIndexes {
                             row.schema_key(),
                             format_pointer_group(&key.pointer_group),
                             key.value.display(),
-                            existing_entity_pk.as_json_array_text()?,
-                            row.entity_pk().as_json_array_text()?
+                            existing_row_pk.as_json_array_text()?,
+                            row.row_pk().as_json_array_text()?
                         ),
                     ));
                 }
@@ -2164,7 +2344,7 @@ impl PendingConstraintIndexes {
             })
             .or_default()
             .push(PendingForeignKeyTarget {
-                entity_pk: row.entity_pk().clone(),
+                row_pk: row.row_pk().clone(),
             });
     }
 
@@ -2198,7 +2378,7 @@ impl PendingConstraintIndexes {
         Ok(())
     }
 
-    fn tombstones_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+    fn tombstones_identity(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
         !self.tombstone_identities.is_empty()
             && committed_row_ref_is_exact_branch_scoped(row, row.branch_id())
             && self
@@ -2206,16 +2386,16 @@ impl PendingConstraintIndexes {
                 .contains(&DomainRowIdentity::in_domain(
                     Domain::for_live_row_ref(row),
                     row.schema_key().to_string(),
-                    row.entity_pk().clone(),
+                    row.row_pk().clone(),
                 ))
     }
 
-    fn replaces_committed_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+    fn replaces_committed_identity(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
         self.identity_targets
             .contains(&DomainRowIdentity::in_domain(
                 Domain::for_live_row_ref(row),
                 row.schema_key().to_string(),
-                row.entity_pk().clone(),
+                row.row_pk().clone(),
             ))
     }
 
@@ -2317,7 +2497,7 @@ struct PendingTombstone {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingForeignKeyTarget {
-    entity_pk: EntityPk,
+    row_pk: RowPk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2387,8 +2567,8 @@ fn validate_pending_delete_restrictions(
                         schema_key: tombstone.identity.schema_key_owned(),
                         domain,
                         pointer_group: primary_key_paths.clone(),
-                        value: UniqueConstraintValue::from_entity_pk(
-                            tombstone.identity.entity_pk(),
+                        value: UniqueConstraintValue::from_row_pk(
+                            tombstone.identity.row_pk(),
                         ),
                     })
                 })
@@ -2419,9 +2599,9 @@ fn reject_pending_delete_references(
         format!(
             "cannot delete '{}' row '{}' in branch '{}' because pending row '{}' references it{}",
             deleted_identity.schema_key(),
-            deleted_identity.entity_pk().as_json_array_text()?,
+            deleted_identity.row_pk().as_json_array_text()?,
             deleted_identity.domain().branch_id(),
-            reference.identity.entity_pk().as_json_array_text()?,
+            reference.identity.row_pk().as_json_array_text()?,
             pending_foreign_key_reference_target_description(target)?
         ),
     ))
@@ -2456,7 +2636,7 @@ async fn validate_committed_delete_restrictions(
         }
         for reference in delete_plan.foreign_key_references {
             let Some(deleted_value) = committed_deleted_row_value(
-                input.live_state,
+                input.hot_state,
                 tombstone,
                 &reference.foreign_key.referenced_properties,
             )
@@ -2464,7 +2644,10 @@ async fn validate_committed_delete_restrictions(
             else {
                 continue;
             };
-            for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
+            for source_domain in delete_restriction_source_domains(
+                &tombstone.identity,
+                reference.source_key.schema_key.as_str(),
+            ) {
                 normal_batches
                     .entry(NormalDeleteRestrictionBatchKey {
                         source_key: reference.source_key.clone(),
@@ -2479,12 +2662,49 @@ async fn validate_committed_delete_restrictions(
         }
     }
     validate_committed_normal_delete_restriction_batches(
-        input.live_state,
+        input.hot_state,
         pending_constraints,
         normal_batches,
     )
     .await?;
     Ok(())
+}
+
+/// Delete-side mirror of [`foreign_key_target_domain`].
+///
+/// The insert side rewrites the *target* domain of a
+/// `lix_file_descriptor -> lix_directory_descriptor` reference to
+/// `Exact(None)`, because a file-descriptor row carries `file_id = own id`
+/// while the directory row it points at carries `file_id = NULL`. The delete
+/// side has to invert that rewrite: given the deleted directory, which file
+/// scopes can hold a file descriptor that still references it?
+///
+/// Because `canonicalize_descriptor_file_id` forces
+/// `lix_file_descriptor.file_id` to equal the row's own row id, the answer
+/// is "every file scope, and at most one row per scope". `DomainFileScope::Any`
+/// is therefore *exact* for this one pair rather than a widening: no two
+/// file-descriptor rows can share a file scope, so nothing can be conflated
+/// across scopes.
+///
+/// This stays a targeted rewrite instead of widening
+/// `fk_source_domains_for_target` for every schema. For an ordinary
+/// file-scoped schema the same referenced key may legitimately exist in two
+/// different files, and a source row in file G is satisfied by the target in
+/// file G; scanning every file scope would let the copy in G block a delete of
+/// the copy in F and turn a legal delete into a foreign-key error. See
+/// `widening_delete_source_domain_to_any_file_falsely_rejects`.
+fn delete_restriction_source_domains(
+    deleted_identity: &DomainRowIdentity,
+    source_schema_key: &str,
+) -> Vec<Domain> {
+    let domain = deleted_identity.domain();
+    if deleted_identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+        && source_schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+    {
+        return Domain::any_file(domain.branch_id().to_string(), domain.untracked())
+            .fk_source_domains_for_target();
+    }
+    domain.fk_source_domains_for_target()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2495,7 +2715,7 @@ struct NormalDeleteRestrictionBatchKey {
 }
 
 async fn validate_committed_normal_delete_restriction_batches(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     pending_constraints: &PendingConstraintIndexes,
     batches: BTreeMap<
         NormalDeleteRestrictionBatchKey,
@@ -2504,7 +2724,7 @@ async fn validate_committed_normal_delete_restriction_batches(
 ) -> Result<(), LixError> {
     for (batch, tombstones_by_value) in batches {
         let rows = scan_committed_constraint_rows(
-            live_state,
+            hot_state,
             &batch.source_domain,
             vec![batch.source_key.schema_key.clone()],
             Vec::new(),
@@ -2545,15 +2765,15 @@ async fn validate_committed_normal_delete_restriction_batches(
 }
 
 async fn committed_deleted_row_value(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     tombstone: &PendingTombstone,
     referenced_properties: &[Vec<String>],
 ) -> Result<Option<UniqueConstraintValue>, LixError> {
     let rows = load_committed_constraint_rows(
-        live_state,
+        hot_state,
         tombstone.identity.domain(),
         tombstone.identity.schema_key(),
-        tombstone.identity.entity_pk_owned(),
+        tombstone.identity.row_pk_owned(),
         true,
     )
     .await?;
@@ -2572,7 +2792,7 @@ async fn committed_deleted_row_value(
 
 fn committed_delete_restriction_error(
     deleted_identity: &DomainRowIdentity,
-    referencing_row: MaterializedLiveStateRowRef<'_>,
+    referencing_row: MaterializedHotStateRowRef<'_>,
     local_properties: &[Vec<String>],
 ) -> Result<LixError, LixError> {
     Ok(LixError::new(
@@ -2580,16 +2800,16 @@ fn committed_delete_restriction_error(
         format!(
             "cannot delete '{}' row '{}' in branch '{}' because committed row '{}' references it through {}",
             deleted_identity.schema_key(),
-            deleted_identity.entity_pk().as_json_array_text()?,
+            deleted_identity.row_pk().as_json_array_text()?,
             deleted_identity.domain().branch_id(),
-            referencing_row.entity_pk().as_json_array_text()?,
+            referencing_row.row_pk().as_json_array_text()?,
             format_pointer_group(local_properties)
         ),
     ))
 }
 
 fn parse_committed_snapshot(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     snapshot_content: &str,
 ) -> Result<JsonValue, LixError> {
     serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
@@ -2715,7 +2935,7 @@ async fn validate_committed_foreign_keys(
     let mut still_unresolved = Vec::new();
     for check in unresolved_checks {
         let resolved = committed_normal_foreign_key_target_exists(
-            input.live_state,
+            input.hot_state,
             input.schema_catalog,
             pending_constraints,
             &check.target,
@@ -2739,7 +2959,7 @@ fn reject_unresolved_foreign_keys(
         format!(
             "foreign key on schema '{}' row '{}' via {} has no matching target in branch '{}'{}",
             check.source_schema_key,
-            check.source_identity.entity_pk().as_json_array_text()?,
+            check.source_identity.row_pk().as_json_array_text()?,
             format_pointer_group(&check.source_pointer_group),
             check.source_identity.domain().branch_id(),
             unresolved_foreign_key_target_description(&check.target)?
@@ -2759,20 +2979,20 @@ fn unresolved_foreign_key_target_description(
 }
 
 async fn committed_normal_foreign_key_target_exists(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
     target: &PendingForeignKeyTargetKey,
 ) -> Result<bool, LixError> {
-    let entity_pks: Vec<EntityPk> = primary_key_entity_pk_for_target(schema_catalog, target)
+    let row_pks: Vec<RowPk> = primary_key_row_pk_for_target(schema_catalog, target)
         .into_iter()
         .collect();
     for domain in target.domain.fk_target_domains() {
         let rows = scan_committed_constraint_rows(
-            live_state,
+            hot_state,
             &domain,
             vec![target.schema_key.clone()],
-            entity_pks.clone(),
+            row_pks.clone(),
             false,
         )
         .await?;
@@ -2808,10 +3028,10 @@ async fn committed_normal_foreign_key_target_exists(
     Ok(false)
 }
 
-fn primary_key_entity_pk_for_target(
+fn primary_key_row_pk_for_target(
     schema_catalog: &CatalogSnapshot,
     target: &PendingForeignKeyTargetKey,
-) -> Option<EntityPk> {
+) -> Option<RowPk> {
     let (_, target_plan) = schema_catalog.plan_for_key(&target.schema_key)?;
     if target_plan.primary_key.as_ref()? != &target.pointer_group {
         return None;
@@ -2822,7 +3042,7 @@ fn primary_key_entity_pk_for_target(
         .iter()
         .map(|value| serde_json::from_str::<JsonValue>(value).ok())
         .collect::<Option<Vec<_>>>()?;
-    EntityPk::from_json_values(&values, target_plan.primary_key_component_types.as_deref()?).ok()
+    RowPk::from_json_values(&values, target_plan.primary_key_component_types.as_deref()?).ok()
 }
 
 async fn validate_committed_unique_constraints(
@@ -2831,10 +3051,10 @@ async fn validate_committed_unique_constraints(
 ) -> Result<(), LixError> {
     let mut pending_by_scope = BTreeMap::<
         PendingUniqueConstraintScope,
-        BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
+        BTreeMap<UniqueConstraintValue, Vec<&RowPk>>,
     >::new();
     let can_skip_unchanged = pending_constraints.unique_values.len() == 1;
-    for (key, pending_entity_pk) in &pending_constraints.unique_values {
+    for (key, pending_row_pk) in &pending_constraints.unique_values {
         // The fixed descriptor schemas only declare parent/name uniqueness.
         // Filesystem namespace validation below is strictly stronger: it
         // rejects same-kind duplicates and file/directory cross-kind clashes.
@@ -2843,10 +3063,10 @@ async fn validate_committed_unique_constraints(
             continue;
         }
         let is_insert =
-            can_skip_unchanged && pending_unique_owner_is_insert(input, key, pending_entity_pk);
+            can_skip_unchanged && pending_unique_owner_is_insert(input, key, pending_row_pk);
         if can_skip_unchanged
             && !is_insert
-            && committed_unique_value_is_unchanged(input.live_state, key, pending_entity_pk).await?
+            && committed_unique_value_is_unchanged(input.hot_state, key, pending_row_pk).await?
         {
             continue;
         }
@@ -2855,66 +3075,151 @@ async fn validate_committed_unique_constraints(
             .or_default()
             .entry(key.value.clone())
             .or_default()
-            .push(pending_entity_pk);
+            .push(pending_row_pk);
     }
 
     for (scope, pending_values) in pending_by_scope {
-        let committed_rows = scan_committed_constraint_rows(
-            input.live_state,
-            &scope.domain,
-            vec![scope.schema_key.clone()],
-            Vec::new(),
-            false,
-        )
-        .await?;
+        // A scope with exactly one pending value becomes a point probe instead
+        // of a whole-collection scan with a parse per row. Everything else —
+        // composite groups, columns the plane cannot key, and scopes holding
+        // several pending values — keeps the single scan it always had.
+        match declared_column_probe(input.schema_catalog, &scope, &pending_values) {
+            Some(probe) => {
+                let committed_rows = scan_committed_constraint_rows_by_declared_column(
+                    input.hot_state,
+                    &scope.domain,
+                    &scope.schema_key,
+                    probe,
+                )
+                .await?;
+                reject_committed_unique_conflicts(
+                    &committed_rows,
+                    &scope,
+                    &pending_values,
+                    pending_constraints,
+                )?;
+            }
+            None => {
+                let committed_rows = scan_committed_constraint_rows(
+                    input.hot_state,
+                    &scope.domain,
+                    vec![scope.schema_key.clone()],
+                    Vec::new(),
+                    false,
+                )
+                .await?;
+                reject_committed_unique_conflicts(
+                    &committed_rows,
+                    &scope,
+                    &pending_values,
+                    pending_constraints,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 
-        for committed_row in committed_rows.iter() {
-            if !committed_row_is_in_exact_unique_scope(committed_row, &scope) {
+/// The one `declared_column_eq` predicate that can replace this scope's scan,
+/// or `None` when the scope must keep scanning.
+///
+/// **Deliberately one value only.** Probing per distinct value would turn one
+/// scan-per-scope into N probes, and a collection with no completeness witness
+/// silently falls back to its ordinary scan — so each of those N probes would
+/// become a *full scan*. That is exactly the population this change must not
+/// hurt: repositories whose collections predate the index plane. Capping at
+/// one value makes the probe route weakly better than the scan route in every
+/// case, which is what lets it be chosen here without first asking whether the
+/// index can serve. Lifting the cap needs that question answered first.
+///
+/// Declines unless the scope is a single-column group the schema's
+/// `indexed_columns` cover **and** the value round-trips exactly through the
+/// index's key encoding. A probe built from a value that does not round-trip
+/// could miss a committed conflict — a unique violation silently accepted, not
+/// a slow query — so an inexact value goes back to the scan.
+fn declared_column_probe(
+    schema_catalog: &CatalogSnapshot,
+    scope: &PendingUniqueConstraintScope,
+    pending_values: &BTreeMap<UniqueConstraintValue, Vec<&RowPk>>,
+) -> Option<crate::hot_state::DeclaredColumnEq> {
+    let [pointer] = scope.pointer_group.as_slice() else {
+        return None;
+    };
+    let [property] = pointer.as_slice() else {
+        return None;
+    };
+    let [value] = pending_values.keys().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let schema = schema_catalog.schema(&scope.schema_key)?;
+    let spec = crate::sql2::derive_schema_surface_spec_from_schema(schema).ok()?;
+    let ordinal = spec
+        .indexed_columns
+        .iter()
+        .find(|column| column.name == *property)?
+        .ordinal;
+    Some(crate::hot_state::DeclaredColumnEq {
+        schema_key: scope.schema_key.clone(),
+        ordinal,
+        values: vec![value.exact_hot_index_value()?],
+    })
+}
+
+/// The committed-row half of the unique check, shared by the probe and scan
+/// routes so both reject exactly the same conflicts.
+fn reject_committed_unique_conflicts(
+    committed_rows: &CommittedHotStateRows,
+    scope: &PendingUniqueConstraintScope,
+    pending_values: &BTreeMap<UniqueConstraintValue, Vec<&RowPk>>,
+    pending_constraints: &PendingConstraintIndexes,
+) -> Result<(), LixError> {
+    for committed_row in committed_rows.iter() {
+        if !committed_row_is_in_exact_unique_scope(committed_row, scope) {
+            continue;
+        }
+        if pending_constraints.tombstones_identity(committed_row) {
+            continue;
+        }
+        let Some(snapshot_content) = committed_row
+            .snapshot_content()
+            .map(|snapshot| snapshot.as_str())
+        else {
+            continue;
+        };
+        let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "committed snapshot_content for schema '{}' is invalid JSON: {error}",
+                    committed_row.schema_key()
+                ),
+            )
+        })?;
+        let Some(committed_value) =
+            UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
+        else {
+            continue;
+        };
+        // Index entries are candidates, never answers: a probe can return a
+        // row whose value has since changed. This lookup is what rejects it.
+        let Some(pending_row_pks) = pending_values.get(&committed_value) else {
+            continue;
+        };
+        for pending_row_pk in pending_row_pks {
+            if committed_row.row_pk() == *pending_row_pk {
                 continue;
             }
-            if pending_constraints.tombstones_identity(committed_row) {
-                continue;
-            }
-            let Some(snapshot_content) = committed_row
-                .snapshot_content()
-                .map(|snapshot| snapshot.as_str())
-            else {
-                continue;
-            };
-            let snapshot =
-                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_VALIDATION,
-                        format!(
-                            "committed snapshot_content for schema '{}' is invalid JSON: {error}",
-                            committed_row.schema_key()
-                        ),
-                    )
-                })?;
-            let Some(committed_value) =
-                UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
-            else {
-                continue;
-            };
-            let Some(pending_entity_pks) = pending_values.get(&committed_value) else {
-                continue;
-            };
-            for pending_entity_pk in pending_entity_pks {
-                if committed_row.entity_pk() == *pending_entity_pk {
-                    continue;
-                }
-                return Err(LixError::new(
-                    LixError::CODE_UNIQUE,
-                    format!(
-                        "unique constraint violation on {}.{} for value {}: committed row '{}' conflicts with staged row '{}'",
-                        scope.schema_key,
-                        format_pointer_group(&scope.pointer_group),
-                        committed_value.display(),
-                        committed_row.entity_pk().as_json_array_text()?,
-                        pending_entity_pk.as_json_array_text()?
-                    ),
-                ));
-            }
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "unique constraint violation on {}.{} for value {}: committed row '{}' conflicts with staged row '{}'",
+                    scope.schema_key,
+                    format_pointer_group(&scope.pointer_group),
+                    committed_value.display(),
+                    committed_row.row_pk().as_json_array_text()?,
+                    pending_row_pk.as_json_array_text()?
+                ),
+            ));
         }
     }
     Ok(())
@@ -2930,13 +3235,13 @@ fn filesystem_namespace_owns_unique_constraint(key: &PendingUniqueKey) -> bool {
 fn pending_unique_owner_is_insert(
     input: &TransactionValidationInput<'_>,
     key: &PendingUniqueKey,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
 ) -> bool {
     // Conflict-aware inserts use Replace mode, but retain their logical Insert
     // origin when the row is new. Both forms must keep the original single scan.
     input.staged_writes.inserts().any(|insert| {
         insert.row.schema_key.as_str() == key.schema_key.as_str()
-            && insert.row.entity_pk == entity_pk
+            && insert.row.row_pk == row_pk
             && Domain::exact_file(
                 insert.row.branch_id.to_string(),
                 insert.row.untracked,
@@ -2944,7 +3249,7 @@ fn pending_unique_owner_is_insert(
             ) == key.domain
     }) || input.staged_writes.rows().any(|row| {
         row.schema_key() == key.schema_key
-            && row.entity_pk() == entity_pk
+            && row.row_pk() == row_pk
             && row.domain() == key.domain
             && row
                 .origin()
@@ -2953,15 +3258,15 @@ fn pending_unique_owner_is_insert(
 }
 
 async fn committed_unique_value_is_unchanged(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     key: &PendingUniqueKey,
-    entity_pk: &EntityPk,
+    row_pk: &RowPk,
 ) -> Result<bool, LixError> {
     let committed_rows = load_committed_constraint_rows(
-        live_state,
+        hot_state,
         &key.domain,
         &key.schema_key,
-        entity_pk.clone(),
+        row_pk.clone(),
         false,
     )
     .await?;
@@ -2982,10 +3287,10 @@ async fn committed_unique_value_is_unchanged(
 }
 
 fn committed_row_is_in_exact_unique_scope(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     scope: &PendingUniqueConstraintScope,
 ) -> bool {
-    // LiveStateReader may return serving projections such as global rows
+    // HotStateReader may return serving projections such as global rows
     // projected into a requested branch. Constraint validation is root-local:
     // only rows authored in the exact branch participate.
     scope.domain.contains_ref(row) && row.schema_key() == scope.schema_key
@@ -3005,7 +3310,7 @@ impl UniqueConstraintValue {
         )
     }
 
-    fn from_entity_pk(identity: &EntityPk) -> Self {
+    fn from_row_pk(identity: &RowPk) -> Self {
         Self(
             identity
                 .components
@@ -3034,6 +3339,27 @@ impl UniqueConstraintValue {
             values.push(stable_unique_value(value));
         }
         Some(Self(values))
+    }
+
+    /// The hot index plane's encoding of a single-column value, but only when
+    /// the recovered value re-encodes to exactly this stable form.
+    ///
+    /// `stable_unique_value` is lossy for anything the index cannot key
+    /// anyway, and an approximate probe would be a missed conflict rather
+    /// than a slow one. The round-trip check makes "recoverable" provable
+    /// instead of assumed.
+    fn exact_hot_index_value(&self) -> Option<crate::hot_state::HotIndexValue> {
+        let [encoded] = self.0.as_slice() else {
+            return None;
+        };
+        if let Ok(text) = serde_json::from_str::<String>(encoded)
+            && stable_unique_value(&JsonValue::String(text.clone())) == *encoded
+        {
+            return Some(crate::hot_state::HotIndexValue::String(text));
+        }
+        let number = encoded.parse::<i64>().ok()?;
+        (stable_unique_value(&JsonValue::Number(number.into())) == *encoded)
+            .then_some(crate::hot_state::HotIndexValue::Integer(number))
     }
 
     fn display(&self) -> String {
@@ -3071,26 +3397,26 @@ fn format_pointer_group(group: &[Vec<String>]) -> String {
 fn primary_key_identity_error(
     row: PreparedValidationRow<'_>,
     primary_key_paths: &[Vec<String>],
-    error: EntityPkError,
+    error: RowPkError,
 ) -> LixError {
     let reason = match error {
-        EntityPkError::EmptyPrimaryKey => "empty x-lix-primary-key".to_string(),
-        EntityPkError::EmptyPrimaryKeyPath { index } => {
-            format!("empty x-lix-primary-key pointer at index {index}")
+        RowPkError::EmptyPrimaryKey => "empty primary_key".to_string(),
+        RowPkError::EmptyPrimaryKeyPath { index } => {
+            format!("empty primary_key column at index {index}")
         }
-        EntityPkError::MissingPrimaryKeyValue { index } => {
+        RowPkError::MissingPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("missing value at primary-key pointer '{pointer}'")
         }
-        EntityPkError::UnsupportedPrimaryKeyValue { index } => {
+        RowPkError::UnsupportedPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("unsupported value at primary-key pointer '{pointer}'")
         }
-        EntityPkError::InvalidPrimaryKeyValue { index, expected } => {
+        RowPkError::InvalidPrimaryKeyValue { index, expected } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("value at primary-key pointer '{pointer}' must be a valid {expected}")
         }
-        EntityPkError::InvalidEncodedEntityPk => "invalid encoded entity primary key".to_string(),
+        RowPkError::InvalidEncodedRowPk => "invalid encoded row primary key".to_string(),
     };
     LixError::new(
         LixError::CODE_UNIQUE,
@@ -3174,20 +3500,16 @@ fn validate_foreign_key_definition(
 }
 
 fn validate_schema_field_pointer(schema: &JsonValue, pointer: &[String]) -> Result<(), String> {
-    if pointer.is_empty() {
-        return Err("empty pointer does not name a field".to_string());
-    }
-    let mut current = schema;
-    for segment in pointer {
-        let properties = current
-            .get("properties")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| format!("schema segment before '{segment}' has no object properties"))?;
-        current = properties
-            .get(segment)
-            .ok_or_else(|| format!("property '{segment}' does not exist"))?;
-    }
-    Ok(())
+    let [column] = pointer else {
+        return Err("Schema v1 fields are top-level column names".to_string());
+    };
+    let schema = crate::schema::parse_lix_schema(schema).map_err(|error| error.to_string())?;
+    schema
+        .columns
+        .iter()
+        .any(|candidate| candidate.name == *column)
+        .then_some(())
+        .ok_or_else(|| format!("column '{column}' does not exist"))
 }
 
 fn referenced_properties_are_keyed(
@@ -3257,11 +3579,11 @@ mod tests {
 
     use super::*;
     use crate::common::SharedStr;
-    use crate::live_state::{
-        LiveStateScanRequest, MaterializedLiveStateBatchBuilder, MaterializedLiveStateRow,
+    use crate::hot_state::{
+        HotStateScanRequest, MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
     };
     use crate::schema::{schema_key_from_definition, seed_schema_definition};
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         LogicalPrimaryKey, StageJson, TestPreparedStateRow, TransactionJson, shared_origin_surface,
     };
 
@@ -3271,19 +3593,19 @@ mod tests {
         };
     }
 
-    struct EmptyLiveStateReader;
+    struct EmptyHotStateReader;
 
-    struct BatchOnlyConstraintLiveStateReader {
-        rows: Mutex<Option<MaterializedLiveStateBatch>>,
+    struct BatchOnlyConstraintHotStateReader {
+        rows: Mutex<Option<MaterializedHotStateBatch>>,
     }
 
     #[async_trait]
-    impl LiveStateReader for BatchOnlyConstraintLiveStateReader {
+    impl HotStateReader for BatchOnlyConstraintHotStateReader {
         async fn scan_constraint_batch(
             &self,
-            _request: &LiveStateScanRequest,
+            _request: &HotStateScanRequest,
             _tracked_only: bool,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(self
                 .rows
                 .lock()
@@ -3294,17 +3616,17 @@ mod tests {
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             panic!("constraint validation must not project the shared batch into owned rows")
         }
 
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::MaterializedLiveStateExactBatch::new(
-                MaterializedLiveStateBatch::default(),
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::MaterializedHotStateExactBatch::new(
+                MaterializedHotStateBatch::default(),
                 vec![None; request.rows.len()],
             )
         }
@@ -3318,14 +3640,14 @@ mod tests {
     async fn ten_thousand_constraint_rows_retain_one_dense_batch_and_shared_payload() {
         const ROW_COUNT: usize = 10_000;
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
-        let entity_pk = EntityPk::single("shared-entity");
+        let row_pk = RowPk::single("shared-row");
         let snapshot = SharedStr::from(r#"{"value":"shared"}"#);
         let metadata = SharedStr::from(r#"{"source":"constraint-batch"}"#);
         let timestamp = ts("2026-01-01T00:00:00Z");
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(ROW_COUNT);
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(ROW_COUNT);
         for _ in 0..ROW_COUNT {
             builder.push_materialized_ref(
-                &entity_pk,
+                &row_pk,
                 "constraint_schema",
                 None,
                 Some(snapshot.clone()),
@@ -3341,8 +3663,8 @@ mod tests {
             );
         }
         let batch = builder.finish();
-        let original_entity_column = batch.entity_column_ptr();
-        let reader = BatchOnlyConstraintLiveStateReader {
+        let original_row_column = batch.row_column_ptr();
+        let reader = BatchOnlyConstraintHotStateReader {
             rows: Mutex::new(Some(batch)),
         };
 
@@ -3361,11 +3683,11 @@ mod tests {
             rows.is_dense(),
             "a conforming constraint scan must retain the owner without an ordinal allocation"
         );
-        assert_eq!(rows.batch.entity_column_ptr(), original_entity_column);
+        assert_eq!(rows.batch.row_column_ptr(), original_row_column);
         assert_eq!(rows.batch.dictionary_entry_count(), 2);
         let first = rows
             .first()
-            .and_then(MaterializedLiveStateRowRef::snapshot_content)
+            .and_then(MaterializedHotStateRowRef::snapshot_content)
             .expect("first row should retain its snapshot");
         let last = rows
             .batch
@@ -3378,15 +3700,15 @@ mod tests {
     #[test]
     fn defensive_constraint_selection_keeps_original_batch_order() {
         let timestamp = ts("2026-01-01T00:00:00Z");
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(4);
-        for (entity_id, schema_key) in [
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(4);
+        for (row_id, schema_key) in [
             ("first", "selected"),
             ("rejected", "other"),
             ("second", "selected"),
             ("third", "selected"),
         ] {
             builder.push_materialized_ref(
-                &EntityPk::single(entity_id),
+                &RowPk::single(row_id),
                 schema_key,
                 None,
                 None,
@@ -3402,16 +3724,16 @@ mod tests {
             );
         }
         let batch = builder.finish();
-        let original_entity_column = batch.entity_column_ptr();
-        let rows = CommittedLiveStateRows::select(batch, |row| row.schema_key() == "selected")
+        let original_row_column = batch.row_column_ptr();
+        let rows = CommittedHotStateRows::select(batch, |row| row.schema_key() == "selected")
             .expect("four rows fit the selection ordinal column");
 
         assert!(!rows.is_dense());
-        assert_eq!(rows.batch.entity_column_ptr(), original_entity_column);
+        assert_eq!(rows.batch.row_column_ptr(), original_row_column);
         assert_eq!(
             rows.iter()
                 .map(|row| {
-                    row.entity_pk()
+                    row.row_pk()
                         .as_single_string_owned()
                         .expect("test key is one string")
                 })
@@ -3426,7 +3748,7 @@ mod tests {
 
     fn test_stage_json(value: &str) -> StageJson {
         let parsed = test_json_text(value).expect("test staged JSON should parse");
-        crate::transaction::types::stage_json_from_value(
+        crate::transaction_types::stage_json_from_value(
             TransactionJson::from_value_for_test(parsed),
             "test staged JSON",
         )
@@ -3461,21 +3783,21 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateReader for EmptyLiveStateReader {
+    impl HotStateReader for EmptyHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(test_file_descriptor_rows()
                 .into_iter()
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>()
                 .into())
         }
@@ -3490,12 +3812,12 @@ mod tests {
                 .expect("test schema catalog should build"),
         ));
         let validation_set = Box::leak(Box::new(staged_writes.validation_set_for_tests()));
-        TransactionValidationInput::new(validation_set, catalog, &EmptyLiveStateReader)
+        TransactionValidationInput::new(validation_set, catalog, &EmptyHotStateReader)
     }
 
     async fn filesystem_namespace_domain_changed_for_test(
         staged_rows: Vec<TestPreparedStateRow>,
-        committed_rows: Vec<MaterializedLiveStateRow>,
+        committed_rows: Vec<MaterializedHotStateRow>,
     ) -> Result<bool, LixError> {
         let staged_writes = PreparedWriteSet {
             state_rows: PreparedStateBatch::from_test_rows(staged_rows),
@@ -3511,16 +3833,16 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ])?;
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: committed_rows,
         };
-        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
         filesystem_namespace_domain_changed(&input, &staged_rows, &domain).await
     }
 
     async fn assert_filesystem_namespace_domain_changed(
         staged_rows: Vec<TestPreparedStateRow>,
-        committed_rows: Vec<MaterializedLiveStateRow>,
+        committed_rows: Vec<MaterializedHotStateRow>,
         expected: bool,
         scenario: &str,
     ) {
@@ -3540,23 +3862,23 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ])?;
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: Vec::new(),
             scan_count: AtomicUsize::new(0),
         };
-        let mut input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let mut input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
         if trust_filesystem_planner {
             input = input.with_trusted_filesystem_planner();
         }
         validate_filesystem_namespace(&input, &staged_rows).await?;
-        Ok(live_state.scan_count.load(Ordering::Relaxed))
+        Ok(hot_state.scan_count.load(Ordering::Relaxed))
     }
 
-    fn filesystem_insert_origin(surface: &str, entity_id: &str) -> TransactionWriteOrigin {
+    fn filesystem_insert_origin(surface: &str, row_id: &str) -> TransactionWriteOrigin {
         TransactionWriteOrigin {
             surface: shared_origin_surface(surface),
             operation: TransactionWriteOperation::Insert,
-            primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(entity_id))),
+            primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(row_id))),
         }
     }
 
@@ -3572,7 +3894,7 @@ mod tests {
         visible_schemas: &[JsonValue],
     ) -> Result<CatalogSnapshot, LixError> {
         let catalog = catalog_from_transaction_parts_unchecked(staged_writes, visible_schemas)?;
-        let mut pending_keys = BTreeMap::<SchemaCatalogKey, EntityPk>::new();
+        let mut pending_keys = BTreeMap::<SchemaCatalogKey, RowPk>::new();
         for row in staged_writes
             .validation_rows()
             .filter(|row| row.schema_key() == REGISTERED_SCHEMA_KEY)
@@ -3594,16 +3916,16 @@ mod tests {
                 })?;
             let (key, _) = schema_from_registered_snapshot(&snapshot)?;
             let catalog_key = SchemaCatalogKey::from_schema_key(key);
-            if let Some(existing_entity_pk) =
-                pending_keys.insert(catalog_key.clone(), row.entity_pk().clone())
+            if let Some(existing_row_pk) =
+                pending_keys.insert(catalog_key.clone(), row.row_pk().clone())
             {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
                         "duplicate pending registered schema '{}' in transaction: rows '{}' and '{}'",
                         catalog_key.schema_key,
-                        existing_entity_pk.as_json_array_text()?,
-                        row.entity_pk().as_json_array_text()?
+                        existing_row_pk.as_json_array_text()?,
+                        row.row_pk().as_json_array_text()?
                     ),
                 ));
             }
@@ -3637,57 +3959,57 @@ mod tests {
         Ok(catalog)
     }
 
-    struct StaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct StaticHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for StaticLiveStateReader {
+    impl HotStateReader for StaticHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(self
                 .rows
                 .iter()
                 .cloned()
                 .chain(test_file_descriptor_rows())
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>()
                 .into())
         }
     }
 
-    struct OverlayingStaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct OverlayingStaticHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for OverlayingStaticLiveStateReader {
+    impl HotStateReader for OverlayingStaticHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             let rows = self
                 .rows
                 .iter()
                 .cloned()
                 .chain(test_file_descriptor_rows())
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>();
             if request.filter.untracked.is_some() {
                 return Ok(rows.into());
@@ -3706,9 +4028,9 @@ mod tests {
     }
 
     fn overlay_untracked_rows_for_test(
-        tracked_rows: Vec<MaterializedLiveStateRow>,
-        untracked_rows: Vec<MaterializedLiveStateRow>,
-    ) -> Vec<MaterializedLiveStateRow> {
+        tracked_rows: Vec<MaterializedHotStateRow>,
+        untracked_rows: Vec<MaterializedHotStateRow>,
+    ) -> Vec<MaterializedHotStateRow> {
         let mut rows_by_identity = BTreeMap::new();
         for row in tracked_rows {
             rows_by_identity.insert(DomainRowIdentity::from_live_row(&row), row);
@@ -3719,77 +4041,77 @@ mod tests {
         rows_by_identity.into_values().collect()
     }
 
-    struct StrictEmptyLiveStateReader;
+    struct StrictEmptyHotStateReader;
 
     #[async_trait]
-    impl LiveStateReader for StrictEmptyLiveStateReader {
+    impl HotStateReader for StrictEmptyHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(Vec::new().into())
         }
     }
 
-    struct StrictStaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct StrictStaticHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for StrictStaticLiveStateReader {
+    impl HotStateReader for StrictStaticHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into())
         }
     }
 
-    struct CountingStaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct CountingStaticHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
         scan_count: AtomicUsize,
     }
 
     #[async_trait]
-    impl LiveStateReader for CountingStaticLiveStateReader {
+    impl HotStateReader for CountingStaticHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             self.scan_count.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .rows
                 .iter()
                 .cloned()
                 .chain(test_file_descriptor_rows())
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>()
                 .into())
         }
@@ -3798,8 +4120,10 @@ mod tests {
     #[test]
     fn schema_catalog_indexes_visible_schemas_by_key_and_branch() {
         let visible_schemas = vec![json!({
-            "x-lix-key": "visible_schema",
-            "type": "object",
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "visible_schema",
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"],
         })];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
@@ -3815,8 +4139,10 @@ mod tests {
         let visible_schemas = vec![
             registered_schema(),
             json!({
-                "x-lix-key": "visible_schema",
-                "type": "object",
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "visible_schema",
+                "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                "primary_key": ["id"],
             }),
         ];
         let staged_writes = PreparedWriteSet {
@@ -3883,7 +4209,7 @@ mod tests {
             ),
             (
                 vec![directory.clone()],
-                vec![MaterializedLiveStateRow::from(directory)],
+                vec![MaterializedHotStateRow::from(directory)],
                 "directory descriptor",
             ),
         ];
@@ -3924,7 +4250,7 @@ mod tests {
             "before",
             "01920000-0000-7000-8000-0000000000a1",
         );
-        let committed_directory = MaterializedLiveStateRow::from(renamed_directory.clone());
+        let committed_directory = MaterializedHotStateRow::from(renamed_directory.clone());
         renamed_directory.snapshot = Some(test_stage_json(
             r#"{"id":"01920000-0000-7000-8000-0000000000a3","parent_id":null,"name":"after"}"#,
         ));
@@ -4018,7 +4344,7 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_planner_inserts_skip_redundant_namespace_scan() {
-        for (surface, schema_key, entity_id) in [
+        for (surface, schema_key, row_id) in [
             (
                 "lix_file",
                 FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -4041,16 +4367,16 @@ mod tests {
             ),
         ] {
             let mut logical_insert = if schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
-                staged_file_descriptor_row(entity_id, "01920000-0000-7000-8000-0000000000a1")
+                staged_file_descriptor_row(row_id, "01920000-0000-7000-8000-0000000000a1")
             } else {
                 directory_descriptor_row(
-                    entity_id,
+                    row_id,
                     None,
                     surface,
                     "01920000-0000-7000-8000-0000000000a1",
                 )
             };
-            logical_insert.origin = Some(filesystem_insert_origin(surface, entity_id));
+            logical_insert.origin = Some(filesystem_insert_origin(surface, row_id));
             let untrusted_transaction_write = PreparedWriteSet {
                 state_rows: prepared_rows![logical_insert.clone()],
                 ..empty_staged_write_set()
@@ -4220,21 +4546,21 @@ mod tests {
             directory_descriptor_schema(),
         ])
         .expect("descriptor catalog should compile");
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: vec![committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
                 "01920000-0000-7000-8000-0000000000a1",
             )],
             scan_count: AtomicUsize::new(0),
         };
-        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
 
         validate_committed_unique_constraints(&input, &pending_constraints)
             .await
             .expect("namespace validation owns descriptor parent/name uniqueness");
 
         assert_eq!(
-            live_state.scan_count.load(Ordering::Relaxed),
+            hot_state.scan_count.load(Ordering::Relaxed),
             0,
             "descriptor unique validation must not rescan committed descriptors"
         );
@@ -4260,7 +4586,7 @@ mod tests {
         );
         committed_file.snapshot_content =
             Some(r#"{"id":"01920000-0000-7000-8000-000000000162","directory_id":null,"name":"occupied"}"#.into());
-        let committed_directory = MaterializedLiveStateRow::from(directory_descriptor_row(
+        let committed_directory = MaterializedHotStateRow::from(directory_descriptor_row(
             "01920000-0000-7000-8000-000000000163",
             None,
             "occupied",
@@ -4271,14 +4597,14 @@ mod tests {
             (committed_file, "file/file"),
             (committed_directory, "file/directory"),
         ] {
-            let live_state = StrictStaticLiveStateReader {
+            let hot_state = StrictStaticHotStateReader {
                 rows: vec![committed],
             };
             let error = validate_prepared_writes(
                 TransactionValidationInput::from_visible_schemas_for_tests(
                     &staged_writes,
                     &visible_schemas,
-                    &live_state,
+                    &hot_state,
                 ),
             )
             .await
@@ -4296,11 +4622,12 @@ mod tests {
         let visible_schemas = vec![
             registered_schema(),
             json!({
-                "x-lix-key": "same_schema",
-                "type": "object",
-                "properties": {
-                    "old": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "same_schema",
+                "columns": [
+                    { "name": "old", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["old"],
             }),
         ];
         let staged_writes = PreparedWriteSet {
@@ -4382,7 +4709,7 @@ mod tests {
     #[test]
     fn schema_catalog_rejects_duplicate_pending_registered_schema_identity() {
         let mut duplicate = pending_registered_schema_row("duplicate_schema");
-        duplicate.entity_pk = registered_schema_entity_pk("duplicate_schema_duplicate");
+        duplicate.row_pk = registered_schema_row_pk("duplicate_schema_duplicate");
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![
                 pending_registered_schema_row("duplicate_schema"),
@@ -4436,18 +4763,9 @@ mod tests {
     #[test]
     fn schema_catalog_rejects_foreign_key_missing_local_field() {
         let mut child = fk_child_schema();
-        child["x-lix-foreign-keys"][0]["properties"] = json!(["/missing_parent_id"]);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                pending_registered_schema_from_definition(fk_parent_schema()),
-                pending_registered_schema_from_definition(child),
-            ],
-            ..empty_staged_write_set()
-        };
-        let visible_schemas = vec![registered_schema()];
-
-        let error = catalog_from_transaction_parts(&staged_writes, &visible_schemas)
-            .expect_err("missing local FK field should fail");
+        child["foreign_keys"][0]["columns"] = json!(["missing_parent_id"]);
+        let error = schema_key_from_definition(&child)
+            .expect_err("missing local FK field should fail during Schema v1 compilation");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
@@ -4455,7 +4773,7 @@ mod tests {
     #[test]
     fn schema_catalog_rejects_foreign_key_missing_referenced_field() {
         let mut child = fk_child_schema();
-        child["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/missing_id"]);
+        child["foreign_keys"][0]["references"]["columns"] = json!(["missing_id"]);
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(fk_parent_schema()),
@@ -4474,9 +4792,12 @@ mod tests {
     #[test]
     fn schema_catalog_rejects_foreign_key_to_non_unique_target_field() {
         let mut parent = fk_parent_schema();
-        parent["properties"]["name"] = json!({ "type": "string" });
+        parent["columns"]
+            .as_array_mut()
+            .expect("columns")
+            .push(json!({ "name": "name", "type": "text", "nullable": false }));
         let mut child = fk_child_schema();
-        child["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/name"]);
+        child["foreign_keys"][0]["references"]["columns"] = json!(["name"]);
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(parent),
@@ -4530,7 +4851,7 @@ mod tests {
                 pending_registered_schema_row("pending_schema"),
                 staged_row(
                     "pending_schema",
-                    Some(json!({ "id": "entity-1" }).to_string()),
+                    Some(json!({ "id": "row-1" }).to_string()),
                 ),
             ],
             ..empty_staged_write_set()
@@ -4539,6 +4860,139 @@ mod tests {
         validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("pending registered schema should be visible to later staged rows");
+    }
+
+    /// A commit that both registers a schema and writes rows of it must
+    /// publish the collection's witness **and** those rows' entries.
+    ///
+    /// This is the one failure the hot index plane cannot have. The
+    /// registration alone earns the collection a completeness witness, so if
+    /// the same commit's rows are missing from the index the read path trusts
+    /// a complete-looking index that holds nothing and returns no rows —
+    /// silently, for every reader, until the next generation.
+    ///
+    /// The commit-time hook that this rework replaced resolved schemas through
+    /// the catalog snapshot taken when the transaction opened, which by
+    /// construction cannot contain a registration the transaction is still
+    /// staging. Extraction now runs here instead, against the same
+    /// transaction-visible catalog that
+    /// `validation_allows_pending_registered_schema_to_validate_later_rows`
+    /// pins — so the fix is structural, not a special case.
+    ///
+    /// (The SQL surface cannot currently reach this shape: a row table
+    /// registered inside an explicit transaction is not bindable until that
+    /// transaction commits. The prepared-write path can, which is why the
+    /// invariant is pinned at this level rather than through SQL.)
+    #[tokio::test]
+    async fn a_schema_registered_in_this_commit_indexes_its_own_rows() {
+        let visible_schemas = vec![registered_schema()];
+        let global_unique_row = |row_pk: &str, slug: &str| {
+            let mut row = staged_row(
+                "unique_schema",
+                Some(json!({ "id": row_pk, "slug": slug, "title": "title" }).to_string()),
+            );
+            row.row_pk = RowPk::single(row_pk);
+            row
+        };
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![
+                pending_registered_schema_from_definition(unique_schema()),
+                global_unique_row("row-1", "slug-1"),
+                global_unique_row("row-2", "slug-2"),
+            ],
+            ..empty_staged_write_set()
+        };
+
+        let extracted =
+            validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
+                .await
+                .expect("registration plus rows of that schema should validate");
+
+        assert_eq!(
+            extracted
+                .registered_collections
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![("unique_schema".to_string(), 0_u16)],
+            "the registration must witness its one declared column"
+        );
+        let indexed = extracted
+            .rows
+            .iter()
+            .flat_map(|row| {
+                row.columns.iter().map(move |(ordinal, value)| {
+                    (row.schema_key.as_str().to_owned(), *ordinal, value.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexed,
+            vec![
+                (
+                    "unique_schema".to_string(),
+                    0,
+                    Some(crate::hot_state::HotIndexValue::String("slug-1".into()))
+                ),
+                (
+                    "unique_schema".to_string(),
+                    0,
+                    Some(crate::hot_state::HotIndexValue::String("slug-2".into()))
+                ),
+            ],
+            "every row of the freshly registered schema must be extracted, or the \
+             witness above publishes an index that is missing them"
+        );
+    }
+
+    /// Every declared ordinal is carried, `None` included.
+    ///
+    /// Commit earns a witness per `(schema, ordinal)` from the row's presence,
+    /// not from a value being found, so a row that omits an indexable value
+    /// must still report that ordinal. Dropping it would leave the column
+    /// unwitnessed and silently un-indexable for the whole collection.
+    #[tokio::test]
+    async fn extraction_reports_declared_ordinals_without_a_value() {
+        let schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "sparse_index_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": true },
+                { "name": "rank", "type": "int8", "nullable": true },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"], ["rank"]],
+        });
+        let mut row = staged_row(
+            "sparse_index_schema",
+            Some(json!({ "id": "row-1", "slug": null, "rank": 7 }).to_string()),
+        );
+        row.row_pk = RowPk::single("row-1");
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![pending_registered_schema_from_definition(schema), row,],
+            ..empty_staged_write_set()
+        };
+
+        let extracted =
+            validate_prepared_writes(validation_input(&staged_writes, &vec![registered_schema()]))
+                .await
+                .expect("sparse indexed row should validate");
+
+        let [row] = extracted.rows.as_slice() else {
+            panic!(
+                "expected exactly one extracted row, got {:?}",
+                extracted.rows
+            );
+        };
+        assert_eq!(
+            row.columns,
+            vec![
+                (0_u16, Some(crate::hot_state::HotIndexValue::Integer(7))),
+                (1_u16, None),
+            ],
+            "a null indexed value must still report its ordinal"
+        );
     }
 
     #[test]
@@ -4552,7 +5006,7 @@ mod tests {
 
         let mut file_row = staged_row(
             "pending_file_schema",
-            Some(json!({ "id": "entity-1" }).to_string()),
+            Some(json!({ "id": "row-1" }).to_string()),
         );
         file_row.global = false;
         file_row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
@@ -4572,7 +5026,7 @@ mod tests {
             "untracked_only_schema",
             Some(json!({ "id": "row-1" }).to_string()),
         );
-        tracked_row.entity_pk = EntityPk::single("row-1");
+        tracked_row.row_pk = RowPk::single("row-1");
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![untracked_schema, tracked_row],
             ..empty_staged_write_set()
@@ -4591,14 +5045,14 @@ mod tests {
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![staged_row(
                 "lix_key_value",
-                Some(json!({ "key": "k" }).to_string()),
+                Some(json!({ "key": "k", "extra": true }).to_string()),
             )],
             ..empty_staged_write_set()
         };
 
         let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect_err("missing required snapshot field should fail");
+            .expect_err("unknown snapshot column should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
     }
@@ -4636,7 +5090,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &StrictEmptyLiveStateReader,
+                &StrictEmptyHotStateReader,
             ))
             .await
             .expect_err("non-null file_id should require a file descriptor");
@@ -4665,7 +5119,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &StrictEmptyLiveStateReader,
+            &StrictEmptyHotStateReader,
         ))
         .await
         .expect("same-transaction file descriptor should satisfy file ownership");
@@ -4695,16 +5149,25 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &StrictEmptyLiveStateReader,
+                &StrictEmptyHotStateReader,
             ))
             .await
             .expect_err("tracked file owner must not resolve through pending untracked descriptor");
 
-        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
+        // Same lane mismatch as the committed case: the file is being created
+        // in this very transaction, just in the other lane.
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is untracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
+    /// Pending-descriptor sibling of
+    /// `validation_rejects_untracked_file_owner_reference_committed_as_tracked`.
     #[tokio::test]
-    async fn validation_allows_untracked_file_owner_reference_pending_as_tracked() {
+    async fn validation_rejects_untracked_file_owner_reference_pending_as_tracked() {
         let visible_schemas = vec![
             unique_schema(),
             file_descriptor_schema(),
@@ -4723,13 +5186,21 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &StrictEmptyLiveStateReader,
-        ))
-        .await
-        .expect("untracked file owner should resolve through pending tracked descriptor");
+        let error =
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &StrictEmptyHotStateReader,
+            ))
+            .await
+            .expect_err("an untracked row must not be owned by a pending tracked file");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is tracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
     #[tokio::test]
@@ -4756,7 +5227,7 @@ mod tests {
             TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &EmptyLiveStateReader,
+                &EmptyHotStateReader,
             ),
         )
         .await
@@ -4772,7 +5243,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -4782,7 +5253,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("committed file descriptor should satisfy file ownership");
@@ -4798,7 +5269,7 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: Vec::new(),
             scan_count: AtomicUsize::new(0),
         };
@@ -4806,12 +5277,12 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("shared committed file descriptor should satisfy file ownership");
 
-        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 2);
+        assert_eq!(hot_state.scan_count.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -4826,7 +5297,7 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
         );
         mark_live_row_untracked(&mut untracked_file_descriptor);
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![untracked_file_descriptor],
         };
 
@@ -4834,17 +5305,31 @@ mod tests {
             TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ),
         )
         .await
         .expect_err("tracked file owner must not resolve through committed untracked descriptor");
 
-        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
+        // The file exists, in the other lane, so this is a lane mismatch rather
+        // than a missing file. It used to report CODE_FILE_NOT_FOUND for a file
+        // `SELECT * FROM lix_file` plainly returns.
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is untracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
+    /// The inverse of the behaviour PR D removes.
+    ///
+    /// This test previously asserted that an untracked row *may* be owned by a
+    /// tracked file — the cross-lane pairing that let a tracked file deletion
+    /// silently cascade untracked rows away. Its inversion is the evidence that
+    /// the enforcement seam is live.
     #[tokio::test]
-    async fn validation_allows_untracked_file_owner_reference_committed_as_tracked() {
+    async fn validation_rejects_untracked_file_owner_reference_committed_as_tracked() {
         let visible_schemas = vec![unique_schema()];
         let mut untracked_row = unique_row("post-1", "hello-world", "first");
         mark_prepared_row_untracked(&mut untracked_row);
@@ -4852,20 +5337,28 @@ mod tests {
             state_rows: prepared_rows![untracked_row],
             ..empty_staged_write_set()
         };
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
                 "01920000-0000-7000-8000-0000000000a1",
             )],
         };
 
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("untracked file owner should resolve through committed tracked descriptor");
+        let error =
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &hot_state,
+            ))
+            .await
+            .expect_err("an untracked row must not be owned by a tracked file");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is tracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
     #[tokio::test]
@@ -4885,14 +5378,14 @@ mod tests {
         );
         untracked_tombstone.snapshot_content = None;
         mark_live_row_untracked(&mut untracked_tombstone);
-        let live_state = OverlayingStaticLiveStateReader {
+        let hot_state = OverlayingStaticHotStateReader {
             rows: vec![tracked_file_descriptor, untracked_tombstone],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("tracked file owner should resolve against tracked descriptor behind overlay");
@@ -4914,14 +5407,14 @@ mod tests {
             state_rows: prepared_rows![file_descriptor_delete],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("file descriptor deletion cascades committed file-owned rows");
@@ -4944,9 +5437,9 @@ mod tests {
             ..empty_staged_write_set()
         };
         let mut untracked_row =
-            MaterializedLiveStateRow::from(unique_row("post-1", "hello-world", "first"));
+            MaterializedHotStateRow::from(unique_row("post-1", "hello-world", "first"));
         mark_live_row_untracked(&mut untracked_row);
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![
                 committed_file_descriptor_row(
                     "01920000-0000-7000-8000-0000000000a2",
@@ -4959,7 +5452,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("file descriptor deletion cascades untracked file-owned rows");
@@ -4998,7 +5491,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
                 crate::GLOBAL_BRANCH_ID,
@@ -5009,7 +5502,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("global file descriptor should not satisfy a branch-local row");
@@ -5021,7 +5514,7 @@ mod tests {
     async fn validation_rejects_primary_key_duplicate_with_different_identity() {
         let visible_schemas = vec![unique_schema()];
         let mut conflicting = unique_row("post-1", "hello-world", "first");
-        conflicting.entity_pk = EntityPk::single("post-2");
+        conflicting.row_pk = RowPk::single("post-2");
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first"), conflicting],
             ..empty_staged_write_set()
@@ -5161,7 +5654,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
@@ -5169,7 +5662,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("committed visible unique value should conflict");
@@ -5187,7 +5680,7 @@ mod tests {
         let tracked_duplicate = committed_unique_row("post-1", "hello-world", "first");
         let mut untracked_overlay = committed_unique_row("post-1", "draft-slug", "draft");
         mark_live_row_untracked(&mut untracked_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
+        let hot_state = OverlayingStaticHotStateReader {
             rows: vec![tracked_duplicate, untracked_overlay],
         };
 
@@ -5195,7 +5688,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("tracked unique duplicate must be detected behind untracked overlay");
@@ -5217,7 +5710,7 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
@@ -5225,7 +5718,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("untracked tombstone must not hide tracked unique owner");
@@ -5240,7 +5733,7 @@ mod tests {
             state_rows: prepared_rows![nullable_unique_row("row-2", None, "root-name")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_nullable_unique_row("row-1", None, "root-name")],
         };
 
@@ -5248,7 +5741,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("committed duplicate nullable unique value should conflict");
@@ -5263,7 +5756,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
@@ -5271,7 +5764,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("same unique value in the same branch should conflict");
@@ -5288,21 +5781,21 @@ mod tests {
             state_rows: prepared_rows![branch_b],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("committed unique values should be scoped to the exact branch_id");
     }
 
     #[tokio::test]
-    async fn validation_ignores_projected_live_state_rows_for_unique_constraints() {
+    async fn validation_ignores_projected_hot_state_rows_for_unique_constraints() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
@@ -5311,14 +5804,14 @@ mod tests {
         let mut projected_overlay_row = committed_unique_row("post-1", "hello-world", "first");
         projected_overlay_row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         projected_overlay_row.global = true;
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![projected_overlay_row],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("validation should ignore live-state overlay projections");
@@ -5331,14 +5824,14 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "updated")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("same identity should update committed unique owner");
@@ -5351,7 +5844,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-1", "second-slug", "updated")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
                 committed_unique_row("post-1", "hello-world", "first"),
                 committed_unique_row("post-2", "second-slug", "second"),
@@ -5362,7 +5855,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("changing to another committed unique value should conflict");
@@ -5388,7 +5881,7 @@ mod tests {
         };
         let mut committed = committed_unique_row("post-1", "hello-world", "first");
         committed.file_id = None;
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: vec![committed],
             scan_count: AtomicUsize::new(0),
         };
@@ -5396,12 +5889,12 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("insert with a distinct unique value should succeed");
 
-        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 1);
+        assert_eq!(hot_state.scan_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5419,7 +5912,7 @@ mod tests {
             state_rows: prepared_rows![staged_one, staged_two],
             ..empty_staged_write_set()
         };
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: vec![committed_one, committed_two],
             scan_count: AtomicUsize::new(0),
         };
@@ -5427,12 +5920,12 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("distinct pending unique values should not conflict");
 
-        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 1);
+        assert_eq!(hot_state.scan_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5444,14 +5937,14 @@ mod tests {
             state_rows: prepared_rows![tombstone, unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("tombstoned committed owner should not conflict");
@@ -5468,14 +5961,14 @@ mod tests {
             state_rows: prepared_rows![different_file, different_branch],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("committed uniqueness is scoped by file and branch");
@@ -5628,17 +6121,17 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
                 {
-                    let mut unrelated = MaterializedLiveStateRow::from(fk_parent_row(
+                    let mut unrelated = MaterializedHotStateRow::from(fk_parent_row(
                         "unrelated",
                         "01920000-0000-7000-8000-0000000000a1",
                     ));
                     unrelated.snapshot_content = Some("{invalid".into());
                     unrelated
                 },
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
@@ -5648,7 +6141,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("foreign key should resolve against committed rows in the same branch");
@@ -5665,12 +6158,12 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let mut untracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+        let mut untracked_parent = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
         mark_live_row_untracked(&mut untracked_parent);
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![untracked_parent],
         };
 
@@ -5678,7 +6171,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("tracked FK must not resolve through a committed untracked target");
@@ -5709,13 +6202,13 @@ mod tests {
             state_rows: prepared_rows![untracked_file_descriptor, untracked_child],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
                 committed_file_descriptor_row(
                     "01920000-0000-7000-8000-0000000000a2",
                     "01920000-0000-7000-8000-0000000000a1",
                 ),
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
@@ -5725,7 +6218,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("untracked FK should be allowed to reference a committed tracked target");
@@ -5742,23 +6235,23 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+        let tracked_parent = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
-        let mut untracked_overlay = MaterializedLiveStateRow::from(fk_parent_row(
+        let mut untracked_overlay = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
         mark_live_row_untracked(&mut untracked_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
+        let hot_state = OverlayingStaticHotStateReader {
             rows: vec![tracked_parent, untracked_overlay],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect(
@@ -5775,22 +6268,22 @@ mod tests {
             state_rows: prepared_rows![parent_delete],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+        let tracked_parent = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
-        let tracked_child = MaterializedLiveStateRow::from(fk_child_row(
+        let tracked_child = MaterializedHotStateRow::from(fk_child_row(
             "child-1",
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
-        let mut untracked_child_overlay = MaterializedLiveStateRow::from(fk_child_row(
+        let mut untracked_child_overlay = MaterializedHotStateRow::from(fk_child_row(
             "child-1",
             "other-parent",
             "01920000-0000-7000-8000-0000000000a1",
         ));
         mark_live_row_untracked(&mut untracked_child_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
+        let hot_state = OverlayingStaticHotStateReader {
             rows: vec![tracked_parent, tracked_child, untracked_child_overlay],
         };
 
@@ -5798,7 +6291,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("tracked referencing row behind overlay must block target delete");
@@ -5815,17 +6308,17 @@ mod tests {
             state_rows: prepared_rows![parent_delete],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+        let tracked_parent = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
-        let mut untracked_child = MaterializedLiveStateRow::from(fk_child_row(
+        let mut untracked_child = MaterializedHotStateRow::from(fk_child_row(
             "child-1",
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
         mark_live_row_untracked(&mut untracked_child);
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![tracked_parent, untracked_child],
         };
 
@@ -5833,7 +6326,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("tracked target delete must be blocked by committed untracked references");
@@ -5852,8 +6345,8 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000b1",
             ))],
@@ -5863,7 +6356,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err(
@@ -5889,8 +6382,8 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000a1",
             ))],
@@ -5900,7 +6393,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("same-transaction tombstone should hide the committed FK target");
@@ -5926,8 +6419,8 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000a1",
             ))],
@@ -5936,7 +6429,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("untracked tombstone must not hide tracked FK target");
@@ -5958,8 +6451,8 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000a1",
             ))],
@@ -5969,7 +6462,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("pending child reference should block parent delete");
@@ -6005,13 +6498,13 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
-                MaterializedLiveStateRow::from(fk_child_row(
+                MaterializedHotStateRow::from(fk_child_row(
                     "child-1",
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
@@ -6027,7 +6520,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("delete should be restricted by same-branch references");
@@ -6043,11 +6536,11 @@ mod tests {
         parent_one_delete.snapshot = None;
         let mut parent_two_delete = fk_parent_row("parent-2", branch_id);
         parent_two_delete.snapshot = None;
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", branch_id)),
-                MaterializedLiveStateRow::from(fk_parent_row("parent-2", branch_id)),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-2", branch_id)),
+                MaterializedHotStateRow::from(fk_parent_row("parent-1", branch_id)),
+                MaterializedHotStateRow::from(fk_parent_row("parent-2", branch_id)),
+                MaterializedHotStateRow::from(fk_child_row("child-1", "parent-2", branch_id)),
             ],
             scan_count: AtomicUsize::new(0),
         };
@@ -6062,7 +6555,7 @@ mod tests {
         for row in validation_set.rows() {
             pending_constraints.remember_tombstone(row);
         }
-        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
 
         let error = validate_committed_delete_restrictions(&input, &catalog, &pending_constraints)
             .await
@@ -6070,9 +6563,407 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
         assert_eq!(
-            live_state.scan_count.load(Ordering::Relaxed),
+            hot_state.scan_count.load(Ordering::Relaxed),
             3,
             "two target point loads should share the committed source-schema scan"
+        );
+    }
+
+    fn file_descriptor_row_in_directory(
+        file_id: &str,
+        directory_id: Option<&str>,
+        name: &str,
+        branch_id: &str,
+    ) -> TestPreparedStateRow {
+        let mut row = staged_row(
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            Some(
+                json!({
+                    "id": file_id,
+                    "directory_id": directory_id,
+                    "name": name,
+                })
+                .to_string(),
+            ),
+        );
+        row.row_pk =
+            RowPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
+        row.file_id = Some(file_id.into());
+        row.branch_id = branch_id.into();
+        row.global = branch_id == crate::GLOBAL_BRANCH_ID;
+        row
+    }
+
+    const FK_SCOPE_BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000a1";
+    const FK_SCOPE_DIRECTORY_ID: &str = "01920000-0000-7000-8000-0000000000d1";
+    const FK_SCOPE_CHILD_DIRECTORY_ID: &str = "01920000-0000-7000-8000-0000000000d2";
+    const FK_SCOPE_FILE_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    async fn committed_delete_restriction_outcome(
+        staged_rows: Vec<TestPreparedStateRow>,
+        committed_rows: Vec<MaterializedHotStateRow>,
+    ) -> Result<(), LixError> {
+        let staged_writes = PreparedWriteSet {
+            state_rows: PreparedStateBatch::from_test_rows(staged_rows),
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ])
+        .expect("descriptor schemas should compile");
+        let hot_state = StrictStaticHotStateReader {
+            rows: committed_rows,
+        };
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            if row.snapshot_json().is_none() {
+                pending_constraints.remember_tombstone(row);
+            }
+        }
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
+        validate_committed_delete_restrictions(&input, &catalog, &pending_constraints).await
+    }
+
+    async fn directory_delete_with_committed_file_child_outcome(
+        untracked: bool,
+    ) -> Result<(), LixError> {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let mut committed_directory =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        let mut committed_file = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+        if untracked {
+            mark_prepared_row_untracked(&mut directory_delete);
+            mark_prepared_row_untracked(&mut committed_directory);
+            mark_prepared_row_untracked(&mut committed_file);
+        }
+        committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedHotStateRow::from(committed_directory),
+                MaterializedHotStateRow::from(committed_file),
+            ],
+        )
+        .await
+    }
+
+    /// Control: the same declared restriction on a same-file-scope pair does
+    /// fire, so the batch machinery itself is alive.
+    #[tokio::test]
+    async fn committed_delete_restriction_rejects_child_directory_of_deleted_directory() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let committed_directory =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        let committed_child = directory_descriptor_row(
+            FK_SCOPE_CHILD_DIRECTORY_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "guides",
+            FK_SCOPE_BRANCH_ID,
+        );
+
+        let error = committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedHotStateRow::from(committed_directory),
+                MaterializedHotStateRow::from(committed_child),
+            ],
+        )
+        .await
+        .expect_err("committed child directory must block its parent's delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    /// A file descriptor row lives in file scope `Exact(Some(own id))` while
+    /// the directory it references lives in `Exact(None)`. Before
+    /// `delete_restriction_source_domains`, the committed delete side scanned
+    /// only `file_id IS NULL` and this declared foreign key could never fire.
+    #[tokio::test]
+    async fn committed_delete_restriction_rejects_tracked_file_child_of_deleted_directory() {
+        let error = directory_delete_with_committed_file_child_outcome(false)
+            .await
+            .expect_err("tracked lane: committed file child must block the directory delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    #[tokio::test]
+    async fn committed_delete_restriction_rejects_untracked_file_child_of_deleted_directory() {
+        let error = directory_delete_with_committed_file_child_outcome(true)
+            .await
+            .expect_err("untracked lane: committed file child must block the directory delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    /// The mirror must not reach across branches, and must not fire for a
+    /// file descriptor that sits in a different directory.
+    #[tokio::test]
+    async fn committed_delete_restriction_allows_directory_delete_without_file_children() {
+        let other_directory = "01920000-0000-7000-8000-0000000000d8";
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+
+        let outcome = committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedHotStateRow::from(directory_descriptor_row(
+                    FK_SCOPE_DIRECTORY_ID,
+                    None,
+                    "docs",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                // same branch, different parent directory
+                MaterializedHotStateRow::from(file_descriptor_row_in_directory(
+                    FK_SCOPE_FILE_ID,
+                    Some(other_directory),
+                    "readme.md",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                // same directory id, different branch
+                MaterializedHotStateRow::from(file_descriptor_row_in_directory(
+                    "01920000-0000-7000-8000-0000000000f2",
+                    Some(FK_SCOPE_DIRECTORY_ID),
+                    "readme.md",
+                    "01920000-0000-7000-8000-0000000000b1",
+                )),
+            ],
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "unrelated file descriptors must not block the delete, got {outcome:?}"
+        );
+    }
+
+    /// A file descriptor staged as a tombstone in the same transaction is not
+    /// a live reference, so deleting its directory alongside it is legal --
+    /// this is the shape the recursive directory-delete planner produces.
+    #[tokio::test]
+    async fn committed_delete_restriction_allows_directory_delete_with_staged_file_tombstone() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let mut file_delete = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+        file_delete.snapshot = None;
+
+        let outcome = committed_delete_restriction_outcome(
+            vec![directory_delete, file_delete],
+            vec![
+                MaterializedHotStateRow::from(directory_descriptor_row(
+                    FK_SCOPE_DIRECTORY_ID,
+                    None,
+                    "docs",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                MaterializedHotStateRow::from(file_descriptor_row_in_directory(
+                    FK_SCOPE_FILE_ID,
+                    Some(FK_SCOPE_DIRECTORY_ID),
+                    "readme.md",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+            ],
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a cascading recursive delete must stay legal, got {outcome:?}"
+        );
+    }
+
+    fn fk_row_in_file(mut row: TestPreparedStateRow, file_id: &str) -> MaterializedHotStateRow {
+        row.file_id = Some(file_id.into());
+        MaterializedHotStateRow::from(row)
+    }
+
+    /// Simulates the "just widen the delete-side source domain" fix by running
+    /// the committed batch with an `Any` file scope, against a corpus where the
+    /// same target primary key legitimately exists in two file scopes.
+    async fn widened_source_domain_probe(source_domain: Domain) -> Result<(), LixError> {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let file_f = "01920000-0000-7000-8000-0000000000f0";
+        let file_g = "01920000-0000-7000-8000-0000000000f9";
+
+        let hot_state = StrictStaticHotStateReader {
+            rows: vec![
+                fk_row_in_file(fk_parent_row("parent-1", branch_id), file_f),
+                fk_row_in_file(fk_parent_row("parent-1", branch_id), file_g),
+                fk_row_in_file(fk_child_row("child-1", "parent-1", branch_id), file_g),
+            ],
+        };
+        let catalog =
+            CatalogSnapshot::from_visible_schemas(&[fk_parent_schema(), fk_child_schema()])
+                .expect("fk schemas should compile");
+        let reference = catalog
+            .delete_plan_for_key("fk_parent_schema")
+            .foreign_key_references
+            .first()
+            .expect("fk_parent_schema is referenced by fk_child_schema")
+            .clone();
+
+        // Delete `parent-1` in file F only. `child-1` lives in file G and is
+        // satisfied by the `parent-1` row that remains in file G.
+        let deleted_identity = DomainRowIdentity::in_domain(
+            Domain::exact_file(branch_id.to_string(), false, Some(file_f.to_string())),
+            "fk_parent_schema",
+            RowPk::single("parent-1"),
+        );
+        let batches = BTreeMap::from([(
+            NormalDeleteRestrictionBatchKey {
+                source_key: reference.source_key.clone(),
+                source_domain,
+                local_properties: reference.foreign_key.local_properties.clone(),
+            },
+            BTreeMap::from([(
+                UniqueConstraintValue::from_snapshot(
+                    &json!({ "id": "parent-1" }),
+                    &reference.foreign_key.referenced_properties,
+                )
+                .expect("referenced value should encode"),
+                vec![deleted_identity],
+            )]),
+        )]);
+
+        validate_committed_normal_delete_restriction_batches(
+            &hot_state,
+            &PendingConstraintIndexes::default(),
+            batches,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn widening_delete_source_domain_to_any_file_falsely_rejects() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let file_f = "01920000-0000-7000-8000-0000000000f0";
+
+        let narrow = widened_source_domain_probe(Domain::exact_file(
+            branch_id.to_string(),
+            false,
+            Some(file_f.to_string()),
+        ))
+        .await;
+        assert!(
+            narrow.is_ok(),
+            "today's exact file scope correctly allows this delete, got {narrow:?}"
+        );
+
+        let widened =
+            widened_source_domain_probe(Domain::any_file(branch_id.to_string(), false)).await;
+        let error = widened.expect_err(
+            "Domain::any_file conflates same-valued keys across file scopes and must reject",
+        );
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    fn pending_delete_restriction_probe(
+        visible_schemas: &[JsonValue],
+        staged_rows: Vec<TestPreparedStateRow>,
+    ) -> Result<(), LixError> {
+        let staged_writes = PreparedWriteSet {
+            state_rows: PreparedStateBatch::from_test_rows(staged_rows),
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(visible_schemas)
+            .expect("probe schemas should compile");
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            match row.snapshot_json() {
+                Some(snapshot) => {
+                    let (_, schema_plan) = catalog
+                        .plan_for_key(row.schema_key())
+                        .expect("probe schema plan should resolve");
+                    pending_constraints
+                        .remember_foreign_key_references(row, schema_plan, snapshot)
+                        .expect("probe foreign-key references should index");
+                }
+                None => pending_constraints.remember_tombstone(row),
+            }
+        }
+        validate_pending_delete_restrictions(&catalog, &pending_constraints)
+    }
+
+    /// `UniqueConstraintValue::from_row_pk` renders a component with
+    /// `format!("{:?}", JsonValue)` while `from_snapshot*` renders the inner
+    /// value. The two encodings can never compare equal for a string or UUID
+    /// primary key, and `validate_pending_delete_restrictions` is the only
+    /// caller of `from_row_pk`.
+    #[test]
+    fn pending_delete_restriction_value_encodings_do_not_agree() {
+        let row_pk = RowPk::single("parent-1");
+        let snapshot = json!({ "id": "parent-1" });
+        let pointer_group = vec![vec!["id".to_string()]];
+
+        let from_identity = UniqueConstraintValue::from_row_pk(&row_pk);
+        let from_snapshot = UniqueConstraintValue::from_snapshot(&snapshot, &pointer_group)
+            .expect("snapshot value should encode");
+
+        assert_eq!(from_identity.0, vec!["String(\"parent-1\")".to_string()]);
+        assert_eq!(from_snapshot.0, vec!["\"parent-1\"".to_string()]);
+        assert_ne!(from_identity, from_snapshot);
+    }
+
+    /// Consequence of the encoding mismatch: the pending lane never fires,
+    /// for a plain user schema pair with no file-scope subtlety at all.
+    #[test]
+    fn pending_delete_restriction_scope_probe_generic_schema_pair() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let mut parent_delete = fk_parent_row("parent-1", branch_id);
+        parent_delete.snapshot = None;
+
+        let outcome = pending_delete_restriction_probe(
+            &[fk_parent_schema(), fk_child_schema()],
+            vec![
+                parent_delete,
+                fk_child_row("child-1", "parent-1", branch_id),
+            ],
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "generic pair: expected the pending restriction to be unreachable, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pending_delete_restriction_scope_probe_staged_file_child() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let staged_file = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+
+        let outcome = pending_delete_restriction_probe(
+            &[file_descriptor_schema(), directory_descriptor_schema()],
+            vec![directory_delete, staged_file],
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "descriptor pair: expected the pending restriction to be unreachable, got {outcome:?}"
         );
     }
 
@@ -6081,13 +6972,13 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
-                MaterializedLiveStateRow::from(fk_child_row(
+                MaterializedHotStateRow::from(fk_child_row(
                     "child-1",
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -6102,7 +6993,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("references in another branch should not restrict this branch");
@@ -6119,13 +7010,13 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
         );
         child_delete.snapshot = None;
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
-                MaterializedLiveStateRow::from(fk_child_row(
+                MaterializedHotStateRow::from(fk_child_row(
                     "child-1",
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
@@ -6140,7 +7031,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("committed references deleted in the same transaction should not restrict delete");
@@ -6153,11 +7044,11 @@ mod tests {
         let mut parent_delete = fk_parent_row("parent-1", branch_id);
         parent_delete.snapshot = None;
         let child_update = fk_child_row("child-1", "parent-2", branch_id);
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", branch_id)),
-                MaterializedLiveStateRow::from(fk_parent_row("parent-2", branch_id)),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", branch_id)),
+                MaterializedHotStateRow::from(fk_parent_row("parent-1", branch_id)),
+                MaterializedHotStateRow::from(fk_parent_row("parent-2", branch_id)),
+                MaterializedHotStateRow::from(fk_child_row("child-1", "parent-1", branch_id)),
             ],
         };
         let staged_writes = PreparedWriteSet {
@@ -6168,7 +7059,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("a replacement row's final foreign keys should supersede its committed references");
@@ -6330,16 +7221,13 @@ mod tests {
         indexes.remember_tombstone(PreparedValidationRow::State(deleted.borrowed()));
 
         let committed =
-            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", branch_id));
+            MaterializedHotStateRow::from(fk_child_row("child-1", "parent-1", branch_id));
         let mut other_file = committed.clone();
         other_file.file_id = Some("01920000-0000-7000-8000-0000000000b1".into());
         let mut malformed_projection = committed.clone();
         malformed_projection.global = true;
-        let batch = MaterializedLiveStateBatch::from_rows(vec![
-            committed,
-            other_file,
-            malformed_projection,
-        ]);
+        let batch =
+            MaterializedHotStateBatch::from_rows(vec![committed, other_file, malformed_projection]);
 
         assert!(indexes.tombstones_identity(batch.row(0)));
         assert!(!indexes.tombstones_identity(batch.row(1)));
@@ -6429,7 +7317,7 @@ mod tests {
                 false,
                 Some("01920000-0000-7000-8000-0000000000a2".to_string()),
                 "fk_child_schema",
-                EntityPk::single("child-1"),
+                RowPk::single("child-1"),
             )
         );
         assert_eq!(unresolved[0].source_schema_key, "fk_child_schema");
@@ -6455,7 +7343,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_fk_targets_have_exact_entity_pk_filters_but_unique_targets_do_not() {
+    fn primary_key_fk_targets_have_exact_row_pk_filters_but_unique_targets_do_not() {
         let catalog = CatalogSnapshot::from_visible_schemas(&[unique_schema()])
             .expect("unique schema catalog should build");
         let mut target = PendingForeignKeyTargetKey {
@@ -6466,17 +7354,17 @@ mod tests {
                 Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             ),
             pointer_group: vec![vec!["id".to_string()]],
-            value: UniqueConstraintValue::string_values(["entity-1"]),
+            value: UniqueConstraintValue::string_values(["row-1"]),
         };
 
         assert_eq!(
-            primary_key_entity_pk_for_target(&catalog, &target),
-            Some(EntityPk::single("entity-1"))
+            primary_key_row_pk_for_target(&catalog, &target),
+            Some(RowPk::single("row-1"))
         );
 
         target.pointer_group = vec![vec!["slug".to_string()]];
         assert_eq!(
-            primary_key_entity_pk_for_target(&catalog, &target),
+            primary_key_row_pk_for_target(&catalog, &target),
             None,
             "non-primary unique constraints still require value scans"
         );
@@ -6625,8 +7513,8 @@ mod tests {
             )],
         )
         .expect("pending FK validation should collect unresolved check");
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000a1",
             ))],
@@ -6636,7 +7524,7 @@ mod tests {
             &TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ),
             &indexes,
             &unresolved,
@@ -6680,8 +7568,8 @@ mod tests {
             )],
         )
         .expect("pending FK validation should collect unresolved check");
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000b1",
             ))],
@@ -6691,7 +7579,7 @@ mod tests {
             &TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ),
             &indexes,
             &unresolved,
@@ -6719,9 +7607,9 @@ mod tests {
         }
     }
 
-    fn live_state_row_matches_scan(
-        row: &MaterializedLiveStateRow,
-        request: &LiveStateScanRequest,
+    fn hot_state_row_matches_scan(
+        row: &MaterializedHotStateRow,
+        request: &HotStateScanRequest,
     ) -> bool {
         if request
             .filter
@@ -6746,7 +7634,7 @@ mod tests {
                     .any(|filter| filter.matches(row.file_id.as_ref())))
     }
 
-    fn test_file_descriptor_rows() -> Vec<MaterializedLiveStateRow> {
+    fn test_file_descriptor_rows() -> Vec<MaterializedHotStateRow> {
         vec![
             committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
@@ -6769,13 +7657,12 @@ mod tests {
 
     fn pending_registered_schema_row(schema_key: &str) -> TestPreparedStateRow {
         pending_registered_schema_from_definition(json!({
-            "x-lix-key": schema_key,
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" }
-            },
-            "required": ["id"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         }))
     }
 
@@ -6783,11 +7670,13 @@ mod tests {
         let key = schema_key_from_definition(&schema).expect("test schema should have a key");
         TestPreparedStateRow {
             schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
-            facts: crate::transaction::types::PreparedRowFacts::default(),
-            entity_pk: registered_schema_entity_pk(&key.schema_key),
+            facts: crate::transaction_types::PreparedRowFacts::default(),
+            row_pk: registered_schema_row_pk(&key.schema_key),
             schema_key: REGISTERED_SCHEMA_KEY.into(),
             file_id: None,
-            snapshot: Some(test_stage_json(&json!({ "value": schema }).to_string())),
+            snapshot: Some(test_stage_json(
+                &json!({ "schema_key": key.schema_key.clone(), "value": schema }).to_string(),
+            )),
             metadata: None,
             origin: None,
             origin_key: None,
@@ -6801,14 +7690,12 @@ mod tests {
         }
     }
 
-    fn registered_schema_entity_pk(schema_key: &str) -> EntityPk {
-        EntityPk::from_primary_key_paths(
+    fn registered_schema_row_pk(schema_key: &str) -> RowPk {
+        RowPk::from_primary_key_paths(
             &serde_json::json!({
-                "value": {
-                    "x-lix-key": schema_key,
-                }
+                "schema_key": schema_key,
             }),
-            &[vec!["value".to_string(), "x-lix-key".to_string()]],
+            &[vec!["schema_key".to_string()]],
         )
         .expect("registered schema identity should derive")
     }
@@ -6839,83 +7726,75 @@ mod tests {
 
     fn unique_schema() -> JsonValue {
         json!({
-            "x-lix-key": "unique_schema",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/slug"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "slug": { "type": "string" },
-                "title": { "type": "string" }
-            },
-            "required": ["id", "slug", "title"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "unique_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "slug", "type": "text", "nullable": false },
+                { "name": "title", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["slug"]],
         })
     }
 
     fn nullable_unique_schema() -> JsonValue {
         json!({
-            "x-lix-key": "nullable_unique_schema",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/scope", "/name"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "scope": { "type": ["string", "null"] },
-                "name": { "type": "string" }
-            },
-            "required": ["id", "scope", "name"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "nullable_unique_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "scope", "type": "jsonb", "nullable": false },
+                { "name": "name", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["scope", "name"]],
         })
     }
 
     fn fk_parent_schema() -> JsonValue {
         json!({
-            "x-lix-key": "fk_parent_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "fk_parent_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         })
     }
 
     fn fk_child_schema() -> JsonValue {
         json!({
-            "x-lix-key": "fk_child_schema",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/parent_id"],
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "fk_child_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
                 "references": {
-                    "schemaKey": "fk_parent_schema",
-                    "properties": ["/id"]
+                    "schema_key": "fk_parent_schema",
+                    "columns": ["id"]
                 }
             }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "parent_id": { "type": "string" }
-            },
-            "required": ["id", "parent_id"],
-            "additionalProperties": false
         })
     }
 
-    fn unique_row(entity_pk: &str, slug: &str, title: &str) -> TestPreparedStateRow {
+    fn unique_row(row_pk: &str, slug: &str, title: &str) -> TestPreparedStateRow {
         let mut row = staged_row(
             "unique_schema",
             Some(
                 json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "slug": slug,
                     "title": title,
                 })
                 .to_string(),
             ),
         );
-        row.entity_pk = EntityPk::single(entity_pk);
+        row.row_pk = RowPk::single(row_pk);
         row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
         row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         row.global = false;
@@ -6923,7 +7802,7 @@ mod tests {
     }
 
     fn nullable_unique_row(
-        entity_pk: &str,
+        row_pk: &str,
         scope: Option<&str>,
         name: &str,
     ) -> TestPreparedStateRow {
@@ -6931,38 +7810,38 @@ mod tests {
             "nullable_unique_schema",
             Some(
                 json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "scope": scope,
                     "name": name,
                 })
                 .to_string(),
             ),
         );
-        row.entity_pk = EntityPk::single(entity_pk);
+        row.row_pk = RowPk::single(row_pk);
         row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
         row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         row.global = false;
         row
     }
 
-    fn fk_parent_row(entity_pk: &str, branch_id: &str) -> TestPreparedStateRow {
+    fn fk_parent_row(row_pk: &str, branch_id: &str) -> TestPreparedStateRow {
         let mut row = staged_row(
             "fk_parent_schema",
-            Some(json!({ "id": entity_pk }).to_string()),
+            Some(json!({ "id": row_pk }).to_string()),
         );
-        row.entity_pk = EntityPk::single(entity_pk);
+        row.row_pk = RowPk::single(row_pk);
         row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
         row.branch_id = branch_id.into();
         row.global = false;
         row
     }
 
-    fn fk_child_row(entity_pk: &str, parent_id: &str, branch_id: &str) -> TestPreparedStateRow {
+    fn fk_child_row(row_pk: &str, parent_id: &str, branch_id: &str) -> TestPreparedStateRow {
         let mut row = staged_row(
             "fk_child_schema",
-            Some(json!({ "id": entity_pk, "parent_id": parent_id }).to_string()),
+            Some(json!({ "id": row_pk, "parent_id": parent_id }).to_string()),
         );
-        row.entity_pk = EntityPk::single(entity_pk);
+        row.row_pk = RowPk::single(row_pk);
         row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
         row.branch_id = branch_id.into();
         row.global = false;
@@ -6975,7 +7854,7 @@ mod tests {
         row.commit_id = None;
     }
 
-    fn mark_live_row_untracked(row: &mut MaterializedLiveStateRow) {
+    fn mark_live_row_untracked(row: &mut MaterializedHotStateRow) {
         row.untracked = true;
         row.change_id = None;
         row.commit_id = None;
@@ -6993,16 +7872,16 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk =
-            EntityPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
+        row.row_pk =
+            RowPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
         row.file_id = Some(file_id.into());
         row.branch_id = branch_id.into();
         row.global = branch_id == crate::GLOBAL_BRANCH_ID;
         row
     }
 
-    fn committed_file_descriptor_row(file_id: &str, branch_id: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow::from(staged_file_descriptor_row(file_id, branch_id))
+    fn committed_file_descriptor_row(file_id: &str, branch_id: &str) -> MaterializedHotStateRow {
+        MaterializedHotStateRow::from(staged_file_descriptor_row(file_id, branch_id))
     }
 
     fn directory_descriptor_row(
@@ -7022,7 +7901,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk = EntityPk::uuid_from_canonical(directory_id)
+        row.row_pk = RowPk::uuid_from_canonical(directory_id)
             .expect("fixture directory ID should be a UUID");
         row.file_id = None;
         row.branch_id = branch_id.into();
@@ -7030,10 +7909,10 @@ mod tests {
         row
     }
 
-    fn committed_unique_row(entity_pk: &str, slug: &str, title: &str) -> MaterializedLiveStateRow {
-        let row = unique_row(entity_pk, slug, title);
-        MaterializedLiveStateRow {
-            entity_pk: row.entity_pk,
+    fn committed_unique_row(row_pk: &str, slug: &str, title: &str) -> MaterializedHotStateRow {
+        let row = unique_row(row_pk, slug, title);
+        MaterializedHotStateRow {
+            row_pk: row.row_pk,
             schema_key: row.schema_key.into(),
             file_id: row.file_id.map(Into::into),
             snapshot_content: row
@@ -7056,18 +7935,18 @@ mod tests {
     }
 
     fn committed_nullable_unique_row(
-        entity_pk: &str,
+        row_pk: &str,
         scope: Option<&str>,
         name: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow::from(nullable_unique_row(entity_pk, scope, name))
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow::from(nullable_unique_row(row_pk, scope, name))
     }
 
     fn staged_row(schema_key: &str, snapshot_content: Option<String>) -> TestPreparedStateRow {
         TestPreparedStateRow {
             schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
-            facts: crate::transaction::types::PreparedRowFacts::default(),
-            entity_pk: EntityPk::single("entity-1"),
+            facts: crate::transaction_types::PreparedRowFacts::default(),
+            row_pk: RowPk::single("row-1"),
             schema_key: schema_key.into(),
             file_id: None,
             snapshot: snapshot_content.as_deref().map(test_stage_json),
@@ -7118,7 +7997,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        blob_ref.entity_pk = EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000a2")
+        blob_ref.row_pk = RowPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000a2")
             .expect("fixture file ID should be a UUID");
         blob_ref.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
         blob_ref.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
@@ -7144,7 +8023,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        owner.entity_pk = EntityPk::single(PLUGIN_OWNER_KEY);
+        owner.row_pk = RowPk::single(PLUGIN_OWNER_KEY);
         owner.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
         owner.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         owner.global = false;
@@ -7152,7 +8031,7 @@ mod tests {
         owner.origin = Some(plugin_reconciliation_update_origin());
 
         let mut semantic = staged_row("json_root", Some(json!({ "kind": "object" }).to_string()));
-        semantic.entity_pk = EntityPk::single("root");
+        semantic.row_pk = RowPk::single("root");
         semantic.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
         semantic.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         semantic.global = false;
@@ -7161,7 +8040,7 @@ mod tests {
 
         let mut writes = PreparedWriteSet {
             state_rows: prepared_rows![descriptor.clone(), blob_ref.clone(), owner, semantic],
-            file_content_writes: vec![crate::transaction::types::TransactionFileContent::new(
+            file_content_writes: vec![crate::transaction_types::TransactionFileContent::new(
                 "01920000-0000-7000-8000-0000000000a2".to_string(),
                 Some("/a.json".to_string()),
                 Some("a.json".to_string()),
@@ -7174,7 +8053,7 @@ mod tests {
         };
         writes.commit_change_refs_by_branch.insert(
             "01920000-0000-7000-8000-0000000000a1".to_string(),
-            crate::transaction::types::StagedCommitChangeRefs::default(),
+            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::default(),
         );
         writes.remember_insert_identity_for_tests(&descriptor);
         writes
@@ -7213,6 +8092,72 @@ mod tests {
         assert!(!prepared_tracked_rows_have_row_local_certificates(
             &prepared_rows![reserved]
         ));
+    }
+
+    /// A row that carries an indexed column must never reach commit without
+    /// passing through the extraction inside `validate_prepared_writes`.
+    ///
+    /// The hot index plane's one inviolable property is "never a false
+    /// negative". A bypassed row that still earns its collection a witness
+    /// would publish a complete-looking index that is missing that row, and
+    /// every read of it would silently return nothing. Seven certificates can
+    /// skip validation; this pins all seven.
+    ///
+    /// Four live in `bound_public_write.rs` — the insert batch, the two update
+    /// batches, and the path-value replacement program — and each declines
+    /// outright on `spec.has_inter_row_constraints`. That is sufficient
+    /// because a column is only indexable if `x-lix-unique` or
+    /// `x-lix-foreign-keys` declared it, which is the same predicate; see
+    /// `indexed_columns_imply_inter_row_constraints`.
+    ///
+    /// The remaining three are asserted here directly: they all require
+    /// `!requires_transaction_validation` on every row, which
+    /// `normalization.rs` grants to a snapshot row only when its schema plan
+    /// declares no uniques and no foreign keys — hence no indexed columns — or
+    /// when `constraints_unchanged` proves the UPDATE assigned none of them;
+    /// see `every_indexed_column_revokes_the_constraints_unchanged_certificate`.
+    #[test]
+    fn declared_column_rows_never_bypass_extraction() {
+        let mut row = staged_row("indexed_schema", Some(r#"{"id":"row"}"#.to_string()));
+        row.facts.row_content_validated = true;
+        row.facts.requires_transaction_validation = true;
+
+        // Site 5: `prepared_tracked_rows_have_row_local_certificates`, the
+        // early return in `validate_prepared_writes_by_branch`.
+        assert!(
+            !prepared_tracked_rows_have_row_local_certificates(&prepared_rows![row.clone()]),
+            "a row needing transaction validation must not skip the validation index"
+        );
+
+        // Site 6: `row_local_certificates_cover_validation`, the early return
+        // inside `validate_prepared_writes` itself.
+        let borrowed = row.borrowed();
+        assert!(
+            !row_local_certificates_cover_validation(&[PreparedValidationRow::State(borrowed)]),
+            "a row needing transaction validation must not skip per-schema validation"
+        );
+
+        // Site 7: `fresh_plugin_file_import_certificate` under
+        // `trust_filesystem_planner`. Its plugin-owned rows are admitted only
+        // while `requires_transaction_validation` is clear.
+        let mut writes = fresh_plugin_file_import_write_set();
+        assert!(
+            fresh_plugin_file_import_certificate(&writes).is_some(),
+            "the unmodified fixture must certify, or this test proves nothing"
+        );
+        let mut constrained = staged_row("indexed_schema", Some(r#"{"id":"root"}"#.to_string()));
+        constrained.row_pk = RowPk::single("root");
+        constrained.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
+        constrained.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
+        constrained.global = false;
+        constrained.facts.row_content_validated = true;
+        constrained.facts.requires_transaction_validation = true;
+        constrained.origin = Some(plugin_reconciliation_update_origin());
+        writes.state_rows.push_test_row(constrained);
+        assert!(
+            fresh_plugin_file_import_certificate(&writes).is_none(),
+            "an indexed-schema row inside a plugin import must revoke the certificate"
+        );
     }
 
     #[test]
@@ -7259,7 +8204,7 @@ mod tests {
         let writes = fresh_plugin_file_import_write_set();
         let certificate = fresh_plugin_file_import_certificate(&writes)
             .expect("fixture should satisfy the structural certificate");
-        validate_certified_fresh_plugin_file_import(&StrictEmptyLiveStateReader, certificate)
+        validate_certified_fresh_plugin_file_import(&StrictEmptyHotStateReader, certificate)
             .await
             .expect("new descriptor and blob identities should be absent");
 
@@ -7271,8 +8216,8 @@ mod tests {
         let certificate = fresh_plugin_file_import_certificate(&writes)
             .expect("certificate remains valid before committed lookup");
         let error = validate_certified_fresh_plugin_file_import(
-            &StrictStaticLiveStateReader {
-                rows: vec![MaterializedLiveStateRow::from(duplicate_descriptor)],
+            &StrictStaticHotStateReader {
+                rows: vec![MaterializedHotStateRow::from(duplicate_descriptor)],
             },
             certificate,
         )

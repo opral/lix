@@ -8,10 +8,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let baseline = sim.initial_commit_id().to_string();
@@ -38,8 +35,8 @@ simulation_test!(
 
         let working = select_rows(
             &session,
-            "SELECT diff_id, entity_pk, diff_type FROM lix_working_diff \
-         WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+            "SELECT diff_id, row_pk, diff_type FROM lix_working_diff \
+         WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
         )
         .await;
         assert_eq!(working.len(), 2);
@@ -60,7 +57,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_revert (diff_id) \
                  SELECT diff_id \
-                 FROM VALUES ($1) AS selected(diff_id) \
+                 FROM (VALUES ($1)) AS selected(diff_id) \
                  RETURNING commit_id",
                 &[selected_diff_id],
             )
@@ -81,7 +78,7 @@ simulation_test!(
             .await,
             vec![vec![
                 Value::Text("b".to_string()),
-                Value::Json(json!("two")),
+                Value::Jsonb(json!("two").into()),
             ]]
         );
 
@@ -89,7 +86,7 @@ simulation_test!(
             "SELECT diff_id, before_change_id, after_change_id \
          FROM lix_diff('{baseline}', '{original_head}') \
          WHERE schema_key = 'lix_key_value' \
-           AND entity_pk = lix_json('[\"a\"]')"
+           AND row_pk = CAST('[\"a\"]' AS JSONB)"
         );
         let historical_rows = select_rows(&session, &historical_diff).await;
         assert_eq!(historical_rows.len(), 1);
@@ -101,7 +98,7 @@ simulation_test!(
                 "INSERT INTO lix_apply (diff_id) \
                  SELECT diff_id FROM lix_diff($1, $2) \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"a\"]') \
+                   AND row_pk = CAST('[\"a\"]' AS JSONB) \
                  RETURNING commit_id",
                 &[
                     Value::Text(baseline.clone()),
@@ -119,7 +116,7 @@ simulation_test!(
                 "INSERT INTO lix_apply (diff_id) \
                  SELECT diff_id FROM lix_diff($1, $2) \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"a\"]')",
+                   AND row_pk = CAST('[\"a\"]' AS JSONB)",
                 &[
                     Value::Text(baseline),
                     Value::Text(original_head.to_string()),
@@ -138,7 +135,7 @@ simulation_test!(
                 "INSERT INTO lix_create_checkpoint (diff_id) \
              SELECT diff_id FROM lix_working_diff \
              WHERE schema_key = $1 \
-               AND entity_pk = lix_json($2) \
+               AND row_pk = CAST($2 AS JSONB) \
              RETURNING commit_id",
                 &[
                     Value::Text("lix_key_value".to_string()),
@@ -179,11 +176,11 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
+                "SELECT row_pk FROM lix_working_diff \
+             WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
             )
             .await,
-            vec![vec![Value::Json(json!(["b"]))]]
+            vec![vec![Value::Jsonb(json!(["b"]).into())]]
         );
         assert_eq!(
             select_rows(
@@ -192,8 +189,14 @@ simulation_test!(
             )
             .await,
             vec![
-                vec![Value::Text("a".to_string()), Value::Json(json!("one"))],
-                vec![Value::Text("b".to_string()), Value::Json(json!("two"))],
+                vec![
+                    Value::Text("a".to_string()),
+                    Value::Jsonb(json!("one").into())
+                ],
+                vec![
+                    Value::Text("b".to_string()),
+                    Value::Jsonb(json!("two").into())
+                ],
             ]
         );
 
@@ -220,5 +223,139 @@ simulation_test!(
             .expect("head after empty selection should load")
             .expect("head after empty selection should exist");
         assert_eq!(head_after_empty, head_before_empty);
+    }
+);
+
+// A checkpointed delete is a *soft* delete: the checkpoint root keeps a
+// tombstone for the identity. Re-inserting that identity therefore produces an
+// `added` working-diff row whose before-image is `BeforePresent { deleted:
+// true }` rather than absent. `diff_id` must encode only the after side in that
+// case, exactly as it does for an identity that was never present — otherwise
+// physically compacting tombstones away would renumber the id.
+simulation_test!(
+    diff_id_ignores_a_checkpointed_delete_tombstone,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+
+        // A `d1.` id carries a one-byte side mask plus one 16-byte UUID per
+        // present side, base64url-unpadded: 3 + 23 = 26 chars for one side,
+        // 3 + 44 = 47 for two. Length is the only way to observe the encoded
+        // side count from SQL, since clients must not decode a diff_id.
+        const AFTER_ONLY_LEN: usize = 26;
+
+        // Control: an identity that was never present before the checkpoint.
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('fresh', 'one')",
+                &[],
+            )
+            .await
+            .expect("fresh insert should succeed");
+        let fresh = select_rows(
+            &session,
+            "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff \
+             WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"fresh\"]' AS JSONB)",
+        )
+        .await;
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0][1], Value::Text("added".to_string()));
+        assert_eq!(
+            fresh[0][2],
+            Value::Null,
+            "an identity that never existed has no before row"
+        );
+        let Value::Text(fresh_diff_id) = &fresh[0][0] else {
+            panic!("diff_id should be text, got {:?}", fresh[0][0]);
+        };
+        assert_eq!(fresh_diff_id.len(), AFTER_ONLY_LEN);
+
+        // Now build the tombstone history: insert, checkpoint, delete,
+        // checkpoint (which retains the tombstone), then re-insert.
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('recycled', 'one')",
+                &[],
+            )
+            .await
+            .expect("first insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_create_checkpoint (diff_id) \
+                 SELECT diff_id FROM lix_working_diff",
+                &[],
+            )
+            .await
+            .expect("checkpoint of the insert should succeed");
+        session
+            .execute("DELETE FROM lix_key_value WHERE key = 'recycled'", &[])
+            .await
+            .expect("delete should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_create_checkpoint (diff_id) \
+                 SELECT diff_id FROM lix_working_diff",
+                &[],
+            )
+            .await
+            .expect("checkpoint of the delete should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('recycled', 'two')",
+                &[],
+            )
+            .await
+            .expect("re-insert should succeed");
+
+        let recycled = select_rows(
+            &session,
+            "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff \
+             WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"recycled\"]' AS JSONB)",
+        )
+        .await;
+        assert_eq!(recycled.len(), 1);
+        assert_eq!(recycled[0][1], Value::Text("added".to_string()));
+
+        // Non-vacuity: this scenario only tests anything if the checkpointed
+        // delete really did leave a tombstone that reaches the diff surface.
+        // `before_change_id` reports the raw before row, so it stays populated.
+        assert!(
+            matches!(&recycled[0][2], Value::Text(id) if !id.is_empty()),
+            "fixture must retain a tombstoned before row, got {:?}",
+            recycled[0][2]
+        );
+
+        let Value::Text(recycled_diff_id) = &recycled[0][0] else {
+            panic!("diff_id should be text, got {:?}", recycled[0][0]);
+        };
+        assert_eq!(
+            recycled_diff_id.len(),
+            AFTER_ONLY_LEN,
+            "a tombstoned before row must not add a side to the diff_id"
+        );
+
+        // The normalized id must still drive a command end to end.
+        let reverted = session
+            .execute(
+                "INSERT INTO lix_revert (diff_id) \
+                 SELECT diff_id FROM (VALUES ($1)) AS selected(diff_id) \
+                 RETURNING commit_id",
+                &[recycled[0][0].clone()],
+            )
+            .await
+            .expect("revert of a tombstone-backed add should succeed");
+        assert_eq!(reverted.rows_affected(), 1);
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT key FROM lix_key_value WHERE key = 'recycled'",
+            )
+            .await,
+            Vec::<Vec<Value>>::new(),
+            "reverting the re-insert must return the identity to absent"
+        );
     }
 );

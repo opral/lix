@@ -41,15 +41,15 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "diagnostics",
             "execution",
             "init",
-            "live_state",
+            "hot_state",
             "schema",
             "session",
             "sql",
         ],
     },
     ForbiddenDependencyRule {
-        from_scope: "live_state",
-        reason: "live_state is the generic projection engine and must not reacquire services sidecars or write orchestration owners",
+        from_scope: "hot_state",
+        reason: "hot_state is the generic projection engine and must not reacquire services sidecars or write orchestration owners",
         forbidden_scopes: &["execution", "services"],
     },
     ForbiddenDependencyRule {
@@ -76,7 +76,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
 ];
 
-const TARGET_CORE_MODULES: &[&str] = &["storage", "live_state", "session", "sql2", "transaction"];
+const TARGET_CORE_MODULES: &[&str] = &["storage", "hot_state", "session", "sql2", "transaction"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
@@ -1624,9 +1624,6 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
             if sealed_owner_allows_importer(owner_root, &relative_path) {
                 continue;
             }
-            if sealed_owner_allows_import_path(owner_root, &imported_path) {
-                continue;
-            }
 
             if !violates_sealed_owner_boundary(owner_root, &imported_path, &child_modules) {
                 continue;
@@ -1647,6 +1644,12 @@ fn violates_sealed_owner_boundary(
     imported_path: &[String],
     child_modules: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
+    if owner_root == "plugin" {
+        return !matches!(
+            imported_path.get(1).map(String::as_str),
+            Some("runtime" | "wire")
+        );
+    }
     if sealed_owner_root_facade_owners().contains(owner_root) {
         return true;
     }
@@ -1663,13 +1666,6 @@ fn sealed_owner_root_facade_owners() -> BTreeSet<&'static str> {
 fn sealed_owner_allows_importer(owner_root: &str, importer_file: &str) -> bool {
     (matches!(owner_root, "api") && importer_file == "lib.rs")
         || importer_file == "storage_bench.rs"
-}
-
-fn sealed_owner_allows_import_path(owner_root: &str, imported_path: &[String]) -> bool {
-    owner_root == "transaction"
-        && imported_path
-            .get(1)
-            .is_some_and(|segment| segment == "types")
 }
 
 fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -> String {
@@ -1946,7 +1942,7 @@ fn current_services_sibling_dependency_violations() -> Vec<ImportPathViolation> 
 }
 
 fn is_engine_owned_persistence_path(relative_path: &str) -> bool {
-    let in_scope_owner_root = relative_path.starts_with("live_state")
+    let in_scope_owner_root = relative_path.starts_with("hot_state")
         || relative_path.starts_with("canonical")
         || relative_path.starts_with("binary_cas")
         || relative_path.starts_with("session/branch_ops");
@@ -2031,7 +2027,7 @@ fn current_engine_owned_persistence_raw_storage_type_violations() -> Vec<RawStor
 }
 
 fn is_owner_persistence_root_path(relative_path: &str) -> bool {
-    relative_path.starts_with("live_state")
+    relative_path.starts_with("hot_state")
         || relative_path.starts_with("canonical")
         || relative_path.starts_with("binary_cas")
 }
@@ -2175,8 +2171,8 @@ fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
     is_owner_local_storage_path(relative_path)
         || relative_path.starts_with("sql")
         || relative_path.starts_with("execution")
+        || relative_path == "server_protocol/mod.rs"
         || relative_path == "transaction/buffered_write_transaction.rs"
-        || relative_path == "transaction/live_state_write_transaction.rs"
 }
 
 fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations()
@@ -2658,7 +2654,7 @@ fn internal_metadata_crud_is_centralized_in_owner_storage() {
 
     assert!(
         violations.is_empty(),
-        "internal metadata CRUD for workspace selectors, commit idempotency, and undo/redo log should live in owner-local `storage.rs` seams, not scattered through `api/*`, `init/*`, `session/*`, or `transaction/*`.\n\nCurrent violations:\n{}",
+        "internal metadata CRUD for primary-session state, commit idempotency, and undo/redo log should live in owner-local `storage.rs` seams, not scattered through `api/*`, `init/*`, `session/*`, or `transaction/*`.\n\nCurrent violations:\n{}",
         render_grouped_raw_sql_execution_violations(&violations),
     );
 }
@@ -2715,7 +2711,7 @@ fn sql2_public_boundary_does_not_reintroduce_stringly_validation() {
             "public_input::expect_json_text(\"",
             "public_input::expect_file_path_public(\"",
             "public_input::expect_directory_path_public(\"",
-            "public_input::expect_entity_pk_public(\"",
+            "public_input::expect_row_pk_public(\"",
             "public_input::expect_non_blob_public_id(\"",
             "require_write(\"",
             "routed_surface(",
@@ -2762,8 +2758,8 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "mod change;",
             "mod directory;",
             "mod directory_history;",
-            "mod entity;",
-            "mod entity_history;",
+            "mod schema;",
+            "mod schema_history;",
             "mod file;",
             "mod file_history;",
             "mod history_util;",
@@ -2803,7 +2799,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "directory::register_lix_directory_by_branch_provider",
             "file::register_lix_file_active_provider",
             "file::register_lix_file_by_branch_provider",
-            "entity::register_entity_providers",
+            "schema::register_row_providers",
         ],
     );
     assert_source_contains_none(
@@ -2813,7 +2809,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "register_lix_branch_write_provider",
             "register_lix_directory_write_providers",
             "register_lix_file_write_providers",
-            "register_entity_write_providers",
+            "register_row_write_providers",
             "register_lix_branch_provider",
             "register_lix_change_provider",
             "register_history_providers",
@@ -2872,14 +2868,14 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
             "file::register_by_branch_write_provider",
             "directory::register_active_write_provider",
             "directory::register_by_branch_write_provider",
-            "entity::register_entity_write_providers",
+            "schema::register_row_write_providers",
         ],
     );
     assert_source_contains_none(
         relative,
         write_registration,
         &[
-            "ctx.live_state()",
+            "ctx.hot_state()",
             "ctx.branch_ref()",
             "PublicCatalog::from_visible_schemas",
             "register_lix_branch_provider",
@@ -2889,7 +2885,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
             "register_lix_directory_history_provider",
             "register_lix_directory_providers",
             "register_lix_file_providers",
-            "register_entity_providers",
+            "register_row_providers",
             "register_lix_branch_write_provider",
             "register_lix_branch_write_surface",
             "register_lix_directory_active_write_provider",
@@ -2914,21 +2910,21 @@ fn session_transaction_commits_go_through_commit_boundary() {
 }
 
 #[test]
-fn sql2_entity_provider_registration_is_catalog_driven() {
-    let relative = "sql2/providers/entity.rs";
+fn sql2_row_provider_registration_is_catalog_driven() {
+    let relative = "sql2/providers/schema.rs";
     let source = read_engine_source(relative);
     let non_test_source = strip_test_code(&source);
     let read_registration = source_between(
         relative,
         &source,
-        "pub(crate) async fn register_entity_providers",
-        "pub(crate) async fn register_entity_write_providers",
+        "pub(crate) async fn register_row_providers",
+        "pub(crate) async fn register_row_write_providers",
     );
     let write_registration = source_between(
         relative,
         &source,
-        "pub(crate) async fn register_entity_write_providers",
-        "fn catalog_entity_spec",
+        "pub(crate) async fn register_row_write_providers",
+        "fn catalog_schema_spec",
     );
 
     assert_source_contains_all(
@@ -2936,9 +2932,9 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         read_registration,
         &[
             "catalog.surfaces()",
-            "PublicSurfaceKind::EntityBase",
-            "PublicSurfaceKind::EntityByBranch",
-            "PublicSurfaceKind::EntityHistory",
+            "PublicSurfaceKind::SchemaBase",
+            "PublicSurfaceKind::SchemaByBranch",
+            "PublicSurfaceKind::SchemaHistory",
         ],
     );
     assert_source_contains_all(
@@ -2946,8 +2942,8 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         write_registration,
         &[
             "catalog.surfaces()",
-            "PublicSurfaceKind::EntityBase",
-            "PublicSurfaceKind::EntityByBranch",
+            "PublicSurfaceKind::SchemaBase",
+            "PublicSurfaceKind::SchemaByBranch",
         ],
     );
     assert_source_contains_none(
@@ -2955,9 +2951,9 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         read_registration,
         &[
             "schema_definitions",
-            "derive_entity_surface_spec_from_schema",
-            "schema_exposed_as_entity_surface",
-            "schema_exposed_as_entity_history_surface",
+            "derive_schema_surface_spec_from_schema",
+            "schema_exposed_as_schema_surface",
+            "schema_exposed_as_history_surface",
         ],
     );
     assert_source_contains_none(
@@ -2965,18 +2961,18 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         write_registration,
         &[
             "schema_definitions",
-            "derive_entity_surface_spec_from_schema",
-            "schema_exposed_as_entity_surface",
-            "schema_exposed_as_entity_history_surface",
+            "derive_schema_surface_spec_from_schema",
+            "schema_exposed_as_schema_surface",
+            "schema_exposed_as_history_surface",
         ],
     );
     assert_source_contains_none(
         relative,
         &non_test_source,
         &[
-            "schema_exposed_as_entity_surface",
-            "schema_exposed_as_entity_history_surface",
-            "derive_entity_surface_spec_from_schema(",
+            "schema_exposed_as_schema_surface",
+            "schema_exposed_as_history_surface",
+            "derive_schema_surface_spec_from_schema(",
         ],
     );
 }

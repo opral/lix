@@ -4,44 +4,12 @@ use crate::json_store::types::{
     JsonLoadBatch, JsonLoadRequestRef, JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::storage_adapter::{
-    BufferRange, EncodedMutationBatch, EncodedPut, StorageAdapterRead, StorageSpace,
-    StorageSpaceId, StorageWriteSet,
-};
-#[cfg(test)]
-use crate::storage_adapter::{
-    StorageBeginScanOptions, StorageCoreProjection, StorageKey, StoragePrefix,
+    BufferRange, EncodedMutationBatch, EncodedPut, StorageAdapterRead, StorageWriteSet,
 };
 use bytes::Bytes;
 use std::collections::HashSet;
 
-/// A durable deletion hint for a large JSON payload retired from the
-/// untracked current-state plane.
-///
-/// The content-addressed JSON store intentionally has no refcount: the same
-/// payload can be owned by tracked history and by multiple untracked rows.
-/// This key is therefore not an ownership edge. Repository GC compares it
-/// with the complete live-payload set before it deletes the JSON value.
-pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_NAMESPACE: &str =
-    "json_store.untracked_reclaim_candidate.v1";
-pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0002_0002),
-    UNTRACKED_JSON_RECLAIM_CANDIDATE_NAMESPACE,
-);
-
-const UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE: &[u8] = b"\x01";
 const JSON_REF_BYTES: usize = 32;
-
-/// One candidate record discovered from the pinned repository-GC view.
-///
-/// Malformed keys are retained as `None` so GC can reclaim the derived record
-/// without treating a corrupt hint as a reason to touch an arbitrary JSON
-/// payload.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct UntrackedJsonReclaimCandidate {
-    pub(crate) key: StorageKey,
-    pub(crate) json_ref: Option<JsonRef>,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JsonStoreContext;
@@ -72,50 +40,6 @@ impl JsonStoreContext {
         store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
             .await
             .map(JsonLoadBatch::new)
-    }
-
-    /// Lists the durable hints for out-of-band untracked payloads that may no
-    /// longer have an owner. This is deliberately a key-only, paged scan: the
-    /// hint value carries no data and the caller already holds the complete
-    /// logical root set from the same pinned read.
-    #[cfg(test)]
-    pub(crate) async fn scan_untracked_reclaim_candidates(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-    ) -> Result<Vec<UntrackedJsonReclaimCandidate>, LixError> {
-        let range = StoragePrefix {
-            bytes: Bytes::new(),
-        }
-        .to_range()?;
-        let mut candidates = Vec::new();
-        let mut cursor = store
-            .begin_scan(
-                UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-                range,
-                StorageBeginScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    ..StorageBeginScanOptions::default()
-                },
-            )
-            .await?;
-        loop {
-            let page = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            candidates.extend(page.entries.into_iter().map(|entry| {
-                let json_ref = <[u8; 32]>::try_from(entry.key.0.as_ref())
-                    .ok()
-                    .map(JsonRef::from_hash_bytes);
-                UntrackedJsonReclaimCandidate {
-                    key: entry.key,
-                    json_ref,
-                }
-            }));
-            if !page.has_more {
-                break;
-            }
-        }
-        Ok(candidates)
     }
 }
 
@@ -202,7 +126,6 @@ impl JsonStoreWriter {
             return Ok(order);
         }
 
-        const JSON_REF_BYTES: usize = 32;
         let key_bytes_len = unique_payloads
             .len()
             .checked_mul(JSON_REF_BYTES)
@@ -234,77 +157,13 @@ impl JsonStoreWriter {
         Ok(order)
     }
 
-    /// Records exactly the out-of-band untracked JSON payloads that lost one
-    /// current-state owner in this atomic write. Repeated content hashes are
-    /// idempotent: they remain one durable GC hint until a sweep proves them
-    /// dead.
-    pub(crate) fn stage_untracked_reclaim_candidates<I>(writes: &mut StorageWriteSet, refs: I)
-    where
-        I: IntoIterator<Item = JsonRef>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let refs = refs.into_iter();
-        let row_capacity = refs.len();
-        let mut key_bytes =
-            Vec::with_capacity(row_capacity.checked_mul(JSON_REF_BYTES).unwrap_or_default());
-        let mut puts = Vec::with_capacity(row_capacity);
-        for json_ref in refs {
-            let offset = key_bytes.len();
-            key_bytes.extend_from_slice(json_ref.as_hash_bytes());
-            puts.push(EncodedPut {
-                key: BufferRange::new(offset, JSON_REF_BYTES),
-                value: BufferRange::new(0, UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE.len()),
-            });
-        }
-        if puts.is_empty() {
-            return;
-        }
-        let batch = EncodedMutationBatch::try_new(
-            Bytes::from(key_bytes),
-            Bytes::from_static(UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE),
-            puts,
-            Vec::new(),
-        )
-        .expect("JSON reclaim candidate descriptors are built from arena offsets");
-        // The write-set helper coalesces an identical hint emitted by an
-        // earlier current-state staging call in the same atomic commit.
-        writes.stage_content_addressed_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
-    }
-
-    /// Removes only candidate hints whose payload was proved dead (or whose
-    /// key was malformed) from the same pinned GC view.
-    #[cfg(test)]
-    pub(crate) fn stage_delete_untracked_reclaim_candidates<I>(
-        writes: &mut StorageWriteSet,
-        keys: I,
-    ) where
-        I: IntoIterator<Item = StorageKey>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let keys = keys.into_iter();
-        let row_capacity = keys.len();
-        let mut key_bytes =
-            Vec::with_capacity(row_capacity.checked_mul(JSON_REF_BYTES).unwrap_or_default());
-        let mut deletes = Vec::with_capacity(row_capacity);
-        for key in keys {
-            let offset = key_bytes.len();
-            key_bytes.extend_from_slice(&key.0);
-            deletes.push(BufferRange::new(offset, key.0.len()));
-        }
-        if deletes.is_empty() {
-            return;
-        }
-        let batch = EncodedMutationBatch::try_new(
-            Bytes::from(key_bytes),
-            Bytes::new(),
-            Vec::new(),
-            deletes,
-        )
-        .expect("JSON reclaim candidate delete descriptors are built from arena offsets");
-        writes.stage_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
-    }
-
-    #[allow(dead_code)] // Activated by the checkpoint GC integration.
+    /// Deletes JSON payload rows.
+    ///
+    /// The caller must have proved that no owner outliving its write set names
+    /// these refs — see `gc::collect_live_json_payload_hashes` — and must stage
+    /// [`crate::json_store::stage_json_reclamation_fence`] in the same write
+    /// set, because payload rows are content addressed and a concurrent
+    /// publisher can resolve onto one of them.
     #[expect(clippy::unused_self)]
     pub(crate) fn stage_delete_refs<I>(&self, writes: &mut StorageWriteSet, refs: I)
     where
@@ -407,50 +266,12 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_and_delete_batches_use_one_key_arena_for_ten_thousand_rows() {
+    fn delete_batches_use_one_key_arena_for_ten_thousand_rows() {
         const ROW_COUNT: usize = 10_000;
 
         let refs = (0_u32..ROW_COUNT as u32)
             .map(|index| JsonRef::for_content(&index.to_be_bytes()))
             .collect::<Vec<_>>();
-
-        let mut candidate_puts = StorageWriteSet::new();
-        JsonStoreWriter::stage_untracked_reclaim_candidates(
-            &mut candidate_puts,
-            refs.iter().copied(),
-        );
-        // A later domain stage of the same content-addressed hints must discard
-        // descriptors without retaining another pair of arenas.
-        JsonStoreWriter::stage_untracked_reclaim_candidates(
-            &mut candidate_puts,
-            refs.iter().copied(),
-        );
-        let arenas = candidate_puts.arena_stats();
-        assert_eq!(arenas.put_descriptors, ROW_COUNT);
-        assert_eq!(arenas.delete_descriptors, 0);
-        assert_eq!(arenas.key_shared_buffers, 1);
-        assert_eq!(arenas.key_shared_bytes, ROW_COUNT * JSON_REF_BYTES);
-        assert_eq!(arenas.value_shared_buffers, 1);
-        assert_eq!(
-            arenas.value_shared_bytes,
-            UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE.len()
-        );
-
-        let candidate_keys = refs
-            .iter()
-            .map(|json_ref| StorageKey(Bytes::copy_from_slice(json_ref.as_hash_bytes())))
-            .collect::<Vec<_>>();
-        let mut candidate_deletes = StorageWriteSet::new();
-        JsonStoreWriter::stage_delete_untracked_reclaim_candidates(
-            &mut candidate_deletes,
-            candidate_keys,
-        );
-        let arenas = candidate_deletes.arena_stats();
-        assert_eq!(arenas.put_descriptors, 0);
-        assert_eq!(arenas.delete_descriptors, ROW_COUNT);
-        assert_eq!(arenas.key_shared_buffers, 1);
-        assert_eq!(arenas.key_shared_bytes, ROW_COUNT * JSON_REF_BYTES);
-        assert_eq!(arenas.value_shared_buffers, 0);
 
         let mut payload_deletes = StorageWriteSet::new();
         JsonStoreContext::new()

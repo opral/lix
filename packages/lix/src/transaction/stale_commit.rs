@@ -6,27 +6,25 @@ use crate::tracked_state::TrackedStateKeyRef;
 use super::staging::PreparedWriteSet;
 
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum StaleCommitPlan {
     Direct,
-    RevalidateOrdinaryInsert,
-    ReconcilePlugin(StalePluginReconciliationPlan),
-    Unsafe,
+    ReconcileRows(StaleRowReconciliationPlan),
 }
 
 impl StaleCommitPlan {
     pub(super) const fn kind(&self) -> &'static str {
         match self {
             Self::Direct => "direct",
-            Self::RevalidateOrdinaryInsert => "revalidate_ordinary_insert",
-            Self::ReconcilePlugin(_) => "reconcile_plugin",
-            Self::Unsafe => "unsafe",
+            Self::ReconcileRows(_) => "reconcile_rows",
         }
     }
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct StalePluginReconciliationPlan {
+pub(super) struct StaleRowReconciliationPlan {
     pub(super) semantic_conflict_indices: Vec<usize>,
     pub(super) file_ids: BTreeSet<String>,
 }
@@ -46,7 +44,7 @@ pub(super) fn classify_stale_commit<'a>(
                     TrackedStateKeyRef {
                         schema_key: row.schema_key.as_str(),
                         file_id: row.file_id.map(SharedStr::as_str),
-                        entity_pk: row.entity_pk,
+                        row_pk: row.row_pk,
                     },
                 )
             }),
@@ -54,16 +52,6 @@ pub(super) fn classify_stale_commit<'a>(
     );
     if overlapping_indices.is_empty() {
         return StaleCommitPlan::Direct;
-    }
-
-    // Ordinary INSERT races keep their established constraint surface:
-    // commit-time validation reports the exact UNIQUE/statement-index error
-    // from the current snapshot.
-    if overlapping_indices.iter().all(|&index| {
-        prepared_writes.insert_selection.contains(index)
-            && prepared_writes.state_rows.row(index).file_id.is_none()
-    }) {
-        return StaleCommitPlan::RevalidateOrdinaryInsert;
     }
 
     let file_ids = overlapping_indices
@@ -76,14 +64,6 @@ pub(super) fn classify_stale_commit<'a>(
                 .map(ToString::to_string)
         })
         .collect::<BTreeSet<_>>();
-    if file_ids.is_empty()
-        || overlapping_indices
-            .iter()
-            .any(|&index| prepared_writes.state_rows.row(index).file_id.is_none())
-    {
-        return StaleCommitPlan::Unsafe;
-    }
-
     let semantic_conflict_indices = overlapping_indices
         .iter()
         .copied()
@@ -91,10 +71,12 @@ pub(super) fn classify_stale_commit<'a>(
             !matches!(
                 prepared_writes.state_rows.row(index).schema_key.as_str(),
                 BLOB_REF_SCHEMA_KEY
+                    | FILE_DESCRIPTOR_SCHEMA_KEY
+                    | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
             )
         })
         .collect();
-    StaleCommitPlan::ReconcilePlugin(StalePluginReconciliationPlan {
+    StaleCommitPlan::ReconcileRows(StaleRowReconciliationPlan {
         semantic_conflict_indices,
         file_ids,
     })
@@ -115,30 +97,30 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::tracked_state::TrackedStateKey;
 
     fn test_key_ref(key: &TrackedStateKey) -> TrackedStateKeyRef<'_> {
         TrackedStateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
+            row_pk: &key.row_pk,
         }
     }
 
     fn overlap_fixture(rows: usize) -> (Vec<TrackedStateKey>, Vec<TrackedStateKey>) {
         let prepared = (0..rows)
             .map(|index| TrackedStateKey {
-                schema_key: "plugin_entity".to_owned(),
+                schema_key: "plugin_row".to_owned(),
                 file_id: Some("hot-file".to_owned()),
-                entity_pk: EntityPk::single(format!("row-{index}")),
+                row_pk: RowPk::single(format!("row-{index}")),
             })
             .collect::<Vec<_>>();
         let concurrent = (0..rows)
             .map(|index| TrackedStateKey {
-                schema_key: "plugin_entity".to_owned(),
+                schema_key: "plugin_row".to_owned(),
                 file_id: Some("hot-file".to_owned()),
-                entity_pk: EntityPk::single(if index.is_multiple_of(2) {
+                row_pk: RowPk::single(if index.is_multiple_of(2) {
                     format!("row-{index}")
                 } else {
                     format!("other-{index}")

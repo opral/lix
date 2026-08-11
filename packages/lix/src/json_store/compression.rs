@@ -133,6 +133,7 @@ fn json_compression_bound(input_len: usize) -> Option<usize> {
         .checked_add(small_input_margin)
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn json_compression_error(error: String) -> LixError {
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),

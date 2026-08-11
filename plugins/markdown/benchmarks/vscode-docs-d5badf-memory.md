@@ -108,7 +108,7 @@ headroom while preserving the existing semantic model.
 The next arena cut should be conditional on a new profile showing that the
 remaining peak is dominated by `NodeSnapshot`/`serde_json::Value`
 materialization. If so, use typed arena nodes with compact `NodeId` references
-and defer JSON wire serialization to changed entities only. Do not put source
+and defer JSON wire serialization to changed rows only. Do not put source
 bytes, parser AST, semantic nodes, and durable snapshots into one universal
 arena: their lifetimes and mutation patterns differ, and coupling them would
 make sparse persistent successors harder to share.

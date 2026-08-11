@@ -1,7 +1,9 @@
-export type LocalFilesystemOptions = {
-	path: string;
-	lixDir?: string;
-	syncAllFiles: boolean;
+export type IndexedDbStorageOptions = {
+	/**
+	 * Identifies one persistent Lix database within the current origin.
+	 * A database name can be opened by only one Lix handle at a time.
+	 */
+	name: string;
 };
 
 export type RemoteLixFetch = (
@@ -29,32 +31,16 @@ export type LixTelemetryOptions = {
 	onSpan(span: LixTelemetrySpan): void;
 };
 
-/**
- * Persists opaque Lix snapshots under SDK-provided namespaces.
- *
- * Implementations must treat snapshots as bytes owned by Lix. The namespace
- * selects one logical Lix and allows a single adapter to persist more than one
- * instance without collisions.
- */
-export interface LixSnapshotStorage {
-	load(namespace: string): Promise<Uint8Array | undefined>;
-	save(namespace: string, snapshot: Uint8Array): Promise<void>;
-}
-
 export type OpenLixOptions =
 	| {
 			storage?:
-				| import("./open-lix.js").LocalFilesystem
-				| LixSnapshotStorage;
+				| import("./storage-adapter.js").LixStorage
+				| import("./open-lix.js").IndexedDbStorage;
 			server?: never;
 			telemetry?: LixTelemetryOptions;
 	  }
 	| {
-			/**
-			 * Optional client-local storage. In remote mode workspace SQL remains on
-			 * the server; only `lix.clientState` is stored here.
-			 */
-			storage?: LixSnapshotStorage;
+			storage?: never;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
 	  };
@@ -65,7 +51,8 @@ export type LixValue =
 	| { kind: "integer"; value: number }
 	| { kind: "real"; value: number }
 	| { kind: "text"; value: string }
-	| { kind: "json"; value: JsonValue }
+	| { kind: "jsonb"; value: JsonValue }
+	| { kind: "timestamptz"; value: string }
 	| { kind: "blob"; value: Uint8Array };
 
 export type JsonValue =
@@ -218,9 +205,9 @@ export type MergeChangeStats = {
 };
 
 export type MergeConflict = {
-	kind: "sameEntityChanged";
+	kind: "sameRowChanged";
 	schemaKey: string;
-	entityPk: unknown;
+	rowPk: unknown;
 	fileId: string | null;
 	target: MergeConflictSide;
 	source: MergeConflictSide;

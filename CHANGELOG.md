@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.12.2 - 2026-08-15
+
+### Patch
+
+- Fixed in-memory Lix on Node.js when the native addon is unavailable by falling back to the bundled WebAssembly engine.
+
+  This restores compatibility for memory-backed consumers on musl-based Linux distributions such as Alpine while keeping native-only features unchanged.
+
+## 0.12.1 - 2026-08-15
+
+### Patch
+
+- Integrated the generated plugin bindings directly into the `lix` crate.
+
+  Rust consumers no longer need the separate column-merger, combined, or file-projection binding crates.
+
+## 0.12.0 - 2026-08-15
+
+### Minor
+
+- Added first-class browser and filesystem storage backends.
+
+  Browser applications can persist repositories with `IndexedDbStorage`, while filesystem storage is available through the dedicated `@lix-js/storage-filesystem` package.
+- Plugin authoring and the Lix Server Protocol are now provided directly by Lix.
+
+  Rust plugins use `lix::plugin`, server hosts can use the canonical Server Protocol API, and plugins can read and edit untracked files as rows.
+- Lix SQL now uses the PostgreSQL dialect.
+
+  Queries use PostgreSQL syntax and numbered parameters such as `$1`. Row tables expose native SQL types, including `jsonb` and `timestamptz`, with consistent row terminology and typed columns instead of raw snapshots.
+- Removed `lix.clientState` and remote client-storage composition.
+
+  Applications now own browser-local UI persistence explicitly, while remote Lix handles remain focused on repository operations and independent branch-pinned sessions.
+
+### Patch
+
+- History, branch, and merge operations now scale with the relevant changes instead of the total repository size.
+
+  History traversal skips unrelated work, file history prunes irrelevant paths and plugin states, and branch-head moves reuse existing state instead of copying the complete working set.
+- SQL queries and everyday CRUD operations are substantially faster.
+
+  Lix now reuses SQL sessions and prepared plans, seeks directly for indexed and file-scoped lookups, and avoids unnecessary intermediate materialization when returning typed and JSON results.
+- Fixed several correctness and reliability issues across storage, branches, and files.
+
+  This includes stale SlateDB reads, truncated scans, false transaction conflicts, incorrect branch reverts, subquery failures, and directory operations that could leave invalid state.
+- Files and repositories use storage more efficiently.
+
+  Binary edits reuse unchanged content, SlateDB durable writes complete faster, deleted branches release their serving storage, and commits retain less internal bookkeeping.
+
 ## 0.11.0 - 2026-08-09
 
 ### Minor
@@ -30,7 +78,7 @@
 - Added repository-native accounts and single-account change attribution across local and remote sessions.
 
   Every change now has one required account, anonymous work uses the built-in anonymous account, and applications can select an active account through the Rust, JavaScript, SQL, and server-protocol APIs.
-- Added persistent undo and redo for tracked branch history across the Rust SDK, JavaScript SDK, remote protocol, and CLI.
+- Added persistent undo and redo for tracked branch history across the Rust SDK, JavaScript SDK, Lix Server Protocol, and CLI.
 
   Undo and redo append inverse and replay commits without rewinding branch history. Atomic batches and transactions remain one undo unit, while untracked state remains unchanged; checkpoints and merge commits form undo boundaries.
 - Renamed the `lix_file`, `lix_file_by_branch`, and `lix_file_history` binary payload column from `data` to `content`. Native file read and write APIs now use `content` names as well; the former `data` surface is not supported.
@@ -40,7 +88,7 @@
 - Introduced Plugin API v1 and migrated the bundled CSV, JSON, Markdown, Excalidraw, and Git text plugins.
 
   Plugin API v1 replaces the previous Wasm plugin contract with a fused, host-owned API.
-- SQL writes now support `RETURNING` across registered entities and writable filesystem and branch surfaces. INSERT and UPDATE return final post-write values (including generated defaults), while DELETE continues to return the removed row values.
+- SQL writes now support `RETURNING` across registered rows and writable filesystem and branch surfaces. INSERT and UPDATE return final post-write values (including generated defaults), while DELETE continues to return the removed row values.
 
 ### Patch
 
@@ -63,14 +111,14 @@
 
 - Directory paths now use the same canonical syntax as file paths.
 
-  Non-root paths must not end with `/`; the typed file or directory surface determines the entity kind. Applications must remove trailing slashes from directory path values.
+  Non-root paths must not end with `/`; the typed file or directory surface determines the row kind. Applications must remove trailing slashes from directory path values.
 - Turn automatic edit history into deliberate checkpoints.
 
   The SDK can create milestones, SQL can query checkpoint history and working diffs, and Lix automatically cleans up superseded automatic commits after a recovery window.
 - Rename the filesystem working-diff SQL surfaces for consistent terminology.
 
   `lix_file_working_diff`, `lix_file_working_diff_by_branch`, `lix_directory_working_diff`, and `lix_directory_working_diff_by_branch` replace their `*_working_change*` predecessors. The old names are not retained as aliases.
-- Lix is substantially faster and more storage-efficient for large files and workspaces.
+- Lix is substantially faster and more storage-efficient for large files and repositories.
 
   v0.9 adds indexed and batched file operations, faster SQL reads and writes, compressed native storage, lower-copy blob handling, and more efficient tracked-state merges. Remote clients also transfer localized file and query changes instead of repeatedly sending complete payloads.
 
@@ -80,9 +128,9 @@
   Use `example_history()` for history from the active head or `example_history($commit)` for an explicit head. The former `lixcol_as_of_commit_id` result column and predicate-based anchor API have been removed.
 - Structured files now merge incrementally through the new Component v2 plugin platform.
 
-  Reference plugins for CSV and TSV, JSON, Markdown, Excalidraw, and Git-compatible text turn localized file edits into sparse semantic changes without reparsing or rendering the complete document. Concurrent edits merge at the entity level, and plugin authors can build on the same public Rust API used by the bundled plugins.
+  Reference plugins for CSV and TSV, JSON, Markdown, Excalidraw, and Git-compatible text turn localized file edits into sparse semantic changes without reparsing or rendering the complete document. Concurrent edits merge at the row level, and plugin authors can build on the same public Rust API used by the bundled plugins.
 - Git replay can now target RocksDB or SlateDB and compare the full semantic plugin path with an explicit no-plugin control. Replay profiles identify the selected adapter and include per-commit WASM transition work counters.
-- Run Lix workspaces remotely with live, low-latency clients.
+- Run Lix repositories remotely with live, low-latency clients.
 
   `openLix()` can connect to the versioned Lix HTTP protocol for SQL, branches, atomic batches, binary file operations, and multiplexed live queries. Each client gets an isolated branch-pinned session, retries writes safely, persists private local state locally, and sends compact deltas for localized edits.
 - Plugin-backed atomic imports now scale independently of document count. The engine automatically reuses its bounded live-Store working set for fresh and existing documents while preserving actively contested same-file leases, so callers no longer need a special single-writer ingestion API or actor-retention policy. Retained session observations also recover from benign working-set eviction when their exact durable semantic root is unchanged.
@@ -151,12 +199,12 @@
 - Added `LocalFilesystem.syncDiskToLix()` as an awaitable filesystem sync barrier.
 
   The filesystem storage picks up disk edits in the background with debouncing. `storage.syncDiskToLix()` flushes pending on-disk changes into Lix and resolves once they are materialized, so subsequent queries reflect the current disk state.
-- Added a `lixDir` option to `LocalFilesystem` for storing lix state outside the workspace.
+- Added a `lixDir` option to `LocalFilesystem` for storing lix state outside the repository.
 
-  By default, state lives in `<workspace>/.lix`. Passing `lixDir` keeps repository metadata in an external `.lix` directory and writes no `.lix` directory into the workspace. Pointing `lixDir` at a temporary directory gives ephemeral filesystem sync: workspace files are imported and watched without persisting lix state.
+  By default, state lives in `<repository>/.lix`. Passing `lixDir` keeps repository metadata in an external `.lix` directory and writes no `.lix` directory into the repository. Pointing `lixDir` at a temporary directory gives ephemeral filesystem sync: repository files are imported and watched without persisting lix state.
 - `LocalFilesystem` now requires an explicit `syncAllFiles` option and supports on-demand file sync.
 
-  `new LocalFilesystem({ path, syncAllFiles: true })` syncs the full workspace as before. With `syncAllFiles: false`, the lix opens without workspace files and `storage.importPaths(["notes/today.md"])` syncs selected files on demand. Imported paths are exact workspace-relative file paths, not directories or globs. In Rust, use `LocalFilesystemOpenOptions::new(root, sync_all_files)` and `LocalFilesystem::import_paths()`.
+  `new LocalFilesystem({ path, syncAllFiles: true })` syncs the full repository as before. With `syncAllFiles: false`, the lix opens without repository files and `storage.importPaths(["notes/today.md"])` syncs selected files on demand. Imported paths are exact repository-relative file paths, not directories or globs. In Rust, use `LocalFilesystemOpenOptions::new(root, sync_all_files)` and `LocalFilesystem::import_paths()`.
 - Added optional origin keys for tagging Lix writes.
 
   `lix.execute(sql, params, { originKey })` in JavaScript and `execute_with_options(sql, params, options)` in Rust stamp the change records a write produces. The key is exposed as `origin_key` on `lix_change` and as `lixcol_origin_key` on state, file, and history surfaces; writes without an origin key stay `NULL`.
@@ -166,7 +214,7 @@
 - Made the JavaScript SDK's native bindings fully asynchronous.
 
   Awaited methods previously blocked the calling thread inside the native binding, which could freeze an Electron main process. Opening a lix, `execute`, transactions, branch and merge calls, observers, and `close` now return real promises and run their work off-thread.
-- Sped up `INSERT ... ON CONFLICT` entity upserts by scanning only the inserted identity for conflicts instead of the full entity state.
+- Sped up `INSERT ... ON CONFLICT` row upserts by scanning only the inserted identity for conflicts instead of the full row state.
 - Improved `lix_file` read and write performance.
 
   Simple single- and multi-row `lix_file (path, data)` inserts and upserts take a fast path that makes large file writes roughly 10x faster. File bytes are hashed once per write, unchanged chunks skip re-writes, and filesystem sync batches its upserts: in repository benchmarks, a 1,000-row `lix_file` insert dropped from ~95 ms to ~41 ms and a 200-file filesystem cold open from ~780 ms to ~210 ms. `SELECT` queries that project `data` now batch their blob reads.
@@ -181,10 +229,10 @@
 
 ### Minor
 
-- Added `INSERT ... ON CONFLICT` upsert support for entity state.
+- Added `INSERT ... ON CONFLICT` upsert support for row state.
 - Added file format plugins: CSV, Markdown, and plain text files are stored as queryable state instead of blobs.
 
-  Writing a file with a matching plugin stores the changes inside the file as entity state. A CSV cell edit is one row-level change that can be queried, diffed, and merged. Reorders are detected: a moved row or paragraph is recorded as a move, not a delete plus an insert. Files without a plugin keep content-defined chunked blob storage.
+  Writing a file with a matching plugin stores the changes inside the file as row state. A CSV cell edit is one row-level change that can be queried, diffed, and merged. Reorders are detected: a moved row or paragraph is recorded as a move, not a delete plus an insert. Files without a plugin keep content-defined chunked blob storage.
 - Added filesystem sync: a lix can mirror into a plain directory and back.
 
   Edits made in the directory with any tool flow into Lix with full history. Switching branches updates the directory contents.

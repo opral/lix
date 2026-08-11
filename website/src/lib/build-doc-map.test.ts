@@ -80,10 +80,10 @@ describe("resolveDocsMarkdownHref", () => {
       content: "",
       relativePath: "./storage.md",
     },
-    "./versions.md": {
-      slug: "versions",
+    "./branching.md": {
+      slug: "branching",
       content: "",
-      relativePath: "./versions.md",
+      relativePath: "./branching.md",
     },
   };
 
@@ -106,10 +106,10 @@ describe("resolveDocsMarkdownHref", () => {
   test("preserves heading hashes", () => {
     expect(
       resolveDocsMarkdownHref(
-        "./versions.md#merge",
+        "./branching.md#merge",
         currentDoc,
         docsByRelativePath,
       ),
-    ).toBe("/docs/versions#merge");
+    ).toBe("/docs/branching#merge");
   });
 });

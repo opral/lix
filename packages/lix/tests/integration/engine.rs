@@ -1,8 +1,8 @@
 use crate::support;
 use std::collections::BTreeSet;
 
-use lix::integration::{Engine, SessionContext};
 use lix::{CreateBranchOptions, ExecuteResult, MergeBranchOptions, SwitchBranchOptions, Value};
+use lix::{engine::Engine, session::SessionContext};
 use serde_json::json;
 
 simulation_test!(engine_new_rejects_uninitialized_storage, |sim| async move {
@@ -18,14 +18,14 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("initialized storage should open global session"),
             &engine,
         );
         let main_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("initialized storage should open main session"),
             &engine,
@@ -103,24 +103,24 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open a session"),
             &engine,
         );
 
         let uuid_result = session
-            .execute("SELECT lix_uuid_v7()", &[])
+            .execute("SELECT uuidv7()", &[])
             .await
-            .expect("session should expose lix_uuid_v7 UDF");
+            .expect("session should expose uuidv7 UDF");
         let uuid_rows = uuid_result;
         assert_eq!(uuid_rows.len(), 1);
         let Value::Text(uuid) = &uuid_rows.rows()[0].values()[0] else {
-            panic!("lix_uuid_v7 should return text");
+            panic!("uuidv7 should return text");
         };
         assert!(
             !uuid.is_empty(),
-            "lix_uuid_v7 should return a non-empty UUID"
+            "uuidv7 should return a non-empty UUID"
         );
 
         let insert_result = session
@@ -145,7 +145,7 @@ simulation_test!(
             row_set.rows()[0].values(),
             &[
                 Value::Text("sql2-key".to_string()),
-                Value::Json(json!("sql2-value")),
+                Value::Jsonb(json!("sql2-value").into()),
             ]
         );
     }
@@ -156,7 +156,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("storage should open a session");
 
@@ -182,7 +182,7 @@ simulation_test!(
         let insert_result = session
             .execute(
                 "INSERT INTO poison_task (id, title, meta) \
-                 VALUES ('good-task', 'valid', lix_json('{\"priority\":\"high\"}'))",
+                 VALUES ('good-task', 'valid', CAST('{\"priority\":\"high\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -196,7 +196,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("storage should open a session");
 
@@ -248,22 +248,19 @@ simulation_test!(
 
 async fn register_poison_task_schema(session: &SessionContext) {
     let schema = json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "x-lix-key": "poison_task",
-                "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "title", "meta"],
-        "properties": {
-            "id": { "type": "string" },
-            "title": { "type": "string" },
-            "meta": { "type": "object" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "poison_task",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "title", "type": "text", "nullable": false },
+            { "name": "meta", "type": "jsonb", "nullable": false },
+        ],
+        "primary_key": ["id"],
     });
 
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -275,7 +272,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("storage should open a session");
         let cloned_session = session.clone();
@@ -305,7 +302,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open first session"),
             &engine,
@@ -315,7 +312,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 '{\"enabled\":true}'::jsonb, true, true)",
                 &[],
             )
             .await
@@ -324,14 +321,14 @@ simulation_test!(
 
         assert_single_text(
             session
-                .execute("SELECT lix_uuid_v7()", &[])
+                .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("first deterministic uuid should succeed"),
             "01920000-0000-7000-8000-000000000000",
         );
         assert_single_text(
             session
-                .execute("SELECT lix_uuid_v7()", &[])
+                .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("second deterministic uuid should succeed"),
             "01920000-0000-7000-8000-000000000001",
@@ -339,14 +336,14 @@ simulation_test!(
 
         let second_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open second session"),
             &engine,
         );
         assert_single_text(
             second_session
-                .execute("SELECT lix_uuid_v7()", &[])
+                .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("third deterministic uuid should succeed"),
             "01920000-0000-7000-8000-000000000002",
@@ -362,12 +359,15 @@ simulation_test!(
         assert_eq!(write_result, ExecuteResult::from_rows_affected(1));
         assert_single_text(
             second_session
-                .execute("SELECT lix_uuid_v7()", &[])
+                .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("uuid after deterministic write should continue"),
             // The tracked write consumes deterministic values for row and
-            // commit metadata, including the branch-ref ChangeRecord ID.
-            "01920000-0000-7000-8000-000000000009",
+            // commit metadata, including the branch-ref ChangeRecord ID. The
+            // commit's own change id is no longer among them — it is derived
+            // from the commit id — so the write draws one fewer value than it
+            // used to.
+            "01920000-0000-7000-8000-000000000008",
         );
     }
 );
@@ -381,7 +381,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open a session"),
             &engine,
@@ -391,7 +391,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 CAST('{\"enabled\":true}' AS JSONB), true, true)",
                 &[],
             )
             .await
@@ -399,7 +399,7 @@ simulation_test!(
         assert_eq!(mode_result, ExecuteResult::from_rows_affected(1));
 
         let failed_read = session
-            .execute("SELECT lix_uuid_v7() FROM missing_engine_table", &[])
+            .execute("SELECT uuidv7() FROM missing_engine_table", &[])
             .await;
         assert!(
             failed_read.is_err(),
@@ -407,7 +407,7 @@ simulation_test!(
         );
         assert_single_text(
             session
-                .execute("SELECT lix_uuid_v7()", &[])
+                .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("first deterministic uuid should still start at zero"),
             "01920000-0000-7000-8000-000000000000",
@@ -415,7 +415,7 @@ simulation_test!(
 
         let failed_write = session
             .execute(
-                "INSERT INTO missing_engine_table VALUES (lix_uuid_v7())",
+                "INSERT INTO missing_engine_table VALUES (uuidv7())",
                 &[],
             )
             .await;
@@ -425,7 +425,7 @@ simulation_test!(
         );
         assert_single_text(
             session
-                .execute("SELECT lix_uuid_v7()", &[])
+                .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("second deterministic uuid should continue after last success"),
             "01920000-0000-7000-8000-000000000001",
@@ -442,7 +442,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open first session"),
             &engine,
@@ -451,7 +451,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 CAST('{\"enabled\":true}' AS JSONB), true, true)",
                 &[],
             )
             .await
@@ -459,15 +459,15 @@ simulation_test!(
 
         let second_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open second session"),
             &engine,
         );
 
         let (first, second) = tokio::join!(
-            session.execute("SELECT lix_uuid_v7()", &[]),
-            second_session.execute("SELECT lix_uuid_v7()", &[])
+            session.execute("SELECT uuidv7()", &[]),
+            second_session.execute("SELECT uuidv7()", &[])
         );
         let values = BTreeSet::from([
             single_text(first.expect("first deterministic uuid should succeed")),
@@ -483,7 +483,7 @@ simulation_test!(
 
         assert_single_text(
             session
-                .execute("SELECT lix_uuid_v7()", &[])
+                .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("third deterministic uuid should continue"),
             "01920000-0000-7000-8000-000000000002",
@@ -500,7 +500,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open first session"),
             &engine,
@@ -509,14 +509,14 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 CAST('{\"enabled\":true}' AS JSONB), true, true)",
                 &[],
             )
             .await
             .expect("deterministic mode insert should succeed");
         let second_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open second session"),
             &engine,
@@ -528,13 +528,13 @@ simulation_test!(
             .expect("transaction should begin");
         assert_single_text(
             transaction
-                .execute("SELECT lix_uuid_v7()", &[])
+                .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("transaction deterministic uuid should succeed"),
             "01920000-0000-7000-8000-000000000000",
         );
 
-        let concurrent_read = second_session.execute("SELECT lix_uuid_v7()", &[]);
+        let concurrent_read = second_session.execute("SELECT uuidv7()", &[]);
         let commit_after_yield = async {
             tokio::task::yield_now().await;
             transaction
@@ -579,7 +579,10 @@ fn assert_single_json(result: ExecuteResult, expected: &str) {
     assert_eq!(row_set.len(), 1);
     let expected_json = serde_json::from_str::<serde_json::Value>(expected)
         .expect("expected JSON value should parse");
-    assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json)]);
+    assert_eq!(
+        row_set.rows()[0].values(),
+        &[Value::Jsonb(expected_json.into())]
+    );
 }
 
 fn assert_closed(error: lix::LixError) {

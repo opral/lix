@@ -8,10 +8,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let initial_commit_id = sim.initial_commit_id().to_string();
@@ -52,17 +49,17 @@ simulation_test!(
         assert_eq!(
             select_rows(&session, "SELECT commit_id FROM lix_checkpoint").await,
             vec![vec![Value::Text(initial_commit_id.clone())]],
-            "ordinary branch commits do not mutate the global checkpoint entity"
+            "ordinary branch commits do not mutate the global checkpoint row"
         );
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, schema_key, diff_type \
-                 FROM lix_working_diff ORDER BY schema_key, entity_pk",
+                "SELECT row_pk, schema_key, diff_type \
+                 FROM lix_working_diff ORDER BY schema_key, row_pk",
             )
             .await,
             vec![vec![
-                Value::Json(json!(["checkpoint-key"])),
+                Value::Jsonb(json!(["checkpoint-key"]).into()),
                 Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
@@ -70,14 +67,14 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, schema_key, diff_type \
+                "SELECT row_pk, schema_key, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"checkpoint-key\"]')",
+                   AND row_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
             )
             .await,
             vec![vec![
-                Value::Json(json!(["checkpoint-key"])),
+                Value::Jsonb(json!(["checkpoint-key"]).into()),
                 Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
@@ -85,7 +82,7 @@ simulation_test!(
         assert!(
             select_rows(
                 &session,
-                "SELECT entity_pk \
+                "SELECT row_pk \
                  FROM lix_working_diff \
                  WHERE schema_key = 'other_schema'",
             )
@@ -132,14 +129,14 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT schema_key, entity_pk FROM lix_change WHERE id = '{}'",
+                    "SELECT schema_key, row_pk FROM lix_change WHERE id = '{}'",
                     receipt.change_id
                 ),
             )
             .await,
             vec![vec![
                 Value::Text("lix_checkpoint".to_string()),
-                Value::Json(json!([receipt.commit_id.clone()])),
+                Value::Jsonb(json!([receipt.commit_id.clone()]).into()),
             ]],
             "checkpoint publication must be a normal logical change"
         );
@@ -193,7 +190,7 @@ simulation_test!(
                 "SELECT value FROM lix_key_value WHERE key = 'checkpoint-key'",
             )
             .await,
-            vec![vec![Value::Json(json!("two"))]]
+            vec![vec![Value::Jsonb(json!("two").into())]]
         );
 
         let timestamps_before_rebuild = select_rows(
@@ -231,14 +228,11 @@ simulation_test!(
 );
 
 simulation_test!(
-    checkpoint_surface_is_global_entity_and_read_only,
+    checkpoint_surface_is_global_row_and_read_only,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -280,10 +274,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -316,19 +307,19 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, diff_type \
+                "SELECT row_pk, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                 ORDER BY entity_pk",
+                 ORDER BY row_pk",
             )
             .await,
             vec![
                 vec![
-                    Value::Json(json!(["working-added"])),
+                    Value::Jsonb(json!(["working-added"]).into()),
                     Value::Text("added".to_string()),
                 ],
                 vec![
-                    Value::Json(json!(["working-removed"])),
+                    Value::Jsonb(json!(["working-removed"]).into()),
                     Value::Text("removed".to_string()),
                 ],
             ],
@@ -340,7 +331,7 @@ simulation_test!(
                 "SELECT diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"working-removed\"]')",
+                   AND row_pk = CAST('[\"working-removed\"]' AS JSONB)",
             )
             .await,
             vec![vec![Value::Text("removed".to_string())]],
@@ -354,10 +345,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let file_id = "01950000-0000-7000-8000-000000000099";
@@ -489,10 +477,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 

@@ -17,8 +17,8 @@ mod directory;
 mod directory_history;
 pub(crate) use diff::register_diff_function;
 mod diff_command;
-mod entity;
-mod entity_history;
+mod schema;
+mod schema_history;
 mod file;
 mod file_history;
 mod filesystem_history_path;
@@ -39,6 +39,7 @@ use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::TableSource;
 
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
+pub(crate) use schema::{execute_exact_schema_batch_read, execute_exact_schema_point_read};
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_file_batch_read, execute_exact_lix_file_id_manifest_batch_read,
@@ -74,23 +75,40 @@ where
     if selection.is_empty() {
         return Ok(());
     }
-    let dynamic_catalog;
     let catalog = if selection.requires_visible_schemas() {
-        dynamic_catalog = ctx.public_catalog().await?;
-        dynamic_catalog.as_ref()
+        ctx.public_catalog().await?
     } else {
-        PublicCatalog::fixed_system()
+        Arc::clone(PublicCatalog::fixed_system_shared())
     };
     register_read_from_catalog(
         session,
         ctx,
         branch_ref,
         active_branch_commit_id,
-        catalog,
+        catalog.as_ref(),
         ReadProviderScope::All,
         selection,
     )
     .await?;
+    register_information_schema(session, selection, catalog)
+}
+
+/// Installs the `information_schema` views only for statements that can reach
+/// them.
+///
+/// `read_provider_selection` widens to [`ProviderSelection::All`] for every
+/// `information_schema`-qualified reference and every `SHOW` form, so a narrowed
+/// selection provably never resolves an information-schema table. Registering
+/// the schema anyway cost one catalog write lock and one `SchemaProvider`
+/// allocation on every ordinary statement.
+fn register_information_schema(
+    session: &SessionContext,
+    selection: &ProviderSelection,
+    catalog: Arc<PublicCatalog>,
+) -> Result<(), LixError> {
+    if !matches!(selection, ProviderSelection::All) {
+        return Ok(());
+    }
     crate::sql2::information_schema::register(session, catalog)
 }
 
@@ -131,7 +149,7 @@ impl ProviderSelection {
     /// Runtime registration rejects schema keys whose generated table names
     /// would shadow these fixed providers.
     /// `All` and every unknown name remain conservative: they load the full
-    /// visible catalog so information-schema, custom entities, and normal
+    /// visible catalog so information-schema, custom rows, and normal
     /// unknown-table errors keep their current semantics.
     fn requires_visible_schemas(&self) -> bool {
         match self {
@@ -144,11 +162,13 @@ impl ProviderSelection {
 }
 
 pub(crate) fn read_provider_selection(
-    session: &SessionContext,
+    state: &datafusion::execution::session_state::SessionState,
     statements: &[datafusion::sql::parser::Statement],
 ) -> ProviderSelection {
     let mut names = BTreeSet::new();
-    let state = session.state();
+    // Resolving references only reads the SQL parser configuration, so the
+    // statement's pooled session state is used directly instead of cloning the
+    // live one.
     for statement in statements {
         if statement_requires_all_providers(statement) {
             return ProviderSelection::All;
@@ -231,7 +251,7 @@ where
             && selection.includes(surface)
             && match &surface.kind {
                 PublicSurfaceKind::FileHistory | PublicSurfaceKind::DirectoryHistory => true,
-                PublicSurfaceKind::EntityHistory { schema_key } => {
+                PublicSurfaceKind::SchemaHistory { schema_key } => {
                     schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
                 }
                 _ => false,
@@ -262,7 +282,7 @@ where
             && selection.includes(surface)
             && matches!(
                 &surface.kind,
-                PublicSurfaceKind::EntityHistory { schema_key }
+                PublicSurfaceKind::SchemaHistory { schema_key }
                     if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY
             )
     });
@@ -290,7 +310,7 @@ where
                 branch::register_lix_branch_read_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     Arc::clone(&branch_ref),
                 )
                 .await?;
@@ -378,7 +398,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
@@ -392,7 +412,7 @@ where
                 file::register_lix_file_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
@@ -418,7 +438,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -429,7 +449,7 @@ where
                 directory::register_lix_directory_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -445,26 +465,26 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::EntityBase { .. }
-            | PublicSurfaceKind::EntityByBranch { .. }
-            | PublicSurfaceKind::EntityHistory { .. }
+            PublicSurfaceKind::SchemaBase { .. }
+            | PublicSurfaceKind::SchemaByBranch { .. }
+            | PublicSurfaceKind::SchemaHistory { .. }
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => {}
         }
     }
-    let needs_entity_history = catalog.surfaces().any(|surface| {
+    let needs_row_history = catalog.surfaces().any(|surface| {
         scope.includes(surface)
             && selection.includes(surface)
-            && matches!(&surface.kind, PublicSurfaceKind::EntityHistory { .. })
+            && matches!(&surface.kind, PublicSurfaceKind::SchemaHistory { .. })
     });
-    entity::register_entity_providers(
+    schema::register_row_providers(
         session,
         ctx.active_branch_id(),
-        ctx.live_state(),
-        ctx.entity_snapshot_reader(),
+        ctx.hot_state(),
+        ctx.row_snapshot_reader(),
         Arc::clone(&branch_ref),
-        needs_entity_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
+        needs_row_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
         history_query_source,
         checkpoint_history_query_source,
         catalog,
@@ -486,7 +506,7 @@ pub(crate) async fn register_write(
     let catalog = write_ctx.public_catalog()?;
     register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
         .await?;
-    crate::sql2::information_schema::register(session, &catalog)
+    register_information_schema(session, selection, catalog)
 }
 
 pub(crate) async fn register_transaction<C>(
@@ -525,7 +545,7 @@ where
         selection,
     )
     .await?;
-    crate::sql2::information_schema::register(session, &catalog)
+    register_information_schema(session, selection, catalog)
 }
 
 async fn register_write_from_catalog(
@@ -624,12 +644,12 @@ async fn register_write_from_catalog(
             | PublicSurfaceKind::DirectoryWorkingDiffByBranch
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
-            PublicSurfaceKind::EntityBase { .. }
-            | PublicSurfaceKind::EntityByBranch { .. }
-            | PublicSurfaceKind::EntityHistory { .. } => {}
+            PublicSurfaceKind::SchemaBase { .. }
+            | PublicSurfaceKind::SchemaByBranch { .. }
+            | PublicSurfaceKind::SchemaHistory { .. } => {}
         }
     }
-    entity::register_entity_write_providers(session, write_ctx, branch_ref, catalog, selection)
+    schema::register_row_write_providers(session, write_ctx, branch_ref, catalog, selection)
         .await?;
     Ok(())
 }
@@ -652,19 +672,19 @@ mod tests {
         CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader,
         ReachableCommitGraphNode,
     };
+    use crate::hot_state::{HotStateReader, HotStateScanRequest};
     use crate::json_store::JsonStoreContext;
-    use crate::live_state::{LiveStateReader, LiveStateScanRequest};
     use crate::sql2::HistoryQuerySource;
     use crate::sql2::catalog::{
-        PublicCatalog, PublicSurfaceKind, derive_entity_surface_spec_from_schema,
+        PublicCatalog, PublicSurfaceKind, derive_schema_surface_spec_from_schema,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
     };
 
     use super::{
-        ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, entity,
-        file, file_history, filesystem_working_diff, is_write_surface, read_provider_selection,
+        ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, file,
+        file_history, filesystem_working_diff, is_write_surface, read_provider_selection, schema,
         working_diff,
     };
 
@@ -673,7 +693,7 @@ mod tests {
             .iter()
             .map(|sql| crate::sql2::parse_statement(sql).expect("SQL should parse"))
             .collect::<Vec<_>>();
-        read_provider_selection(&SessionContext::new(), &statements)
+        read_provider_selection(&SessionContext::new().state(), &statements)
     }
 
     fn selected_names(names: &[&str]) -> ProviderSelection {
@@ -689,11 +709,11 @@ mod tests {
              SELECT left_side.id \
              FROM shadowed AS left_side \
              JOIN (\
-                 SELECT entity_pk FROM lix_change \
+                 SELECT row_pk FROM lix_change \
                  UNION ALL \
-                 SELECT entity_pk FROM lix_change\
+                 SELECT row_pk FROM lix_change\
              ) AS right_side \
-               ON left_side.id = right_side.entity_pk \
+               ON left_side.id = right_side.row_pk \
              JOIN public.\"lix_directory\" AS directory_a ON true \
              JOIN public.\"lix_directory\" AS directory_b ON true"]);
 
@@ -736,7 +756,7 @@ mod tests {
     #[test]
     fn referenced_provider_selection_registers_none_for_table_free_queries() {
         assert_eq!(
-            selection_for_sql(&["SELECT 1, lix_uuid_v7()"]),
+            selection_for_sql(&["SELECT 1, uuidv7()"]),
             ProviderSelection::Only(BTreeSet::new())
         );
     }
@@ -761,9 +781,9 @@ mod tests {
             !selection_for_sql(&["SELECT * FROM lix_key_value JOIN lix_file ON false"])
                 .requires_visible_schemas()
         );
-        assert!(selection_for_sql(&["SELECT * FROM custom_entity"]).requires_visible_schemas());
+        assert!(selection_for_sql(&["SELECT * FROM custom_row"]).requires_visible_schemas());
         assert!(
-            selection_for_sql(&["SELECT * FROM lix_key_value JOIN custom_entity ON false",])
+            selection_for_sql(&["SELECT * FROM lix_key_value JOIN custom_row ON false",])
                 .requires_visible_schemas()
         );
         assert!(
@@ -797,10 +817,12 @@ mod tests {
     #[test]
     fn transaction_registration_partitions_provider_construction_once() {
         let schema = json!({
-            "x-lix-key": "phase8_entity",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "phase8_row",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         let catalog = PublicCatalog::from_visible_schemas(&[schema]).expect("catalog should build");
 
@@ -831,7 +853,7 @@ mod tests {
                 "lix_file_working_diff_by_branch",
                 "lix_working_diff",
                 "lix_working_diff_by_branch",
-                "phase8_entity_history",
+                "phase8_row_history",
             ]
         );
         assert_eq!(
@@ -845,8 +867,8 @@ mod tests {
                 "lix_file",
                 "lix_file_by_branch",
                 "lix_revert",
-                "phase8_entity",
-                "phase8_entity_by_branch",
+                "phase8_row",
+                "phase8_row_by_branch",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
@@ -973,25 +995,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_entity_schemas_match_catalog_contract_order() {
+    async fn provider_row_schemas_match_catalog_contract_order() {
         let schema = json!({
-            "x-lix-key": "phase8_entity",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "count": { "type": "integer" },
-                "body": { "type": "object" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "phase8_row",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "count", "type": "int8", "nullable": true },
+                { "name": "body", "type": "jsonb", "nullable": true },
+            ],
+            "primary_key": ["id"],
         });
         let catalog =
             PublicCatalog::from_visible_schemas(&[schema.clone()]).expect("catalog should build");
-        let _spec = derive_entity_surface_spec_from_schema(&schema).expect("schema should derive");
+        let _spec = derive_schema_surface_spec_from_schema(&schema).expect("schema should derive");
         let session = SessionContext::new();
-        entity::register_entity_providers(
+        schema::register_row_providers(
             &session,
             "01920000-0000-7000-8000-0000000000a1",
-            Arc::new(EmptyLiveStateReader),
+            Arc::new(EmptyHotStateReader),
             None,
             Arc::new(EmptyBranchRefReader),
             Some(Arc::new(tokio::sync::Mutex::new(Box::new(
@@ -1004,16 +1026,16 @@ mod tests {
             &ProviderSelection::All,
         )
         .await
-        .expect("entity providers should register");
+        .expect("row providers should register");
 
-        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_entity").await;
+        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row").await;
         assert_registered_table_schema_matches_catalog(
             &session,
             &catalog,
-            "phase8_entity_by_branch",
+            "phase8_row_by_branch",
         )
         .await;
-        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_entity_history")
+        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row_history")
             .await;
     }
 
@@ -1027,7 +1049,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
         let provider = if matches!(
             surface.kind,
-            PublicSurfaceKind::EntityHistory { .. }
+            PublicSurfaceKind::SchemaHistory { .. }
                 | PublicSurfaceKind::FileHistory
                 | PublicSurfaceKind::DirectoryHistory
         ) {
@@ -1055,7 +1077,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
         let history_surface = matches!(
             surface.kind,
-            PublicSurfaceKind::EntityHistory { .. }
+            PublicSurfaceKind::SchemaHistory { .. }
                 | PublicSurfaceKind::FileHistory
                 | PublicSurfaceKind::DirectoryHistory
         );
@@ -1107,21 +1129,21 @@ mod tests {
         }
     }
 
-    struct EmptyLiveStateReader;
+    struct EmptyHotStateReader;
 
     #[async_trait]
-    impl LiveStateReader for EmptyLiveStateReader {
+    impl HotStateReader for EmptyHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             Ok(Vec::new().into())
         }
     }
@@ -1172,3 +1194,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) use file_history::{file_history_context_census, reset_file_history_context_census};

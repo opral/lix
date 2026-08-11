@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::core::{Document, FileEdit, LINE_SCHEMA_KEY, Line};
 use crate::{STATE_PAGE_BYTES, decode_identities, decode_identity_manifest, encode_identities};
 
-fn open(bytes: &[u8]) -> (Document, Vec<lix::EntityChange>) {
+fn open(bytes: &[u8]) -> (Document, Vec<lix::RowChange>) {
     let (document, changes) =
         Document::open_file(bytes.to_vec(), |ordinal| format!("line-{ordinal}"))
             .expect("Text document should open");
@@ -26,13 +26,13 @@ fn ids(document: &Document) -> Vec<String> {
         .collect()
 }
 
-fn records(changes: &[lix::EntityChange]) -> Vec<lix::EntityRecord> {
+fn records(changes: &[lix::RowChange]) -> Vec<lix::RowRecord> {
     changes
         .iter()
         .filter_map(|change| {
-            change.snapshot.as_ref().map(|snapshot| lix::EntityRecord {
+            change.snapshot.as_ref().map(|snapshot| lix::RowRecord {
                 schema_key: change.schema_key.clone(),
-                entity_pk: change.entity_pk.clone(),
+                row_pk: change.row_pk.clone(),
                 snapshot: snapshot.clone(),
             })
         })
@@ -72,7 +72,7 @@ fn empty_document_has_zero_rows_and_nonempty_to_empty_tombstones_each_line() {
     assert!(initial.is_empty());
     assert!(empty.lines().is_empty());
     assert_eq!(empty.bytes(), b"");
-    let reopened = Document::open_entities(Vec::new()).expect("empty rows should render empty");
+    let reopened = Document::open_rows(Vec::new()).expect("empty rows should render empty");
     assert_eq!(reopened.bytes(), b"");
 
     let (nonempty, _) = open(b"one\ntwo\n");
@@ -101,7 +101,7 @@ fn initial_rows_round_trip_invalid_utf8_and_final_unterminated_line_exactly() {
     assert_eq!(document.lines()[1].bytes(), b"a\r\n");
     assert_eq!(document.lines()[2].bytes(), &[0xfe]);
 
-    let reopened = Document::open_entities(records(&changes)).expect("line rows should reopen");
+    let reopened = Document::open_rows(records(&changes)).expect("line rows should reopen");
     assert_eq!(reopened.bytes(), source);
     assert_eq!(ids(&reopened), ids(&document));
 }
@@ -124,7 +124,7 @@ fn localized_line_edit_preserves_that_lines_id_and_leaves_unrelated_rows_untouch
     assert_eq!(after.bytes(), b"alpha\nBETA\ngamma\n");
     assert_eq!(ids(&after), before_ids);
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].entity_pk, ["line-1"]);
+    assert_eq!(changes[0].row_pk, ["line-1"]);
     assert!(changes[0].snapshot.is_some());
 }
 
@@ -146,12 +146,12 @@ fn adding_a_duplicate_line_allocates_a_new_identity() {
     assert_eq!(after.bytes(), b"a\na\n");
     assert_eq!(ids(&after), [before_ids[0].clone(), "new-0".to_owned()]);
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].entity_pk, ["new-0"]);
+    assert_eq!(changes[0].row_pk, ["new-0"]);
     assert!(changes[0].snapshot.is_some());
 }
 
 #[test]
-fn line_insertion_adds_one_row_without_rewriting_existing_line_entities() {
+fn line_insertion_adds_one_row_without_rewriting_existing_line_rows() {
     let (document, _) = open(b"alpha\nomega\n");
     let before_ids = ids(&document);
     let (after, changes) = document
@@ -175,7 +175,7 @@ fn line_insertion_adds_one_row_without_rewriting_existing_line_entities() {
         ]
     );
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].entity_pk, ["new-0"]);
+    assert_eq!(changes[0].row_pk, ["new-0"]);
     assert!(changes[0].snapshot.is_some());
 }
 
@@ -212,7 +212,7 @@ fn durable_identities_survive_insert_reopen_and_second_edit() {
 
     assert_eq!(ids(&after_edit)[1], inserted_id);
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].entity_pk, [inserted_id]);
+    assert_eq!(changes[0].row_pk, [inserted_id]);
 }
 
 #[test]
@@ -260,7 +260,7 @@ fn reorder_preserves_ids_and_updates_only_the_moved_rows_order_key() {
         ]
     );
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].entity_pk, [before_ids[2].clone()]);
+    assert_eq!(changes[0].row_pk, [before_ids[2].clone()]);
     let snapshot: Value = serde_json::from_slice(
         changes[0]
             .snapshot
@@ -277,20 +277,20 @@ fn independent_semantic_line_updates_render_as_independent_exact_byte_edits() {
     let alpha = &document.lines()[0];
     let gamma = &document.lines()[2];
     let semantic_changes = [
-        lix::EntityChange::upsert(
+        lix::RowChange::upsert(
             LINE_SCHEMA_KEY,
             vec![alpha.id().to_owned()],
             snapshot_with_bytes(alpha, b"ALPHA\n"),
         ),
-        lix::EntityChange::upsert(
+        lix::RowChange::upsert(
             LINE_SCHEMA_KEY,
             vec![gamma.id().to_owned()],
             snapshot_with_bytes(gamma, b"GAMMA\n"),
         ),
     ];
     let (after, edits) = document
-        .entities_changed(semantic_changes)
-        .expect("line entity updates should render");
+        .rows_changed(semantic_changes)
+        .expect("line row updates should render");
 
     assert_eq!(after.bytes(), b"ALPHA\nbeta\nGAMMA\n");
     assert_eq!(edits.len(), 2);
@@ -312,17 +312,17 @@ fn text_nul_window_rejects_early_nul_and_allows_nul_after_eight_kib() {
         .collect::<Result<Vec<_>, _>>()
         .expect("late-NUL changes should serialize");
     assert_eq!(document.bytes(), source);
-    let reopened = Document::open_entities(records(&changes)).expect("late-NUL row should reopen");
+    let reopened = Document::open_rows(records(&changes)).expect("late-NUL row should reopen");
     assert_eq!(reopened.bytes(), source);
 }
 
 #[test]
-fn semantic_rows_cannot_smuggle_multiple_logical_lines_into_one_entity() {
+fn semantic_rows_cannot_smuggle_multiple_logical_lines_into_one_row() {
     let (document, _) = open(b"alpha\nbeta\n");
     let alpha = &document.lines()[0];
     let malformed = snapshot_with_bytes(alpha, b"alpha\nbeta\n");
     let error = document
-        .entities_changed([lix::EntityChange::upsert(
+        .rows_changed([lix::RowChange::upsert(
             LINE_SCHEMA_KEY,
             vec![alpha.id().to_owned()],
             malformed,

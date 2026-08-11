@@ -1,12 +1,12 @@
 # CSV plugin
 
-The CSV plugin implements the universal `lix:plugin@1.0.0` lifecycle described
-in [the universal plugin API](../../docs/universal-plugin-api.md). It preserves
+The CSV plugin implements the `FileProjection` and `ColumnMerger` capabilities
+described in [the universal plugin API](../../rfcs/universal-plugin-api.md). It preserves
 table and row identity, exact source bytes, dialect metadata, sparse edits,
-cold successors, and reopen behavior.
+cold successors, reopen behavior, and disjoint edits to cells in the same row.
 
-All entity mutations, including initial import, use complete snapshots through
-the universal entity output method. The SDK owns page framing, batching,
+All row mutations, including initial import, use complete snapshots through
+the universal row output method. The SDK owns page framing, batching,
 generated primary keys, final flush, and oversized attachments. CSV streams
 rows into that method without constructing a persistent document first.
 

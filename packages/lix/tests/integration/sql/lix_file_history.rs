@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use lix::Value;
-use lix::integration::Engine;
+use lix::engine::Engine;
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanChunk, ScanCursor, Storage, StorageError, StorageRead, StorageScanSource,
@@ -116,10 +116,10 @@ impl StorageScanSource for CountingScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
         Box::pin(async move {
-            let chunk = self.inner.next_page(limit_rows).await?;
+            let (chunk, chunk_has_more) = self.inner.next_page(limit_rows).await?.into_parts();
             self.scanned_rows
-                .fetch_add(chunk.entries.len() as u64, Ordering::Relaxed);
-            Ok(chunk)
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            Ok(ScanChunk::new(chunk, chunk_has_more))
         })
     }
 }
@@ -134,7 +134,6 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     // or other unrelated file rows a second time.
     const MAX_REQUESTED_KEYS: u64 = 416;
     const MAX_SCAN_CALLS: u64 = 128;
-    const MAX_SCANNED_ROWS: u64 = 512;
 
     let storage = CountingStorage::default();
     Engine::initialize(storage.clone())
@@ -143,10 +142,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("workspace session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     let unrelated_values = (0..UNRELATED_FILE_COUNT)
         .map(|index| {
@@ -241,9 +237,290 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
          {UNRELATED_ADDITIONAL_FILE_COUNT} additional files; expected at most {MAX_REQUESTED_KEYS}"
     );
     assert!(
-        scan_calls <= MAX_SCAN_CALLS && scanned_rows <= MAX_SCANNED_ROWS,
-        "point-routed history performed {scan_calls} scans returning {scanned_rows} rows; \
-         expected at most {MAX_SCAN_CALLS} scans and {MAX_SCANNED_ROWS} rows"
+        scan_calls <= MAX_SCAN_CALLS,
+        "point-routed history performed {scan_calls} scans; \
+         expected at most {MAX_SCAN_CALLS}"
+    );
+    // Point-routed file history resolves entirely through `get_many`: it opens
+    // scan cursors but never draws a row from one. An upper bound on rows is
+    // therefore vacuous here — it cannot fail, so it reads as coverage without
+    // being any. Asserting the exact zero makes it a real guard that fails the
+    // moment this path starts serving rows out of a scan.
+    assert_eq!(
+        scanned_rows, 0,
+        "point-routed history drew {scanned_rows} rows from scan cursors; \
+         this path is expected to read exclusively through get_many"
+    );
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn lix_file_history_path_lookup_does_not_rescan_unrelated_observed_state() {
+    const UNRELATED_FILE_COUNT: usize = 64;
+    const UNRELATED_DIRECTORY_COUNT: usize = 32;
+    const UNRELATED_ADDITIONAL_FILE_COUNT: usize = 16;
+    // A `path` predicate identifies one file exactly as an `id` predicate does,
+    // so it must cost the same: the unrelated descriptors, directories and
+    // blobs must not be reconstructed once per observed commit.
+    const MAX_REQUESTED_KEYS: u64 = 416;
+    const MAX_SCAN_CALLS: u64 = 128;
+
+    let storage = CountingStorage::default();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should open");
+    let session = engine.open_session().await.expect("session should open");
+
+    let unrelated_values = (0..UNRELATED_FILE_COUNT)
+        .map(|index| {
+            format!(
+                "('01940000-0000-7000-8000-{index:012x}', '/unrelated-history-{index:03}.txt', CAST('x' AS BYTEA))"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    session
+        .execute(
+            &format!("INSERT INTO lix_file (id, path, content) VALUES {unrelated_values}"),
+            &[],
+        )
+        .await
+        .expect("unrelated files should insert in one commit");
+    let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
+        .map(|index| {
+            format!("('01940001-0000-7000-8000-{index:012x}', '/unrelated-directory-{index:03}')")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    session
+        .execute(
+            &format!("INSERT INTO lix_directory (id, path) VALUES {unrelated_directories}"),
+            &[],
+        )
+        .await
+        .expect("unrelated directories should insert in one commit");
+    let unrelated_additional_files = (0..UNRELATED_ADDITIONAL_FILE_COUNT)
+        .map(|index| {
+            format!(
+                "('01940002-0000-7000-8000-{index:012x}', '/unrelated-additional-{index:03}.bin', CAST('x' AS BYTEA))"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    session
+        .execute(
+            &format!(
+                "INSERT INTO lix_file (id, path, content) VALUES {unrelated_additional_files}"
+            ),
+            &[],
+        )
+        .await
+        .expect("unrelated additional files should insert in one commit");
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, content) \
+             VALUES ('3faa577b-02e3-7c30-8b7d-30a9698cba93', '/target-by-path.txt', CAST('target' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("target file should insert in its own commit");
+    let commit_id_rows = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("target commit head should load");
+    let [Value::Text(commit_id)] = commit_id_rows.rows()[0].values() else {
+        panic!(
+            "expected active branch commit id row, got {:?}",
+            commit_id_rows.rows()[0].values()
+        );
+    };
+
+    storage.reset_counters();
+    let result = session
+        .execute(
+            &format!(
+                "SELECT id, path \
+                 FROM lix_file_history('{commit_id}') \
+                   WHERE lixcol_depth = 0 \
+                   AND path = '/target-by-path.txt'"
+            ),
+            &[],
+        )
+        .await
+        .expect("path-routed file history should load");
+
+    assert_rows_eq(
+        result,
+        vec![vec![
+            Value::Text("3faa577b-02e3-7c30-8b7d-30a9698cba93".to_string()),
+            Value::Text("/target-by-path.txt".to_string()),
+        ]],
+    );
+    let (requested_keys, scan_calls, scanned_rows) = storage.counters();
+    assert!(
+        requested_keys <= MAX_REQUESTED_KEYS,
+        "path-routed history requested {requested_keys} storage keys with \
+         {UNRELATED_FILE_COUNT} unrelated files, {UNRELATED_DIRECTORY_COUNT} directories, and \
+         {UNRELATED_ADDITIONAL_FILE_COUNT} additional files; expected at most {MAX_REQUESTED_KEYS}"
+    );
+    assert!(
+        scan_calls <= MAX_SCAN_CALLS,
+        "path-routed history performed {scan_calls} scans; \
+         expected at most {MAX_SCAN_CALLS}"
+    );
+    // See the point-routed guard: a row upper bound cannot fail on this path,
+    // so assert the exact zero instead.
+    assert_eq!(
+        scanned_rows, 0,
+        "path-routed history drew {scanned_rows} rows from scan cursors; \
+         this path is expected to read exclusively through get_many"
+    );
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn lix_file_history_path_filter_equals_unfiltered_scan_over_many_files() {
+    const BULK_FILE_COUNT: usize = 40;
+
+    let storage = Memory::default();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should open");
+    let session = engine.open_session().await.expect("session should open");
+
+    let bulk_values = (0..BULK_FILE_COUNT)
+        .map(|index| format!("('/bulk/f{index:03}.txt', CAST('bulk' AS BYTEA))"))
+        .collect::<Vec<_>>()
+        .join(",");
+    session
+        .execute(
+            &format!("INSERT INTO lix_file (path, content) VALUES {bulk_values}"),
+            &[],
+        )
+        .await
+        .expect("bulk files should insert");
+    // Same basename in two directories: the name-derived candidate set must not
+    // be mistaken for the answer.
+    for path in ["/bulk/target.txt", "/other/target.txt"] {
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST('v0' AS BYTEA))",
+                &[Value::Text(path.to_string())],
+            )
+            .await
+            .expect("target file should insert");
+    }
+    for revision in 1..4u32 {
+        session
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE path = '/bulk/target.txt'",
+                &[Value::Blob(format!("v{revision}").into_bytes().into())],
+            )
+            .await
+            .expect("target revision should commit");
+    }
+    session
+        .execute(
+            "UPDATE lix_file SET name = 'renamed.txt' WHERE path = '/bulk/target.txt'",
+            &[],
+        )
+        .await
+        .expect("target rename should commit");
+    session
+        .execute("DELETE FROM lix_file WHERE path = '/bulk/f005.txt'", &[])
+        .await
+        .expect("bulk delete should commit");
+    let directory_id: String = session
+        .execute("SELECT id FROM lix_directory WHERE path = '/bulk'", &[])
+        .await
+        .expect("bulk directory should load")
+        .rows()[0]
+        .get("id")
+        .expect("directory id should be text");
+    session
+        .execute(
+            "UPDATE lix_directory SET name = 'bulk-renamed' WHERE id = $1",
+            &[Value::Text(directory_id)],
+        )
+        .await
+        .expect("directory rename should commit");
+
+    let head: String = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("head should load")
+        .rows()[0]
+        .get("commit_id")
+        .expect("head should be text");
+
+    let projection = "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
+                      FROM lix_file_history($1)";
+    let unfiltered = session
+        .execute(projection, &[Value::Text(head.clone())])
+        .await
+        .expect("unfiltered history should load");
+    let row_key = |row: &lix::Row| {
+        let id: String = row.get("id").expect("id");
+        let depth: i64 = row.get("lixcol_depth").expect("depth");
+        let observed: String = row
+            .get("lixcol_observed_commit_id")
+            .expect("observed commit");
+        let path = match row.value("path").expect("path column") {
+            Value::Text(path) => path.clone(),
+            _ => String::new(),
+        };
+        format!("{id}|{depth}|{observed}|{path}")
+    };
+
+    let probes = [
+        "/bulk/target.txt",
+        "/bulk/renamed.txt",
+        "/bulk-renamed/renamed.txt",
+        "/other/target.txt",
+        "/bulk/f005.txt",
+        "/bulk/f012.txt",
+        "/bulk-renamed/f012.txt",
+        "/never/existed.txt",
+    ];
+    let mut matched_any = false;
+    for probe in probes {
+        let expected = unfiltered
+            .rows()
+            .iter()
+            .filter(|row| match row.value("path").expect("path column") {
+                Value::Text(path) => path == probe,
+                _ => false,
+            })
+            .map(row_key)
+            .collect::<BTreeSet<_>>();
+        let actual = session
+            .execute(
+                &format!("{projection} WHERE path = $2"),
+                &[Value::Text(head.clone()), Value::Text(probe.to_string())],
+            )
+            .await
+            .expect("path-filtered history should load")
+            .rows()
+            .iter()
+            .map(row_key)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            expected, actual,
+            "path pushdown changed the result set for '{probe}'"
+        );
+        matched_any |= !expected.is_empty();
+    }
+    assert!(
+        matched_any,
+        "the probe corpus must produce at least one matching history row"
     );
 
     session.close().await.expect("session should close");
@@ -254,7 +531,6 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     const UNRELATED_DIRECTORY_COUNT: usize = 256;
     const MAX_REQUESTED_KEYS: u64 = 400;
     const MAX_SCAN_CALLS: u64 = 48;
-    const MAX_SCANNED_ROWS: u64 = 48;
 
     let storage = CountingStorage::default();
     Engine::initialize(storage.clone())
@@ -263,10 +539,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("workspace session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
         .map(|index| {
@@ -332,14 +605,15 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
         result.rows()[0].get::<Value>("path").unwrap(),
         Value::Text("/renamed/child/target.txt".to_string())
     );
-    let Value::Json(sources) = result.rows()[0]
+    let Value::Jsonb(sources) = result.rows()[0]
         .get::<Value>("lixcol_source_changes")
         .unwrap()
     else {
         panic!("ancestor source changes should be JSON");
     };
+    let sources = sources.to_value();
     assert_eq!(
-        sources[0]["entity_pk"],
+        sources[0]["row_pk"],
         json!(["863f406b-3ce8-724d-8548-6dc1e41d451d"])
     );
 
@@ -350,9 +624,16 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
          {UNRELATED_DIRECTORY_COUNT} unrelated directories; expected at most {MAX_REQUESTED_KEYS}"
     );
     assert!(
-        scan_calls <= MAX_SCAN_CALLS && scanned_rows <= MAX_SCANNED_ROWS,
-        "ancestor point history performed {scan_calls} scans returning {scanned_rows} rows; \
-         expected at most {MAX_SCAN_CALLS} scans and {MAX_SCANNED_ROWS} rows"
+        scan_calls <= MAX_SCAN_CALLS,
+        "ancestor point history performed {scan_calls} scans; \
+         expected at most {MAX_SCAN_CALLS}"
+    );
+    // See the point-routed guard: a row upper bound cannot fail on this path,
+    // so assert the exact zero instead.
+    assert_eq!(
+        scanned_rows, 0,
+        "ancestor point history drew {scanned_rows} rows from scan cursors; \
+         this path is expected to read exclusively through get_many"
     );
 
     session.close().await.expect("session should close");
@@ -364,7 +645,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -420,15 +701,16 @@ simulation_test!(
             renamed_file.rows()[0].get::<Value>("path").unwrap(),
             Value::Text("/archive/docs/guides/readme.md".to_string())
         );
-        let Value::Json(rename_sources) = renamed_file.rows()[0]
+        let Value::Jsonb(rename_sources) = renamed_file.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
             panic!("rename sources should be JSON");
         };
+        let rename_sources = rename_sources.to_value();
         assert_eq!(rename_sources.as_array().map(Vec::len), Some(1));
         assert_eq!(
-            rename_sources[0]["entity_pk"],
+            rename_sources[0]["row_pk"],
             json!(["7813628c-6493-7241-80fe-c63337c5d3f9"])
         );
 
@@ -491,7 +773,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -567,17 +849,18 @@ simulation_test!(
             file_row.rows()[0].get::<Value>("path").unwrap(),
             Value::Text("/renamed-root/renamed-child/renamed.txt".to_string())
         );
-        let Value::Json(file_sources) = file_row.rows()[0]
+        let Value::Jsonb(file_sources) = file_row.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
             panic!("grouped file sources should be JSON");
         };
+        let file_sources = file_sources.to_value();
         let source_ids = file_sources
             .as_array()
             .expect("grouped file sources should be an array")
             .iter()
-            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .map(|source| source["row_pk"][0].as_str().unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             source_ids,
@@ -601,12 +884,13 @@ simulation_test!(
             .await
             .expect("grouped directory history should load");
         assert_eq!(directory_row.len(), 1);
-        let Value::Json(directory_sources) = directory_row.rows()[0]
+        let Value::Jsonb(directory_sources) = directory_row.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
             panic!("grouped directory sources should be JSON");
         };
+        let directory_sources = directory_sources.to_value();
         assert_eq!(directory_sources.as_array().map(Vec::len), Some(2));
     }
 );
@@ -617,7 +901,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -646,7 +930,7 @@ simulation_test!(
         .expect("sibling branch should create");
         let draft = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-00000000000b")
+                .open_session_at("01930000-0000-7000-8000-00000000000b")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -726,7 +1010,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -776,18 +1060,19 @@ simulation_test!(
             .expect("deleted descendant file history should load");
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted.rows()[0].get::<Value>("path").unwrap(), Value::Null);
-        let Value::Json(delete_sources) = deleted.rows()[0]
+        let Value::Jsonb(delete_sources) = deleted.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
             panic!("delete sources should be JSON");
         };
+        let delete_sources = delete_sources.to_value();
         let deleted_directory_ids = delete_sources
             .as_array()
             .expect("delete sources should be an array")
             .iter()
             .filter(|source| source["schema_key"] == json!("lix_directory_descriptor"))
-            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .map(|source| source["row_pk"][0].as_str().unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             deleted_directory_ids,
@@ -848,18 +1133,19 @@ simulation_test!(
             restored.rows()[0].get::<Value>("content").unwrap(),
             Value::Blob(b"y".to_vec().into())
         );
-        let Value::Json(restore_sources) = restored.rows()[0]
+        let Value::Jsonb(restore_sources) = restored.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .unwrap()
         else {
             panic!("restore sources should be JSON");
         };
+        let restore_sources = restore_sources.to_value();
         let restored_directory_ids = restore_sources
             .as_array()
             .expect("restore sources should be an array")
             .iter()
             .filter(|source| source["schema_key"] == json!("lix_directory_descriptor"))
-            .map(|source| source["entity_pk"][0].as_str().unwrap())
+            .map(|source| source["row_pk"][0].as_str().unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             restored_directory_ids,
@@ -877,7 +1163,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -988,9 +1274,10 @@ simulation_test!(
         let source_changes = source_changes_result.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .expect("source_changes should be present");
-        let Value::Json(source_changes) = source_changes else {
+        let Value::Jsonb(source_changes) = source_changes else {
             panic!("source_changes should be semantic JSON, got {source_changes:?}");
         };
+        let source_changes = source_changes.to_value();
         assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
         assert_eq!(
             source_changes[0]["schema_key"],
@@ -1022,7 +1309,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1070,7 +1357,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1091,7 +1378,7 @@ simulation_test!(
         .expect("draft branch should be created");
         let draft = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-00000000000c")
+                .open_session_at("01930000-0000-7000-8000-00000000000c")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -1166,9 +1453,10 @@ simulation_test!(
                 let source_changes = row
                     .get::<Value>("lixcol_source_changes")
                     .expect("source changes should exist");
-                let Value::Json(source_changes) = source_changes else {
+                let Value::Jsonb(source_changes) = source_changes else {
                     panic!("source changes should be JSON, got {source_changes:?}");
                 };
+                let source_changes = source_changes.to_value();
                 assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
                 match row
                     .get::<Value>("lixcol_observed_commit_id")
@@ -1192,7 +1480,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1255,7 +1543,7 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1314,7 +1602,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1372,7 +1660,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1422,7 +1710,7 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1461,7 +1749,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1519,7 +1807,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1570,21 +1858,23 @@ simulation_test!(
                 Value::Blob(b"blob2".to_vec().into()),
             ]
         );
-        let Value::Json(latest_sources) = &latest[3] else {
+        let Value::Jsonb(latest_sources) = &latest[3] else {
             panic!("latest source changes should be JSON, got {:?}", latest[3]);
         };
+        let latest_sources = latest_sources.to_value();
         assert_eq!(latest_sources.as_array().map(Vec::len), Some(1));
         assert_eq!(
             latest_sources[0]["schema_key"],
             json!("lix_binary_blob_ref")
         );
 
-        let Value::Json(initial_sources) = &result.rows()[1].values()[3] else {
+        let Value::Jsonb(initial_sources) = &result.rows()[1].values()[3] else {
             panic!(
                 "initial source changes should be JSON, got {:?}",
                 result.rows()[1].values()[3]
             );
         };
+        let initial_sources = initial_sources.to_value();
         assert_eq!(initial_sources.as_array().map(Vec::len), Some(2));
         let source_schema_keys = initial_sources
             .as_array()
@@ -1616,11 +1906,11 @@ simulation_test!(
                     .collect::<Vec<_>>(),
                 vec![
                     "created_at",
-                    "entity_pk",
                     "file_id",
                     "id",
                     "metadata",
                     "origin_key",
+                    "row_pk",
                     "schema_key",
                     "snapshot_content",
                 ],

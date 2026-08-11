@@ -1,8 +1,9 @@
 use crate::LixError;
-use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
+use crate::binary_cas::chunking::chunk_ranges;
 use crate::binary_cas::codec::BinaryChunkCodec;
 use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlobId([u8; 32]);
@@ -13,13 +14,19 @@ impl BlobId {
     }
 
     pub(crate) fn from_content(content: &[u8]) -> Self {
-        if content.len() <= MEDIA_CHUNK_BYTES {
-            return Self::from_single_chunk(ChunkHash::from_content(content));
+        let ranges = chunk_ranges(content);
+        match ranges.as_slice() {
+            [] | [_] => Self::from_single_chunk(ChunkHash::from_content(content)),
+            ranges => Self::from_chunks(
+                content.len() as u64,
+                ranges.iter().map(|&(start, end)| {
+                    (
+                        ChunkHash::from_content(&content[start..end]),
+                        (end - start) as u64,
+                    )
+                }),
+            ),
         }
-        let chunks = content
-            .chunks(MEDIA_CHUNK_BYTES)
-            .map(|chunk| (ChunkHash::from_content(chunk), chunk.len() as u64));
-        Self::from_chunks(content.len() as u64, chunks)
     }
 
     pub(crate) fn from_single_chunk(chunk_hash: ChunkHash) -> Self {
@@ -128,13 +135,34 @@ impl BlobSameLengthSplice {
 pub(crate) struct BlobPayload {
     bytes: crate::Blob,
     hash: Option<BlobId>,
+    chunks: Arc<[BlobChunkReceipt]>,
 }
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        let hash = (!bytes.is_empty()).then(|| BlobId::from_content(&bytes));
-        Self { bytes, hash }
+        // The one and only boundary search for these bytes. Staging rebuilds
+        // the ranges from the receipt sizes below.
+        let chunks = chunk_ranges(&bytes)
+            .into_iter()
+            .map(|(start, end)| BlobChunkReceipt {
+                hash: ChunkHash::from_content(&bytes[start..end]),
+                size_bytes: (end - start) as u64,
+            })
+            .collect::<Arc<[_]>>();
+        let hash = match chunks.as_ref() {
+            [] => None,
+            [chunk] => Some(BlobId::from_single_chunk(chunk.hash)),
+            chunks => Some(BlobId::from_chunks(
+                bytes.len() as u64,
+                chunks.iter().map(|chunk| (chunk.hash, chunk.size_bytes)),
+            )),
+        };
+        Self {
+            bytes,
+            hash,
+            chunks,
+        }
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -147,6 +175,13 @@ impl BlobPayload {
 
     pub(crate) fn hash(&self) -> Option<BlobId> {
         self.hash
+    }
+
+    /// Canonical chunk identities derived from these exact immutable bytes,
+    /// in order. Their sizes are also the payload's chunk layout, so staging
+    /// neither hashes nor re-searches for boundaries a second time.
+    pub(crate) fn chunks(&self) -> &[BlobChunkReceipt] {
+        &self.chunks
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -268,4 +303,46 @@ pub(crate) struct BinaryCasChunkView<'a> {
     pub(crate) uncompressed_len: u64,
     #[musli(bytes)]
     pub(crate) payload: &'a [u8],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
+
+    #[test]
+    fn payload_carries_exact_canonical_chunk_receipts() {
+        // A byte pattern with real variety: the gear hash finds no cut point in
+        // a short repeating sequence, so a periodic fixture would collapse to
+        // one max-sized chunk and prove nothing about receipt ordering.
+        let mut bytes = vec![0u8; MEDIA_CHUNK_BYTES * 5 + 17];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for chunk in bytes.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
+        let payload = BlobPayload::from_bytes(bytes.clone());
+
+        // Boundaries are content-defined, so the receipts are asserted by the
+        // properties staging relies on rather than by fixed sizes: they tile
+        // the payload in order and each names its own slice.
+        assert!(payload.chunks().len() > 1);
+        assert_eq!(payload.hash(), Some(BlobId::from_content(&bytes)));
+        let mut cursor = 0usize;
+        for receipt in payload.chunks() {
+            let end = cursor + receipt.size_bytes as usize;
+            assert_eq!(receipt.hash, ChunkHash::from_content(&bytes[cursor..end]));
+            cursor = end;
+        }
+        assert_eq!(cursor, bytes.len());
+
+        let clone = payload.clone();
+        assert!(std::ptr::eq(
+            payload.chunks().as_ptr(),
+            clone.chunks().as_ptr()
+        ));
+        assert_eq!(payload.bytes(), clone.bytes());
+    }
 }

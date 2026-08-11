@@ -1,0 +1,544 @@
+[package]
+name = "lix_e2e"
+workspace = "../../tooling"
+version.workspace = true
+publish = false
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+autobenches = false
+autotests = false
+autoexamples = false
+
+[lints]
+workspace = true
+
+# NOTE: `rocksdb`, `slatedb` and `storage-benches` look like gates on
+# dependencies this crate always needs, but they are not: 116 `#[cfg(feature =
+# ...)]` sites across 12 source files in this crate read them, including a
+# `StorageProfile::SlateDB` enum variant. Deleting the features silently
+# compiles that code out -- measured, it produced 160 `unexpected cfg condition
+# value` warnings and 2 hard errors where the variant vanished and its use sites
+# did not. They stay until someone edits those 116 sites as a separate change.
+[features]
+default = ["rocksdb"]
+rocksdb = ["dep:lix_storage_rocksdb"]
+slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
+storage-benches = ["lix/storage-benches", "rocksdb", "lix_storage_rocksdb/storage-benches"]
+root-replay-trace = ["lix/root-replay-trace", "storage-benches"]
+server-protocol = ["lix/server-protocol"]
+tpch = ["dep:duckdb", "dep:tpchgen"]
+# Turns on `lix/default_wasm_runtime` for the SDK tests folded in from the
+# former `lix_tests` crate, which ran with it enabled. It is deliberately not
+# unconditional: with that feature on, `handle.rs::new_engine` gives every Lix
+# opened without an explicit runtime a Wasmtime runtime, which would change what
+# every benchmark in this crate measures.
+sdk-tests = ["lix/default_wasm_runtime"]
+# Compiled-plugin qualifications that need the engine's maintenance inspection
+# hooks but no external storage adapter.
+plugin-tests = ["lix/default_wasm_runtime", "lix/storage-benches"]
+# Opt-in profiling build that routes Rust allocations through libc so tools
+# such as heaptrack can attribute transient allocation churn to call stacks.
+# Normal tracked-CRUD builds wrap mimalloc with byte accounting so latency
+# remains comparable with the existing benchmark. This feature removes that
+# allocator entirely so heap profilers and RSS controls use libc directly.
+system-allocation-profiler = []
+
+[dependencies]
+lix = { workspace = true }
+lix_storage_filesystem = { workspace = true }
+lix_storage_rocksdb = { workspace = true, optional = true }
+lix_storage_slatedb = { workspace = true, optional = true }
+object_store = { version = "0.14", default-features = false, features = ["fs"], optional = true }
+slatedb = { version = "0.14.1", default-features = false, features = ["moka", "zstd"], optional = true }
+ulid = { version = "1.2.1", optional = true }
+duckdb = { version = "=1.10505.0", features = ["bundled"], optional = true }
+tpchgen = { version = "=3.0.0", optional = true }
+zstd = "0.13"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc.workspace = true
+
+[dev-dependencies]
+ahash = "0.8"
+async-trait = "0.1"
+base64 = "0.22"
+blake3 = "1"
+bytes = "1"
+fastcdc = "3"
+criterion = { package = "codspeed-criterion-compat", version = "4" }
+datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+lix_collaboration_test_support = { path = "../collaboration-test-support" }
+sha2 = "0.10"
+libc = "0.2"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = "1.15"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["std"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zip = { version = "8", default-features = false }
+
+# Plugin components, built for wasm32-wasip2 and handed to the tests through
+# CARGO_CDYLIB_FILE_*. Cargo forbids optional dev-dependencies, so these are
+# unconditional; they cost build time on a bench-only invocation but cannot
+# change what a bench measures, since nothing loads them without `sdk-tests`.
+plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_conversation = { path = "../../plugins/conversation", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_excalidraw = { path = "../../plugins/excalidraw", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_text = { path = "../../plugins/text", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+http = "1"
+http-body-util = "0.1"
+
+[[example]]
+name = "e1_json_leak"
+path = "examples/e1_json_leak.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "e24_cas_read_probe"
+path = "examples/e24_cas_read_probe.rs"
+required-features = ["rocksdb"]
+
+[[example]]
+name = "e29_locator_leak"
+path = "examples/e29_locator_leak.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "expY_untracked_mutation_scaling"
+path = "examples/expY_untracked_mutation_scaling.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "expfk_directory_delete_scan"
+path = "examples/expfk_directory_delete_scan.rs"
+required-features = ["rocksdb"]
+
+[[example]]
+name = "expaa_replay_scope"
+path = "examples/expaa_replay_scope.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "expab_plan_load"
+path = "examples/expab_plan_load.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "e53_hot_locality"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "e53_write_amplification"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "e53_hot_locality_slatedb"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "space_growth"
+path = "examples/space_growth.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "expv_blind_space_growth"
+path = "examples/expv_blind_space_growth.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "delta_segment_duplication"
+path = "examples/delta_segment_duplication.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "storage_layout"
+path = "examples/storage_layout.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "duplicate_audit"
+path = "examples/duplicate_audit.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "expu_json_delta"
+path = "examples/expu_json_delta.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "revision_pack_oracle"
+path = "examples/revision_pack_oracle.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "e5_media_probe"
+path = "examples/e5_media_probe.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "chunking_oracle"
+path = "examples/chunking_oracle.rs"
+
+[[test]]
+name = "server_protocol_durable_idempotency"
+path = "tests/server_protocol_durable_idempotency.rs"
+required-features = ["server-protocol", "slatedb"]
+
+[[example]]
+name = "cas_sharing"
+path = "examples/cas_sharing.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "e3_cas_reclaim_scan"
+path = "examples/e3_cas_reclaim_scan.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "cas_gc_qualification"
+path = "examples/cas_gc_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "cas_publication_epoch_qualification"
+path = "examples/cas_publication_epoch_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "expW_hot_row_anatomy"
+path = "examples/expW_hot_row_anatomy.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
+name = "exact_file_read_benchmark"
+path = "tests/exact_file_read_benchmark.rs"
+required-features = ["rocksdb"]
+
+[[test]]
+name = "tracked_state_crud_public_result"
+path = "tests/tracked_state_crud_public_result.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "native_schema_point_reopen"
+path = "tests/native_schema_point_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+# Deliberately its own target rather than a `-p lix` unit test: the scoped-root
+# census counters it reads are process-global, and a dedicated test binary with
+# a single test keeps them free of concurrent contributors.
+[[test]]
+name = "current_state_scoped_root_engagement"
+path = "tests/current_state_scoped_root_engagement.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "corruption_recovery_qualification"
+path = "tests/corruption_recovery_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
+name = "crash_consistency_qualification"
+path = "tests/crash_consistency_qualification.rs"
+required-features = ["rocksdb", "server-protocol"]
+
+[[test]]
+name = "certified_replacement_delete_reopen"
+path = "tests/certified_replacement_delete_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
+name = "checkpoint_gc_replay_reopen"
+path = "tests/checkpoint_gc_replay_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
+name = "checkpoint_branch_merge_reopen"
+path = "tests/checkpoint_branch_merge_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
+name = "cas_gc_history_retention"
+path = "tests/cas_gc_history_retention.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
+name = "tpch_overlay_helpers"
+path = "tests/tpch_overlay_helpers.rs"
+
+[[bench]]
+name = "storage_v2"
+path = "benches/storage_v2.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_scorecard"
+path = "benches/changelog/scorecard.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_cpu_profile"
+path = "benches/changelog/profile_cpu.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_direct_profile"
+path = "benches/changelog/profile_direct.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "untracked_state_crud"
+path = "benches/untracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "tracked_state_crud"
+path = "benches/tracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "current_state_scope_sharing"
+path = "benches/current_state_scope_sharing.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "tracked_working_diff"
+path = "benches/tracked_working_diff.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "schema_registration"
+path = "benches/schema_registration.rs"
+harness = false
+
+[[bench]]
+name = "working_diff_file_scope"
+path = "benches/working_diff_file_scope.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+
+
+[[bench]]
+name = "undo_redo_storage"
+path = "benches/undo_redo_storage.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+
+[[bench]]
+name = "small_blob_cas"
+path = "benches/small_blob_cas.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "changelog_history_append"
+path = "benches/changelog_history_append.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "packed_history_scale"
+path = "benches/packed_history_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "checkpoint_history_scale"
+path = "benches/checkpoint_history_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+
+[[bench]]
+name = "merge_base_scale"
+path = "benches/merge_base_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "repository_gc_scale"
+path = "benches/repository_gc_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "branch_checkpoint_retirement"
+path = "benches/branch_checkpoint_retirement.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "branch_storage_sharing"
+path = "benches/branch_storage_sharing.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "fixed_live_history_scale"
+path = "benches/fixed_live_history_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "multi_space_point_read"
+path = "benches/multi_space_point_read.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "uuid_v7_physical_keys"
+path = "benches/uuid_v7_physical_keys.rs"
+harness = false
+required-features = ["lix/storage-benches", "rocksdb", "slatedb"]
+
+
+
+[[example]]
+name = "exppq_write_scaling"
+path = "examples/exppq_write_scaling.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "write_amplification"
+path = "examples/write_amplification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+# Folded in from packages/rs-sdk-tests (crate `lix_tests`). That crate took
+# `lix` with `default_wasm_runtime` + `storage-benches`, and both storage
+# adapters, unconditionally -- so every target below asks for the feature set
+# that reproduces exactly that environment.
+#
+# `benchmark_metrics` is deliberately both a module of `e2e.rs` (`mod
+# benchmark_metrics;`) and a test target in its own right, as it was under
+# rs-sdk-tests's auto-discovery. This crate sets `autotests = false`, so
+# dropping this entry would silently retire a target that runs one test.
+
+[[test]]
+name = "batch_benchmark_scorecard"
+path = "tests/batch_benchmark_scorecard.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "benchmark_metrics"
+path = "tests/benchmark_metrics.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "crdt_benchmarks_baseline"
+path = "tests/crdt_benchmarks_baseline.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "git_text_plugin"
+path = "tests/git_text_plugin.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "history_scaling_probe"
+path = "tests/history_scaling_probe.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "markdown_git_benchmark"
+path = "tests/markdown_git_benchmark.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "plugin_document_scale"
+path = "tests/plugin_document_scale.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "plugin_api_benchmarks"
+path = "tests/plugin_api_benchmarks.rs"
+required-features = ["sdk-tests"]
+
+[[test]]
+name = "plugin_row_only_merge"
+path = "tests/plugin_row_only_merge.rs"
+required-features = ["sdk-tests"]
+
+[[test]]
+name = "realtime_collaboration_capacity"
+path = "tests/realtime_collaboration_capacity.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "rust_sdk_api"
+path = "tests/rust_sdk_api.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "semantic_merge"
+path = "tests/semantic_merge.rs"
+required-features = ["sdk-tests"]
+
+[[test]]
+name = "plugin_gc"
+path = "tests/plugin_gc.rs"
+required-features = ["plugin-tests"]
+
+[[test]]
+name = "server_protocol_plugin_convergence"
+path = "tests/server_protocol_plugin_convergence.rs"
+required-features = ["plugin-tests", "server-protocol"]
+
+[[test]]
+name = "untracked_plugin_cold_open_bench"
+path = "tests/untracked_plugin_cold_open_bench.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[example]]
+name = "branch_merge_benchmark"
+path = "examples/branch_merge_benchmark.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[example]]
+name = "e10_branch_file_cost"
+path = "examples/e10_branch_file_cost.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[example]]
+name = "e16_write_file_scaling"
+path = "examples/e16_write_file_scaling.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[example]]
+name = "exppth2_txn_probe"
+path = "examples/exppth2_txn_probe.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "hot_scan_refcount_census"
+path = "tests/hot_scan_refcount_census.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "scan_key_buffer_census"
+path = "tests/scan_key_buffer_census.rs"
+required-features = ["storage-benches"]

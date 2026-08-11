@@ -47,7 +47,8 @@ enum ObserveParamKey {
     Integer(i64),
     Real(u64),
     Text(String),
-    Json(String),
+    Jsonb(String),
+    Timestamptz(i64),
     Blob(crate::Blob),
 }
 
@@ -59,15 +60,16 @@ impl ObserveParamKey {
             Value::Integer(value) => Ok(Self::Integer(*value)),
             Value::Real(value) => Ok(Self::Real(value.to_bits())),
             Value::Text(value) => Ok(Self::Text(value.clone())),
-            Value::Json(value) => {
+            Value::Jsonb(value) => {
                 let json = serde_json::to_string(value).map_err(|error| {
                     LixError::new(
                         LixError::CODE_UNKNOWN,
                         format!("failed to serialize observe JSON parameter: {error}"),
                     )
                 })?;
-                Ok(Self::Json(json))
+                Ok(Self::Jsonb(json))
             }
+            Value::Timestamptz(value) => Ok(Self::Timestamptz(*value)),
             Value::Blob(value) => Ok(Self::Blob(value.clone())),
         }
     }
@@ -81,7 +83,8 @@ impl Hash for ObserveParamKey {
             Self::Boolean(value) => value.hash(state),
             Self::Integer(value) => value.hash(state),
             Self::Real(value) => value.hash(state),
-            Self::Text(value) | Self::Json(value) => value.hash(state),
+            Self::Text(value) | Self::Jsonb(value) => value.hash(state),
+            Self::Timestamptz(value) => value.hash(state),
             Self::Blob(value) => value.hash(state),
         }
     }

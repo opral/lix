@@ -11,7 +11,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -95,9 +95,10 @@ simulation_test!(
         let source_changes = source_changes_result.rows()[0]
             .get::<Value>("lixcol_source_changes")
             .expect("source_changes should be present");
-        let Value::Json(source_changes) = source_changes else {
+        let Value::Jsonb(source_changes) = source_changes else {
             panic!("source_changes should be semantic JSON, got {source_changes:?}");
         };
+        let source_changes = source_changes.to_value();
         assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
         assert_eq!(
             source_changes[0]["schema_key"],
@@ -120,11 +121,11 @@ simulation_test!(
                 .collect::<Vec<_>>(),
             vec![
                 "created_at",
-                "entity_pk",
                 "file_id",
                 "id",
                 "metadata",
                 "origin_key",
+                "row_pk",
                 "schema_key",
                 "snapshot_content",
             ]
@@ -138,7 +139,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -178,7 +179,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -198,7 +199,7 @@ simulation_test!(
         .expect("draft branch should be created");
         let draft = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-000000000009")
+                .open_session_at("01930000-0000-7000-8000-000000000009")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -287,7 +288,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -328,9 +329,9 @@ simulation_test!(
                 &format!(
 					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_depth \
 	                 FROM lix_directory_history('{delete_commit_id}') \
-	                   WHERE lixcol_entity_pk IN (lix_json('[\"01940000-0000-7000-8000-000000000001\"]'), lix_json('[\"01940000-0000-7000-8000-000000000002\"]')) \
+	                   WHERE lixcol_row_pk IN (CAST('[\"01940000-0000-7000-8000-000000000001\"]' AS JSONB), CAST('[\"01940000-0000-7000-8000-000000000002\"]' AS JSONB)) \
 	                   AND lixcol_depth = 0 \
-	                 ORDER BY lixcol_entity_pk"
+	                 ORDER BY lixcol_row_pk"
 				),
                 &[],
             )
@@ -351,9 +352,10 @@ simulation_test!(
                     Value::Boolean(true),
                 ]
             );
-            let Value::Json(source_changes) = &row.values()[4] else {
+            let Value::Jsonb(source_changes) = &row.values()[4] else {
                 panic!("delete source changes should be JSON");
             };
+            let source_changes = source_changes.to_value();
             let source_changes = source_changes
                 .as_array()
                 .expect("delete source changes should be an array");
@@ -370,7 +372,7 @@ simulation_test!(
                 .map(|source| {
                     assert_eq!(source["schema_key"], json!("lix_directory_descriptor"));
                     assert_eq!(source["snapshot_content"], serde_json::Value::Null);
-                    source["entity_pk"][0]
+                    source["row_pk"][0]
                         .as_str()
                         .expect("directory source identity should be text")
                 })

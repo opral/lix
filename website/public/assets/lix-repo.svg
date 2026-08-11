@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 200" role="img" aria-label="A Lix repo holds files, a SQL database, and version control in one system" font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
+  <rect x="0.75" y="0.75" width="678.5" height="198.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
+  <rect x="20" y="30" width="640" height="150" rx="12" fill="#F0FAFC" stroke="#07B6D5" stroke-width="1.5"/>
+  <rect x="296" y="22" width="88" height="16" fill="#F7F6F1"/>
+  <text x="340" y="34" text-anchor="middle" font-size="11.5" font-weight="700" letter-spacing="1" fill="#0891AC">LIX REPO</text>
+
+  <g transform="translate(113, 72)">
+    <rect x="28" y="6" width="30" height="38" rx="3" fill="#FBFAF7" stroke="#C9C7BF" stroke-width="1.5"/>
+    <rect x="24" y="10" width="30" height="38" rx="3" fill="#FBFAF7" stroke="#C9C7BF" stroke-width="1.5"/>
+    <rect x="20" y="14" width="30" height="38" rx="3" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+    <line x1="26" y1="24" x2="44" y2="24" stroke="#C9C7BF" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="26" y1="31" x2="44" y2="31" stroke="#C9C7BF" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="26" y1="38" x2="36" y2="38" stroke="#07B6D5" stroke-width="1.5" stroke-linecap="round"/>
+  </g>
+  <text x="153" y="152" text-anchor="middle" font-size="12" fill="#6B7076">files</text>
+
+  <g transform="translate(300, 72)">
+    <ellipse cx="40" cy="15" rx="19" ry="6" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+    <path d="M21 15 V41 C21 44.3 29.5 47 40 47 C50.5 47 59 44.3 59 41 V15" fill="none" stroke="#8A8F96" stroke-width="1.5"/>
+    <path d="M21 28 C21 31.3 29.5 34 40 34 C50.5 34 59 31.3 59 28" fill="none" stroke="#C9C7BF" stroke-width="1.5"/>
+    <line x1="33" y1="40" x2="47" y2="40" stroke="#07B6D5" stroke-width="1.5" stroke-linecap="round"/>
+  </g>
+  <text x="340" y="152" text-anchor="middle" font-size="12" fill="#6B7076">database</text>
+
+  <g transform="translate(487, 72)">
+    <line x1="14" y1="40" x2="66" y2="40" stroke="#8A8F96" stroke-width="1.5"/>
+    <path d="M22 40 C22 26 30 18 40 18 C50 18 58 26 58 40" fill="none" stroke="#07B6D5" stroke-width="1.5"/>
+    <circle cx="40" cy="18" r="3.5" fill="#07B6D5"/>
+    <circle cx="22" cy="40" r="3.5" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+    <circle cx="58" cy="40" r="3.5" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  </g>
+  <text x="527" y="152" text-anchor="middle" font-size="12" fill="#6B7076">version control</text>
+</svg>

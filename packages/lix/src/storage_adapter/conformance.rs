@@ -181,17 +181,14 @@ async fn prefix_scan_lowers_to_storage_range() -> StorageConformanceResult {
         .begin_scan(space_one(), range, BeginScanOptions::default())
         .await
         .map_err(|error| format!("begin prefix scan failed: {error}"))?;
-    let chunk = cursor
+    let (chunk, _chunk_has_more) = cursor
         .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
         .await
-        .map_err(|error| format!("scan_prefix failed: {error}"))?;
+        .map_err(|error| format!("scan_prefix failed: {error}"))?
+        .into_parts();
 
     assert_eq!(
-        chunk
-            .entries
-            .into_iter()
-            .map(|entry| entry.key)
-            .collect::<Vec<_>>(),
+        chunk.into_iter().map(|entry| entry.key).collect::<Vec<_>>(),
         vec![key("aa"), key("ab")]
     );
 
@@ -236,20 +233,20 @@ async fn cursor_drains_chunked_pages() -> StorageConformanceResult {
         .map_err(|error| format!("begin scan plan failed: {error}"))?;
 
     loop {
-        let result = cursor
+        let (result, result_has_more) = cursor
             .next_page(2)
             .await
-            .map_err(|error| format!("scan cursor page failed: {error}"))?;
+            .map_err(|error| format!("scan cursor page failed: {error}"))?
+            .into_parts();
 
         if result
-            .entries
             .iter()
             .any(|entry| !matches!(entry.value, ProjectedValue::KeyOnly))
         {
             return Err("expected key-only scan value".to_string());
         }
-        emitted += result.entries.len();
-        if !result.has_more {
+        emitted += result.len();
+        if !result_has_more {
             break;
         }
     }
@@ -291,14 +288,14 @@ async fn read_scope_pins_snapshot() -> StorageConformanceResult {
         )
         .await
         .map_err(|error| format!("begin scan_range failed: {error}"))?;
-    let chunk = cursor
+    let (chunk, _chunk_has_more) = cursor
         .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
         .await
-        .map_err(|error| format!("scan_range failed: {error}"))?;
+        .map_err(|error| format!("scan_range failed: {error}"))?
+        .into_parts();
 
     assert_eq!(
         chunk
-            .entries
             .into_iter()
             .map(|entry| entry.value)
             .collect::<Vec<_>>(),

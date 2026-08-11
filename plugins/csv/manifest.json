@@ -1,6 +1,6 @@
 {
   "key": "plugin_csv",
-  "match": {
+  "file_match": {
     "path_glob": "*.{csv,tsv}",
     "content": "text"
   },

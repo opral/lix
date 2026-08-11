@@ -10,18 +10,116 @@ use crate::storage_adapter::StorageAdapterRead;
 /// Walks parent links from `head_commit_id` and returns reachable commits
 /// nearest-first.
 ///
+/// `max_depth` bounds the walk itself. A caller that only wants the first few
+/// generations pays for those generations, not for the whole graph.
+///
 /// The walker is intentionally storage-free. It asks `CommitGraphReader` to
-/// load parsed commit facts and owns only traversal concerns: caching, cycle
+/// load parsed commit facts and owns only traversal concerns: batching, cycle
 /// detection, and nearest-depth selection.
 pub(crate) async fn walk_reachable_nodes<S>(
     reader: &mut CommitGraphStoreReader<S>,
     head_commit_id: &CommitId,
+    max_depth: Option<u32>,
 ) -> Result<Vec<ReachableCommitGraphNode>, LixError>
 where
     S: StorageAdapterRead,
 {
-    let mut loader = NodeTraversalLoader::new(reader);
-    loader.walk(head_commit_id).await
+    let mut walk = ReachableWalk::new(*head_commit_id);
+    let mut commits = Vec::new();
+    while let Some(layer) = walk.next_layer(reader).await? {
+        let depth = layer.depth;
+        commits.extend(
+            layer
+                .commits
+                .into_iter()
+                .map(|commit| ReachableCommitGraphNode { commit, depth }),
+        );
+        if max_depth.is_some_and(|max_depth| depth >= max_depth) {
+            break;
+        }
+    }
+    Ok(commits)
+}
+
+/// One nearest-depth generation of a reachable-commit walk.
+pub(crate) struct ReachableLayer {
+    pub(crate) depth: u32,
+    pub(crate) commits: Vec<CommitGraphNode>,
+}
+
+/// Resumable breadth-first cursor over the reachable commit graph.
+///
+/// Breadth-first order is the order the history surfaces already publish
+/// (nearest depth first, commit id within a depth), so a caller that has
+/// collected enough rows can simply stop asking for the next layer instead of
+/// materializing the remainder of the graph and truncating afterwards.
+///
+/// Each layer is loaded with one batched point read rather than one storage
+/// round-trip per commit.
+pub(crate) struct ReachableWalk {
+    seen: BTreeSet<CommitId>,
+    /// Frontier entries carry the generation of the child that discovered them.
+    /// Commit generations are strictly increasing away from the roots, so a
+    /// parent that fails to sit below its child proves a corrupt cycle.
+    frontier: Vec<(CommitId, u64)>,
+    depth: u32,
+}
+
+impl ReachableWalk {
+    pub(crate) fn new(head_commit_id: CommitId) -> Self {
+        Self {
+            seen: BTreeSet::from([head_commit_id]),
+            frontier: vec![(head_commit_id, u64::MAX)],
+            depth: 0,
+        }
+    }
+
+    pub(crate) async fn next_layer<S>(
+        &mut self,
+        reader: &mut CommitGraphStoreReader<S>,
+    ) -> Result<Option<ReachableLayer>, LixError>
+    where
+        S: StorageAdapterRead,
+    {
+        if self.frontier.is_empty() {
+            return Ok(None);
+        }
+        let depth = self.depth;
+        let mut frontier = std::mem::take(&mut self.frontier);
+        frontier.sort_unstable();
+        let commit_ids = frontier
+            .iter()
+            .map(|(commit_id, _)| *commit_id)
+            .collect::<Vec<_>>();
+        let loaded = reader.load_nodes(&commit_ids).await?;
+        let mut commits = Vec::with_capacity(commit_ids.len());
+        let mut next_frontier = Vec::new();
+        for ((commit_id, node), (_, child_generation)) in loaded.into_iter().zip(frontier.iter()) {
+            let Some(node) = node else {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("commit_graph missing commit '{commit_id}'"),
+                ));
+            };
+            if node.generation >= *child_generation {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "commit_graph cycle detected at commit '{commit_id}': it does not have a lower generation than the child that reaches it"
+                    ),
+                ));
+            }
+            for parent_commit_id in &node.parent_commit_ids {
+                if self.seen.insert(*parent_commit_id) {
+                    next_frontier.push((*parent_commit_id, node.generation));
+                }
+            }
+            commits.push(node);
+        }
+        self.frontier = next_frontier;
+        self.depth = depth.saturating_add(1);
+        Ok(Some(ReachableLayer { depth, commits }))
+    }
 }
 
 /// Returns the best common ancestors shared by two commit heads.
@@ -140,84 +238,6 @@ where
         Ok(best)
     }
 
-    async fn walk(
-        &mut self,
-        head_commit_id: &CommitId,
-    ) -> Result<Vec<ReachableCommitGraphNode>, LixError> {
-        let mut visiting = BTreeSet::new();
-        let mut nearest_depths = BTreeMap::new();
-        self.walk_commit(head_commit_id, 0, &mut visiting, &mut nearest_depths)
-            .await?;
-        let mut commits = Vec::with_capacity(nearest_depths.len());
-        for (commit_id, depth) in nearest_depths {
-            commits.push(ReachableCommitGraphNode {
-                commit: self.load_node(&commit_id).await?,
-                depth,
-            });
-        }
-        commits.sort_by(|left, right| {
-            left.depth
-                .cmp(&right.depth)
-                .then_with(|| left.commit.commit_id.cmp(&right.commit.commit_id))
-        });
-        Ok(commits)
-    }
-
-    async fn walk_commit(
-        &mut self,
-        commit_id: &CommitId,
-        depth: u32,
-        visiting: &mut BTreeSet<CommitId>,
-        nearest_depths: &mut BTreeMap<CommitId, u32>,
-    ) -> Result<(), LixError> {
-        let mut stack = vec![TraversalFrame {
-            commit_id: *commit_id,
-            depth,
-            expanded: false,
-        }];
-
-        while let Some(frame) = stack.pop() {
-            if frame.expanded {
-                visiting.remove(&frame.commit_id);
-                continue;
-            }
-
-            if visiting.contains(&frame.commit_id) {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "commit_graph cycle detected at commit '{}'",
-                        frame.commit_id
-                    ),
-                ));
-            }
-
-            if let Some(previous_depth) = nearest_depths.get(&frame.commit_id) {
-                if *previous_depth <= frame.depth {
-                    continue;
-                }
-            }
-
-            let commit = self.load_node(&frame.commit_id).await?;
-            nearest_depths.insert(frame.commit_id, frame.depth);
-
-            visiting.insert(frame.commit_id);
-            stack.push(TraversalFrame {
-                commit_id: frame.commit_id,
-                depth: frame.depth,
-                expanded: true,
-            });
-            for parent_commit_id in commit.parent_commit_ids.iter().rev() {
-                stack.push(TraversalFrame {
-                    commit_id: *parent_commit_id,
-                    depth: frame.depth + 1,
-                    expanded: false,
-                });
-            }
-        }
-        Ok(())
-    }
-
     async fn load_node(&mut self, commit_id: &CommitId) -> Result<CommitGraphNode, LixError> {
         let Some(commit) = self.reader.load_node(commit_id).await? else {
             return Err(LixError::new(
@@ -227,12 +247,6 @@ where
         };
         Ok(commit)
     }
-}
-
-struct TraversalFrame {
-    commit_id: CommitId,
-    depth: u32,
-    expanded: bool,
 }
 
 #[cfg(test)]
@@ -355,11 +369,13 @@ mod tests {
             crate::changelog::COMMIT_SPACE,
             StorageKey(Bytes::copy_from_slice(requested.as_uuid().as_bytes())),
             crate::changelog::encode_commit_record(&CommitRecord {
-                format_version: 2,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: embedded,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("mismatched-key-change"),
+                first_parent_jump_commit_id: embedded,
+                first_parent_jump_span: 0,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
             })
@@ -392,19 +408,24 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
         for (label, parent) in [("commit-a", "commit-b"), ("commit-b", "commit-a")] {
-            let commit_id = commit_id(label);
+            let current_commit_id = commit_id(label);
+            let parent_commit_id = commit_id(parent);
             let record = CommitRecord {
-                format_version: 2,
-                commit_id,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
+                commit_id: current_commit_id,
                 generation: 1,
-                parent_commit_ids: commit_ids([parent]),
-                change_id: ChangeId::for_test_label(&format!("{label}-change")),
+                parent_commit_ids: vec![parent_commit_id],
+                first_parent_jump_commit_id: parent_commit_id,
+                first_parent_jump_span: 1,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
             };
             writes.put(
                 crate::changelog::COMMIT_SPACE,
-                StorageKey(Bytes::copy_from_slice(commit_id.as_uuid().as_bytes())),
+                StorageKey(Bytes::copy_from_slice(
+                    current_commit_id.as_uuid().as_bytes(),
+                )),
                 crate::changelog::encode_commit_record(&record)
                     .expect("cycle commit should encode"),
             );
@@ -567,6 +588,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_reachable_nodes_match_unbounded_prefix_for_a_diamond() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
+                commit_change("commit-right-change", "commit-right", &[], &["commit-root"]),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &[],
+                    &["commit-left", "commit-right"],
+                ),
+            ],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let head = commit_id("commit-head");
+        let full = reader
+            .reachable_nodes(&head)
+            .await
+            .expect("full diamond should load");
+        for max_depth in [0, 1, 2] {
+            let bounded = super::walk_reachable_nodes(&mut reader, &head, Some(max_depth))
+                .await
+                .expect("bounded diamond should load");
+            let expected = full
+                .iter()
+                .filter(|reachable| reachable.depth <= max_depth)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(bounded, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_reachable_nodes_match_unbounded_prefix_for_linear_history() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change(
+                    "commit-parent-change",
+                    "commit-parent",
+                    &[],
+                    &["commit-root"],
+                ),
+                commit_change("commit-head-change", "commit-head", &[], &["commit-parent"]),
+            ],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let head = commit_id("commit-head");
+        let full = reader
+            .reachable_nodes(&head)
+            .await
+            .expect("full linear history should load");
+        for max_depth in [0, 1, 2] {
+            let bounded = super::walk_reachable_nodes(&mut reader, &head, Some(max_depth))
+                .await
+                .expect("bounded linear history should load");
+            let expected = full
+                .iter()
+                .filter(|reachable| reachable.depth <= max_depth)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(bounded, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_reachable_nodes_validate_only_parents_inside_the_frontier() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change(
+                    "commit-parent-change",
+                    "commit-parent",
+                    &[],
+                    &["commit-root"],
+                ),
+                commit_change("commit-head-change", "commit-head", &[], &["commit-parent"]),
+            ],
+        )
+        .await;
+        let root = commit_id("commit-root");
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            crate::changelog::COMMIT_SPACE,
+            StorageKey(Bytes::copy_from_slice(root.as_uuid().as_bytes())),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("old ancestry corruption should stage");
+
+        let head = commit_id("commit-head");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let bounded = super::walk_reachable_nodes(&mut reader, &head, Some(1))
+            .await
+            .expect("parent below the frontier must not load");
+        assert_eq!(bounded.len(), 2);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = super::walk_reachable_nodes(&mut reader, &head, Some(2))
+            .await
+            .expect_err("missing parent inside the frontier must fail");
+        assert!(error.message.contains(&root.to_string()));
+    }
+
+    #[tokio::test]
+    async fn bounded_reachable_nodes_reject_cycles_closed_at_the_frontier() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[commit_change("commit-root-change", "commit-root", &[], &[])],
+        )
+        .await;
+        let root = commit_id("commit-root");
+        let left = commit_id("commit-cycle-left");
+        let right = commit_id("commit-cycle-right");
+        let record = |commit_id, parents| CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 4,
+            commit_id,
+            generation: 2,
+            parent_commit_ids: parents,
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+        };
+        let records = [
+            record(left, vec![right, root]),
+            record(right, vec![left, root]),
+        ];
+        let mut writes = storage.new_write_set();
+        for record in records {
+            writes.put(
+                crate::changelog::COMMIT_SPACE,
+                StorageKey(Bytes::copy_from_slice(
+                    record.commit_id.as_uuid().as_bytes(),
+                )),
+                crate::changelog::encode_commit_record(&record)
+                    .expect("cyclic record should encode"),
+            );
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("cycle should persist");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = super::walk_reachable_nodes(&mut reader, &left, Some(1))
+            .await
+            .expect_err("cycle closed at the frontier must fail");
+        assert!(error.message.contains("cycle detected"));
+    }
+
+    #[tokio::test]
     async fn reachable_nodes_errors_on_missing_head_commit() {
         let storage = StorageAdapter::new(Memory::new());
         let graph = CommitGraphContext::new();
@@ -696,11 +903,13 @@ mod tests {
         let child = commit_id("commit-child");
         let mut writes = storage.new_write_set();
         let record = CommitRecord {
-            format_version: 2,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 4,
             commit_id: child,
             generation: 0,
             parent_commit_ids: commit_ids(["commit-root"]),
-            change_id: ChangeId::for_test_label("commit-child-change"),
+            first_parent_jump_commit_id: child,
+            first_parent_jump_span: 0,
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         };
@@ -726,7 +935,13 @@ mod tests {
             .await
             .expect_err("invalid generations should fail the graph walk");
 
-        assert!(error.message.contains("does not have a lower generation"));
+        assert!(
+            error.message.contains("does not have a lower generation")
+                || error
+                    .message
+                    .contains("first-parent jump span exceeds its generation")
+                || error.message.contains("no advancing first-parent jump")
+        );
 
         for (left, right) in [
             ("commit-root", "commit-child"),
@@ -741,7 +956,10 @@ mod tests {
                 .merge_base(&commit_id(left), &commit_id(right))
                 .await
                 .expect_err("direct-parent shortcut must reject invalid generations");
-            assert!(error.message.contains("does not have a lower generation"));
+            assert!(
+                error.message.contains("does not have a lower generation")
+                    || error.message.contains("no advancing first-parent jump")
+            );
         }
 
         let read = storage
@@ -753,7 +971,10 @@ mod tests {
             .merge_base(&commit_id("commit-child"), &commit_id("commit-sibling"))
             .await
             .expect_err("shared-parent shortcut must reject invalid generations");
-        assert!(error.message.contains("does not have a lower generation"));
+        assert!(
+            error.message.contains("does not have a lower generation")
+                || error.message.contains("no advancing first-parent jump")
+        );
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -764,7 +985,10 @@ mod tests {
             .merge_base(&commit_id("commit-root"), &commit_id("commit-grandchild"))
             .await
             .expect_err("linear prefix and DAG fallback must preserve generation validation");
-        assert!(error.message.contains("does not have a lower generation"));
+        assert!(
+            error.message.contains("does not have a lower generation")
+                || error.message.contains("no advancing first-parent jump")
+        );
     }
 
     #[tokio::test]
@@ -968,6 +1192,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_base_segment_skips_refine_shared_fork_and_unequal_head() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut changes = Vec::new();
+        changes.push(commit_change(
+            "segment-root-change",
+            "segment-root",
+            &[],
+            &[],
+        ));
+        let mut trunk_parent = "segment-root".to_string();
+        for index in 1..=70 {
+            let label = format!("segment-trunk-{index}");
+            changes.push(commit_change(
+                &format!("{label}-change"),
+                &label,
+                &[],
+                &[&trunk_parent],
+            ));
+            trunk_parent = label;
+        }
+        let fork = trunk_parent.clone();
+        let mut left_parent = fork.clone();
+        let mut right_parent = fork.clone();
+        for index in 1..=130 {
+            let left = format!("segment-left-{index}");
+            changes.push(commit_change(
+                &format!("{left}-change"),
+                &left,
+                &[],
+                &[&left_parent],
+            ));
+            left_parent = left;
+            let right = format!("segment-right-{index}");
+            changes.push(commit_change(
+                &format!("{right}-change"),
+                &right,
+                &[],
+                &[&right_parent],
+            ));
+            right_parent = right;
+        }
+        append_changes(&storage, &changes).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("general-walker read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let general = reader
+            .best_common_ancestors(&commit_id(&left_parent), &commit_id(&right_parent))
+            .await
+            .expect("general walker should resolve fork");
+        assert_eq!(
+            general
+                .iter()
+                .map(|node| node.commit_id)
+                .collect::<Vec<_>>(),
+            vec![commit_id(&fork)],
+            "Myers fast path must agree with the general DAG walker",
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        assert_eq!(
+            reader
+                .merge_base(&commit_id(&left_parent), &commit_id(&right_parent))
+                .await
+                .expect("segmented fork should resolve exactly"),
+            commit_id(&fork)
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("second read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        assert_eq!(
+            reader
+                .merge_base(&commit_id("segment-trunk-10"), &commit_id(&left_parent))
+                .await
+                .expect("unequal segmented ancestor should resolve exactly"),
+            commit_id("segment-trunk-10")
+        );
+    }
+
+    #[tokio::test]
     async fn merge_base_errors_when_histories_have_no_common_commit() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
@@ -1109,10 +1422,11 @@ mod tests {
         let mut writes = storage.new_write_set();
         let mut append = ChangelogAppend::default();
         let mut generations = std::collections::BTreeMap::<CommitId, u64>::new();
+        let mut topology_records = std::collections::BTreeMap::<CommitId, CommitRecord>::new();
         for change in changes {
             let commit_id = change
                 .change
-                .entity_pk
+                .row_pk
                 .as_single_string()
                 .expect("commit fixture should have single id")
                 .to_string();
@@ -1121,17 +1435,46 @@ mod tests {
                 .iter()
                 .filter_map(|parent| generations.get(parent).copied())
                 .max()
-                .map_or(0, |parent_generation| parent_generation + 1);
+                .map_or_else(
+                    || usize::from(!parent_commit_ids.is_empty()) as u64,
+                    |parent_generation| parent_generation + 1,
+                );
             let typed_commit_id = CommitId::for_test_label(&commit_id);
-            append.commits.push(CommitRecord {
-                format_version: 2,
+            let parent = match parent_commit_ids.as_slice() {
+                [parent_commit_id] => topology_records.get(parent_commit_id),
+                _ => None,
+            };
+            let (first_parent_jump_commit_id, first_parent_jump_span) = match parent {
+                Some(parent) => {
+                    let parent_jump = topology_records
+                        .get(&parent.first_parent_jump_commit_id)
+                        .expect("test parent jump target exists");
+                    crate::changelog::next_first_parent_jump(
+                        typed_commit_id,
+                        &parent_commit_ids,
+                        Some(parent),
+                        Some(parent_jump),
+                    )
+                    .expect("test commit jump should derive")
+                }
+                None => match parent_commit_ids.as_slice() {
+                    [missing_parent] => (*missing_parent, 1),
+                    _ => (typed_commit_id, 0),
+                },
+            };
+            let record = CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: typed_commit_id,
                 generation,
                 parent_commit_ids,
-                change_id: change.change.id,
+                first_parent_jump_commit_id,
+                first_parent_jump_span,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
-            });
+            };
+            append.commits.push(record.clone());
+            topology_records.insert(typed_commit_id, record);
             generations.insert(typed_commit_id, generation);
         }
         let commit_records = append.commits.clone();
@@ -1159,8 +1502,7 @@ mod tests {
                 commit_id: record.commit_id,
                 change_account_id: record.account_id.clone(),
                 replay_debt: CommitStateReplayDebt {
-                    depth: u16::try_from(record.generation + 1)
-                        .expect("test generation should fit replay depth"),
+                    depth: 1,
                     rows: 0,
                     bytes: 0,
                 },
@@ -1183,7 +1525,7 @@ mod tests {
             change: CommitGraphChange {
                 id: ChangeId::for_test_label(change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single(commit_id),
+                row_pk: crate::row_pk::RowPk::single(commit_id),
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
                 snapshot: crate::json_store::JsonSlot::None,

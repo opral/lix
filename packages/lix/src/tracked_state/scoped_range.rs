@@ -16,14 +16,17 @@ use bytes::Bytes;
 
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
-    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet, ValueSemantics,
 };
 use crate::{LixError, storage_codec};
 
 /// Hard-cut namespace: nodes from the former per-scope directory/catalog
 /// formats are neither readable nor hash-compatible with this tree.
-pub(crate) const SCOPED_RANGE_NODE_SPACE: StorageSpace =
-    StorageSpace::immutable(StorageSpaceId(0x0004_0032), "tracked_state.scoped_range.v3");
+pub(crate) const SCOPED_RANGE_NODE_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0004_0032),
+    "tracked_state.scoped_range.v3",
+    ValueSemantics::Immutable,
+);
 
 const NODE_RAW_MAGIC: &[u8; 6] = b"LXSR3R";
 const NODE_ZSTD_MAGIC: &[u8; 6] = b"LXSR3Z";
@@ -1613,7 +1616,7 @@ pub(crate) async fn load_scoped_range_coverage_with_staged(
     }
 }
 
-/// Returns every part in one exact scope without inventing a sentinel entity
+/// Returns every part in one exact scope without inventing a sentinel row
 /// key. The synthetic route kind sorts after all part starts in that scope.
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn scan_scoped_range_scope(

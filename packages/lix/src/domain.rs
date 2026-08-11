@@ -1,7 +1,7 @@
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 #[cfg(test)]
-use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::MaterializedLiveStateRowRef;
+use crate::hot_state::MaterializedHotStateRow;
+use crate::hot_state::MaterializedHotStateRowRef;
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 /// Validation/storage coordinate for repository facts.
@@ -42,7 +42,7 @@ impl Domain {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_live_row(row: &MaterializedLiveStateRow) -> Self {
+    pub(crate) fn for_live_row(row: &MaterializedHotStateRow) -> Self {
         Self::exact_file(
             row.branch_id.to_string(),
             row.untracked,
@@ -50,7 +50,7 @@ impl Domain {
         )
     }
 
-    pub(crate) fn for_live_row_ref(row: MaterializedLiveStateRowRef<'_>) -> Self {
+    pub(crate) fn for_live_row_ref(row: MaterializedHotStateRowRef<'_>) -> Self {
         Self::exact_file(
             row.branch_id(),
             row.untracked(),
@@ -114,7 +114,7 @@ impl Domain {
         }
     }
 
-    pub(crate) fn contains_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+    pub(crate) fn contains_ref(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
         row.branch_id() == self.branch_id
             && row.untracked() == self.untracked
             && self.contains_canonical_ref(row)
@@ -122,7 +122,7 @@ impl Domain {
 
     /// Matches branch and file scope while accepting whichever durability
     /// member won canonical tracked/untracked overlay.
-    pub(crate) fn contains_canonical_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+    pub(crate) fn contains_canonical_ref(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
         row.branch_id() == self.branch_id
             && committed_row_ref_is_exact_branch_scoped(row, &self.branch_id)
             && match &self.file_scope {
@@ -165,8 +165,18 @@ impl Domain {
         self.source_domains_that_can_reach()
     }
 
+    /// A row's owning file is looked up in the row's own lane only.
+    ///
+    /// This is the enforcement seam for "a row and the file that owns it live in
+    /// the same lane". Deliberately NOT `reachable_target_domains()`: that
+    /// widening is still correct for `fk_target_domains()` and
+    /// `directory_parent_domains()`, where an untracked row referencing a
+    /// tracked schema, account or parent directory is load-bearing. File
+    /// ownership is the one relationship that must not cross the lane
+    /// boundary, because a tracked file deletion would otherwise silently take
+    /// untracked rows with it.
     pub(crate) fn file_owner_domains(&self) -> Vec<Self> {
-        self.reachable_target_domains()
+        vec![self.clone()]
     }
 
     pub(crate) fn directory_parent_domains(&self) -> Vec<Self> {
@@ -199,33 +209,33 @@ pub(crate) enum DomainFileScope {
 pub(crate) struct DomainRowIdentity {
     domain: Domain,
     schema_key: String,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
 }
 
 impl DomainRowIdentity {
-    pub(crate) fn new(domain: Domain, schema_key: impl Into<String>, entity_pk: EntityPk) -> Self {
+    pub(crate) fn new(domain: Domain, schema_key: impl Into<String>, row_pk: RowPk) -> Self {
         Self {
             domain,
             schema_key: schema_key.into(),
-            entity_pk,
+            row_pk,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn from_live_row(row: &MaterializedLiveStateRow) -> Self {
+    pub(crate) fn from_live_row(row: &MaterializedHotStateRow) -> Self {
         Self::new(
             Domain::for_live_row(row),
             row.schema_key.clone(),
-            row.entity_pk.clone(),
+            row.row_pk.clone(),
         )
     }
 
     pub(crate) fn in_domain(
         domain: Domain,
         schema_key: impl Into<String>,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
     ) -> Self {
-        Self::new(domain, schema_key, entity_pk)
+        Self::new(domain, schema_key, row_pk)
     }
 
     #[cfg(test)]
@@ -234,12 +244,12 @@ impl DomainRowIdentity {
         untracked: bool,
         file_id: Option<String>,
         schema_key: impl Into<String>,
-        entity_pk: EntityPk,
+        row_pk: RowPk,
     ) -> Self {
         Self::new(
             Domain::exact_file(branch_id, untracked, file_id),
             schema_key,
-            entity_pk,
+            row_pk,
         )
     }
 
@@ -255,12 +265,12 @@ impl DomainRowIdentity {
         self.schema_key.clone()
     }
 
-    pub(crate) fn entity_pk(&self) -> &EntityPk {
-        &self.entity_pk
+    pub(crate) fn row_pk(&self) -> &RowPk {
+        &self.row_pk
     }
 
-    pub(crate) fn entity_pk_owned(&self) -> EntityPk {
-        self.entity_pk.clone()
+    pub(crate) fn row_pk_owned(&self) -> RowPk {
+        self.row_pk.clone()
     }
 }
 
@@ -288,7 +298,7 @@ impl DomainSchemaIdentity {
 }
 
 pub(crate) fn committed_row_ref_is_exact_branch_scoped(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     branch_id: &str,
 ) -> bool {
     row.branch_id() == branch_id && row.global() == (row.branch_id() == GLOBAL_BRANCH_ID)

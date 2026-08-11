@@ -1,9 +1,11 @@
-use lix::wasm::v1::{ByteEdit, PerformanceMeasurement, Root, Store, compare_to_baseline};
+use lix::plugin::runtime::v1::{
+    ByteEdit, PerformanceMeasurement, Root, Store, compare_to_baseline,
+};
 use std::hint::black_box;
 use std::time::Instant;
 
 #[test]
-fn plugin_v1_wit_is_valid_and_has_no_guest_document_resource() {
+fn plugin_v1_wit_is_valid_and_exposes_independent_row_first_capabilities() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("wit");
     let mut resolve = wit_parser::Resolve::default();
     resolve
@@ -13,18 +15,19 @@ fn plugin_v1_wit_is_valid_and_has_no_guest_document_resource() {
     assert!(wit.contains("package lix:plugin@1.0.0"));
     assert!(wit.contains("resource snapshot"));
     assert!(wit.contains("resource transition"));
-    assert!(wit.contains("apply: func("));
     assert!(wit.contains("output: borrow<transition>"));
-    assert!(wit.contains("resolve-conflicts: func("));
-    assert!(wit.contains("variant transition-request"));
-    assert!(wit.contains("open(open-request)"));
-    assert!(wit.contains("file-changed(file-changed-request)"));
-    assert!(wit.contains("entities-changed(entities-changed-request)"));
-    assert!(wit.contains("restore(restore-request)"));
-    assert!(wit.contains("cold-file-changed(cold-file-changed-request)"));
-    assert!(!wit.contains("path: option<string>"));
+    assert!(wit.contains("interface column-merger"));
+    assert!(wit.contains("interface file-projection"));
+    assert!(wit.contains("parse: func("));
+    assert!(wit.contains("parse-changes: func("));
+    assert!(wit.contains("serialize: func("));
+    assert!(wit.contains("serialize-changes: func("));
+    assert!(wit.contains("file-id: option<string>"));
+    assert!(wit.contains("world column-merger-plugin"));
+    assert!(wit.contains("world file-projection-plugin"));
     assert!(!wit.contains("resource document"));
     assert!(!wit.contains("resource change-cursor"));
+    assert!(!wit.contains("resolve-conflicts"));
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,7 +131,7 @@ fn score(format: Format) -> Score {
     let bytes = format.fixture();
     let edit_offset = bytes.len() / 2;
     let replacement = vec![b'X'];
-    let entity = format!("{{\"format\":\"{}\",\"changed\":true}}", format.name()).into_bytes();
+    let row = format!("{{\"format\":\"{}\",\"changed\":true}}", format.name()).into_bytes();
     let state = format!("{}-page:{}", format.name(), edit_offset).into_bytes();
 
     let store = Store::default();
@@ -136,7 +139,7 @@ fn score(format: Format) -> Score {
         store.clone(),
         "v3-generation",
         &bytes,
-        [(b"stable/entity".to_vec(), b"{\"changed\":false}".to_vec())],
+        [(b"stable/row".to_vec(), b"{\"changed\":false}".to_vec())],
         [(b"affected/page".to_vec(), b"old-index-page".to_vec())],
     );
     let base_unique = store.unique_page_bytes();
@@ -146,7 +149,7 @@ fn score(format: Format) -> Score {
         delete_len: 1,
         insert: replacement.clone(),
     });
-    transaction.upsert_entity(b"stable/entity".to_vec(), entity.clone());
+    transaction.upsert_row(b"stable/row".to_vec(), row.clone());
     transaction.put_state(b"affected/page".to_vec(), state.clone());
     let successor = transaction.commit().unwrap();
     let actual = successor
@@ -162,16 +165,16 @@ fn score(format: Format) -> Score {
     // is a conservative comparison.
     let v2_retained_bytes = bytes.len() * 2
         + b"{\"changed\":false}".len()
-        + entity.len()
+        + row.len()
         + b"old-index-page".len()
         + state.len();
     let v3_retained_bytes = store.unique_page_bytes();
     assert!(v3_retained_bytes >= base_unique);
 
     // v2 cold materialization lowers a full accepted document and persistent
-    // state; v3 lowers one splice plus one entity and one state page.
+    // state; v3 lowers one splice plus one row and one state page.
     let v2_boundary_bytes = bytes.len() + b"old-index-page".len();
-    let v3_boundary_bytes = 24 + replacement.len() + entity.len() + state.len();
+    let v3_boundary_bytes = 24 + replacement.len() + row.len() + state.len();
 
     Score {
         format: format.name(),

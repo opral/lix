@@ -50,6 +50,21 @@ pub(crate) async fn analyze<S>(
 where
     S: StorageAdapterRead,
 {
+    // Commit-graph analysis has already authenticated both heads and selected
+    // this base. When the source is the base, the merge cannot contribute any
+    // tracked-state changes, so avoid opening the immutable state authorities
+    // solely to prove two empty diffs.
+    if commits.base_commit_id == commits.source_commit_id {
+        return Ok(MergeAnalysis {
+            outcome: MergeOutcome::AlreadyUpToDate,
+            commits,
+            source_diff: TrackedStateDiff::default(),
+            target_diff: TrackedStateDiff::default(),
+            stats: MergeStats::default(),
+            merge_plan: None,
+        });
+    }
+
     let request = TrackedStateDiffRequest::default();
     let base_commit_id = commits.base_commit_id.to_string();
     let source_commit_id = commits.source_commit_id.to_string();
@@ -66,12 +81,10 @@ where
             .diff_commits(&base_commit_id, &target_commit_id, &request)
             .await?
     };
-    exclude_checkpoint_entities(&mut source_diff);
-    exclude_checkpoint_entities(&mut target_diff);
+    exclude_checkpoint_rows(&mut source_diff);
+    exclude_checkpoint_rows(&mut target_diff);
 
-    let outcome = if commits.base_commit_id == commits.source_commit_id {
-        MergeOutcome::AlreadyUpToDate
-    } else if commits.base_commit_id == commits.target_commit_id {
+    let outcome = if commits.base_commit_id == commits.target_commit_id {
         MergeOutcome::FastForward
     } else {
         MergeOutcome::MergeCommitted
@@ -91,7 +104,7 @@ where
     };
 
     let stats = match outcome {
-        MergeOutcome::AlreadyUpToDate => MergeStats::default(),
+        MergeOutcome::AlreadyUpToDate => unreachable!("already-up-to-date merges return early"),
         MergeOutcome::FastForward => stats_from_diff(&source_diff),
         MergeOutcome::MergeCommitted => merge_plan
             .as_ref()
@@ -110,7 +123,7 @@ where
     })
 }
 
-fn exclude_checkpoint_entities(diff: &mut TrackedStateDiff) {
+fn exclude_checkpoint_rows(diff: &mut TrackedStateDiff) {
     diff.entries.retain(|entry| {
         entry.identity.schema_key() != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
             && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY

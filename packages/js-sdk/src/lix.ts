@@ -1,10 +1,4 @@
 import { invalidArgument } from "./errors.js";
-import {
-	ACTIVE_BRANCH_CLIENT_STATE_KEY,
-	type LixClientState,
-	type ManagedClientState,
-	unavailableClientState,
-} from "./client-state.js";
 import type {
 	BindingObserveEvent,
 	LixBinding,
@@ -16,7 +10,6 @@ import {
 	wrapExecuteBatchResult,
 	wrapExecuteResult,
 } from "./result.js";
-import { isSnapshotPersistenceAfterCommitError } from "./snapshot-persistence.js";
 import { normalizeParam, toNativeValue } from "./value.js";
 import type {
 	CreateBranchOptions,
@@ -32,7 +25,6 @@ import type {
 	MergeBranchPreview,
 	MergeBranchReceipt,
 	ObserveEvent,
-	JsonValue,
 	SqlParam,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
@@ -60,7 +52,6 @@ const observeFinalizer = new FinalizationRegistry<{
 
 export class Lix {
 	private closePromise: Promise<void> | undefined;
-	readonly clientState: LixClientState;
 	readonly #activeBranchListeners = new Set<() => void>();
 	readonly #inFlightOperations = new Set<Promise<unknown>>();
 	readonly #observations = new Map<number, WeakRef<ObserveEvents>>();
@@ -69,25 +60,7 @@ export class Lix {
 	#activeTransactions = 0;
 	#acceptingOperations = true;
 
-	constructor(
-		private readonly binding: LixBinding,
-		private readonly managedClientState?: ManagedClientState,
-	) {
-		this.clientState = managedClientState
-			? {
-					get: <T extends JsonValue = JsonValue>(key: string) =>
-						managedClientState.get<T>(key),
-					set: (key, value) =>
-						this.#runOperation(() => managedClientState.set(key, value)),
-					delete: (key) =>
-						this.#runOperation(() => managedClientState.delete(key)),
-					subscribe: (listener) => {
-						this.#assertAcceptingOperations();
-						return managedClientState.subscribe(listener);
-					},
-				}
-			: unavailableClientState();
-	}
+	constructor(private readonly binding: LixBinding) {}
 
 	async execute(
 		sql: string,
@@ -200,18 +173,6 @@ export class Lix {
 	): Promise<SwitchBranchReceipt> {
 		return this.#runOperation(async () => {
 			const receipt = await this.binding.switchBranch(options);
-			try {
-				if (this.managedClientState) {
-					await this.managedClientState.set(
-						ACTIVE_BRANCH_CLIENT_STATE_KEY,
-						receipt.branchId,
-					);
-				}
-			} catch {
-				// The remote branch switch already committed. Client persistence is a
-				// best-effort reopen preference and cannot turn that success into a
-				// rejected switch with ambiguous branch state.
-			}
 			for (const listener of [...this.#activeBranchListeners]) {
 				try {
 					listener();
@@ -255,9 +216,15 @@ export class Lix {
 			this.#observations.clear();
 			this.closePromise = (async () => {
 				await Promise.allSettled([...this.#inFlightOperations]);
-				await this.binding.close();
-				await this.managedClientState?.close();
+				const results = await Promise.allSettled([
+					Promise.resolve().then(() => this.binding.close()),
+				]);
 				this.#activeBranchListeners.clear();
+				const failure = results.find(
+					(result): result is PromiseRejectedResult =>
+						result.status === "rejected",
+				);
+				if (failure) throw failure.reason;
 			})();
 		}
 		await this.closePromise;
@@ -391,28 +358,19 @@ export class LixTransaction {
 		if (this.finished) throw transactionClosedError();
 		if (!this.finishPromise) {
 			this.finishPromise = (async () => {
-				if (kind === "transaction.commit") await this.binding.commit();
-				else await this.binding.rollback();
-				this.finished = true;
-				transactionFinalizer.unregister(this);
-				this.onFinish();
+				try {
+					if (kind === "transaction.commit") await this.binding.commit();
+					else await this.binding.rollback();
+				} finally {
+					// A terminal binding call consumes the underlying transaction even
+					// when its durable commit or rollback reports an error.
+					this.finished = true;
+					transactionFinalizer.unregister(this);
+					this.onFinish();
+				}
 			})();
 		}
-		try {
-			await this.finishPromise;
-		} catch (error) {
-			if (isSnapshotPersistenceAfterCommitError(error)) {
-				// The transaction finished in Rust; only durable snapshot saving
-				// failed. Release the transaction lifecycle while reporting that
-				// durability failure to the caller.
-				this.finished = true;
-				transactionFinalizer.unregister(this);
-				this.onFinish();
-				throw error;
-			}
-			this.finishPromise = undefined;
-			throw error;
-		}
+		await this.finishPromise;
 	}
 }
 

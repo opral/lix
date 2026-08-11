@@ -95,11 +95,11 @@ mod tests {
     fn hint_from_error_returns_lix_hint() {
         let cli_err = CliError::from_lix(
             "sql execution failed",
-            LixError::new("CODE", "desc").with_hint("use lix_json(...)"),
+            LixError::new("CODE", "desc").with_hint("use CAST(... AS JSONB)"),
         );
         assert_eq!(
             hint_from_error(&cli_err),
-            vec!["use lix_json(...)".to_string()]
+            vec!["use CAST(... AS JSONB)".to_string()]
         );
     }
 }

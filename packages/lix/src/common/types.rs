@@ -102,6 +102,25 @@ impl SharedStr {
         })
     }
 
+    /// Retains bytes whose producer already proved complete-buffer UTF-8.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must contain valid UTF-8. Callers should prefer [`Self::from_utf8`]
+    /// unless validity follows directly from construction from `str` slices or
+    /// a UTF-8 serializer.
+    pub(crate) unsafe fn from_utf8_unchecked(bytes: bytes::Bytes) -> Self {
+        debug_assert!(
+            std::str::from_utf8(&bytes).is_ok(),
+            "SharedStr trusted producer emitted invalid UTF-8"
+        );
+        let len = bytes.len();
+        Self {
+            bytes,
+            range: 0..len,
+        }
+    }
+
     /// Retains one UTF-8 range of an otherwise arbitrary shared buffer.
     #[cfg(test)]
     pub(crate) fn from_utf8_range(bytes: bytes::Bytes, range: Range<usize>) -> Option<Self> {
@@ -324,6 +343,135 @@ impl<'de> serde::Deserialize<'de> for SharedStr {
     }
 }
 
+/// Canonical JSON text carried by a SQL value.
+///
+/// Every JSON payload the engine accepts is normalized to serde_json's stable
+/// compact form at the write boundary, and the row projection decoder hands
+/// those exact bytes to Arrow as UTF-8. A JSON result column is therefore
+/// already the byte string a caller receives, so `Json` retains the bytes
+/// instead of rebuilding a `serde_json::Value` DOM for every row on every scan.
+#[derive(Clone)]
+pub struct Json(SharedStr);
+
+impl Json {
+    /// Retains canonical JSON text without re-validating it.
+    ///
+    /// Only engine-produced text may take this constructor. Public input is
+    /// canonicalized before it reaches storage, so re-parsing on read would
+    /// only re-prove what the write boundary already proved.
+    pub fn from_canonical_text(text: impl Into<SharedStr>) -> Self {
+        Self(text.into())
+    }
+
+    /// Parses arbitrary JSON text into canonical form.
+    pub fn parse(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str::<serde_json::Value>(text).map(Self::from)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub fn as_shared_str(&self) -> &SharedStr {
+        &self.0
+    }
+
+    pub fn into_shared_str(self) -> SharedStr {
+        self.0
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0.as_str() == "null"
+    }
+
+    /// Returns the decoded string when this payload is a JSON string.
+    pub fn as_json_string(&self) -> Option<String> {
+        match self.to_value() {
+            serde_json::Value::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Materializes the DOM for callers that must inspect JSON structure.
+    ///
+    /// This is the opt-in cost. Row plumbing, the wire encoder, and the JS
+    /// bridges all stay on the text representation and never call it.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::from_str(self.0.as_str())
+            .expect("canonical JSON text retained by Json is valid JSON")
+    }
+}
+
+impl From<serde_json::Value> for Json {
+    fn from(value: serde_json::Value) -> Self {
+        Self(SharedStr::from(value.to_string()))
+    }
+}
+
+impl From<&serde_json::Value> for Json {
+    fn from(value: &serde_json::Value) -> Self {
+        Self(SharedStr::from(value.to_string()))
+    }
+}
+
+impl From<Json> for serde_json::Value {
+    fn from(value: Json) -> Self {
+        value.to_value()
+    }
+}
+
+impl PartialEq for Json {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Json {}
+
+impl PartialEq<serde_json::Value> for Json {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        &self.to_value() == other
+    }
+}
+
+impl fmt::Debug for Json {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Json({})", self.0.as_str())
+    }
+}
+
+impl fmt::Display for Json {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0.as_str())
+    }
+}
+
+impl serde::Serialize for Json {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // `RawValue` emits the retained bytes verbatim, so the wire encoding is
+        // identical to what re-serializing the DOM produced.
+        serde_json::value::RawValue::from_string(self.0.as_str().to_owned())
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Json {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde_json::Value::deserialize(deserializer).map(Self::from)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
@@ -331,7 +479,10 @@ pub enum Value {
     Integer(i64),
     Real(f64),
     Text(String),
-    Json(serde_json::Value),
+    Jsonb(Json),
+    /// PostgreSQL `timestamptz`, represented losslessly as signed UTC
+    /// microseconds since the Unix epoch.
+    Timestamptz(i64),
     Blob(Blob),
 }
 
@@ -395,8 +546,34 @@ pub struct LixNotice {
 
 #[cfg(test)]
 mod tests {
-    use super::{SharedStr, Value};
+    use super::{Json, SharedStr, Value};
     use bytes::Bytes;
+
+    #[test]
+    fn json_values_serialize_their_retained_bytes_verbatim() {
+        let canonical = r#"{"a":1,"b":[true,null],"c":"x"}"#;
+        let value = Value::Jsonb(Json::from_canonical_text(canonical));
+
+        let encoded = serde_json::to_string(&value).expect("value serializes");
+        assert_eq!(encoded, format!(r#"{{"Jsonb":{canonical}}}"#));
+    }
+
+    #[test]
+    fn json_text_matches_what_re_serializing_the_dom_produced() {
+        // The read path stops building a DOM, so the retained bytes must equal
+        // the bytes the previous `serde_json::Value` round trip emitted.
+        let canonical = r#"{"a":1,"b":[true,null],"c":"x"}"#;
+        let dom = serde_json::from_str::<serde_json::Value>(canonical).expect("valid JSON");
+
+        assert_eq!(Json::from_canonical_text(canonical).as_str(), canonical);
+        assert_eq!(Json::from(dom).as_str(), canonical);
+    }
+
+    #[test]
+    fn json_deserialization_canonicalizes_noncanonical_input() {
+        let decoded = serde_json::from_str::<Json>(r#"{ "b" : 2 , "a" : 1 }"#).expect("decodes");
+        assert_eq!(decoded.as_str(), r#"{"a":1,"b":2}"#);
+    }
 
     #[test]
     fn cloning_blob_values_shares_the_payload() {

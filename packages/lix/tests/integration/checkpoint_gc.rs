@@ -11,10 +11,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -82,7 +79,7 @@ simulation_test!(
             .expect("current state should remain readable after collection");
         assert_eq!(
             state.rows()[0].values(),
-            &[Value::Json(json!("interval-two"))]
+            &[Value::Jsonb(json!("interval-two").into())]
         );
         assert_eq!(
             session
@@ -100,10 +97,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -136,7 +130,7 @@ simulation_test!(
         .expect("branch should be created from the recoverable auto-commit");
         let protected = sim.wrap_session(
             engine
-                .open_session("01920000-0000-7000-8000-000000000510")
+                .open_session_at("01920000-0000-7000-8000-000000000510")
                 .await
                 .expect("protected branch session should open"),
             &engine,
@@ -175,7 +169,7 @@ simulation_test!(
             .expect("protected branch state should remain readable");
         assert_eq!(
             state.rows()[0].values(),
-            &[Value::Json(json!("protected-source"))]
+            &[Value::Jsonb(json!("protected-source").into())]
         );
 
         drop(protected);
@@ -201,10 +195,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         main.create_branch(CreateBranchOptions {
@@ -216,7 +207,7 @@ simulation_test!(
         .expect("other branch should be created");
         let other = sim.wrap_session(
             engine
-                .open_session("01920000-0000-7000-8000-000000000511")
+                .open_session_at("01920000-0000-7000-8000-000000000511")
                 .await
                 .expect("other branch session should open"),
             &engine,
@@ -304,10 +295,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -426,9 +414,9 @@ simulation_test!(
             .expect("engine should reopen after replay GC");
         let reopened = sim.wrap_session(
             reopened_engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("reopened workspace session should open"),
+                .expect("reopened session should open"),
             &reopened_engine,
         );
         assert_replay_gc_state(&reopened).await;
@@ -444,22 +432,20 @@ simulation_test!(
 
 async fn register_replay_gc_schema(session: &support::simulation_test::engine::SimSession) {
     let schema = json!({
-        "x-lix-key": REPLAY_GC_SCHEMA_KEY,
-        "x-lix-primary-key": ["/id"],
-        "x-lix-unique": [["/indexed_value"]],
-        "type": "object",
-        "required": ["id", "indexed_value", "note", "generation"],
-        "properties": {
-            "id": { "type": "string" },
-            "indexed_value": { "type": "string" },
-            "note": { "type": "string" },
-            "generation": { "type": "integer" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": REPLAY_GC_SCHEMA_KEY,
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "indexed_value", "type": "text", "nullable": false },
+            { "name": "note", "type": "text", "nullable": false },
+            { "name": "generation", "type": "int8", "nullable": false },
+        ],
+        "primary_key": ["id"],
+        "unique": [["indexed_value"]],
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -486,7 +472,7 @@ async fn advance_to_next_gc(session: &support::simulation_test::engine::SimSessi
     }
 }
 
-async fn branch_head(engine: &lix::integration::Engine, branch_id: &str) -> String {
+async fn branch_head(engine: &lix::engine::Engine, branch_id: &str) -> String {
     engine
         .load_branch_head_commit_id(branch_id)
         .await

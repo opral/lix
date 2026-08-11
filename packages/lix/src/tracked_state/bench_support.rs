@@ -1,5 +1,5 @@
 use crate::changelog::{ChangeId, CommitId};
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::json_store::{
     JsonRef, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
@@ -32,12 +32,28 @@ fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
 ) -> Result<Vec<super::storage::CommitDeltaChangeLocator>, crate::LixError> {
-    let staged = super::storage::stage_commit_deltas_for_commit_state(writes, deltas)?;
+    let (mutations, locators) = if packed_history_addressable_ids() {
+        let staged = super::storage::stage_ordered_addressable_commit_deltas(
+            writes,
+            deltas.iter().copied().map(Ok),
+            false,
+            false,
+        )?
+        .ok_or_else(|| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "addressable packed-history fixture is not strictly ordered",
+            )
+        })?;
+        (staged.mutation_inventory().clone(), Vec::new())
+    } else {
+        let staged = super::storage::stage_commit_deltas_for_commit_state(writes, deltas)?;
+        (staged.mutation_inventory().clone(), staged.locators)
+    };
     let commit_id = deltas
         .first()
         .map(|delta| delta.delta.commit_id)
         .unwrap_or_default();
-    let mutations = staged.mutation_inventory().clone();
     super::storage::stage_commit_state_manifest(
         writes,
         &CommitStateManifest {
@@ -54,14 +70,14 @@ fn stage_bench_commit_deltas(
             snapshot_root: None,
         },
     )?;
-    Ok(staged.locators)
+    Ok(locators)
 }
 
 #[derive(Clone, Debug)]
 pub struct BenchTrackedRow {
     pub schema_key: String,
     pub file_id: Option<String>,
-    pub entity_pk: String,
+    pub row_pk: String,
     pub value: Vec<u8>,
     pub updated_value: Vec<u8>,
 }
@@ -133,8 +149,8 @@ where
     assert!(scope_count > 0);
     let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(11);
     let updated_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(22);
-    let entity_pks = (0..replacement_rows)
-        .map(|index| EntityPk::single(format!("entity-{index:09}")))
+    let row_pks = (0..replacement_rows)
+        .map(|index| RowPk::single(format!("row-{index:09}")))
         .collect::<Vec<_>>();
     let alpha_scope = super::types::CommitDeltaReplacementScope {
         schema_key: "bench_current_state_alpha".to_string(),
@@ -151,14 +167,14 @@ where
     };
 
     let parent_id = bench_addressable_commit_id("scoped-range-parent");
-    let parent_rows = entity_pks
+    let parent_rows = row_pks
         .iter()
         .enumerate()
-        .map(|(index, entity_pk)| TrackedStateCommitDeltaRef {
+        .map(|(index, row_pk)| TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: "bench_current_state_alpha",
                 file_id: None,
-                entity_pk,
+                row_pk,
                 change_id: ChangeId::for_test_label(&format!("scoped-parent-{index}")),
                 commit_id: parent_id,
                 deleted: false,
@@ -195,7 +211,7 @@ where
         let commit_id = bench_addressable_commit_id(&format!("scoped-range-scope-{index}"));
         let schema_key = format!("bench_scope_{index:08}");
         let file_id = format!("file-{:05}", index % 10_000);
-        let entity_pk = EntityPk::single("entity");
+        let row_pk = RowPk::single("row");
         let scope = super::types::CommitDeltaReplacementScope {
             schema_key: schema_key.clone(),
             file_id: Some(file_id.clone()),
@@ -213,7 +229,7 @@ where
             delta: TrackedStateDeltaRef {
                 schema_key: &schema_key,
                 file_id: Some(&file_id),
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
                 change_id: ChangeId::for_test_label(&format!("scoped-scope-change-{index}")),
                 commit_id,
                 deleted: false,
@@ -251,7 +267,7 @@ where
     }
     let base_manifest = current_manifest.clone();
 
-    let beta_pk = EntityPk::single("unrelated");
+    let beta_pk = RowPk::single("unrelated");
     let mut scoped_manifest_bytes = 0u64;
     let mut replay_manifest_bytes = 0u64;
     let mut sparse_scoped_range_staged_puts = 0u64;
@@ -281,9 +297,9 @@ where
         let file_id =
             present_scope.then(|| format!("file-{:05}", (1 + index % (scope_count - 1)) % 10_000));
         let sparse_pk = if sparse_shape == BenchCurrentStateSparseShape::TouchedScopeDistinct {
-            &entity_pks[(replacement_rows / 4 + index) % replacement_rows]
+            &row_pks[(replacement_rows / 4 + index) % replacement_rows]
         } else if touches_alpha {
-            &entity_pks[replacement_rows / 4]
+            &row_pks[replacement_rows / 4]
         } else {
             &beta_pk
         };
@@ -291,7 +307,7 @@ where
             delta: TrackedStateDeltaRef {
                 schema_key: &schema_key,
                 file_id: file_id.as_deref(),
-                entity_pk: sparse_pk,
+                row_pk: sparse_pk,
                 change_id: ChangeId::for_test_label(&format!("scoped-child-change-{index}")),
                 commit_id,
                 deleted: false,
@@ -382,7 +398,7 @@ where
         super::types::TrackedStateKeyRef {
             schema_key: "bench_current_state_alpha",
             file_id: None,
-            entity_pk: &entity_pks[target_index],
+            row_pk: &row_pks[target_index],
         },
     ));
     let current_state_part_count = current_manifest
@@ -815,7 +831,7 @@ pub enum BenchPackedHistoryPayload {
 pub struct BenchPackedHistoryOptions<'a> {
     pub shape: BenchPackedHistoryShape,
     pub payload: BenchPackedHistoryPayload,
-    pub live_entities: usize,
+    pub live_rows: usize,
     pub shared_large_payload: Option<&'a str>,
 }
 
@@ -824,7 +840,7 @@ impl Default for BenchPackedHistoryOptions<'_> {
         Self {
             shape: BenchPackedHistoryShape::UniqueInserts,
             payload: BenchPackedHistoryPayload::None,
-            live_entities: 10_000,
+            live_rows: 10_000,
             shared_large_payload: None,
         }
     }
@@ -879,7 +895,7 @@ where
         storage_batch_changes >= commit_width,
         "storage batch must hold at least one logical commit"
     );
-    validate_packed_history_shape(changes, commit_width, options.shape, options.live_entities);
+    validate_packed_history_shape(changes, commit_width, options.shape, options.live_rows);
     assert_eq!(
         matches!(options.payload, BenchPackedHistoryPayload::SharedLarge),
         options.shared_large_payload.is_some(),
@@ -954,7 +970,7 @@ fn validate_packed_history_shape(
     changes: usize,
     commit_width: usize,
     shape: BenchPackedHistoryShape,
-    live_entities: usize,
+    live_rows: usize,
 ) {
     let required_generations = match shape {
         BenchPackedHistoryShape::UniqueInserts => return,
@@ -962,16 +978,16 @@ fn validate_packed_history_shape(
         BenchPackedHistoryShape::DeleteReinsert => 3,
     };
     assert!(
-        live_entities >= commit_width,
-        "repeated packed-history shapes require at least one live entity per commit row"
+        live_rows >= commit_width,
+        "repeated packed-history shapes require at least one live row per commit row"
     );
-    let required_changes = live_entities
+    let required_changes = live_rows
         .checked_mul(required_generations)
         .expect("packed-history generation size should not overflow");
     assert!(
         changes >= required_changes,
         "{shape:?} requires at least {required_generations} complete generations \
-         ({required_changes} changes for {live_entities} live entities)"
+         ({required_changes} changes for {live_rows} live rows)"
     );
 }
 
@@ -1046,7 +1062,7 @@ where
 struct PackedHistoryDelta {
     change_id: ChangeId,
     commit_id: CommitId,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: String,
     deleted: bool,
     payload: BenchPackedHistoryPayload,
@@ -1067,23 +1083,23 @@ impl PackedHistoryDelta {
             .checked_mul(commit_width)
             .and_then(|index| index.checked_add(row_index))
             .expect("packed-history change index should not overflow");
-        let entity_pk = match options.shape {
+        let row_pk = match options.shape {
             BenchPackedHistoryShape::UniqueInserts => {
-                format!("packed-history-entity-{commit_index}-{row_index}")
+                format!("packed-history-row-{commit_index:012}-{row_index:012}")
             }
             BenchPackedHistoryShape::RepeatedUpdates | BenchPackedHistoryShape::DeleteReinsert => {
                 format!(
-                    "packed-history-entity-{}",
-                    change_index % options.live_entities
+                    "packed-history-row-{:012}",
+                    change_index % options.live_rows
                 )
             }
         };
         let deleted = matches!(options.shape, BenchPackedHistoryShape::DeleteReinsert)
-            && (change_index / options.live_entities) % 2 == 1;
+            && (change_index / options.live_rows) % 2 == 1;
         Self {
             change_id: packed_history_change_id(commit_index, row_index),
-            commit_id: CommitId::new(packed_history_uuid(commit_index, 0, 0x43)),
-            entity_pk: EntityPk::single(entity_pk),
+            commit_id: packed_history_commit_id(commit_index),
+            row_pk: RowPk::single(row_pk),
             schema_key: "packed_history".to_string(),
             deleted,
             payload: options.payload,
@@ -1118,7 +1134,7 @@ impl PackedHistoryDelta {
             delta: TrackedStateDeltaRef {
                 schema_key: &self.schema_key,
                 file_id: None,
-                entity_pk: &self.entity_pk,
+                row_pk: &self.row_pk,
                 change_id: self.change_id,
                 commit_id: self.commit_id,
                 deleted: self.deleted,
@@ -1135,7 +1151,28 @@ impl PackedHistoryDelta {
 }
 
 fn packed_history_change_id(commit_index: usize, row_index: usize) -> ChangeId {
+    if packed_history_addressable_ids() {
+        return super::storage::change_id_from_packed_address(
+            packed_history_commit_id(commit_index),
+            u32::try_from(row_index)
+                .expect("packed-history row index fits u32")
+                .checked_add(1)
+                .expect("packed-history packed address fits u32"),
+        );
+    }
     ChangeId::new(packed_history_uuid(commit_index, row_index, 0x68))
+}
+
+fn packed_history_commit_id(commit_index: usize) -> CommitId {
+    let mut bytes = *packed_history_uuid(commit_index, 0, 0x43).as_bytes();
+    if packed_history_addressable_ids() {
+        bytes[12..].copy_from_slice(&0_u32.to_be_bytes());
+    }
+    CommitId::new(uuid::Uuid::from_bytes(bytes))
+}
+
+fn packed_history_addressable_ids() -> bool {
+    std::env::var("LIX_PACKED_HISTORY_ID_SHAPE").is_ok_and(|shape| shape == "addressable")
 }
 
 fn packed_history_uuid(commit_index: usize, ordinal: usize, discriminator: u8) -> uuid::Uuid {
@@ -1184,14 +1221,14 @@ mod packed_history_tests {
         BenchPackedHistoryOptions {
             shape,
             payload,
-            live_entities: 10,
+            live_rows: 10,
             shared_large_payload: matches!(payload, BenchPackedHistoryPayload::SharedLarge)
                 .then_some(r#"{"payload":"large"}"#),
         }
     }
 
     #[test]
-    fn repeated_updates_reuse_entity_identity() {
+    fn repeated_updates_reuse_row_identity() {
         let first = PackedHistoryDelta::new(
             0,
             0,
@@ -1213,7 +1250,7 @@ mod packed_history_tests {
             None,
         );
 
-        assert_eq!(first.entity_pk, second.entity_pk);
+        assert_eq!(first.row_pk, second.row_pk);
         assert!(!first.deleted);
         assert!(!second.deleted);
     }
@@ -1228,8 +1265,8 @@ mod packed_history_tests {
         let delete = PackedHistoryDelta::new(1, 0, 10, options, None);
         let reinsert = PackedHistoryDelta::new(2, 0, 10, options, None);
 
-        assert_eq!(insert.entity_pk, delete.entity_pk);
-        assert_eq!(delete.entity_pk, reinsert.entity_pk);
+        assert_eq!(insert.row_pk, delete.row_pk);
+        assert_eq!(delete.row_pk, reinsert.row_pk);
         assert!(!insert.deleted);
         assert!(delete.deleted);
         assert!(!reinsert.deleted);
@@ -1528,7 +1565,7 @@ where
 struct OwnedDelta {
     change_id: ChangeId,
     commit_id: CommitId,
-    entity_pk: EntityPk,
+    row_pk: RowPk,
     schema_key: String,
     file_id: Option<String>,
     deleted: bool,
@@ -1548,7 +1585,7 @@ impl OwnedDelta {
         Self {
             change_id: ChangeId::for_test_label(&change_id),
             commit_id: CommitId::for_test_label(commit_id),
-            entity_pk: EntityPk::single(row.entity_pk),
+            row_pk: RowPk::single(row.row_pk),
             schema_key: row.schema_key,
             file_id: row.file_id,
             deleted,
@@ -1567,7 +1604,7 @@ impl OwnedDelta {
         TrackedStateDeltaRef {
             schema_key: &self.schema_key,
             file_id: self.file_id.as_deref(),
-            entity_pk: &self.entity_pk,
+            row_pk: &self.row_pk,
             change_id: self.change_id,
             commit_id: self.commit_id,
             deleted: self.deleted,
@@ -1580,7 +1617,7 @@ impl OwnedDelta {
 fn row_key(row: &BenchTrackedRow) -> TrackedStateKey {
     TrackedStateKey {
         schema_key: row.schema_key.clone(),
-        entity_pk: EntityPk::single(row.entity_pk.clone()),
+        row_pk: RowPk::single(row.row_pk.clone()),
         file_id: row.file_id.clone(),
     }
 }

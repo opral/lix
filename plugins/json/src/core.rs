@@ -66,17 +66,17 @@ pub enum ChangeEffect {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntityChange {
+pub struct RowChange {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Option<Vec<u8>>,
     pub effect: ChangeEffect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntityRecord {
+pub struct RowRecord {
     pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub snapshot: Vec<u8>,
 }
 
@@ -87,28 +87,24 @@ pub struct ByteEdit {
     pub insert: Arc<Vec<u8>>,
 }
 
-impl EntityChange {
-    fn upsert(identity: &EntityIdentity, snapshot: Vec<u8>) -> Self {
+impl RowChange {
+    fn upsert(identity: &RowIdentity, snapshot: Vec<u8>) -> Self {
         Self::upsert_with_effect(identity, snapshot, ChangeEffect::Content)
     }
 
-    fn upsert_with_effect(
-        identity: &EntityIdentity,
-        snapshot: Vec<u8>,
-        effect: ChangeEffect,
-    ) -> Self {
+    fn upsert_with_effect(identity: &RowIdentity, snapshot: Vec<u8>, effect: ChangeEffect) -> Self {
         Self {
             schema_key: identity.schema_key().to_owned(),
-            entity_pk: identity.entity_pk(),
+            row_pk: identity.row_pk(),
             snapshot: Some(snapshot),
             effect,
         }
     }
 
-    fn delete(identity: &EntityIdentity) -> Self {
+    fn delete(identity: &RowIdentity) -> Self {
         Self {
             schema_key: identity.schema_key().to_owned(),
-            entity_pk: identity.entity_pk(),
+            row_pk: identity.row_pk(),
             snapshot: None,
             effect: ChangeEffect::Content,
         }
@@ -352,7 +348,7 @@ impl NodeKind {
             "number" => Ok(Self::Number),
             "boolean" => Ok(Self::Boolean),
             "null" => Ok(Self::Null),
-            _ => Err(format!("unsupported JSON entity kind {raw:?}")),
+            _ => Err(format!("unsupported JSON row kind {raw:?}")),
         }
     }
 
@@ -551,26 +547,26 @@ impl Node {
         }
     }
 
-    fn identity(&self) -> EntityIdentity {
+    fn identity(&self) -> RowIdentity {
         match &self.relation {
-            NodeRelation::Snapshot => EntityIdentity::Snapshot,
-            NodeRelation::Object { parent_id, key, .. } => EntityIdentity::Object {
+            NodeRelation::Snapshot => RowIdentity::Snapshot,
+            NodeRelation::Object { parent_id, key, .. } => RowIdentity::Object {
                 parent_id: Arc::clone(parent_id),
                 key: Arc::clone(key),
             },
-            NodeRelation::Array { id, .. } => EntityIdentity::Array(Arc::clone(id)),
+            NodeRelation::Array { id, .. } => RowIdentity::Array(Arc::clone(id)),
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum EntityIdentity {
+enum RowIdentity {
     Snapshot,
     Object { parent_id: Arc<str>, key: Arc<str> },
     Array(Arc<str>),
 }
 
-impl EntityIdentity {
+impl RowIdentity {
     const fn schema_key(&self) -> &'static str {
         match self {
             Self::Snapshot => ROOT_SCHEMA_KEY,
@@ -579,7 +575,7 @@ impl EntityIdentity {
         }
     }
 
-    fn entity_pk(&self) -> Vec<String> {
+    fn row_pk(&self) -> Vec<String> {
         match self {
             Self::Snapshot => vec![ROOT_ID.to_owned()],
             Self::Object { parent_id, key } => {
@@ -589,8 +585,8 @@ impl EntityIdentity {
         }
     }
 
-    fn from_parts(schema_key: &str, entity_pk: &[String]) -> Result<Self, String> {
-        match (schema_key, entity_pk) {
+    fn from_parts(schema_key: &str, row_pk: &[String]) -> Result<Self, String> {
+        match (schema_key, row_pk) {
             (ROOT_SCHEMA_KEY, [id]) if id == ROOT_ID => Ok(Self::Snapshot),
             (ROOT_SCHEMA_KEY, _) => Err("json_root requires the single key \"root\"".to_owned()),
             (OBJECT_MEMBER_SCHEMA_KEY, [parent_id, key]) => Ok(Self::Object {
@@ -604,7 +600,7 @@ impl EntityIdentity {
             (ARRAY_ITEM_SCHEMA_KEY, _) => {
                 Err("json_array_item requires one ID component".to_owned())
             }
-            (other, _) => Err(format!("unsupported JSON entity schema {other:?}")),
+            (other, _) => Err(format!("unsupported JSON row schema {other:?}")),
         }
     }
 }
@@ -618,25 +614,25 @@ fn intern_string(strings: &mut HashSet<Arc<str>>, value: &str) -> Arc<str> {
     value
 }
 
-fn intern_identity(identity: EntityIdentity, strings: &mut HashSet<Arc<str>>) -> EntityIdentity {
+fn intern_identity(identity: RowIdentity, strings: &mut HashSet<Arc<str>>) -> RowIdentity {
     match identity {
-        EntityIdentity::Snapshot => EntityIdentity::Snapshot,
-        EntityIdentity::Object { parent_id, key } => EntityIdentity::Object {
+        RowIdentity::Snapshot => RowIdentity::Snapshot,
+        RowIdentity::Object { parent_id, key } => RowIdentity::Object {
             parent_id: intern_string(strings, parent_id.as_ref()),
             key: intern_string(strings, key.as_ref()),
         },
-        EntityIdentity::Array(id) => EntityIdentity::Array(intern_string(strings, id.as_ref())),
+        RowIdentity::Array(id) => RowIdentity::Array(intern_string(strings, id.as_ref())),
     }
 }
 
-fn identity_fingerprint(identity: &EntityIdentity) -> [u8; 16] {
+fn identity_fingerprint(identity: &RowIdentity) -> [u8; 16] {
     match identity {
-        EntityIdentity::Snapshot => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
-        EntityIdentity::Object { parent_id, key } => fingerprint_components(
+        RowIdentity::Snapshot => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
+        RowIdentity::Object { parent_id, key } => fingerprint_components(
             OBJECT_MEMBER_SCHEMA_KEY,
             &[parent_id.as_ref(), key.as_ref()],
         ),
-        EntityIdentity::Array(id) => fingerprint_components(ARRAY_ITEM_SCHEMA_KEY, &[id.as_ref()]),
+        RowIdentity::Array(id) => fingerprint_components(ARRAY_ITEM_SCHEMA_KEY, &[id.as_ref()]),
     }
 }
 
@@ -655,7 +651,7 @@ fn identity_fingerprint_node(node: &Node) -> [u8; 16] {
 
 fn fingerprint_components(schema_key: &str, components: &[&str]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lix-json-entity-lookup\0");
+    hasher.update(b"lix-json-row-lookup\0");
     hasher.update(
         &u64::try_from(schema_key.len())
             .expect("usize fits u64")
@@ -1086,7 +1082,7 @@ pub struct ArenaJsonScalar {
     pub start: u32,
     pub length: u32,
     pub relation: ArenaJsonRelation,
-    pub entity_pk: Vec<String>,
+    pub row_pk: Vec<String>,
     pub parent_id: Option<String>,
     pub order_key: Option<String>,
     pub prefix_json: Option<String>,
@@ -1168,12 +1164,12 @@ impl Document {
                 if lookup
                     .insert(
                         fingerprint,
-                        u32::try_from(ordinal).map_err(|_| "JSON has too many entities")?,
+                        u32::try_from(ordinal).map_err(|_| "JSON has too many rows")?,
                     )
                     .is_some()
                 {
                     return Err(format!(
-                        "duplicate or colliding JSON entity identity {:?}",
+                        "duplicate or colliding JSON row identity {:?}",
                         node.identity()
                     ));
                 }
@@ -1254,7 +1250,7 @@ impl Document {
                     .spans
                     .span(ordinal)
                     .ok_or_else(|| "JSON scalar span is missing".to_owned())?;
-                let (relation, entity_pk, parent_id, order_key) = match &node.relation {
+                let (relation, row_pk, parent_id, order_key) = match &node.relation {
                     NodeRelation::Snapshot => (
                         ArenaJsonRelation::Snapshot,
                         vec![ROOT_ID.to_owned()],
@@ -1287,7 +1283,7 @@ impl Document {
                     start,
                     length,
                     relation,
-                    entity_pk,
+                    row_pk,
                     parent_id,
                     order_key,
                     prefix_json: node
@@ -1315,7 +1311,7 @@ impl Document {
     pub fn scalar_change_from_arena(
         metadata: ArenaJsonScalar,
         scalar: &[u8],
-    ) -> Result<Option<EntityChange>, String> {
+    ) -> Result<Option<RowChange>, String> {
         let kind = match parse_complete_scalar(scalar) {
             Ok(kind) => kind,
             // The indexed scalar span may now contain adjacent structural
@@ -1327,7 +1323,7 @@ impl Document {
             .map_err(|error| format!("JSON scalar must be UTF-8: {error}"))?;
         let ArenaJsonScalar {
             relation,
-            entity_pk,
+            row_pk,
             parent_id,
             order_key,
             prefix_json,
@@ -1336,7 +1332,7 @@ impl Document {
             ..
         } = metadata;
         let mut object = Map::new();
-        let schema_key = match (relation, entity_pk.as_slice()) {
+        let schema_key = match (relation, row_pk.as_slice()) {
             (ArenaJsonRelation::Snapshot, [id]) if id == ROOT_ID => {
                 object.insert("id".to_owned(), Value::String(id.clone()));
                 ROOT_SCHEMA_KEY
@@ -1382,9 +1378,9 @@ impl Document {
         if let Some(value) = empty_json {
             object.insert("empty_json".to_owned(), Value::String(value));
         }
-        Ok(Some(EntityChange {
+        Ok(Some(RowChange {
             schema_key: schema_key.to_owned(),
-            entity_pk,
+            row_pk,
             snapshot: Some(
                 serde_json::to_vec(&Value::Object(object))
                     .map_err(|error| format!("serialize JSON arena scalar: {error}"))?,
@@ -1397,7 +1393,7 @@ impl Document {
         &self,
         splices: &[FileEdit<'_>],
         namespace: IdNamespace,
-    ) -> Result<(Self, Vec<EntityChange>), String> {
+    ) -> Result<(Self, Vec<RowChange>), String> {
         validate_splices(self.0.blob.len(), splices)?;
         if splices.is_empty() {
             return Ok((self.clone(), Vec::new()));
@@ -1444,7 +1440,7 @@ impl Document {
         after_blob: PersistentBlob,
         splices: &[FileEdit<'_>],
         node_index: usize,
-    ) -> Result<Option<(Self, Vec<EntityChange>)>, String> {
+    ) -> Result<Option<(Self, Vec<RowChange>)>, String> {
         let (value_start, old_len) = self
             .0
             .spans
@@ -1502,7 +1498,7 @@ impl Document {
         let changes = if before_snapshot == after_snapshot {
             Vec::new()
         } else {
-            vec![EntityChange::upsert(&identity, after_snapshot)]
+            vec![RowChange::upsert(&identity, after_snapshot)]
         };
         Ok(Some((after, changes)))
     }
@@ -1511,13 +1507,13 @@ impl Document {
         &self,
         after: Self,
         _before_bytes: &[u8],
-    ) -> Result<(Self, Vec<EntityChange>), String> {
-        let before = self.entity_snapshots()?;
-        let after_snapshots = after.entity_snapshots()?;
+    ) -> Result<(Self, Vec<RowChange>), String> {
+        let before = self.row_snapshots()?;
+        let after_snapshots = after.row_snapshots()?;
         let mut changes = Vec::new();
         for identity in before.keys() {
             if !after_snapshots.contains_key(identity) {
-                changes.push(EntityChange::delete(identity));
+                changes.push(RowChange::delete(identity));
             }
         }
         for (identity, snapshot) in after_snapshots {
@@ -1530,11 +1526,9 @@ impl Document {
                 } else {
                     ChangeEffect::Content
                 };
-                changes.push(EntityChange::upsert_with_effect(
-                    &identity, snapshot, effect,
-                ));
+                changes.push(RowChange::upsert_with_effect(&identity, snapshot, effect));
             } else {
-                changes.push(EntityChange::upsert(&identity, snapshot));
+                changes.push(RowChange::upsert(&identity, snapshot));
             }
         }
         Ok((after, changes))
@@ -1574,16 +1568,13 @@ impl Document {
         Ok(Some(candidate))
     }
 
-    pub fn entities_changed(
-        &self,
-        changes: &[EntityChange],
-    ) -> Result<(Self, Vec<ByteEdit>), String> {
+    pub fn rows_changed(&self, changes: &[RowChange]) -> Result<(Self, Vec<ByteEdit>), String> {
         if changes.is_empty() {
             return Ok((self.clone(), Vec::new()));
         }
         let mut edits = Vec::with_capacity(changes.len());
         for change in changes {
-            if let Some(edit) = self.scalar_entity_edit(change)? {
+            if let Some(edit) = self.scalar_row_edit(change)? {
                 edits.push(edit);
             }
         }
@@ -1611,15 +1602,15 @@ impl Document {
         Ok((after, edits))
     }
 
-    fn scalar_entity_edit(&self, change: &EntityChange) -> Result<Option<ByteEdit>, String> {
-        let identity = EntityIdentity::from_parts(&change.schema_key, &change.entity_pk)?;
+    fn scalar_row_edit(&self, change: &RowChange) -> Result<Option<ByteEdit>, String> {
+        let identity = RowIdentity::from_parts(&change.schema_key, &change.row_pk)?;
         let Some(&node_index) = self.0.lookup.get(&identity_fingerprint(&identity)) else {
             return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         };
         let node_index = usize::try_from(node_index).expect("u32 fits usize");
         let node = &self.0.nodes[node_index];
         if node.identity() != identity {
-            return Err("JSON entity identity fingerprint collision".to_owned());
+            return Err("JSON row identity fingerprint collision".to_owned());
         }
         if node.kind.is_container() {
             return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
@@ -1628,34 +1619,34 @@ impl Document {
             return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         };
         let mut strings = HashSet::new();
-        let entity = SemanticEntity::parse(
-            EntityRecord {
+        let row = SemanticRow::parse(
+            RowRecord {
                 schema_key: change.schema_key.clone(),
-                entity_pk: change.entity_pk.clone(),
+                row_pk: change.row_pk.clone(),
                 snapshot: snapshot.clone(),
             },
             &mut strings,
         )?;
-        if entity.identity() != identity || entity.kind().is_container() {
+        if row.identity() != identity || row.kind().is_container() {
             return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         }
-        let current = SemanticEntity::parse(
-            EntityRecord {
+        let current = SemanticRow::parse(
+            RowRecord {
                 schema_key: change.schema_key.clone(),
-                entity_pk: change.entity_pk.clone(),
+                row_pk: change.row_pk.clone(),
                 snapshot: self.node_snapshot(node_index)?,
             },
             &mut strings,
         )?;
-        if !entity.same_location(&current) {
+        if !row.same_location(&current) {
             return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         }
-        let scalar = entity
+        let scalar = row
             .scalar_json()
-            .ok_or_else(|| "scalar JSON entity is missing scalar_json".to_owned())?;
+            .ok_or_else(|| "scalar JSON row is missing scalar_json".to_owned())?;
         let scalar_kind = parse_complete_scalar(scalar.as_bytes())?;
-        if scalar_kind != entity.kind() {
-            return Err("scalar_json does not match the entity kind".to_owned());
+        if scalar_kind != row.kind() {
+            return Err("scalar_json does not match the row kind".to_owned());
         }
         let (value_start, value_len) = self
             .0
@@ -1678,24 +1669,24 @@ impl Document {
         }))
     }
 
-    pub fn open_entities(entities: Vec<EntityRecord>) -> Result<(Self, ByteEdit), String> {
-        let mut builder = EntityImportBuilder::new();
-        for entity in entities {
-            builder.push(entity)?;
+    pub fn open_rows(rows: Vec<RowRecord>) -> Result<(Self, ByteEdit), String> {
+        let mut builder = RowImportBuilder::new();
+        for row in rows {
+            builder.push(row)?;
         }
         builder.finish()
     }
 
-    pub fn entity_records(&self) -> Result<Vec<EntityRecord>, String> {
+    pub fn row_records(&self) -> Result<Vec<RowRecord>, String> {
         self.initial_changes()
             .map(|change| {
                 let change = change?;
-                Ok(EntityRecord {
+                Ok(RowRecord {
                     schema_key: change.schema_key,
-                    entity_pk: change.entity_pk,
+                    row_pk: change.row_pk,
                     snapshot: change
                         .snapshot
-                        .ok_or_else(|| "initial JSON entity has no snapshot".to_owned())?,
+                        .ok_or_else(|| "initial JSON row has no snapshot".to_owned())?,
                 })
             })
             .collect()
@@ -1710,7 +1701,7 @@ impl Document {
         snapshot_node(&self.0.blob, &self.0.nodes[index], value_start, value_len)
     }
 
-    fn entity_snapshots(&self) -> Result<HashMap<EntityIdentity, Vec<u8>>, String> {
+    fn row_snapshots(&self) -> Result<HashMap<RowIdentity, Vec<u8>>, String> {
         self.0
             .nodes
             .iter()
@@ -1727,38 +1718,37 @@ pub struct InitialChanges {
 }
 
 impl Iterator for InitialChanges {
-    type Item = Result<EntityChange, String>;
+    type Item = Result<RowChange, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.document.0.nodes.get(self.node)?;
         let identity = node.identity();
         let snapshot = self.document.node_snapshot(self.node);
         self.node += 1;
-        Some(snapshot.map(|snapshot| EntityChange::upsert(&identity, snapshot)))
+        Some(snapshot.map(|snapshot| RowChange::upsert(&identity, snapshot)))
     }
 }
 
 #[derive(Debug, Default)]
-pub struct EntityImportBuilder {
-    entities: Vec<SemanticEntity>,
+pub struct RowImportBuilder {
+    rows: Vec<SemanticRow>,
     strings: HashSet<Arc<str>>,
 }
 
-impl EntityImportBuilder {
+impl RowImportBuilder {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn push(&mut self, entity: EntityRecord) -> Result<(), String> {
-        self.entities
-            .push(SemanticEntity::parse(entity, &mut self.strings)?);
+    pub fn push(&mut self, row: RowRecord) -> Result<(), String> {
+        self.rows.push(SemanticRow::parse(row, &mut self.strings)?);
         Ok(())
     }
 
     pub fn finish(self) -> Result<(Document, ByteEdit), String> {
-        let Self { entities, strings } = self;
+        let Self { rows, strings } = self;
         drop(strings);
-        let model = SemanticModel::new(entities)?;
+        let model = SemanticModel::new(rows)?;
         let (rendered, nodes) = model.render_document()?;
         let rendered = Arc::new(rendered);
         let document = Document::from_parts(
@@ -1778,7 +1768,7 @@ impl EntityImportBuilder {
 }
 
 #[derive(Clone, Debug)]
-enum SemanticEntity {
+enum SemanticRow {
     Snapshot {
         kind: NodeKind,
         scalar_json: Option<String>,
@@ -1803,24 +1793,24 @@ enum SemanticEntity {
     },
 }
 
-impl SemanticEntity {
-    fn parse(record: EntityRecord, strings: &mut HashSet<Arc<str>>) -> Result<Self, String> {
+impl SemanticRow {
+    fn parse(record: RowRecord, strings: &mut HashSet<Arc<str>>) -> Result<Self, String> {
         let identity = intern_identity(
-            EntityIdentity::from_parts(&record.schema_key, &record.entity_pk)?,
+            RowIdentity::from_parts(&record.schema_key, &record.row_pk)?,
             strings,
         );
         let value: Value = serde_json::from_slice(&record.snapshot)
-            .map_err(|error| format!("invalid JSON entity snapshot: {error}"))?;
+            .map_err(|error| format!("invalid JSON row snapshot: {error}"))?;
         reject_numbers(&value)?;
         let object = value
             .as_object()
-            .ok_or_else(|| "JSON entity snapshot must be an object".to_owned())?;
+            .ok_or_else(|| "JSON row snapshot must be an object".to_owned())?;
         let kind = required_string(object, "kind").and_then(NodeKind::parse)?;
         let scalar_json = optional_string(object, "scalar_json")?;
         validate_scalar_fields(kind, scalar_json.as_deref())?;
-        let layout = parse_entity_layout(object, &identity, kind, strings)?;
+        let layout = parse_row_layout(object, &identity, kind, strings)?;
         match identity {
-            EntityIdentity::Snapshot => {
+            RowIdentity::Snapshot => {
                 require_fields(
                     object,
                     &["id", "kind"],
@@ -1835,7 +1825,7 @@ impl SemanticEntity {
                     layout,
                 })
             }
-            EntityIdentity::Object { parent_id, key } => {
+            RowIdentity::Object { parent_id, key } => {
                 require_fields(
                     object,
                     &["parent_id", "key", "order_key", "kind"],
@@ -1879,7 +1869,7 @@ impl SemanticEntity {
                     layout,
                 })
             }
-            EntityIdentity::Array(id) => {
+            RowIdentity::Array(id) => {
                 require_fields(
                     object,
                     &["id", "parent_id", "order_key", "kind"],
@@ -1902,14 +1892,14 @@ impl SemanticEntity {
         }
     }
 
-    fn identity(&self) -> EntityIdentity {
+    fn identity(&self) -> RowIdentity {
         match self {
-            Self::Snapshot { .. } => EntityIdentity::Snapshot,
-            Self::Object { parent_id, key, .. } => EntityIdentity::Object {
+            Self::Snapshot { .. } => RowIdentity::Snapshot,
+            Self::Object { parent_id, key, .. } => RowIdentity::Object {
                 parent_id: Arc::clone(parent_id),
                 key: Arc::clone(key),
             },
-            Self::Array { id, .. } => EntityIdentity::Array(Arc::clone(id)),
+            Self::Array { id, .. } => RowIdentity::Array(Arc::clone(id)),
         }
     }
 
@@ -2071,28 +2061,28 @@ impl SemanticEntity {
 }
 
 struct SemanticModel {
-    entities: HashMap<EntityIdentity, SemanticEntity>,
-    children: HashMap<Arc<str>, Vec<EntityIdentity>>,
+    rows: HashMap<RowIdentity, SemanticRow>,
+    children: HashMap<Arc<str>, Vec<RowIdentity>>,
 }
 
 impl SemanticModel {
-    fn new(entities: Vec<SemanticEntity>) -> Result<Self, String> {
-        let mut by_identity = HashMap::with_capacity(entities.len());
-        let mut children: HashMap<Arc<str>, Vec<EntityIdentity>> = HashMap::new();
-        for entity in entities {
-            let identity = entity.identity();
-            if let Some(parent_id) = entity.parent_id_arc() {
+    fn new(rows: Vec<SemanticRow>) -> Result<Self, String> {
+        let mut by_identity = HashMap::with_capacity(rows.len());
+        let mut children: HashMap<Arc<str>, Vec<RowIdentity>> = HashMap::new();
+        for row in rows {
+            let identity = row.identity();
+            if let Some(parent_id) = row.parent_id_arc() {
                 children
                     .entry(parent_id)
                     .or_default()
                     .push(identity.clone());
             }
-            if by_identity.insert(identity.clone(), entity).is_some() {
-                return Err(format!("duplicate JSON entity {identity:?}"));
+            if by_identity.insert(identity.clone(), row).is_some() {
+                return Err(format!("duplicate JSON row {identity:?}"));
             }
         }
-        if !by_identity.contains_key(&EntityIdentity::Snapshot) {
-            return Err("JSON entity graph requires one root".to_owned());
+        if !by_identity.contains_key(&RowIdentity::Snapshot) {
+            return Err("JSON row graph requires one root".to_owned());
         }
         for identities in children.values_mut() {
             identities.sort_unstable_by(|left, right| {
@@ -2103,18 +2093,18 @@ impl SemanticModel {
             });
         }
         Ok(Self {
-            entities: by_identity,
+            rows: by_identity,
             children,
         })
     }
 
     fn render_document(&self) -> Result<(Vec<u8>, Vec<Node>), String> {
         let mut output = Vec::new();
-        let mut nodes = Vec::with_capacity(self.entities.len());
+        let mut nodes = Vec::with_capacity(self.rows.len());
         let mut visiting = HashSet::new();
         let mut visited = HashSet::new();
-        self.render_entity(
-            &EntityIdentity::Snapshot,
+        self.render_row(
+            &RowIdentity::Snapshot,
             None,
             &mut output,
             &mut nodes,
@@ -2122,40 +2112,40 @@ impl SemanticModel {
             &mut visited,
             0,
         )?;
-        if visited.len() != self.entities.len() {
-            return Err("JSON entity graph contains unreachable entities".to_owned());
+        if visited.len() != self.rows.len() {
+            return Err("JSON row graph contains unreachable rows".to_owned());
         }
         Ok((output, nodes))
     }
 
-    fn render_entity(
+    fn render_row(
         &self,
-        identity: &EntityIdentity,
+        identity: &RowIdentity,
         parent: Option<u32>,
         output: &mut Vec<u8>,
         nodes: &mut Vec<Node>,
-        visiting: &mut HashSet<EntityIdentity>,
-        visited: &mut HashSet<EntityIdentity>,
+        visiting: &mut HashSet<RowIdentity>,
+        visited: &mut HashSet<RowIdentity>,
         depth: usize,
     ) -> Result<u32, String> {
         if depth > 1024 {
-            return Err("JSON entity graph nesting exceeds 1024 levels".to_owned());
+            return Err("JSON row graph nesting exceeds 1024 levels".to_owned());
         }
         if !visiting.insert(identity.clone()) {
-            return Err("JSON entity graph contains an owning cycle".to_owned());
+            return Err("JSON row graph contains an owning cycle".to_owned());
         }
-        let entity = self
-            .entities
+        let row = self
+            .rows
             .get(identity)
-            .ok_or_else(|| format!("missing JSON entity {identity:?}"))?;
-        entity.write_prefix(output)?;
+            .ok_or_else(|| format!("missing JSON row {identity:?}"))?;
+        row.write_prefix(output)?;
         let start = u32::try_from(output.len()).map_err(|_| "JSON output offset exceeds 4GiB")?;
         let node_index =
             u32::try_from(nodes.len()).map_err(|_| "JSON has too many semantic nodes")?;
         nodes.push(Node {
-            relation: entity.node_relation(),
-            kind: entity.kind(),
-            layout: entity.layout().cloned(),
+            relation: row.node_relation(),
+            kind: row.kind(),
+            layout: row.layout().cloned(),
             parent,
             first_child: None,
             next_sibling: None,
@@ -2163,28 +2153,28 @@ impl SemanticModel {
             value_len: 0,
         });
         let mut rendered_children = Vec::new();
-        match entity.kind() {
+        match row.kind() {
             NodeKind::Object => {
                 output.push(b'{');
-                let container_id = entity
+                let container_id = row
                     .container_id()
                     .ok_or_else(|| "JSON object has no container identity".to_owned())?;
                 let children = self
                     .children
                     .get(container_id)
                     .map_or(&[][..], Vec::as_slice);
-                entity.write_empty_layout(output, !children.is_empty())?;
+                row.write_empty_layout(output, !children.is_empty())?;
                 for (position, child_identity) in children.iter().enumerate() {
                     if !matches!(
-                        self.entities.get(child_identity),
-                        Some(SemanticEntity::Object { .. })
+                        self.rows.get(child_identity),
+                        Some(SemanticRow::Object { .. })
                     ) {
-                        return Err("JSON object contains a non-object-member entity".to_owned());
+                        return Err("JSON object contains a non-object-member row".to_owned());
                     }
                     if position > 0 {
                         output.push(b',');
                     }
-                    rendered_children.push(self.render_entity(
+                    rendered_children.push(self.render_row(
                         child_identity,
                         Some(node_index),
                         output,
@@ -2198,22 +2188,22 @@ impl SemanticModel {
             }
             NodeKind::Array => {
                 output.push(b'[');
-                let container_id = entity
+                let container_id = row
                     .container_id()
                     .ok_or_else(|| "JSON array has no container identity".to_owned())?;
                 let children = self
                     .children
                     .get(container_id)
                     .map_or(&[][..], Vec::as_slice);
-                entity.write_empty_layout(output, !children.is_empty())?;
+                row.write_empty_layout(output, !children.is_empty())?;
                 for (position, child_identity) in children.iter().enumerate() {
-                    if !matches!(self.entities[child_identity], SemanticEntity::Array { .. }) {
-                        return Err("JSON array contains a non-array-item entity".to_owned());
+                    if !matches!(self.rows[child_identity], SemanticRow::Array { .. }) {
+                        return Err("JSON array contains a non-array-item row".to_owned());
                     }
                     if position > 0 {
                         output.push(b',');
                     }
-                    rendered_children.push(self.render_entity(
+                    rendered_children.push(self.render_row(
                         child_identity,
                         Some(node_index),
                         output,
@@ -2226,8 +2216,7 @@ impl SemanticModel {
                 output.push(b']');
             }
             _ => output.extend_from_slice(
-                entity
-                    .scalar_json()
+                row.scalar_json()
                     .ok_or_else(|| "JSON scalar has no scalar_json".to_owned())?
                     .as_bytes(),
             ),
@@ -2243,10 +2232,10 @@ impl SemanticModel {
                 .map_err(|_| "JSON output size exceeds 4GiB")?
                 .checked_sub(start)
                 .ok_or_else(|| "JSON output span underflow".to_owned())?;
-        entity.write_suffix(output);
+        row.write_suffix(output);
         visiting.remove(identity);
         if !visited.insert(identity.clone()) {
-            return Err("JSON entity graph has multiple owning parents".to_owned());
+            return Err("JSON row graph has multiple owning parents".to_owned());
         }
         Ok(node_index)
     }
@@ -2349,7 +2338,7 @@ fn push_snapshot_string_field(
     }
     output.extend_from_slice(encoded_key);
     serde_json::to_writer(output, value)
-        .map_err(|error| format!("failed to serialize JSON entity snapshot: {error}"))
+        .map_err(|error| format!("failed to serialize JSON row snapshot: {error}"))
 }
 
 fn push_layout_empty_field(
@@ -2388,10 +2377,10 @@ fn push_layout_suffix_field(
 fn snapshots_equal_without_layout(before: &[u8], after: &[u8]) -> Result<bool, String> {
     fn semantic_snapshot(bytes: &[u8]) -> Result<Value, String> {
         let mut value: Value = serde_json::from_slice(bytes)
-            .map_err(|error| format!("invalid generated JSON entity snapshot: {error}"))?;
+            .map_err(|error| format!("invalid generated JSON row snapshot: {error}"))?;
         let object = value
             .as_object_mut()
-            .ok_or_else(|| "generated JSON entity snapshot is not an object".to_owned())?;
+            .ok_or_else(|| "generated JSON row snapshot is not an object".to_owned())?;
         object.remove("prefix_json");
         object.remove("suffix_json");
         object.remove("empty_json");
@@ -3085,14 +3074,14 @@ fn parse_complete_scalar(bytes: &[u8]) -> Result<NodeKind, String> {
 fn validate_scalar_fields(kind: NodeKind, scalar_json: Option<&str>) -> Result<(), String> {
     if kind.is_container() {
         if scalar_json.is_some() {
-            return Err("JSON container entity cannot carry scalar_json".to_owned());
+            return Err("JSON container row cannot carry scalar_json".to_owned());
         }
         return Ok(());
     }
     let scalar_json =
-        scalar_json.ok_or_else(|| "JSON scalar entity requires scalar_json".to_owned())?;
+        scalar_json.ok_or_else(|| "JSON scalar row requires scalar_json".to_owned())?;
     if parse_complete_scalar(scalar_json.as_bytes())? != kind {
-        return Err("scalar_json kind does not match entity kind".to_owned());
+        return Err("scalar_json kind does not match row kind".to_owned());
     }
     Ok(())
 }
@@ -3104,7 +3093,7 @@ fn require_fields(
 ) -> Result<(), String> {
     for field in required {
         if !object.contains_key(*field) {
-            return Err(format!("JSON entity snapshot is missing {field:?}"));
+            return Err(format!("JSON row snapshot is missing {field:?}"));
         }
     }
     if let Some(field) = object
@@ -3112,7 +3101,7 @@ fn require_fields(
         .find(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
     {
         return Err(format!(
-            "JSON entity snapshot contains unsupported field {field:?}"
+            "JSON row snapshot contains unsupported field {field:?}"
         ));
     }
     Ok(())
@@ -3122,7 +3111,7 @@ fn required_string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'
     object
         .get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("JSON entity field {field:?} must be a string"))
+        .ok_or_else(|| format!("JSON row field {field:?} must be a string"))
 }
 
 fn optional_string(object: &Map<String, Value>, field: &str) -> Result<Option<String>, String> {
@@ -3132,14 +3121,14 @@ fn optional_string(object: &Map<String, Value>, field: &str) -> Result<Option<St
             value
                 .as_str()
                 .map(ToOwned::to_owned)
-                .ok_or_else(|| format!("JSON entity field {field:?} must be a string"))
+                .ok_or_else(|| format!("JSON row field {field:?} must be a string"))
         })
         .transpose()
 }
 
-fn parse_entity_layout(
+fn parse_row_layout(
     object: &Map<String, Value>,
-    identity: &EntityIdentity,
+    identity: &RowIdentity,
     kind: NodeKind,
     strings: &mut HashSet<Arc<str>>,
 ) -> Result<Option<Arc<NodeLayout>>, String> {
@@ -3149,8 +3138,8 @@ fn parse_entity_layout(
 
     if let Some(prefix) = prefix_json.as_deref() {
         match identity {
-            EntityIdentity::Object { key, .. } => validate_object_prefix(prefix, key)?,
-            EntityIdentity::Snapshot | EntityIdentity::Array(_) => {
+            RowIdentity::Object { key, .. } => validate_object_prefix(prefix, key)?,
+            RowIdentity::Snapshot | RowIdentity::Array(_) => {
                 if !is_json_whitespace(prefix) {
                     return Err(
                         "JSON root/array prefix_json must contain only JSON whitespace".to_owned(),
@@ -3167,7 +3156,7 @@ fn parse_entity_layout(
     }
     if let Some(empty) = empty_json.as_deref() {
         if !kind.is_container() {
-            return Err("JSON scalar entity cannot carry empty_json".to_owned());
+            return Err("JSON scalar row cannot carry empty_json".to_owned());
         }
         if !is_json_whitespace(empty) {
             return Err("JSON empty_json must contain only JSON whitespace".to_owned());
@@ -3198,7 +3187,7 @@ fn validate_object_prefix(prefix: &str, expected_key: &str) -> Result<(), String
     let key: String = serde_json::from_slice(&bytes[key_start..key_end])
         .map_err(|error| format!("invalid JSON object prefix_json key: {error}"))?;
     if key != expected_key {
-        return Err("JSON object prefix_json key does not match the entity key".to_owned());
+        return Err("JSON object prefix_json key does not match the row key".to_owned());
     }
     cursor = key_end;
     skip_json_whitespace(bytes, &mut cursor);
@@ -3241,18 +3230,18 @@ fn parse_order_key(raw: &str) -> Result<String, String> {
     Ok(raw.to_owned())
 }
 
-fn identity_tiebreak(entity: &SemanticEntity) -> &str {
-    match entity {
-        SemanticEntity::Snapshot { .. } => "",
-        SemanticEntity::Object { key, .. } => key,
-        SemanticEntity::Array { id, .. } => id,
+fn identity_tiebreak(row: &SemanticRow) -> &str {
+    match row {
+        SemanticRow::Snapshot { .. } => "",
+        SemanticRow::Object { key, .. } => key,
+        SemanticRow::Array { id, .. } => id,
     }
 }
 
 fn reject_numbers(value: &Value) -> Result<(), String> {
     match value {
         Value::Number(_) => Err(
-            "durable JSON entity snapshots must encode JSON numbers inside scalar_json strings"
+            "durable JSON row snapshots must encode JSON numbers inside scalar_json strings"
                 .to_owned(),
         ),
         Value::Array(values) => {

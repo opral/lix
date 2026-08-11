@@ -1,10 +1,24 @@
 import { expect, test } from "vitest";
 import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
-import type { LixSnapshotStorage } from "./types.js";
 
 registerMemoryStorageContract({
 	name: "browser WASM",
 	loadSdk: async () => await import("@lix-js/sdk"),
+	operationTimeoutMs: 30_000,
+	supportsPluginExecution: false,
+});
+
+registerMemoryStorageContract({
+	name: "browser WASM IndexedDB",
+	loadSdk: async () => await import("@lix-js/sdk"),
+	openStorage: async () => {
+		const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
+		return openLix({
+			storage: new IndexedDbStorage({
+				name: `lix-indexed-db-contract:${crypto.randomUUID()}`,
+			}),
+		});
+	},
 	operationTimeoutMs: 30_000,
 	supportsPluginExecution: false,
 });
@@ -20,7 +34,13 @@ test("forwards opt-in SQL telemetry from browser WASM", async () => {
 	const lix = await openLix({
 		telemetry: {
 			onSpan(span) {
-				if (span.name === "lix.sql.query") resolveSpan(span);
+				if (
+					span.name === "lix.sql.query" &&
+					span.attributes["db.query.text"] ===
+						"SELECT ? AS value, ? AS number"
+				) {
+					resolveSpan(span);
+				}
 			},
 		},
 	});
@@ -126,190 +146,10 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 	}
 });
 
-test("remote client state and active branch survive reopen without reaching the server", async () => {
-	const { openLix } = await import("@lix-js/sdk");
-	const { LocalStorage } = await import("@lix-js/sdk/local-storage-adapter");
-	const prefix = `lix-client-state-test:${crypto.randomUUID()}`;
-	const sessions = new Map<string, string>();
-	const availableBranches = new Set(["main", "draft"]);
-	const initialBranchRequests: Array<string | null> = [];
-	const initialAccountRequests: Array<string | null> = [];
-	const requestBodies: string[] = [];
-	let nextSession = 0;
-	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-		const request = new Request(input, init);
-		const url = new URL(request.url);
-		const suppliedSession = request.headers.get("lix-session-id");
-		if (url.pathname.endsWith("/lix/v1/")) {
-			const requestedBranch = url.searchParams.get("activeBranchId");
-			if (!suppliedSession) {
-				initialBranchRequests.push(requestedBranch);
-				initialAccountRequests.push(url.searchParams.get("activeAccountId"));
-				if (requestedBranch && !availableBranches.has(requestedBranch)) {
-					return Response.json(
-						{
-							error: {
-								code: "LIX_BRANCH_NOT_FOUND",
-								message: "Branch not found",
-								details: { branchId: requestedBranch },
-							},
-						},
-						{ status: 404 },
-					);
-				}
-			}
-			const sessionId = suppliedSession ?? `session-${++nextSession}`;
-			if (!sessions.has(sessionId)) {
-				sessions.set(sessionId, requestedBranch ?? "main");
-			}
-			return Response.json({
-				protocolVersion: 2,
-				activeBranchId: sessions.get(sessionId),
-				activeAccountId: "00000000-0000-7000-8000-000000000002",
-				sessionId,
-			});
-		}
-		if (url.pathname.endsWith("/branch/switch")) {
-			const body = await request.text();
-			requestBodies.push(body);
-			const branchId = (JSON.parse(body) as { branchId: string }).branchId;
-			if (!suppliedSession) throw new Error("missing test session");
-			sessions.set(suppliedSession, branchId);
-			return Response.json({ branchId });
-		}
-		if (url.pathname.endsWith("/lix/v1/session")) {
-			if (suppliedSession) sessions.delete(suppliedSession);
-			return new Response(null, { status: 204 });
-		}
-		throw new Error(`Unexpected request: ${url.pathname}`);
-	};
-	const options = {
-		server: {
-			mode: "remote" as const,
-			url: "https://lixray.test/@acme/client-state",
-			fetch: remoteFetch,
-		},
-		storage: new LocalStorage({ prefix }),
-	};
-
-	const first = await openLix(options);
-	await first.clientState.set("atelier", { focusedPanel: "right" });
-	await first.switchBranch({ branchId: "draft" });
-	await first.close();
-
-	const second = await openLix(options);
-	try {
-		expect(await second.activeBranchId()).toBe("draft");
-		expect(second.clientState.get("atelier")).toEqual({
-			focusedPanel: "right",
-		});
-		expect(requestBodies).toEqual([JSON.stringify({ branchId: "draft" })]);
-		expect(requestBodies.join("\n")).not.toContain("focusedPanel");
-	} finally {
-		await second.close();
-	}
-
-	availableBranches.delete("draft");
-	const fallback = await openLix(options);
-	expect(await fallback.activeBranchId()).toBe("main");
-	await fallback.close();
-
-	const reopenedFallback = await openLix(options);
-	try {
-		expect(await reopenedFallback.activeBranchId()).toBe("main");
-		expect(initialBranchRequests).toEqual([
-			null,
-			"draft",
-			"draft",
-			null,
-			"main",
-		]);
-		expect(initialAccountRequests).toEqual([
-			null,
-			"00000000-0000-7000-8000-000000000002",
-			"00000000-0000-7000-8000-000000000002",
-			"00000000-0000-7000-8000-000000000002",
-			"00000000-0000-7000-8000-000000000002",
-		]);
-	} finally {
-		await reopenedFallback.close();
-	}
-});
-
-test("a failed client snapshot save does not reject a completed remote branch switch", async () => {
-	const { openLix } = await import("@lix-js/sdk");
-	let snapshot: Uint8Array | undefined;
-	let failSaves = false;
-	const storage: LixSnapshotStorage = {
-		load: async () => snapshot?.slice(),
-		save: async (_namespace, nextSnapshot) => {
-			if (failSaves) throw new Error("storage.save failed");
-			snapshot = nextSnapshot.slice();
-		},
-	};
-	let activeBranchId = "main";
-	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-		const request = new Request(input, init);
-		const pathname = new URL(request.url).pathname;
-		if (pathname.endsWith("/lix/v1/")) {
-			return Response.json({
-				protocolVersion: 2,
-				activeBranchId,
-				activeAccountId: "00000000-0000-7000-8000-000000000002",
-				sessionId: "save-failure-session",
-			});
-		}
-		if (pathname.endsWith("/branch/switch")) {
-			activeBranchId = ((await request.json()) as { branchId: string })
-				.branchId;
-			return Response.json({ branchId: activeBranchId });
-		}
-		if (pathname.endsWith("/lix/v1/session")) {
-			return new Response(null, { status: 204 });
-		}
-		throw new Error(`Unexpected request: ${pathname}`);
-	};
-	const options = {
-		server: {
-			mode: "remote" as const,
-			url: "https://lixray.test/@acme/save-failure",
-			fetch: remoteFetch,
-		},
-		storage,
-	};
-	const lix = await openLix(options);
-	let branchNotifications = 0;
-	lix.subscribeActiveBranch(() => {
-		branchNotifications += 1;
-	});
-
-	failSaves = true;
-	await expect(lix.clientState.set("direct", true)).rejects.toThrow(
-		"storage.save failed",
-	);
-	expect(lix.clientState.get("direct")).toBe(true);
-	await expect(lix.switchBranch({ branchId: "draft" })).resolves.toEqual({
-		branchId: "draft",
-	});
-	expect(await lix.activeBranchId()).toBe("draft");
-	expect(branchNotifications).toBe(1);
-
-	failSaves = false;
-	await lix.close();
-
-	const reopened = await openLix(options);
-	try {
-		expect(reopened.clientState.get("direct")).toBe(true);
-	} finally {
-		await reopened.close();
-	}
-});
-
-test("LocalStorage can persist a complete local Lix", async () => {
-	const { openLix } = await import("@lix-js/sdk");
-	const { LocalStorage } = await import("@lix-js/sdk/local-storage-adapter");
-	const storage = new LocalStorage({
-		prefix: `lix-local-storage-test:${crypto.randomUUID()}`,
+test("IndexedDbStorage persists a complete local Lix", async () => {
+	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
+	const storage = new IndexedDbStorage({
+		name: `lix-indexed-db-test:${crypto.randomUUID()}`,
 	});
 	const first = await openLix({ storage });
 	await first.execute(
@@ -332,15 +172,41 @@ test("LocalStorage can persist a complete local Lix", async () => {
 	}
 });
 
-test("snapshot-backed close can retry after an active transaction", async () => {
-	const { openLix } = await import("@lix-js/sdk");
-	let snapshot: Uint8Array | undefined;
-	const storage: LixSnapshotStorage = {
-		load: async () => snapshot?.slice(),
-		save: async (_namespace, nextSnapshot) => {
-			snapshot = nextSnapshot.slice();
-		},
-	};
+test("IndexedDbStorage exclusively owns a database name", async () => {
+	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
+	const name = `lix-indexed-db-owner-test:${crypto.randomUUID()}`;
+	const firstStorage = new IndexedDbStorage({ name });
+	const secondStorage = new IndexedDbStorage({ name });
+	const first = await openLix({ storage: firstStorage });
+
+	await expect(openLix({ storage: secondStorage })).rejects.toThrow(
+		"already open",
+	);
+	await first.close();
+
+	const second = await openLix({ storage: secondStorage });
+	await second.close();
+});
+
+test("IndexedDbStorage releases ownership after corrupt data rejects open", async () => {
+	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
+	const name = `lix-indexed-db-corrupt-test:${crypto.randomUUID()}`;
+	await seedMalformedIndexedDbEntry(name);
+
+	await expect(
+		openLix({ storage: new IndexedDbStorage({ name }) }),
+	).rejects.toThrow("not binary data");
+	await deleteIndexedDb(name);
+
+	const recovered = await openLix({ storage: new IndexedDbStorage({ name }) });
+	await recovered.close();
+});
+
+test("IndexedDbStorage close can retry after an active transaction", async () => {
+	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
+	const storage = new IndexedDbStorage({
+		name: `lix-indexed-db-close-test:${crypto.randomUUID()}`,
+	});
 	const lix = await openLix({ storage });
 	const tx = await lix.beginTransaction();
 
@@ -348,48 +214,43 @@ test("snapshot-backed close can retry after an active transaction", async () => 
 		code: "LIX_INVALID_TRANSACTION_STATE",
 	});
 	await tx.rollback();
-	await lix.clientState.set("after-failed-close", true);
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["after-failed-close", true],
+	);
 	await lix.close();
 
 	const reopened = await openLix({ storage });
-	expect(reopened.clientState.get("after-failed-close")).toBe(true);
+	const result = await reopened.execute(
+		"SELECT value FROM lix_key_value WHERE key = $1",
+		["after-failed-close"],
+	);
+	expect(result.rows[0]?.get("value")).toBe(true);
 	await reopened.close();
 });
 
-test("a committed transaction releases its lifecycle when snapshot saving fails", async () => {
-	const { openLix } = await import("@lix-js/sdk");
-	let snapshot: Uint8Array | undefined;
-	let failSaves = false;
-	const storage: LixSnapshotStorage = {
-		load: async () => snapshot?.slice(),
-		save: async (_namespace, nextSnapshot) => {
-			if (failSaves) throw new Error("transaction snapshot save failed");
-			snapshot = nextSnapshot.slice();
-		},
-	};
-	const lix = await openLix({ storage });
-	const tx = await lix.beginTransaction();
-	await tx.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
-		"committed-before-save",
-		true,
-	]);
-
-	failSaves = true;
-	await expect(tx.commit()).rejects.toMatchObject({
-		code: "LIX_SNAPSHOT_PERSISTENCE_FAILED",
+async function seedMalformedIndexedDbEntry(name: string): Promise<void> {
+	const request = indexedDB.open(name, 1);
+	request.onupgradeneeded = () => request.result.createObjectStore("entries");
+	const database = await new Promise<IDBDatabase>((resolve, reject) => {
+		request.onsuccess = () => resolve(request.result);
+		request.onerror = () => reject(request.error);
 	});
-	await expect(tx.rollback()).rejects.toThrow(/closed/);
+	const transaction = database.transaction("entries", "readwrite");
+	transaction.objectStore("entries").put("not-binary", new Uint8Array([0, 0, 0, 1]));
+	await new Promise<void>((resolve, reject) => {
+		transaction.oncomplete = () => resolve();
+		transaction.onerror = () => reject(transaction.error);
+		transaction.onabort = () => reject(transaction.error);
+	});
+	database.close();
+}
 
-	failSaves = false;
-	await lix.close();
-	const reopened = await openLix({ storage });
-	try {
-		const result = await reopened.execute(
-			"SELECT value FROM lix_key_value WHERE key = $1",
-			["committed-before-save"],
-		);
-		expect(result.rows[0]?.get("value")).toBe(true);
-	} finally {
-		await reopened.close();
-	}
-});
+async function deleteIndexedDb(name: string): Promise<void> {
+	const request = indexedDB.deleteDatabase(name);
+	await new Promise<void>((resolve, reject) => {
+		request.onsuccess = () => resolve();
+		request.onerror = () => reject(request.error);
+		request.onblocked = () => reject(new Error("IndexedDB delete was blocked"));
+	});
+}

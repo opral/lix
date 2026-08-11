@@ -2,8 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use lix::LixError;
-use lix::integration::{Engine, InitReceipt};
 use lix::storage::Memory;
+use lix::{engine::Engine, init::InitReceipt};
 
 use super::expect_same::{
     SharedExpectSameCase, SharedExpectSameRun, SharedExpectSameRunGuard, SimulationAssertions,
@@ -111,7 +111,9 @@ pub(crate) async fn enable_deterministic_mode(
     mode: SimulationMode,
 ) -> Result<(), LixError> {
     let timestamp_shuffle = deterministic_timestamp_shuffle_for(mode);
-    let session = engine.open_session(receipt.main_branch_id.clone()).await?;
+    let session = engine
+        .open_session_at(receipt.main_branch_id.clone())
+        .await?;
     match session
         .execute(&deterministic_mode_insert_sql(timestamp_shuffle), &[])
         .await
@@ -127,7 +129,7 @@ fn deterministic_mode_insert_sql(timestamp_shuffle: bool) -> String {
     format!(
         "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
          VALUES ('lix_deterministic_mode', \
-         lix_json('{{\"enabled\":true,\"timestamp_shuffle\":{timestamp_shuffle}}}'), true, true)"
+         CAST('{{\"enabled\":true,\"timestamp_shuffle\":{timestamp_shuffle}}}' AS JSONB), true, true)"
     )
 }
 

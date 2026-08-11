@@ -1,13 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest, CommitRecord,
 };
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
-use crate::tracked_state::TrackedStateDeltaRef;
 use crate::tracked_state::context::{
     TrackedStateContext, TrackedStateRootRebuilder, TrackedStateTransientRebuildState,
     TrackedStateWriteReport, TrackedStateWriter,
@@ -17,13 +16,16 @@ use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
+use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateKey};
+
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 /// Owned delta used only by explicit commit-root rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitRootRebuildDelta {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_pk: EntityPk,
+    pub(crate) row_pk: RowPk,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
@@ -70,8 +72,15 @@ async fn rebuild_commit_root_at_inner<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plans =
-        load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
+    // Explicit repair is the caller whose job is to distrust the chunk plane,
+    // so it — and only it — pays for the total closure proof.
+    let plans = load_rebuild_plans_to_nearest_available_root_with_proof(
+        rebuilder.store,
+        commit_id,
+        true,
+        RootAvailabilityProof::Complete,
+    )
+    .await?;
     let mut report = None;
     let context = TrackedStateContext::new();
     let mut state = TrackedStateTransientRebuildState::default();
@@ -136,7 +145,7 @@ where
                 )
             })?;
         if let Some(expected) = manifest.snapshot_root.as_ref()
-            && !expected.has_same_authoritative_layout(&snapshot_root)
+            && **expected != snapshot_root
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -152,10 +161,48 @@ where
     Ok(report)
 }
 
+/// How much of a candidate resume point's chunk closure a caller demands to be
+/// proved readable before it may resume from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootAvailabilityProof {
+    /// Prove the root is *addressable*: the root chunk and one root-to-leaf
+    /// path load and decode. `O(tree depth)`.
+    ///
+    /// Closure completeness is not re-derived. Chunks are staged in the same
+    /// atomic write set that publishes the root and the manifest, and GC
+    /// reaches them from refs, so the write path and GC are already its single
+    /// authority. This is what the commit path uses.
+    Addressable,
+    /// Prove the whole addressed closure loads and decodes. `O(tree rows)`.
+    ///
+    /// Used only by explicit repair (`rebuild_commit_root_at`), whose contract
+    /// is to distrust the chunk plane: rejecting a damaged resume point is what
+    /// makes it walk back and re-stage every chunk, so repair stays total.
+    Complete,
+}
+
 pub(crate) async fn load_rebuild_plans_to_nearest_available_root<S>(
     store: &S,
     commit_id: &str,
     force_head: bool,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    load_rebuild_plans_to_nearest_available_root_with_proof(
+        store,
+        commit_id,
+        force_head,
+        RootAvailabilityProof::Addressable,
+    )
+    .await
+}
+
+pub(crate) async fn load_rebuild_plans_to_nearest_available_root_with_proof<S>(
+    store: &S,
+    commit_id: &str,
+    force_head: bool,
+    proof: RootAvailabilityProof,
 ) -> Result<Vec<CommitRootRebuildPlan>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -173,12 +220,17 @@ where
                 ),
             ));
         }
-        if !force_current
-            && load_available_root(store, &current_commit_id)
-                .await?
-                .is_some()
-        {
-            break;
+        if !force_current {
+            #[cfg(feature = "storage-benches")]
+            let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+                crate::storage_bench::PlanLoadPhase::AvailProbe,
+            );
+            let available = load_available_root(store, &current_commit_id, proof).await?;
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_root_replay_available_root_probe(available.is_some());
+            if available.is_some() {
+                break;
+            }
         }
         let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
         let parent_commit_id = plan.parent_commit_id;
@@ -192,82 +244,76 @@ where
     Ok(plans)
 }
 
+/// Resolves the durable root a replay may resume from.
+///
+/// The commit-state manifest is the single immutable authority for a commit's
+/// tracked-state root: it is sealed atomically with the commit, keyed by that
+/// commit id, and never rewritten. `rebuild_commit_root_at_inner` already
+/// treats a rebuild that disagrees with it as a hard error rather than a
+/// repair, so the manifest — not a replay of the changelog — is what makes a
+/// root canonical. Availability therefore has exactly two obligations:
+///
+/// 1. the root pointer is live (`load_snapshot_commit_root` also proves the
+///    commit itself exists in the changelog, so an orphaned manifest cannot
+///    authorize a resume), and
+/// 2. the content-addressed chunk closure it names is physically addressable,
+///    so a damaged root is never resumed from and explicit repair stays total.
+///
+/// It deliberately does **not** recurse through the ancestry: ordinary commits
+/// are rootless bounded-replay layouts by design, so an ancestry-wide proof can
+/// only ever succeed by reaching genesis, which makes every interval closure
+/// replay the entire history.
+///
+/// How much of obligation (2) is proved is the caller's choice — see
+/// [`RootAvailabilityProof`]. The commit path proves addressability only:
+/// re-deriving closure completeness there cost `O(total state)` per boundary
+/// and, at one boundary per `COMMIT_STATE_MAX_REPLAY_DEPTH` commits, put an
+/// `O(N^2)` term back into commit for a fact atomic publication and GC already
+/// own. Explicit repair still proves the whole closure.
 async fn load_available_root<S>(
     store: &S,
     commit_id: &str,
+    proof: RootAvailabilityProof,
 ) -> Result<Option<TrackedStateRootId>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    // Build the ancestry proof iteratively. The former boxed async recursion
-    // retained one large future frame per ancestor and could overflow the test
-    // worker stack even for otherwise valid publication paths.
-    let mut chain = Vec::new();
-    let mut current_commit_id = commit_id.to_string();
-    let mut seen = HashSet::new();
-    loop {
-        if !seen.insert(current_commit_id.clone()) {
-            return Ok(None);
-        }
-        let Some(metadata) = storage::load_snapshot_commit_root(store, &current_commit_id).await?
-        else {
-            return Ok(None);
-        };
-        if !commit_root_tree_is_readable(store, &metadata).await? {
-            return Ok(None);
-        }
-        let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
-        let parent_commit_id = plan.parent_commit_id;
-        chain.push((metadata, plan));
-        let Some(parent_commit_id) = parent_commit_id else {
-            break;
-        };
-        current_commit_id = parent_commit_id.to_string();
+    let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
+        return Ok(None);
+    };
+    let readable = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::AvailTreeScan,
+        );
+        commit_root_tree_is_readable(store, &metadata, proof).await?
+    };
+    if !readable {
+        return Ok(None);
     }
-
-    let target_root_id = chain
-        .first()
-        .expect("available-root proof contains its requested commit")
-        .0
-        .root_id
-        .clone();
-    let mut canonical_parent = None;
-    for (metadata, plan) in chain.iter().rev() {
-        match (plan.parent_commit_id, canonical_parent.as_ref()) {
-            (Some(parent_commit_id), Some(parent_root_id)) => match metadata.parent_roots.first() {
-                Some(parent)
-                    if parent.commit_id == parent_commit_id
-                        && &parent.root_id == parent_root_id => {}
-                _ => return Ok(None),
-            },
-            (None, None) if metadata.parent_roots.is_empty() => {}
-            _ => return Ok(None),
-        }
-        let mut scratch_writes = StorageWriteSet::new();
-        let context = TrackedStateContext::new();
-        let mut writer = context.writer(store, &mut scratch_writes);
-        let report = stage_rebuild_plan_with_writer(&mut writer, plan).await?;
-        if report.root_id != metadata.root_id {
-            return Ok(None);
-        }
-        canonical_parent = Some(metadata.root_id.clone());
-    }
-    Ok(Some(target_root_id))
+    Ok(Some(metadata.root_id))
 }
 
 async fn commit_root_tree_is_readable<S>(
     store: &S,
     metadata: &TrackedStateCommitRoot,
+    proof: RootAvailabilityProof,
 ) -> Result<bool, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    // One row is enough for addressability: the scan walks root -> leftmost
+    // overlapping child -> leaf and stops, so a missing or corrupt root chunk
+    // still fails while the probe stays `O(tree depth)`.
+    let request = TrackedStateTreeScanRequest {
+        limit: match proof {
+            RootAvailabilityProof::Addressable => Some(1),
+            RootAvailabilityProof::Complete => None,
+        },
+        ..TrackedStateTreeScanRequest::default()
+    };
     match TrackedStateTree::new()
-        .scan(
-            store,
-            &metadata.root_id,
-            &TrackedStateTreeScanRequest::default(),
-        )
+        .scan(store, &metadata.root_id, &request)
         .await
     {
         Ok(_) => Ok(true),
@@ -289,39 +335,59 @@ async fn load_commit_root_rebuild_plan<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let mut reader = ChangelogContext::new().reader(store);
-    let commit_ids = [CommitId::parse_lix(
-        commit_id,
-        "commit-root rebuild commit_id",
-    )?];
-    let batch = reader
-        .load_commits(CommitLoadRequest {
-            commit_ids: &commit_ids,
-        })
-        .await?;
-    let entry = batch
-        .into_iter()
-        .next()
-        .and_then(|(_, value)| value)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"
-                ),
-            )
-        })?;
-    let commit = entry;
+    let commit = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::CommitRecord,
+        );
+        let mut reader = ChangelogContext::new().reader(store);
+        let commit_ids = [CommitId::parse_lix(
+            commit_id,
+            "commit-root rebuild commit_id",
+        )?];
+        let batch = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &commit_ids,
+            })
+            .await?;
+        batch
+            .into_iter()
+            .next()
+            .and_then(|(_, value)| value)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"
+                    ),
+                )
+            })?
+    };
     // Commit roots contain only identity/index facts. Avoid hydrating JSON
     // sidecars while rebuilding them; the packed delta index already carries
     // deletion, owner ids, and original timestamps.
-    let deltas = storage::scan_commit_delta_members(store, commit.commit_id)
-        .await?
+    let members = storage::scan_commit_delta_members(store, commit.commit_id).await?;
+    #[cfg(feature = "root-replay-trace")]
+    let member_bytes = members
+        .iter()
+        .map(|(key, _)| {
+            (key.schema_key.len()
+                + key.file_id.as_ref().map(String::len).unwrap_or(0)
+                + key.row_pk.estimated_heap_bytes()) as u64
+        })
+        .sum::<u64>();
+    #[cfg(feature = "root-replay-trace")]
+    crate::storage_bench::record_plan_load_plan(
+        members.len() as u64,
+        members.len() as u64,
+        member_bytes,
+    );
+    let deltas = members
         .into_iter()
         .map(|(key, value)| CommitRootRebuildDelta {
             schema_key: key.schema_key,
             file_id: key.file_id,
-            entity_pk: key.entity_pk,
+            row_pk: key.row_pk,
             change_id: value.change_id,
             commit_id: value.commit_id,
             deleted: value.deleted,
@@ -350,7 +416,7 @@ where
         .map(|delta| TrackedStateDeltaRef {
             schema_key: &delta.schema_key,
             file_id: delta.file_id.as_deref(),
-            entity_pk: &delta.entity_pk,
+            row_pk: &delta.row_pk,
             change_id: delta.change_id,
             commit_id: delta.commit_id,
             deleted: delta.deleted,
@@ -369,6 +435,300 @@ where
         .await
 }
 
+/// Collapses one contiguous rootless first-parent replay interval into its
+/// canonical terminal root.
+///
+/// Rootless commit roots are transient implementation details: immutable
+/// commit-delta authority remains the source of every mutation, while only the
+/// terminal root is needed as the parent of the publication being assembled.
+/// Applying the latest authenticated delta for each key once changes replay
+/// from O(H * D * log N) frontier rewrites to
+/// O(H * D * log U + U * log N), where U is the number of unique keys in the
+/// interval.
+///
+/// File-descriptor deletion has ordered cascade semantics, so those uncommon
+/// intervals stay on the canonical sequential algorithm.
+pub(crate) async fn try_stage_collapsed_rebuild_plans_with_writer<S>(
+    writer: &mut TrackedStateWriter<'_, S>,
+    plans: &[CommitRootRebuildPlan],
+) -> Result<Option<TrackedStateWriteReport>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    if plans.len() < 2 {
+        return Ok(None);
+    }
+    for pair in plans.windows(2) {
+        if pair[0].parent_commit_id != Some(pair[1].commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state collapsed rebuild plans are not one first-parent interval",
+            ));
+        }
+    }
+    if plans.iter().flat_map(|plan| &plan.deltas).any(|delta| {
+        (delta.deleted && delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            || delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+    }) {
+        return Ok(None);
+    }
+
+    let mut terminal_by_key = BTreeMap::<TrackedStateKey, CommitRootRebuildDelta>::new();
+    for plan in plans.iter().rev() {
+        for delta in &plan.deltas {
+            let key = TrackedStateKey {
+                schema_key: delta.schema_key.clone(),
+                file_id: delta.file_id.clone(),
+                row_pk: delta.row_pk.clone(),
+            };
+            match terminal_by_key.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(delta.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let created_at = entry.get().created_at;
+                    let mut terminal = delta.clone();
+                    // Sequential replay preserves the first visible lifecycle
+                    // timestamp across every later update, tombstone, and
+                    // reinsert. The durable base, when present, may replace it
+                    // once more inside the canonical root writer.
+                    terminal.created_at = created_at;
+                    entry.insert(terminal);
+                }
+            }
+        }
+    }
+    let deltas = terminal_by_key
+        .values()
+        .map(|delta| TrackedStateDeltaRef {
+            schema_key: &delta.schema_key,
+            file_id: delta.file_id.as_deref(),
+            row_pk: &delta.row_pk,
+            change_id: delta.change_id,
+            commit_id: delta.commit_id,
+            deleted: delta.deleted,
+            created_at: delta.created_at,
+            updated_at: delta.updated_at,
+        })
+        .collect::<Vec<_>>();
+    let terminal_commit_id = plans[0].commit_id.to_string();
+    let base_commit_id = plans
+        .last()
+        .and_then(|plan| plan.parent_commit_id)
+        .map(|commit_id| commit_id.to_string());
+    writer
+        .stage_commit_root(&terminal_commit_id, base_commit_id.as_deref(), deltas)
+        .await
+        .map(Some)
+}
+
 fn first_parent_commit_id(commit: &CommitRecord) -> Option<CommitId> {
     commit.parent_commit_ids.first().copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::LixTimestamp;
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
+
+    fn delta(
+        key: &str,
+        commit: &str,
+        created_millis: i64,
+        updated_millis: i64,
+        deleted: bool,
+    ) -> CommitRootRebuildDelta {
+        CommitRootRebuildDelta {
+            schema_key: "test_row".to_owned(),
+            file_id: None,
+            row_pk: RowPk::single(key),
+            change_id: ChangeId::for_test_label(&format!("{commit}-{key}")),
+            commit_id: CommitId::for_test_label(commit),
+            deleted,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(created_millis),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(updated_millis),
+        }
+    }
+
+    fn plan(
+        commit: &str,
+        parent: Option<&str>,
+        deltas: Vec<CommitRootRebuildDelta>,
+    ) -> CommitRootRebuildPlan {
+        CommitRootRebuildPlan {
+            commit_id: CommitId::for_test_label(commit),
+            parent_commit_id: parent.map(CommitId::for_test_label),
+            deltas,
+        }
+    }
+
+    async fn sequential_and_collapsed_roots(
+        plans: &[CommitRootRebuildPlan],
+    ) -> (TrackedStateRootId, TrackedStateRootId) {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("test read should open");
+        let context = TrackedStateContext::new();
+
+        let mut sequential_writes = StorageWriteSet::new();
+        let mut sequential = context.writer(&read, &mut sequential_writes);
+        let mut sequential_report = None;
+        for plan in plans.iter().rev() {
+            sequential_report = Some(
+                stage_rebuild_plan_with_writer(&mut sequential, plan)
+                    .await
+                    .expect("sequential replay should stage"),
+            );
+        }
+
+        let mut collapsed_writes = StorageWriteSet::new();
+        let mut collapsed = context.writer(&read, &mut collapsed_writes);
+        let collapsed_report = try_stage_collapsed_rebuild_plans_with_writer(&mut collapsed, plans)
+            .await
+            .expect("collapsed replay should validate")
+            .expect("multi-plan ordinary replay should collapse");
+        (
+            sequential_report
+                .expect("sequential replay has a root")
+                .root_id,
+            collapsed_report.root_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn collapsed_replay_matches_sequential_lifecycle_roots() {
+        for terminal in [
+            delta("row", "second-update", 20, 20, false),
+            delta("row", "second-delete", 20, 20, true),
+        ] {
+            let plans = vec![
+                plan("second", Some("first"), vec![terminal]),
+                plan("first", None, vec![delta("row", "first", 10, 10, false)]),
+            ];
+            let (sequential, collapsed) = sequential_and_collapsed_roots(&plans).await;
+            assert_eq!(collapsed, sequential);
+        }
+
+        let plans = vec![
+            plan(
+                "third",
+                Some("second"),
+                vec![delta("row", "third", 30, 30, false)],
+            ),
+            plan(
+                "second",
+                Some("first"),
+                vec![delta("row", "second", 20, 20, true)],
+            ),
+            plan("first", None, vec![delta("row", "first", 10, 10, false)]),
+        ];
+        let (sequential, collapsed) = sequential_and_collapsed_roots(&plans).await;
+        assert_eq!(collapsed, sequential);
+    }
+
+    #[tokio::test]
+    async fn shared_rootless_suffixes_stage_independent_terminal_and_child_roots() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("test read should open");
+        let context = TrackedStateContext::new();
+        let mut writes = StorageWriteSet::new();
+        let mut writer = context.writer(&read, &mut writes);
+        let suffix = vec![
+            plan(
+                "suffix-new",
+                Some("suffix-old"),
+                vec![delta("shared-new", "suffix-new", 20, 20, false)],
+            ),
+            plan(
+                "suffix-old",
+                None,
+                vec![delta("shared-old", "suffix-old", 10, 10, false)],
+            ),
+        ];
+        let mut left = vec![plan(
+            "left",
+            Some("suffix-new"),
+            vec![delta("left", "left", 30, 30, false)],
+        )];
+        left.extend(suffix.clone());
+        let mut right = vec![plan(
+            "right",
+            Some("suffix-new"),
+            vec![delta("right", "right", 30, 30, false)],
+        )];
+        right.extend(suffix);
+
+        let left_report = try_stage_collapsed_rebuild_plans_with_writer(&mut writer, &left)
+            .await
+            .expect("left collapse should validate")
+            .expect("left collapse should stage");
+        let right_report = try_stage_collapsed_rebuild_plans_with_writer(&mut writer, &right)
+            .await
+            .expect("right collapse should validate")
+            .expect("right collapse should stage");
+        assert_ne!(left_report.root_id, right_report.root_id);
+
+        for (parent, child) in [("left", "left-child"), ("right", "right-child")] {
+            let child_delta = delta(child, child, 40, 40, false);
+            writer
+                .stage_commit_root(
+                    &CommitId::for_test_label(child).to_string(),
+                    Some(&CommitId::for_test_label(parent).to_string()),
+                    [TrackedStateDeltaRef {
+                        schema_key: &child_delta.schema_key,
+                        file_id: child_delta.file_id.as_deref(),
+                        row_pk: &child_delta.row_pk,
+                        change_id: child_delta.change_id,
+                        commit_id: child_delta.commit_id,
+                        deleted: child_delta.deleted,
+                        created_at: child_delta.created_at,
+                        updated_at: child_delta.updated_at,
+                    }],
+                )
+                .await
+                .expect("child should use its independently staged parent root");
+        }
+    }
+
+    #[tokio::test]
+    async fn order_sensitive_lifecycle_intervals_keep_sequential_replay() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("test read should open");
+        let context = TrackedStateContext::new();
+        for sensitive_delta in [
+            CommitRootRebuildDelta {
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+                deleted: true,
+                ..delta("file", "file-delete", 20, 20, true)
+            },
+            CommitRootRebuildDelta {
+                schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    .to_owned(),
+                ..delta("replacement", "replacement", 20, 20, false)
+            },
+        ] {
+            let plans = vec![
+                plan("second", Some("first"), vec![sensitive_delta]),
+                plan("first", None, vec![delta("row", "first", 10, 10, false)]),
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut writer = context.writer(&read, &mut writes);
+            assert!(
+                try_stage_collapsed_rebuild_plans_with_writer(&mut writer, &plans)
+                    .await
+                    .expect("sensitive replay classification should validate")
+                    .is_none(),
+                "order-sensitive lifecycle replay must use the sequential writer"
+            );
+        }
+    }
 }

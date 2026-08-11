@@ -1,25 +1,25 @@
 use serde_json::json;
 
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(feature = "storage-benches")]
 use std::collections::HashMap;
 
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::CommitId;
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(feature = "storage-benches")]
 use crate::changelog::{ChangelogContext, ChangelogReader, CommitScanRequest};
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(feature = "storage-benches")]
 use crate::commit_graph::CommitGraphNode;
-use crate::entity_pk::EntityPk;
+use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError};
 
 pub(crate) const CHECKPOINT_SCHEMA_KEY: &str = "lix_checkpoint";
 
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(feature = "storage-benches")]
 const CHECKPOINT_RECORD_SCAN_PAGE_SIZE: usize = 1_024;
 
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(feature = "storage-benches")]
 pub(crate) type CheckpointCommitRecords = HashMap<CommitId, CommitGraphNode>;
 
 pub(crate) fn checkpoint_snapshot(commit_id: &CommitId) -> String {
@@ -34,8 +34,8 @@ pub(crate) fn checkpoint_snapshot(commit_id: &CommitId) -> String {
 pub(crate) fn checkpoint_stage_row(commit_id: &CommitId, change_id: String) -> TransactionWriteRow {
     let commit_id = commit_id.to_string();
     TransactionWriteRow {
-        entity_pk: Some(
-            EntityPk::uuid_from_canonical(&commit_id)
+        row_pk: Some(
+            RowPk::uuid_from_canonical(&commit_id)
                 .expect("checkpoint commit ID is a canonical UUID"),
         ),
         schema_key: CHECKPOINT_SCHEMA_KEY.into(),
@@ -58,9 +58,9 @@ pub(crate) fn checkpoint_stage_row(commit_id: &CommitId, change_id: String) -> T
 
 /// Loads the private compaction cursor bound to an exact branch head.
 ///
-/// Checkpoints are logical global entities. Branch-relative working-diff
+/// Checkpoints are logical global rows. Branch-relative working-diff
 /// baselines are control-plane state and must never be reconstructed by
-/// searching checkpoint entity history.
+/// searching checkpoint row history.
 pub(crate) async fn checkpoint_commit_id_at_head<S>(
     store: S,
     branch_id: &str,
@@ -88,7 +88,7 @@ where
     })
 }
 
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(feature = "storage-benches")]
 pub(crate) async fn scan_checkpoint_commit_records<S>(
     store: S,
 ) -> Result<CheckpointCommitRecords, LixError>
@@ -112,11 +112,14 @@ where
                 record.commit_id,
                 CommitGraphNode {
                     commit_id: record.commit_id,
-                    change_id: record.change_id,
+                    change_id: record.change_id(),
                     account_id: record.account_id,
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
+                    first_parent_jump_commit_id: record.first_parent_jump_commit_id,
+                    first_parent_jump_span: record.first_parent_jump_span,
                     created_at: record.created_at,
+                    touched_scope_digest: record.touched_scope_digest,
                 },
             );
         }

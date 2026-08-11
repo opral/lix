@@ -20,8 +20,12 @@ use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::{GLOBAL_BRANCH_ID, LixError, LixNotice, SqlQueryResult, Value};
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::{
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, PrimitiveArray, StringArray,
+    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use datafusion::arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -53,7 +57,7 @@ use crate::sql2::predicate_typecheck::{
 };
 use crate::sql2::providers::ProviderSelection;
 use crate::sql2::result_metadata::{
-    LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
+    LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
 };
 use crate::sql2::session::{
     SqlWriteSessionOptions, build_read_session, build_read_session_at_head,
@@ -66,12 +70,14 @@ use crate::sql2::{
 };
 
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
+use crate::sql2::PooledReadSession;
+use datafusion::execution::SessionState;
 
 pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_column_omitted";
 
 pub(crate) struct DataFusionLogicalPlan {
-    pub(super) session: SessionContext,
-    pub(super) plan: LogicalPlan,
+    pub(super) state: std::sync::Arc<SessionState>,
+    pub(super) plan: crate::sql2::runtime::RuntimeReadPlan,
     pub(super) notices: Vec<LixNotice>,
     pub(super) json_predicate_params: BTreeSet<usize>,
     pub(super) expected_parameter_count: usize,
@@ -236,7 +242,7 @@ impl SessionReadResult {
 
 /// DataFusion catalog and providers scoped to one immutable storage read.
 pub(crate) struct ReadSqlSession<'ctx> {
-    session: SessionContext,
+    session: Option<PooledReadSession>,
     planning_environment: Option<(
         std::sync::Arc<SqlPlanningCache<CatalogFingerprint>>,
         CatalogFingerprint,
@@ -244,10 +250,27 @@ pub(crate) struct ReadSqlSession<'ctx> {
     _context: PhantomData<&'ctx ()>,
 }
 
+impl ReadSqlSession<'_> {
+    fn pooled(&self) -> &PooledReadSession {
+        self.session
+            .as_ref()
+            .expect("read session is only taken back when the statement ends")
+    }
+
+    fn context(&self) -> &SessionContext {
+        self.pooled().context()
+    }
+
+    fn state(&self) -> &std::sync::Arc<SessionState> {
+        self.pooled().state()
+    }
+}
+
 impl Drop for ReadSqlSession<'_> {
     fn drop(&mut self) {
-        if let Some((cache, _)) = &self.planning_environment {
-            cache.recycle_datafusion_read_session(self.session.clone());
+        if let (Some((cache, _)), Some(session)) = (&self.planning_environment, self.session.take())
+        {
+            cache.recycle_datafusion_read_session(session);
         }
     }
 }
@@ -284,7 +307,7 @@ where
 {
     let planning_environment = ctx.sql_planning_environment().await?;
     Ok(ReadSqlSession {
-        session: build_read_session(ctx, statements).await?,
+        session: Some(build_read_session(ctx, statements).await?),
         planning_environment,
         _context: PhantomData,
     })
@@ -300,7 +323,7 @@ where
 {
     let planning_environment = ctx.sql_planning_environment().await?;
     Ok(ReadSqlSession {
-        session: build_read_session_at_head(ctx, active_head, statements).await?,
+        session: Some(build_read_session_at_head(ctx, active_head, statements).await?),
         planning_environment,
         _context: PhantomData,
     })
@@ -402,25 +425,37 @@ async fn create_logical_plan_in_session_from_parsed(
         && let Some((cache, catalog)) = &session.planning_environment
         && let Some(cached) = cache.read_plan(sql, params, catalog)
     {
-        let plan = rebind_cached_read_plan(&session.session, cached.plan.clone()).await?;
+        let physical_planning_cache = PhysicalReadPlanCacheKey::new(sql, params, catalog.clone())
+            .map(|key| (std::sync::Arc::clone(cache), key));
+        // With a physical-cache key the runtime rebinds scan providers lazily:
+        // a warm template execution never touches the logical plan, so eagerly
+        // resolving providers into it here would be pure per-statement waste.
+        let plan = if physical_planning_cache.is_some() {
+            crate::sql2::runtime::RuntimeReadPlan::Detached(cached.plan.clone())
+        } else {
+            crate::sql2::runtime::RuntimeReadPlan::Bound(
+                rebind_cached_read_plan(session.context(), cached.plan.clone()).await?,
+            )
+        };
         return Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
-            session: session.session.clone(),
+            state: std::sync::Arc::clone(session.state()),
             plan,
             notices: Vec::new(),
             json_predicate_params: cached.json_predicate_params.clone(),
             expected_parameter_count: cached.expected_parameter_count,
-            physical_planning_cache: PhysicalReadPlanCacheKey::new(sql, params, catalog.clone())
-                .map(|key| (std::sync::Arc::clone(cache), key)),
+            physical_planning_cache,
         }));
     }
     bind_table_function_parameters(&mut statement, params)?;
-    let plan = create_logical_plan_from_statement(&session.session, statement).await?;
+    let plan = create_logical_plan_from_statement(session.context(), statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
 
-    let physical_plan_cacheable = cacheable_statement && !logical_plan_has_scalar_function(&plan);
+    let physical_plan_cacheable = cacheable_statement
+        && !logical_plan_has_scalar_function(&plan)
+        && !logical_plan_has_subquery_expression(&plan);
     if physical_plan_cacheable && let Some((cache, catalog)) = &session.planning_environment {
         cache.remember_read_plan(
             sql,
@@ -447,8 +482,8 @@ async fn create_logical_plan_in_session_from_parsed(
     };
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
-        session: session.session.clone(),
-        plan,
+        state: std::sync::Arc::clone(session.state()),
+        plan: crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
         notices: Vec::new(),
         json_predicate_params,
         expected_parameter_count,
@@ -505,6 +540,43 @@ async fn rebind_cached_read_plan(
     .map_err(datafusion_error_to_lix_error)
 }
 
+/// Reports whether any expression in `plan` carries a nested subquery plan.
+///
+/// `LogicalPlan`'s tree traversal walks plan inputs only; the plans hidden
+/// inside `Expr::ScalarSubquery`, `Expr::InSubquery` and `Expr::Exists` are
+/// invisible to it. `detach_cached_read_plan` therefore cannot swap their
+/// `TableScan` sources for placeholders, so caching such a plan would park
+/// live snapshot-bound providers in an engine-lifetime LRU: the read scope
+/// then fails `finish()` with leaked handles, and a later cache hit would
+/// execute against a storage read that has already been released.
+///
+/// Planning-cache participation is an optimization, so the safe answer is to
+/// keep these statements out of the cache entirely rather than grow a second
+/// subquery-aware rewrite path that has to stay in sync with `detach`/`rebind`.
+fn logical_plan_has_subquery_expression(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        for expression in node.expressions() {
+            let _ = expression.apply(|expression| {
+                if matches!(
+                    expression,
+                    Expr::ScalarSubquery(_) | Expr::InSubquery(_) | Expr::Exists(_)
+                ) {
+                    found = true;
+                    Ok(TreeNodeRecursion::Stop)
+                } else {
+                    Ok(TreeNodeRecursion::Continue)
+                }
+            });
+            if found {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
 fn logical_plan_has_scalar_function(plan: &LogicalPlan) -> bool {
     let mut found = false;
     let _ = plan.apply(|node| {
@@ -526,7 +598,7 @@ fn logical_plan_has_scalar_function(plan: &LogicalPlan) -> bool {
     found
 }
 
-fn statement_has_table_function(statement: &DataFusionStatement) -> bool {
+pub(crate) fn statement_has_table_function(statement: &DataFusionStatement) -> bool {
     struct TableFunctionVisitor(bool);
 
     impl Visitor for TableFunctionVisitor {
@@ -562,14 +634,10 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
     let planning_environment = read_ctx.sql_planning_environment().await?;
-    let plan = create_transaction_read_logical_plan_from_parsed(
+    let (plan, session) = create_transaction_read_logical_plan_from_parsed(
         read_ctx, write_ctx, sql, statement, params,
     )
     .await?;
-    let session = match &plan {
-        SqlLogicalPlan::DataFusion(plan) => plan.session.clone(),
-        _ => unreachable!("transaction reads are planned by DataFusion"),
-    };
     let result = execute_logical_plan(plan, params)
         .await
         .and_then(SessionReadResult::into_sql_query_result);
@@ -585,27 +653,30 @@ async fn create_transaction_read_logical_plan_from_parsed(
     sql: &str,
     mut statement: DataFusionStatement,
     params: &[Value],
-) -> Result<SqlLogicalPlan, LixError> {
+) -> Result<(SqlLogicalPlan, PooledReadSession), LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
     let parameter_names = statement_parameter_names(&statement)?;
     let expected_parameter_count = expected_positional_parameter_count(&parameter_names)?;
     validate_parameter_count_values(expected_parameter_count, &parameter_names, params.len())?;
     bind_table_function_parameters(&mut statement, params)?;
     let session = build_transaction_read_session(read_ctx, write_ctx, &statement).await?;
-    let plan = create_logical_plan_from_statement(&session, statement).await?;
+    let plan = create_logical_plan_from_statement(session.context(), statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
 
-    Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
+    Ok((
+        SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
+            state: std::sync::Arc::clone(session.state()),
+            plan: crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
+            notices: Vec::new(),
+            json_predicate_params,
+            expected_parameter_count,
+            physical_planning_cache: None,
+        }),
         session,
-        plan,
-        notices: Vec::new(),
-        json_predicate_params,
-        expected_parameter_count,
-        physical_planning_cache: None,
-    }))
+    ))
 }
 
 async fn create_logical_plan_from_statement(
@@ -1281,6 +1352,35 @@ fn validate_history_anchor_predicates_in_logical_plan(plan: &LogicalPlan) -> Res
     visit_history_anchor_plan(plan, &[]).map(|_| ())
 }
 
+/// Substitutes positional parameters into a bound read plan.
+///
+/// Mirrors `DataFrame::with_param_values`, which is exactly
+/// `LogicalPlan::with_param_values` plus a `SessionState` it does not need.
+fn bind_runtime_plan_param_values(
+    plan: crate::sql2::runtime::RuntimeReadPlan,
+    params: &[Value],
+) -> Result<crate::sql2::runtime::RuntimeReadPlan, LixError> {
+    use crate::sql2::runtime::RuntimeReadPlan;
+    Ok(match plan {
+        RuntimeReadPlan::Bound(plan) => {
+            RuntimeReadPlan::Bound(bind_plan_param_values(plan, params)?)
+        }
+        RuntimeReadPlan::Detached(plan) => {
+            RuntimeReadPlan::Detached(bind_plan_param_values(plan, params)?)
+        }
+    })
+}
+
+fn bind_plan_param_values(plan: LogicalPlan, params: &[Value]) -> Result<LogicalPlan, LixError> {
+    if params.is_empty() {
+        return Ok(plan);
+    }
+    plan.with_param_values(ParamValues::List(
+        params.iter().map(scalar_value_from_lix_value).collect(),
+    ))
+    .map_err(datafusion_error_to_lix_error)
+}
+
 async fn execute_logical_plan(
     plan: SqlLogicalPlan,
     params: &[Value],
@@ -1292,7 +1392,7 @@ async fn execute_logical_plan(
         ));
     };
     let SqlDataFusionLogicalPlan {
-        session,
+        state,
         plan,
         notices,
         json_predicate_params,
@@ -1302,25 +1402,21 @@ async fn execute_logical_plan(
     debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
 
-    let mut dataframe = session
-        .execute_logical_plan(plan)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
-    if !params.is_empty() {
-        dataframe = dataframe
-            .with_param_values(ParamValues::List(
-                params.iter().map(scalar_value_from_lix_value).collect(),
-            ))
-            .map_err(datafusion_error_to_lix_error)?;
-    }
+    // `SessionContext::execute_logical_plan` only branches for DDL and utility
+    // statements, both of which `validate_supported_logical_plan` already
+    // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
+    // here is to carry a freshly deep-copied `SessionState`. Bind the
+    // parameters on the plan directly against the statement's pooled state.
+    let plan = bind_runtime_plan_param_values(plan, params)?;
 
-    let result_fields = dataframe
+    let result_fields = plan
+        .inner()
         .schema()
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = crate::sql2::runtime::collect_dataframe(dataframe, physical_planning_cache)
+    let batches = crate::sql2::runtime::collect_plan(&state, plan, physical_planning_cache)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     // This is a benchmark-only causal ceiling probe. It keeps DataFusion's
@@ -1371,7 +1467,7 @@ async fn execute_logical_plan_stream<'session>(
         ));
     };
     let SqlDataFusionLogicalPlan {
-        session,
+        state,
         plan,
         notices,
         json_predicate_params,
@@ -1381,24 +1477,20 @@ async fn execute_logical_plan_stream<'session>(
     debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
 
-    let mut dataframe = session
-        .execute_logical_plan(plan)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
-    if !params.is_empty() {
-        dataframe = dataframe
-            .with_param_values(ParamValues::List(
-                params.iter().map(scalar_value_from_lix_value).collect(),
-            ))
-            .map_err(datafusion_error_to_lix_error)?;
-    }
-    let fields = dataframe
+    // `SessionContext::execute_logical_plan` only branches for DDL and utility
+    // statements, both of which `validate_supported_logical_plan` already
+    // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
+    // here is to carry a freshly deep-copied `SessionState`. Bind the
+    // parameters on the plan directly against the statement's pooled state.
+    let plan = bind_runtime_plan_param_values(plan, params)?;
+    let fields = plan
+        .inner()
         .schema()
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let stream = crate::sql2::runtime::stream_dataframe(dataframe, physical_planning_cache)
+    let stream = crate::sql2::runtime::stream_plan(&state, plan, physical_planning_cache)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     Ok(SessionReadBatchStreamResult {
@@ -1421,7 +1513,7 @@ async fn execute_logical_plan_collected_batches(
         ));
     };
     let SqlDataFusionLogicalPlan {
-        session,
+        state,
         plan,
         notices,
         json_predicate_params,
@@ -1431,24 +1523,20 @@ async fn execute_logical_plan_collected_batches(
     debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
 
-    let mut dataframe = session
-        .execute_logical_plan(plan)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
-    if !params.is_empty() {
-        dataframe = dataframe
-            .with_param_values(ParamValues::List(
-                params.iter().map(scalar_value_from_lix_value).collect(),
-            ))
-            .map_err(datafusion_error_to_lix_error)?;
-    }
-    let fields = dataframe
+    // `SessionContext::execute_logical_plan` only branches for DDL and utility
+    // statements, both of which `validate_supported_logical_plan` already
+    // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
+    // here is to carry a freshly deep-copied `SessionState`. Bind the
+    // parameters on the plan directly against the statement's pooled state.
+    let plan = bind_runtime_plan_param_values(plan, params)?;
+    let fields = plan
+        .inner()
         .schema()
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = crate::sql2::runtime::collect_dataframe(dataframe, physical_planning_cache)
+    let batches = crate::sql2::runtime::collect_plan(&state, plan, physical_planning_cache)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     Ok(SessionReadCollectedBatchResult {
@@ -1495,20 +1583,26 @@ fn retain_columnar_result(fields: &[Field], batches: &[RecordBatch]) -> bool {
         fields.iter().enumerate().any(|(column_index, field)| {
             let array = batch.column(column_index);
             match field.data_type() {
-                DataType::Float32 => array
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Float32Array>()
-                    .is_some_and(|values| {
-                        (0..values.len())
-                            .any(|index| values.is_valid(index) && !values.value(index).is_finite())
-                    }),
-                DataType::Float64 => array
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Float64Array>()
-                    .is_some_and(|values| {
-                        (0..values.len())
-                            .any(|index| values.is_valid(index) && !values.value(index).is_finite())
-                    }),
+                DataType::Float32 => {
+                    array
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .is_some_and(|values| {
+                            (0..values.len()).any(|index| {
+                                values.is_valid(index) && !values.value(index).is_finite()
+                            })
+                        })
+                }
+                DataType::Float64 => {
+                    array
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .is_some_and(|values| {
+                            (0..values.len()).any(|index| {
+                                values.is_valid(index) && !values.value(index).is_finite()
+                            })
+                        })
+                }
                 _ => false,
             }
         })
@@ -2029,7 +2123,7 @@ fn datafusion_dml_returning(
     };
     let df_schema =
         DFSchema::try_from(table_schema.clone()).map_err(datafusion_error_to_lix_error)?;
-    let props = session.state().execution_props().clone();
+    let props = session.state_ref().read().execution_props().clone();
     let mut fields = Vec::with_capacity(returning.items.len());
     let mut expressions = Vec::with_capacity(returning.items.len());
     let mut required_columns = BTreeSet::new();
@@ -2185,7 +2279,7 @@ fn datafusion_conflict_assignments(
     }
     let augmented = Schema::new(fields);
     let df_schema = DFSchema::try_from(augmented).map_err(datafusion_error_to_lix_error)?;
-    let props = session.state().execution_props().clone();
+    let props = session.state_ref().read().execution_props().clone();
 
     assignments
         .iter()
@@ -2394,7 +2488,14 @@ fn datafusion_filter_expr_from_bound_expr(
             if identity_json_comparison_context {
                 if let ScalarValue::Utf8(Some(raw)) = &value {
                     return Ok(Expr::Literal(
-                        ScalarValue::Utf8(Some(canonical_json_text(raw)?)),
+                        ScalarValue::Utf8(Some(
+                            crate::sql2::udfs::common::canonical_jsonb_text(raw).map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_TYPE_MISMATCH,
+                                    format!("JSON comparison value is not valid JSON: {error}"),
+                                )
+                            })?,
+                        )),
                         Some(json_field_metadata()),
                     ));
                 }
@@ -2409,7 +2510,14 @@ fn datafusion_filter_expr_from_bound_expr(
             if json_comparison_context && identity_json_comparison_context =>
         {
             Ok(Expr::Literal(
-                ScalarValue::Utf8(Some(canonical_json_text(value)?)),
+                ScalarValue::Utf8(Some(
+                    crate::sql2::udfs::common::canonical_jsonb_text(value).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("JSON comparison value is not valid JSON: {error}"),
+                        )
+                    })?,
+                )),
                 Some(json_field_metadata()),
             ))
         }
@@ -2450,6 +2558,7 @@ fn datafusion_expr_from_bound_expr(
                 BoundCastType::BigInt => DataType::Int64,
                 BoundCastType::Double => DataType::Float64,
                 BoundCastType::Boolean => DataType::Boolean,
+                BoundCastType::Jsonb => DataType::Utf8,
             };
             Ok(Expr::Cast(Cast::new(
                 Box::new(datafusion_expr_from_bound_expr(session, expr, params)?),
@@ -2507,7 +2616,10 @@ fn bound_expr_is_json(expr: &BoundExpr, schema: &Schema) -> bool {
             .find(|field| field.name() == &column.name)
             .is_some_and(|field| field_is_json(field.as_ref())),
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
-        BoundExpr::Function { name, .. } => matches!(name.as_str(), "lix_json" | "lix_json_get"),
+        BoundExpr::Function { name, .. } => matches!(
+            name.as_str(),
+            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+        ),
         _ => false,
     }
 }
@@ -2516,31 +2628,20 @@ fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
-            if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
+            if matches!(column.name.as_str(), "row_pk" | "lixcol_row_pk")
     )
-}
-
-fn canonical_json_text(raw: &str) -> Result<String, LixError> {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .map(|value| value.to_string())
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("JSON comparison value is not valid JSON: {error}"),
-            )
-        })
 }
 
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
     match &plan.bound.target {
-        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::Base {
+        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base {
             schema_key,
         }) if bound_predicate_contains_like(&plan.bound.predicate)
             || bound_update_contains_binary(plan) =>
         {
             Ok(schema_key.clone())
         }
-        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
+        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::ByBranch {
             schema_key,
         }) if bound_predicate_contains_like(&plan.bound.predicate)
             || bound_update_contains_binary(plan) =>
@@ -2563,9 +2664,9 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
             Ok("lix_create_checkpoint".to_string())
         }
-        BoundWriteTarget::Entity(_) => Err(LixError::new(
+        BoundWriteTarget::Row(_) => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "sql2 DataFusion reference writer does not support this entity write",
+            "sql2 DataFusion reference writer does not support this row write",
         )),
     }
 }
@@ -2664,12 +2765,12 @@ fn validate_json_predicate_params(
         let Some(value) = params.get(index - 1) else {
             continue;
         };
-        if !matches!(value, Value::Json(_) | Value::Null) {
+        if !matches!(value, Value::Jsonb(_) | Value::Null) {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 "JSON columns can only be compared with JSON expressions",
             )
-            .with_hint("Use lix_json(...) or pass a JSON parameter value instead of bare text."));
+            .with_hint("Use CAST(... AS JSONB) or pass a JSON parameter value instead of bare text."));
         }
     }
     Ok(())
@@ -2841,7 +2942,7 @@ fn expected_positional_parameter_count(
                 LixError::CODE_PARSE_ERROR,
                 format!("unsupported SQL parameter placeholder '{name}'"),
             )
-            .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...")
+            .with_hint("Use PostgreSQL-style numbered placeholders like $1, $2, ...")
             .with_details(json!({
                 "operation": "execute",
                 "placeholder": name,
@@ -2852,7 +2953,7 @@ fn expected_positional_parameter_count(
                 LixError::CODE_PARSE_ERROR,
                 "SQL parameter placeholders are 1-indexed",
             )
-            .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...")
+            .with_hint("Use PostgreSQL-style numbered placeholders like $1, $2, ...")
             .with_details(json!({
                 "operation": "execute",
                 "placeholder": name,
@@ -2877,7 +2978,7 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
                 "DDL statements are not supported by Lix SQL",
             )
             .with_hint(
-                "Use Lix entity surfaces such as lix_registered_schema, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
+                "Use Lix SQL surfaces such as lix_registered_schema, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
             ));
         }
         LogicalPlan::Statement(_) => {
@@ -2918,10 +3019,15 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
         Value::Integer(value) => ScalarValue::Int64(Some(*value)).into(),
         Value::Real(value) => ScalarValue::Float64(Some(*value)).into(),
         Value::Text(value) => ScalarValue::Utf8(Some(value.clone())).into(),
-        Value::Json(value) => ScalarAndMetadata::new(
+        Value::Jsonb(value) => ScalarAndMetadata::new(
             ScalarValue::Utf8(Some(value.to_string())),
             Some(json_field_metadata()),
         ),
+        Value::Timestamptz(value) => ScalarValue::TimestampMicrosecond(
+            Some(*value),
+            Some("UTC".into()),
+        )
+        .into(),
         Value::Blob(value) => ScalarValue::LargeBinary(Some(value.to_vec())).into(),
     }
 }
@@ -2929,7 +3035,7 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
 fn json_field_metadata() -> FieldMetadata {
     FieldMetadata::new(BTreeMap::from([(
         LIX_VALUE_TYPE_METADATA_KEY.to_string(),
-        LIX_VALUE_TYPE_JSON.to_string(),
+        LIX_VALUE_TYPE_JSONB.to_string(),
     )]))
 }
 
@@ -2945,74 +3051,300 @@ pub(crate) fn query_result_from_batches(
         .iter()
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
-    let mut rows = Vec::<Vec<Value>>::new();
+    let mut rows =
+        Vec::<Vec<Value>>::with_capacity(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
     for batch in batches {
-        for row_index in 0..batch.num_rows() {
-            rows.push(row_values_from_batch(result_fields, batch, row_index)?);
-        }
+        append_batch_rows(result_fields, batch, &mut rows)?;
     }
 
     Ok(SqlQueryResult {
         rows,
-        columns: result_columns.clone(),
+        columns: result_columns,
         notices: Vec::new(),
     })
 }
 
+/// Appends one batch to `rows`, filling it column by column.
+///
+/// Rows are grown to their final width first, then each column is downcast once
+/// and written across every row. Reading a column top to bottom keeps both the
+/// Arrow side and the type dispatch out of the inner loop: the array kind is
+/// matched once per column instead of once per cell.
+fn append_batch_rows(
+    result_fields: &[Field],
+    batch: &RecordBatch,
+    rows: &mut Vec<Vec<Value>>,
+) -> Result<(), LixError> {
+    let row_base = rows.len();
+    let column_count = batch.num_columns();
+    rows.resize_with(row_base + batch.num_rows(), || {
+        Vec::<Value>::with_capacity(column_count)
+    });
+    let batch_rows = &mut rows[row_base..];
+    for (column_index, array) in batch.columns().iter().enumerate() {
+        let cursor = column_cursor(result_fields.get(column_index), array.as_ref())?;
+        cursor.append_column(batch_rows)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "storage-benches", test))]
 pub(crate) fn row_values_from_batch(
     result_fields: &[Field],
     batch: &RecordBatch,
     row_index: usize,
 ) -> Result<Vec<Value>, LixError> {
-    let mut row = Vec::<Value>::with_capacity(batch.num_columns());
-    for (column_index, array) in batch.columns().iter().enumerate() {
-        let scalar = ScalarValue::try_from_array(array.as_ref(), row_index)
-            .map_err(datafusion_error_to_lix_error)?;
-        let field = result_fields.get(column_index);
-        row.push(scalar_value_to_lix_value(scalar, field)?);
-    }
-    Ok(row)
+    // Slicing is an offset adjustment, not a copy, so one row reuses exactly
+    // the same column fill as a whole batch.
+    let row = batch.slice(row_index, 1);
+    let mut rows = Vec::<Vec<Value>>::with_capacity(1);
+    append_batch_rows(result_fields, &row, &mut rows)?;
+    rows.pop().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "result row index out of range",
+        )
+    })
 }
 
-fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Result<Value, LixError> {
-    match value {
-        ScalarValue::Null => Ok(Value::Null),
-        ScalarValue::Boolean(Some(value)) => Ok(Value::Boolean(value)),
-        ScalarValue::Boolean(None) => Ok(Value::Null),
-        ScalarValue::Int8(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::Int8(None) => Ok(Value::Null),
-        ScalarValue::Int16(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::Int16(None) => Ok(Value::Null),
-        ScalarValue::Int32(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::Int32(None) => Ok(Value::Null),
-        ScalarValue::Int64(Some(value)) => Ok(Value::Integer(value)),
-        ScalarValue::Int64(None) => Ok(Value::Null),
-        ScalarValue::UInt8(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::UInt8(None) => Ok(Value::Null),
-        ScalarValue::UInt16(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::UInt16(None) => Ok(Value::Null),
-        ScalarValue::UInt32(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::UInt32(None) => Ok(Value::Null),
-        ScalarValue::UInt64(Some(value)) => match i64::try_from(value) {
-            Ok(value) => Ok(Value::Integer(value)),
-            Err(_) => Ok(Value::Text(value.to_string())),
-        },
-        ScalarValue::UInt64(None) => Ok(Value::Null),
-        ScalarValue::Float32(Some(value)) => finite_query_float(f64::from(value)),
-        ScalarValue::Float32(None) => Ok(Value::Null),
-        ScalarValue::Float64(Some(value)) => finite_query_float(value),
-        ScalarValue::Float64(None) => Ok(Value::Null),
-        ScalarValue::Utf8(Some(value))
-        | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => string_scalar_to_lix_value(value, field),
-        ScalarValue::Utf8(None) | ScalarValue::Utf8View(None) | ScalarValue::LargeUtf8(None) => {
-            Ok(Value::Null)
+/// One result column of one `RecordBatch`, already downcast to its concrete
+/// Arrow array.
+///
+/// Result materialization used to build a `ScalarValue` per cell, which meant
+/// one dynamic downcast plus one owned allocation for every cell of every scan.
+/// The batch is uniform by construction, so the downcast is hoisted here and
+/// the row loop reads straight out of the typed array into `Value`.
+enum ColumnCursor<'a> {
+    Null,
+    Boolean(&'a BooleanArray),
+    Int8(&'a Int8Array),
+    Int16(&'a Int16Array),
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    UInt8(&'a UInt8Array),
+    UInt16(&'a UInt16Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Float32(&'a Float32Array),
+    Float64(&'a Float64Array),
+    Utf8(&'a StringArray, TextKind),
+    LargeUtf8(&'a LargeStringArray, TextKind),
+    Utf8View(&'a StringViewArray, TextKind),
+    Binary(&'a BinaryArray),
+    LargeBinary(&'a LargeBinaryArray),
+    TimestampMicrosecond(&'a TimestampMicrosecondArray),
+}
+
+/// Whether a string column carries JSON payloads, decided once per batch from
+/// the result field metadata rather than re-tested per cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextKind {
+    Text,
+    Jsonb,
+}
+
+fn column_cursor<'a>(
+    field: Option<&Field>,
+    array: &'a dyn Array,
+) -> Result<ColumnCursor<'a>, LixError> {
+    let text_kind = if field.is_some_and(field_is_json) {
+        TextKind::Jsonb
+    } else {
+        TextKind::Text
+    };
+    let cursor = match array.data_type() {
+        DataType::Null => ColumnCursor::Null,
+        DataType::Boolean => ColumnCursor::Boolean(downcast_column(array)?),
+        DataType::Int8 => ColumnCursor::Int8(downcast_column(array)?),
+        DataType::Int16 => ColumnCursor::Int16(downcast_column(array)?),
+        DataType::Int32 => ColumnCursor::Int32(downcast_column(array)?),
+        DataType::Int64 => ColumnCursor::Int64(downcast_column(array)?),
+        DataType::UInt8 => ColumnCursor::UInt8(downcast_column(array)?),
+        DataType::UInt16 => ColumnCursor::UInt16(downcast_column(array)?),
+        DataType::UInt32 => ColumnCursor::UInt32(downcast_column(array)?),
+        DataType::UInt64 => ColumnCursor::UInt64(downcast_column(array)?),
+        DataType::Float32 => ColumnCursor::Float32(downcast_column(array)?),
+        DataType::Float64 => ColumnCursor::Float64(downcast_column(array)?),
+        DataType::Utf8 => ColumnCursor::Utf8(downcast_column(array)?, text_kind),
+        DataType::LargeUtf8 => ColumnCursor::LargeUtf8(downcast_column(array)?, text_kind),
+        DataType::Utf8View => ColumnCursor::Utf8View(downcast_column(array)?, text_kind),
+        DataType::Binary => ColumnCursor::Binary(downcast_column(array)?),
+        DataType::LargeBinary => ColumnCursor::LargeBinary(downcast_column(array)?),
+        DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, _) => {
+            ColumnCursor::TimestampMicrosecond(downcast_column(array)?)
         }
-        ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)) => {
-            Ok(Value::Blob(value.into()))
+        other => {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("SQL query produced an unsupported result column type {other}"),
+            )
+            .with_hint(
+                "Cast the column to a supported Lix result type such as TEXT, BIGINT, DOUBLE, BOOLEAN, or BYTEA.",
+            ));
         }
-        ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Ok(Value::Null),
-        other => Ok(Value::Text(other.to_string())),
+    };
+    Ok(cursor)
+}
+
+fn downcast_column<'a, ArrayType: 'static>(
+    array: &'a dyn Array,
+) -> Result<&'a ArrayType, LixError> {
+    array.as_any().downcast_ref::<ArrayType>().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!(
+                "SQL result column declares Arrow type {} but carries a different array layout",
+                array.data_type()
+            ),
+        )
+    })
+}
+
+impl ColumnCursor<'_> {
+    /// Pushes this column's value onto every row of the batch.
+    ///
+    /// `rows` is exactly the batch's row window, so row `n` of the slice is row
+    /// `n` of the array.
+    fn append_column(&self, rows: &mut [Vec<Value>]) -> Result<(), LixError> {
+        match self {
+            Self::Null => {
+                for row in rows.iter_mut() {
+                    row.push(Value::Null);
+                }
+            }
+            Self::Boolean(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Boolean(values.value(row_index))
+                    });
+                }
+            }
+            Self::Int8(values) => append_integers(values, rows),
+            Self::Int16(values) => append_integers(values, rows),
+            Self::Int32(values) => append_integers(values, rows),
+            Self::Int64(values) => append_integers(values, rows),
+            Self::UInt8(values) => append_integers(values, rows),
+            Self::UInt16(values) => append_integers(values, rows),
+            Self::UInt32(values) => append_integers(values, rows),
+            Self::UInt64(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        let value = values.value(row_index);
+                        match i64::try_from(value) {
+                            Ok(value) => Value::Integer(value),
+                            // Unsigned values past the signed range have no
+                            // integer representation in a Lix row, so they are
+                            // preserved exactly as decimal text.
+                            Err(_) => Value::Text(value.to_string()),
+                        }
+                    });
+                }
+            }
+            Self::Float32(values) => append_reals(values, rows)?,
+            Self::Float64(values) => append_reals(values, rows)?,
+            Self::Utf8(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::LargeUtf8(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::Utf8View(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::Binary(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Blob(values.value(row_index).into())
+                    });
+                }
+            }
+            Self::LargeBinary(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Blob(values.value(row_index).into())
+                    });
+                }
+            }
+            Self::TimestampMicrosecond(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Timestamptz(values.value(row_index))
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn append_integers<NativeType>(values: &PrimitiveArray<NativeType>, rows: &mut [Vec<Value>])
+where
+    NativeType: ArrowPrimitiveType,
+    NativeType::Native: Into<i64>,
+{
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        row.push(if values.is_null(row_index) {
+            Value::Null
+        } else {
+            Value::Integer(values.value(row_index).into())
+        });
+    }
+}
+
+fn append_reals<NativeType>(
+    values: &PrimitiveArray<NativeType>,
+    rows: &mut [Vec<Value>],
+) -> Result<(), LixError>
+where
+    NativeType: ArrowPrimitiveType,
+    NativeType::Native: Into<f64>,
+{
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        row.push(if values.is_null(row_index) {
+            Value::Null
+        } else {
+            finite_query_float(values.value(row_index).into())?
+        });
+    }
+    Ok(())
+}
+
+fn text_value(value: &str, kind: TextKind) -> Value {
+    match kind {
+        // The write boundary canonicalizes every JSON payload before it reaches
+        // storage, and the projection decoder copies those bytes into Arrow
+        // verbatim. Re-parsing here only rebuilt a DOM that was immediately
+        // re-serialized, so the bytes are retained directly instead.
+        TextKind::Jsonb => Value::Jsonb(crate::Json::from_canonical_text(value)),
+        TextKind::Text => Value::Text(value.to_owned()),
     }
 }
 
@@ -3024,25 +3356,6 @@ fn finite_query_float(value: f64) -> Result<Value, LixError> {
         ));
     }
     Ok(Value::Real(value))
-}
-
-fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Value, LixError> {
-    if field.is_some_and(field_is_json) {
-        return serde_json::from_str::<serde_json::Value>(&value)
-            .map(Value::Json)
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_INVALID_JSON",
-                    format!(
-                        "column '{}' is marked as JSON but contains invalid JSON: {error}",
-                        field
-                            .map(|field| field.name().as_str())
-                            .unwrap_or("<unknown>")
-                    ),
-                )
-            });
-    }
-    Ok(Value::Text(value))
 }
 
 #[cfg(test)]
@@ -3063,8 +3376,8 @@ mod tests {
 
     use super::{
         SqlExecutionContext, SqlWriteExecutionContext, build_write_session_with_options,
-        execute_sql, scalar_value_to_lix_value, write_provider_selection, write_session_options,
-        write_target_table_name,
+        execute_sql, query_result_from_batches, row_values_from_batch, write_provider_selection,
+        write_session_options, write_target_table_name,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
@@ -3075,10 +3388,10 @@ mod tests {
     };
     use crate::common::LixTimestamp;
     use crate::functions::FunctionProviderHandle;
+    use crate::hot_state::{HotStateReader, HotStateScanRequest, MaterializedHotStateRow};
     use crate::json_store::JsonStoreContext;
-    use crate::live_state::{LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::sql2::{
-        ChangelogQuerySource, EntitySnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
+        ChangelogQuerySource, RowSnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
         SqlHistoryQuerySource,
     };
     use crate::sql2::{
@@ -3089,7 +3402,7 @@ mod tests {
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope,
         StorageReadOptions,
     };
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
     };
     use crate::{
@@ -3098,27 +3411,124 @@ mod tests {
     };
     use crate::{LixError, NullableKeyFilter, Value};
     use bytes::Bytes;
-    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::array::{
+        ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
+        StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::common::ScalarValue;
     use datafusion::error::DataFusionError;
     use datafusion::physical_plan::RecordBatchStream;
+
+    #[test]
+    fn direct_typed_public_rows_match_generic_scalar_conversion_for_every_supported_type() {
+        const ROWS: usize = 242;
+        let present = |index: usize| index % 7 != 0;
+        let fields = vec![
+            Field::new("null", DataType::Null, true),
+            Field::new("bool", DataType::Boolean, true),
+            Field::new("i8", DataType::Int8, true),
+            Field::new("i16", DataType::Int16, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("i64", DataType::Int64, true),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("u16", DataType::UInt16, true),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("u64", DataType::UInt64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("utf8", DataType::Utf8, true),
+            Field::new("utf8_view", DataType::Utf8View, true),
+            Field::new("large_utf8", DataType::LargeUtf8, true),
+            Field::new("binary", DataType::Binary, true),
+            Field::new("large_binary", DataType::LargeBinary, true),
+        ];
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(NullArray::new(ROWS)),
+            Arc::new(BooleanArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index % 2 == 0)),
+            )),
+            Arc::new(Int8Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some((index % 101) as i8 - 50)),
+            )),
+            Arc::new(Int16Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i16 - 120)),
+            )),
+            Arc::new(Int32Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i32 - 130)),
+            )),
+            Arc::new(Int64Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i64 - 140)),
+            )),
+            Arc::new(UInt8Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u8)),
+            )),
+            Arc::new(UInt16Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u16 * 3)),
+            )),
+            Arc::new(UInt32Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u32 * 5)),
+            )),
+            Arc::new(UInt64Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(if index == 1 {
+                    u64::MAX
+                } else {
+                    index as u64 * 7
+                })
+            }))),
+            Arc::new(Float32Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(index as f32 * 0.25 - 10.0)
+            }))),
+            Arc::new(Float64Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(index as f64 * 0.5 - 20.0)
+            }))),
+            Arc::new(StringArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("utf8")),
+            )),
+            Arc::new(StringViewArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("utf8-view")),
+            )),
+            Arc::new(LargeStringArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("large-utf8")),
+            )),
+            Arc::new(BinaryArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(b"binary".as_slice())),
+            )),
+            Arc::new(LargeBinaryArray::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(b"large-binary".as_slice())
+            }))),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), arrays)
+            .expect("all ordinary result arrays share one schema");
+
+        let generic_rows = (0..ROWS)
+            .map(|row_index| row_values_from_batch(&fields, &batch, row_index))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("generic scalar conversion");
+        let direct = query_result_from_batches(&fields, &[batch]).expect("direct typed conversion");
+
+        assert_eq!(
+            direct.columns,
+            fields.iter().map(Field::name).cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(direct.rows, generic_rows);
+    }
 
     struct DummyBlobReader;
     struct StaticBlobReader {
         bytes: Vec<u8>,
     }
-    struct DummyLiveStateReader;
-    struct RowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct DummyHotStateReader;
+    struct RowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
-    struct CapturingRowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
-        requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+    struct CapturingRowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
+        requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
     }
-    struct CountingRowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct CountingRowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
         scans: Arc<AtomicUsize>,
     }
     struct CountingBatchStream {
@@ -3216,9 +3626,9 @@ mod tests {
         );
         assert_eq!(cursor.next_values().await.unwrap(), None);
     }
-    struct RecordingEntitySnapshotReader {
+    struct RecordingRowSnapshotReader {
         snapshots: Vec<Option<Bytes>>,
-        requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+        requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
     }
     struct DummyCommitGraphReader;
     struct DummyBranchRefReader;
@@ -3235,17 +3645,71 @@ mod tests {
     }
 
     #[test]
-    fn result_scalar_conversion_moves_blob_payload() {
-        let payload = vec![0x41, 0x42, 0x43];
-        let payload_pointer = payload.as_ptr();
-
-        let result = scalar_value_to_lix_value(ScalarValue::LargeBinary(Some(payload)), None)
-            .expect("blob scalar should convert");
-        let Value::Blob(bytes) = result else {
-            panic!("expected blob result");
+    fn typed_row_conversion_covers_every_supported_result_column_type() {
+        use datafusion::arrow::array::{
+            BooleanArray, Float64Array, LargeBinaryArray, NullArray, StringArray, UInt64Array,
         };
 
-        assert_eq!(bytes.as_ptr(), payload_pointer);
+        let fields = vec![
+            Field::new("nothing", DataType::Null, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("ordinal", DataType::Int64, true),
+            Field::new("big", DataType::UInt64, true),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new("label", DataType::Utf8, true),
+            crate::sql2::result_metadata::json_field("document", true),
+            Field::new("payload", DataType::LargeBinary, true),
+        ];
+        let schema = Arc::new(Schema::new(fields.clone()));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(NullArray::new(2)),
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+                Arc::new(Int64Array::from(vec![Some(7i64), None])),
+                Arc::new(UInt64Array::from(vec![Some(u64::MAX), None])),
+                Arc::new(Float64Array::from(vec![Some(1.5f64), None])),
+                Arc::new(StringArray::from(vec![Some("hello"), None])),
+                Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some([0x41u8, 0x42, 0x43].as_slice()),
+                    None,
+                ])),
+            ],
+        )
+        .expect("test batch should match schema");
+
+        assert_eq!(
+            row_values_from_batch(&fields, &batch, 0).expect("typed row conversion"),
+            vec![
+                Value::Null,
+                Value::Boolean(true),
+                Value::Integer(7),
+                Value::Text(u64::MAX.to_string()),
+                Value::Real(1.5),
+                Value::Text("hello".to_owned()),
+                Value::Jsonb(crate::Json::from_canonical_text(r#"{"a":1}"#)),
+                Value::Blob(vec![0x41, 0x42, 0x43].into()),
+            ]
+        );
+        assert_eq!(
+            row_values_from_batch(&fields, &batch, 1).expect("typed row conversion"),
+            vec![Value::Null; 8]
+        );
+    }
+
+    #[test]
+    fn unsupported_result_column_types_are_rejected_once_per_batch() {
+        use datafusion::arrow::array::Date32Array;
+
+        let fields = vec![Field::new("day", DataType::Date32, true)];
+        let schema = Arc::new(Schema::new(fields.clone()));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Date32Array::from(vec![0i32]))])
+            .expect("test batch should match schema");
+
+        let error = row_values_from_batch(&fields, &batch, 0)
+            .expect_err("unsupported column types must be rejected");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
     }
 
     #[derive(Default)]
@@ -3294,7 +3758,7 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     struct CapturedStageRow {
-        entity_pk: String,
+        row_pk: String,
         schema_key: String,
         branch_id: String,
         file_id: Option<String>,
@@ -3308,11 +3772,11 @@ mod tests {
     impl From<TransactionWriteRow> for CapturedStageRow {
         fn from(row: TransactionWriteRow) -> Self {
             Self {
-                entity_pk: row
-                    .entity_pk
-                    .expect("captured staged row should carry entity_pk")
+                row_pk: row
+                    .row_pk
+                    .expect("captured staged row should carry row_pk")
                     .as_json_array_text()
-                    .expect("captured staged row should project entity_pk"),
+                    .expect("captured staged row should project row_pk"),
                 schema_key: row.schema_key.into(),
                 branch_id: row.branch_id.into(),
                 file_id: row.file_id.map(Into::into),
@@ -3328,8 +3792,8 @@ mod tests {
     struct DummySqlExecutionContext<'a> {
         active_branch_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
-        live_state: Arc<dyn LiveStateReader>,
-        entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
+        hot_state: Arc<dyn HotStateReader>,
+        row_snapshot_reader: Option<Arc<dyn RowSnapshotReader>>,
         schema_definitions: Vec<JsonValue>,
     }
 
@@ -3341,17 +3805,17 @@ mod tests {
             self.active_branch_id
         }
 
-        fn live_state(&self) -> Arc<dyn LiveStateReader> {
-            Arc::clone(&self.live_state)
+        fn hot_state(&self) -> Arc<dyn HotStateReader> {
+            Arc::clone(&self.hot_state)
         }
 
-        fn entity_snapshot_reader(&self) -> Option<Arc<dyn EntitySnapshotReader>> {
-            self.entity_snapshot_reader.clone()
+        fn row_snapshot_reader(&self) -> Option<Arc<dyn RowSnapshotReader>> {
+            self.row_snapshot_reader.clone()
         }
 
         fn filesystem_path_index(&self) -> Arc<dyn crate::filesystem::FilesystemPathIndexReader> {
             Arc::new(crate::filesystem::UncachedFilesystemPathIndexReader::new(
-                Arc::clone(&self.live_state),
+                Arc::clone(&self.hot_state),
             ))
         }
 
@@ -3402,7 +3866,7 @@ mod tests {
     struct DummySqlWriteExecutionContext<'a> {
         active_branch_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
-        live_state: Arc<dyn LiveStateReader>,
+        hot_state: Arc<dyn HotStateReader>,
         staged_writes: Arc<Mutex<CapturingStagedWrites>>,
         schema_definitions: Vec<JsonValue>,
     }
@@ -3439,18 +3903,18 @@ mod tests {
             self.blob_reader.load_bytes_many(hashes).await
         }
 
-        async fn scan_live_state_batch(
+        async fn scan_hot_state_batch(
             &mut self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
-            self.live_state.scan_batch(request).await
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
+            self.hot_state.scan_batch(request).await
         }
 
-        async fn load_exact_live_state_batch(
+        async fn load_exact_hot_state_batch(
             &mut self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            self.live_state.load_exact_batch(request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            self.hot_state.load_exact_batch(request).await
         }
 
         async fn load_branch_head(
@@ -3487,7 +3951,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction::types::TypedMutationJournalBatch,
+            _rows: crate::transaction_types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -3545,18 +4009,18 @@ mod tests {
             self.inner.load_bytes_many(hashes).await
         }
 
-        async fn scan_live_state_batch(
+        async fn scan_hot_state_batch(
             &mut self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
-            self.inner.scan_live_state_batch(request).await
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
+            self.inner.scan_hot_state_batch(request).await
         }
 
-        async fn load_exact_live_state_batch(
+        async fn load_exact_hot_state_batch(
             &mut self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            self.inner.load_exact_live_state_batch(request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            self.inner.load_exact_hot_state_batch(request).await
         }
 
         async fn load_branch_head(
@@ -3576,7 +4040,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            rows: crate::transaction::types::TypedMutationJournalBatch,
+            rows: crate::transaction_types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             self.inner.stage_typed_mutation_journal_replace(rows).await
         }
@@ -3774,7 +4238,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(StaticBlobReader { bytes: Vec::new() }),
-            live_state: Arc::new(CapturingRowsLiveStateReader {
+            hot_state: Arc::new(CapturingRowsHotStateReader {
                 rows: Vec::new(),
                 requests: Arc::new(Mutex::new(Vec::new())),
             }),
@@ -3784,7 +4248,7 @@ mod tests {
         let plan = create_write_logical_plan(
             &mut ctx,
             "INSERT INTO lix_revert (diff_id) \
-             SELECT diff_id FROM VALUES ('d1.test') AS selected(diff_id) \
+             SELECT diff_id FROM (VALUES ('d1.test')) AS selected(diff_id) \
              RETURNING commit_id",
         )
         .await
@@ -3868,29 +4332,29 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateReader for DummyLiveStateReader {
+    impl HotStateReader for DummyHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             Ok(vec![].into())
         }
     }
 
-    fn filter_live_state_rows(
-        rows: &[MaterializedLiveStateRow],
-        request: &LiveStateScanRequest,
-    ) -> Vec<MaterializedLiveStateRow> {
+    fn filter_hot_state_rows(
+        rows: &[MaterializedHotStateRow],
+        request: &HotStateScanRequest,
+    ) -> Vec<MaterializedHotStateRow> {
         if matches!(
             request.filter.rows,
-            crate::live_state::LiveStateRowFilter::None
+            crate::hot_state::HotStateRowFilter::None
         ) {
             return Vec::new();
         }
@@ -3899,8 +4363,7 @@ mod tests {
             .filter(|row| {
                 (request.filter.schema_keys.is_empty()
                     || request.filter.schema_keys.contains(&row.schema_key))
-                    && (request.filter.entity_pks.is_empty()
-                        || request.filter.entity_pks.contains(&row.entity_pk))
+                    && request.filter.matches_row_pk(&row.row_pk)
                     && (request.filter.branch_ids.is_empty()
                         || request
                             .filter
@@ -3930,66 +4393,66 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateReader for RowsLiveStateReader {
+    impl HotStateReader for RowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
-            Ok(filter_live_state_rows(&self.rows, request).into())
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
+            Ok(filter_hot_state_rows(&self.rows, request).into())
         }
     }
 
     #[async_trait]
-    impl LiveStateReader for CapturingRowsLiveStateReader {
+    impl HotStateReader for CapturingRowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             self.requests
                 .lock()
                 .expect("captured live-state requests lock")
                 .push(request.clone());
-            Ok(filter_live_state_rows(&self.rows, request).into())
+            Ok(filter_hot_state_rows(&self.rows, request).into())
         }
     }
 
     #[async_trait]
-    impl LiveStateReader for CountingRowsLiveStateReader {
+    impl HotStateReader for CountingRowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             self.scans.fetch_add(1, Ordering::SeqCst);
-            Ok(filter_live_state_rows(&self.rows, request).into())
+            Ok(filter_hot_state_rows(&self.rows, request).into())
         }
     }
 
     #[async_trait]
-    impl EntitySnapshotReader for RecordingEntitySnapshotReader {
-        async fn scan_entity_snapshots(
+    impl RowSnapshotReader for RecordingRowSnapshotReader {
+        async fn scan_row_snapshots(
             &self,
-            request: LiveStateScanRequest,
+            request: HotStateScanRequest,
         ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
             self.requests
                 .lock()
@@ -4027,17 +4490,19 @@ mod tests {
         }
     }
 
-    fn live_entity_row(entity_pk: &str, branch_id: &str, value: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+    fn live_row(row_pk: &str, branch_id: &str, value: &str) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: crate::row_pk::RowPk::single(row_pk),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
-            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
+            snapshot_content: Some(
+                format!("{{\"id\":\"{row_pk}\",\"value\":\"{value}\"}}").into(),
+            ),
+            metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -4046,14 +4511,14 @@ mod tests {
     }
 
     fn live_test_state_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         value: &str,
         untracked: bool,
-    ) -> MaterializedLiveStateRow {
-        let mut row = live_entity_row(entity_pk, branch_id, value);
+    ) -> MaterializedHotStateRow {
+        let mut row = live_row(row_pk, branch_id, value);
         row.snapshot_content = Some(
-            json!({ "id": entity_pk, "value": value })
+            json!({ "id": row_pk, "value": value })
                 .to_string()
                 .into(),
         );
@@ -4062,30 +4527,30 @@ mod tests {
     }
 
     fn live_directory_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         parent_id: Option<&str>,
         name: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture directory ID should be a UUID"),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(
                 json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "parent_id": parent_id,
                     "name": name
                 })
                 .to_string()
                 .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
+            metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -4094,30 +4559,30 @@ mod tests {
     }
 
     fn live_file_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         directory_id: Option<&str>,
         name: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture file ID should be a UUID"),
             schema_key: "lix_file_descriptor".to_string(),
-            file_id: Some(entity_pk.to_string()),
+            file_id: Some(row_pk.to_string()),
             snapshot_content: Some(
                 json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "directory_id": directory_id,
                     "name": name
                 })
                 .to_string()
                 .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
+            metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -4126,32 +4591,32 @@ mod tests {
     }
 
     fn live_blob_ref_row(
-        entity_pk: &str,
+        row_pk: &str,
         branch_id: &str,
         bytes: &[u8],
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
                 .expect("fixture blob-ref ID should be a UUID"),
             schema_key: "lix_binary_blob_ref".to_string(),
-            file_id: Some(entity_pk.to_string()),
+            file_id: Some(row_pk.to_string()),
             snapshot_content: Some(
                 json!({
-                    "id": entity_pk,
+                    "id": row_pk,
                     "blob_hash": crate::binary_cas::BlobId::from_content(bytes).to_hex(),
                     "size_bytes": bytes.len()
                 })
                 .to_string()
                 .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
+            metadata: Some(json!({ "source": row_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!(
-                "change-{entity_pk}-blob"
+                "change-{row_pk}-blob"
             ))),
             commit_id: Some(CommitId::for_test_label(&format!(
-                "commit-{entity_pk}-blob"
+                "commit-{row_pk}-blob"
             ))),
             global: false,
             untracked: false,
@@ -4160,8 +4625,41 @@ mod tests {
         }
     }
 
+    /// The revocation guard refuses a retired write context instead of
+    /// dereferencing a pointer into a destroyed `Transaction`.
+    ///
+    /// The first half is load-bearing: it proves the guard is *reached* on this
+    /// path. Without it a green result could mean "never checked" rather than
+    /// "checked and live", which is exactly how a null instrument result lies.
+    #[tokio::test]
+    async fn retired_write_context_is_refused_instead_of_dereferenced() {
+        const BRANCH: &str = "01920000-0000-7000-8000-0000000000a1";
+        const REFUSAL: &str = "refusing to dereference a retired context";
+
+        let (mut ctx, _staged, _scans) = counting_write_context(vec![]);
+        let write_ctx = crate::sql2::SqlWriteContext::new(&mut ctx);
+
+        let live = write_ctx.load_branch_head(BRANCH).await;
+        assert!(
+            !format!("{live:?}").contains(REFUSAL),
+            "guard must not fire while the borrowed context is live: {live:?}"
+        );
+
+        // Exactly what `Transaction::drop` does.
+        write_ctx.liveness_for_test().retire();
+
+        let error = write_ctx
+            .load_branch_head(BRANCH)
+            .await
+            .expect_err("a retired write context must be refused");
+        assert!(
+            format!("{error:?}").contains(REFUSAL),
+            "retired context produced the wrong failure: {error:?}"
+        );
+    }
+
     fn counting_write_context(
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<MaterializedHotStateRow>,
     ) -> (
         DummySqlWriteExecutionContext<'static>,
         Arc<Mutex<CapturingStagedWrites>>,
@@ -4171,7 +4669,7 @@ mod tests {
     }
 
     fn counting_write_context_with_blob_reader(
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<MaterializedHotStateRow>,
         blob_reader: Arc<dyn BlobDataReader>,
     ) -> (
         DummySqlWriteExecutionContext<'static>,
@@ -4179,7 +4677,7 @@ mod tests {
         Arc<AtomicUsize>,
     ) {
         let scans = Arc::new(AtomicUsize::new(0));
-        let live_state: Arc<dyn LiveStateReader> = Arc::new(CountingRowsLiveStateReader {
+        let hot_state: Arc<dyn HotStateReader> = Arc::new(CountingRowsHotStateReader {
             rows,
             scans: Arc::clone(&scans),
         });
@@ -4188,7 +4686,7 @@ mod tests {
             DummySqlWriteExecutionContext {
                 active_branch_id: "01920000-0000-7000-8000-0000000000a1",
                 blob_reader,
-                live_state,
+                hot_state,
                 staged_writes: Arc::clone(&staged_writes),
                 schema_definitions: vec![],
             },
@@ -4197,7 +4695,7 @@ mod tests {
         )
     }
 
-    fn mark_untracked(mut row: MaterializedLiveStateRow) -> MaterializedLiveStateRow {
+    fn mark_untracked(mut row: MaterializedHotStateRow) -> MaterializedHotStateRow {
         row.untracked = true;
         row
     }
@@ -4218,19 +4716,19 @@ mod tests {
 
     #[tokio::test]
     #[expect(trivial_casts)]
-    async fn sql_execution_context_exposes_live_state_and_blob_reader() {
+    async fn sql_execution_context_exposes_hot_state_and_blob_reader() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::clone(&blob_reader),
-            live_state: Arc::clone(&live_state) as Arc<dyn LiveStateReader>,
-            entity_snapshot_reader: None,
+            hot_state: Arc::clone(&hot_state) as Arc<dyn HotStateReader>,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
-        let actual = ctx.live_state();
-        let expected = live_state as Arc<dyn LiveStateReader>;
+        let actual = ctx.hot_state();
+        let expected = hot_state as Arc<dyn HotStateReader>;
         assert_eq!(
             ctx.active_branch_id(),
             "01920000-0000-7000-8000-0000000000a1"
@@ -4242,12 +4740,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_uses_execution_context_boundary() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
-            entity_snapshot_reader: None,
+            hot_state,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -4258,37 +4756,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integer_primary_key_read_pushes_exact_identity_to_live_state() {
+    async fn integer_primary_key_read_pushes_exact_identity_to_hot_state() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
-        let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
-        let entity_pk = crate::entity_pk::EntityPk::from_external_parts(
+        let component_types = [crate::row_pk::RowPkComponentType::Integer];
+        let row_pk = crate::row_pk::RowPk::from_external_parts(
             vec!["42".to_string()],
             &component_types,
         )
         .expect("integer fixture identity should encode");
-        let mut row = live_entity_row("42", branch_id, "answer");
-        row.entity_pk = entity_pk.clone();
+        let mut row = live_row("42", branch_id, "answer");
+        row.row_pk = row_pk.clone();
         row.schema_key = "integer_state_schema".to_string();
         row.snapshot_content = Some(json!({ "id": 42, "value": "answer" }).to_string().into());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let ctx = DummySqlExecutionContext {
             active_branch_id: branch_id,
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(CapturingRowsLiveStateReader {
+            hot_state: Arc::new(CapturingRowsHotStateReader {
                 rows: vec![row],
                 requests: Arc::clone(&requests),
             }),
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![json!({
-                "x-lix-key": "integer_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "integer_state_schema",
+                "columns": [
+                    { "name": "id", "type": "int8", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -4305,43 +4801,41 @@ mod tests {
         let [request] = requests.as_slice() else {
             panic!("integer point read should issue one live-state scan");
         };
-        assert_eq!(request.filter.entity_pks, vec![entity_pk]);
+        assert_eq!(request.filter.row_pks, vec![row_pk]);
     }
 
     #[tokio::test]
-    async fn datafusion_entity_primary_key_read_materializes_public_result() {
+    async fn datafusion_row_primary_key_read_materializes_public_result() {
         let sql = "SELECT id, value FROM test_state_schema \
-                   WHERE id IN ('entity-b', 'entity-a') ORDER BY id";
+                   WHERE id IN ('row-b', 'row-a') ORDER BY id";
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(RowsLiveStateReader {
+            hot_state: Arc::new(RowsHotStateReader {
                 rows: vec![
                     live_test_state_row(
-                        "entity-b",
+                        "row-b",
                         "01920000-0000-7000-8000-0000000000a1",
                         "B",
                         false,
                     ),
                     live_test_state_row(
-                        "entity-a",
+                        "row-a",
                         "01920000-0000-7000-8000-0000000000a1",
                         "A",
                         false,
                     ),
                 ],
             }),
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
         let result = execute_sql(&ctx, sql, &[])
@@ -4353,11 +4847,11 @@ mod tests {
             result.rows,
             vec![
                 vec![
-                    Value::Text("entity-a".to_string()),
+                    Value::Text("row-a".to_string()),
                     Value::Text("A".to_string())
                 ],
                 vec![
-                    Value::Text("entity-b".to_string()),
+                    Value::Text("row-b".to_string()),
                     Value::Text("B".to_string())
                 ],
             ]
@@ -4365,14 +4859,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datafusion_entity_primary_key_read_uses_registered_provider() {
+    async fn datafusion_row_primary_key_read_uses_registered_provider() {
         let sql = "SELECT id, value FROM test_state_schema \
-                   WHERE id IN ('entity-b', 'entity-a', 'entity-b') ORDER BY id";
+                   WHERE id IN ('row-b', 'row-a', 'row-b') ORDER BY id";
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let snapshot_reader = Arc::new(RecordingEntitySnapshotReader {
+        let snapshot_reader = Arc::new(RecordingRowSnapshotReader {
             snapshots: vec![
-                Some(Bytes::from_static(br#"{"id":"entity-a","value":"A"}"#)),
-                Some(Bytes::from_static(br#"{"id":"entity-b","value":"B"}"#)),
+                Some(Bytes::from_static(br#"{"id":"row-a","value":"A"}"#)),
+                Some(Bytes::from_static(br#"{"id":"row-b","value":"B"}"#)),
             ],
             requests: Arc::clone(&requests),
         });
@@ -4380,16 +4874,16 @@ mod tests {
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(CountingRowsLiveStateReader {
+            hot_state: Arc::new(CountingRowsHotStateReader {
                 rows: vec![
                     live_test_state_row(
-                        "entity-b",
+                        "row-b",
                         "01920000-0000-7000-8000-0000000000a1",
                         "B",
                         false,
                     ),
                     live_test_state_row(
-                        "entity-a",
+                        "row-a",
                         "01920000-0000-7000-8000-0000000000a1",
                         "A",
                         false,
@@ -4397,17 +4891,15 @@ mod tests {
                 ],
                 scans: Arc::clone(&scans),
             }),
-            entity_snapshot_reader: Some(snapshot_reader),
+            row_snapshot_reader: Some(snapshot_reader),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
         let result = execute_sql(&ctx, sql, &[])
@@ -4418,35 +4910,68 @@ mod tests {
             result.rows,
             vec![
                 vec![
-                    Value::Text("entity-a".to_string()),
+                    Value::Text("row-a".to_string()),
                     Value::Text("A".to_string())
                 ],
                 vec![
-                    Value::Text("entity-b".to_string()),
+                    Value::Text("row-b".to_string()),
                     Value::Text("B".to_string())
                 ],
             ]
         );
-        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        // A `WHERE` clause that resolves to a complete row identity set is
+        // applied in full by the `row_pks` access path, so this read must
+        // take the direct point-snapshot route rather than the generic
+        // visibility scan.
+        //
+        // This assertion pair previously read `scans == 1` and
+        // `requests.is_empty()` — the exact opposite — and its message called
+        // the snapshot reader "the deleted native snapshot route". That wording
+        // predates the current `RowSnapshotReader`, which is a live route
+        // registered from `SqlExecutionContext::row_snapshot_reader` and
+        // backed by the row point-snapshot cache. The old expectation froze
+        // a mis-gate in `plan_scan_parts`: it re-derived a residual row filter
+        // for a predicate the access path already applied, and a non-empty
+        // `row_filters` disqualifies every direct route.
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            0,
+            "an exact identity point read must not fall back to the generic visibility scan"
+        );
         let requests = requests.lock().expect("captured snapshot requests lock");
-        assert!(
-            requests.is_empty(),
-            "DataFusion reads must not invoke the deleted native snapshot route"
+        assert_eq!(
+            requests.len(),
+            1,
+            "an exact identity point read must consult the row point-snapshot route exactly once"
+        );
+        assert_eq!(
+            requests[0].filter.schema_keys,
+            vec!["test_state_schema".to_string()],
+            "the point-snapshot request must be scoped to the queried schema"
+        );
+        assert_eq!(
+            requests[0].filter.row_pks,
+            vec![
+                crate::row_pk::RowPk::single("row-a"),
+                crate::row_pk::RowPk::single("row-b"),
+            ],
+            "the repeated 'row-b' in the IN list must collapse into a deduplicated, \
+             ordered identity set rather than being pushed down three times"
         );
     }
 
     #[tokio::test]
-    async fn datafusion_entity_left_join_preserves_matches_and_null_extension() {
-        let sql = r#"SELECT "bundle"."id" AS "bundleId",
-                         "message"."id" AS "messageId",
+    async fn datafusion_row_left_join_preserves_matches_and_null_extension() {
+        let sql = r#"SELECT "bundle"."id" AS "bundle_id",
+                         "message"."id" AS "message_id",
                          "variant"."id" AS "variantId",
                          "variant"."pattern" AS "variantPattern"
                     FROM "bundle"
-                    LEFT JOIN "message" ON "message"."bundleId" = "bundle"."id"
-                    LEFT JOIN "variant" ON "variant"."messageId" = "message"."id"
+                    LEFT JOIN "message" ON "message"."bundle_id" = "bundle"."id"
+                    LEFT JOIN "variant" ON "variant"."message_id" = "message"."id"
                    WHERE "bundle"."id" = $1"#;
-        let row = |schema_key: &str, entity_pk: &str, snapshot: &str| {
-            let mut row = live_entity_row(entity_pk, "01920000-0000-7000-8000-0000000000a1", "");
+        let row = |schema_key: &str, row_pk: &str, snapshot: &str| {
+            let mut row = live_row(row_pk, "01920000-0000-7000-8000-0000000000a1", "");
             row.schema_key = schema_key.to_string();
             row.snapshot_content = Some(snapshot.to_string().into());
             row
@@ -4454,62 +4979,58 @@ mod tests {
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(RowsLiveStateReader {
+            hot_state: Arc::new(RowsHotStateReader {
                 rows: vec![
                     row("bundle", "b1", r#"{"id":"b1"}"#),
                     // Stored JSON can violate a registered string type. The
                     // provider projection retains the established coercion.
-                    row("message", "true", r#"{"id":true,"bundleId":"b1"}"#),
-                    row("message", "m2", r#"{"id":"m2","bundleId":"b1"}"#),
+                    row("message", "true", r#"{"id":true,"bundle_id":"b1"}"#),
+                    row("message", "m2", r#"{"id":"m2","bundle_id":"b1"}"#),
                     row(
                         "variant",
                         "v1",
-                        r#"{"id":"v1","messageId":true,"pattern":"Hello"}"#,
+                        r#"{"id":"v1","message_id":true,"pattern":"Hello"}"#,
                     ),
                 ],
             }),
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![
                 json!({
-                    "x-lix-key": "bundle",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": { "id": { "type": "string" } },
-                    "required": ["id"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "bundle",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 }),
                 json!({
-                    "x-lix-key": "message",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "bundleId": { "type": "string" }
-                    },
-                    "required": ["id", "bundleId"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "message",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                        { "name": "bundle_id", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 }),
                 json!({
-                    "x-lix-key": "variant",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "messageId": { "type": "string" },
-                        "pattern": { "type": "string" }
-                    },
-                    "required": ["id", "messageId", "pattern"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "variant",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                        { "name": "message_id", "type": "text", "nullable": false },
+                        { "name": "pattern", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 }),
             ],
         };
         let result = execute_sql(&ctx, sql, &[Value::Text("b1".to_string())])
             .await
-            .expect("DataFusion entity join should execute");
+            .expect("DataFusion row join should execute");
 
         assert_eq!(
             result.columns,
-            ["bundleId", "messageId", "variantId", "variantPattern"]
+            ["bundle_id", "message_id", "variantId", "variantPattern"]
         );
         assert_eq!(
             result.rows,
@@ -4533,12 +5054,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_collects_union_all_partitions() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
-            entity_snapshot_reader: None,
+            hot_state,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -4559,14 +5080,14 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"aggregate_filter_test\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"integer\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"aggregate_filter_test\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"int8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false, false)",
                 &[],
             )
@@ -4595,12 +5116,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_rejects_extra_parameters() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
-            entity_snapshot_reader: None,
+            hot_state,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -4631,12 +5152,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_exposes_datafusion_information_schema() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
-            entity_snapshot_reader: None,
+            hot_state,
+            row_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -4669,13 +5190,13 @@ mod tests {
         let storage = Memory::new();
         let init_receipt = Engine::initialize(storage.clone()).await?;
         let engine = Engine::new(storage).await?;
-        let session = engine.open_session(init_receipt.main_branch_id).await?;
+        let session = engine.open_session_at(init_receipt.main_branch_id).await?;
 
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"test_state_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"int8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -4685,8 +5206,8 @@ mod tests {
         session
             .execute(
                 "INSERT INTO test_state_schema \
-	             (lixcol_entity_pk, value, count, lixcol_metadata, lixcol_untracked) \
-	             VALUES (lix_json('[\"entity-history\"]'), 'A', 7, '{\"source\":\"history\"}', false)",
+             (lixcol_row_pk, id, value, count, lixcol_metadata, lixcol_untracked) \
+             VALUES (CAST('[\"row-history\"]' AS JSONB), 'row-history', 'A', 7, '{\"source\":\"history\"}', false)",
                 &[],
             )
             .await?;
@@ -4719,7 +5240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_entity_collection_delete_uses_one_generation_fact_and_allows_recreation() {
+    async fn whole_row_collection_delete_uses_one_generation_fact_and_allows_recreation() {
         let storage = Memory::new();
         let init_receipt = Engine::initialize(storage.clone())
             .await
@@ -4727,14 +5248,14 @@ mod tests {
         let engine = Engine::new(storage).await.expect("engine should open");
         let branch_id = init_receipt.main_branch_id.clone();
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"test_state_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -4811,7 +5332,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("entity tombstone changelog should query")
+            .expect("row tombstone changelog should query")
             .rows()[0]
             .get::<i64>("changes")
             .expect("tombstone count should be numeric");
@@ -4859,7 +5380,7 @@ mod tests {
             .await
             .expect("branching from the deleted collection should succeed");
         let checkout_session = engine
-            .open_session(checkout.id)
+            .open_session_at(checkout.id)
             .await
             .expect("checkout branch session should open");
         let selected = checkout_session
@@ -4905,21 +5426,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_entity_collection_delete_is_visible_inside_explicit_transaction() {
+    async fn whole_row_collection_delete_is_visible_inside_explicit_transaction() {
         let storage = Memory::new();
         let init_receipt = Engine::initialize(storage.clone())
             .await
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"test_state_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -5037,23 +5558,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_entity_collection_delete_falls_back_for_global_members() {
+    async fn whole_row_collection_delete_falls_back_for_global_members() {
         let storage = Memory::new();
         let init_receipt = Engine::initialize(storage.clone())
             .await
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global) VALUES \
-                 ('local-only', lix_json('1'), false), \
-                 ('global-only', lix_json('2'), true), \
-                 ('shadowed', lix_json('3'), true), \
-                 ('shadowed', lix_json('4'), false)",
+                 ('local-only', CAST('1' AS JSONB), false), \
+                 ('global-only', CAST('2' AS JSONB), true), \
+                 ('shadowed', CAST('3' AS JSONB), true), \
+                 ('shadowed', CAST('4' AS JSONB), false)",
                 &[],
             )
             .await
@@ -5093,13 +5614,13 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let main = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("main session should open");
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"test_state_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -5122,7 +5643,7 @@ mod tests {
             .await
             .expect("source branch should create");
         let source_session = engine
-            .open_session(source.id.clone())
+            .open_session_at(source.id.clone())
             .await
             .expect("source session should open");
         let deleted = source_session
@@ -5154,7 +5675,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("merged entity tombstones should query")
+            .expect("merged row tombstones should query")
             .rows()[0]
             .get::<i64>("changes")
             .expect("tombstone count should be numeric");
@@ -5169,7 +5690,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
 
@@ -5231,7 +5752,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
 
@@ -5279,31 +5800,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_reads_entity_history_view_from_history_context() {
+    async fn execute_sql_reads_row_history_view_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
             .await
             .expect("history fixture should initialize");
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, count, lixcol_entity_pk, lixcol_depth \
+                    "SELECT value, count, lixcol_row_pk, lixcol_depth \
 	             FROM test_state_schema_history('{head_commit_id}') \
-	             WHERE lixcol_entity_pk = lix_json('[\"entity-history\"]')"
+	             WHERE lixcol_row_pk = CAST('[\"row-history\"]' AS JSONB)"
                 ),
                 &[],
             )
             .await
-            .expect("sql2 execute should read entity history through real engine context");
+            .expect("sql2 execute should read row history through real engine context");
         let (columns, rows) = rows_from_execute_result(result);
 
         assert_eq!(
             columns,
-            vec!["value", "count", "lixcol_entity_pk", "lixcol_depth",]
+            vec!["value", "count", "lixcol_row_pk", "lixcol_depth",]
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("A".to_string()));
         assert_eq!(rows[0][1], Value::Integer(7));
-        assert_eq!(rows[0][2], Value::Json(json!(["entity-history"])));
+        assert_eq!(rows[0][2], Value::Jsonb(json!(["row-history"]).into()));
         assert!(matches!(rows[0][3], Value::Integer(_)));
     }
 
@@ -5411,6 +5932,701 @@ mod tests {
         );
     }
 
+    /// Connectivity check for the per-commit touched-scope digest.
+    ///
+    /// This asserts the *route*, not the timing: that the digest is consulted
+    /// once per reached commit, that it actually prunes commits the query
+    /// cannot need, and that it never falls back to the pre-digest path on a
+    /// repository this build wrote. Four optimizations in earlier rounds
+    /// measured flat because the changed code never ran; a timing sweep cannot
+    /// tell that apart from "the optimization does not help".
+    #[tokio::test]
+    async fn file_history_consults_the_touched_scope_digest_per_commit() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        // Commits that touch a different file. A history read for
+        // `/docs/readme.md` still reaches every one of them, but none can
+        // contribute a row.
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('01920000-0000-7000-8000-0000000000b7', '/docs/noise.md', CAST('n0' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("noise file should insert");
+        for revision in 0..8 {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('n{revision}' AS BYTEA) \
+                         WHERE id = '01920000-0000-7000-8000-0000000000b7'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("noise commit should apply");
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let before = crate::commit_graph::scope_digest_census();
+        let _ = crate::commit_graph::scope_digest_census::by_projection::take();
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT id, path, lixcol_depth FROM lix_file_history('{head_commit_id}') \
+                     WHERE path = '/docs/readme.md' ORDER BY lixcol_depth"
+                ),
+                &[],
+            )
+            .await
+            .expect("by-path history should execute");
+        let census = crate::commit_graph::scope_digest_census().since(&before);
+        let by_projection = crate::commit_graph::scope_digest_census::by_projection::take();
+        eprintln!("scope_digest_census {census:?}");
+        for (projection, buckets) in &by_projection {
+            eprintln!("scope_digest_projection {projection} {buckets:?}");
+        }
+
+        assert!(
+            !result.rows().is_empty(),
+            "the queried path must still have history rows"
+        );
+        assert!(
+            census.probed() > 0,
+            "the digest must be consulted at least once per history read: {census:?}"
+        );
+        assert!(
+            census.pruned > 0,
+            "the digest must skip commits that cannot contribute rows: {census:?}"
+        );
+        assert!(
+            census.loaded_present > 0 || census.loaded_opaque > 0,
+            "commits that can contribute must still be loaded: {census:?}"
+        );
+        assert_eq!(
+            census.loaded_absent, 0,
+            "a repository written by this build must carry a digest on every commit: {census:?}"
+        );
+
+        // Requirement: the digest must serve every projection of history-by-path,
+        // not just the one a benchmark happens to exercise. Each of these is a
+        // separate commit-graph traversal with its own schema-key set.
+        for projection in [
+            "lix_binary_blob_ref+lix_file_descriptor",
+            "lix_directory_descriptor",
+            "lix_key_value",
+        ] {
+            let buckets = by_projection.get(projection).unwrap_or_else(|| {
+                panic!("by-path history should traverse {projection}: {by_projection:?}")
+            });
+            assert!(
+                buckets.get("pruned").copied().unwrap_or(0) > 0,
+                "{projection} must be able to prune commits: {by_projection:?}"
+            );
+            assert_eq!(
+                buckets.get("loaded_absent").copied().unwrap_or(0),
+                0,
+                "{projection} must never hit the pre-digest fallback: {by_projection:?}"
+            );
+        }
+    }
+
+    /// The pinned descriptor/blob route must not narrow the answer.
+    ///
+    /// Pinning `file_ids` makes `change_matches_history_request` require a
+    /// non-null `file_id`, so a descriptor or blob-ref change carrying a null
+    /// or divergent one would silently vanish from file history — a
+    /// correctness bug wearing a performance win's clothes.
+    ///
+    /// The oracle is the **unfiltered** read. A `lix_file_history` query with
+    /// no `id`/`path` predicate resolves no lookup IDs at all, so it never
+    /// constructs the descriptor/blob route and cannot execute the pin; it is
+    /// the answer a completely unpruned traversal produces. Every filtered read
+    /// must equal that answer restricted to the same file.
+    ///
+    /// The shapes are the ones that could plausibly carry a null or divergent
+    /// `file_id`: a file inserted with **no explicit id**, where the planner
+    /// really does emit a descriptor row with `file_id: None` and only
+    /// `canonicalize_descriptor_file_id` fills it in; a rename, which rewrites
+    /// the descriptor without touching content; a content clear, which
+    /// tombstones the blob ref while the descriptor survives; a delete, which
+    /// tombstones both through the snapshot-less row builder; and a recreation
+    /// at the same path under a **different** id, so a path lookup resolves two
+    /// IDs and the per-file discrimination has to be exact rather than
+    /// vacuous.
+    #[tokio::test]
+    async fn pinned_file_history_route_returns_the_unfiltered_answer() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        // Inserted with no explicit id: the engine mints one, and the planner
+        // stages the descriptor row with `file_id: None`.
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) \
+                 VALUES ('/docs/minted.md', CAST('v0' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("id-less file insert should succeed");
+        let minted_id = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/docs/minted.md'",
+                &[],
+            )
+            .await
+            .expect("minted file id should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(minted_id) = minted_id else {
+            panic!("file id should be text");
+        };
+
+        for statement in [
+            // Content revisions: blob-ref rows.
+            "UPDATE lix_file SET content = CAST('v1' AS BYTEA) WHERE path = '/docs/minted.md'",
+            "UPDATE lix_file SET content = CAST('v2' AS BYTEA) WHERE path = '/docs/minted.md'",
+            // Rename: a descriptor rewrite with no content change.
+            "UPDATE lix_file SET path = '/docs/renamed.md' WHERE path = '/docs/minted.md'",
+            // Clear the content: blob-ref tombstone, descriptor survives.
+            "UPDATE lix_file SET content = CAST('' AS BYTEA) WHERE path = '/docs/renamed.md'",
+            // Content on the fixture's own file, so the oracle is not trivially
+            // a single-file history.
+            "UPDATE lix_file SET content = CAST('hello2' AS BYTEA) \
+             WHERE id = '01920000-0000-7000-8000-0000000000a2'",
+            // Delete: descriptor and blob-ref tombstones for the same file.
+            "DELETE FROM lix_file WHERE path = '/docs/renamed.md'",
+            // Recreate at a path the deleted file once occupied, under a
+            // different id.
+            "INSERT INTO lix_file (id, path, content) \
+             VALUES ('01920000-0000-7000-8000-0000000000c4', '/docs/minted.md', \
+             CAST('w0' AS BYTEA))",
+            "UPDATE lix_file SET content = CAST('w1' AS BYTEA) WHERE path = '/docs/minted.md'",
+        ] {
+            session
+                .execute(statement, &[])
+                .await
+                .unwrap_or_else(|error| panic!("fixture statement failed: {statement}: {error}"));
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let projection = format!(
+            "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
+             FROM lix_file_history('{head_commit_id}')"
+        );
+        let key = |row: &Vec<Value>| format!("{:?}", row);
+        let unfiltered = rows_from_execute_result(
+            session
+                .execute(&projection, &[])
+                .await
+                .expect("unfiltered history should execute"),
+        )
+        .1;
+        assert!(
+            !unfiltered.is_empty(),
+            "the unfiltered oracle must produce rows"
+        );
+
+        for (id, path) in [
+            (
+                minted_id.as_str(),
+                // The minted file's last path before it was deleted.
+                "/docs/renamed.md",
+            ),
+            (
+                "01920000-0000-7000-8000-0000000000c4",
+                "/docs/minted.md",
+            ),
+            (
+                "01920000-0000-7000-8000-0000000000a2",
+                "/docs/readme.md",
+            ),
+        ] {
+            let expected_by_id: BTreeSet<String> = unfiltered
+                .iter()
+                .filter(|row| row[0] == Value::Text(id.to_string()))
+                .map(key)
+                .collect();
+            assert!(
+                !expected_by_id.is_empty(),
+                "the oracle must carry history for {id}"
+            );
+            let actual_by_id: BTreeSet<String> = rows_from_execute_result(
+                session
+                    .execute(&format!("{projection} WHERE id = '{id}'"), &[])
+                    .await
+                    .expect("id-filtered history should execute"),
+            )
+            .1
+            .iter()
+            .map(key)
+            .collect();
+            assert_eq!(
+                expected_by_id, actual_by_id,
+                "pinning file_ids changed the id-filtered answer for {id}"
+            );
+
+            let expected_by_path: BTreeSet<String> = unfiltered
+                .iter()
+                .filter(|row| row[1] == Value::Text(path.to_string()))
+                .map(key)
+                .collect();
+            assert!(
+                !expected_by_path.is_empty(),
+                "the oracle must carry history for {path}"
+            );
+            let actual_by_path: BTreeSet<String> = rows_from_execute_result(
+                session
+                    .execute(&format!("{projection} WHERE path = '{path}'"), &[])
+                    .await
+                    .expect("path-filtered history should execute"),
+            )
+            .1
+            .iter()
+            .map(key)
+            .collect();
+            assert_eq!(
+                expected_by_path, actual_by_path,
+                "pinning file_ids changed the path-filtered answer for {path}"
+            );
+        }
+    }
+
+    /// Number of commits that touch a file the query never asks about.
+    ///
+    /// The assertion below is a **threshold** scaled to this fixture, not an
+    /// exact value: the projection census is process-global, so concurrent
+    /// tests in this binary can only ever push the count up.
+    const DESCRIPTOR_BLOB_PRUNE_NOISE_COMMITS: u64 = 32;
+
+    /// Engagement check for pinning `file_ids` on the descriptor + blob-ref
+    /// route.
+    ///
+    /// `lix_binary_blob_ref` is touched by every content commit, so the
+    /// digest's schema-family test cannot prune this projection: without a
+    /// pinned `file_id` the membership test answers `LoadedPresent` for every
+    /// content commit in the repository and the traversal loads one commit
+    /// delta each. Pinning lets the same already-shipped digest answer the
+    /// sharper `(schema_key, file_id)` pair question instead.
+    ///
+    /// This counts inside the membership test itself, one layer below the SQL
+    /// timing instrument, and fails on a tree without the pin — the whole point
+    /// is that a flat timing result and "the changed code never ran" are
+    /// otherwise indistinguishable.
+    #[tokio::test]
+    async fn file_history_by_path_prunes_content_commits_for_other_files() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('01920000-0000-7000-8000-0000000000b8', '/docs/noise.md', CAST('n0' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("noise file should insert");
+        for revision in 0..DESCRIPTOR_BLOB_PRUNE_NOISE_COMMITS {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('n{revision}' AS BYTEA) \
+                         WHERE id = '01920000-0000-7000-8000-0000000000b8'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("noise commit should apply");
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let _ = crate::commit_graph::scope_digest_census::by_projection::take();
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT id, path, lixcol_depth FROM lix_file_history('{head_commit_id}') \
+                     WHERE path = '/docs/readme.md' ORDER BY lixcol_depth"
+                ),
+                &[],
+            )
+            .await
+            .expect("by-path history should execute");
+        let by_projection = crate::commit_graph::scope_digest_census::by_projection::take();
+        for (projection, buckets) in &by_projection {
+            eprintln!("descriptor_blob_prune_projection {projection} {buckets:?}");
+        }
+
+        assert!(
+            !result.rows().is_empty(),
+            "the queried path must still have history rows"
+        );
+        let projection = "lix_binary_blob_ref+lix_file_descriptor";
+        let buckets = by_projection.get(projection).unwrap_or_else(|| {
+            panic!("by-path history should traverse {projection}: {by_projection:?}")
+        });
+        assert!(
+            buckets.get("pruned").copied().unwrap_or(0)
+                >= DESCRIPTOR_BLOB_PRUNE_NOISE_COMMITS,
+            "{projection} must prune every content commit that belongs to another \
+             file; without a pinned file_id the membership test answers \
+             LoadedPresent for all of them: {by_projection:?}"
+        );
+        assert_eq!(
+            buckets.get("loaded_absent").copied().unwrap_or(0),
+            0,
+            "{projection} must never hit the pre-digest fallback: {by_projection:?}"
+        );
+    }
+
+    /// Number of content commits on a file the depth-bounded query never asks
+    /// about.
+    const DEPTH_BOUNDED_CONTEXT_NOISE_COMMITS: u64 = 12;
+
+    /// Depth-bounded file history by path: engagement, then the answer.
+    ///
+    /// `HistoryRoute::anchors_only` drops the depth bounds by construction, so
+    /// a depth predicate is the **only** shape in which the event route and the
+    /// context route differ — and therefore the only shape that loads context
+    /// descriptors separately at all. Every other file-history test in this
+    /// suite compares the two routes equal and takes the reuse branch, so
+    /// without this test the separate context load is never executed and a
+    /// regression in it would gate green.
+    ///
+    /// The census is thread-local and counts inside
+    /// `load_file_history_filesystem_context` itself, one layer below the SQL
+    /// surface, and asserts a hit *and* a miss: the depth-bounded read must take
+    /// the separate load, the unbounded read must take the reuse branch.
+    ///
+    /// The oracle is the unfiltered read. A `lix_file_history` query with no
+    /// `id`/`path` predicate resolves no lookup IDs and never builds either
+    /// pinned route, so it is the answer a completely unpruned traversal
+    /// produces; the depth-bounded path answer must equal it restricted to the
+    /// same path and depth.
+    #[tokio::test]
+    async fn depth_bounded_file_history_by_path_matches_the_unfiltered_answer() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        for statement in [
+            "INSERT INTO lix_file (id, path, content) \
+             VALUES ('01920000-0000-7000-8000-0000000000d1', '/docs/moved.md', CAST('m0' AS BYTEA))",
+            "UPDATE lix_file SET content = CAST('m1' AS BYTEA) WHERE path = '/docs/moved.md'",
+            // A rename: the descriptor changes without any content change, and
+            // it is the shape the context descriptors exist to resolve.
+            "UPDATE lix_file SET path = '/docs/moved-again.md' WHERE path = '/docs/moved.md'",
+            "UPDATE lix_file SET content = CAST('m2' AS BYTEA) WHERE path = '/docs/moved-again.md'",
+            "INSERT INTO lix_file (id, path, content) \
+             VALUES ('01920000-0000-7000-8000-0000000000d2', '/docs/noise2.md', CAST('n0' AS BYTEA))",
+        ] {
+            session
+                .execute(statement, &[])
+                .await
+                .unwrap_or_else(|error| panic!("fixture statement failed: {statement}: {error}"));
+        }
+        for revision in 0..DEPTH_BOUNDED_CONTEXT_NOISE_COMMITS {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('n{revision}' AS BYTEA) \
+                         WHERE id = '01920000-0000-7000-8000-0000000000d2'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("noise commit should apply");
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let projection = format!(
+            "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
+             FROM lix_file_history('{head_commit_id}')"
+        );
+        let key = |row: &Vec<Value>| format!("{row:?}");
+        let unfiltered = rows_from_execute_result(
+            session
+                .execute(&projection, &[])
+                .await
+                .expect("unfiltered history should execute"),
+        )
+        .1;
+        assert!(
+            !unfiltered.is_empty(),
+            "the unfiltered oracle must produce rows"
+        );
+
+        // Miss: no depth predicate, so the routes compare equal and the context
+        // descriptors are reused from the event set.
+        crate::sql2::providers::reset_file_history_context_census();
+        let _ = session
+            .execute(
+                &format!("{projection} WHERE path = '/docs/moved-again.md'"),
+                &[],
+            )
+            .await
+            .expect("unbounded path history should execute");
+        let (loads, reuses) = crate::sql2::providers::file_history_context_census();
+        assert_eq!(
+            (loads, reuses),
+            (0, 1),
+            "a depth-unbounded path read must reuse the event descriptors"
+        );
+
+        // The depths this path actually has rows at, plus depth 0, which the
+        // noise commits made empty for it -- an empty answer that must stay
+        // empty is the negative case of the same comparison.
+        let mut probe_depths = unfiltered
+            .iter()
+            .filter(|row| row[1] == Value::Text("/docs/moved-again.md".to_string()))
+            .filter_map(|row| match row[2] {
+                Value::Integer(depth) => Some(depth),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            probe_depths.len() >= 2,
+            "the fixture must put rows for this path at more than one depth, or \
+             the comparison is vacuous: {probe_depths:?}"
+        );
+        probe_depths.insert(0);
+
+        let mut covered_depths = 0_usize;
+        for depth in probe_depths {
+            let expected: BTreeSet<String> = unfiltered
+                .iter()
+                .filter(|row| {
+                    row[1] == Value::Text("/docs/moved-again.md".to_string())
+                        && row[2] == Value::Integer(depth)
+                })
+                .map(key)
+                .collect();
+
+            // Hit: the depth predicate makes the event route and the anchor
+            // route differ, which is the only shape that loads the context
+            // descriptors separately.
+            crate::sql2::providers::reset_file_history_context_census();
+            let actual: BTreeSet<String> = rows_from_execute_result(
+                session
+                    .execute(
+                        &format!(
+                            "{projection} WHERE path = '/docs/moved-again.md' \
+                             AND lixcol_depth = {depth}"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("depth-bounded path history should execute"),
+            )
+            .1
+            .iter()
+            .map(key)
+            .collect();
+            let (loads, reuses) = crate::sql2::providers::file_history_context_census();
+            assert_eq!(
+                (loads, reuses),
+                (1, 0),
+                "a depth-bounded path read must load the context descriptors separately"
+            );
+
+            assert_eq!(
+                expected, actual,
+                "the depth-bounded answer at depth {depth} must equal the \
+                 unfiltered oracle restricted to the same path and depth"
+            );
+            if !expected.is_empty() {
+                covered_depths += 1;
+            }
+        }
+        assert!(
+            covered_depths >= 2,
+            "the non-empty depths must have been compared, not skipped"
+        );
+    }
+
+    /// The raw-byte prefilter in path resolution must not change any answer,
+    /// including for names it refuses to accelerate.
+    ///
+    /// The prefilter is a necessary-condition test on the snapshot text, so its
+    /// only possible failure is the silent one: skipping a parse that would
+    /// have matched, which drops history rows rather than erroring. That can
+    /// only happen if a name is written to JSON as something other than its
+    /// source bytes, so the fixture uses exactly those names —
+    /// backslash, quote, non-ASCII, emoji — alongside a plain ASCII one.
+    ///
+    /// The oracle is the unfiltered read, which resolves no lookup ids and
+    /// therefore never runs the resolver at all.
+    ///
+    /// The census assertions are the hit and the miss: a plain-ASCII name must
+    /// take the accelerated route AND actually skip parses, and a name carrying
+    /// a character `serde_json` escapes must refuse it. Lower bounds only —
+    /// these counters are process-global.
+    #[tokio::test]
+    async fn path_resolution_prefilter_preserves_every_answer() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        // Plain ASCII first, then the shapes whose JSON encoding may differ
+        // from their source text.
+        let names = ["plain.md", "with space.md", "quo\"te.md", "back\\slash.md", "ünïcode.md", "emoji-🙂.md"];
+        for (index, name) in names.iter().enumerate() {
+            let statement = format!(
+                "INSERT INTO lix_file (path, content) VALUES ('/docs/{name}', CAST('c{index}' AS BYTEA))"
+            );
+            session
+                .execute(&statement, &[])
+                .await
+                .unwrap_or_else(|error| panic!("insert of {name} should succeed: {error}"));
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('c{index}b' AS BYTEA) \
+                         WHERE path = '/docs/{name}'"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("update of {name} should succeed: {error}"));
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let projection = format!(
+            "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
+             FROM lix_file_history('{head_commit_id}')"
+        );
+        let key = |row: &Vec<Value>| format!("{row:?}");
+        let unfiltered = rows_from_execute_result(
+            session
+                .execute(&projection, &[])
+                .await
+                .expect("unfiltered history should execute"),
+        )
+        .1;
+
+        for name in names {
+            let path = format!("/docs/{name}");
+            let expected: BTreeSet<String> = unfiltered
+                .iter()
+                .filter(|row| row[1] == Value::Text(path.clone()))
+                .map(key)
+                .collect();
+            assert!(
+                !expected.is_empty(),
+                "the oracle must carry history for {path}"
+            );
+            let actual: BTreeSet<String> = rows_from_execute_result(
+                session
+                    .execute(
+                        &format!("{projection} WHERE path = $1"),
+                        &[Value::Text(path.clone())],
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("path history for {path} should execute: {error}")),
+            )
+            .1
+            .iter()
+            .map(key)
+            .collect();
+            assert_eq!(
+                expected, actual,
+                "the prefilter changed the answer for {path}"
+            );
+        }
+
+        #[cfg(feature = "storage-benches")]
+        {
+            // Hit: a plain-ASCII name accelerates and actually skips parses.
+            let _ = crate::storage_bench::take_path_resolver_census();
+            let _ = session
+                .execute(
+                    &format!("{projection} WHERE path = $1"),
+                    &[Value::Text("/docs/plain.md".to_string())],
+                )
+                .await
+                .expect("plain path history should execute");
+            let (seen, parsed, prefiltered, _metadata, on, off) =
+                crate::storage_bench::take_path_resolver_census();
+            assert!(
+                on >= 1 && prefiltered >= 1 && seen > parsed,
+                "a plain ASCII name must take the accelerated route and skip parses:                  seen={seen} parsed={parsed} prefiltered={prefiltered} on={on} off={off}"
+            );
+
+            // Miss: a name carrying a character `serde_json` escapes must
+            // refuse the accelerator rather than risk a wrong byte test.
+            let _ = crate::storage_bench::take_path_resolver_census();
+            let _ = session
+                .execute(
+                    &format!("{projection} WHERE path = $1"),
+                    &[Value::Text("/docs/quo\"te.md".to_string())],
+                )
+                .await
+                .expect("quoted path history should execute");
+            let (_seen, _parsed, _prefiltered, _metadata, _on, off) =
+                crate::storage_bench::take_path_resolver_census();
+            assert!(
+                off >= 1,
+                "a name whose JSON encoding differs from its source text must \
+                 refuse the prefilter"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn execute_sql_rejects_writes_to_history_views_before_planning() {
         for sql in [
@@ -5418,23 +6634,21 @@ mod tests {
             "DELETE FROM TEST_STATE_SCHEMA_HISTORY",
         ] {
             let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-            let live_state = Arc::new(DummyLiveStateReader);
+            let hot_state = Arc::new(DummyHotStateReader);
             let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
             let mut ctx = DummySqlWriteExecutionContext {
                 active_branch_id: "01920000-0000-7000-8000-0000000000a1",
                 blob_reader,
-                live_state,
+                hot_state,
                 staged_writes,
                 schema_definitions: vec![json!({
-                    "x-lix-key": "test_state_schema",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "value": { "type": "string" }
-                    },
-                    "required": ["id", "value"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "test_state_schema",
+                    "columns": [
+                        { "name": "id", "type": "text", "nullable": false },
+                        { "name": "value", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 })],
             };
 
@@ -5453,12 +6667,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_lix_file_select_without_data_stages_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -5479,40 +6693,42 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000312\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_entity_by_branch_stages_write() {
+    async fn execute_sql_insert_into_row_by_branch_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch (\
-	     lixcol_entity_pk, lixcol_branch_id, value\
-	     ) VALUES (lix_json('[\"entity-c\"]'), '01920000-0000-7000-8000-0000000000b1', 'C')",
+	     lixcol_row_pk, lixcol_branch_id, id, value\
+	     ) VALUES (CAST('[\"row-c\"]' AS JSONB), '01920000-0000-7000-8000-0000000000b1', 'row-c', 'C')",
             &[],
         )
         .await
-        .expect("INSERT INTO entity by-branch surface should stage write");
+        .expect("INSERT INTO row by-branch surface should stage write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -5524,46 +6740,48 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-c\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"C\"}")
+            Some("{\"id\":\"row-c\",\"value\":\"C\"}")
         );
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_entity_by_branch_accepts_parameterized_branch_id() {
+    async fn execute_sql_insert_into_row_by_branch_accepts_parameterized_branch_id() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch (\
-             lixcol_entity_pk, lixcol_branch_id, value\
-             ) VALUES (lix_json('[\"entity-c\"]'), $1, 'C')",
+             lixcol_row_pk, lixcol_branch_id, id, value\
+             ) VALUES (CAST('[\"row-c\"]' AS JSONB), $1, 'row-c', 'C')",
             &[Value::Text(
                 "01920000-0000-7000-8000-0000000000b1".to_string(),
             )],
         )
         .await
-        .expect("parameterized by-branch entity insert should stage write");
+        .expect("parameterized by-branch row insert should stage write");
 
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
@@ -5573,37 +6791,39 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-c\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_active_entity_defaults_active_branch() {
+    async fn execute_sql_insert_into_active_row_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
-	     VALUES (lix_json('[\"entity-c\"]'), 'C')",
+            "INSERT INTO test_state_schema (lixcol_row_pk, id, value) \
+	     VALUES (CAST('[\"row-c\"]' AS JSONB), 'row-c', 'C')",
             &[],
         )
         .await
-        .expect("INSERT INTO active entity surface should stage write");
+        .expect("INSERT INTO active schema surface should stage write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -5615,39 +6835,34 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-c\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"C\"}")
+            Some("{\"id\":\"row-c\",\"value\":\"C\"}")
         );
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_default_values_uses_the_native_entity_writer() {
+    async fn execute_sql_insert_default_values_uses_the_native_row_writer() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "default_values_probe",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "x-lix-default": "lix_uuid_v7()"
-                    },
-                    "label": { "type": "string", "default": "untitled" }
-                },
-                "required": ["id", "label"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "default_values_probe",
+                "columns": [
+                    { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
+                    { "name": "label", "type": "text", "nullable": false, "default_value": "untitled" },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -5672,7 +6887,7 @@ mod tests {
             rows[0]
                 .snapshot_content
                 .as_deref()
-                .expect("inserted entity should have a snapshot"),
+                .expect("inserted row should have a snapshot"),
         )
         .expect("defaulted snapshot should be JSON");
         let id = snapshot["id"]
@@ -5688,28 +6903,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_active_entity_does_not_probe_active_head_during_lowering() {
+    async fn execute_sql_insert_into_active_row_does_not_probe_active_head_during_lowering() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "missing-branch",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
-             VALUES (lix_json('[\"entity-c\"]'), 'C')",
+            "INSERT INTO test_state_schema (lixcol_row_pk, id, value) \
+             VALUES (CAST('[\"row-c\"]' AS JSONB), 'row-c', 'C')",
             &[],
         )
         .await
@@ -5728,21 +6945,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_noop_active_entity_write_does_not_probe_active_head() {
+    async fn execute_sql_noop_active_row_write_does_not_probe_active_head() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "missing-branch",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -5767,10 +6986,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_entity_upsert_conflict_scan_is_narrowed_to_inserted_identity() {
+    async fn execute_sql_row_upsert_conflict_scan_is_narrowed_to_inserted_identity() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(CapturingRowsLiveStateReader {
+        let hot_state = Arc::new(CapturingRowsHotStateReader {
             rows: vec![
                 live_test_state_row(
                     "target",
@@ -5791,18 +7010,16 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "value": { "type": "string" }
-                },
-                "required": ["id", "value"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -5816,7 +7033,7 @@ mod tests {
             WriteExecutorMode::Auto,
         )
         .await
-        .expect("entity upsert should update the matching row");
+        .expect("row upsert should update the matching row");
 
         assert_eq!(path, WriteExecutorPath::Fast);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -5825,8 +7042,8 @@ mod tests {
         let filter = &requests[0].filter;
         assert_eq!(filter.schema_keys, vec!["test_state_schema"]);
         assert_eq!(
-            filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single("target")]
+            filter.row_pks,
+            vec![crate::row_pk::RowPk::single("target")]
         );
         assert_eq!(
             filter.branch_ids,
@@ -5846,7 +7063,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"target\"]");
+        assert_eq!(rows[0].row_pk, "[\"target\"]");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"id\":\"target\",\"value\":\"new\"}")
@@ -5856,8 +7073,8 @@ mod tests {
     #[tokio::test]
     async fn integer_primary_key_update_and_delete_narrow_candidate_scans() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
-        let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
-        let entity_pk = crate::entity_pk::EntityPk::from_external_parts(
+        let component_types = [crate::row_pk::RowPkComponentType::Integer];
+        let row_pk = crate::row_pk::RowPk::from_external_parts(
             vec!["42".to_string()],
             &component_types,
         )
@@ -5873,29 +7090,27 @@ mod tests {
                 vec![Value::Integer(42)],
             ),
         ] {
-            let mut row = live_entity_row("42", branch_id, "before");
-            row.entity_pk = entity_pk.clone();
+            let mut row = live_row("42", branch_id, "before");
+            row.row_pk = row_pk.clone();
             row.schema_key = "integer_state_schema".to_string();
             row.snapshot_content = Some(json!({ "id": 42, "value": "before" }).to_string().into());
             let requests = Arc::new(Mutex::new(Vec::new()));
             let mut ctx = DummySqlWriteExecutionContext {
                 active_branch_id: branch_id,
                 blob_reader: Arc::new(DummyBlobReader),
-                live_state: Arc::new(CapturingRowsLiveStateReader {
+                hot_state: Arc::new(CapturingRowsHotStateReader {
                     rows: vec![row],
                     requests: Arc::clone(&requests),
                 }),
                 staged_writes: Arc::new(Mutex::new(CapturingStagedWrites::default())),
                 schema_definitions: vec![json!({
-                    "x-lix-key": "integer_state_schema",
-                    "x-lix-primary-key": ["/id"],
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "integer" },
-                        "value": { "type": "string" }
-                    },
-                    "required": ["id", "value"],
-                    "additionalProperties": false
+                    "$schema": "https://lix.dev/schema-v1.json",
+                    "key": "integer_state_schema",
+                    "columns": [
+                        { "name": "id", "type": "int8", "nullable": false },
+                        { "name": "value", "type": "text", "nullable": false },
+                    ],
+                    "primary_key": ["id"],
                 })],
             };
 
@@ -5910,7 +7125,7 @@ mod tests {
             let [request] = requests.as_slice() else {
                 panic!("integer point write should issue one candidate scan: {sql}");
             };
-            assert_eq!(request.filter.entity_pks, vec![entity_pk.clone()], "{sql}");
+            assert_eq!(request.filter.row_pks, vec![row_pk.clone()], "{sql}");
         }
     }
 
@@ -5920,7 +7135,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(StaticBlobReader {
             bytes: b"old".to_vec(),
         });
-        let live_state = Arc::new(CapturingRowsLiveStateReader {
+        let hot_state = Arc::new(CapturingRowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -5957,7 +7172,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -5997,7 +7212,7 @@ mod tests {
             .iter()
             .filter(|request| {
                 request.filter.schema_keys == vec!["lix_directory_descriptor".to_string()]
-                    && request.filter.entity_pks.is_empty()
+                    && request.filter.row_pks.is_empty()
             })
             .count();
         assert_eq!(
@@ -6015,9 +7230,9 @@ mod tests {
         );
         for request in blob_requests {
             assert_eq!(
-                request.filter.entity_pks,
+                request.filter.row_pks,
                 vec![
-                    crate::entity_pk::EntityPk::uuid_from_canonical(
+                    crate::row_pk::RowPk::uuid_from_canonical(
                         "01920000-0000-7000-8000-000000000562",
                     )
                     .expect("fixture file ID"),
@@ -6040,7 +7255,7 @@ mod tests {
         let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(descriptor_rows.len(), 1);
         assert_eq!(
-            descriptor_rows[0].entity_pk,
+            descriptor_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000562\"]"
         );
         let descriptor: JsonValue = serde_json::from_str(
@@ -6060,7 +7275,7 @@ mod tests {
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
         assert_eq!(
-            blob_ref_rows[0].entity_pk,
+            blob_ref_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000562\"]"
         );
         let blob_ref: JsonValue = serde_json::from_str(
@@ -6080,12 +7295,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_directory_by_branch_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6111,7 +7326,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d3\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
@@ -6128,12 +7343,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_directory_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6158,7 +7373,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d3\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -6169,7 +7384,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_directory_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -6189,7 +7404,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6215,7 +7430,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d3\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -6234,7 +7449,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_directory_stages_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -6246,7 +7461,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6270,7 +7485,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d3\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -6285,7 +7500,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_directory_by_branch_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -6305,7 +7520,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6330,7 +7545,7 @@ mod tests {
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000313\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
@@ -6341,12 +7556,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_file_by_branch_stages_descriptor_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6372,7 +7587,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
@@ -6392,12 +7607,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_file_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6422,7 +7637,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -6433,7 +7648,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_file_with_data_stages_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000b1",
@@ -6445,7 +7660,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6471,13 +7686,13 @@ mod tests {
         let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(descriptor_rows.len(), 1);
         assert_eq!(
-            descriptor_rows[0].entity_pk,
+            descriptor_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
         assert_eq!(
-            blob_ref_rows[0].entity_pk,
+            blob_ref_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(
@@ -6565,7 +7780,7 @@ mod tests {
             &[
                 Value::Text("/multi/param-a.md".to_string()),
                 Value::Blob(b"param-a".to_vec().into()),
-                Value::Json(json!({"source": "json-param"})),
+                Value::Jsonb(json!({"source": "json-param"}).into()),
                 Value::Text("/multi/param-b.md".to_string()),
                 Value::Blob(b"param-b".to_vec().into()),
                 Value::Text(r#"{"source":"text-param"}"#.to_string()),
@@ -6637,7 +7852,7 @@ mod tests {
         let params = [
             Value::Text("/docs/existing.md".to_string()),
             Value::Blob(b"updated".to_vec().into()),
-            Value::Json(json!({"source": "upload"})),
+            Value::Jsonb(json!({"source": "upload"}).into()),
         ];
 
         let (fast_result, fast_path) =
@@ -6709,7 +7924,7 @@ mod tests {
             &[
                 Value::Text("/invalid.md".to_string()),
                 Value::Blob(b"content".to_vec().into()),
-                Value::Json(json!(["not", "an", "object"])),
+                Value::Jsonb(json!(["not", "an", "object"]).into()),
             ],
             WriteExecutorMode::ForceFast,
         )
@@ -6832,7 +8047,7 @@ mod tests {
         assert!(
             blob_ref_rows
                 .iter()
-                .any(|row| row.entity_pk == "[\"01920000-0000-7000-8000-000000000322\"]")
+                .any(|row| row.row_pk == "[\"01920000-0000-7000-8000-000000000322\"]")
         );
     }
 
@@ -6872,7 +8087,7 @@ mod tests {
             .filter(|row| row.schema_key == "lix_file_descriptor")
             .collect::<Vec<_>>();
         assert!(descriptor_rows.iter().any(|row| {
-            row.entity_pk == "[\"01920000-0000-7000-8000-000000000322\"]"
+            row.row_pk == "[\"01920000-0000-7000-8000-000000000322\"]"
                 && row
                     .snapshot_content
                     .as_deref()
@@ -7117,7 +8332,7 @@ mod tests {
         let mut ids = overlay
             .visible_semantic_rows(false, "lix_file_descriptor")
             .into_iter()
-            .map(|row| row.entity_pk)
+            .map(|row| row.row_pk)
             .collect::<Vec<_>>();
         ids.sort();
         assert_eq!(
@@ -7154,7 +8369,7 @@ mod tests {
         let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(descriptor_rows.len(), 1);
         assert_eq!(
-            descriptor_rows[0].entity_pk,
+            descriptor_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000a2\"]"
         );
         assert_eq!(
@@ -7166,7 +8381,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -7192,7 +8407,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -7218,7 +8433,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
@@ -7438,7 +8653,7 @@ mod tests {
             DummySqlWriteExecutionContext {
                 active_branch_id: "missing-branch",
                 blob_reader: Arc::new(DummyBlobReader),
-                live_state: Arc::new(RowsLiveStateReader { rows: Vec::new() }),
+                hot_state: Arc::new(RowsHotStateReader { rows: Vec::new() }),
                 staged_writes,
                 schema_definitions: vec![],
             }
@@ -7556,7 +8771,7 @@ mod tests {
         let sql = "UPDATE lix_file SET content = $1, lixcol_metadata = $2 WHERE id = $3";
         let params = [
             Value::Blob(b"parameterized".to_vec().into()),
-            Value::Json(serde_json::json!({"source": "git"})),
+            Value::Jsonb(serde_json::json!({"source": "git"}).into()),
             Value::Text("01920000-0000-7000-8000-0000000000d2".to_string()),
         ];
 
@@ -7759,7 +8974,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_stages_data_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -7779,7 +8994,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -7808,7 +9023,7 @@ mod tests {
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
         assert_eq!(
-            blob_ref_rows[0].entity_pk,
+            blob_ref_rows[0].row_pk,
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         let snapshot: JsonValue =
@@ -7821,7 +9036,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_stages_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -7841,7 +9056,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -7877,7 +9092,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_file_by_branch_stages_descriptor_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -7909,7 +9124,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -7934,7 +9149,7 @@ mod tests {
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_pk,
+            rows[0].row_pk,
             "[\"01920000-0000-7000-8000-000000000332\"]"
         );
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
@@ -7943,38 +9158,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_update_entity_surface_stages_rewritten_snapshot() {
+    async fn execute_sql_update_schema_surface_stages_rewritten_snapshot() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
-                live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-                live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000a1", "B"),
+                live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
+                live_row("row-b", "01920000-0000-7000-8000-0000000000a1", "B"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let result = execute_write_sql(
             &mut ctx,
             "UPDATE test_state_schema \
-             SET value = 'updated', lixcol_metadata = '{\"source\":\"entity-update\"}' \
+             SET value = 'updated', lixcol_metadata = '{\"source\":\"row-update\"}' \
              WHERE value = 'A'",
             &[],
         )
         .await
-        .expect("UPDATE entity surface should stage rewritten row");
+        .expect("UPDATE schema surface should stage rewritten row");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -7986,39 +9203,41 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-a\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-a\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"updated\"}")
+            Some("{\"id\":\"row-a\",\"value\":\"updated\"}")
         );
         assert_eq!(
             rows[0].metadata.as_deref(),
-            Some("{\"source\":\"entity-update\"}")
+            Some("{\"source\":\"row-update\"}")
         );
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_entity_by_branch_stages_tombstone() {
+    async fn execute_sql_delete_row_by_branch_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
-                live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-                live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000b1", "B"),
+                live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
+                live_row("row-b", "01920000-0000-7000-8000-0000000000b1", "B"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -8031,7 +9250,7 @@ mod tests {
             )],
         )
         .await
-        .expect("parameterized DELETE entity by-branch surface should stage tombstone");
+        .expect("parameterized DELETE row by-branch surface should stage tombstone");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -8043,25 +9262,27 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-b\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_entity_by_branch_like_uses_datafusion_and_stages_tombstone() {
+    async fn execute_sql_delete_row_by_branch_like_uses_datafusion_and_stages_tombstone() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![
-            live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-            live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000b1", "Before"),
-            live_entity_row("entity-c", "01920000-0000-7000-8000-0000000000b1", "After"),
+            live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
+            live_row("row-b", "01920000-0000-7000-8000-0000000000b1", "Before"),
+            live_row("row-c", "01920000-0000-7000-8000-0000000000b1", "After"),
         ]);
         ctx.schema_definitions = vec![json!({
-            "x-lix-key": "test_state_schema",
-            "type": "object",
-            "properties": {
-                "value": { "type": "string" }
-            }
+            "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
         })];
 
         let (result, path) = execute_write_sql_trace(
@@ -8075,7 +9296,7 @@ mod tests {
             WriteExecutorMode::Auto,
         )
         .await
-        .expect("DELETE LIKE on an entity surface should stage a tombstone");
+        .expect("DELETE LIKE on a schema surface should stage a tombstone");
 
         assert_eq!(path, WriteExecutorPath::DataFusion);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -8087,27 +9308,29 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
+        assert_eq!(rows[0].row_pk, "[\"row-b\"]");
         assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert!(rows[0].tombstone);
     }
 
     #[tokio::test]
-    async fn bound_public_write_supports_only_supported_entity_shapes() {
+    async fn bound_public_write_supports_only_supported_row_shapes() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let hot_state = Arc::new(RowsHotStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -8116,7 +9339,7 @@ mod tests {
             "UPDATE test_state_schema SET value = 'updated' WHERE value = 'A'",
         )
         .await
-        .expect("supported entity update should plan");
+        .expect("supported row update should plan");
         let crate::sql2::exec::SqlLogicalPlan::Write(supported_plan) = supported_plan else {
             panic!("expected write plan");
         };
@@ -8136,19 +9359,21 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_unsupported_target_contradiction_still_falls_back_and_errors() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let hot_state = Arc::new(RowsHotStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
@@ -8157,7 +9382,7 @@ mod tests {
             "DELETE FROM test_state_schema WHERE value = 'A' AND value = 'B'",
         )
         .await
-        .expect("registered entity write should bind before reference writer selection");
+        .expect("registered row write should bind before reference writer selection");
         let error = crate::sql2::execute_write_logical_plan_with_mode(
             &mut ctx,
             plan,
@@ -8168,31 +9393,33 @@ mod tests {
         .expect_err("unsupported reference writer target should not become a fast no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("does not support this entity write"));
+        assert!(error.message.contains("does not support this row write"));
     }
 
     #[tokio::test]
     async fn execute_sql_delete_unsupported_target_false_predicate_still_errors() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let hot_state = Arc::new(RowsHotStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "test_state_schema",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false },
+                ],
+                "primary_key": ["id"],
             })],
         };
 
         let plan = create_write_logical_plan(&mut ctx, "DELETE FROM test_state_schema WHERE false")
             .await
-            .expect("registered entity write should bind before reference writer selection");
+            .expect("registered row write should bind before reference writer selection");
         let error = crate::sql2::execute_write_logical_plan_with_mode(
             &mut ctx,
             plan,
@@ -8203,28 +9430,28 @@ mod tests {
         .expect_err("unsupported target with empty scope should not become a no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("does not support this entity write"));
+        assert!(error.message.contains("does not support this row write"));
     }
 
     async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, LixError> {
         let schema_definition = json!({
-            "x-lix-key": "test_state_schema",
-            "type": "object",
-            "properties": {
-                "value": { "type": "string" }
-            },
-            "required": ["value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "test_state_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         Ok(DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(StaticBlobReader {
                 bytes: vec![0x41, 0x42],
             }),
-            live_state: Arc::new(RowsLiveStateReader {
+            hot_state: Arc::new(RowsHotStateReader {
                 rows: vec![
-                    live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
-                    live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000b1", "B"),
+                    live_row("row-a", "01920000-0000-7000-8000-0000000000a1", "A"),
+                    live_row("row-b", "01920000-0000-7000-8000-0000000000b1", "B"),
                     live_directory_row(
                         "01920000-0000-7000-8000-0000000000d3",
                         "01920000-0000-7000-8000-0000000000a1",
@@ -8244,58 +9471,34 @@ mod tests {
                     ),
                 ],
             }),
-            entity_snapshot_reader: None,
+            row_snapshot_reader: None,
             schema_definitions: vec![schema_definition],
         })
     }
 
-    fn run_async_test_with_large_stack(
-        test: impl FnOnce() -> futures_util::future::LocalBoxFuture<'static, ()> + Send + 'static,
-    ) {
-        std::thread::Builder::new()
-            .name("sql2-execute-test".to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("test runtime should build")
-                    .block_on(test());
-            })
-            .expect("test thread should spawn")
-            .join()
-            .expect("test thread should join");
-    }
-
-    #[test]
-    fn execute_sql_reads_entity_view_from_active_branch() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_row_view_from_active_branch() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT value, lixcol_entity_pk \
+                    "SELECT value, lixcol_row_pk \
                      FROM test_state_schema",
                     &[],
                 )
                 .await
-                .expect("sql2 execute should read entity view");
+                .expect("sql2 execute should read row view");
 
-                assert_eq!(result.columns, vec!["value", "lixcol_entity_pk"]);
+                assert_eq!(result.columns, vec!["value", "lixcol_row_pk"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
-                assert_eq!(result.rows[0][1], Value::Json(json!(["entity-a"])));
-            })
-        });
+                assert_eq!(result.rows[0][1], Value::Jsonb(json!(["row-a"]).into()));
     }
 
-    #[test]
-    fn execute_sql_reads_entity_by_branch_view() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_row_by_branch_view() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -8308,7 +9511,7 @@ mod tests {
                     &[],
                 )
                 .await
-                .expect("sql2 execute should read entity by-branch view");
+                .expect("sql2 execute should read row by-branch view");
 
                 assert_eq!(result.columns, vec!["value", "lixcol_branch_id"]);
                 assert_eq!(result.rows.len(), 1);
@@ -8317,14 +9520,10 @@ mod tests {
                     result.rows[0][1],
                     Value::Text("01920000-0000-7000-8000-0000000000b1".to_string())
                 );
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_lix_directory_by_branch_view() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_lix_directory_by_branch_view() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -8347,14 +9546,10 @@ mod tests {
                     result.rows[0][2],
                     Value::Text("01920000-0000-7000-8000-0000000000a1".to_string())
                 );
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_lix_directory_from_active_branch() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_lix_directory_from_active_branch() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -8373,14 +9568,10 @@ mod tests {
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("/docs".to_string()));
                 assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_lix_file_by_branch_view() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_lix_file_by_branch_view() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -8410,14 +9601,10 @@ mod tests {
                     result.rows[0][3],
                     Value::Text("01920000-0000-7000-8000-0000000000a1".to_string())
                 );
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_lix_file_from_active_branch() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_lix_file_from_active_branch() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -8440,7 +9627,5 @@ mod tests {
                 );
                 assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
                 assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42].into()));
-            })
-        });
     }
 }

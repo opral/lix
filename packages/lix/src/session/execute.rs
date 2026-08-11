@@ -87,6 +87,8 @@ pub struct ExecuteResult {
     /// empty case inline avoids one Arc clone/drop pair for every scalar write.
     backing: Option<Arc<ExecuteResultBacking>>,
     rows_affected: u64,
+    #[cfg(feature = "storage-benches")]
+    profile_provider_rows_examined: u64,
 }
 
 #[derive(Debug)]
@@ -224,6 +226,8 @@ impl ExecuteResult {
             statement_label: None,
             backing: None,
             rows_affected,
+            #[cfg(feature = "storage-benches")]
+            profile_provider_rows_examined: 0,
         }
     }
 
@@ -265,6 +269,8 @@ impl ExecuteResult {
                 file_view_mutations: Vec::new(),
             })),
             rows_affected,
+            #[cfg(feature = "storage-benches")]
+            profile_provider_rows_examined: 0,
         }
     }
 
@@ -289,6 +295,8 @@ impl ExecuteResult {
                 file_view_mutations: Vec::new(),
             })),
             rows_affected: 0,
+            #[cfg(feature = "storage-benches")]
+            profile_provider_rows_examined: 0,
         }
     }
 
@@ -519,8 +527,8 @@ impl TryFromValue for f64 {
 impl TryFromValue for serde_json::Value {
     fn try_from_value(value: &Value) -> Result<Self, LixError> {
         match value {
-            Value::Json(value) => Ok(value.clone()),
-            other => Err(value_type_error("json", other)),
+            Value::Jsonb(value) => Ok(value.to_value()),
+            other => Err(value_type_error("jsonb", other)),
         }
     }
 }
@@ -762,7 +770,10 @@ where
     /// Lix's bound route. It does not use SQL-text heuristics, and callers
     /// must still execute the statement to receive the normal validation and
     /// query-planning errors.
-    pub fn execution_disposition(&self, sql: &str) -> Result<ExecutionDisposition, LixError> {
+    pub(crate) fn execution_disposition(
+        &self,
+        sql: &str,
+    ) -> Result<ExecutionDisposition, LixError> {
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         execution_disposition(&statement)
     }
@@ -773,7 +784,7 @@ where
     /// A batch is cancellable only when every parsed and bound statement is a
     /// pure read. Any durable statement makes the whole batch durable so its
     /// atomic transaction can complete after a transport disconnects.
-    pub fn execute_batch_disposition(
+    pub(crate) fn execute_batch_disposition(
         &self,
         statements: &[ExecuteBatchStatement],
     ) -> Result<ExecutionDisposition, LixError> {
@@ -792,13 +803,13 @@ where
         Ok(ExecutionDisposition::CancellableRead)
     }
 
-    /// Executes one DataFusion SQL statement against this Lix session.
+    /// Executes one PostgreSQL-dialect SQL statement against this Lix session.
     ///
-    /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
-    /// placeholders use `?` or `$1`, `$2`, and so on. SQLite-specific catalog tables
-    /// and transaction statements such as `sqlite_master`, `BEGIN`, and
-    /// `COMMIT` are not part of this contract; use `information_schema` for
-    /// catalog inspection. Lix owns transaction boundaries for each statement.
+    /// Lix supports a PostgreSQL-dialect subset executed by DataFusion.
+    /// Positional placeholders use `$1`, `$2`, and so on. Parsing PostgreSQL
+    /// syntax does not imply support for every PostgreSQL statement or runtime
+    /// feature. Use `information_schema` for catalog inspection. Lix owns
+    /// transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
     }
@@ -808,12 +819,20 @@ where
     /// This diagnostic API is available only to storage benchmarks. It uses
     /// the normal public execution path and does not alter query semantics.
     #[cfg(feature = "storage-benches")]
-    pub async fn execute_profiled(
+    pub(crate) async fn execute_profiled(
         &self,
         sql: &str,
         params: &[Value],
     ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
-        let (result, profile) = crate::sql_profile::scope(self.execute(sql, params)).await;
+        let (result, mut profile) = crate::sql_profile::scope(self.execute(sql, params)).await;
+        if let Ok(result) = &result {
+            if result.profile_provider_rows_examined != 0 {
+                profile.scan_rows = profile.scan_rows.saturating_add(result.len() as u64);
+            }
+            profile.provider_rows_examined = profile
+                .provider_rows_examined
+                .saturating_add(result.profile_provider_rows_examined);
+        }
         result.map(|result| (result, profile))
     }
 
@@ -821,8 +840,7 @@ where
     /// collected-batch and live-batch consumers. No stream escapes the scoped
     /// storage read, and this does not change the public execution contract.
     #[cfg(feature = "storage-benches")]
-    #[doc(hidden)]
-    pub async fn execute_result_streaming_profiled(
+    pub(crate) async fn execute_result_streaming_profiled(
         &self,
         sql: &str,
         params: &[Value],
@@ -867,7 +885,7 @@ where
                 .storage
                 .begin_read(StorageReadOptions::default())
                 .await?;
-            with_static_session_sql_read::<StorageImpl, _, _>(
+            with_static_session_sql_read::<StorageImpl, _, _, _>(
                 read_scope,
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                     let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
@@ -875,7 +893,7 @@ where
                         active_branch_id: &active_branch_id,
                         active_account_id: self.active_account_id(),
                         read_store,
-                        live_state: Arc::clone(&self.live_state),
+                        hot_state: Arc::clone(&self.hot_state),
                         binary_cas: Arc::clone(&self.binary_cas),
                         branch_ctx: Arc::clone(&self.branch_ctx),
                         catalog_context: Arc::clone(&self.catalog_context),
@@ -963,7 +981,7 @@ where
         Ok(profile)
     }
 
-    pub async fn execute_with_options(
+    pub(crate) async fn execute_with_options(
         &self,
         sql: &str,
         params: &[Value],
@@ -978,8 +996,7 @@ where
         .await
     }
 
-    #[doc(hidden)]
-    pub async fn execute_with_options_and_metadata(
+    pub(crate) async fn execute_with_options_and_metadata(
         &self,
         sql: &str,
         params: &[Value],
@@ -997,8 +1014,7 @@ where
     /// the protocol makes a clean hard cut requiring an idempotency key for
     /// SQL writes, while in-process callers may continue to own their own
     /// transaction/retry contract. Read routes ignore a supplied key.
-    #[doc(hidden)]
-    pub fn execute_with_idempotency_and_options_and_metadata(
+    pub(crate) fn execute_with_idempotency_and_options_and_metadata(
         self: Arc<Self>,
         sql: String,
         params: Vec<Value>,
@@ -1032,7 +1048,11 @@ where
     /// This stays separate from the batch API so the established one-file
     /// transfer path does not pay for batch-vector allocation or duplicate
     /// validation.
-    pub async fn upsert_file_content(&self, path: String, content: Blob) -> Result<u64, LixError> {
+    pub(crate) async fn upsert_file_content(
+        &self,
+        path: String,
+        content: Blob,
+    ) -> Result<u64, LixError> {
         self.ensure_open()?;
         // Preserve the public filesystem path contract before entering a
         // write transaction. The lower-level fast helper maps this validation
@@ -1085,7 +1105,7 @@ where
     /// opened. This is deliberately a direct filesystem write: if the path
     /// index cannot route an exceptional layout unambiguously, the batch is
     /// rejected instead of copying the complete payload into a SQL fallback.
-    pub async fn upsert_file_content_batch(
+    pub(crate) async fn upsert_file_content_batch(
         &self,
         writes: Vec<(String, Blob)>,
     ) -> Result<u64, LixError> {
@@ -1123,15 +1143,12 @@ where
     /// active-branch file selection, plugin rendering, and session file-view
     /// acknowledgement as `SELECT content FROM lix_file WHERE path = $1`, while
     /// avoiding SQL parsing, planning, and a JSON-shaped result envelope.
-    pub fn read_file_content(
+    pub(crate) fn read_file_content(
         &self,
         path: String,
         requested_range: Option<Range<u64>>,
     ) -> impl Future<Output = Result<Option<FileRead>, LixError>> + Send + '_ {
-        // SAFETY: the read future owns its path/range and retains only shared
-        // references to this Sync session. Rustc cannot prove the Send bound
-        // through the higher-ranked scoped SQL-read closure.
-        unsafe { super::AssumeSendFuture::new(self.read_file_content_inner(path, requested_range)) }
+        self.read_file_content_inner(path, requested_range)
     }
 
     async fn read_file_content_inner(
@@ -1151,15 +1168,15 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (content, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
+        let (content, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let plugin_cache_snapshot = read_store.snapshot_cache_key();
-                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
+                let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+                    Arc::new(self.hot_state.reader(read_store.clone()));
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
+                    Arc::new(self.hot_state.reader(read_store.clone()));
                 let branch_ref: Arc<dyn BranchRefReader> =
                     Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                 let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
@@ -1170,7 +1187,7 @@ where
                 let file_view_collector = sql2::SessionFileViews::default();
                 let result = sql2::execute_exact_lix_file_batch_read(
                     &active_branch_id,
-                    live_state,
+                    hot_state,
                     filesystem_path_index,
                     branch_ref,
                     blob_reader,
@@ -1302,8 +1319,17 @@ where
         }
 
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
-        let late_file_content_read = exact_filesystem_read
+        let exact_schema_point_read = exact_filesystem_read
             .is_none()
+            .then(|| exact_schema_point_read_route(&statement, params))
+            .flatten();
+        let exact_schema_batch_read = (exact_filesystem_read.is_none()
+            && exact_schema_point_read.is_none())
+            .then(|| exact_schema_batch_read_route(&statement, params))
+            .flatten();
+        let late_file_content_read = (exact_filesystem_read.is_none()
+            && exact_schema_point_read.is_none()
+            && exact_schema_batch_read.is_none())
             .then(|| late_materialized_lix_file_content_read(&statement))
             .flatten();
         let acknowledge_file_views = is_acknowledgeable_file_content_read(&statement, params)
@@ -1337,7 +1363,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let read_result = with_static_session_sql_read::<StorageImpl, _, _>(
+        let read_result = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 self.execute_read_statement_with_store(
@@ -1347,18 +1373,21 @@ where
                     params,
                     acknowledge_file_views,
                     exact_filesystem_read,
+                    exact_schema_point_read,
+                    exact_schema_batch_read,
                     late_file_content_read,
                     has_durable_runtime_function,
                 )
                 .await
             },
         );
-        let (mut read_result, file_view_mutations) = match read_result.await {
-            Ok(result) => result,
-            Err(error) => {
-                return Err(normalize_sql_surface_error(error, sql));
-            }
-        };
+        let (mut read_result, file_view_mutations, _provider_rows_examined) =
+            match read_result.await {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(normalize_sql_surface_error(error, sql));
+                }
+            };
         let runtime_storage_stats = match read_result.runtime_functions.take() {
             Some(runtime_functions) => {
                 self.persist_runtime_functions_if_needed(
@@ -1375,6 +1404,12 @@ where
         }
         let result = ExecuteResult::from_session_read_result(read_result)
             .with_file_view_mutations(file_view_mutations);
+        #[cfg(feature = "storage-benches")]
+        let result = {
+            let mut result = result;
+            result.profile_provider_rows_examined = _provider_rows_examined as u64;
+            result
+        };
         if !defer_file_view_acknowledgement {
             self.file_views
                 .apply_mutations(result.file_view_mutations().iter().cloned());
@@ -1554,7 +1589,7 @@ where
     /// certificate or the physical parameter-batch route; shapes that require
     /// sequential statement semantics are rejected instead of silently
     /// degrading to per-row execution.
-    pub async fn execute_prepared_dml_batch(
+    pub(crate) async fn execute_prepared_dml_batch(
         &self,
         sql: Arc<str>,
         parameter_batch: PreparedDmlParameterBatch,
@@ -1610,7 +1645,7 @@ where
         result.map_err(|error| normalize_sql_surface_error(error, &sql_for_error))
     }
 
-    pub async fn execute_batch_with_options(
+    pub(crate) async fn execute_batch_with_options(
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
@@ -1623,8 +1658,7 @@ where
         .await
     }
 
-    #[doc(hidden)]
-    pub async fn execute_batch_with_options_and_metadata(
+    pub(crate) async fn execute_batch_with_options_and_metadata(
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
@@ -1674,8 +1708,7 @@ where
     /// Executes a protocol SQL batch with durable replay for batches that
     /// contain at least one SQL write. Pure read batches and batches that only
     /// persist runtime-function state retain their existing execution path.
-    #[doc(hidden)]
-    pub fn execute_batch_with_idempotency_and_options_and_metadata(
+    pub(crate) fn execute_batch_with_idempotency_and_options_and_metadata(
         self: Arc<Self>,
         statements: Vec<ExecuteBatchStatement>,
         options: ExecuteOptions,
@@ -1779,7 +1812,7 @@ where
                 if let IdempotencyReceiptResolution::Replay(receipt) =
                     self.resolve_idempotency_receipt(&idempotency).await?
                 {
-                    return Ok(receipt.into_results());
+                    return receipt.into_results();
                 }
                 let result = self
                     .execute_transaction_batch(
@@ -1807,7 +1840,7 @@ where
                                 // callback was bypassed by an ambiguous error.
                                 self.observe_invalidation.bump();
                                 self.file_views.clear();
-                                Ok(receipt.into_results())
+                                receipt.into_results()
                             }
                             Ok(IdempotencyReceiptResolution::Absent) => Err(error),
                             Err(recovery_error) => Err(recovery_error),
@@ -1872,7 +1905,7 @@ where
                             // Keep the large statement executor behind a heap boundary. The
                             // lending transaction closure already carries the whole parsed batch;
                             // embedding this future in it makes debug poll stacks exceed the
-                            // standard 2 MiB worker stack for ordinary entity writes.
+                            // standard 2 MiB worker stack for ordinary row writes.
                             let operation = Box::pin(execute_transaction_statement(
                                 transaction,
                                 &sql,
@@ -1967,7 +2000,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
+        let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let file_view_collector =
@@ -1977,7 +2010,7 @@ where
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
                     read_store,
-                    live_state: Arc::clone(&self.live_state),
+                    hot_state: Arc::clone(&self.hot_state),
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
@@ -2056,6 +2089,25 @@ where
         result
     }
 
+    pub(crate) fn execute_coherent_read_batch_owned(
+        self: Arc<Self>,
+        statements: Vec<(String, Vec<Value>)>,
+    ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
+        // SAFETY: the future owns its Arc session and every SQL/parameter
+        // payload. Storage read handles are Send by the Storage contract; the
+        // compiler obstruction is the higher-ranked shared reference carried
+        // by borrowing adapters such as RocksDB snapshots.
+        unsafe {
+            super::AssumeSendFuture::new(async move {
+                let statement_refs = statements
+                    .iter()
+                    .map(|(sql, params)| (sql.as_str(), params.as_slice()))
+                    .collect::<Vec<_>>();
+                self.execute_coherent_read_batch(&statement_refs).await
+            })
+        }
+    }
+
     async fn execute_coherent_read_batch_inner(
         &self,
         statements: &[(&str, &[Value])],
@@ -2090,7 +2142,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
+        let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let file_view_collector =
@@ -2128,7 +2180,7 @@ where
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
                     read_store,
-                    live_state: Arc::clone(&self.live_state),
+                    hot_state: Arc::clone(&self.hot_state),
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
@@ -2230,7 +2282,7 @@ where
     /// Persists execution-scoped runtime function state after a successful read.
     ///
     /// Reads do not otherwise own a write transaction, but SQL functions such as
-    /// `lix_uuid_v7()` can still advance runtime state. Persisting happens only
+    /// `uuidv7()` can still advance runtime state. Persisting happens only
     /// after successful execution so failed reads do not consume durable
     /// sequence state.
     async fn persist_runtime_functions_if_needed(
@@ -2280,12 +2332,15 @@ where
         params: &[Value],
         acknowledge_file_views: bool,
         exact_filesystem_read: Option<ExactFilesystemRead>,
+        exact_schema_point_read: Option<ExactSchemaPointRead>,
+        exact_schema_batch_read: Option<ExactSchemaBatchRead>,
         late_file_content_read: Option<LateMaterializedLixFileContentRead>,
         has_durable_runtime_function: bool,
     ) -> Result<
         (
             sql2::SessionReadSqlResult,
             Vec<sql2::SessionFileViewMutation>,
+            usize,
         ),
         LixError,
     > {
@@ -2302,7 +2357,7 @@ where
                 ExactFilesystemRead::RootFileListing => {
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(self.hot_state.reader(read_store.clone()));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store));
                     sql2::execute_exact_lix_file_root_listing(
@@ -2315,7 +2370,7 @@ where
                 ExactFilesystemRead::RootDirectoryListing => {
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(self.hot_state.reader(read_store.clone()));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store));
                     sql2::execute_exact_lix_directory_root_listing(
@@ -2326,11 +2381,11 @@ where
                     .await?
                 }
                 exact_filesystem_read => {
-                    let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                        Arc::new(self.live_state.reader(read_store.clone()));
+                    let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+                        Arc::new(self.hot_state.reader(read_store.clone()));
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(self.hot_state.reader(read_store.clone()));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                     let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
@@ -2339,7 +2394,7 @@ where
                         ExactFilesystemRead::Point(selector, column) => {
                             sql2::execute_exact_lix_file_read(
                                 &active_branch_id,
-                                live_state,
+                                hot_state,
                                 filesystem_path_index,
                                 branch_ref,
                                 blob_reader,
@@ -2353,7 +2408,7 @@ where
                         ExactFilesystemRead::PathContentBatch(paths) => {
                             sql2::execute_exact_lix_file_batch_read(
                                 &active_branch_id,
-                                live_state,
+                                hot_state,
                                 filesystem_path_index,
                                 branch_ref,
                                 blob_reader,
@@ -2368,7 +2423,7 @@ where
                         ExactFilesystemRead::IdManifestBatch(file_ids) => {
                             sql2::execute_exact_lix_file_id_manifest_batch_read(
                                 &active_branch_id,
-                                live_state,
+                                hot_state,
                                 filesystem_path_index,
                                 branch_ref,
                                 blob_reader,
@@ -2394,12 +2449,98 @@ where
                     query: sql2::SessionReadResult::Rows(query),
                 },
                 file_view_mutations,
+                0,
             ));
         }
-        let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-            Arc::new(self.live_state.reader(read_store.clone()));
+        if let Some(exact) = exact_schema_point_read {
+            let ctx = SessionSqlExecutionContext {
+                active_branch_id: &active_branch_id,
+                active_account_id: self.active_account_id(),
+                read_store: read_store.clone(),
+                hot_state: Arc::clone(&self.hot_state),
+                binary_cas: Arc::clone(&self.binary_cas),
+                branch_ctx: Arc::clone(&self.branch_ctx),
+                catalog_context: Arc::clone(&self.catalog_context),
+                sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+                functions: FunctionProviderHandle::system(),
+                plugin_host: self.plugin_host.clone(),
+                file_views: None,
+            };
+            let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
+            if let Some((spec, row_pk)) =
+                resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
+            {
+                let reader: Arc<dyn sql2::RowSnapshotReader> = Arc::new(
+                    sql2::CurrentRowSnapshotReader::new(
+                        Arc::clone(&self.hot_state),
+                        read_store.clone(),
+                    ),
+                );
+                let query = sql2::execute_exact_schema_point_read(
+                    &spec,
+                    &active_branch_id,
+                    reader,
+                    row_pk,
+                    &exact.projected_columns,
+                    exact.output_columns,
+                )
+                .await?;
+                if let Some(query) = query {
+                    return Ok((
+                        sql2::SessionReadSqlResult {
+                            runtime_functions: None,
+                            query: sql2::SessionReadResult::Rows(query),
+                        },
+                        Vec::new(),
+                        1,
+                    ));
+                }
+            }
+        }
+        if let Some(exact) = exact_schema_batch_read {
+            let ctx = SessionSqlExecutionContext {
+                active_branch_id: &active_branch_id,
+                active_account_id: self.active_account_id(),
+                read_store: read_store.clone(),
+                hot_state: Arc::clone(&self.hot_state),
+                binary_cas: Arc::clone(&self.binary_cas),
+                branch_ctx: Arc::clone(&self.branch_ctx),
+                catalog_context: Arc::clone(&self.catalog_context),
+                sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+                functions: FunctionProviderHandle::system(),
+                plugin_host: self.plugin_host.clone(),
+                file_views: None,
+            };
+            let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
+            if let Some((spec, identities)) =
+                resolve_exact_schema_batch_read(catalog.as_ref(), &exact)?
+            {
+                let provider_rows_examined = identities.iter().collect::<BTreeSet<_>>().len();
+                let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+                    Arc::new(self.hot_state.reader(read_store.clone()));
+                let query = sql2::execute_exact_schema_batch_read(
+                    &spec,
+                    &active_branch_id,
+                    hot_state,
+                    identities,
+                    &exact.projected_columns,
+                    exact.output_columns,
+                )
+                .await?;
+                return Ok((
+                    sql2::SessionReadSqlResult {
+                        runtime_functions: None,
+                        query: sql2::SessionReadResult::Rows(query),
+                    },
+                    Vec::new(),
+                    provider_rows_examined,
+                ));
+            }
+        }
+        let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+            Arc::new(self.hot_state.reader(read_store.clone()));
         let runtime_functions = if has_durable_runtime_function {
-            Some(FunctionContext::prepare(&read_store).await?)
+            Some(FunctionContext::prepare(&read_store, None).await?)
         } else {
             None
         };
@@ -2409,15 +2550,19 @@ where
         let functions = runtime_functions
             .as_ref()
             .map_or_else(FunctionProviderHandle::system, FunctionContext::provider);
-        let (statement, late_file_content_column) = match late_file_content_read {
-            Some(plan) => (*plan.statement, Some(plan.data_column_index)),
-            None => (statement, None),
+        let (statement, late_file_content_column, rewritten_sql) = match late_file_content_read {
+            Some(plan) => {
+                let statement = *plan.statement;
+                let rewritten_sql = statement.to_string();
+                (statement, Some(plan.data_column_index), Some(rewritten_sql))
+            }
+            None => (statement, None, None),
         };
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
             active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
-            live_state: Arc::clone(&self.live_state),
+            hot_state: Arc::clone(&self.hot_state),
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
             catalog_context: Arc::clone(&self.catalog_context),
@@ -2431,7 +2576,7 @@ where
             sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
         let mut query = sql2::execute_read_statement_in_session_with_result(
             &read_session,
-            sql,
+            rewritten_sql.as_deref().unwrap_or(sql),
             statement,
             params,
         )
@@ -2440,7 +2585,7 @@ where
         drop(ctx);
         if let Some(data_column_index) = late_file_content_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
+                Arc::new(self.hot_state.reader(read_store.clone()));
             let branch_ref: Arc<dyn BranchRefReader> =
                 Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
             let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
@@ -2448,7 +2593,7 @@ where
             let mut materialized = query.query.into_sql_query_result()?;
             hydrate_lix_file_content_result(
                 &active_branch_id,
-                Arc::clone(&live_state),
+                Arc::clone(&hot_state),
                 filesystem_path_index,
                 branch_ref,
                 blob_reader,
@@ -2460,7 +2605,7 @@ where
             .await?;
             query.query = sql2::SessionReadResult::Rows(materialized);
         }
-        drop(live_state);
+        drop(hot_state);
         let file_view_mutations = file_view_collector
             .map(|collector| collector.plugin_file_mutations())
             .unwrap_or_default();
@@ -2470,6 +2615,7 @@ where
                 query: query.query,
             },
             file_view_mutations,
+            0,
         ))
     }
 }
@@ -2680,11 +2826,11 @@ fn validate_execute_statement_metadata(
 #[allow(clippy::too_many_arguments)]
 async fn hydrate_lix_file_content_result(
     active_branch_id: &str,
-    live_state: Arc<dyn crate::live_state::LiveStateReader>,
+    hot_state: Arc<dyn crate::hot_state::HotStateReader>,
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
-    plugin_host: crate::plugin::PluginRuntimeHost,
+    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     session_file_views: Option<sql2::SessionFileViews>,
     query: &mut SqlQueryResult,
     data_column_index: usize,
@@ -2705,7 +2851,7 @@ async fn hydrate_lix_file_content_result(
 
     let hydrated = sql2::execute_exact_lix_file_batch_read(
         active_branch_id,
-        live_state,
+        hot_state,
         filesystem_path_index,
         branch_ref,
         blob_reader,
@@ -2798,11 +2944,15 @@ fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixEr
                 profile_checksum_bytes(checksum, &value.to_bits().to_le_bytes())
             }
             Value::Text(value) => profile_checksum_sized_bytes(checksum, 4, value.as_bytes()),
-            Value::Json(value) => {
+            Value::Jsonb(value) => {
                 profile_checksum_sized_bytes(checksum, 5, value.to_string().as_bytes())
             }
             Value::Blob(value) => {
                 profile_checksum_sized_bytes(checksum, 6, value.as_bytes().as_ref())
+            }
+            Value::Timestamptz(value) => {
+                let checksum = profile_checksum_bytes(checksum, &[7]);
+                profile_checksum_bytes(checksum, &value.to_le_bytes())
             }
         };
     }
@@ -2831,13 +2981,14 @@ fn profile_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
 /// storage implementations such as RocksDB naturally expose borrowed read snapshots. Keep
 /// the lifetime erasure private to session SQL execution so callers cannot
 /// receive the widened read as a general crate capability.
-async fn with_static_session_sql_read<StorageImpl, F, T>(
+async fn with_static_session_sql_read<StorageImpl, F, Fut, T>(
     read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
     f: F,
 ) -> Result<T, LixError>
 where
     StorageImpl: Storage + 'static,
-    F: AsyncFnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Result<T, LixError>,
+    F: FnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Fut,
+    Fut: Future<Output = Result<T, LixError>>,
 {
     // SAFETY: the widened read is wrapped immediately in `SharedStorageAdapterRead`,
     // only passed into this private SQL execution closure, and explicitly
@@ -2895,7 +3046,7 @@ where
     /// Executes one public prepared-DML parameter page inside this explicit
     /// transaction. The page is atomic with surrounding statements; callers
     /// use ordinary `execute` for shape changes or dependency barriers.
-    pub async fn execute_prepared_dml_batch(
+    pub(crate) async fn execute_prepared_dml_batch(
         &mut self,
         sql: Arc<str>,
         parameter_batch: PreparedDmlParameterBatch,
@@ -3146,7 +3297,7 @@ where
         result
     }
 
-    pub fn execute_with_options(
+    pub(crate) fn execute_with_options(
         &mut self,
         sql: String,
         params: Vec<Value>,
@@ -3212,14 +3363,14 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) async fn scan_live_state_for_test(
+    pub(crate) async fn scan_hot_state_for_test(
         &mut self,
-        request: &crate::live_state::LiveStateScanRequest,
-    ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+        request: &crate::hot_state::HotStateScanRequest,
+    ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
         let _operation_guard = self.begin_session_operation()?;
         let transaction = self.transaction_mut()?;
         transaction.flush_prepared_mutations_for_read().await?;
-        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_live_state_batch(
+        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_hot_state_batch(
             transaction,
             request,
         )
@@ -3451,10 +3602,10 @@ where
 /// Returns true only when SQL directly delivers one file's bytes to the
 /// caller. Materializing `data` inside an aggregate, join, filter, or derived
 /// expression is not acknowledgement: the caller did not receive those bytes
-/// and must not gain the ability to delete entities that only existed there.
+/// and must not gain the ability to delete rows that only existed there.
 ///
 /// This intentionally recognizes a narrow, predictable MVP surface. False
-/// negatives merely preserve an omitted entity; false positives can lose one.
+/// negatives merely preserve an omitted row; false positives can lose one.
 fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params: &[Value]) -> bool {
     let Some(point_read) = simple_point_read(statement) else {
         return false;
@@ -3479,21 +3630,7 @@ fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params:
         .as_ref()
         .expect("simple point read requires a predicate");
     let mut equality_columns = BTreeSet::new();
-    // Anonymous placeholders are bound in textual order. Atelier's point read
-    // projects the active branch as `? AS active_branch_id` before filtering
-    // by `file.id = ?`, so start the WHERE binder after projection params.
-    let mut anonymous_placeholder_index = point_read
-        .select
-        .projection
-        .iter()
-        .map(anonymous_placeholders_in_select_item)
-        .sum();
-    if !collect_literal_equalities(
-        selection,
-        &mut equality_columns,
-        params,
-        &mut anonymous_placeholder_index,
-    ) {
+    if !collect_literal_equalities(selection, &mut equality_columns, params) {
         return false;
     }
     match point_read.table_name.as_str() {
@@ -3824,6 +3961,427 @@ enum ExactFilesystemRead {
     IdManifestBatch(BTreeSet<String>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ExactSchemaPointRead {
+    table_name: String,
+    projected_columns: Vec<String>,
+    output_columns: Vec<String>,
+    equalities: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExactSchemaBatchRead {
+    table_name: String,
+    projected_columns: Vec<String>,
+    output_columns: Vec<String>,
+    identities: Vec<BTreeMap<String, Value>>,
+    order_by_columns: Vec<String>,
+}
+
+fn exact_schema_point_read_route(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<ExactSchemaPointRead> {
+    let simple = simple_single_table_select(statement)?;
+    if !simple.unqualified_unquoted_table
+        || simple.alias.is_some()
+        || simple.query.order_by.is_some()
+        || simple.query.fetch.is_some()
+        || !point_read_limit_is_safe(simple.query.limit_clause.as_ref())
+    {
+        return None;
+    }
+    let mut projected_columns = Vec::with_capacity(simple.select.projection.len());
+    let mut output_columns = Vec::with_capacity(simple.select.projection.len());
+    for item in &simple.select.projection {
+        let (expression, alias) = match item {
+            SelectItem::UnnamedExpr(expression) => (expression, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+            _ => return None,
+        };
+        let column = exact_point_column(expression)?;
+        projected_columns.push(column.clone());
+        output_columns.push(alias.map_or(column, |alias| alias.value.clone()));
+    }
+    if projected_columns.is_empty() {
+        return None;
+    }
+    let mut equalities = BTreeMap::new();
+    collect_exact_schema_equalities(
+        simple.select.selection.as_ref()?,
+        params,
+        &mut equalities,
+    )?;
+    Some(ExactSchemaPointRead {
+        table_name: simple.table_name,
+        projected_columns,
+        output_columns,
+        equalities,
+    })
+}
+
+fn exact_schema_batch_read_route(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<ExactSchemaBatchRead> {
+    let simple = simple_single_table_select(statement)?;
+    if !simple.unqualified_unquoted_table
+        || simple.alias.is_some()
+        || simple.query.fetch.is_some()
+        || simple.query.limit_clause.is_some()
+    {
+        return None;
+    }
+    let mut projected_columns = Vec::with_capacity(simple.select.projection.len());
+    let mut output_columns = Vec::with_capacity(simple.select.projection.len());
+    for item in &simple.select.projection {
+        let (expression, alias) = match item {
+            SelectItem::UnnamedExpr(expression) => (expression, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+            _ => return None,
+        };
+        let column = exact_point_column(expression)?;
+        projected_columns.push(column.clone());
+        output_columns.push(alias.map_or(column, |alias| alias.value.clone()));
+    }
+    if projected_columns.is_empty() {
+        return None;
+    }
+    let order_by_columns = match &simple.query.order_by {
+        None => Vec::new(),
+        Some(order_by) if order_by.interpolate.is_none() => {
+            let OrderByKind::Expressions(expressions) = &order_by.kind else {
+                return None;
+            };
+            expressions
+                .iter()
+                .map(|order| {
+                    (order.with_fill.is_none()
+                        && order.options.asc != Some(false)
+                        && order.options.nulls_first.is_none())
+                    .then(|| exact_point_column(&order.expr))
+                    .flatten()
+                })
+                .collect::<Option<Vec<_>>>()?
+        }
+        Some(_) => return None,
+    };
+    let identities = collect_exact_schema_identity_rows(
+        simple.select.selection.as_ref()?,
+        params,
+    )?;
+    (identities.len() > 1).then_some(ExactSchemaBatchRead {
+        table_name: simple.table_name,
+        projected_columns,
+        output_columns,
+        identities,
+        order_by_columns,
+    })
+}
+
+fn collect_exact_schema_identity_rows(
+    expression: &Expr,
+    params: &[Value],
+) -> Option<Vec<BTreeMap<String, Value>>> {
+    match expression {
+        Expr::Nested(expression) => collect_exact_schema_identity_rows(expression, params),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let mut rows = collect_exact_schema_identity_rows(left, params)?;
+            rows.extend(collect_exact_schema_identity_rows(right, params)?);
+            Some(rows)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let left = collect_exact_schema_identity_rows(left, params)?;
+            let right = collect_exact_schema_identity_rows(right, params)?;
+            (left.len().checked_mul(right.len())? <= 4096).then_some(())?;
+            let mut rows = Vec::with_capacity(left.len() * right.len());
+            for left in left {
+                for right in &right {
+                    let mut combined = left.clone();
+                    let mut compatible = true;
+                    for (column, value) in right {
+                        if combined
+                            .insert(column.clone(), value.clone())
+                            .is_some_and(|existing| existing != *value)
+                        {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                    if compatible {
+                        rows.push(combined);
+                    }
+                }
+            }
+            Some(rows)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
+                (Some(column), None) => (column, exact_schema_literal(right, params)?),
+                (None, Some(column)) => (column, exact_schema_literal(left, params)?),
+                _ => return None,
+            };
+            Some(vec![BTreeMap::from([(column, value)])])
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if !list.is_empty() => {
+            let column = exact_point_column(expr)?;
+            list.iter()
+                .map(|value| {
+                    Some(BTreeMap::from([(
+                        column.clone(),
+                        exact_schema_literal(value, params)?,
+                    )]))
+                })
+                .collect()
+        }
+        Expr::IsNull(expression) => {
+            let column = exact_point_column(expression)?;
+            Some(vec![BTreeMap::from([(column, Value::Null)])])
+        }
+        _ => None,
+    }
+}
+
+fn collect_exact_schema_equalities(
+    expression: &Expr,
+    params: &[Value],
+    equalities: &mut BTreeMap<String, Value>,
+) -> Option<()> {
+    match expression {
+        Expr::Nested(expression) => collect_exact_schema_equalities(expression, params, equalities),
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            collect_exact_schema_equalities(left, params, equalities)?;
+            collect_exact_schema_equalities(right, params, equalities)
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
+                (Some(column), None) => (column, exact_schema_literal(right, params)?),
+                (None, Some(column)) => (column, exact_schema_literal(left, params)?),
+                _ => return None,
+            };
+            equalities.insert(column, value).is_none().then_some(())
+        }
+        _ => None,
+    }
+}
+
+fn exact_schema_literal(expression: &Expr, params: &[Value]) -> Option<Value> {
+    let Expr::Value(value) = expression else {
+        return None;
+    };
+    match &value.value {
+        SqlValue::Placeholder(placeholder) => placeholder
+            .strip_prefix('$')
+            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| params.get(index))
+            .cloned(),
+        SqlValue::SingleQuotedString(value) => Some(Value::Text(value.clone())),
+        SqlValue::Number(value, _) => value.parse::<i64>().ok().map(Value::Integer),
+        _ => None,
+    }
+}
+
+fn resolve_exact_schema_point_read(
+    catalog: &sql2::PublicCatalog,
+    exact: &ExactSchemaPointRead,
+) -> Result<Option<(sql2::SchemaSurfaceSpec, crate::row_pk::RowPk)>, LixError> {
+    let Some(surface) = catalog.surface(&exact.table_name) else {
+        return Ok(None);
+    };
+    let sql2::PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind else {
+        return Ok(None);
+    };
+    let spec = catalog.schema_spec(schema_key).cloned().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "exact schema point route is missing schema metadata",
+        )
+    })?;
+    if exact
+        .projected_columns
+        .iter()
+        .any(|column| spec.visible_column(column).is_none())
+    {
+        return Ok(None);
+    }
+    let primary_key_columns = spec
+        .primary_key_paths
+        .iter()
+        .map(|path| match path.as_slice() {
+            [column] => Some(column.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "exact schema point route requires top-level primary-key columns",
+            )
+        })?;
+    if exact.equalities.len() != primary_key_columns.len()
+        || exact
+            .equalities
+            .keys()
+            .any(|column| !primary_key_columns.contains(&column.as_str()))
+    {
+        return Ok(None);
+    }
+    let parts = primary_key_columns
+        .iter()
+        .zip(&spec.primary_key_component_types)
+        .map(|(column, component_type)| {
+            let value = exact.equalities.get(*column)?;
+            match (component_type, value) {
+                (
+                    crate::row_pk::RowPkComponentType::Uuid
+                    | crate::row_pk::RowPkComponentType::String
+                    | crate::row_pk::RowPkComponentType::Bytes,
+                    Value::Text(value),
+                ) => Some(value.clone()),
+                (crate::row_pk::RowPkComponentType::Integer, Value::Integer(value)) => {
+                    Some(value.to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
+        parts,
+        &spec.primary_key_component_types,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((spec, row_pk)))
+}
+
+fn resolve_exact_schema_batch_read(
+    catalog: &sql2::PublicCatalog,
+    exact: &ExactSchemaBatchRead,
+) -> Result<
+    Option<(
+        sql2::SchemaSurfaceSpec,
+        Vec<(crate::row_pk::RowPk, Option<String>)>,
+    )>,
+    LixError,
+> {
+    let Some(surface) = catalog.surface(&exact.table_name) else {
+        return Ok(None);
+    };
+    let sql2::PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind else {
+        return Ok(None);
+    };
+    let spec = catalog.schema_spec(schema_key).cloned().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "exact schema batch route is missing schema metadata",
+        )
+    })?;
+    if exact
+        .projected_columns
+        .iter()
+        .any(|column| spec.visible_column(column).is_none())
+    {
+        return Ok(None);
+    }
+    let primary_key_columns = spec
+        .primary_key_paths
+        .iter()
+        .map(|path| match path.as_slice() {
+            [column] => Some(column.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "exact schema batch route requires top-level primary-key columns",
+            )
+        })?;
+    if !exact.order_by_columns.is_empty()
+        && exact.order_by_columns
+            != primary_key_columns
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect::<Vec<_>>()
+    {
+        return Ok(None);
+    }
+    let mut seen = BTreeSet::new();
+    let mut identities = Vec::with_capacity(exact.identities.len());
+    for identity in &exact.identities {
+        if identity.len() != primary_key_columns.len() + 1
+            || identity
+                .keys()
+                .any(|column| {
+                    column != "lixcol_file_id"
+                        && !primary_key_columns.contains(&column.as_str())
+                })
+        {
+            return Ok(None);
+        }
+        let file_id = match identity.get("lixcol_file_id") {
+            Some(Value::Null) => None,
+            Some(Value::Text(file_id)) => Some(file_id.clone()),
+            _ => return Ok(None),
+        };
+        let parts = primary_key_columns
+            .iter()
+            .zip(&spec.primary_key_component_types)
+            .map(|(column, component_type)| {
+                let value = identity.get(*column)?;
+                match (component_type, value) {
+                    (
+                        crate::row_pk::RowPkComponentType::Uuid
+                        | crate::row_pk::RowPkComponentType::String
+                        | crate::row_pk::RowPkComponentType::Bytes,
+                        Value::Text(value),
+                    ) => Some(value.clone()),
+                    (crate::row_pk::RowPkComponentType::Integer, Value::Integer(value)) => {
+                        Some(value.to_string())
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(parts) = parts else {
+            return Ok(None);
+        };
+        let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
+            parts,
+            &spec.primary_key_component_types,
+        ) else {
+            return Ok(None);
+        };
+        if seen.insert((row_pk.clone(), file_id.clone())) {
+            identities.push((row_pk, file_id));
+        }
+    }
+    if !exact.order_by_columns.is_empty() {
+        identities.sort_unstable();
+    }
+    Ok(Some((spec, identities)))
+}
+
 fn exact_filesystem_read_route(
     statement: &DataFusionStatement,
     params: &[Value],
@@ -4097,9 +4655,7 @@ fn exact_point_text_param(expression: &Expr, params: &[Value]) -> Option<String>
         return None;
     };
     match &value.value {
-        SqlValue::Placeholder(placeholder)
-            if params.len() == 1 && (placeholder == "?" || placeholder == "$1") =>
-        {
+        SqlValue::Placeholder(placeholder) if params.len() == 1 && placeholder == "$1" => {
             let Value::Text(value) = &params[0] else {
                 return None;
             };
@@ -4134,38 +4690,6 @@ fn point_read_limit_is_safe(limit_clause: Option<&LimitClause>) -> bool {
     matches!(&value.value, SqlValue::Number(number, _) if number.parse::<u64>().is_ok_and(|number| number > 0))
 }
 
-fn anonymous_placeholders_in_select_item(item: &SelectItem) -> usize {
-    let expression = match item {
-        SelectItem::UnnamedExpr(expression)
-        | SelectItem::ExprWithAlias {
-            expr: expression, ..
-        } => expression,
-        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return 0,
-    };
-    let mut visitor = AnonymousPlaceholderCounter::default();
-    let _ = expression.visit(&mut visitor);
-    visitor.count
-}
-
-#[derive(Default)]
-struct AnonymousPlaceholderCounter {
-    count: usize,
-}
-
-impl Visitor for AnonymousPlaceholderCounter {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-        if matches!(
-            expression,
-            Expr::Value(value) if matches!(&value.value, SqlValue::Placeholder(placeholder) if placeholder == "?")
-        ) {
-            self.count = self.count.saturating_add(1);
-        }
-        ControlFlow::Continue(())
-    }
-}
-
 fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
     matches!(group_by, GroupByExpr::Expressions(expressions, modifiers)
         if expressions.is_empty() && modifiers.is_empty())
@@ -4185,19 +4709,16 @@ fn collect_literal_equalities(
     expression: &Expr,
     columns: &mut BTreeSet<String>,
     params: &[Value],
-    anonymous_placeholder_index: &mut usize,
 ) -> bool {
     match expression {
-        Expr::Nested(expression) => {
-            collect_literal_equalities(expression, columns, params, anonymous_placeholder_index)
-        }
+        Expr::Nested(expression) => collect_literal_equalities(expression, columns, params),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
         } => {
-            collect_literal_equalities(left, columns, params, anonymous_placeholder_index)
-                && collect_literal_equalities(right, columns, params, anonymous_placeholder_index)
+            collect_literal_equalities(left, columns, params)
+                && collect_literal_equalities(right, columns, params)
         }
         Expr::BinaryOp {
             left,
@@ -4205,16 +4726,8 @@ fn collect_literal_equalities(
             right,
         } => {
             let column = match (direct_column_name(left), direct_column_name(right)) {
-                (Some(column), None)
-                    if point_identity_value_is_text(right, params, anonymous_placeholder_index) =>
-                {
-                    column
-                }
-                (None, Some(column))
-                    if point_identity_value_is_text(left, params, anonymous_placeholder_index) =>
-                {
-                    column
-                }
+                (Some(column), None) if point_identity_value_is_text(right, params) => column,
+                (None, Some(column)) if point_identity_value_is_text(left, params) => column,
                 _ => return false,
             };
             columns.insert(column)
@@ -4223,26 +4736,16 @@ fn collect_literal_equalities(
     }
 }
 
-fn point_identity_value_is_text(
-    expression: &Expr,
-    params: &[Value],
-    anonymous_placeholder_index: &mut usize,
-) -> bool {
+fn point_identity_value_is_text(expression: &Expr, params: &[Value]) -> bool {
     let Expr::Value(value) = expression else {
         return false;
     };
     match &value.value {
         SqlValue::Placeholder(placeholder) => {
-            let index = if placeholder == "?" {
-                let index = *anonymous_placeholder_index;
-                *anonymous_placeholder_index += 1;
-                Some(index)
-            } else {
-                placeholder
-                    .strip_prefix('$')
-                    .and_then(|index| index.parse::<usize>().ok())
-                    .and_then(|index| index.checked_sub(1))
-            };
+            let index = placeholder
+                .strip_prefix('$')
+                .and_then(|index| index.parse::<usize>().ok())
+                .and_then(|index| index.checked_sub(1));
             index
                 .and_then(|index| params.get(index))
                 .is_some_and(|value| matches!(value, Value::Text(_)))
@@ -4539,11 +5042,11 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
 mod tests {
     use super::*;
     use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::telemetry::{
         CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
     };
-    use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
+    use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{
         Memory,
         engine::{Engine, EngineOptions},
@@ -4557,10 +5060,65 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
-        engine
-            .open_workspace_session()
+        engine.open_session().await.expect("session should open")
+    }
+
+    #[tokio::test]
+    async fn exact_registered_schema_point_preserves_typed_public_projection() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "native_point_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "payload", "type": "jsonb", "nullable": true },
+                { "name": "optional", "type": "text", "nullable": true }
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
             .await
-            .expect("workspace session should open")
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO native_point_probe (id, payload, optional) VALUES ($1, CAST($2 AS JSONB), NULL)",
+                &[
+                    Value::Text("row-a".into()),
+                    Value::Text(r#"{"nested":[true,null],"count":7}"#.into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let native = session
+            .execute(
+                "SELECT payload AS body, optional FROM native_point_probe WHERE id = $1 LIMIT 1",
+                &[Value::Text("row-a".into())],
+            )
+            .await
+            .unwrap();
+        let planned = session
+            .execute(
+                "SELECT payload AS body, optional FROM native_point_probe WHERE id = CAST($1 AS TEXT) LIMIT 1",
+                &[Value::Text("row-a".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(native.columns(), &["body", "optional"]);
+        assert_eq!(native, planned);
+
+        let missing = session
+            .execute(
+                "SELECT payload FROM native_point_probe WHERE id = $1 LIMIT 1",
+                &[Value::Text("missing".into())],
+            )
+            .await
+            .unwrap();
+        assert!(missing.is_empty());
     }
 
     async fn assert_columnar_lifecycle_current(
@@ -4598,9 +5156,9 @@ mod tests {
             .await
             .expect("columnar route read should open");
         let overlay_rows = session
-            .live_state
+            .hot_state
             .reader(&read)
-            .entity_columnar_overlay_len_for_test(&branch_id, schema_key)
+            .row_columnar_overlay_len_for_test(&branch_id, schema_key)
             .await
             .expect("columnar route should plan")
             .expect("fixture must retain the authenticated columnar path");
@@ -4639,7 +5197,7 @@ mod tests {
                 .expect("replacement metadata should load")
                 .expect("current head must publish replacement metadata");
         assert_eq!(u64::from(replay.member_count), expected_rows);
-        let id = crate::live_state::entity_row_group_set_id(head.commit_id, schema_key);
+        let id = crate::hot_state::row_group_set_id(head.commit_id, schema_key);
         let manifest = crate::columnar_row_group::load_row_group_manifest(&state_read, id)
             .await
             .expect("columnar manifest lookup should succeed");
@@ -4663,10 +5221,7 @@ mod tests {
             Engine::new_with_options(storage, EngineOptions::new().with_telemetry(Arc::new(sink)))
                 .await
                 .expect("initialized storage should create engine");
-        engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open")
+        engine.open_session().await.expect("session should open")
     }
 
     fn batch_statement(sql: &str) -> ExecuteBatchStatement {
@@ -4716,7 +5271,7 @@ mod tests {
         );
 
         let change_by_path =
-            sql2::parse_statement("SELECT lixcol_change_id FROM lix_file WHERE path = ?").unwrap();
+            sql2::parse_statement("SELECT lixcol_change_id FROM lix_file WHERE path = $1").unwrap();
         assert_eq!(
             exact_filesystem_read_route(&change_by_path, &[Value::Text("/a.txt".to_string())]),
             Some(ExactFilesystemRead::Point(
@@ -4917,6 +5472,116 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_schema_batch_route_preserves_composite_identity_expansion() {
+        let statement = sql2::parse_statement(
+            "SELECT tenant, revision, payload FROM batch_route_row \
+             WHERE tenant = $1 AND revision IN ($2, $3, $2) \
+               AND lixcol_file_id IS NULL \
+             ORDER BY tenant, revision",
+        )
+        .expect("batch route SQL should parse");
+        let route = exact_schema_batch_read_route(
+            &statement,
+            &[
+                Value::Text("docs".to_owned()),
+                Value::Integer(7),
+                Value::Integer(9),
+            ],
+        )
+        .expect("complete composite identities should route");
+        assert_eq!(route.identities.len(), 3, "request slots stay aligned");
+        assert_eq!(route.order_by_columns, ["tenant", "revision"]);
+        assert_eq!(route.identities[0]["tenant"], Value::Text("docs".to_owned()));
+        assert_eq!(route.identities[0]["revision"], Value::Integer(7));
+        assert_eq!(route.identities[0]["lixcol_file_id"], Value::Null);
+        assert_eq!(route.identities[1]["revision"], Value::Integer(9));
+        assert_eq!(route.identities[2]["revision"], Value::Integer(7));
+    }
+
+    #[tokio::test]
+    async fn exact_schema_batch_matches_relational_duplicate_missing_null_and_jsonb_semantics() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "batch_route_row",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "note", "type": "text", "nullable": true },
+                { "name": "payload", "type": "jsonb", "nullable": false }
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) \
+                 VALUES ('batch_route_row', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("register batch-route schema");
+        session
+            .execute(
+                "INSERT INTO batch_route_row (id, note, payload) VALUES \
+                 ('a', NULL, CAST('{\"rank\":1}' AS JSONB)), \
+                 ('b', 'present', CAST('{\"rank\":2}' AS JSONB))",
+                &[],
+            )
+            .await
+            .expect("seed batch-route rows");
+
+        let params = [
+            Value::Text("b".to_owned()),
+            Value::Text("missing".to_owned()),
+            Value::Text("a".to_owned()),
+            Value::Text("b".to_owned()),
+        ];
+        let exact = session
+            .execute(
+                "SELECT id, note, payload FROM batch_route_row \
+                 WHERE id IN ($1, $2, $3, $4) \
+                   AND lixcol_file_id IS NULL ORDER BY id",
+                &params,
+            )
+            .await
+            .expect("native batch route should execute");
+        let relational = session
+            .execute(
+                "SELECT row.id, row.note, row.payload FROM batch_route_row AS row \
+                 WHERE row.id IN ($1, $2, $3, $4) \
+                   AND row.lixcol_file_id IS NULL ORDER BY row.id",
+                &params,
+            )
+            .await
+            .expect("relational control should execute");
+        assert_eq!(exact, relational);
+        assert_eq!(exact.rows().len(), 2, "duplicates and misses emit no extra rows");
+        assert_eq!(exact.rows()[0].value("note").expect("note column"), &Value::Null);
+        assert_eq!(
+            exact.rows()[1].value("payload").expect("payload column"),
+            &Value::Jsonb(serde_json::json!({"rank": 2}).into())
+        );
+
+        #[cfg(feature = "storage-benches")]
+        {
+            let (profiled, profile) = session
+                .execute_profiled(
+                    "SELECT id, note, payload FROM batch_route_row \
+                     WHERE id IN ($1, $2, $3, $4) \
+                       AND lixcol_file_id IS NULL ORDER BY id",
+                    &params,
+                )
+                .await
+                .expect("profiled native batch route should execute");
+            assert_eq!(profiled.rows().len(), 2);
+            assert_eq!(profile.scan_rows, 2, "only returned public rows are scanned");
+            assert_eq!(
+                profile.provider_rows_examined, 3,
+                "present, missing, and duplicate slots examine three unique exact identities"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn exact_root_filesystem_listings_match_the_relational_path() {
         let session = open_session().await;
@@ -4932,7 +5597,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES \
-                 ('01920000-0000-7000-8000-0000000000f1', '/b.txt', $1, lix_json('{\"rank\":2}')), \
+                 ('01920000-0000-7000-8000-0000000000f1', '/b.txt', $1, CAST('{\"rank\":2}' AS JSONB)), \
                  ('01920000-0000-7000-8000-0000000000f2', '/nested/a.txt', $2, NULL), \
                  ('01920000-0000-7000-8000-0000000000f3', '/a.txt', $3, NULL)",
                 &[
@@ -4976,7 +5641,7 @@ mod tests {
         );
         assert_eq!(
             exact.rows()[1].value("lixcol_metadata").unwrap(),
-            &Value::Json(serde_json::json!({"rank": 2}))
+            &Value::Jsonb(serde_json::json!({"rank": 2}).into())
         );
 
         let exact_directories = session
@@ -5081,7 +5746,7 @@ mod tests {
             ExecuteBatchExecution::Transaction(_)
         ));
         assert!(matches!(
-            classify_execute_batch(&[batch_statement("SELECT lix_uuid_v7()")], &cache).unwrap(),
+            classify_execute_batch(&[batch_statement("SELECT uuidv7()")], &cache).unwrap(),
             ExecuteBatchExecution::Transaction(_)
         ));
     }
@@ -5163,7 +5828,7 @@ mod tests {
         );
         assert_eq!(
             session
-                .execution_disposition("SELECT lix_uuid_v7()")
+                .execution_disposition("SELECT uuidv7()")
                 .unwrap(),
             ExecutionDisposition::Durable
         );
@@ -5188,7 +5853,7 @@ mod tests {
             session
                 .execute_batch_disposition(&[
                     batch_statement("SELECT 1"),
-                    batch_statement("SELECT lix_timestamp()"),
+                    batch_statement("SELECT CURRENT_TIMESTAMP"),
                 ])
                 .unwrap(),
             ExecutionDisposition::Durable
@@ -5283,19 +5948,17 @@ mod tests {
     async fn public_insert_preserves_declared_integer_primary_key_type() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "integer_primary_key_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "integer" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "integer_primary_key_insert_probe",
+            "columns": [
+                { "name": "id", "type": "int8", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5323,29 +5986,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_lowers_distinct_bound_entity_inserts_once() {
+    async fn execute_batch_lowers_distinct_bound_row_inserts_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_batch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string", "minLength": 3 }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_batch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let sql = "INSERT INTO parameter_insert_batch_probe (id, value) VALUES ($1, $2)";
         let results = session
             .execute_batch(&[
@@ -5370,7 +6030,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             1
         );
         assert_eq!(
@@ -5390,7 +6050,7 @@ mod tests {
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "value-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "value-b");
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -5414,7 +6074,7 @@ mod tests {
             .expect_err("the second INSERT conflicts with committed row b");
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
         let rows = session
@@ -5446,9 +6106,9 @@ mod tests {
                 },
             ])
             .await
-            .expect_err("the later normalization error must precede the committed conflict");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+            .expect_err("the committed conflict should be reported first");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
 
         session
             .create_checkpoint()
@@ -5497,20 +6157,17 @@ mod tests {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "ordered_packed_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "ordered_packed_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5562,19 +6219,17 @@ mod tests {
         const ROW_COUNT: usize = 32 * 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "rootless_ordered_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "rootless_ordered_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5798,7 +6453,7 @@ mod tests {
                 branch_id: branch_id.clone(),
             })
             .await
-            .expect("workspace should switch back to the rootless main branch");
+            .expect("repository should switch back to the rootless main branch");
         let main_session = &session;
         session
             .execute(
@@ -5985,20 +6640,17 @@ mod tests {
         const BATCH_ROWS: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "successive_columnar_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "successive_columnar_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -6058,27 +6710,24 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         let main = engine
-            .open_workspace_session_with_account(crate::SYSTEM_ACCOUNT_ID)
+            .open_session_with_account(crate::SYSTEM_ACCOUNT_ID)
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         let main_branch_id = main
             .active_branch_id()
             .await
-            .expect("workspace branch should resolve");
+            .expect("repository branch should resolve");
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "columnar_lifecycle_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "columnar_lifecycle_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         main.execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -6130,7 +6779,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("sidecar read scope should open");
-        let row_group_id = crate::live_state::entity_row_group_set_id(
+        let row_group_id = crate::hot_state::row_group_set_id(
             crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle insert head")
                 .expect("insert head should be canonical"),
             "columnar_lifecycle_probe",
@@ -6207,12 +6856,15 @@ mod tests {
                 .parts
                 .iter()
                 .map(|part| {
-                    crate::tracked_state::current_state_descriptor_from_scoped_range_part(part)
-                        .expect("columnar locator should decode")
-                        .source_kind
+                    matches!(
+                        crate::tracked_state::current_state_descriptor_from_scoped_range_part(part)
+                            .expect("columnar locator should decode")
+                            .source,
+                        crate::tracked_state::CurrentStatePartSource::ColumnarPage(_)
+                    )
                 })
                 .collect::<Vec<_>>(),
-            vec![2; 33]
+            vec![true; 33]
         );
         let owner =
             crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle serving owner")
@@ -6221,13 +6873,13 @@ mod tests {
         let point_keys = point_ids
             .iter()
             .map(|identity| {
-                let entity_pk = EntityPk::from_json_array_text(&format!("[\"{identity}\"]"))
+                let row_pk = RowPk::from_json_array_text(&format!("[\"{identity}\"]"))
                     .expect("test identity should parse");
                 bytes::Bytes::from(crate::tracked_state::encode_key_ref(
                     crate::tracked_state::TrackedStateKeyRef {
                         schema_key: "columnar_lifecycle_probe",
                         file_id: None,
-                        entity_pk: &entity_pk,
+                        row_pk: &row_pk,
                     },
                 ))
             })
@@ -6383,7 +7035,7 @@ mod tests {
             .await
             .expect("checkpoint branch should create");
         let draft_session = engine
-            .open_session(draft.id.clone())
+            .open_session_at(draft.id.clone())
             .await
             .expect("draft session should open");
         draft_session
@@ -6494,7 +7146,7 @@ mod tests {
             .await
             .expect("corrupt storage should still open structurally");
         let reopened_session = reopened
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("corrupt storage session should open");
         assert!(
@@ -6518,31 +7170,24 @@ mod tests {
         const PARTIAL_ROW_COUNT: usize = ROW_COUNT / 2;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "ordered_packed_update_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "ordered_packed_update_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let insert_statements = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -6557,7 +7202,7 @@ mod tests {
 
         crate::transaction::take_complete_replacement_packed_current_base_retirements();
         let update_sql =
-            "UPDATE ordered_packed_update_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE ordered_packed_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for version in 1..=2 {
             let update_statements = (0..ROW_COUNT)
                 .map(|row_index| ExecuteBatchStatement {
@@ -6672,19 +7317,17 @@ mod tests {
     async fn ordered_batch_update_preserves_non_uniform_lifecycle_without_journal_admission() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "non_uniform_journal_admission_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "non_uniform_journal_admission_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -6743,6 +7386,92 @@ mod tests {
         assert_eq!(before.rows(), after.rows());
     }
 
+    /// A file and its rows share one durability lane. An untracked
+    /// parameter batch large enough to reach the dense certified transport
+    /// must still land untracked — the lane is not a function of batch size.
+    #[tokio::test]
+    async fn expdl_dense_scale_untracked_parameter_batch_stays_untracked() {
+        // The dense certified transport engages at this row count, so this is
+        // the smallest batch that can exercise the dense projection.
+        const ROW_COUNT: usize = 32 * 1024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "expdl_dense_untracked_lane_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema \
+                 (value, lixcol_global, lixcol_untracked) \
+                 VALUES (CAST($1 AS JSONB), false, true)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("untracked schema registration should succeed");
+
+        let sql = "INSERT INTO expdl_dense_untracked_lane_probe \
+                   (path, value, lixcol_untracked) VALUES ($1, CAST($2 AS JSONB), TRUE)";
+        let statements = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
+                label: None,
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text(format!("/p-{index:05}")),
+                    Value::Text(format!("\"v-{index:05}\"")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&statements)
+            .await
+            .expect("dense-scale untracked parameter batch should commit");
+
+        let totals = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe",
+                &[],
+            )
+            .await
+            .expect("probe rows should read");
+        assert_eq!(
+            totals.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64
+        );
+
+        let lanes = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe \
+                 WHERE lixcol_untracked",
+                &[],
+            )
+            .await
+            .expect("probe lanes should read");
+        assert_eq!(
+            lanes.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64,
+            "every row of an untracked batch must stay in the untracked lane"
+        );
+
+        let commits = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe \
+                 WHERE lixcol_commit_id IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("probe commit ids should read");
+        assert_eq!(
+            commits.rows()[0].get::<i64>("entries").unwrap(),
+            0,
+            "untracked rows carry no commit id"
+        );
+    }
+
     #[tokio::test]
     async fn certified_parameter_batch_revalidates_after_staged_schema_amendment() {
         // Keep this at the production typed-transport boundary. A separate
@@ -6750,37 +7479,31 @@ mod tests {
         const ROW_COUNT: usize = 32 * 1024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "amended_parameter_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "amended_parameter_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let amended_schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "amended_parameter_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" },
-                "source": { "type": "string", "default": "amended-plan" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "amended_parameter_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+                { "name": "source", "type": "text", "nullable": false, "default_value": "amended-plan" },
+            ],
+            "primary_key": ["id"],
         });
         crate::transaction::take_direct_journal_replacement_publications(
             "amended_parameter_insert_probe",
@@ -6789,8 +7512,8 @@ mod tests {
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_insert_probe\"]')",
-                &[Value::Json(amended_schema)],
+                 WHERE lixcol_row_pk = CAST('[\"amended_parameter_insert_probe\"]' AS JSONB)",
+                &[Value::Jsonb(amended_schema.into())],
             )
             .await
             .expect("compatible schema amendment should stage");
@@ -6801,7 +7524,7 @@ mod tests {
                 label: None,
                 sql: sql.to_string(),
                 params: vec![
-                    Value::Text(format!("entity-{index:05}")),
+                    Value::Text(format!("row-{index:05}")),
                     Value::Text(format!("value-{index:05}")),
                 ],
             })
@@ -6849,64 +7572,50 @@ mod tests {
     async fn certified_replacement_batch_revalidates_after_staged_schema_amendment() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "amended_parameter_update_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "amended_parameter_update_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
         session
             .execute(
-                "INSERT INTO amended_parameter_update_probe (path, value) VALUES ('a', lix_json('\"old-a\"')), ('b', lix_json('\"old-b\"'))",
+                "INSERT INTO amended_parameter_update_probe (path, value) VALUES ('a', CAST('\"old-a\"' AS JSONB)), ('b', CAST('\"old-b\"' AS JSONB))",
                 &[],
             )
             .await
             .unwrap();
 
         let amended_schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "amended_parameter_update_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                },
-                "source": { "type": "string", "default": "amended-plan" }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "amended_parameter_update_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+                { "name": "source", "type": "text", "nullable": true, "default_value": "amended-plan" },
+            ],
+            "primary_key": ["path"],
         });
         let mut transaction = session.begin_transaction().await.unwrap();
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_update_probe\"]')",
-                &[Value::Json(amended_schema)],
+                 WHERE lixcol_row_pk = CAST('[\"amended_parameter_update_probe\"]' AS JSONB)",
+                &[Value::Jsonb(amended_schema.into())],
             )
             .await
             .expect("compatible schema amendment should stage");
 
-        let sql = "UPDATE amended_parameter_update_probe SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE amended_parameter_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let statements = [
             ExecuteBatchStatement {
                 label: None,
@@ -6976,7 +7685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn certified_empty_batch_rechecks_concurrent_insert_at_commit_snapshot() {
+    async fn certified_batch_reconciles_concurrent_insert_at_commit_snapshot() {
         let storage = Memory::default();
         Engine::initialize(storage.clone())
             .await
@@ -6984,29 +7693,26 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
-        let setup = engine.open_workspace_session().await.unwrap();
+        let setup = engine.open_session().await.unwrap();
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "concurrent_parameter_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "concurrent_parameter_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         setup
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
-        let first = engine.open_workspace_session().await.unwrap();
-        let second = engine.open_workspace_session().await.unwrap();
+        let first = engine.open_session().await.unwrap();
+        let second = engine.open_session().await.unwrap();
         let sql = "INSERT INTO concurrent_parameter_insert_probe (id, value) VALUES ($1, $2)";
         let first_statements = [
             ExecuteBatchStatement {
@@ -7069,12 +7775,10 @@ mod tests {
             .await
             .expect("concurrent batch should commit first");
 
-        let error = first_transaction
+        first_transaction
             .commit()
             .await
-            .expect_err("commit snapshot must observe the concurrent identity");
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+            .expect("same-identity concurrent inserts use row-existence LWW");
         let rows = second
             .execute(
                 "SELECT value FROM concurrent_parameter_insert_probe WHERE id = 'shared'",
@@ -7082,27 +7786,27 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "second");
+        assert!(matches!(
+            rows.rows()[0].get::<String>("value").unwrap().as_str(),
+            "first" | "second"
+        ));
     }
 
     #[tokio::test]
     async fn consecutive_certified_batches_preserve_local_conflict_statement_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "consecutive_parameter_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "consecutive_parameter_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7201,36 +7905,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_declines_uncertified_entity_insert_rows() {
+    async fn execute_batch_declines_uncertified_row_insert_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_fallback_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": {
-                    "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
-                    "additionalProperties": false
-                }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_fallback_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let sql =
-            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, CAST($2 AS JSONB))";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -7251,11 +7947,11 @@ mod tests {
                 },
             ])
             .await
-            .expect_err("the first row's schema failure must precede later expression evaluation");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert_eq!(error.details.unwrap()["statementIndex"], 0);
+            .expect_err("the later invalid JSON expression should be reported");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
     }
@@ -7264,26 +7960,23 @@ mod tests {
     async fn execute_batch_declines_json_marked_utf8_for_string_columns() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_json_string_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_json_string_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let sql = "INSERT INTO parameter_insert_json_string_probe (id, value) VALUES ($1, $2)";
         let error = session
             .execute_batch(&[
@@ -7292,7 +7985,7 @@ mod tests {
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
-                        Value::Json(serde_json::json!({"not": "text"})),
+                        Value::Jsonb(serde_json::json!({"not": "text"}).into()),
                     ],
                 },
                 ExecuteBatchStatement {
@@ -7300,7 +7993,7 @@ mod tests {
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
-                        Value::Json(serde_json::json!({"also": "not text"})),
+                        Value::Jsonb(serde_json::json!({"also": "not text"}).into()),
                     ],
                 },
             ])
@@ -7308,7 +8001,7 @@ mod tests {
             .expect_err("JSON objects must not be coerced into string column values");
         assert_eq!(error.details.unwrap()["statementIndex"], 0);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
         let rows = session
@@ -7322,26 +8015,23 @@ mod tests {
     async fn execute_batch_preserves_early_duplicate_before_later_schema_error() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_error_order_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string", "minLength": 1 }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_error_order_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let sql = "INSERT INTO parameter_insert_error_order_probe (id, value) VALUES ($1, $2)";
         let error = session
             .execute_batch(&[
@@ -7372,7 +8062,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
         let rows = session
@@ -7386,20 +8076,17 @@ mod tests {
     async fn execute_batch_preserves_later_missing_branch_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_branch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_branch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7457,22 +8144,19 @@ mod tests {
     async fn execute_batch_preserves_later_durability_domain_error_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_insert_durability_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_insert_durability_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
                 "INSERT INTO lix_registered_schema \
                  (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, true)",
+                 VALUES (CAST($1 AS JSONB), false, true)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7520,23 +8204,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_lowers_distinct_bound_entity_updates_once() {
+    async fn execute_batch_lowers_distinct_bound_row_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7550,7 +8231,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let sql = "UPDATE parameter_batch_probe SET value = $1 WHERE id = $2";
         let results = session
             .execute_batch(&[
@@ -7574,7 +8255,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 1);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 1);
         assert_eq!(
             results
                 .iter()
@@ -7597,20 +8278,17 @@ mod tests {
     async fn execute_prepared_dml_batch_preserves_order_absence_and_atomic_errors() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "prepared_dml_contract_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "prepared_dml_contract_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7647,7 +8325,7 @@ mod tests {
         let error = session
             .execute_prepared_dml_batch(
                 Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
                 ),
                 PreparedDmlParameterBatch::from_rows([
                     vec![Value::Text("{invalid".into()), Value::Text("a".into())],
@@ -7680,7 +8358,7 @@ mod tests {
         let error = transaction
             .execute_prepared_dml_batch(
                 Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
                 ),
                 PreparedDmlParameterBatch::from_rows([
                     vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
@@ -7711,22 +8389,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_lowers_distinct_literal_entity_updates_once() {
+    async fn execute_batch_lowers_distinct_literal_row_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "literal_parameter_batch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "literal_parameter_batch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7740,7 +8416,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let results = session
             .execute_batch(&[
                 batch_statement(
@@ -7753,7 +8429,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 1);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 1);
         assert_eq!(
             results
                 .iter()
@@ -7773,28 +8449,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entity_insert_values_use_one_certified_canonical_batch() {
+    async fn row_insert_values_use_one_certified_canonical_batch() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "certified_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "certified_insert_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("schema registration should succeed");
 
-        sql2::take_certified_entity_insert_batch_executions();
+        sql2::take_certified_row_insert_batch_executions();
         session
             .execute(
                 "INSERT INTO certified_insert_probe (value, id) VALUES \
@@ -7804,7 +8478,7 @@ mod tests {
             .await
             .expect("certified insert batch should commit");
 
-        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 1);
+        assert_eq!(sql2::take_certified_row_insert_batch_executions(), 1);
         let rows = session
             .execute(
                 "SELECT id, value FROM certified_insert_probe ORDER BY id",
@@ -7820,19 +8494,17 @@ mod tests {
     async fn conflict_insert_filters_rows_before_snapshot_validation() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "conflict_validation_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string", "minLength": 3 }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "conflict_validation_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7845,7 +8517,7 @@ mod tests {
             .await
             .expect("seed row should commit");
 
-        sql2::take_certified_entity_insert_batch_executions();
+        sql2::take_certified_row_insert_batch_executions();
         session
             .execute(
                 "INSERT INTO conflict_validation_probe (id, value) VALUES ('a', 'x') \
@@ -7855,7 +8527,7 @@ mod tests {
             .await
             .expect("conflicting invalid payload should be discarded before validation");
 
-        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 0);
+        assert_eq!(sql2::take_certified_row_insert_batch_executions(), 0);
         let rows = session
             .execute(
                 "SELECT value FROM conflict_validation_probe WHERE id = 'a'",
@@ -7872,29 +8544,27 @@ mod tests {
 
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "explicit_uuid_key_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "format": "uuid" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "explicit_uuid_key_probe",
+            "columns": [
+                { "name": "id", "type": "uuid", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("schema registration should succeed");
 
-        sql2::take_certified_entity_insert_batch_executions();
+        sql2::take_certified_row_insert_batch_executions();
         session
             .execute(
-                "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_entity_pk) \
-                 VALUES ($1, 'value', lix_json($2))",
+                "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_row_pk) \
+                 VALUES ($1, 'value', CAST($2 AS JSONB))",
                 &[
                     Value::Text(UUID.to_string()),
                     Value::Text(format!("[\"{UUID}\"]")),
@@ -7903,7 +8573,7 @@ mod tests {
             .await
             .expect("matching typed and external UUID keys should commit");
 
-        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 1);
+        assert_eq!(sql2::take_certified_row_insert_batch_executions(), 1);
         let rows = session
             .execute(
                 "SELECT value FROM explicit_uuid_key_probe WHERE id = $1",
@@ -7918,23 +8588,17 @@ mod tests {
     async fn execute_batch_certifies_out_of_order_complete_path_value_replacements() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "certified_replacement_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "certified_replacement_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7942,13 +8606,13 @@ mod tests {
         session
             .execute(
                 "INSERT INTO certified_replacement_probe (path, value) VALUES \
-                 ('/a', lix_json('\"old-a\"')), ('/b', lix_json('\"old-b\"'))",
+                 ('/a', CAST('\"old-a\"' AS JSONB)), ('/b', CAST('\"old-b\"' AS JSONB))",
                 &[],
             )
             .await
             .unwrap();
 
-        let sql = "UPDATE certified_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE certified_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let missing_results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -8047,7 +8711,7 @@ mod tests {
                     label: None,
                     sql: sql.to_string(),
                     params: vec![
-                        Value::Text("null".to_string()),
+                        Value::Text("true".to_string()),
                         Value::Text("/a".to_string()),
                     ],
                 },
@@ -8089,7 +8753,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.rows()[0].value("value").unwrap(), &Value::Null);
+        assert_eq!(
+            rows.rows()[0].value("value").unwrap(),
+            &Value::Jsonb(serde_json::json!(true).into())
+        );
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!({"final": "b"})
@@ -8101,30 +8768,24 @@ mod tests {
         const ROW_COUNT: usize = 32 * 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "packed_replacement_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "packed_replacement_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8140,7 +8801,7 @@ mod tests {
         crate::transaction::take_complete_replacement_packed_current_base_publications();
         crate::transaction::take_rootless_replacement_generation_publications();
         sql2::take_certified_generation_identity_replacements();
-        let update_sql = "UPDATE packed_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let update_sql = "UPDATE packed_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8429,7 +9090,7 @@ mod tests {
             .unwrap();
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"branch\":true}') WHERE path = '/00000'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"branch\":true}' AS JSONB) WHERE path = '/00000'",
                 &[],
             )
             .await
@@ -8442,7 +9103,7 @@ mod tests {
             .unwrap();
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"main\":true}') WHERE path = '/32767'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"main\":true}' AS JSONB) WHERE path = '/32767'",
                 &[],
             )
             .await
@@ -8520,7 +9181,7 @@ mod tests {
 
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"overlay\":true}') WHERE path = '/00000'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"overlay\":true}' AS JSONB) WHERE path = '/00000'",
                 &[],
             )
             .await
@@ -8571,7 +9232,7 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO packed_replacement_probe (path, value) VALUES ('/32767', lix_json('{\"reinserted\":true}'))",
+                "INSERT INTO packed_replacement_probe (path, value) VALUES ('/32767', CAST('{\"reinserted\":true}' AS JSONB))",
                 &[],
             )
             .await
@@ -8605,7 +9266,7 @@ mod tests {
             .unwrap();
         let reinserted_created_at = reinserted
             .iter()
-            .find(|row| row.entity_pk().as_single_string().ok() == Some("/32767"))
+            .find(|row| row.row_pk().as_single_string().ok() == Some("/32767"))
             .expect("reinserted row must be visible")
             .created_at();
 
@@ -8656,7 +9317,7 @@ mod tests {
         assert_eq!(
             post_reinsert
                 .iter()
-                .find(|row| row.entity_pk().as_single_string().ok() == Some("/32767"))
+                .find(|row| row.row_pk().as_single_string().ok() == Some("/32767"))
                 .expect("updated reinserted row must be visible")
                 .created_at(),
             reinserted_created_at,
@@ -8700,7 +9361,12 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("active head part descriptors should decode")
                 .into_iter()
-                .find(|descriptor| descriptor.source_kind == 1);
+                .find(|descriptor| {
+                    matches!(
+                        descriptor.source,
+                        crate::tracked_state::CurrentStatePartSource::NativeDataPart { .. }
+                    )
+                });
             if live_descriptor.is_some() {
                 break;
             }
@@ -8753,26 +9419,24 @@ mod tests {
         const ROW_COUNT: usize = 16;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "staged_generation_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": "object" }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "staged_generation_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO staged_generation_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO staged_generation_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8794,7 +9458,7 @@ mod tests {
             .await
             .unwrap();
 
-        let update_sql = "UPDATE staged_generation_probe SET value = lix_json($1) WHERE path = $2";
+        let update_sql = "UPDATE staged_generation_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8846,28 +9510,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_keeps_repeated_generic_entity_identity_sequential() {
+    async fn execute_batch_keeps_repeated_generic_row_identity_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_repeat_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_repeat_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let insert_sql = "INSERT INTO parameter_batch_repeat_probe (id, value) VALUES ($1, $2)";
         let error = session
             .execute_batch(&[
@@ -8892,7 +9553,7 @@ mod tests {
             .expect_err("the second INSERT repeats the first identity");
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
         session
@@ -8903,7 +9564,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let sql = "UPDATE parameter_batch_repeat_probe SET value = $1 WHERE id = $2";
         session
             .execute_batch(&[
@@ -8927,7 +9588,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 0);
         let row = session
             .execute(
                 "SELECT value FROM parameter_batch_repeat_probe WHERE id = 'a'",
@@ -8942,20 +9603,17 @@ mod tests {
     async fn execute_batch_keeps_unsupported_parameterless_updates_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameterless_batch_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameterless_batch_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -8968,7 +9626,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let results = session
             .execute_batch(&[
                 batch_statement(
@@ -8989,7 +9647,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 1]
         );
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 0);
         let row = session
             .execute(
                 "SELECT value FROM parameterless_batch_probe WHERE id = 'a'",
@@ -9004,21 +9662,18 @@ mod tests {
     async fn execute_batch_keeps_inter_row_constraints_on_sequential_execution() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_constraint_probe",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-unique": [["/value"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_constraint_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+            "unique": [["value"]],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9032,7 +9687,7 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_certified_entity_insert_parameter_batch_executions();
+        sql2::take_certified_row_insert_parameter_batch_executions();
         let insert_sql = "INSERT INTO parameter_batch_constraint_probe (id, value) VALUES ($1, $2)";
         session
             .execute_batch(&[
@@ -9056,11 +9711,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            sql2::take_certified_row_insert_parameter_batch_executions(),
             0
         );
 
-        sql2::take_entity_update_parameter_batch_executions();
+        sql2::take_row_update_parameter_batch_executions();
         let sql = "UPDATE parameter_batch_constraint_probe SET value = $1 WHERE id = $2";
         session
             .execute_batch(&[
@@ -9084,27 +9739,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 0);
     }
 
     #[tokio::test]
     async fn execute_batch_parameter_batch_preserves_failing_statement_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_error_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_error_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9118,8 +9770,8 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_entity_update_parameter_batch_executions();
-        let sql = "UPDATE parameter_batch_error_probe SET value = lix_json($1) WHERE id = $2";
+        sql2::take_row_update_parameter_batch_executions();
+        let sql = "UPDATE parameter_batch_error_probe SET value = CAST($1 AS JSONB) WHERE id = $2";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -9143,7 +9795,7 @@ mod tests {
             .expect_err("the second statement has invalid JSON");
 
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
-        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        assert_eq!(sql2::take_row_update_parameter_batch_executions(), 0);
         let rows = session
             .execute(
                 "SELECT id, value FROM parameter_batch_error_probe ORDER BY id",
@@ -9159,20 +9811,17 @@ mod tests {
     async fn execute_batch_parameter_batch_indexes_parameter_count_errors() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_count_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_count_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9211,20 +9860,17 @@ mod tests {
         let spans = Arc::new(std::sync::Mutex::new(Vec::new()));
         let session = open_session_with_telemetry(Arc::clone(&spans)).await;
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "parameter_batch_telemetry_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameter_batch_telemetry_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9338,11 +9984,11 @@ mod tests {
                     Value::Text(b.to_string()),
                     Value::Text("/b.txt".to_string()),
                     Value::Blob(b"bravo".to_vec().into()),
-                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"b"})),
+                    Value::Jsonb(serde_json::json!({"git_mode":"100644","git_oid":"b"}).into()),
                     Value::Text(a.to_string()),
                     Value::Text("/a.txt".to_string()),
                     Value::Blob(b"alpha".to_vec().into()),
-                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"})),
+                    Value::Jsonb(serde_json::json!({"git_mode":"100644","git_oid":"a"}).into()),
                 ],
             )
             .await
@@ -9369,7 +10015,7 @@ mod tests {
         );
         assert_eq!(
             result.rows()[0].value("lixcol_metadata").unwrap(),
-            &Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"}))
+            &Value::Jsonb(serde_json::json!({"git_mode":"100644","git_oid":"a"}).into())
         );
         assert_eq!(result.rows()[1].get::<String>("id").unwrap(), b);
         assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");
@@ -9660,9 +10306,9 @@ mod tests {
                  FROM files AS file_a \
                  JOIN files AS file_b ON file_a.id = file_b.id \
                  LEFT JOIN (\
-                     SELECT entity_pk FROM lix_change \
+                     SELECT row_pk FROM lix_change \
                      UNION ALL \
-                     SELECT entity_pk FROM lix_change\
+                     SELECT row_pk FROM lix_change\
                  ) AS changes ON false",
                 &[],
             )
@@ -9701,11 +10347,11 @@ mod tests {
         session
             .execute("SELECT COUNT(*) AS rows FROM lix_key_value", &[])
             .await
-            .expect("fixed entity surface should execute");
+            .expect("fixed schema surface should execute");
         assert_eq!(
             schema_loads(),
             before,
-            "fixed entity metadata comes from compile-time schemas"
+            "fixed row metadata comes from compile-time schemas"
         );
 
         session
@@ -9746,17 +10392,16 @@ mod tests {
         );
 
         let custom_schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "custom_catalog_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false,
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "custom_catalog_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(custom_schema.to_string())],
             )
             .await
@@ -9766,11 +10411,11 @@ mod tests {
         session
             .execute("SELECT COUNT(*) AS rows FROM custom_catalog_probe", &[])
             .await
-            .expect("custom entity should execute");
+            .expect("custom row should execute");
         assert_eq!(
             schema_loads(),
             before_custom_read,
-            "custom entity metadata must use the compiled catalog instead of rescanning schemas"
+            "custom row metadata must use the compiled catalog instead of rescanning schemas"
         );
 
         let before_mixed_join = schema_loads();
@@ -9789,10 +10434,10 @@ mod tests {
         );
 
         let mut next_schema = custom_schema.clone();
-        next_schema["x-lix-key"] = serde_json::json!("custom_catalog_probe_after_mutation");
+        next_schema["key"] = serde_json::json!("custom_catalog_probe_after_mutation");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(next_schema.to_string())],
             )
             .await
@@ -9819,7 +10464,7 @@ mod tests {
 
         fn row(value: &str, created_at: Option<&str>) -> TransactionWriteRow {
             TransactionWriteRow {
-                entity_pk: Some(EntityPk::single(KEY)),
+                row_pk: Some(RowPk::single(KEY)),
                 schema_key: "lix_key_value".into(),
                 file_id: None,
                 snapshot: Some(TransactionJson::from_value_for_test(serde_json::json!({
@@ -10048,28 +10693,24 @@ mod tests {
     async fn explicit_transaction_certified_json_pointer_updates_observe_staged_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "json_pointer",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_pointer",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("json pointer schema should register");
         session
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text("/certified".to_string()),
                     Value::Text("{\"step\":0}".to_string()),
@@ -10083,7 +10724,7 @@ mod tests {
             .await
             .expect("transaction should begin");
         assert_eq!(sql2::take_certified_single_path_value_replacements(), 0);
-        let sql = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
         for step in [1, 2] {
             let result = transaction
                 .execute(
@@ -10135,21 +10776,17 @@ mod tests {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "packed_journal_overlay_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "packed_journal_overlay_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10157,7 +10794,7 @@ mod tests {
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
-                sql: "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ($1, lix_json($2))"
+                sql: "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                     .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10174,7 +10811,7 @@ mod tests {
             .await
             .expect("transaction should begin");
         let update_sql =
-            "UPDATE packed_journal_overlay_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE packed_journal_overlay_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         transaction
             .execute(
                 update_sql,
@@ -10187,7 +10824,7 @@ mod tests {
             .expect("base update should prepare packed membership");
         transaction
             .execute(
-                "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ('2000', lix_json('{\"state\":\"inserted\"}'))",
+                "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ('2000', CAST('{\"state\":\"inserted\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10259,29 +10896,25 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("replacement session should open");
         let concurrent_session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("concurrent session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "stale_journal_replacement_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "stale_journal_replacement_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10289,7 +10922,7 @@ mod tests {
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
-                sql: "INSERT INTO stale_journal_replacement_probe (path, value) VALUES ($1, lix_json($2))"
+                sql: "INSERT INTO stale_journal_replacement_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                     .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10317,7 +10950,7 @@ mod tests {
             .await
             .expect("replacement transaction should begin");
         let update_sql =
-            "UPDATE stale_journal_replacement_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE stale_journal_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             let result = replacement
                 .execute(
@@ -10335,7 +10968,7 @@ mod tests {
         concurrent_session
             .execute(
                 "INSERT INTO stale_journal_replacement_probe (path, value) \
-                 VALUES ('2000', lix_json('{\"state\":\"concurrent\"}'))",
+                 VALUES ('2000', CAST('{\"state\":\"concurrent\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10389,21 +11022,17 @@ mod tests {
         const ROW_COUNT: usize = 8_193;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "direct_journal_seal_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "direct_journal_seal_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10412,7 +11041,7 @@ mod tests {
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
                 sql:
-                    "INSERT INTO direct_journal_seal_probe (path, value) VALUES ($1, lix_json($2))"
+                    "INSERT INTO direct_journal_seal_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                         .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10430,7 +11059,7 @@ mod tests {
             .await
             .expect("direct journal transaction should begin");
         let update_sql =
-            "UPDATE direct_journal_seal_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE direct_journal_seal_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             let result = transaction
                 .execute(
@@ -10514,21 +11143,17 @@ mod tests {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "journal_read_your_writes_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "journal_read_your_writes_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10538,7 +11163,7 @@ mod tests {
                 &(0..ROW_COUNT)
                     .map(|row_index| ExecuteBatchStatement {
                         label: None,
-                        sql: "INSERT INTO journal_read_your_writes_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
+                        sql: "INSERT INTO journal_read_your_writes_probe (path, value) VALUES ($1, CAST($2 AS JSONB))".to_string(),
                         params: vec![
                             Value::Text(format!("{row_index:04}")),
                             Value::Text("{\"state\":\"base\"}".to_string()),
@@ -10563,7 +11188,7 @@ mod tests {
 
         let mut transaction = session.begin_transaction().await.unwrap();
         let update_sql =
-            "UPDATE journal_read_your_writes_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE journal_read_your_writes_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             transaction
                 .execute(
@@ -10609,21 +11234,17 @@ mod tests {
     async fn mixed_journal_fallback_preserves_created_at() {
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "mixed_journal_lifecycle_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "mixed_journal_lifecycle_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10631,7 +11252,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO mixed_journal_lifecycle_probe (path, value) \
-                 VALUES ('existing', lix_json('{\"state\":\"base\"}'))",
+                 VALUES ('existing', CAST('{\"state\":\"base\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10652,14 +11273,14 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO mixed_journal_lifecycle_probe (path, value) \
-                 VALUES ('inserted', lix_json('{\"state\":\"inserted\"}'))",
+                 VALUES ('inserted', CAST('{\"state\":\"inserted\"}' AS JSONB))",
                 &[],
             )
             .await
             .unwrap();
         transaction
             .execute(
-                "UPDATE mixed_journal_lifecycle_probe SET value = lix_json($1) WHERE path = $2",
+                "UPDATE mixed_journal_lifecycle_probe SET value = CAST($1 AS JSONB) WHERE path = $2",
                 &[
                     Value::Text("{\"state\":\"updated\"}".to_string()),
                     Value::Text("existing".to_string()),
@@ -10688,21 +11309,17 @@ mod tests {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
-            "x-lix-key": "rooted_journal_parent_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "rooted_journal_parent_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10712,7 +11329,7 @@ mod tests {
                 &(0..ROW_COUNT)
                     .map(|row_index| ExecuteBatchStatement {
                         label: None,
-                        sql: "INSERT INTO rooted_journal_parent_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
+                        sql: "INSERT INTO rooted_journal_parent_probe (path, value) VALUES ($1, CAST($2 AS JSONB))".to_string(),
                         params: vec![
                             Value::Text(format!("{row_index:04}")),
                             Value::Text("{\"state\":\"base\"}".to_string()),
@@ -10740,7 +11357,7 @@ mod tests {
         );
         let mut transaction = session.begin_transaction().await.unwrap();
         let update_sql =
-            "UPDATE rooted_journal_parent_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE rooted_journal_parent_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             transaction
                 .execute(
@@ -10921,27 +11538,25 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("first workspace session should open");
+            .expect("first session should open");
         let concurrent = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("second workspace session should open");
+            .expect("second session should open");
         let schema = serde_json::json!({
-            "x-lix-key": "read_plan_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "revision": { "type": "integer" }
-            },
-            "required": ["id", "revision"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "read_plan_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "revision", "type": "int8", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10998,16 +11613,16 @@ mod tests {
         assert_eq!(session.sql_planning_cache.read_plan_count(), before + 1);
 
         let added_schema = serde_json::json!({
-            "x-lix-key": "read_plan_catalog_revision",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "read_plan_catalog_revision",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
                 &[Value::Text(added_schema.to_string())],
             )
             .await
@@ -11032,5 +11647,189 @@ mod tests {
             uncached.rows()[0].values(),
             "cached templates must match a fresh DataFusion plan"
         );
+    }
+}
+
+
+/// Compile-time proofs for the `AssumeSendFuture` safety obligation.
+///
+/// `AssumeSendFuture` asserts `Send` unconditionally, so its soundness rests on
+/// each call site's wrapped future genuinely holding only `Send` values across
+/// its suspension points. Nothing in the type system re-checks that after the
+/// wrapper is applied, which makes the obligation silently rot-prone.
+///
+/// `Memory::Read<'a> = MemoryRead` is lifetime-independent, so instantiating the
+/// wrapped futures at `Memory` collapses the higher-ranked obstruction that
+/// forces the wrapper in the generic case and lets rustc perform the full
+/// auto-trait walk over the entire suspension state. A future change that parks
+/// an `Rc`, a `RefCell` borrow guard, or any other `!Send` value across an
+/// `.await` on these paths fails to compile here instead of becoming undefined
+/// behaviour behind the wrapper.
+#[cfg(test)]
+mod assume_send_future_proofs {
+    use super::*;
+    use crate::storage_adapter::Memory;
+
+    fn is_send<T: Send>(_: &T) {}
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    // session/execute.rs -- SessionContext::read_file_content
+    #[allow(dead_code)]
+    fn read_file_content_inner_is_send(session: &SessionContext<Memory>) {
+        is_send(&session.read_file_content_inner(String::new(), None));
+    }
+
+    // session/execute.rs -- execute_with_idempotency_and_options_and_metadata
+    #[allow(dead_code)]
+    fn execute_with_kind_is_send(
+        session: &SessionContext<Memory>,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
+    ) {
+        is_send(&session.execute_with_kind(sql, params, options, metadata, "execute", None, true));
+    }
+
+    // session/execute.rs -- execute_batch_with_idempotency_and_options_and_metadata
+    #[allow(dead_code)]
+    fn execute_batch_inner_is_send(
+        session: &SessionContext<Memory>,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+        metadata: Vec<ExecuteStatementMetadata>,
+    ) {
+        is_send(&session.execute_batch_with_options_and_metadata_inner(
+            statements, options, metadata, None, true,
+        ));
+    }
+
+    // session/execute.rs -- SessionTransaction::execute_with_options
+    #[allow(dead_code)]
+    fn transaction_execute_inner_is_send(
+        transaction: &mut SessionTransaction<Memory>,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) {
+        is_send(&transaction.execute_with_options_inner(sql, params, options));
+    }
+
+    /// The values the wrapped futures retain are `Send`/`Sync` for *every*
+    /// legal `StorageImpl`, not just `Memory`. Storage-supplied handles are
+    /// covered by the `Storage`/`StorageRead`/`StorageWrite` trait contract
+    /// alone, so no adapter can introduce a non-`Send` value into these paths.
+    #[allow(dead_code)]
+    fn retained_values_are_send_for_every_storage<S>()
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        assert_send::<SessionContext<S>>();
+        assert_sync::<SessionContext<S>>();
+        assert_send::<SessionTransaction<S>>();
+        assert_send::<ExecuteResult>();
+        assert_sync::<ExecuteResult>();
+        assert_send::<Value>();
+        assert_sync::<Value>();
+        assert_send::<ExecuteBatchStatement>();
+        assert_sync::<ExecuteBatchStatement>();
+        assert_send::<ExecuteOptions>();
+        assert_send::<ExecuteStatementMetadata>();
+        assert_send::<S::Read<'static>>();
+        assert_sync::<S::Read<'static>>();
+        assert_send::<S::Write<'static>>();
+    }
+
+    /// Adapter-independent concrete types that cross suspensions on these paths.
+    #[allow(dead_code)]
+    fn storage_cursor_types_are_send() {
+        assert_send::<crate::storage::ScanCursor<'static>>();
+        assert_send::<crate::storage::GetManyResult>();
+    }
+}
+
+
+/// Borrowing-adapter half of the `AssumeSendFuture` proofs.
+///
+/// # What this covers, and the limit
+///
+/// `assume_send_future_proofs` instantiates the wrapped futures at `Memory`,
+/// where `Read<'a> = MemoryRead` is lifetime-independent. That collapses the
+/// higher-ranked obstruction and lets rustc walk the *complete* suspension
+/// state. The shipping RocksDB adapter is `Read<'a> = RocksDBRead<'a>`, so that
+/// proof covers the easy case.
+///
+/// **A whole-future proof at a lifetime-dependent `Read<'a>` is not achievable,
+/// even for a fully concrete adapter.** Measured against `BorrowingStorage`
+/// below: five of the six remaining wrapper sites fail with the same
+/// `implementation of 'Send' is not general enough` diagnostic that forces the
+/// wrapper generically. The borrowing shape *is* the obstruction; making the
+/// adapter concrete does not remove it. That is a rustc limitation on
+/// higher-ranked auto-trait obligations, not a property of this code.
+///
+/// So the borrowing case is covered in two pieces instead:
+///
+/// 1. `read_file_content_inner` — which carries no wrapper since its
+///    `with_static_session_sql_read` bound was relaxed — is proven `Send`
+///    against the borrowing adapter directly, and generically for every
+///    `StorageImpl` by its own `+ Send` signature.
+/// 2. Every type rustc names in the remaining obstructions is proven `Sync`
+///    below, **universally quantified over the lifetime**. `&'x T: Send` holds
+///    exactly when `T: Sync`, so these discharge the named obligations for all
+///    lifetimes; rustc simply cannot assemble them inside a generator. Combined
+///    with the `Memory` walk — which enumerates the complete suspension state,
+///    and finds no `Rc`, `RefCell` guard, or raw pointer anywhere — this is the
+///    tightest statement the type system supports.
+#[cfg(test)]
+mod assume_send_future_proofs_borrowing {
+    use super::*;
+    use crate::session::borrowing_proof_storage::{BorrowingRead, BorrowingStorage};
+
+    fn is_send<T: Send>(_: &T) {}
+    fn assert_send<T: Send + ?Sized>() {}
+    fn assert_sync<T: Sync + ?Sized>() {}
+
+    /// Whole-future proof, borrowing adapter. This site has no wrapper.
+    #[allow(dead_code)]
+    fn read_file_content_inner_is_send(session: &SessionContext<BorrowingStorage>) {
+        is_send(&session.read_file_content_inner(String::new(), None));
+    }
+
+    /// The shared read wrapper is `Send + Sync` for every storage adapter and
+    /// **every lifetime** — `'a` is a free parameter here, so this is a genuine
+    /// `for<'a>` proof of the obligation rustc reports as "not general enough".
+    #[allow(dead_code)]
+    fn shared_read_is_send_for_every_storage_and_lifetime<'a, S>()
+    where
+        S: Storage + Clone + Send + Sync + 'a,
+    {
+        assert_send::<SharedStorageAdapterRead<S::Read<'a>>>();
+        assert_sync::<SharedStorageAdapterRead<S::Read<'a>>>();
+        assert_send::<S::Read<'a>>();
+        assert_sync::<S::Read<'a>>();
+    }
+
+    /// The same, pinned at the concrete borrowing adapter.
+    #[allow(dead_code)]
+    fn shared_read_is_send_for_borrowing_adapter<'a>() {
+        assert_send::<SharedStorageAdapterRead<BorrowingRead<'a>>>();
+        assert_sync::<SharedStorageAdapterRead<BorrowingRead<'a>>>();
+    }
+
+    /// Every remaining type named by a "not general enough" obstruction, proven
+    /// `Sync` — which is exactly `for<'x> &'x T: Send`.
+    #[allow(dead_code)]
+    fn obstruction_pointees_are_sync<S>()
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        assert_sync::<str>();
+        assert_sync::<[Value]>();
+        assert_sync::<[ExecuteBatchStatement]>();
+        assert_sync::<SessionContext<S>>();
+        assert_sync::<crate::Lix<S>>();
+        assert_sync::<crate::storage_adapter::Memory>();
+        assert_sync::<tokio::sync::Mutex<()>>();
     }
 }

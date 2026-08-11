@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -186,10 +187,31 @@ enum MutationIndex {
     Delete(usize),
 }
 
-#[derive(Hash, PartialEq, Eq)]
-struct ContentAddressedRef<'a> {
+/// Staged content-addressed puts indexed by key.
+///
+/// A content-addressed space derives its key from the value, so the key alone
+/// identifies the content. Hashing only the key keeps coalescing proportional
+/// to the key bytes instead of the whole staged payload; the retained value is
+/// compared directly when a key repeats, which is the only case where the
+/// distinction between "identical entry" and "conflicting mutation" matters.
+type ContentAddressedIndex<'a> = HashMap<&'a [u8], &'a [u8], FastHashBuilder>;
+
+/// Returns whether the put must stay staged.
+///
+/// An identical entry is coalesced. A same-key/different-value entry is kept
+/// so the canonical validator still rejects it as a duplicate mutation.
+fn retain_content_addressed_put<'a>(
+    index: &mut ContentAddressedIndex<'a>,
     key: &'a [u8],
     value: &'a [u8],
+) -> bool {
+    match index.entry(key) {
+        Entry::Occupied(entry) => *entry.get() != value,
+        Entry::Vacant(entry) => {
+            entry.insert(value);
+            true
+        }
+    }
 }
 
 struct ArenaRemap {
@@ -336,7 +358,6 @@ impl StorageWriteSet {
     /// Identical entries already staged by an earlier batch are coalesced;
     /// same-key, different-value entries remain duplicate mutations and are
     /// deliberately left for the canonical validator to reject.
-    #[cfg(test)]
     pub(crate) fn put_content_addressed_batch<I>(&mut self, space: StorageSpace, entries: I)
     where
         I: IntoIterator<Item = (Key, StoredValue)>,
@@ -348,24 +369,22 @@ impl StorageWriteSet {
 
         let keep = {
             let group = self.group_mut(space);
-            let mut existing = HashSet::with_capacity_and_hasher(
+            let mut existing = ContentAddressedIndex::with_capacity_and_hasher(
                 group.puts.len().saturating_add(entries.len()),
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             );
             for put in &group.puts {
-                existing.insert(ContentAddressedRef {
-                    key: group.key_bytes(put.key),
-                    value: group.value_bytes(put.value),
-                });
+                existing.insert(group.key_bytes(put.key), group.value_bytes(put.value));
             }
 
             entries
                 .iter()
                 .map(|(key, value)| {
-                    existing.insert(ContentAddressedRef {
-                        key: key.0.as_ref(),
-                        value: value.bytes.as_ref(),
-                    })
+                    retain_content_addressed_put(
+                        &mut existing,
+                        key.0.as_ref(),
+                        value.bytes.as_ref(),
+                    )
                 })
                 .collect::<Vec<_>>()
         };
@@ -469,24 +488,22 @@ impl StorageWriteSet {
         );
         let puts = {
             let group = self.group_mut(space);
-            let mut existing = HashSet::with_capacity_and_hasher(
+            let mut existing = ContentAddressedIndex::with_capacity_and_hasher(
                 group.puts.len().saturating_add(puts.len()),
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             );
             for put in &group.puts {
-                existing.insert(ContentAddressedRef {
-                    key: group.key_bytes(put.key),
-                    value: group.value_bytes(put.value),
-                });
+                existing.insert(group.key_bytes(put.key), group.value_bytes(put.value));
             }
             puts.into_iter()
                 .filter(|put| {
-                    existing.insert(ContentAddressedRef {
-                        key: &key_bytes
+                    retain_content_addressed_put(
+                        &mut existing,
+                        &key_bytes
                             [put.key.offset()..put.key.offset().saturating_add(put.key.len())],
-                        value: &value_bytes[put.value.offset()
+                        &value_bytes[put.value.offset()
                             ..put.value.offset().saturating_add(put.value.len())],
-                    })
+                    )
                 })
                 .collect::<Vec<_>>()
         };
@@ -719,7 +736,7 @@ impl StorageWriteSet {
     /// storage space.  This is benchmark/test observability only: production
     /// planning continues to use the aggregate write-set counters and never
     /// depends on this classification.
-    #[cfg(any(test, feature = "storage-benches"))]
+    #[cfg(feature = "storage-benches")]
     pub fn delete_counts_by_space(&self) -> Vec<(StorageSpace, usize)> {
         self.groups
             .iter()
@@ -737,11 +754,29 @@ impl StorageWriteSet {
             .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
     }
 
+    /// Keys this write set already declares in `space`.
+    ///
+    /// A caller that reclaims a whole key range needs this when another writer
+    /// in the same transaction may already have declared some of those keys:
+    /// restating one is a duplicate mutation, not an idempotent delete.
+    pub(crate) fn declared_keys(&self, space: StorageSpace) -> std::collections::BTreeSet<Vec<u8>> {
+        self.group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))
+            .map(|group| {
+                (0..group.puts.len())
+                    .map(MutationIndex::Put)
+                    .chain((0..group.deletes.len()).map(MutationIndex::Delete))
+                    .map(|mutation| group.mutation_key(mutation).to_vec())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn changelog_gc_is_sealed(&self) -> bool {
         self.changelog_gc_sealed
     }
 
-    #[allow(dead_code)] // Activated by the checkpoint GC integration.
     pub(crate) fn seal_changelog_gc(&mut self) {
         self.changelog_gc_sealed = true;
     }

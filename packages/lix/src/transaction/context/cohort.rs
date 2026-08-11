@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::*;
 
@@ -103,7 +103,6 @@ where
         return false;
     };
     let branch_id = leader.transaction.active_branch_id.as_str();
-    let mut unfiled_identities = BTreeSet::new();
     for member in members {
         let writes = &member.prepared_writes;
         if writes.commit_change_refs_by_branch.len() != 1
@@ -117,15 +116,6 @@ where
         }
         for row in &writes.state_rows {
             if row.untracked || row.global || row.branch_id.as_str() != branch_id {
-                return false;
-            }
-            if row.file_id.is_none()
-                && !unfiled_identities.insert((
-                    row.branch_id.to_string(),
-                    row.schema_key.to_string(),
-                    row.entity_pk.clone(),
-                ))
-            {
                 return false;
             }
         }
@@ -148,10 +138,12 @@ where
         affected_cohort_file_ids(std::iter::once(&leader).chain(members.iter()));
     let cohort_file_ids = all_cohort_file_ids(std::iter::once(&leader).chain(members.iter()));
 
-    let replacement = if affected_file_ids.is_empty() {
+    let has_overlapping_unfiled_rows =
+        cohort_has_overlapping_unfiled_rows(std::iter::once(&leader).chain(members.iter()));
+    let replacement = if affected_file_ids.is_empty() && !has_overlapping_unfiled_rows {
         None
     } else {
-        match Box::pin(reconcile_cohort_files(
+        match Box::pin(reconcile_cohort_rows(
             &mut leader.transaction,
             std::iter::once(&leader.prepared_writes)
                 .chain(members.iter().map(|member| &member.prepared_writes)),
@@ -167,6 +159,10 @@ where
                 // partial replay staging and retry through the established
                 // per-transaction commit semantics.
                 let _ = leader.transaction.staged_writes.drain();
+                leader
+                    .transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
                 let mut individual = Vec::with_capacity(member_count);
                 individual.push(leader);
                 individual.extend(members);
@@ -174,21 +170,6 @@ where
             }
         }
     };
-    let session_views = std::iter::once(&leader)
-        .chain(members.iter())
-        .map(|member| member.transaction.session_file_views.clone())
-        .collect::<Vec<_>>();
-    for views in &session_views {
-        views.apply_mutations(cohort_file_ids.iter().map(|file_id| {
-            SessionFileViewMutation::Remove {
-                key: SessionFileViewKey::new(&branch_id, file_id),
-            }
-        }));
-    }
-    leader
-        .transaction
-        .pending_file_view_mutations
-        .retain(|key, _| !cohort_file_ids.contains(&key.file_id));
     let mut merged_writes = leader.prepared_writes.clone();
     for member in &members {
         if let Err(error) = merged_writes.append_cohort_member(
@@ -204,7 +185,7 @@ where
         }
     }
     if let Some(replacement) = replacement {
-        merged_writes.replace_reconciled_file_writes(replacement, &affected_file_ids);
+        merged_writes.replace_reconciled_writes(replacement, &affected_file_ids);
     }
 
     let validation_storage = leader.transaction.storage.clone();
@@ -214,6 +195,11 @@ where
     {
         Ok(read) => read,
         Err(_) => {
+            let _ = leader.transaction.staged_writes.drain();
+            leader
+                .transaction
+                .discard_pending_plugin_actor_publications()
+                .await;
             let mut individual = vec![leader];
             individual.extend(members);
             return commit_prepared_individually(individual).await;
@@ -222,14 +208,34 @@ where
     let validation_read = SharedStorageAdapterRead::new(validation_read);
     if leader
         .transaction
-        .validate_prepared_writes_by_branch(&validation_read, &merged_writes)
+        .validate_prepared_writes_by_branch(&validation_read, &mut merged_writes)
         .await
         .is_err()
     {
+        let _ = leader.transaction.staged_writes.drain();
+        leader
+            .transaction
+            .discard_pending_plugin_actor_publications()
+            .await;
         let mut individual = vec![leader];
         individual.extend(members);
         return commit_prepared_individually(individual).await;
     }
+    let session_views = std::iter::once(&leader)
+        .chain(members.iter())
+        .map(|member| member.transaction.session_file_views.clone())
+        .collect::<Vec<_>>();
+    for views in &session_views {
+        views.apply_mutations(cohort_file_ids.iter().map(|file_id| {
+            SessionFileViewMutation::Remove {
+                key: SessionFileViewKey::new(&branch_id, file_id),
+            }
+        }));
+    }
+    leader
+        .transaction
+        .pending_file_view_mutations
+        .retain(|key, _| !cohort_file_ids.contains(&key.file_id));
     for member in &mut members {
         member
             .transaction
@@ -253,6 +259,25 @@ where
         }
         Err(error) => vec![Err(error); member_count],
     }
+}
+
+fn cohort_has_overlapping_unfiled_rows<'a, StorageImpl>(
+    members: impl Iterator<Item = &'a PreparedCohortMember<StorageImpl>>,
+) -> bool
+where
+    StorageImpl: Storage + 'static,
+{
+    let mut seen = BTreeSet::new();
+    for member in members {
+        for row in &member.prepared_writes.state_rows {
+            if row.file_id.is_none()
+                && !seen.insert((row.schema_key.to_string(), row.row_pk.clone()))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn all_cohort_file_ids<'a, StorageImpl>(
@@ -318,16 +343,52 @@ struct CohortSemanticCandidate {
     rank: ConflictRank,
 }
 
-struct CohortPluginGroup {
-    plugin: PluginRegistryEntry,
-    descriptor: WasmFileDescriptor,
-    candidates: BTreeMap<TrackedStateKey, Vec<CohortSemanticCandidate>>,
+fn reconcile_native_frontier(
+    base: Option<&StaleConflictPayload>,
+    candidates: &[CohortSemanticCandidate],
+    primary_key_columns: &BTreeSet<String>,
+) -> Result<Option<StaleConflictPayload>, LixError> {
+    if let [candidate] = candidates {
+        return Ok(candidate.payload.clone());
+    }
+    // Host-native column LWW is associative for successors ranked against one
+    // common base. Fold the complete frontier while its rows are decoded so a
+    // large same-base cohort does not repeatedly cross the async batch helper
+    // and decode/encode the evolving row once per writer.
+    let base = decode_stale_payload(base)?;
+    let mut current = decode_stale_payload(
+        candidates
+            .first()
+            .and_then(|candidate| candidate.payload.as_ref()),
+    )?;
+    for candidate in candidates.iter().skip(1) {
+        let next = decode_stale_payload(candidate.payload.as_ref())?;
+        current = reconcile_row(
+            row_version_ref(base.as_ref()),
+            row_version_ref(current.as_ref()),
+            row_version_ref(next.as_ref()),
+            primary_key_columns,
+            |_| Ok(None),
+        )?
+        .map(|row| DecodedStalePayload {
+            snapshot: row.snapshot,
+            metadata: row.metadata,
+        });
+    }
+    current
+        .map(|row| {
+            encoded_stale_payload(crate::plugin::runtime::ReconciledRow {
+                snapshot: row.snapshot,
+                metadata: row.metadata,
+            })
+        })
+        .transpose()
 }
 
-async fn reconcile_cohort_files<'a, StorageImpl>(
+async fn reconcile_cohort_rows<'a, StorageImpl>(
     transaction: &mut Transaction<StorageImpl>,
     prepared: impl Iterator<Item = &'a PreparedWriteSet>,
-    file_ids: &BTreeSet<String>,
+    affected_file_ids: &BTreeSet<String>,
     cohort_commit_id: CommitId,
 ) -> Result<PreparedWriteSet, LixError>
 where
@@ -336,40 +397,49 @@ where
     let opening_head = transaction.opening_active_branch_head.ok_or_else(|| {
         LixError::new(
             LixError::CODE_TRANSACTION_CONFLICT,
-            "rootless branch transactions cannot join a semantic commit cohort",
+            "rootless branch transactions cannot join a row reconciliation cohort",
         )
     })?;
-    let read = transaction.opening_read();
-    let mut groups = load_cohort_plugin_groups(transaction, &read, opening_head, file_ids).await?;
+    let mut candidates = BTreeMap::<TrackedStateKey, Vec<CohortSemanticCandidate>>::new();
+    let mut primary_keys_by_key = BTreeMap::<TrackedStateKey, BTreeSet<String>>::new();
     for writes in prepared {
         for row in &writes.state_rows {
-            let Some(file_id) = row.file_id.map(SharedStr::as_str) else {
-                continue;
-            };
-            let Some(group) = groups.get_mut(file_id) else {
-                continue;
-            };
-            if !group
-                .plugin
-                .schema_keys()
-                .iter()
-                .any(|schema_key| schema_key == row.schema_key.as_str())
-            {
+            let include = row
+                .file_id
+                .map_or(true, |file_id| affected_file_ids.contains(file_id.as_str()));
+            if !include {
                 continue;
             }
             let change_id = row.change_id.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "cohort semantic row is missing change_id",
+                    "cohort row is missing change_id",
                 )
             })?;
             let key = TrackedStateKey {
                 schema_key: row.schema_key.to_string(),
-                file_id: Some(file_id.to_string()),
-                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.map(ToString::to_string),
+                row_pk: row.row_pk.clone(),
             };
-            group
-                .candidates
+            let primary_keys = transaction
+                .sql_schema_snapshot
+                .plan(row.schema_plan_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "cohort row reconciliation lost its schema plan",
+                    )
+                })
+                .and_then(crate::plugin::runtime::primary_key_columns)?;
+            if let Some(existing) = primary_keys_by_key.insert(key.clone(), primary_keys.clone())
+                && existing != primary_keys
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "one cohort row identity resolved to inconsistent schema plans",
+                ));
+            }
+            candidates
                 .entry(key)
                 .or_default()
                 .push(CohortSemanticCandidate {
@@ -381,128 +451,142 @@ where
                 });
         }
     }
-
-    let mut replay_batches = BTreeMap::<String, RawWriteBatch>::new();
+    // Ordinary rows need replay only when at least two cohort members wrote
+    // the same identity. File-backed candidates are narrowed to plugin-owned
+    // semantic rows below because their projection must observe the complete
+    // combined semantic delta for the file.
+    candidates.retain(|key, values| key.file_id.is_some() || values.len() > 1);
+    let read = transaction.opening_read();
     let mut tracked = transaction.tracked_state.reader(&read);
-    for (file_id, group) in &mut groups {
-        let keys = group.candidates.keys().cloned().collect::<Vec<_>>();
-        let base_rows = tracked
-            .load_projected_batch_at_commit(
-                &opening_head.to_string(),
-                &keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let mut frontiers = BTreeMap::<TrackedStateKey, Vec<Option<StaleConflictPayload>>>::new();
-        let mut bases = BTreeMap::<TrackedStateKey, Option<StaleConflictPayload>>::new();
-        let rows = replay_batches
-            .entry(file_id.clone())
-            .or_insert_with(|| RawWriteBatch::with_capacity(keys.len()));
-        for (slot, key) in keys.iter().enumerate() {
-            let candidates = group
-                .candidates
-                .get_mut(key)
-                .expect("candidate key originates from group");
-            candidates.sort_by_key(|candidate| candidate.rank);
-            let base = stale_payload_from_tracked(base_rows.row(slot));
-            candidates.retain(|candidate| candidate.payload != base);
-            let mut seen = BTreeSet::new();
-            candidates.retain(|candidate| seen.insert(candidate.payload.clone()));
-            if candidates.is_empty() {
-                continue;
-            }
-            bases.insert(key.clone(), base);
-            frontiers.insert(
-                key.clone(),
-                std::mem::take(candidates)
-                    .into_iter()
-                    .map(|candidate| candidate.payload)
-                    .collect(),
-            );
-        }
-
-        while frontiers.values().any(|frontier| frontier.len() > 1) {
-            let mut conflicts = Vec::new();
-            let mut semantic_conflicts = Vec::new();
-            let mut next_frontiers =
-                BTreeMap::<TrackedStateKey, Vec<Option<StaleConflictPayload>>>::new();
-            for key in &keys {
-                let Some(frontier) = frontiers.get(key) else {
-                    continue;
-                };
-                let next = next_frontiers.entry(key.clone()).or_default();
-                for pair in frontier.chunks(2) {
-                    if pair.len() == 1 {
-                        next.push(pair[0].clone());
-                        continue;
-                    }
-                    let conflict = StaleSemanticConflict {
-                        key: key.clone(),
-                        base: bases.get(key).cloned().flatten(),
-                        a: pair[0].clone(),
-                        b: pair[1].clone(),
-                    };
-                    let ordinal = u32::try_from(conflicts.len()).map_err(|_| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            "cohort conflict batch exceeds the u32 ordinal limit",
-                        )
-                    })?;
-                    conflicts.push(WasmEntityConflict {
-                        ordinal,
-                        key: WasmEntityKey::from_owned_parts(
-                            key.schema_key.clone(),
-                            key.entity_pk.clone().into_parts(),
-                        ),
-                        base: stale_conflict_bytes(conflict.base.as_ref()),
-                        a: stale_conflict_bytes(conflict.a.as_ref()),
-                        b: stale_conflict_bytes(conflict.b.as_ref()),
-                    });
-                    semantic_conflicts.push(conflict);
-                }
-            }
-            let resolutions = transaction
-                .resolve_plugin_conflicts(&group.plugin, group.descriptor.clone(), conflicts)
-                .instrument(tracing::debug_span!(
-                    target: "lix_transaction",
-                    "lix.transaction.cohort.resolve_plugin",
-                    plugin_key = group.plugin.key(),
-                    conflict_entities = semantic_conflicts.len(),
-                ))
-                .await?;
-            for (conflict, resolution) in
-                semantic_conflicts.into_iter().zip(resolutions.resolutions)
-            {
-                let key = conflict.key.clone();
-                let payload = stale_conflict_resolution_payload(&conflict, resolution)?;
-                next_frontiers.entry(key).or_default().push(payload);
-            }
-            frontiers = next_frontiers;
-        }
-        for (key, frontier) in frontiers {
-            let payload = frontier.into_iter().next().expect("non-empty frontier");
-            push_cohort_payload(rows, &key, payload.as_ref(), &transaction.active_branch_id);
-        }
+    let opening_registry =
+        load_plugin_registry_at_commit(&mut tracked, &opening_head.to_string()).await?;
+    // File-internal rows such as `lix_binary_blob_ref` are outputs of the
+    // consolidated projection below, not semantic inputs to it. Replaying
+    // them here would stage the old blob reference and then generate its
+    // successor a second time, forcing the cohort onto the serialized
+    // fallback through a duplicate-primary-key error.
+    candidates.retain(|key, _| {
+        key.file_id.is_none() || registry_owns_schema(&opening_registry, &key.schema_key)
+    });
+    let keys = candidates.keys().cloned().collect::<Vec<_>>();
+    let base_rows = tracked
+        .load_projected_batch_at_commit(
+            &opening_head.to_string(),
+            &keys,
+            &ChangeRecordProjection::full(),
+        )
+        .await?;
+    drop(tracked);
+    struct CohortFrontier {
+        base: Option<StaleConflictPayload>,
+        current: Option<StaleConflictPayload>,
+        remaining: VecDeque<Option<StaleConflictPayload>>,
+        primary_key_columns: BTreeSet<String>,
+        plugin: Option<PluginRegistryEntry>,
     }
-
-    // The replay is a new consolidated semantic transition. Original private
-    // actor publications describe per-member byte transitions and cannot be
-    // chained into it.
+    let mut frontiers = BTreeMap::<TrackedStateKey, CohortFrontier>::new();
+    for (slot, key) in keys.iter().enumerate() {
+        let base = stale_payload_from_tracked(base_rows.row(slot));
+        let versions = candidates
+            .get_mut(key)
+            .expect("candidate key originates from map");
+        versions.sort_by_key(|candidate| candidate.rank);
+        versions.retain(|candidate| candidate.payload != base);
+        let Some(first) = versions.first() else {
+            continue;
+        };
+        let plugin = opening_registry.plugins().iter().find(|plugin| {
+            plugin.has_column_merger()
+                && plugin
+                    .schema_keys()
+                    .binary_search_by(|schema| schema.as_str().cmp(key.schema_key.as_str()))
+                    .is_ok()
+        });
+        let primary_key_columns = primary_keys_by_key
+            .get(key)
+            .cloned()
+            .expect("candidate row has primary-key metadata");
+        let (current, remaining) = if plugin.is_none() {
+            (
+                reconcile_native_frontier(base.as_ref(), versions, &primary_key_columns)?,
+                VecDeque::new(),
+            )
+        } else {
+            (
+                first.payload.clone(),
+                versions
+                    .iter()
+                    .skip(1)
+                    .map(|candidate| candidate.payload.clone())
+                    .collect(),
+            )
+        };
+        frontiers.insert(
+            key.clone(),
+            CohortFrontier {
+                base,
+                current,
+                remaining,
+                primary_key_columns,
+                plugin: plugin.cloned(),
+            },
+        );
+    }
+    // Per-member file actors describe transitions now superseded by the
+    // consolidated cohort and may otherwise consume the Store slots needed
+    // by a stateless column merger.
     transaction
         .discard_pending_plugin_actor_publications()
         .await;
-    for rows in replay_batches.into_values() {
-        transaction
-            .stage_write(TransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows,
-            })
-            .await?;
+    while frontiers
+        .values()
+        .any(|frontier| !frontier.remaining.is_empty())
+    {
+        let mut merge_keys = Vec::new();
+        let mut inputs = Vec::new();
+        for (key, frontier) in &mut frontiers {
+            if frontier.remaining.is_empty() {
+                continue;
+            }
+            let next = frontier
+                .remaining
+                .pop_front()
+                .expect("non-empty frontier has a next version");
+            merge_keys.push(key.clone());
+            inputs.push(StaleColumnMergeInput {
+                key: key.clone(),
+                base: frontier.base.clone(),
+                a: frontier.current.clone(),
+                b: next,
+                primary_key_columns: frontier.primary_key_columns.clone(),
+                plugin: frontier.plugin.clone(),
+            });
+        }
+        let merged = transaction.merge_stale_column_inputs(&inputs).await?;
+        for (key, payload) in merge_keys.into_iter().zip(merged) {
+            frontiers
+                .get_mut(&key)
+                .expect("frontier key originates from map")
+                .current = payload;
+        }
     }
-    // A cohort transition can apply several independently-produced semantic
-    // deltas at once. Persist its checkpoint, but force the next transaction
-    // to hydrate from the committed graph instead of treating the cohort's
-    // private renderer document as an ordinary single-writer successor.
+
+    let mut rows = RawWriteBatch::with_capacity(keys.len());
+    for (key, frontier) in frontiers {
+        push_cohort_payload(
+            &mut rows,
+            &key,
+            frontier.current.as_ref(),
+            &transaction.active_branch_id,
+        );
+    }
+
+    transaction
+        .stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows,
+        })
+        .await?;
     transaction.release_pending_plugin_actor_leases().await;
     let mut replacement = transaction.staged_writes.drain()?;
     let mut latest_file_content = BTreeMap::new();
@@ -523,7 +607,7 @@ pub(super) fn push_cohort_payload(
     branch_id: &str,
 ) {
     rows.push_parts(
-        Some(key.entity_pk.clone()),
+        Some(key.row_pk.clone()),
         SharedStr::from(key.schema_key.as_str()),
         key.file_id.as_deref().map(SharedStr::from),
         payload.map(|payload| {
@@ -544,115 +628,6 @@ pub(super) fn push_cohort_payload(
         false,
         SharedStr::from(branch_id),
     );
-}
-
-async fn load_cohort_plugin_groups<StorageImpl, S>(
-    transaction: &mut Transaction<StorageImpl>,
-    read: &S,
-    opening_head: CommitId,
-    file_ids: &BTreeSet<String>,
-) -> Result<BTreeMap<String, CohortPluginGroup>, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-    S: StorageAdapterRead,
-{
-    let owner_keys = file_ids
-        .iter()
-        .map(|file_id| TrackedStateKey {
-            schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
-            file_id: Some(file_id.clone()),
-            entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
-        })
-        .collect::<Vec<_>>();
-    let registry_key = TrackedStateKey {
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
-        file_id: None,
-        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
-    };
-    let mut tracked = transaction.tracked_state.reader(read);
-    let owners = tracked
-        .load_projected_batch_at_commit(
-            &opening_head.to_string(),
-            &owner_keys,
-            &ChangeRecordProjection::full(),
-        )
-        .await?;
-    let registry_rows = tracked
-        .load_projected_batch_at_commit(
-            &opening_head.to_string(),
-            std::slice::from_ref(&registry_key),
-            &ChangeRecordProjection::full(),
-        )
-        .await?;
-    let registry_snapshot = registry_rows
-        .row(0)
-        .filter(|row| !row.deleted())
-        .and_then(|row| row.snapshot_content())
-        .map(|snapshot| serde_json::from_str(snapshot.as_str()))
-        .transpose()
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!("plugin registry snapshot is invalid JSON: {error}"),
-            )
-        })?;
-    let registry = PluginRegistry::from_optional_snapshot(registry_snapshot.as_ref())?;
-    let path_index = transaction
-        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
-            transaction.active_branch_id.clone(),
-        ]))
-        .await?;
-    let mut groups = BTreeMap::new();
-    for (owner_index, file_id) in file_ids.iter().enumerate() {
-        let owner = owners
-            .row(owner_index)
-            .filter(|row| !row.deleted())
-            .map(PluginFileOwner::from_tracked_state_row_ref)
-            .transpose()?
-            .flatten()
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_TRANSACTION_CONFLICT,
-                    "cohort file is not owned by a stable plugin generation",
-                )
-            })?;
-        let plugin = registry
-            .plugin(owner.plugin_key())
-            .filter(|plugin| plugin.schema_keys() == owner.schema_keys())
-            .cloned()
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_TRANSACTION_CONFLICT,
-                    "cohort file plugin ownership does not match the registry",
-                )
-            })?;
-        let path = path_index
-            .exact_file_id_entries(file_id)
-            .iter()
-            .find(|entry| entry.key.branch_id() == transaction.active_branch_id)
-            .map(|entry| entry.path.clone())
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_TRANSACTION_CONFLICT,
-                    "cohort file has no stable active-branch path",
-                )
-            })?;
-        groups.insert(
-            file_id.clone(),
-            CohortPluginGroup {
-                descriptor: WasmFileDescriptor {
-                    path: Some(path.clone()),
-                    plugin: WasmPluginSelection {
-                        plugin_key: plugin.key().to_owned(),
-                        generation: plugin.archive_blob_hash().to_owned(),
-                    },
-                },
-                plugin,
-                candidates: BTreeMap::new(),
-            },
-        );
-    }
-    Ok(groups)
 }
 
 async fn commit_prepared_individually<StorageImpl>(

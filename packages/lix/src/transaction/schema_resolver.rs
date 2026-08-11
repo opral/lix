@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use crate::LixError;
 use crate::catalog::{CatalogContext, CatalogSnapshot, TransactionCatalog};
 use crate::domain::Domain;
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateExactBatch, StagedLiveStateRows, overlay_load_exact_batch,
+use crate::hot_state::{
+    HotStateExactBatchRequest, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
+    MaterializedHotStateExactBatch, StagedHotStateRows, overlay_load_exact_batch,
     overlay_scan_batch, overlay_scan_tracked_batch,
 };
 use crate::transaction::staging::PreparedStateRowOverlay;
@@ -28,7 +28,7 @@ impl TransactionSchemaResolver {
 
     async fn load_catalog_for_domain(
         &mut self,
-        live_state: &dyn LiveStateReader,
+        hot_state: &dyn HotStateReader,
         staged: Option<&PreparedStateRowOverlay>,
         domain: &Domain,
     ) -> Result<(), LixError> {
@@ -39,8 +39,8 @@ impl TransactionSchemaResolver {
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_transaction_schema_catalog_load();
         let catalog = if let Some(staged) = staged {
-            let reader = TransactionSchemaLiveStateReader {
-                base: live_state,
+            let reader = TransactionSchemaHotStateReader {
+                base: hot_state,
                 staged,
             };
             self.context
@@ -48,7 +48,7 @@ impl TransactionSchemaResolver {
                 .await?
         } else {
             self.context
-                .compiled_catalog_for_domain(live_state, &domain)
+                .compiled_catalog_for_domain(hot_state, &domain)
                 .await?
         };
         self.catalogs_by_domain
@@ -58,11 +58,11 @@ impl TransactionSchemaResolver {
 
     pub(crate) async fn catalog_for_row_normalization(
         &mut self,
-        live_state: &dyn LiveStateReader,
+        hot_state: &dyn HotStateReader,
         staged: &PreparedStateRowOverlay,
         domain: &Domain,
     ) -> Result<&mut TransactionCatalog, LixError> {
-        self.load_catalog_for_domain(live_state, Some(staged), domain)
+        self.load_catalog_for_domain(hot_state, Some(staged), domain)
             .await?;
         let domain = domain.schema_catalog_domain();
         Ok(self
@@ -73,11 +73,11 @@ impl TransactionSchemaResolver {
 
     pub(crate) async fn catalog_for_validation(
         &mut self,
-        live_state: &dyn LiveStateReader,
+        hot_state: &dyn HotStateReader,
         staged: &PreparedStateRowOverlay,
         domain: &Domain,
     ) -> Result<&CatalogSnapshot, LixError> {
-        self.load_catalog_for_domain(live_state, Some(staged), domain)
+        self.load_catalog_for_domain(hot_state, Some(staged), domain)
             .await?;
         let domain = domain.schema_catalog_domain();
         Ok(self
@@ -113,34 +113,34 @@ impl TransactionSchemaResolver {
     }
 }
 
-struct TransactionSchemaLiveStateReader<'a, S: StagedLiveStateRows + Sync + ?Sized> {
-    base: &'a dyn LiveStateReader,
+struct TransactionSchemaHotStateReader<'a, S: StagedHotStateRows + Sync + ?Sized> {
+    base: &'a dyn HotStateReader,
     staged: &'a S,
 }
 
 #[async_trait]
-impl<S> LiveStateReader for TransactionSchemaLiveStateReader<'_, S>
+impl<S> HotStateReader for TransactionSchemaHotStateReader<'_, S>
 where
-    S: StagedLiveStateRows + Sync + ?Sized,
+    S: StagedHotStateRows + Sync + ?Sized,
 {
     async fn scan_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         overlay_scan_batch(self.base, self.staged, request).await
     }
 
     async fn scan_tracked_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         overlay_scan_tracked_batch(self.base, self.staged, request).await
     }
 
     async fn load_exact_batch(
         &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         overlay_load_exact_batch(self.base, self.staged, request).await
     }
 }
@@ -149,27 +149,27 @@ where
 mod tests {
     use super::*;
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
-    use crate::live_state::{LiveStateFilter, MaterializedLiveStateRow};
+    use crate::row_pk::RowPk;
+    use crate::hot_state::{HotStateFilter, MaterializedHotStateRow};
 
     struct SplitCurrentAndTrackedReader {
-        canonical: MaterializedLiveStateRow,
-        tracked: MaterializedLiveStateRow,
+        canonical: MaterializedHotStateRow,
+        tracked: MaterializedHotStateRow,
     }
 
     #[async_trait]
-    impl LiveStateReader for SplitCurrentAndTrackedReader {
+    impl HotStateReader for SplitCurrentAndTrackedReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(row_matches(&self.canonical, request)
                 .then(|| self.canonical.clone())
                 .into_iter()
@@ -179,8 +179,8 @@ mod tests {
 
         async fn scan_tracked_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(row_matches(&self.tracked, request)
                 .then(|| self.tracked.clone())
                 .into_iter()
@@ -189,14 +189,14 @@ mod tests {
         }
     }
 
-    struct StaticStagedRows(Vec<MaterializedLiveStateRow>);
+    struct StaticStagedRows(Vec<MaterializedHotStateRow>);
 
-    impl StagedLiveStateRows for StaticStagedRows {
+    impl StagedHotStateRows for StaticStagedRows {
         fn staged_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            Ok(MaterializedLiveStateBatch::from_rows(
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            Ok(MaterializedHotStateBatch::from_rows(
                 self.0
                     .iter()
                     .filter(|row| row_matches(row, request))
@@ -207,9 +207,9 @@ mod tests {
 
         fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-            Ok(MaterializedLiveStateExactBatch::from_rows(
+            request: &HotStateExactBatchRequest,
+        ) -> Result<MaterializedHotStateExactBatch, LixError> {
+            Ok(MaterializedHotStateExactBatch::from_rows(
                 request
                     .rows
                     .iter()
@@ -231,20 +231,20 @@ mod tests {
             tracked: schema_row("tracked schema", false),
         };
         let staged = StaticStagedRows(vec![schema_row("newer untracked schema", true)]);
-        let reader = TransactionSchemaLiveStateReader {
+        let reader = TransactionSchemaHotStateReader {
             base: &base,
             staged: &staged,
         };
 
         let rows = reader
-            .scan_tracked_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan_tracked_batch(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec!["lix_registered_schema".to_string()],
                     branch_ids: vec!["main".to_string()],
                     untracked: Some(false),
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
+                ..HotStateScanRequest::default()
             })
             .await
             .expect("tracked schema scan should succeed")
@@ -262,19 +262,19 @@ mod tests {
             tracked: schema_row("old tracked schema", false),
         };
         let staged = StaticStagedRows(vec![schema_row("new tracked schema", false)]);
-        let reader = TransactionSchemaLiveStateReader {
+        let reader = TransactionSchemaHotStateReader {
             base: &base,
             staged: &staged,
         };
 
         let rows = reader
-            .scan_tracked_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan_tracked_batch(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec!["lix_registered_schema".to_string()],
                     branch_ids: vec!["main".to_string()],
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
+                ..HotStateScanRequest::default()
             })
             .await
             .expect("tracked staged schema scan should succeed")
@@ -288,9 +288,9 @@ mod tests {
         );
     }
 
-    fn schema_row(snapshot_content: &str, untracked: bool) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: EntityPk::single("example_schema"),
+    fn schema_row(snapshot_content: &str, untracked: bool) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: RowPk::single("example_schema"),
             schema_key: "lix_registered_schema".to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string().into()),
@@ -306,7 +306,7 @@ mod tests {
         }
     }
 
-    fn row_matches(row: &MaterializedLiveStateRow, request: &LiveStateScanRequest) -> bool {
+    fn row_matches(row: &MaterializedHotStateRow, request: &HotStateScanRequest) -> bool {
         (request.filter.schema_keys.is_empty()
             || request.filter.schema_keys.contains(&row.schema_key))
             && (request.filter.branch_ids.is_empty()

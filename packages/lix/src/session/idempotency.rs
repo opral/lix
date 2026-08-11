@@ -1,10 +1,11 @@
+use base64::Engine as _;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::storage_adapter::StorageSpaceId;
 use crate::storage_adapter::{
     StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
-    StorageKey, StorageProjectedValue, StorageSpace, exact_get_many,
+    StorageKey, StorageProjectedValue, StorageSpace, ValueSemantics, exact_get_many,
 };
 use crate::{LixError, LixNotice, Value};
 
@@ -71,12 +72,16 @@ impl ExecuteIdempotency {
 /// This is not a user table. A receipt is staged into the same storage write
 /// set as the mutation and guarded by `KeyAbsent`, so a published receipt and
 /// its mutation have one atomic storage outcome.
-pub(crate) const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0007_0005),
     "session.execute_idempotency_receipt.v1",
+    ValueSemantics::Mutable,
 );
 
-const RECEIPT_VERSION: u8 = 2;
+const BASE64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
+
+const RECEIPT_VERSION: u8 = 3;
 /// Keep the retry ledger bounded even when a mutation uses `RETURNING` with a
 /// large blob. The request is rejected before its transaction commits, so a
 /// successful mutation always has a replayable response.
@@ -85,18 +90,86 @@ const MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ExecuteIdempotencyReceipt {
     version: u8,
-    scope: Option<String>,
     branch_id: Option<String>,
-    request_fingerprint: [u8; 32],
+    /// Base64 rather than `[u8; 32]`: `serde_json` renders a byte array as 32
+    /// decimal numbers plus separators, which costs ~115 bytes for 32 bytes of
+    /// information and dominates a receipt for a mutation with no `RETURNING`.
+    request_fingerprint: String,
     results: Vec<StoredExecuteResult>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct StoredExecuteResult {
     columns: Vec<String>,
-    rows: Vec<Vec<Value>>,
+    rows: Vec<Vec<StoredValue>>,
     rows_affected: u64,
     notices: Vec<LixNotice>,
+}
+
+/// Replay-storage form of a SQL value.
+///
+/// This exists for one variant. `Value`'s own `serde` representation renders
+/// `Blob` as an array of decimal numbers, which costs 3.57 stored bytes per
+/// payload byte, so a mutation that projects file content through `RETURNING`
+/// writes almost four permanent copies of that content into the retry ledger.
+/// The match below is exhaustive, so a new `Value` variant is a compile error
+/// here rather than a silently unreplayable receipt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+enum StoredValue {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Jsonb(crate::Json),
+    Timestamptz(i64),
+    Blob(String),
+}
+
+impl StoredValue {
+    fn from_value(value: &Value) -> Result<Self, LixError> {
+        Ok(match value {
+            Value::Null => Self::Null,
+            Value::Boolean(value) => Self::Boolean(*value),
+            Value::Integer(value) => Self::Integer(*value),
+            Value::Real(value) => {
+                if !value.is_finite() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "execute result contains a non-finite value that cannot be replayed over the protocol",
+                    ));
+                }
+                Self::Real(*value)
+            }
+            Value::Text(value) => Self::Text(value.clone()),
+            Value::Jsonb(value) => Self::Jsonb(value.clone()),
+            Value::Timestamptz(value) => Self::Timestamptz(*value),
+            Value::Blob(value) => Self::Blob(BASE64.encode(value.as_ref())),
+        })
+    }
+
+    fn into_value(self) -> Result<Value, LixError> {
+        Ok(match self {
+            Self::Null => Value::Null,
+            Self::Boolean(value) => Value::Boolean(value),
+            Self::Integer(value) => Value::Integer(value),
+            Self::Real(value) => Value::Real(value),
+            Self::Text(value) => Value::Text(value),
+            Self::Jsonb(value) => Value::Jsonb(value),
+            Self::Timestamptz(value) => Value::Timestamptz(value),
+            Self::Blob(value) => Value::Blob(
+                BASE64
+                    .decode(value.as_bytes())
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!("decode execute idempotency receipt blob: {error}"),
+                        )
+                    })?
+                    .into(),
+            ),
+        })
+    }
 }
 
 impl ExecuteIdempotencyReceipt {
@@ -113,9 +186,8 @@ impl ExecuteIdempotencyReceipt {
     ) -> Result<Self, LixError> {
         Ok(Self {
             version: RECEIPT_VERSION,
-            scope: idempotency.scope.clone(),
             branch_id: idempotency.branch_id.clone(),
-            request_fingerprint: *idempotency.request_fingerprint(),
+            request_fingerprint: BASE64.encode(idempotency.request_fingerprint()),
             results: results
                 .iter()
                 .map(StoredExecuteResult::from_execute_result)
@@ -123,15 +195,19 @@ impl ExecuteIdempotencyReceipt {
         })
     }
 
+    /// `scope` is deliberately not a stored field. [`receipt_key`] is injective
+    /// over `(scope, key)` — it length-prefixes both components and carries the
+    /// scope's presence bit — so a receipt read at a key *is* a receipt for that
+    /// key's scope. Storing it again would make the value a second authority for
+    /// a fact the key already decides.
     pub(crate) fn matches(&self, idempotency: &ExecuteIdempotency) -> bool {
         self.version == RECEIPT_VERSION
-            && self.scope.as_deref() == idempotency.scope()
             && self.branch_id.as_deref() == idempotency.branch_id()
-            && self.request_fingerprint == *idempotency.request_fingerprint()
+            && self.request_fingerprint == BASE64.encode(idempotency.request_fingerprint())
     }
 
     pub(crate) fn into_single_result(self) -> Result<ExecuteResult, LixError> {
-        let mut results = self.into_results();
+        let mut results = self.into_results()?;
         if results.len() != 1 {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -141,8 +217,11 @@ impl ExecuteIdempotencyReceipt {
         Ok(results.remove(0))
     }
 
-    pub(crate) fn into_results(self) -> Vec<ExecuteResult> {
-        self.results.into_iter().map(ExecuteResult::from).collect()
+    pub(crate) fn into_results(self) -> Result<Vec<ExecuteResult>, LixError> {
+        self.results
+            .into_iter()
+            .map(StoredExecuteResult::into_execute_result)
+            .collect()
     }
 }
 
@@ -154,7 +233,7 @@ impl StoredExecuteResult {
             .map(|row| {
                 row.values()
                     .iter()
-                    .map(replayable_value)
+                    .map(StoredValue::from_value)
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -165,16 +244,23 @@ impl StoredExecuteResult {
             notices: result.notices().to_vec(),
         })
     }
-}
 
-impl From<StoredExecuteResult> for ExecuteResult {
-    fn from(result: StoredExecuteResult) -> Self {
-        Self::from_idempotency_parts(
-            result.columns,
-            result.rows,
-            result.rows_affected,
-            result.notices,
-        )
+    fn into_execute_result(self) -> Result<ExecuteResult, LixError> {
+        let rows = self
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(StoredValue::into_value)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ExecuteResult::from_idempotency_parts(
+            self.columns,
+            rows,
+            self.rows_affected,
+            self.notices,
+        ))
     }
 }
 
@@ -262,14 +348,105 @@ fn receipt_key(idempotency: &ExecuteIdempotency) -> Result<StorageKey, LixError>
     Ok(StorageKey(Bytes::from(bytes)))
 }
 
-fn replayable_value(value: &Value) -> Result<Value, LixError> {
-    if let Value::Real(value) = value
-        && !value.is_finite()
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "execute result contains a non-finite value that cannot be replayed over the protocol",
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Blob;
+
+    fn identity() -> ExecuteIdempotency {
+        ExecuteIdempotency::new(
+            Some("usr_expIR".to_owned()),
+            "key-expIR".to_owned(),
+            [7u8; 32],
+        )
+        .with_branch("0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned())
     }
-    Ok(value.clone())
+
+    fn roundtrip(values: Vec<Value>) -> Vec<Value> {
+        let identity = identity();
+        let result = ExecuteResult::from_rows(vec!["c".to_owned()], vec![values]);
+        let receipt = ExecuteIdempotencyReceipt::single(&identity, &result).expect("build receipt");
+        let (_, encoded) = encode_receipt(&identity, &receipt).expect("encode receipt");
+        let decoded: ExecuteIdempotencyReceipt =
+            serde_json::from_slice(&encoded).expect("decode receipt");
+        assert!(decoded.matches(&identity), "decoded receipt must replay");
+        decoded
+            .into_single_result()
+            .expect("replay result")
+            .rows()
+            .first()
+            .expect("one row")
+            .values()
+            .to_vec()
+    }
+
+    /// Every SQL value shape must survive the storage form byte for byte; the
+    /// replay contract is that a retry sees the recorded response.
+    #[test]
+    fn every_value_variant_replays_unchanged() {
+        let values = vec![
+            Value::Null,
+            Value::Boolean(true),
+            Value::Integer(-42),
+            Value::Real(1.5),
+            Value::Text("text".to_owned()),
+            Value::Jsonb(serde_json::json!({"nested": [true, 42]}).into()),
+            Value::Timestamptz(1_700_000_000_123_456),
+            Value::Blob(Blob::from(vec![0u8, 255, 1, 128, 7])),
+        ];
+        assert_eq!(roundtrip(values.clone()), values);
+    }
+
+    /// Blob payloads are the reason this encoding exists: `Value`'s own serde
+    /// form spends 3.57 stored bytes per payload byte.
+    #[test]
+    fn blob_payloads_cost_roughly_their_own_size() {
+        let payload = (0..4096u32).map(|byte| byte as u8).collect::<Vec<_>>();
+        let identity = identity();
+        let result = ExecuteResult::from_rows(
+            vec!["content".to_owned()],
+            vec![vec![Value::Blob(Blob::from(payload.clone()))]],
+        );
+        let receipt = ExecuteIdempotencyReceipt::single(&identity, &result).expect("build receipt");
+        let (_, encoded) = encode_receipt(&identity, &receipt).expect("encode receipt");
+        assert!(
+            encoded.len() < payload.len() * 2,
+            "a {}-byte payload must not cost {} receipt bytes",
+            payload.len(),
+            encoded.len()
+        );
+    }
+
+    /// A non-finite float cannot cross the protocol, so it must be refused
+    /// while the mutation can still be rejected rather than at replay time.
+    #[test]
+    fn non_finite_reals_are_refused_before_commit() {
+        let identity = identity();
+        let result =
+            ExecuteResult::from_rows(vec!["c".to_owned()], vec![vec![Value::Real(f64::INFINITY)]]);
+        let error =
+            ExecuteIdempotencyReceipt::single(&identity, &result).expect_err("must be refused");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+    }
+
+    /// The storage key already decides the scope, so the value must not carry
+    /// it — but a differing scope must still never replay, because it lands on
+    /// a different key.
+    #[test]
+    fn scope_is_decided_by_the_key_alone() {
+        let scoped =
+            ExecuteIdempotency::new(Some("usr_a".to_owned()), "shared-key".to_owned(), [7u8; 32]);
+        let other =
+            ExecuteIdempotency::new(Some("usr_b".to_owned()), "shared-key".to_owned(), [7u8; 32]);
+        let unscoped = ExecuteIdempotency::new(None, "shared-key".to_owned(), [7u8; 32]);
+        let empty_scope =
+            ExecuteIdempotency::new(Some(String::new()), "shared-key".to_owned(), [7u8; 32]);
+        let keys = [&scoped, &other, &unscoped, &empty_scope]
+            .map(|identity| receipt_key(identity).expect("build key"));
+        for left in 0..keys.len() {
+            for right in (left + 1)..keys.len() {
+                assert_ne!(keys[left], keys[right], "receipt keys must not alias");
+            }
+        }
+    }
 }

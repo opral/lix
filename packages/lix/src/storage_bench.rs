@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -45,13 +45,31 @@ static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
-static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
-static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ROW_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static ROOT_BASE_BATCH_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static ROOT_BASE_BATCH_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_DURABLE_ROOT: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_EXACT_KEYS: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_ROOTLESS_REPLAY: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_CALLS: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_STRING_BYTES: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_ESCAPED_STRINGS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ROWS_LOADED: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ROW_KEY_DECODES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ACCOUNT_ID_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_POINT_KEY_ENCODES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_POINT_KEY_ENCODE_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_REQUEST_KEY_CLONES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_OWNED_KEY_BUILDS: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_OWNED_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_REVERIFY_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_COLUMNAR_ROWS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -60,13 +78,182 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_HITS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 static IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Lifetime counts of real `stage_retire_hot_generation` invocations.
+///
+/// Separate from `HOT_RETIRE_CENSUS`, which a probe resets. A commit lane whose
+/// branch never rotates its tracked generation performs **zero** retires, so
+/// this is what distinguishes "every commit rewrites the plane" from "the plane
+/// is generation-keyed and the generation rarely moves".
+static HOT_RETIRE_CALLS: AtomicU64 = AtomicU64::new(0);
+static HOT_RETIRE_DELETED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_retire_call() {
+    HOT_RETIRE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_retire_deleted(rows: u64) {
+    HOT_RETIRE_DELETED_ROWS.fetch_add(rows, Ordering::Relaxed);
+}
+
+/// `(calls, deleted_rows)` since the last take.
+pub fn take_hot_retire_invocations() -> (u64, u64) {
+    (
+        HOT_RETIRE_CALLS.swap(0, Ordering::Relaxed),
+        HOT_RETIRE_DELETED_ROWS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Which packed-current-base publication route fired, if any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PackedBasePublicationCensus {
+    pub ordered: usize,
+    pub certified_columnar: usize,
+    pub complete_replacement: usize,
+}
+
+/// The single-transaction row count a commit must stage before any packed
+/// current base is eligible. Mirrors `PACKED_CURRENT_BASE_MIN_ROWS`.
+pub const PACKED_CURRENT_BASE_MIN_ROWS_VALUE: usize = 512;
+
+pub fn take_packed_base_publication_census() -> PackedBasePublicationCensus {
+    PackedBasePublicationCensus {
+        ordered: crate::transaction::take_ordered_packed_current_base_publications(),
+        certified_columnar: crate::transaction::take_certified_columnar_current_base_publications(),
+        complete_replacement:
+            crate::transaction::take_complete_replacement_packed_current_base_publications(),
+    }
+}
+
+/// Per-space census of one `stage_retire_hot_generation` call.
+///
+/// One row per entry in `GENERATION_SCOPED_SPACES`, in the order the retire
+/// visits them. `rows` is incremented inside the per-entry decode loop, so it
+/// counts entries the scan actually materialized, not entries it returned.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HotRetireSpaceCensus {
+    pub space_id: u32,
+    pub rows: u64,
+    pub pages: u64,
+    /// Wall time from entering the space to the `begin_scan` future resolving,
+    /// i.e. the seek that positions the iterator at the generation prefix.
+    pub open_nanos: u64,
+    pub total_nanos: u64,
+}
+
+static HOT_RETIRE_CENSUS: std::sync::Mutex<Vec<HotRetireSpaceCensus>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn record_hot_retire_space(
+    space_id: u32,
+    rows: u64,
+    pages: u64,
+    open_nanos: u64,
+    total_nanos: u64,
+) {
+    if let Ok(mut census) = HOT_RETIRE_CENSUS.lock() {
+        census.push(HotRetireSpaceCensus {
+            space_id,
+            rows,
+            pages,
+            open_nanos,
+            total_nanos,
+        });
+    }
+}
+
+pub fn begin_hot_retire_census() {
+    if let Ok(mut census) = HOT_RETIRE_CENSUS.lock() {
+        census.clear();
+    }
+}
+
+pub fn take_hot_retire_census() -> Vec<HotRetireSpaceCensus> {
+    HOT_RETIRE_CENSUS
+        .lock()
+        .map(|mut census| std::mem::take(&mut *census))
+        .unwrap_or_default()
+}
+
+/// Every branch id with a durable branch-head control, in branch-id order.
+pub async fn hot_generation_branches<R>(read: &R) -> Result<Vec<String>, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    Ok(crate::branch::BranchHeadControlContext::new()
+        .reader(read)
+        .scan()
+        .await?
+        .into_iter()
+        .map(|(branch_id, _)| branch_id)
+        .collect())
+}
+
+/// One `stage_retire_hot_generation` invocation, measured.
+#[derive(Clone, Debug, Default)]
+pub struct HotGenerationProbe {
+    pub deleted_rows: u64,
+    pub total_nanos: u64,
+    pub spaces: Vec<HotRetireSpaceCensus>,
+}
+
+/// Replays the production retire scan for one branch's live generation.
+///
+/// This calls `stage_retire_hot_generation` itself -- the same eight prefix
+/// scans a real publication performs -- and throws the resulting write set
+/// away, so the probe is read-only. With `phantom` the generation is a uuid no
+/// row can carry, which makes the garbage exactly zero by construction: every
+/// byte the storage engine touches is the fixed cost of positioning eight
+/// iterators in eight regions of one keyspace.
+pub async fn probe_hot_generation_planes<R>(
+    read: &R,
+    branch_id: &str,
+    phantom: bool,
+) -> Result<HotGenerationProbe, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let generation = if phantom {
+        crate::changelog::CommitId::new(uuid::Uuid::from_u128(0x0e53_0e53_0e53_0e53_0e53_0e53_0e53_0e53))
+    } else {
+        crate::branch::BranchHeadControlContext::new()
+            .reader(read)
+            .load(branch_id)
+            .await?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("no branch-head control for '{branch_id}'"),
+                )
+            })?
+            .tracked_generation
+    };
+    let mut writes = StorageWriteSet::new();
+    begin_hot_retire_census();
+    let start = std::time::Instant::now();
+    let deleted =
+        crate::hot_state::stage_retire_hot_generation(read, &mut writes, branch_id, generation)
+            .await?;
+    let total_nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    Ok(HotGenerationProbe {
+        deleted_rows: deleted,
+        total_nanos,
+        spaces: take_hot_retire_census(),
+    })
+}
 
 /// Matched transaction ownership counters used by the CRUD profile.  These
 /// counters are deliberately disabled unless the profile enables them, so the
@@ -262,12 +449,12 @@ pub fn take_media_structural_accounting() -> MediaStructuralAccounting {
     }
 }
 
-pub(crate) fn record_certified_entity_insert_parameter_batch_certification() {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_certified_row_insert_parameter_batch_certification() {
+    CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CertifiedEntityInsertParameterBatchCounters {
+pub struct CertifiedRowInsertParameterBatchCounters {
     pub certifications: u64,
     pub executions: u64,
 }
@@ -275,23 +462,17 @@ pub struct CertifiedEntityInsertParameterBatchCounters {
 /// Reads the cumulative certified parameter-batch INSERT phase counters
 /// without resetting them. Callers measuring one fixture/sample must subtract
 /// a pre-operation snapshot from a post-operation snapshot.
-pub fn certified_entity_insert_parameter_batch_counters()
--> CertifiedEntityInsertParameterBatchCounters {
-    CertifiedEntityInsertParameterBatchCounters {
-        certifications: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS
+pub fn certified_row_insert_parameter_batch_counters()
+-> CertifiedRowInsertParameterBatchCounters {
+    CertifiedRowInsertParameterBatchCounters {
+        certifications: CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS
             .load(Ordering::Relaxed),
-        executions: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.load(Ordering::Relaxed),
+        executions: CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS.load(Ordering::Relaxed),
     }
 }
 
-/// Returns and resets the number of certified parameter-batch INSERT routes
-/// selected by the planner, before any physical staging occurs.
-pub fn take_certified_entity_insert_parameter_batch_certifications() -> u64 {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.swap(0, Ordering::Relaxed)
-}
-
-pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_certified_row_insert_parameter_batch_execution() {
+    CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Returns and resets the number of certified parameter-batch INSERT routes
@@ -299,8 +480,8 @@ pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
 ///
 /// Benchmark fixtures use this as a route certificate so a schema change
 /// cannot silently turn the measured bulk INSERT back into sequential writes.
-pub fn take_certified_entity_insert_parameter_batch_executions() -> u64 {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed)
+pub fn take_certified_row_insert_parameter_batch_executions() -> u64 {
+    CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -311,20 +492,20 @@ pub struct CrudCertificateAccounting {
     pub certified_rows: u64,
 }
 
-pub(crate) fn record_certified_entity_update_value_batch_attempt() {
-    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_certified_row_update_value_batch_attempt() {
+    CERTIFIED_ROW_UPDATE_VALUE_BATCH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_certified_entity_update_value_batch_hit(row_count: usize) {
-    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS.fetch_add(1, Ordering::Relaxed);
-    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS.fetch_add(row_count as u64, Ordering::Relaxed);
+pub(crate) fn record_certified_row_update_value_batch_hit(row_count: usize) {
+    CERTIFIED_ROW_UPDATE_VALUE_BATCH_HITS.fetch_add(1, Ordering::Relaxed);
+    CERTIFIED_ROW_UPDATE_VALUE_BATCH_ROWS.fetch_add(row_count as u64, Ordering::Relaxed);
 }
 
 /// Returns and resets generated UPDATE certificate hit/miss accounting.
-pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateAccounting {
-    let attempts = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS.swap(0, Ordering::Relaxed);
-    let hits = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS.swap(0, Ordering::Relaxed);
-    let certified_rows = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS.swap(0, Ordering::Relaxed);
+pub fn take_certified_row_update_value_batch_accounting() -> CrudCertificateAccounting {
+    let attempts = CERTIFIED_ROW_UPDATE_VALUE_BATCH_ATTEMPTS.swap(0, Ordering::Relaxed);
+    let hits = CERTIFIED_ROW_UPDATE_VALUE_BATCH_HITS.swap(0, Ordering::Relaxed);
+    let certified_rows = CERTIFIED_ROW_UPDATE_VALUE_BATCH_ROWS.swap(0, Ordering::Relaxed);
     CrudCertificateAccounting {
         attempts,
         hits,
@@ -333,24 +514,316 @@ pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateA
     }
 }
 
+pub(crate) fn record_root_base_batch_cache_hit() {
+    ROOT_BASE_BATCH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_base_batch_cache_miss() {
+    ROOT_BASE_BATCH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Hits and misses since the last call. A rotated generation that is scanned
+/// repeatedly must show hits; zero hits means the serving cache is not
+/// connected to the lane under test, which is not visible in a timing sweep.
+pub fn take_root_base_batch_cache_accounting() -> (u64, u64) {
+    (
+        ROOT_BASE_BATCH_CACHE_HITS.swap(0, Ordering::Relaxed),
+        ROOT_BASE_BATCH_CACHE_MISSES.swap(0, Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn record_tracked_scan_durable_root() {
+    TRACKED_SCAN_DURABLE_ROOT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_tracked_scan_exact_keys() {
+    TRACKED_SCAN_EXACT_KEYS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_tracked_scan_rootless_replay() {
+    TRACKED_SCAN_ROOTLESS_REPLAY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Which arm of `scan_batch_at_commit` ran, since the last call:
+/// `(durable_root, exact_keys, rootless_replay)`.
+///
+/// Symbol presence in a profile is not attribution — a claim about which arm
+/// executed has to come from the branch itself. This exists because inferring
+/// it from which symbols appeared got it exactly backwards once.
+pub fn take_tracked_scan_branch_accounting() -> (u64, u64, u64) {
+    (
+        TRACKED_SCAN_DURABLE_ROOT.swap(0, Ordering::Relaxed),
+        TRACKED_SCAN_EXACT_KEYS.swap(0, Ordering::Relaxed),
+        TRACKED_SCAN_ROOTLESS_REPLAY.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Per-row identity allocation on the commit-delta payload fetch.
+///
+/// Each field names the exact site it counts, because the question this
+/// answers is whether one identity is decoded, cloned and re-encoded once per
+/// row or once per batch — and a count taken at any layer above the payload
+/// fetch cannot tell those apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EntityPointSnapshotCacheAccounting {
-    pub hits: u64,
-    pub misses: u64,
+pub struct TrackedKeyAllocationCensus {
+    /// `codec::decode_key` calls, all callers.
+    pub key_decode_calls: u64,
+    /// Encoded key bytes handed to `codec::decode_key`.
+    pub key_decode_input_bytes: u64,
+    /// Heap bytes copied by `decode_key`'s `into_owned()` over what
+    /// `decode_key_borrowed` already produced — the ceiling on what a
+    /// borrow-based fix at that site can remove.
+    pub key_decode_owned_string_bytes: u64,
+    /// Of those, strings whose encoding contained an escape and so were
+    /// already `Cow::Owned` before `into_owned()` — unavoidable by borrowing.
+    pub key_decode_escaped_strings: u64,
+    /// `load_commit_delta_entry_at_index` calls: rows fetched from a packed
+    /// commit delta.
+    pub commit_delta_rows_loaded: u64,
+    /// `decode_key` calls made by `load_commit_delta_entry_at_index` itself.
+    pub commit_delta_row_key_decodes: u64,
+    /// Bytes allocated by the per-row `account_id.to_string()`.
+    pub commit_delta_account_id_bytes: u64,
+    /// Per-request `encode_key_ref` calls on the point-read commit-delta route.
+    pub commit_delta_point_key_encodes: u64,
+    pub commit_delta_point_key_encode_bytes: u64,
+    /// `TrackedStateKey` deep clones made by `load_commit_delta_change_records`
+    /// to build its request vector.
+    pub commit_delta_request_key_clones: u64,
+    pub commit_delta_request_key_clone_bytes: u64,
+    /// Owned `TrackedStateKey` values built by `materialize_index_payloads`
+    /// from keys it already holds borrowed.
+    pub materialize_owned_key_builds: u64,
+    pub materialize_owned_key_bytes: u64,
+    /// Rows that reached the post-fetch re-verification in
+    /// `materialize_index_payloads`.
+    pub materialize_reverify_rows: u64,
+    /// Rows served by `load_columnar_owned_entries` — the commit-delta route
+    /// that has **no** byte-equality assert and matches identity through JSON
+    /// text instead. Counted separately from `commit_delta_rows_loaded` because
+    /// the two routes establish identity by different means, and a test about
+    /// one of them proves nothing unless it can show which one ran.
+    pub commit_delta_columnar_rows: u64,
 }
 
-pub(crate) fn record_entity_point_snapshot_cache_hit() {
-    ENTITY_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_key_decode_owned(input_bytes: usize, owned_string_bytes: usize, escaped: u32) {
+    KEY_DECODE_OWNED_CALLS.fetch_add(1, Ordering::Relaxed);
+    KEY_DECODE_OWNED_INPUT_BYTES.fetch_add(input_bytes as u64, Ordering::Relaxed);
+    KEY_DECODE_OWNED_STRING_BYTES.fetch_add(owned_string_bytes as u64, Ordering::Relaxed);
+    KEY_DECODE_OWNED_ESCAPED_STRINGS.fetch_add(u64::from(escaped), Ordering::Relaxed);
 }
 
-pub(crate) fn record_entity_point_snapshot_cache_miss() {
-    ENTITY_POINT_SNAPSHOT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+static COMMIT_DELTA_SEGMENT_ENTRIES_DECODED: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_SEGMENT_MEMBERS_KEPT: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_BOUNDED_SCANS_SCHEMA_ONLY: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_BOUNDED_SCANS_FILE_BOUNDED: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_BOUNDED_RANGES: AtomicU64 = AtomicU64::new(0);
+
+/// Counted INSIDE `collect_strict_commit_delta_members`' per-entry loop, at the
+/// `decode_value` / `decode_key` pair that does the work -- not at the member
+/// vector the scan returns. Those are different numbers: a selected segment is
+/// decoded whole and the schema/file retain is applied afterwards, so a count
+/// taken at the return value reports the surviving members and cannot
+/// distinguish a two-component seek from a schema-wide walk.
+pub(crate) fn record_commit_delta_segment_entry_decoded() {
+    COMMIT_DELTA_SEGMENT_ENTRIES_DECODED.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn take_entity_point_snapshot_cache_accounting() -> EntityPointSnapshotCacheAccounting {
-    EntityPointSnapshotCacheAccounting {
-        hits: ENTITY_POINT_SNAPSHOT_CACHE_HITS.swap(0, Ordering::Relaxed),
-        misses: ENTITY_POINT_SNAPSHOT_CACHE_MISSES.swap(0, Ordering::Relaxed),
+pub(crate) fn record_commit_delta_segment_members_kept(members: usize) {
+    COMMIT_DELTA_SEGMENT_MEMBERS_KEPT.fetch_add(members as u64, Ordering::Relaxed);
+}
+
+/// Route counter for the directory-bounded member scan.
+///
+/// Without it a flat `entries_decoded` is unreadable: "the narrowing did not
+/// help" and "the narrowed route never ran" produce the same number. Note that
+/// `collect_strict_commit_delta_members` also serves the manifest route, which
+/// has no directory root and cannot be range-bounded at all -- these two
+/// counters are what separates the two.
+pub(crate) fn record_commit_delta_bounded_scan(file_bounded: bool, ranges: usize) {
+    if file_bounded {
+        COMMIT_DELTA_BOUNDED_SCANS_FILE_BOUNDED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        COMMIT_DELTA_BOUNDED_SCANS_SCHEMA_ONLY.fetch_add(1, Ordering::Relaxed);
+    }
+    COMMIT_DELTA_BOUNDED_RANGES.fetch_add(ranges as u64, Ordering::Relaxed);
+}
+
+/// `(entries_decoded, members_kept, scans_schema_only, scans_file_bounded, ranges)`.
+///
+/// Process-global, like every counter in this module: assert thresholds scaled
+/// to your own fixture, never exact values, unless the test owns its process.
+pub fn take_commit_delta_member_scan_census() -> (u64, u64, u64, u64, u64) {
+    (
+        COMMIT_DELTA_SEGMENT_ENTRIES_DECODED.swap(0, Ordering::Relaxed),
+        COMMIT_DELTA_SEGMENT_MEMBERS_KEPT.swap(0, Ordering::Relaxed),
+        COMMIT_DELTA_BOUNDED_SCANS_SCHEMA_ONLY.swap(0, Ordering::Relaxed),
+        COMMIT_DELTA_BOUNDED_SCANS_FILE_BOUNDED.swap(0, Ordering::Relaxed),
+        COMMIT_DELTA_BOUNDED_RANGES.swap(0, Ordering::Relaxed),
+    )
+}
+
+static PATH_RESOLVER_DESCRIPTORS_SEEN: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_DESCRIPTORS_PARSED: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_DESCRIPTORS_PREFILTERED: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_METADATA_SLOTS_PRESENT: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_PREFILTER_ENABLED: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_PREFILTER_DISABLED: AtomicU64 = AtomicU64::new(0);
+
+/// Counted at the per-descriptor loop in
+/// `resolve_file_history_path_lookup_ids`, at the `serde_json::from_str` the
+/// prefilter is meant to avoid -- not at the resolved id set, which is the same
+/// set either way and therefore cannot tell a skipped parse from a performed
+/// one.
+pub(crate) fn record_path_resolver_descriptor(parsed: bool, metadata_present: bool) {
+    PATH_RESOLVER_DESCRIPTORS_SEEN.fetch_add(1, Ordering::Relaxed);
+    if parsed {
+        PATH_RESOLVER_DESCRIPTORS_PARSED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PATH_RESOLVER_DESCRIPTORS_PREFILTERED.fetch_add(1, Ordering::Relaxed);
+    }
+    if metadata_present {
+        PATH_RESOLVER_METADATA_SLOTS_PRESENT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Route counter. A prefiltered count of zero is otherwise unreadable: it means
+/// either "every descriptor matched" or "the prefilter refused this query's
+/// names", and those are different findings.
+pub(crate) fn record_path_resolver_prefilter(enabled: bool) {
+    if enabled {
+        PATH_RESOLVER_PREFILTER_ENABLED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PATH_RESOLVER_PREFILTER_DISABLED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(seen, parsed, prefiltered, metadata_slots_present, prefilter_on, prefilter_off)`.
+pub fn take_path_resolver_census() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        PATH_RESOLVER_DESCRIPTORS_SEEN.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_DESCRIPTORS_PARSED.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_DESCRIPTORS_PREFILTERED.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_METADATA_SLOTS_PRESENT.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_PREFILTER_ENABLED.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_PREFILTER_DISABLED.swap(0, Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn record_commit_delta_row_loaded(account_id_bytes: usize) {
+    COMMIT_DELTA_ROWS_LOADED.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_ROW_KEY_DECODES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_ACCOUNT_ID_BYTES.fetch_add(account_id_bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_point_key_encode(bytes: usize) {
+    COMMIT_DELTA_POINT_KEY_ENCODES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_POINT_KEY_ENCODE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_request_key_clone(bytes: usize) {
+    COMMIT_DELTA_REQUEST_KEY_CLONES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_materialize_owned_key(bytes: usize) {
+    MATERIALIZE_OWNED_KEY_BUILDS.fetch_add(1, Ordering::Relaxed);
+    MATERIALIZE_OWNED_KEY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_materialize_reverify_row() {
+    MATERIALIZE_REVERIFY_ROWS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_columnar_row() {
+    COMMIT_DELTA_COLUMNAR_ROWS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_tracked_key_allocation_census() -> TrackedKeyAllocationCensus {
+    TrackedKeyAllocationCensus {
+        key_decode_calls: KEY_DECODE_OWNED_CALLS.swap(0, Ordering::Relaxed),
+        key_decode_input_bytes: KEY_DECODE_OWNED_INPUT_BYTES.swap(0, Ordering::Relaxed),
+        key_decode_owned_string_bytes: KEY_DECODE_OWNED_STRING_BYTES.swap(0, Ordering::Relaxed),
+        key_decode_escaped_strings: KEY_DECODE_OWNED_ESCAPED_STRINGS.swap(0, Ordering::Relaxed),
+        commit_delta_rows_loaded: COMMIT_DELTA_ROWS_LOADED.swap(0, Ordering::Relaxed),
+        commit_delta_row_key_decodes: COMMIT_DELTA_ROW_KEY_DECODES.swap(0, Ordering::Relaxed),
+        commit_delta_account_id_bytes: COMMIT_DELTA_ACCOUNT_ID_BYTES.swap(0, Ordering::Relaxed),
+        commit_delta_point_key_encodes: COMMIT_DELTA_POINT_KEY_ENCODES.swap(0, Ordering::Relaxed),
+        commit_delta_point_key_encode_bytes: COMMIT_DELTA_POINT_KEY_ENCODE_BYTES
+            .swap(0, Ordering::Relaxed),
+        commit_delta_request_key_clones: COMMIT_DELTA_REQUEST_KEY_CLONES.swap(0, Ordering::Relaxed),
+        commit_delta_request_key_clone_bytes: COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES
+            .swap(0, Ordering::Relaxed),
+        materialize_owned_key_builds: MATERIALIZE_OWNED_KEY_BUILDS.swap(0, Ordering::Relaxed),
+        materialize_owned_key_bytes: MATERIALIZE_OWNED_KEY_BYTES.swap(0, Ordering::Relaxed),
+        materialize_reverify_rows: MATERIALIZE_REVERIFY_ROWS.swap(0, Ordering::Relaxed),
+        commit_delta_columnar_rows: COMMIT_DELTA_COLUMNAR_ROWS.swap(0, Ordering::Relaxed),
+    }
+}
+
+/// Hot-index probe routing, counted where the probe *decides*.
+///
+/// A probe that resolves candidates rewrites the request's `row_pks`, which
+/// sends `hot_scan_entries` down its point-batch arm instead of the
+/// full-prefix fallback. Counting the decision here rather than the rows the
+/// scan returns is what distinguishes a seek from a walk: a count taken at the
+/// layer that returns the answer reads identically under both.
+///
+/// The refusal counters exist because a probe that silently declines is
+/// indistinguishable from one that never ran, and "the seek engaged" is
+/// otherwise unfalsifiable. Attribution is the **fallback going to zero**, not
+/// an engaged counter going positive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotIndexProbeCensus {
+    /// Equality/IN probes that resolved a candidate set.
+    pub equality_probes_engaged: u64,
+    /// Range probes that resolved a candidate set.
+    pub range_probes_engaged: u64,
+    /// Candidates resolved by range probes, before the residual re-check.
+    pub range_probe_candidates: u64,
+    /// Probes that fell back because a branch in scope carried no witness.
+    pub probes_refused_unwitnessed: u64,
+    /// Probes that fell back because the candidate set exceeded its budget.
+    pub probes_refused_over_budget: u64,
+}
+
+static HOT_INDEX_EQUALITY_PROBES_ENGAGED: AtomicU64 = AtomicU64::new(0);
+static HOT_INDEX_RANGE_PROBES_ENGAGED: AtomicU64 = AtomicU64::new(0);
+static HOT_INDEX_RANGE_PROBE_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static HOT_INDEX_PROBES_REFUSED_UNWITNESSED: AtomicU64 = AtomicU64::new(0);
+static HOT_INDEX_PROBES_REFUSED_OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_index_equality_probe_engaged() {
+    HOT_INDEX_EQUALITY_PROBES_ENGAGED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_index_range_probe_engaged(candidates: usize) {
+    HOT_INDEX_RANGE_PROBES_ENGAGED.fetch_add(1, Ordering::Relaxed);
+    HOT_INDEX_RANGE_PROBE_CANDIDATES.fetch_add(candidates as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_index_probe_refused_unwitnessed() {
+    HOT_INDEX_PROBES_REFUSED_UNWITNESSED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_index_probe_refused_over_budget() {
+    HOT_INDEX_PROBES_REFUSED_OVER_BUDGET.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drains the hot-index probe census.
+///
+/// These counters are process-global and the suite runs tests in parallel, so
+/// assertions against them must be thresholds scaled to the caller's own
+/// fixture, never exact values.
+pub fn take_hot_index_probe_census() -> HotIndexProbeCensus {
+    HotIndexProbeCensus {
+        equality_probes_engaged: HOT_INDEX_EQUALITY_PROBES_ENGAGED.swap(0, Ordering::Relaxed),
+        range_probes_engaged: HOT_INDEX_RANGE_PROBES_ENGAGED.swap(0, Ordering::Relaxed),
+        range_probe_candidates: HOT_INDEX_RANGE_PROBE_CANDIDATES.swap(0, Ordering::Relaxed),
+        probes_refused_unwitnessed: HOT_INDEX_PROBES_REFUSED_UNWITNESSED
+            .swap(0, Ordering::Relaxed),
+        probes_refused_over_budget: HOT_INDEX_PROBES_REFUSED_OVER_BUDGET
+            .swap(0, Ordering::Relaxed),
     }
 }
 
@@ -399,6 +872,20 @@ pub struct CrudCurrentStateScopedRangeAccounting {
     pub sealed_manifest_loads: u64,
     pub replay_manifest_loads: u64,
     pub ordered_delta_fallbacks: u64,
+    pub commit_delta_direct_segments: u64,
+    pub commit_delta_direct_rows: u64,
+    pub commit_delta_generic_segments: u64,
+    pub commit_delta_generic_rows: u64,
+}
+
+pub(crate) fn record_commit_delta_leaf_layout(rows: usize, direct: bool) {
+    let (segments, encoded_rows) = if direct {
+        (&COMMIT_DELTA_DIRECT_SEGMENTS, &COMMIT_DELTA_DIRECT_ROWS)
+    } else {
+        (&COMMIT_DELTA_GENERIC_SEGMENTS, &COMMIT_DELTA_GENERIC_ROWS)
+    };
+    segments.fetch_add(1, Ordering::Relaxed);
+    encoded_rows.fetch_add(rows as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn record_crud_current_state_scoped_range_attempt() {
@@ -433,7 +920,592 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_segments: COMMIT_DELTA_DIRECT_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_rows: COMMIT_DELTA_DIRECT_ROWS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_segments: COMMIT_DELTA_GENERIC_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_rows: COMMIT_DELTA_GENERIC_ROWS.swap(0, Ordering::Relaxed),
     }
+}
+
+/// Publication-side census for `current_state_scoped_ranges`, the per-scope
+/// read accelerator.
+///
+/// These are deliberately **not** the `crud_current_state_scoped_range_*`
+/// counters above: those record `attempts`/`hits` inside
+/// `resolve_rootless_index_values_at_commit`, which is the rootless replay
+/// *read* path. Nothing there observes whether a commit published a scoped
+/// root, so a test asserting on them passes whether or not the accelerator
+/// ever engaged.
+///
+/// The two fields split the accelerator's two halves, which fail
+/// independently:
+///
+/// * `columnar_root_publications` — a commit whose mutation inventory carried
+///   columnar parts bootstrapped a scoped root out of the `parent_root ==
+///   None` fixed point. Reached only by a certified typed INSERT batch of at
+///   least `TYPED_CERTIFIED_INSERT_MIN_ROWS` (32,768) rows against a
+///   user-registered row schema.
+/// * `parent_root_hits` — a later publication found a parent scoped root and
+///   carried it forward. This is what proves the accelerator *sustains*; a
+///   regression that bootstraps and then self-extinguishes leaves
+///   `columnar_root_publications` intact and drives this to zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CertifiedCurrentStatePublicationCounters {
+    pub columnar_root_publications: u64,
+    pub parent_root_hits: u64,
+}
+
+pub(crate) fn record_certified_current_state_columnar_root_publication() {
+    CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_certified_current_state_parent_root_hit() {
+    CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reads the cumulative scoped-root publication counters **without** resetting
+/// them. These statics are process-global and test binaries run their tests in
+/// parallel, so a `swap`-style reader would let two fixtures steal each other's
+/// counts. Subtract a pre-operation snapshot from a post-operation snapshot and
+/// assert a threshold on the delta; concurrent contributions can only inflate
+/// it, never hide a mechanism that stopped engaging.
+pub fn certified_current_state_publication_counters() -> CertifiedCurrentStatePublicationCounters {
+    CertifiedCurrentStatePublicationCounters {
+        columnar_root_publications: CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS
+            .load(Ordering::Relaxed),
+        parent_root_hits: CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS.load(Ordering::Relaxed),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commit-root replay accounting (experiment AA).
+//
+// Answers "how many ancestor commits does one root-materialization boundary
+// replay, and where does the per-replayed-commit cost go". The coarse counters
+// tick once per boundary/plan and are always compiled under `storage-benches`.
+// The per-node cost attribution is behind `root-replay-trace` so no timing A/B
+// ever pays for an `Instant::now()` inside `hash_bytes`.
+// ---------------------------------------------------------------------------
+
+static ROOT_REPLAY_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_PLANS_LOADED: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_PLANS_STAGED: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_AVAILABLE_ROOT_PROBES: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_AVAILABLE_ROOT_HITS: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_MAX_PLANS: AtomicU64 = AtomicU64::new(0);
+
+static ROOT_REPLAY_PLAN_LOAD_NANOS: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_STAGE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-boundary replay-set sizes, in boundary order.
+static ROOT_REPLAY_PLAN_HISTOGRAM: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayAccounting {
+    /// Distinct durable rootless parents that forced a replay.
+    pub boundaries: u64,
+    /// Total rebuild plans returned by the nearest-available-root walk.
+    pub plans_loaded: u64,
+    /// Plans actually replayed through the tracked-state root writer.
+    pub plans_staged: u64,
+    pub available_root_probes: u64,
+    pub available_root_hits: u64,
+    pub max_plans_in_one_boundary: u64,
+    pub plan_load_nanos: u64,
+    pub stage_nanos: u64,
+    /// Replay-set size per boundary, in boundary order.
+    pub plans_per_boundary: Vec<u64>,
+}
+
+pub(crate) fn record_root_replay_boundary(plans: usize) {
+    ROOT_REPLAY_BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+    ROOT_REPLAY_PLANS_LOADED.fetch_add(plans as u64, Ordering::Relaxed);
+    ROOT_REPLAY_MAX_PLANS.fetch_max(plans as u64, Ordering::Relaxed);
+    if let Ok(mut histogram) = ROOT_REPLAY_PLAN_HISTOGRAM.lock() {
+        histogram.push(plans as u64);
+    }
+}
+
+pub(crate) fn record_root_replay_plan_staged() {
+    ROOT_REPLAY_PLANS_STAGED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_replay_available_root_probe(hit: bool) {
+    ROOT_REPLAY_AVAILABLE_ROOT_PROBES.fetch_add(1, Ordering::Relaxed);
+    if hit {
+        ROOT_REPLAY_AVAILABLE_ROOT_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_root_replay_plan_load_nanos(nanos: u64) {
+    ROOT_REPLAY_PLAN_LOAD_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_replay_stage_nanos(nanos: u64) {
+    ROOT_REPLAY_STAGE_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+pub fn take_root_replay_accounting() -> RootReplayAccounting {
+    RootReplayAccounting {
+        boundaries: ROOT_REPLAY_BOUNDARIES.swap(0, Ordering::Relaxed),
+        plans_loaded: ROOT_REPLAY_PLANS_LOADED.swap(0, Ordering::Relaxed),
+        plans_staged: ROOT_REPLAY_PLANS_STAGED.swap(0, Ordering::Relaxed),
+        available_root_probes: ROOT_REPLAY_AVAILABLE_ROOT_PROBES.swap(0, Ordering::Relaxed),
+        available_root_hits: ROOT_REPLAY_AVAILABLE_ROOT_HITS.swap(0, Ordering::Relaxed),
+        max_plans_in_one_boundary: ROOT_REPLAY_MAX_PLANS.swap(0, Ordering::Relaxed),
+        plan_load_nanos: ROOT_REPLAY_PLAN_LOAD_NANOS.swap(0, Ordering::Relaxed),
+        stage_nanos: ROOT_REPLAY_STAGE_NANOS.swap(0, Ordering::Relaxed),
+        plans_per_boundary: ROOT_REPLAY_PLAN_HISTOGRAM
+            .lock()
+            .map(|mut histogram| std::mem::take(&mut *histogram))
+            .unwrap_or_default(),
+    }
+}
+
+/// Per-node cost attribution for replayed commits.
+///
+/// Every bucket records `(in_replay, total)` so a run can say what fraction of
+/// all tracked-state tree CPU is spent inside commit-root replay rather than on
+/// the commit's own mutations.
+#[cfg(feature = "root-replay-trace")]
+mod replay_trace {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    macro_rules! bucket {
+        ($replay_ns:ident, $total_ns:ident, $replay_bytes:ident, $total_bytes:ident,
+         $replay_count:ident, $total_count:ident, $record:ident) => {
+            static $replay_ns: AtomicU64 = AtomicU64::new(0);
+            static $total_ns: AtomicU64 = AtomicU64::new(0);
+            static $replay_bytes: AtomicU64 = AtomicU64::new(0);
+            static $total_bytes: AtomicU64 = AtomicU64::new(0);
+            static $replay_count: AtomicU64 = AtomicU64::new(0);
+            static $total_count: AtomicU64 = AtomicU64::new(0);
+
+            pub(crate) fn $record(nanos: u64, bytes: u64) {
+                $total_ns.fetch_add(nanos, Ordering::Relaxed);
+                $total_bytes.fetch_add(bytes, Ordering::Relaxed);
+                $total_count.fetch_add(1, Ordering::Relaxed);
+                if in_replay() {
+                    $replay_ns.fetch_add(nanos, Ordering::Relaxed);
+                    $replay_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    $replay_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        };
+    }
+
+    thread_local! {
+        static REPLAY_DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn in_replay() -> bool {
+        REPLAY_DEPTH.with(|depth| depth.get() > 0)
+    }
+
+    pub(crate) fn enter() {
+        REPLAY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    }
+
+    pub(crate) fn exit() {
+        REPLAY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+
+    bucket!(
+        READ_NS,
+        READ_TOTAL_NS,
+        READ_BYTES,
+        READ_TOTAL_BYTES,
+        READ_COUNT,
+        READ_TOTAL_COUNT,
+        record_chunk_read
+    );
+    bucket!(
+        DECODE_NS,
+        DECODE_TOTAL_NS,
+        DECODE_BYTES,
+        DECODE_TOTAL_BYTES,
+        DECODE_COUNT,
+        DECODE_TOTAL_COUNT,
+        record_node_decode
+    );
+    bucket!(
+        ENCODE_NS,
+        ENCODE_TOTAL_NS,
+        ENCODE_BYTES,
+        ENCODE_TOTAL_BYTES,
+        ENCODE_COUNT,
+        ENCODE_TOTAL_COUNT,
+        record_node_encode
+    );
+    bucket!(
+        HASH_NS,
+        HASH_TOTAL_NS,
+        HASH_BYTES,
+        HASH_TOTAL_BYTES,
+        HASH_COUNT,
+        HASH_TOTAL_COUNT,
+        record_node_hash
+    );
+
+    pub(crate) fn take() -> super::RootReplayCostAttribution {
+        let bucket = |ns: &AtomicU64,
+                      total_ns: &AtomicU64,
+                      bytes: &AtomicU64,
+                      total_bytes: &AtomicU64,
+                      count: &AtomicU64,
+                      total_count: &AtomicU64| {
+            super::RootReplayCostBucket {
+                replay_nanos: ns.swap(0, Ordering::Relaxed),
+                total_nanos: total_ns.swap(0, Ordering::Relaxed),
+                replay_bytes: bytes.swap(0, Ordering::Relaxed),
+                total_bytes: total_bytes.swap(0, Ordering::Relaxed),
+                replay_count: count.swap(0, Ordering::Relaxed),
+                total_count: total_count.swap(0, Ordering::Relaxed),
+            }
+        };
+        super::RootReplayCostAttribution {
+            storage_read: bucket(
+                &READ_NS,
+                &READ_TOTAL_NS,
+                &READ_BYTES,
+                &READ_TOTAL_BYTES,
+                &READ_COUNT,
+                &READ_TOTAL_COUNT,
+            ),
+            decode: bucket(
+                &DECODE_NS,
+                &DECODE_TOTAL_NS,
+                &DECODE_BYTES,
+                &DECODE_TOTAL_BYTES,
+                &DECODE_COUNT,
+                &DECODE_TOTAL_COUNT,
+            ),
+            encode: bucket(
+                &ENCODE_NS,
+                &ENCODE_TOTAL_NS,
+                &ENCODE_BYTES,
+                &ENCODE_TOTAL_BYTES,
+                &ENCODE_COUNT,
+                &ENCODE_TOTAL_COUNT,
+            ),
+            hash: bucket(
+                &HASH_NS,
+                &HASH_TOTAL_NS,
+                &HASH_BYTES,
+                &HASH_TOTAL_BYTES,
+                &HASH_COUNT,
+                &HASH_TOTAL_COUNT,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayCostBucket {
+    pub replay_nanos: u64,
+    pub total_nanos: u64,
+    pub replay_bytes: u64,
+    pub total_bytes: u64,
+    pub replay_count: u64,
+    pub total_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayCostAttribution {
+    pub storage_read: RootReplayCostBucket,
+    pub decode: RootReplayCostBucket,
+    pub encode: RootReplayCostBucket,
+    pub hash: RootReplayCostBucket,
+}
+
+/// True when this build carries the per-node replay cost attribution.
+pub fn root_replay_trace_enabled() -> bool {
+    cfg!(feature = "root-replay-trace")
+}
+
+pub fn take_root_replay_cost_attribution() -> RootReplayCostAttribution {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        replay_trace::take()
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    {
+        RootReplayCostAttribution::default()
+    }
+}
+
+/// Marks the dynamic extent of one commit-root replay for cost attribution.
+pub(crate) struct RootReplayScope;
+
+impl RootReplayScope {
+    pub(crate) fn enter() -> Self {
+        #[cfg(feature = "root-replay-trace")]
+        replay_trace::enter();
+        Self
+    }
+}
+
+impl Drop for RootReplayScope {
+    fn drop(&mut self) {
+        #[cfg(feature = "root-replay-trace")]
+        replay_trace::exit();
+    }
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_chunk_read(nanos: u64, bytes: u64) {
+    replay_trace::record_chunk_read(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_decode(nanos: u64, bytes: u64) {
+    replay_trace::record_node_decode(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_encode(nanos: u64, bytes: u64) {
+    replay_trace::record_node_encode(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_hash(nanos: u64, bytes: u64) {
+    replay_trace::record_node_hash(nanos, bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Plan-load phase attribution (experiment AB).
+//
+// Splits one commit-root rebuild plan load into named phases and, for every
+// phase, separates the time spent inside the storage adapter's `get_many`
+// boundary (I/O) from everything else (decode + allocation + setup). Also
+// counts physical read batches and keys per phase, so "how many physical reads
+// does one plan load issue" is answered by a counter rather than a guess.
+//
+// Gated behind `root-replay-trace` exactly like the AA attribution, so no A/B
+// timing build pays for an `Instant::now()` inside `get_many`.
+// ---------------------------------------------------------------------------
+
+/// Named phases of one commit-root rebuild plan load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanLoadPhase {
+    /// Everything outside a plan load.
+    Other = 0,
+    /// `load_available_root` — the bounded durable-root availability probe.
+    AvailProbe = 1,
+    /// `ChangelogReader::load_commits` for the one replayed commit.
+    CommitRecord = 2,
+    /// `load_point_replay_commit_state` — commit-state header + inventory.
+    ReplayState = 3,
+    /// Mutation-directory routing plus packed commit-delta segment reads and
+    /// leaf decode.
+    DeltaSegments = 4,
+    /// Owned-key materialization of the decoded batch into plan deltas.
+    Collect = 5,
+    /// `commit_root_tree_is_readable` — the full tracked-state tree scan the
+    /// availability probe runs to prove the addressed chunk closure is
+    /// physically readable. Nested inside `AvailProbe`.
+    AvailTreeScan = 6,
+}
+
+pub const PLAN_LOAD_PHASE_COUNT: usize = 7;
+
+pub const PLAN_LOAD_PHASE_NAMES: [&str; PLAN_LOAD_PHASE_COUNT] = [
+    "other",
+    "avail_probe",
+    "commit_record",
+    "replay_state",
+    "delta_segments",
+    "collect",
+    "avail_tree_scan",
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanLoadPhaseMetric {
+    /// Wall time inside the phase guard.
+    pub wall_nanos: u64,
+    /// Wall time inside `StorageAdapterRead::get_many` while in this phase.
+    pub io_nanos: u64,
+    /// `StorageAdapterRead::get_many` invocations issued while in this phase.
+    pub read_calls: u64,
+    /// Logical per-space requests inside those invocations.
+    pub read_batches: u64,
+    /// Keys requested across those batches.
+    pub read_keys: u64,
+    /// Keys that returned a value.
+    pub read_hits: u64,
+    /// Bytes returned by those batches.
+    pub read_bytes: u64,
+    /// Times the phase guard was entered.
+    pub entries: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanLoadAttribution {
+    pub phases: [PlanLoadPhaseMetric; PLAN_LOAD_PHASE_COUNT],
+    /// Plan loads completed (one per replayed ancestor).
+    pub plans: u64,
+    /// Commit-delta members decoded across those plan loads.
+    pub members_decoded: u64,
+    /// Members kept in the returned plan.
+    pub members_kept: u64,
+    /// Bytes of packed commit-delta segment payload decoded.
+    pub member_payload_bytes: u64,
+}
+
+/// True when this build carries the plan-load phase attribution.
+pub fn plan_load_trace_enabled() -> bool {
+    cfg!(feature = "root-replay-trace")
+}
+
+#[cfg(feature = "root-replay-trace")]
+mod plan_load_trace {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{PLAN_LOAD_PHASE_COUNT, PlanLoadAttribution, PlanLoadPhase, PlanLoadPhaseMetric};
+
+    const FIELDS: usize = 8;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    static COUNTERS: [AtomicU64; PLAN_LOAD_PHASE_COUNT * FIELDS] =
+        [ZERO; PLAN_LOAD_PHASE_COUNT * FIELDS];
+    static PLANS: AtomicU64 = AtomicU64::new(0);
+    static MEMBERS_DECODED: AtomicU64 = AtomicU64::new(0);
+    static MEMBERS_KEPT: AtomicU64 = AtomicU64::new(0);
+    static MEMBER_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static PHASE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn add(phase: usize, field: usize, value: u64) {
+        COUNTERS[phase * FIELDS + field].fetch_add(value, Ordering::Relaxed);
+    }
+
+    pub(super) fn current_phase() -> usize {
+        PHASE.with(Cell::get)
+    }
+
+    pub(super) fn set_phase(phase: usize) -> usize {
+        PHASE.with(|slot| slot.replace(phase))
+    }
+
+    pub(super) fn record_phase_wall(phase: usize, nanos: u64) {
+        add(phase, 0, nanos);
+        add(phase, 6, 1);
+    }
+
+    pub(super) fn record_io(nanos: u64, batches: u64, keys: u64, hits: u64, bytes: u64) {
+        let phase = current_phase();
+        add(phase, 1, nanos);
+        add(phase, 2, batches);
+        add(phase, 3, keys);
+        add(phase, 4, hits);
+        add(phase, 5, bytes);
+        add(phase, 7, 1);
+    }
+
+    pub(super) fn record_plan(members_decoded: u64, members_kept: u64, payload_bytes: u64) {
+        PLANS.fetch_add(1, Ordering::Relaxed);
+        MEMBERS_DECODED.fetch_add(members_decoded, Ordering::Relaxed);
+        MEMBERS_KEPT.fetch_add(members_kept, Ordering::Relaxed);
+        MEMBER_PAYLOAD_BYTES.fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    pub(super) fn take() -> PlanLoadAttribution {
+        let mut phases = [PlanLoadPhaseMetric::default(); PLAN_LOAD_PHASE_COUNT];
+        for (index, phase) in phases.iter_mut().enumerate() {
+            let get = |field: usize| COUNTERS[index * FIELDS + field].swap(0, Ordering::Relaxed);
+            *phase = PlanLoadPhaseMetric {
+                wall_nanos: get(0),
+                io_nanos: get(1),
+                read_batches: get(2),
+                read_keys: get(3),
+                read_hits: get(4),
+                read_bytes: get(5),
+                entries: get(6),
+                read_calls: get(7),
+            };
+        }
+        PlanLoadAttribution {
+            phases,
+            plans: PLANS.swap(0, Ordering::Relaxed),
+            members_decoded: MEMBERS_DECODED.swap(0, Ordering::Relaxed),
+            members_kept: MEMBERS_KEPT.swap(0, Ordering::Relaxed),
+            member_payload_bytes: MEMBER_PAYLOAD_BYTES.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn phase_index(phase: PlanLoadPhase) -> usize {
+        phase as usize
+    }
+}
+
+pub fn take_plan_load_attribution() -> PlanLoadAttribution {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        plan_load_trace::take()
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    {
+        PlanLoadAttribution::default()
+    }
+}
+
+/// RAII guard marking the dynamic extent of one plan-load phase.
+///
+/// Phases nest: the guard restores the enclosing phase on drop, and wall time
+/// is charged to the phase named by the guard (so an inner phase's time is
+/// counted in both, exactly like a call-tree self/total split at one level).
+pub(crate) struct PlanLoadPhaseScope {
+    #[cfg(feature = "root-replay-trace")]
+    phase: usize,
+    #[cfg(feature = "root-replay-trace")]
+    previous: usize,
+    #[cfg(feature = "root-replay-trace")]
+    start: std::time::Instant,
+}
+
+impl PlanLoadPhaseScope {
+    #[allow(unused_variables)]
+    pub(crate) fn enter(phase: PlanLoadPhase) -> Self {
+        #[cfg(feature = "root-replay-trace")]
+        {
+            let phase = plan_load_trace::phase_index(phase);
+            let previous = plan_load_trace::set_phase(phase);
+            Self {
+                phase,
+                previous,
+                start: std::time::Instant::now(),
+            }
+        }
+        #[cfg(not(feature = "root-replay-trace"))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for PlanLoadPhaseScope {
+    fn drop(&mut self) {
+        #[cfg(feature = "root-replay-trace")]
+        {
+            plan_load_trace::record_phase_wall(self.phase, self.start.elapsed().as_nanos() as u64);
+            plan_load_trace::set_phase(self.previous);
+        }
+    }
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_plan_load_io(nanos: u64, batches: u64, keys: u64, hits: u64, bytes: u64) {
+    plan_load_trace::record_io(nanos, batches, keys, hits, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_plan_load_plan(members_decoded: u64, members_kept: u64, payload_bytes: u64) {
+    plan_load_trace::record_plan(members_decoded, members_kept, payload_bytes);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -476,7 +1548,19 @@ pub enum CommitGraphBenchMode {
     LegacyAllNodes,
     ReachableNodes,
     LegacyReachableNodes,
+    /// Whole reachable history for one member schema.
+    HistoryFull,
+    /// History restricted to the head commit (`lixcol_depth = 0`).
+    HistoryDepth0,
+    /// History for a bounded row demand (`LIMIT 10`).
+    HistoryLimit10,
 }
+
+/// Row demand a bounded history benchmark mode asks for.
+const COMMIT_GRAPH_BENCH_HISTORY_LIMIT: usize = 10;
+
+/// Schema key that [`seed_commit_graph_members_for_bench`] writes per commit.
+const COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY: &str = "commit_graph_bench_member";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CommitGraphBenchResult {
@@ -509,6 +1593,23 @@ pub struct MergePreparationBenchResult {
     pub source_entries: usize,
 }
 
+/// Scope set stamped on every synthetic merge-base fixture commit.
+///
+/// Chosen to look like an ordinary file commit so the encoded record width
+/// matches what the real commit path writes.
+fn merge_base_bench_touched_scopes() -> Vec<crate::changelog::CommitScopeKey> {
+    vec![
+        crate::changelog::CommitScopeKey {
+            schema_key: "lix_file_descriptor".to_string(),
+            file_id: None,
+        },
+        crate::changelog::CommitScopeKey {
+            schema_key: "lix_binary_blob_ref".to_string(),
+            file_id: Some("01920000-0000-7000-8000-00000000beef".to_string()),
+        },
+    ]
+}
+
 /// Seeds an empty-state commit graph whose only varying dimension is ancestry.
 ///
 /// The manifests deliberately contain no tracked mutations or durable roots so
@@ -527,8 +1628,9 @@ where
             "merge-base benchmark ancestry must be positive",
         ));
     }
-    let mut records = Vec::new();
-    let mut generations = std::collections::HashMap::new();
+    let mut records = Vec::<crate::changelog::CommitRecord>::new();
+    let mut generations = std::collections::HashMap::<crate::changelog::CommitId, u64>::new();
+    let mut record_indices = std::collections::HashMap::<crate::changelog::CommitId, usize>::new();
     let scenario_name = match scenario {
         MergeBaseBenchScenario::EqualHeads => "equal",
         MergeBaseBenchScenario::AncestorDescendant => "ancestor",
@@ -552,12 +1654,31 @@ where
             .max()
             .map_or(0, |generation| generation.saturating_add(1));
         let commit_id = crate::changelog::CommitId::for_test_label(&label);
+        let parent = parents
+            .as_slice()
+            .first()
+            .and_then(|parent_id| record_indices.get(parent_id))
+            .map(|index| &records[*index]);
+        let parent_jump = parent
+            .and_then(|parent| record_indices.get(&parent.first_parent_jump_commit_id))
+            .map(|index| &records[*index]);
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
-            format_version: 2,
+            // A realistic full-width digest, not `absent()`. Every commit-topology
+            // consumer pays for this field whether or not it benefits, and
+            // merge-base is the guard for exactly that cost — an `absent()`
+            // fixture encodes no bits, so it would measure a node this build
+            // never writes and report a free change that is not free.
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(
+                merge_base_bench_touched_scopes().iter(),
+            ),
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id,
             generation,
             parent_commit_ids: parents,
-            change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "merge-base benchmark timestamp",
@@ -565,6 +1686,7 @@ where
             ),
         });
         generations.insert(commit_id, generation);
+        record_indices.insert(commit_id, records.len() - 1);
         Ok(commit_id)
     };
 
@@ -694,28 +1816,19 @@ where
         reader.merge_base(&left, &right).await?
     };
     let mut reader = crate::tracked_state::TrackedStateContext::new().reader(&read);
-    let target_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            left_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
-    let source_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            right_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
+    let analysis = crate::session::analyze_merge_for_bench(
+        &mut reader,
+        crate::session::MergeCommitsForBench {
+            base_commit_id: base,
+            target_commit_id: left,
+            source_commit_id: right,
+        },
+    )
+    .await?;
     Ok(MergePreparationBenchResult {
-        base_commit_id: base.to_string(),
-        target_entries,
-        source_entries,
+        base_commit_id: analysis.commits.base_commit_id.to_string(),
+        target_entries: analysis.target_diff.entries.len(),
+        source_entries: analysis.source_diff.entries.len(),
     })
 }
 
@@ -737,6 +1850,36 @@ where
     let mut reader = crate::commit_graph::CommitGraphContext::new().reader(read);
     let head_commit_id =
         crate::changelog::CommitId::parse_lix(head_commit_id, "commit graph benchmark head")?;
+    if let Some((max_depth, limit)) = match mode {
+        CommitGraphBenchMode::HistoryFull => Some((None, None)),
+        CommitGraphBenchMode::HistoryDepth0 => Some((Some(0), None)),
+        CommitGraphBenchMode::HistoryLimit10 => {
+            Some((None, Some(COMMIT_GRAPH_BENCH_HISTORY_LIMIT)))
+        }
+        _ => None,
+    } {
+        let history = reader
+            .change_history_from_commit(
+                &head_commit_id,
+                &crate::commit_graph::CommitGraphChangeHistoryRequest {
+                    row_pks: Vec::new(),
+                    schema_keys: vec![COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY.to_string()],
+                    file_ids: Vec::new(),
+                    min_depth: None,
+                    max_depth,
+                    include_tombstones: true,
+                    limit,
+                },
+            )
+            .await?;
+        let entries = history.entries.len();
+        std::hint::black_box(history);
+        return Ok(CommitGraphBenchResult {
+            nodes: 0,
+            edges: 0,
+            member_changes: entries,
+        });
+    }
     let nodes = match mode {
         CommitGraphBenchMode::AllNodes | CommitGraphBenchMode::LegacyAllNodes => {
             reader.all_nodes().await?
@@ -747,6 +1890,9 @@ where
             .iter()
             .map(|reachable| reachable.commit.clone())
             .collect(),
+        CommitGraphBenchMode::HistoryFull
+        | CommitGraphBenchMode::HistoryDepth0
+        | CommitGraphBenchMode::HistoryLimit10 => unreachable!("history modes returned above"),
     };
     let node_count = nodes.len();
     let edges = crate::commit_graph::commit_edges(&nodes).len();
@@ -816,7 +1962,7 @@ where
             commit_id,
             "commit graph benchmark member commit",
         )?;
-        let entity_pk = crate::entity_pk::EntityPk::single(format!("bench-member-{index:08}"));
+        let row_pk = crate::row_pk::RowPk::single(format!("bench-member-{index:08}"));
         let snapshot = crate::json_store::JsonSlot::from_json(&format!(
             "{{\"index\":{index},\"payload\":\"{}\"}}",
             "x".repeat(192)
@@ -825,9 +1971,9 @@ where
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
                 delta: crate::tracked_state::TrackedStateDeltaRef {
-                    schema_key: "commit_graph_bench_member",
+                    schema_key: COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY,
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: crate::changelog::ChangeId::for_test_label(&format!(
                         "commit-graph-bench-member-{index}"
                     )),
@@ -867,7 +2013,6 @@ pub struct RepositoryGcBenchResult {
     pub deleted_mutation_inventories: usize,
     pub deleted_semantic_commit_projections: usize,
     pub deleted_semantic_change_rows: usize,
-    pub deleted_semantic_reverse_index_rows: usize,
     pub staged_written_bytes: u64,
     pub delete_descriptors: usize,
     pub delete_descriptor_capacity: usize,
@@ -876,6 +2021,7 @@ pub struct RepositoryGcBenchResult {
     pub key_shared_buffers: usize,
     pub key_shared_bytes: usize,
     pub key_shared_capacity: usize,
+    pub reclaimed_generation_rows: u64,
     pub root_discovery_us: u64,
     pub changelog_us: u64,
     pub tracked_root_stage_us: u64,
@@ -1088,8 +2234,6 @@ where
     );
     let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id.0);
     let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
-    let deleted_semantic_reverse_index_rows =
-        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
         swept_commits: plan
@@ -1118,7 +2262,6 @@ where
         deleted_mutation_inventories,
         deleted_semantic_commit_projections,
         deleted_semantic_change_rows,
-        deleted_semantic_reverse_index_rows,
         staged_written_bytes: stats.written_bytes,
         delete_descriptors: arena.delete_descriptors,
         delete_descriptor_capacity: arena.delete_descriptor_capacity,
@@ -1127,6 +2270,7 @@ where
         key_shared_buffers: arena.key_shared_buffers,
         key_shared_bytes: arena.key_shared_bytes,
         key_shared_capacity: arena.key_shared_capacity,
+        reclaimed_generation_rows: plan.sweep.reclaimed_generation_rows,
         root_discovery_us: plan.profile.root_discovery_us,
         changelog_us: plan.profile.changelog_us,
         tracked_root_stage_us: plan.profile.tracked_root_stage_us,
@@ -1138,10 +2282,10 @@ where
 pub struct RepositoryGcCommitBenchResult {
     pub staged_deletes: u64,
     pub swept_commits: usize,
+    pub reclaimed_generation_rows: u64,
     pub reclaimed_manifest_rows: usize,
     pub reclaimed_manifest_chunk_rows: usize,
     pub reclaimed_chunk_rows: usize,
-    pub reclaimed_chunk_bytes: u64,
     pub plan_us: u64,
     pub commit_us: u64,
 }
@@ -1190,6 +2334,7 @@ where
             Ok(_) => {
                 return Ok(RepositoryGcCommitBenchResult {
                     staged_deletes: stats.staged_deletes,
+                    reclaimed_generation_rows: plan.sweep.reclaimed_generation_rows,
                     swept_commits: plan
                         .changelog
                         .sweep
@@ -1199,7 +2344,6 @@ where
                     reclaimed_manifest_rows: binary_cas.reclaimed_manifest_rows,
                     reclaimed_manifest_chunk_rows: binary_cas.reclaimed_manifest_chunk_rows,
                     reclaimed_chunk_rows: binary_cas.reclaimed_chunk_rows,
-                    reclaimed_chunk_bytes: binary_cas.reclaimed_chunk_bytes,
                     plan_us,
                     commit_us: commit_started.elapsed().as_micros() as u64,
                 });
@@ -1657,6 +2801,252 @@ where
     accounting
 }
 
+/// Exact value-level duplication for one storage space.
+///
+/// `duplicate_value_bytes` is what a perfect content-addressed store would not
+/// have had to write: for every distinct value byte string that occurs `n`
+/// times, `(n - 1) * len`. It is an upper bound on the win from content
+/// addressing that plane, because it ignores whatever indirection a real
+/// content-addressed layout would have to add.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageValueDuplication {
+    pub space_id: u32,
+    pub space: &'static str,
+    pub rows: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+    /// Distinct value byte strings in the space.
+    pub distinct_values: u64,
+    /// Rows whose value byte string also occurs on at least one other row.
+    pub duplicate_rows: u64,
+    pub duplicate_value_bytes: u64,
+    /// Largest number of rows sharing one value byte string.
+    pub max_occurrences: u64,
+}
+
+impl StorageValueDuplication {
+    /// Share of the space's value bytes a perfect CAS would have elided.
+    pub fn duplicate_fraction(&self) -> f64 {
+        if self.value_bytes == 0 {
+            0.0
+        } else {
+            self.duplicate_value_bytes as f64 / self.value_bytes as f64
+        }
+    }
+}
+
+/// Byte-exact duplication for every native storage space.
+pub async fn space_value_duplication<R>(read: &R) -> Vec<StorageValueDuplication>
+where
+    R: StorageAdapterRead,
+{
+    let mut accounting = Vec::with_capacity(native_storage_spaces().len());
+    for space in native_storage_spaces() {
+        accounting.push(scan_space_value_duplication(read, *space).await);
+    }
+    accounting
+}
+
+async fn scan_space_value_duplication<R>(
+    read: &R,
+    space: crate::storage_adapter::StorageSpace,
+) -> StorageValueDuplication
+where
+    R: StorageAdapterRead,
+{
+    let mut accounting = StorageValueDuplication {
+        space_id: space.id.0,
+        space: space.name,
+        ..StorageValueDuplication::default()
+    };
+    let mut occurrences = std::collections::HashMap::<[u8; 32], (u64, u64)>::new();
+    for entry in scan_layout_entries(read, space).await {
+        accounting.rows += 1;
+        accounting.key_bytes += entry.key.0.len() as u64 + 4;
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            continue;
+        };
+        accounting.value_bytes += value.len() as u64;
+        let digest = *blake3::hash(&value).as_bytes();
+        let slot = occurrences.entry(digest).or_insert((0, value.len() as u64));
+        slot.0 += 1;
+    }
+    accounting.distinct_values = occurrences.len() as u64;
+    for (count, len) in occurrences.into_values() {
+        accounting.max_occurrences = accounting.max_occurrences.max(count);
+        if count > 1 {
+            accounting.duplicate_rows += count - 1;
+            accounting.duplicate_value_bytes += (count - 1) * len;
+        }
+    }
+    accounting
+}
+
+/// Nearest-neighbour analysis of the commit-delta segment plane.
+///
+/// Byte-exact duplication answers "would a naive CAS dedup this". This answers
+/// the follow-up: when two segments are *not* byte-identical, how far apart are
+/// they? Two equal-length segments differing in a handful of bytes mean the
+/// payload carries per-commit identity (commit id, timestamps) that a redesign
+/// could hoist out; two segments differing in most of their bytes mean the
+/// content genuinely differs and no format change would help.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitDeltaSegmentSimilarity {
+    pub segments: u64,
+    pub distinct_values: u64,
+    /// Distinct values that share their byte length with another distinct value.
+    pub same_length_distinct_values: u64,
+    /// Compared pairs of equal-length distinct values.
+    pub compared_pairs: u64,
+    /// Pairs differing in at most 1% of their bytes.
+    pub near_identical_pairs: u64,
+    /// Smallest positive byte-difference count over all compared pairs.
+    pub min_differing_bytes: u64,
+    /// Byte length of the pair that produced `min_differing_bytes`.
+    pub min_differing_pair_len: u64,
+    /// Shared leading bytes of the pair that produced `min_differing_bytes`.
+    pub min_differing_pair_common_prefix: u64,
+    /// Shared trailing bytes of the same pair. A long shared suffix next to a
+    /// short shared prefix is the signature of a small identity header in front
+    /// of otherwise identical content.
+    pub min_differing_pair_common_suffix: u64,
+    /// Whether any pair was compared at all.
+    pub compared_any: bool,
+    /// Segments that a content-addressed plane could have elided *if* the
+    /// format also hoisted per-commit identity out of the payload. Two segments
+    /// count as content-equal when they share a byte length and their differing
+    /// bytes all fall inside one window of at most
+    /// `SEGMENT_IDENTITY_WINDOW_BYTES`.
+    pub identity_normalized_duplicate_segments: u64,
+    pub identity_normalized_duplicate_bytes: u64,
+    /// Content-equivalence classes with more than one member.
+    pub identity_normalized_shared_classes: u64,
+}
+
+/// Cap on distinct same-length values compared pairwise per length bucket.
+const SEGMENT_SIMILARITY_BUCKET_CAP: usize = 128;
+/// How much per-segment identity a redesigned payload is allowed to hoist out.
+/// The LXCD16 direct leaf carries a 16-byte commit id, a 4-byte packed base and
+/// a small timestamp-tail dictionary; 128 bytes is a generous allowance for all
+/// of it, so this over-counts rather than under-counts the achievable win.
+const SEGMENT_IDENTITY_WINDOW_BYTES: usize = 128;
+
+pub async fn commit_delta_segment_similarity<R>(read: &R) -> CommitDeltaSegmentSimilarity
+where
+    R: StorageAdapterRead,
+{
+    let mut distinct = std::collections::HashMap::<[u8; 32], (Bytes, u64)>::new();
+    let mut segments = 0u64;
+    for entry in scan_layout_entries(
+        read,
+        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    )
+    .await
+    {
+        segments += 1;
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            continue;
+        };
+        let slot = distinct
+            .entry(*blake3::hash(&value).as_bytes())
+            .or_insert((value, 0));
+        slot.1 += 1;
+    }
+
+    let mut buckets = std::collections::BTreeMap::<usize, Vec<(Bytes, u64)>>::new();
+    for (value, occurrences) in distinct.into_values() {
+        buckets
+            .entry(value.len())
+            .or_default()
+            .push((value, occurrences));
+    }
+
+    let mut similarity = CommitDeltaSegmentSimilarity {
+        segments,
+        min_differing_bytes: u64::MAX,
+        ..CommitDeltaSegmentSimilarity::default()
+    };
+    for values in buckets.values() {
+        similarity.distinct_values += values.len() as u64;
+        if values.len() < 2 {
+            continue;
+        }
+        similarity.same_length_distinct_values += values.len() as u64;
+        let window = &values[..values.len().min(SEGMENT_SIMILARITY_BUCKET_CAP)];
+        // Union-find over "content-equal once identity is hoisted out".
+        let mut class = (0..window.len()).collect::<Vec<_>>();
+        for (index, (left, _)) in window.iter().enumerate() {
+            for (offset, (right, _)) in window[index + 1..].iter().enumerate() {
+                let differing = left
+                    .iter()
+                    .zip(right.iter())
+                    .filter(|(left, right)| left != right)
+                    .count() as u64;
+                similarity.compared_pairs += 1;
+                similarity.compared_any = true;
+                if differing * 100 <= left.len() as u64 {
+                    similarity.near_identical_pairs += 1;
+                }
+                let common_prefix = left
+                    .iter()
+                    .zip(right.iter())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                let common_suffix = left
+                    .iter()
+                    .rev()
+                    .zip(right.iter().rev())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                if differing > 0
+                    && common_prefix + common_suffix + SEGMENT_IDENTITY_WINDOW_BYTES >= left.len()
+                {
+                    union(&mut class, index, index + 1 + offset);
+                }
+                if differing < similarity.min_differing_bytes {
+                    similarity.min_differing_bytes = differing;
+                    similarity.min_differing_pair_len = left.len() as u64;
+                    similarity.min_differing_pair_common_prefix = common_prefix as u64;
+                    similarity.min_differing_pair_common_suffix = common_suffix as u64;
+                }
+            }
+        }
+        let mut members = std::collections::BTreeMap::<usize, (u64, u64)>::new();
+        for (index, (value, occurrences)) in window.iter().enumerate() {
+            let root = find(&mut class, index);
+            let slot = members.entry(root).or_insert((0, value.len() as u64));
+            slot.0 += occurrences;
+        }
+        for (occurrences, len) in members.into_values() {
+            if occurrences > 1 {
+                similarity.identity_normalized_shared_classes += 1;
+                similarity.identity_normalized_duplicate_segments += occurrences - 1;
+                similarity.identity_normalized_duplicate_bytes += (occurrences - 1) * len;
+            }
+        }
+    }
+    if !similarity.compared_any {
+        similarity.min_differing_bytes = 0;
+    }
+    similarity
+}
+
+fn find(class: &mut [usize], mut index: usize) -> usize {
+    while class[index] != index {
+        class[index] = class[class[index]];
+        index = class[index];
+    }
+    index
+}
+
+fn union(class: &mut [usize], left: usize, right: usize) {
+    let left = find(class, left);
+    let right = find(class, right);
+    if left != right {
+        class[right] = left;
+    }
+}
+
 pub async fn binary_manifest_layout_accounting<R>(
     read: &R,
 ) -> Result<BinaryManifestLayoutAccounting, crate::LixError>
@@ -1755,16 +3145,16 @@ pub async fn current_image_cas_oracle_accounting<R>(
 where
     R: StorageAdapterRead,
 {
-    use crate::live_state::LiveStateScanRequest;
+    use crate::hot_state::HotStateScanRequest;
 
-    let live_state = crate::live_state::LiveStateContext::new(
+    let hot_state = crate::hot_state::HotStateContext::new(
         crate::tracked_state::TrackedStateContext::new(),
         crate::commit_graph::CommitGraphContext::new(),
     );
-    let current_rows = live_state
+    let current_rows = hot_state
         .reader(read)
-        .scan_batch(&LiveStateScanRequest {
-            filter: crate::live_state::LiveStateFilter {
+        .scan_batch(&HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
                 schema_keys: vec!["lix_binary_blob_ref".to_owned()],
                 ..Default::default()
             },
@@ -2170,6 +3560,37 @@ fn collect_binary_cas_json_owners(
     }
 }
 
+/// One registered storage space, looked up by its registry name.
+///
+/// Tools that issue their own point reads need the physical space without
+/// re-declaring its id, which would be a second authority for the registry.
+#[must_use]
+pub fn storage_space_by_name(space_name: &str) -> crate::storage_adapter::StorageSpace {
+    *native_storage_spaces()
+        .iter()
+        .find(|space| space.name == space_name)
+        .expect("space name should exist")
+}
+
+/// The registered space for one physical space id, value semantics included.
+///
+/// Benchmarks and qualification harnesses that already hold an id must read
+/// their space here rather than re-declaring it with
+/// `StorageSpace::mutable`/`::immutable`. A space id has exactly one value
+/// semantics, and both adapters place data by that declaration — RocksDB by
+/// column family, SlateDB by LSM value versus object segment — so a harness
+/// that guesses the semantics scans a different physical location than the
+/// engine wrote. That is not hypothetical: `large_blob_updates` guessed
+/// `immutable` for `binary_cas.chunk` and handed a raw payload to the
+/// immutable-locator decoder, which reported it as data corruption.
+#[must_use]
+pub fn storage_space_by_id(space_id: u32) -> crate::storage_adapter::StorageSpace {
+    *native_storage_spaces()
+        .iter()
+        .find(|space| space.id.0 == space_id)
+        .unwrap_or_else(|| panic!("storage space id 0x{space_id:08x} is not registered"))
+}
+
 /// Per-row (key, value bytes) inventory of one space.
 ///
 /// Equivalence tests compare these inventories byte-for-byte, so the scan
@@ -2178,10 +3599,7 @@ pub async fn space_inventory<R>(read: &R, space_name: &str) -> Vec<(Vec<u8>, Vec
 where
     R: StorageAdapterRead,
 {
-    let space = *native_storage_spaces()
-        .iter()
-        .find(|space| space.name == space_name)
-        .expect("space name should exist");
+    let space = storage_space_by_name(space_name);
     scan_layout_entries(read, space)
         .await
         .iter()
@@ -2208,41 +3626,106 @@ pub fn layout_space_catalog() -> Vec<(u32, &'static str)> {
         .collect()
 }
 
+/// Every registered storage space, in physical key order.
+///
+/// Layout accounting derives from the one registry so a newly added space
+/// appears in every layout report without a second list to maintain.
 fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
-    &[
-        crate::init::REPOSITORY_PROTOCOL_SPACE,
-        crate::branch::BRANCH_HEAD_CONTROL_SPACE,
-        crate::live_state::HOT_ROW_SPACE,
-        crate::live_state::HOT_FILE_SPACE,
-        crate::live_state::HOT_DIFF_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_SPACE,
-        crate::live_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        crate::live_state::ROOT_CURRENT_BASE_SPACE,
-        crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
-        crate::transaction::plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE,
-        crate::json_store::store::JSON_SPACE,
-        crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-        crate::gc::GC_TREE_SWEEP_EPOCH_SPACE,
-        crate::gc::GC_TREE_SWEEP_MARK_SPACE,
-        crate::gc::GC_TREE_SWEEP_CURSOR_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
-        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-        crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
-        crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
-        crate::changelog::COMMIT_SPACE,
-        crate::changelog::CHANGE_SPACE,
-        crate::changelog::COMMIT_CHANGE_ID_SPACE,
-    ]
+    crate::storage_spaces::ALL_STORAGE_SPACES
+}
+
+/// How a storage space derives its key from the bytes it stores.
+///
+/// Content addressing is what makes identical payloads cost one row instead
+/// of many. The rule is stated once here so an audit can prove the invariant
+/// rather than assume it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentAddressRule {
+    /// The key carries an identity (commit id, row path, ordinal) that is
+    /// independent of the value bytes. Equal payloads under distinct keys are
+    /// stored twice by construction.
+    NotContentAddressed,
+    /// `key == blake3(value)`.
+    Blake3Value,
+    /// `key == blake3::derive_key(context, value)`.
+    Blake3KeyedValue(&'static str),
+    /// `key == blake3(chunk payload)` after the stored chunk envelope is
+    /// decoded.
+    BinaryCasChunkPayload,
+    /// `key == blake3(json text)` after the stored JSON envelope is decoded.
+    JsonStorePayload,
+    /// The key is a content address, but its payload lives in another space:
+    /// this space stores keys only. Nothing here can be verified against the
+    /// row's own (empty) value.
+    ContentAddressedKeyOnlyMirror,
+}
+
+/// The content-address rule for one physical space id.
+#[must_use]
+pub fn content_address_rule(space_id: u32) -> ContentAddressRule {
+    match space_id {
+        // tracked_state.tree_chunk
+        0x0004_0001 => ContentAddressRule::Blake3Value,
+        // tracked_state.commit_mutation_directory_node.v1
+        0x0004_002d => {
+            ContentAddressRule::Blake3KeyedValue("lix commit mutation directory node v1")
+        }
+        // tracked_state.current_state_data_part.v1
+        0x0004_002f => {
+            ContentAddressRule::Blake3KeyedValue("lix native current-state data part v1")
+        }
+        // tracked_state.current_state_data_part_refs.v1
+        0x0004_0030 => {
+            ContentAddressRule::Blake3KeyedValue("lix native current-state data part refs v1")
+        }
+        // tracked_state.scoped_range.v3
+        0x0004_0032 => {
+            ContentAddressRule::Blake3KeyedValue("lix scoped current-state range node v3")
+        }
+        // binary_cas.chunk
+        0x0005_0003 => ContentAddressRule::BinaryCasChunkPayload,
+        // json_store.json
+        0x0002_0001 => ContentAddressRule::JsonStorePayload,
+        // binary_cas.chunk_presence
+        0x0005_0004 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
+        _ => ContentAddressRule::NotContentAddressed,
+    }
+}
+
+/// Recomputes the content address one row *should* have from the bytes it
+/// stores.
+///
+/// `Ok(None)` means the space is not content-addressed (or stores keys only),
+/// so there is nothing to check. `Ok(Some(digest))` must equal the row key.
+pub fn recompute_content_address(
+    space_id: u32,
+    value: &[u8],
+) -> Result<Option<[u8; 32]>, crate::LixError> {
+    Ok(match content_address_rule(space_id) {
+        ContentAddressRule::NotContentAddressed
+        | ContentAddressRule::ContentAddressedKeyOnlyMirror => None,
+        ContentAddressRule::Blake3Value => Some(*blake3::hash(value).as_bytes()),
+        ContentAddressRule::Blake3KeyedValue(context) => Some(
+            *blake3::Hasher::new_derive_key(context)
+                .update(value)
+                .finalize()
+                .as_bytes(),
+        ),
+        ContentAddressRule::BinaryCasChunkPayload => {
+            let (_codec, _len, payload) = crate::binary_cas::decode_binary_cas_chunk(value)?;
+            Some(*blake3::hash(payload).as_bytes())
+        }
+        ContentAddressRule::JsonStorePayload => {
+            let json = crate::json_store::store::decode_stored_json(value)?;
+            Some(*blake3::hash(&json).as_bytes())
+        }
+    })
+}
+
+/// Decodes one `binary_cas.manifest_chunk` row into the chunk it references
+/// and that chunk's logical size.
+pub fn decode_binary_cas_chunk_reference(value: &[u8]) -> Result<([u8; 32], u64), crate::LixError> {
+    crate::binary_cas::decode_binary_cas_manifest_chunk(value)
 }
 
 async fn scan_layout_space<R>(
@@ -2276,12 +3759,12 @@ where
         .await
         .expect("begin storage bench layout scan");
     loop {
-        let result = cursor
+        let (result, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan complete storage bench layout space");
-        let has_more = result.has_more;
-        for entry in result.entries {
+            .expect("scan complete storage bench layout space")
+            .into_parts();
+        for entry in result {
             accounting.rows = accounting
                 .rows
                 .checked_add(1)
@@ -2329,15 +3812,130 @@ where
         .await
         .expect("begin storage bench layout scan");
     loop {
-        let result = cursor
+        let (result, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan complete storage bench layout space");
-        let has_more = result.has_more;
-        entries.extend(result.entries);
+            .expect("scan complete storage bench layout space")
+            .into_parts();
+        entries.extend(result);
         if !has_more {
             return entries;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E42 probe — commit-delta decode census, attributed by write-path phase.
+//
+// Answers, deterministically and in one rep: does a single-row UPDATE reach
+// through the packed commit-delta indirection to locate the row it is
+// updating, or does it read the hot row? The phase is a process-global
+// marker rather than a thread-local because the profile harness runs exactly
+// one statement at a time under `block_on`; guards nest and restore.
+// ---------------------------------------------------------------------------
+
+pub const CRUD_PHASE_OTHER: usize = 0;
+/// The write-side read: `scan_row_candidates*` locating the target row.
+pub const CRUD_PHASE_WRITE_READ: usize = 1;
+/// `Transaction::commit_prepared` — publication of the new write set.
+pub const CRUD_PHASE_COMMIT: usize = 2;
+pub const CRUD_PHASE_COUNT: usize = 3;
+
+static CRUD_PHASE: AtomicUsize = AtomicUsize::new(CRUD_PHASE_OTHER);
+static DELTA_LEAF_DECODES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_LEAF_DECODE_ROWS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_LEAF_DECODE_BYTES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ZSTD_CALLS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ZSTD_IN_BYTES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ZSTD_OUT_BYTES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ORDERED_LOADS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ENCODES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Restores the enclosing phase when dropped.
+#[derive(Debug)]
+pub struct CrudPhaseGuard(usize);
+
+impl Drop for CrudPhaseGuard {
+    fn drop(&mut self) {
+        CRUD_PHASE.store(self.0, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn enter_crud_phase(phase: usize) -> CrudPhaseGuard {
+    CrudPhaseGuard(CRUD_PHASE.swap(phase, Ordering::Relaxed))
+}
+
+fn crud_phase() -> usize {
+    let phase = CRUD_PHASE.load(Ordering::Relaxed);
+    if phase < CRUD_PHASE_COUNT {
+        phase
+    } else {
+        CRUD_PHASE_OTHER
+    }
+}
+
+pub(crate) fn record_commit_delta_leaf_decode(rows: usize, segment_bytes: usize) {
+    let phase = crud_phase();
+    DELTA_LEAF_DECODES[phase].fetch_add(1, Ordering::Relaxed);
+    DELTA_LEAF_DECODE_ROWS[phase].fetch_add(rows as u64, Ordering::Relaxed);
+    DELTA_LEAF_DECODE_BYTES[phase].fetch_add(segment_bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_sidecar_zstd(compressed: usize, uncompressed: usize) {
+    let phase = crud_phase();
+    DELTA_ZSTD_CALLS[phase].fetch_add(1, Ordering::Relaxed);
+    DELTA_ZSTD_IN_BYTES[phase].fetch_add(compressed as u64, Ordering::Relaxed);
+    DELTA_ZSTD_OUT_BYTES[phase].fetch_add(uncompressed as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_ordered_load(keys: usize) {
+    let phase = crud_phase();
+    DELTA_ORDERED_LOADS[phase].fetch_add(keys.max(1) as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_encode() {
+    DELTA_ENCODES[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitDeltaPhaseCensus {
+    pub leaf_decodes: u64,
+    pub leaf_decode_rows: u64,
+    pub leaf_decode_bytes: u64,
+    pub zstd_calls: u64,
+    pub zstd_in_bytes: u64,
+    pub zstd_out_bytes: u64,
+    pub ordered_load_keys: u64,
+    pub encodes: u64,
+}
+
+/// Drains the census. Index with `CRUD_PHASE_*`.
+pub fn take_commit_delta_phase_census() -> [CommitDeltaPhaseCensus; CRUD_PHASE_COUNT] {
+    std::array::from_fn(|phase| CommitDeltaPhaseCensus {
+        leaf_decodes: DELTA_LEAF_DECODES[phase].swap(0, Ordering::Relaxed),
+        leaf_decode_rows: DELTA_LEAF_DECODE_ROWS[phase].swap(0, Ordering::Relaxed),
+        leaf_decode_bytes: DELTA_LEAF_DECODE_BYTES[phase].swap(0, Ordering::Relaxed),
+        zstd_calls: DELTA_ZSTD_CALLS[phase].swap(0, Ordering::Relaxed),
+        zstd_in_bytes: DELTA_ZSTD_IN_BYTES[phase].swap(0, Ordering::Relaxed),
+        zstd_out_bytes: DELTA_ZSTD_OUT_BYTES[phase].swap(0, Ordering::Relaxed),
+        ordered_load_keys: DELTA_ORDERED_LOADS[phase].swap(0, Ordering::Relaxed),
+        encodes: DELTA_ENCODES[phase].swap(0, Ordering::Relaxed),
+    })
+}
+
+pub fn crud_phase_name(phase: usize) -> &'static str {
+    match phase {
+        CRUD_PHASE_WRITE_READ => "write_read",
+        CRUD_PHASE_COMMIT => "commit_prepared",
+        _ => "other",
     }
 }
 
@@ -2473,23 +4071,21 @@ mod tests {
             .await
             .expect("open benchmark engine");
         let main = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("open benchmark main session");
         let schema = serde_json::json!({
-            "x-lix-key": "repository_gc_benchmark_fixture",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": "integer" }
-            },
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "repository_gc_benchmark_fixture",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "int8", "nullable": false },
+            ],
+            "primary_key": ["path"],
         });
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -2503,7 +4099,7 @@ mod tests {
             .await
             .expect("create benchmark branch");
         let branch_session = engine
-            .open_session(branch.id.clone())
+            .open_session_at(branch.id.clone())
             .await
             .expect("open benchmark branch session");
         for commit_index in 0..10 {
@@ -2568,20 +4164,31 @@ mod tests {
         .await;
 
         assert_eq!(first.swept_commits, 10);
-        assert_eq!(first.swept_standalone_changes, 10);
+        // Superseded branch-ref facts are no longer GC debt: each publication
+        // deletes the ref change its own control supersedes, and the branch
+        // deletion deletes the last one, all in the publishing write set.
+        assert_eq!(first.swept_standalone_changes, 0);
         assert_eq!(first.deleted_commit_state_manifests, 10);
         assert_eq!(first.deleted_mutation_inventories, 10);
         // The ten branch-only commits are reclaimable, while the branch base
         // remains the active main head and therefore keeps its semantic
         // projection in the authenticated serving-dependency closure.
         assert_eq!(first.deleted_semantic_commit_projections, 10);
-        // Each reclaimed projection owns one change fact and reverse-index
-        // row; the other ten change deletes are retired branch-ref facts.
-        assert_eq!(first.deleted_semantic_change_rows, 20);
-        assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
+        // Each reclaimed projection owns one change fact and reverse-index row.
+        assert_eq!(first.deleted_semantic_change_rows, 10);
+        // The stranded serving generation is gone too, but the branch deletion
+        // retired it rather than this sweep: a generation is reachable from
+        // exactly one branch control, so the write set that removes the control
+        // is the one that can prove nothing will read it again.
+        assert_eq!(first.reclaimed_generation_rows, 0);
         assert_eq!(
             first.delete_counts_by_space,
             vec![
+                (crate::hot_state::DIFF_SPACE.id.0, 100), // retired checkpoint working-diff rows
+                (
+                    crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE.id.0,
+                    1,
+                ), // retired checkpoint epoch marker
                 (
                     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
                         .id
@@ -2595,8 +4202,7 @@ mod tests {
                     10,
                 ), // mutation inventory authority
                 (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 20), // projection and branch-ref changes
-                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
+                (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
             ]
         );
         assert_eq!(
@@ -2608,12 +4214,32 @@ mod tests {
             first.staged_deletes
         );
         assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
-        // GC also stages the mandatory five-byte binary-CAS epoch key. Its
-        // put shares the key arena with the UUID-keyed delete descriptors.
+        // GC also stages the mandatory binary-CAS reclamation key. Its put
+        // shares the key arena with the UUID-keyed delete descriptors. Since the
+        // revision singletons were consolidated into one space, the reclamation
+        // token's *logical* key is a single byte (`b"b"`) and the 4-byte space
+        // id is prepended at the physical layer, so derive the width from the
+        // constant rather than restating it.
+        const FENCE_KEY_BYTES: usize =
+            crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
+        // Canonical-record deletes are UUID keyed. Checkpoint rotation also
+        // retires the fixture's fixed-width working-diff identities and the
+        // branch-ref marker through their authenticated physical encodings.
+        const UUID_KEY_BYTES: usize = 16;
+        const WORKING_DIFF_KEY_BYTES: usize = 121;
+        const WORKING_DIFF_MARKER_KEY_BYTES: usize = 37;
+        let working_diff_deletes = 100;
+        let marker_deletes = 1;
+        let uuid_deletes = first.staged_deletes as usize
+            - working_diff_deletes
+            - marker_deletes;
         assert_eq!(
             first.key_shared_bytes,
-            first.staged_deletes as usize * 16 + 5
+            uuid_deletes * UUID_KEY_BYTES
+                + working_diff_deletes * WORKING_DIFF_KEY_BYTES
+                + marker_deletes * WORKING_DIFF_MARKER_KEY_BYTES
+                + FENCE_KEY_BYTES
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);
@@ -2621,4 +4247,283 @@ mod tests {
         assert_eq!(before_layout, after_first_layout);
         assert_eq!(after_first_layout, after_second_layout);
     }
+}
+
+static HOT_SCAN_CALLS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_POINT_BATCH: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FILE_PREFIX: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FALLBACK: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FALLBACK_WITH_PKS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FALLBACK_DECODED: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FALLBACK_MATCHED: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FILE_MEMBER_GUARD_READS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+pub(crate) fn record_hot_scan_call() {
+    HOT_SCAN_CALLS[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_point_batch() {
+    HOT_SCAN_POINT_BATCH[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_file_prefix() {
+    HOT_SCAN_FILE_PREFIX[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// `has_row_pks` separates the two ways the primary-prefix arm is reached:
+/// a predicate that bound no identity at all, and a bound identity that the
+/// point-batch arm still refused (a schema with file-backed members).
+pub(crate) fn record_hot_scan_fallback(has_row_pks: bool) {
+    let phase = crud_phase();
+    HOT_SCAN_FALLBACK[phase].fetch_add(1, Ordering::Relaxed);
+    if has_row_pks {
+        HOT_SCAN_FALLBACK_WITH_PKS[phase].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One `FILE_SPACE` point read issued by the point-batch arm's guard, which
+/// asks whether this schema has any file-backed member before it is willing to
+/// serve the scan from a null-file point batch. The guard is uncached, so this
+/// counts once per scan, not once per schema.
+pub(crate) fn record_hot_scan_file_member_guard_read() {
+    HOT_SCAN_FILE_MEMBER_GUARD_READS[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_fallback_entry(matched: bool) {
+    let phase = crud_phase();
+    HOT_SCAN_FALLBACK_DECODED[phase].fetch_add(1, Ordering::Relaxed);
+    if matched {
+        HOT_SCAN_FALLBACK_MATCHED[phase].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Route accounting for every `hot_scan_entries` call, attributed to the CRUD
+/// phase that issued it. Index with `CRUD_PHASE_*`; `CRUD_PHASE_WRITE_READ`
+/// isolates the write path's pre-image read.
+///
+/// `fallback_entries_decoded` is counted INSIDE the per-entry decode loop,
+/// before `identity.matches_filter` rejects anything. A count taken above that
+/// loop -- at `scan_batch`'s return value -- is post-filter and reads
+/// identically under a seek and under a full-prefix walk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotScanRouteCensus {
+    pub calls: u64,
+    pub point_batch: u64,
+    pub file_prefix: u64,
+    pub fallback: u64,
+    pub fallback_with_row_pks: u64,
+    pub fallback_entries_decoded: u64,
+    pub fallback_entries_matched: u64,
+    /// `FILE_SPACE` point reads issued by the point-batch arm's guard.
+    pub file_member_guard_reads: u64,
+}
+
+/// Drains the census. Index with `CRUD_PHASE_*`.
+pub fn take_hot_scan_route_census() -> [HotScanRouteCensus; CRUD_PHASE_COUNT] {
+    std::array::from_fn(|phase| HotScanRouteCensus {
+        calls: HOT_SCAN_CALLS[phase].swap(0, Ordering::Relaxed),
+        point_batch: HOT_SCAN_POINT_BATCH[phase].swap(0, Ordering::Relaxed),
+        file_prefix: HOT_SCAN_FILE_PREFIX[phase].swap(0, Ordering::Relaxed),
+        fallback: HOT_SCAN_FALLBACK[phase].swap(0, Ordering::Relaxed),
+        fallback_with_row_pks: HOT_SCAN_FALLBACK_WITH_PKS[phase].swap(0, Ordering::Relaxed),
+        fallback_entries_decoded: HOT_SCAN_FALLBACK_DECODED[phase].swap(0, Ordering::Relaxed),
+        fallback_entries_matched: HOT_SCAN_FALLBACK_MATCHED[phase].swap(0, Ordering::Relaxed),
+        file_member_guard_reads: HOT_SCAN_FILE_MEMBER_GUARD_READS[phase]
+            .swap(0, Ordering::Relaxed),
+    })
+}
+
+static SCAN_KEY_BUFFER_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static SCAN_KEY_BUFFER_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Records one heap buffer allocated to hold scanned key bytes.
+///
+/// **Public because the storage adapters are separate crates.** A range
+/// adapter calls this once per buffer it allocates for scan keys — once per
+/// row if it copies each key into its own allocation, once per arena if it
+/// carves them out of a shared one. The counting rule is the same either way,
+/// which is what lets the two be compared.
+pub fn record_scan_key_buffer_allocation(bytes: usize) {
+    SCAN_KEY_BUFFER_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    SCAN_KEY_BUFFER_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// Heap buffers allocated for scanned key bytes, as `(allocations, bytes)`.
+///
+/// This is the count that distinguishes a per-row key copy from a page arena.
+/// The handle-clone census cannot see the difference: arena slicing does not
+/// change how many times a key is cloned, only what each clone costs — a plain
+/// refcount increment instead of promoting a `Vec`-backed buffer into a
+/// freshly allocated control block.
+pub fn take_scan_key_buffer_census() -> (u64, u64) {
+    (
+        SCAN_KEY_BUFFER_ALLOCATIONS.swap(0, Ordering::Relaxed),
+        SCAN_KEY_BUFFER_BYTES.swap(0, Ordering::Relaxed),
+    )
+}
+
+static HOT_SCAN_ROWS_DECODED: AtomicU64 = AtomicU64::new(0);
+static HOT_SCAN_KEY_HANDLE_CLONES: AtomicU64 = AtomicU64::new(0);
+static HOT_SCAN_VALUE_HANDLE_CLONES: AtomicU64 = AtomicU64::new(0);
+static HOT_SCAN_ROW_HANDLE_CLONES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_scan_row_decoded() {
+    HOT_SCAN_ROWS_DECODED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_key_handle_clone() {
+    HOT_SCAN_KEY_HANDLE_CLONES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_value_handle_clone() {
+    HOT_SCAN_VALUE_HANDLE_CLONES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_row_handle_clones(count: usize) {
+    if count != 0 {
+        HOT_SCAN_ROW_HANDLE_CLONES.fetch_add(count as u64, Ordering::Relaxed);
+    }
+}
+
+/// Refcounted-buffer handle clones on the HOT scan read path, as
+/// `(rows_decoded, key_handle_clones, value_handle_clones, row_handle_clones)`.
+///
+/// **A count, not a rate.** Nanoseconds per row only travel within a host
+/// class; this number is identical on every machine, so it is the portable
+/// half of any "we stopped cloning" claim.
+///
+/// Every counter sits on the clone expression itself rather than on the
+/// function that contains it, so a site that stops cloning stops counting and
+/// a site that is merely renamed keeps counting. The buckets are:
+///
+/// * `rows_decoded` — one per HOT scan row key decoded. The denominator.
+/// * `key_handle_clones` — handles duplicated onto a row's own **physical
+///   key** buffer while decoding it (one per string or bytes primary-key
+///   component).
+/// * `value_handle_clones` — handles duplicated onto a row's **head value**
+///   buffer while materializing inline JSON.
+/// * `row_handle_clones` — handles duplicated while building or rebuilding a
+///   materialized batch (`push_ref`, `push_materialized_ref`). A batch
+///   rebuilt row by row pays these; a batch compacted in place does not.
+///
+/// These are process-global. Read them from a dedicated `[[test]]` target, or
+/// swap them immediately before the measured statement.
+pub fn take_hot_scan_refcount_census() -> (u64, u64, u64, u64) {
+    (
+        HOT_SCAN_ROWS_DECODED.swap(0, Ordering::Relaxed),
+        HOT_SCAN_KEY_HANDLE_CLONES.swap(0, Ordering::Relaxed),
+        HOT_SCAN_VALUE_HANDLE_CLONES.swap(0, Ordering::Relaxed),
+        HOT_SCAN_ROW_HANDLE_CLONES.swap(0, Ordering::Relaxed),
+    )
+}
+
+static HOT_BLOB_REF_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_POINT_BATCH: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_FILE_PREFIX: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_ENTRIES_DECODED: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_ENTRIES_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_blob_ref_scan_call() {
+    HOT_BLOB_REF_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_point_batch() {
+    HOT_BLOB_REF_SCAN_POINT_BATCH.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_file_prefix() {
+    HOT_BLOB_REF_SCAN_FILE_PREFIX.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_fallback() {
+    HOT_BLOB_REF_SCAN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_entry(matched: bool) {
+    HOT_BLOB_REF_SCAN_ENTRIES_DECODED.fetch_add(1, Ordering::Relaxed);
+    if matched {
+        HOT_BLOB_REF_SCAN_ENTRIES_MATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Accounting for the single-row `lix_binary_blob_ref` probe every
+/// `lix_file` content update issues:
+/// `(calls, point_batch, file_prefix, fallback, entries_decoded, entries_matched)`.
+///
+/// Counted INSIDE `hot_scan_entries`, at the iterator loop that decodes each
+/// storage key — not at `scan_batch`'s return value. Those are different
+/// numbers: `hot_scan_entries` applies `identity.matches_filter` in memory
+/// before returning, so a count taken above it reports the surviving rows and
+/// cannot distinguish a seek from a full-prefix walk. The three route counters
+/// exist so that a zero is readable as "this arm did not run" rather than as
+/// "the counter never ran".
+pub fn take_hot_blob_ref_scan_accounting() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        HOT_BLOB_REF_SCAN_CALLS.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_POINT_BATCH.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_FILE_PREFIX.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_FALLBACK.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_ENTRIES_DECODED.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_ENTRIES_MATCHED.swap(0, Ordering::Relaxed),
+    )
+}
+
+static FILE_LIVE_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_POINT_BATCH: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_FILE_PREFIX: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_ENTRIES_DECODED: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_ENTRIES_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_file_live_scan_call() {
+    FILE_LIVE_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_file_live_scan_point_batch() {
+    FILE_LIVE_SCAN_POINT_BATCH.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_file_live_scan_file_prefix() {
+    FILE_LIVE_SCAN_FILE_PREFIX.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_file_live_scan_fallback() {
+    FILE_LIVE_SCAN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_file_live_scan_entry(matched: bool) {
+    FILE_LIVE_SCAN_ENTRIES_DECODED.fetch_add(1, Ordering::Relaxed);
+    if matched {
+        FILE_LIVE_SCAN_ENTRIES_MATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Accounting for the two-schema `scan_lix_file_live_batch` read that every
+/// `lix_file ... RETURNING` statement issues:
+/// `(calls, point_batch, file_prefix, fallback, entries_decoded, entries_matched)`.
+///
+/// The engagement gate is the request's schema-key pair, which is identical in
+/// both arms, so a zero reads as "this route did not run" and never as "the
+/// counter did not run". Entries are counted at BOTH per-entry decode loops --
+/// the wide arm's in `hot_scan_entries` and the prefix arm's in
+/// `scan_hot_file_entries` -- because counting only the wide arm would make a
+/// seek indistinguishable from a census that never fired.
+pub fn take_file_live_scan_accounting() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        FILE_LIVE_SCAN_CALLS.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_POINT_BATCH.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_FILE_PREFIX.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_FALLBACK.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_ENTRIES_DECODED.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_ENTRIES_MATCHED.swap(0, Ordering::Relaxed),
+    )
 }

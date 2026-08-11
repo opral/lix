@@ -113,6 +113,16 @@ pub trait StorageWrite: Send {
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
+    /// Applies the write transaction atomically and acknowledges it.
+    ///
+    /// Atomicity is required: either every staged mutation becomes visible or
+    /// none does, and no reader may observe a partial write set.
+    ///
+    /// **What the acknowledgement means on disk is the adapter's choice**, and
+    /// it differs between shipping adapters — see `WriteOptions::await_durable`
+    /// for the measured behaviour of each with and without the flag. Returning
+    /// `Ok` does not by itself imply the write survives a crash, and which
+    /// crash it survives is exactly what varies.
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send;
 
     fn rollback(self) -> impl Future<Output = Result<(), StorageError>> + Send;

@@ -1,0 +1,94 @@
+//! RocksDB storage implementation for the Lix engine storage API.
+
+mod rocksdb;
+
+pub use rocksdb::{RocksDB, RocksDBFactory, RocksDBFixture, RocksDBRead, RocksDBWrite};
+
+/// Counts of the block fetches RocksDB performed on the calling thread.
+///
+/// `block_cache_hits + block_reads` is the number of times the table reader had
+/// to fetch a block: on RocksDB a hit is a cache lookup and a read is a file
+/// read, but on a remote object-store LSM every one of these is a range GET.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockFetchCounters {
+    pub block_cache_hits: u64,
+    pub block_reads: u64,
+    pub block_read_bytes: u64,
+    pub user_key_comparisons: u64,
+    pub internal_keys_skipped: u64,
+}
+
+impl BlockFetchCounters {
+    #[must_use]
+    pub fn block_fetches(&self) -> u64 {
+        self.block_cache_hits + self.block_reads
+    }
+}
+
+/// A handle on the calling thread's RocksDB perf context.
+///
+/// RocksDB's perf context is thread-local and cumulative, so the caller must
+/// create, reset and read this on one thread. Drive the measurement on a
+/// `current_thread` runtime; a multi-thread runtime may resume the future on a
+/// different worker and read a context that never saw the work.
+pub struct PerfProbe {
+    context: ::rocksdb::perf::PerfContext,
+}
+
+// `rocksdb::perf::PerfContext` is a raw FFI handle and implements no traits, so
+// the workspace `missing_debug_implementations` lint needs this by hand. The
+// counters are the interesting state and they are read through `read()`.
+impl std::fmt::Debug for PerfProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PerfProbe")
+            .field("counters", &self.read())
+            .finish()
+    }
+}
+
+impl Default for PerfProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PerfProbe {
+    #[must_use]
+    pub fn new() -> Self {
+        ::rocksdb::perf::set_perf_stats(::rocksdb::perf::PerfStatsLevel::EnableCount);
+        Self {
+            context: ::rocksdb::perf::PerfContext::default(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.context.reset();
+    }
+
+    #[must_use]
+    pub fn read(&self) -> BlockFetchCounters {
+        use ::rocksdb::perf::PerfMetric;
+        BlockFetchCounters {
+            block_cache_hits: self.context.metric(PerfMetric::BlockCacheHitCount),
+            block_reads: self.context.metric(PerfMetric::BlockReadCount),
+            block_read_bytes: self.context.metric(PerfMetric::BlockReadByte),
+            user_key_comparisons: self.context.metric(PerfMetric::UserKeyComparisonCount),
+            internal_keys_skipped: self.context.metric(PerfMetric::InternalKeySkippedCount),
+        }
+    }
+}
+
+/// Whether this build records the scan key-buffer census.
+///
+/// **A census that is compiled out reports zero, and zero is exactly what a
+/// scan route that never ran reports.** This constant is what lets a test tell
+/// the two apart in its own failure message rather than sending the reader off
+/// to look for a routing bug that does not exist.
+///
+/// It exists because that already happened: a `git checkout` of
+/// `packages/e2e/Cargo.toml`, run to drop an unrelated bench overlay, reverted
+/// the `lix_storage_rocksdb/storage-benches` feature edge that lived in the
+/// same file, and the census went silent while every other counter kept
+/// working.
+pub const SCAN_KEY_BUFFER_CENSUS_ENABLED: bool = cfg!(feature = "storage-benches");

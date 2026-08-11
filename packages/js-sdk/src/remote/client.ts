@@ -31,14 +31,14 @@ import {
 	errorFromResponseBody,
 	protocolError,
 	record,
-	REMOTE_PROTOCOL_PATH,
+	SERVER_PROTOCOL_PATH,
 	remoteError,
-	type RemoteHandshakeRequest,
-	type RemoteObserveSubscription,
+	type ServerProtocolHandshakeRequest,
+	type ServerProtocolObserveSubscription,
 	type WireRequestBlobSplice,
 	type WireRequestValue,
 	type WireValue,
-} from "./protocol.js";
+} from "./server-protocol.js";
 import { readSseEvents } from "./sse.js";
 
 const OBSERVE_RETRY_BASE_MS = 100;
@@ -65,8 +65,7 @@ const MAX_COMPRESSION_SAMPLE_RATIO = 0.7;
 const MAX_COMPRESSED_BODY_RATIO = 0.9;
 
 type RemoteLixClientOptions = {
-	initialActiveBranchId?: RemoteHandshakeRequest["activeBranchId"];
-	initialActiveAccountId?: RemoteHandshakeRequest["activeAccountId"];
+	initialActiveBranchId?: ServerProtocolHandshakeRequest["activeBranchId"];
 };
 
 export async function openRemoteLixBinding(
@@ -83,7 +82,6 @@ class RemoteLixBinding implements LixBinding {
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
 	readonly #initialActiveBranchId: string | undefined;
-	readonly #initialActiveAccountId: string | undefined;
 	readonly #observationHub: RemoteObservationHub;
 	readonly #requestBlobBases = new Map<string, RequestBlobBase>();
 	#sessionId: string | undefined;
@@ -127,13 +125,6 @@ class RemoteLixBinding implements LixBinding {
 			throw new TypeError("initialActiveBranchId must be a non-empty string");
 		}
 		this.#initialActiveBranchId = clientOptions.initialActiveBranchId;
-		if (
-			clientOptions.initialActiveAccountId !== undefined &&
-			clientOptions.initialActiveAccountId.length === 0
-		) {
-			throw new TypeError("initialActiveAccountId must be a non-empty string");
-		}
-		this.#initialActiveAccountId = clientOptions.initialActiveAccountId;
 		this.#observationHub = new RemoteObservationHub({
 			openStream: (subscriptions, signal) =>
 				this.#requestObserveStream(subscriptions, signal),
@@ -146,9 +137,6 @@ class RemoteLixBinding implements LixBinding {
 		const query = new URLSearchParams();
 		if (this.#initialActiveBranchId !== undefined) {
 			query.set("activeBranchId", this.#initialActiveBranchId);
-		}
-		if (this.#initialActiveAccountId !== undefined) {
-			query.set("activeAccountId", this.#initialActiveAccountId);
 		}
 		const path = query.size === 0 ? "" : `?${query}`;
 		const handshake = decodeHandshake(
@@ -354,7 +342,9 @@ class RemoteLixBinding implements LixBinding {
 					await this.#requestJson("", { method: "GET" }),
 				);
 				if (handshake.sessionId !== this.#sessionId) {
-					throw protocolError("remote handshake changed sessionId");
+					throw protocolError(
+						"Lix Server Protocol handshake changed sessionId",
+					);
 				}
 				this.#activeBranchId = handshake.activeBranchId;
 			}
@@ -370,7 +360,9 @@ class RemoteLixBinding implements LixBinding {
 					await this.#requestJson("", { method: "GET" }),
 				);
 				if (handshake.sessionId !== this.#sessionId) {
-					throw protocolError("remote handshake changed sessionId");
+					throw protocolError(
+						"Lix Server Protocol handshake changed sessionId",
+					);
 				}
 				this.#activeAccountId = handshake.activeAccountId;
 			}
@@ -593,7 +585,7 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async #requestObserveStream(
-		subscriptions: RemoteObserveSubscription[],
+		subscriptions: ServerProtocolObserveSubscription[],
 		signal: AbortSignal,
 	): Promise<Response> {
 		let headers: Headers;
@@ -641,7 +633,7 @@ class RemoteLixBinding implements LixBinding {
 	}
 
 	async #refreshObservation(
-		subscription: RemoteObserveSubscription,
+		subscription: ServerProtocolObserveSubscription,
 	): Promise<BindingExecuteResult> {
 		return this.#enqueue(async () => {
 			const value = await this.#requestJson("execute", {
@@ -1000,11 +992,11 @@ type ObserveOutcome =
 
 type RemoteObservationHubOptions = {
 	openStream(
-		subscriptions: RemoteObserveSubscription[],
+		subscriptions: ServerProtocolObserveSubscription[],
 		signal: AbortSignal,
 	): Promise<Response>;
 	refreshObservation(
-		subscription: RemoteObserveSubscription,
+		subscription: ServerProtocolObserveSubscription,
 	): Promise<BindingExecuteResult>;
 };
 
@@ -1028,7 +1020,7 @@ class RemoteObservationHub {
 
 	observe(
 		sql: string,
-		params: RemoteObserveSubscription["params"],
+		params: ServerProtocolObserveSubscription["params"],
 	): RemoteObservation {
 		const id = `observe-${++this.#nextObservationId}`;
 		const observation = new RemoteObservation({
@@ -1321,14 +1313,14 @@ class RemoteObservationHub {
 	}
 }
 
-type RemoteObservationOptions = RemoteObserveSubscription & {
+type RemoteObservationOptions = ServerProtocolObserveSubscription & {
 	onClose(): void;
 };
 
 class RemoteObservation implements ObserveEventsBinding {
 	readonly #id: string;
 	readonly #sql: string;
-	readonly #params: RemoteObserveSubscription["params"];
+	readonly #params: ServerProtocolObserveSubscription["params"];
 	readonly #onClose: () => void;
 	#outcomes: ObserveOutcome[] = [];
 	#waiters: ObserveWaiter[] = [];
@@ -1344,7 +1336,7 @@ class RemoteObservation implements ObserveEventsBinding {
 		this.#onClose = options.onClose;
 	}
 
-	request(): RemoteObserveSubscription {
+	request(): ServerProtocolObserveSubscription {
 		return { id: this.#id, sql: this.#sql, params: this.#params };
 	}
 
@@ -1514,7 +1506,7 @@ function asObserveProtocolError(error: unknown, event: string): Error {
 	if (
 		error instanceof Error &&
 		"code" in error &&
-		(error as { code?: string }).code === "LIX_REMOTE_PROTOCOL_ERROR"
+		(error as { code?: string }).code === "LIX_SERVER_PROTOCOL_ERROR"
 	) {
 		return error;
 	}
@@ -1562,8 +1554,8 @@ function nativeValuesEqual(
 				left.blob.length === right.blob.length &&
 				left.blob.every((byte, index) => byte === right.blob[index])
 			);
-		case "json":
-			return right.kind === "json" && jsonValuesEqual(left.value, right.value);
+		case "jsonb":
+			return right.kind === "jsonb" && jsonValuesEqual(left.value, right.value);
 		default:
 			return left.value === right.value;
 	}
@@ -1605,22 +1597,25 @@ function stringArraysEqual(left: string[], right: string[]): boolean {
 }
 
 function protocolBaseUrl(value: string | URL): URL {
-	let workspaceUrl: URL;
+	let repositoryUrl: URL;
 	try {
-		workspaceUrl = new URL(value);
+		repositoryUrl = new URL(value);
 	} catch {
 		throw new TypeError("openLix() remote server url must be an absolute URL");
 	}
-	if (workspaceUrl.protocol !== "http:" && workspaceUrl.protocol !== "https:") {
+	if (
+		repositoryUrl.protocol !== "http:" &&
+		repositoryUrl.protocol !== "https:"
+	) {
 		throw new TypeError("openLix() remote server url must use http or https");
 	}
-	if (workspaceUrl.search || workspaceUrl.hash) {
+	if (repositoryUrl.search || repositoryUrl.hash) {
 		throw new TypeError(
 			"openLix() remote server url must not contain a query or fragment",
 		);
 	}
-	workspaceUrl.pathname = `${workspaceUrl.pathname.replace(/\/$/, "")}${REMOTE_PROTOCOL_PATH}`;
-	return workspaceUrl;
+	repositoryUrl.pathname = `${repositoryUrl.pathname.replace(/\/$/, "")}${SERVER_PROTOCOL_PATH}`;
+	return repositoryUrl;
 }
 
 function unsupportedRemoteOperation(

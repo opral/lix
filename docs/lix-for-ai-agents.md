@@ -6,7 +6,7 @@ description: Give each agent an isolated branch, preview its changes, then merge
 
 Agents make fast, useful, and sometimes wrong changes. Lix gives each agent task its own branch so a human or policy can review the work before it reaches main.
 
-Agents can work through normal files with `LocalFilesystem`, through SQL, or through a hosted Lix server. All writes stay isolated on the task branch.
+Agents can work through normal files with `FilesystemStorage`, through SQL, or through a hosted Lix server. All writes stay isolated on the task branch.
 
 ## The pattern
 
@@ -39,36 +39,21 @@ if (preview.conflicts.length === 0) {
 }
 ```
 
-## Local file workspace
+## Local file repository
 
-Use `LocalFilesystem` when the agent works with files on disk:
+Use `FilesystemStorage` when the agent works with files on disk. See
+[Persistence and Storage](./persistence.md#local-filesystem) for setup.
 
-```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+## Hosted repository
 
-const lix = await openLix({
-  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
-});
-```
-
-## Hosted workspace
-
-Use remote mode when the workspace runs on a server:
-
-```ts
-const lix = await openLix({
-  server: {
-    mode: "remote",
-    url: "https://example.com/workspaces/acme",
-  },
-});
-```
+Use remote mode when the repository runs on a server. See
+[Persistence and Storage](./persistence.md#remote-server) for setup.
 
 ## Why branches matter
 
 - Run agents in parallel without changing main.
 - Compare proposed results side by side.
-- Review semantic changes instead of rereading every file.
+- Review the [diff](./diffs.md) instead of rereading every file.
 - Discard a bad attempt without manual cleanup.
 
 ## Inspect the work
@@ -82,18 +67,18 @@ WHERE lixcol_branch_id = $1
 ORDER BY id;
 ```
 
-Pass the task branch id as `$1`. Note that `<schema>_history()` anchors to the active branch head, so run from main it does not show the agent's unmerged work.
+Pass the task branch id as `$1`. `<schema>_history()` anchors to the active branch head. Run it from main and it will not show the agent's unmerged work.
 
-Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole workspace. It is not limited to the active branch.
+Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole repository. It is not limited to the active branch.
 
 ## Conflicts
 
-Merge is per entity today. Two branches that edit different rows can merge cleanly. Two branches that edit the same row produce a `sameEntityChanged` conflict.
+Merge is per row today. Two branches that edit different rows can merge cleanly. Two branches that edit the same row produce a `sameRowChanged` conflict.
 
-See [Branches & Merging](./versions.md) for preview results and conflict handling.
+See [Branching](./branching.md) for preview results and conflict handling.
 
 ## Next
 
 - [Getting Started](./getting-started.md): the basic setup.
-- [Branches & Merging](./versions.md): previews, conflicts, and side-by-side reads.
-- [Change History](./history.md): SQL for review and undo.
+- [Branching](./branching.md): previews, conflicts, and side-by-side reads.
+- [History](./history.md): SQL for review and undo.

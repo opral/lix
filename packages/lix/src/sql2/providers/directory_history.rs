@@ -24,7 +24,7 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-    HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_ROW_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
     serialize_history_source_changes, validate_history_anchor_filter,
@@ -38,7 +38,7 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
-    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
+    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, row_pk_json_array,
 };
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
@@ -255,6 +255,7 @@ where
         &event_route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
         metadata_projection,
+        None,
     )
     .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;
@@ -333,10 +334,10 @@ where
         });
     }
     output.retain(|row| {
-        let entity_pk = entity_pk_json_array(&row.descriptor().id).ok();
+        let row_pk = row_pk_json_array(&row.descriptor().id).ok();
         route.matches_surface_row(
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            entity_pk.as_deref().unwrap_or(&row.descriptor().id),
+            row_pk.as_deref().unwrap_or(&row.descriptor().id),
             None,
             row.event.depth,
         )
@@ -432,7 +433,7 @@ fn parse_directory_history_observed_records(
             let row = observed.row();
             let Some(snapshot_content) = row.snapshot_content() else {
                 return Ok(DirectoryHistoryObservedRecord {
-                    id: row.entity_pk().as_single_string_owned()?,
+                    id: row.row_pk().as_single_string_owned()?,
                     parent_id: None,
                     name: None,
                     row: observed.ordinal(),
@@ -464,7 +465,7 @@ fn parse_directory_history_records(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(DirectoryHistoryRecord {
-                    id: entry.change.entity_pk.as_single_string_owned()?,
+                    id: entry.change.row_pk.as_single_string_owned()?,
                     parent_id: None,
                     name: None,
                     entry: entry.clone(),
@@ -586,8 +587,8 @@ static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = Colu
         ),
         ("name", Col::Utf8(|row| row.descriptor().name.as_deref())),
         (
-            HISTORY_COL_ENTITY_PK,
-            Col::Utf8Fallible(|row| entity_pk_json_array(&row.descriptor().id).map(Some)),
+            HISTORY_COL_ROW_PK,
+            Col::Utf8Fallible(|row| row_pk_json_array(&row.descriptor().id).map(Some)),
         ),
         (
             HISTORY_COL_SOURCE_CHANGES,
@@ -641,7 +642,7 @@ pub(super) fn lix_directory_history_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
-        json_field(HISTORY_COL_ENTITY_PK, false),
+        json_field(HISTORY_COL_ROW_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),

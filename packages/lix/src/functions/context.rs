@@ -5,6 +5,7 @@ use crate::functions::{
     DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
     SystemFunctionProvider, state,
 };
+use crate::hot_state::GlobalKeyValueRowCache;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 
 /// Execution-scoped runtime function context.
@@ -36,16 +37,22 @@ impl FunctionContext {
     ///
     /// If deterministic mode is absent or disabled, the context uses system
     /// functions. If enabled, it starts from the persisted sequence + 1.
+    ///
+    /// `cache` memoizes the deterministic-state rows against the global
+    /// branch-head control they were resolved under. Pass `None` from a caller
+    /// that has no engine-lifetime cache to hand; the read is then always
+    /// canonical.
     #[expect(trivial_casts)]
     pub(crate) async fn prepare(
         read: &(impl StorageAdapterRead + ?Sized),
+        cache: Option<&GlobalKeyValueRowCache>,
     ) -> Result<Self, LixError> {
-        let mode = state::load_mode(read).await?;
+        let mode = state::load_mode(read, cache).await?;
         if !mode.enabled {
             return Ok(Self::system_for_function_free_read());
         }
 
-        let sequence = state::load_sequence(read).await?;
+        let sequence = state::load_sequence(read, cache).await?;
         // Deterministic mode must produce byte-identical state across runs;
         // bookkeeping rows (sequence persistence) take a timestamp derived
         // from the persisted sequence instead of the system clock, without
@@ -87,16 +94,14 @@ impl FunctionContext {
         else {
             return Ok(Vec::new());
         };
-        Ok(vec![
-            state::stage_sequence(
-                read,
-                writes,
-                DeterministicSequence { highest_seen },
-                self.bookkeeping_timestamp,
-                deterministic_sequence_change_id(highest_seen),
-            )
-            .await?,
-        ])
+        state::stage_sequence(
+            read,
+            writes,
+            DeterministicSequence { highest_seen },
+            self.bookkeeping_timestamp,
+            deterministic_sequence_change_id(highest_seen),
+        )
+        .await
     }
 
     pub(crate) fn deterministic_sequence_checkpoint(
@@ -125,21 +130,19 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
 #[cfg(test)]
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
-    use crate::branch::{
-        BranchHeadControlContext, stage_branch_head_control, untracked_lifecycle_generation,
-    };
-    use crate::entity_pk::EntityPk;
+    use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
+    use crate::row_pk::RowPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
-    use crate::live_state::LiveStateContext;
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext};
+    use crate::hot_state::HotStateContext;
+    use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
 
-    fn live_state_context() -> LiveStateContext {
-        LiveStateContext::new(
+    fn hot_state_context() -> HotStateContext {
+        HotStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
@@ -153,7 +156,7 @@ mod tests {
             .await
             .expect("read should open");
 
-        let context = FunctionContext::prepare(&read)
+        let context = FunctionContext::prepare(&read, None)
             .await
             .expect("runtime context should prepare");
 
@@ -182,7 +185,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let context = FunctionContext::prepare(&read)
+        let context = FunctionContext::prepare(&read, None)
             .await
             .expect("runtime context should prepare");
         let functions = context.provider();
@@ -226,7 +229,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let context = FunctionContext::prepare(&read)
+        let context = FunctionContext::prepare(&read, None)
             .await
             .expect("runtime context should prepare");
         let functions = context.provider();
@@ -246,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn persist_if_needed_writes_sequence_when_deterministic_functions_advanced() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
             storage.clone(),
@@ -262,7 +265,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("read should open");
-            FunctionContext::prepare(&read)
+            FunctionContext::prepare(&read, None)
                 .await
                 .expect("runtime context should prepare")
         };
@@ -286,18 +289,18 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sequence = load_sequence(&read).await.expect("sequence should load");
+        let sequence = load_sequence(&read, None).await.expect("sequence should load");
         assert_eq!(sequence, DeterministicSequence { highest_seen: 0 });
 
         // Deterministic mode must stamp the bookkeeping row from the
         // persisted sequence, never from the system clock; the persisted
         // sequence was empty, so next_sequence is 0 -> epoch.
-        let row = live_state
+        let row = hot_state
             .reader(&read)
-            .load_row(&crate::live_state::LiveStateRowRequest {
+            .load_row(&crate::hot_state::HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
+                row_pk: RowPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: crate::NullableKeyFilter::Null,
             })
             .await
@@ -318,7 +321,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let context = FunctionContext::prepare(&read)
+        let context = FunctionContext::prepare(&read, None)
             .await
             .expect("runtime context should prepare");
 
@@ -337,7 +340,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sequence = load_sequence(&read)
+        let sequence = load_sequence(&read, None)
             .await
             .expect("missing sequence should load");
         assert_eq!(sequence, DeterministicSequence::uninitialized());
@@ -350,7 +353,7 @@ mod tests {
         }))
         .expect("snapshot should serialize");
         let timestamp = LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z");
-        let entity_pk = EntityPk::single(key);
+        let row_pk = RowPk::single(key);
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -366,22 +369,16 @@ mod tests {
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
-        let next_generation = untracked_lifecycle_generation(
-            GLOBAL_BRANCH_ID,
-            control.untracked_generation,
-            next_control.current_state_revision,
-        );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_untracked_generation(
+            .stage_untracked_current_state(
                 GLOBAL_BRANCH_ID,
-                control.untracked_generation,
-                next_generation,
+                control.tracked_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: "lix_key_value",
                     file_id: None,
-                    entity_pk: &entity_pk,
-                    change_id: None,
+                    row_pk: &row_pk,
+                    change_id: Some(ChangeId::for_test_label("functions-context-sequence")),
                     commit_id: None,
                     untracked: true,
                     deleted: false,
@@ -395,7 +392,6 @@ mod tests {
             )
             .await
             .expect("test key-value current row should stage");
-        next_control.untracked_generation = next_generation;
         next_control.note_schema("lix_key_value");
         stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
             .expect("global control should publish current state");

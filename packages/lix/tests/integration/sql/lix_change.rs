@@ -9,7 +9,7 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -25,9 +25,9 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT entity_pk, schema_key, snapshot_content \
+            "SELECT row_pk, schema_key, snapshot_content \
              FROM lix_change \
-             WHERE entity_pk = lix_json('[\"change-query\"]')",
+             WHERE row_pk = CAST('[\"change-query\"]' AS JSONB)",
             &[],
         )
         .await
@@ -37,9 +37,9 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
     assert_eq!(
         rows.rows()[0].values(),
         &[
-            Value::Json(json!(["change-query"])),
+            Value::Jsonb(json!(["change-query"]).into()),
             Value::Text("lix_key_value".to_string()),
-            Value::Json(json!({"key": "change-query", "value": "one"})),
+            Value::Jsonb(json!({"key": "change-query", "value": "one"}).into()),
         ]
     );
 });
@@ -48,7 +48,7 @@ simulation_test!(lix_change_includes_commit_changes, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -78,12 +78,12 @@ simulation_test!(lix_change_includes_commit_changes, |sim| async move {
 });
 
 simulation_test!(
-    lix_change_entity_pk_is_json_array_for_composite_primary_keys,
+    lix_change_row_pk_is_json_array_for_composite_primary_keys,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -93,7 +93,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_composite_message\",\"x-lix-primary-key\":[\"/key\",\"/locale\"],\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"locale\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"key\",\"locale\",\"text\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_composite_message\",\"columns\":[{\"name\":\"key\",\"type\":\"text\",\"nullable\":false},{\"name\":\"locale\",\"type\":\"text\",\"nullable\":false},{\"name\":\"text\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"key\",\"locale\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -108,26 +108,26 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("composite entity insert should succeed");
+            .expect("composite row insert should succeed");
 
         let result = session
             .execute(
-                "SELECT entity_pk, \
-                        lix_json_get_text(entity_pk, 0) AS entity_key, \
-                        lix_json_get_text(entity_pk, 1) AS entity_locale \
+                "SELECT row_pk, \
+                        row_pk ->> 0 AS row_key, \
+                        row_pk ->> 1 AS row_locale \
                  FROM lix_change \
                  WHERE schema_key = 'engine_composite_message' \
-                   AND entity_pk = lix_json('[\"welcome.title\",\"en\"]')",
+                   AND row_pk = CAST('[\"welcome.title\",\"en\"]' AS JSONB)",
                 &[],
             )
             .await
-            .expect("lix_change should expose composite entity_pk as JSON");
+            .expect("lix_change should expose composite row_pk as JSON");
 
         assert_eq!(result.len(), 1);
         assert_eq!(
             result.rows()[0].values(),
             &[
-                Value::Json(json!(["welcome.title", "en"])),
+                Value::Jsonb(json!(["welcome.title", "en"]).into()),
                 Value::Text("welcome.title".to_string()),
                 Value::Text("en".to_string()),
             ]
@@ -136,12 +136,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_change_rejects_non_string_primary_key_schemas,
+    lix_change_rejects_float_primary_key_schemas,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -151,7 +151,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_numeric_message\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_numeric_message\",\"columns\":[{\"name\":\"id\",\"type\":\"float8\",\"nullable\":false},{\"name\":\"text\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -164,8 +164,8 @@ simulation_test!(
         assert!(
             error
                 .message
-                .contains("must be a non-null integer or string"),
-            "error should explain non-string primary-key schema: {error:?}"
+                .contains("must use text, uuid, or int8"),
+            "error should explain unsupported primary-key schema: {error:?}"
         );
     }
 );
@@ -176,7 +176,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -195,7 +195,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -221,11 +221,11 @@ fn builtin_schema_property_names() -> BTreeSet<String> {
     ))
     .expect("builtin lix_change schema should parse");
     schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-        .expect("builtin lix_change schema should define properties")
-        .keys()
-        .cloned()
+        .get("columns")
+        .and_then(serde_json::Value::as_array)
+        .expect("builtin lix_change schema should define columns")
+        .iter()
+        .map(|column| column["name"].as_str().expect("column name").to_string())
         .collect::<BTreeSet<_>>()
 }
 

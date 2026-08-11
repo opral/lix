@@ -8,8 +8,7 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::changelog::{
-    COMMIT_CHANGE_ID_SPACE, ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
-    ChangelogContext, ChangelogReader, CommitId,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader,
 };
 use crate::serialize_row_metadata;
 
@@ -21,10 +20,7 @@ use crate::sql2::change_materialization::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
-use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
-};
-use bytes::Bytes;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -274,34 +270,19 @@ where
         return Ok(Some(LixChangeRow::Direct(change)));
     }
 
-    let index_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
-    let indexed_commit =
-        PointReadPlan::new(COMMIT_CHANGE_ID_SPACE, std::slice::from_ref(&index_key))
-            .materialize(&store, StorageGetOptions::default())
-            .await?
-            .value
-            .into_iter()
-            .next()
-            .flatten();
-    let Some(StorageProjectedValue::FullValue(commit_id)) = indexed_commit else {
+    // A commit's synthetic `lix_commit` change is its commit id at ordinal
+    // zero of the commit's own change address space, so the reverse lookup is
+    // arithmetic plus the commit read we would have done anyway.
+    let Some(commit_id) = change_id.as_commit_change() else {
         return Ok(None);
     };
-    let commit_id = CommitId::new(uuid::Uuid::from_slice(&commit_id).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog commit change-id index has invalid commit id: {error}"),
-        )
-    })?);
-    let commit = crate::commit_graph::CommitGraphContext::new()
+    let Some(commit) = crate::commit_graph::CommitGraphContext::new()
         .reader(store)
         .load_node(&commit_id)
         .await?
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("changelog commit change-id index references missing commit '{commit_id}'"),
-            )
-        })?;
+    else {
+        return Ok(None);
+    };
     Ok(Some(LixChangeRow::DerivedCommit(
         crate::commit_graph::canonical_commit_change(&commit),
     )))
@@ -325,7 +306,7 @@ pub(super) fn lix_change_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("account_id", DataType::Utf8, false),
-        json_field("entity_pk", false),
+        json_field("row_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("metadata", true),
@@ -340,12 +321,12 @@ static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
         ("account_id", Col::Utf8(|row| Some(row.account_id.as_str()))),
         (
-            "entity_pk",
+            "row_pk",
             Col::Utf8Owned(|row| {
                 Some(
-                    row.entity_pk
+                    row.row_pk
                         .as_json_array_text()
-                        .expect("canonical change entity primary key should project"),
+                        .expect("canonical change row primary key should project"),
                 )
             }),
         ),

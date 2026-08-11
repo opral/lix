@@ -3,10 +3,7 @@ use lix::Value;
 simulation_test!(untracked_insert_is_current_state_only, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open"),
+        engine.open_session().await.expect("session should open"),
         &engine,
     );
     let head_before = branch_head(&session, sim.main_branch_id()).await;
@@ -38,10 +35,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let head_before = branch_head(&session, sim.main_branch_id()).await;
@@ -73,7 +67,7 @@ simulation_test!(
             .expect("untracked row should read");
         assert_eq!(
             visible.rows()[0].values(),
-            &[Value::Json(serde_json::json!("two"))]
+            &[Value::Jsonb(serde_json::json!("two").into())]
         );
         assert_untracked_current_state(&session, "untracked-current-overwrite").await;
         assert_eq!(
@@ -116,10 +110,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -166,10 +157,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -208,11 +196,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("untracked-current-normal-tracked".to_string()),
-                    Value::Json(serde_json::json!("tracked")),
+                    Value::Jsonb(serde_json::json!("tracked").into()),
                 ],
                 vec![
                     Value::Text("untracked-current-normal-untracked".to_string()),
-                    Value::Json(serde_json::json!("untracked")),
+                    Value::Jsonb(serde_json::json!("untracked").into()),
                 ],
             ],
             "ordinary SQL has no retention lane: it returns both current members"
@@ -225,10 +213,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let initial_head = branch_head(&session, sim.main_branch_id()).await;
@@ -332,10 +317,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let mut transaction = session
@@ -371,10 +353,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -404,6 +383,57 @@ simulation_test!(
                 "untracked mutations must not enter a tracked working diff"
             );
         }
+    }
+);
+
+simulation_test!(
+    checkpoint_does_not_rehome_untracked_rows,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+                 VALUES ('untracked-across-checkpoint', 'one', true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('tracked-across-checkpoint', 'one')",
+                &[],
+            )
+            .await
+            .expect("tracked insert should succeed");
+
+        // A checkpoint re-homes every live tracked row onto the checkpoint
+        // commit. Tracked and untracked rows now share one serving
+        // generation, so this is the fence that proves the checkpoint's
+        // selection is driven by the working diff -- which untracked rows
+        // never enter -- rather than by "everything in the generation".
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        assert_untracked_current_state(&session, "untracked-across-checkpoint").await;
+        assert_eq!(
+            change_count_for_key(&session, "untracked-across-checkpoint").await,
+            0,
+            "a checkpoint must not give an untracked row a change record"
+        );
+        assert!(
+            !current_tracked_change_id(&session, "tracked-across-checkpoint")
+                .await
+                .is_empty(),
+            "the tracked row beside it must still be re-homed by the checkpoint"
+        );
     }
 );
 
@@ -444,10 +474,27 @@ async fn assert_untracked_current_state(
     let [row] = result.rows() else {
         panic!("expected exactly one current row for key '{key}'");
     };
+    // Untracked state is identity-bearing but history-free: it exposes a real
+    // change id and no commit id. The change id is asserted as a property
+    // rather than as a literal on purpose — the value is a function of UUID
+    // draw order, so pinning it here would turn any unrelated change in draw
+    // order into a spurious failure that invites re-recording. History
+    // freedom itself is asserted directly against the changelog and history
+    // views elsewhere in this file, which is where it belongs.
+    let [change_id, commit_id, untracked] = row.values() else {
+        panic!("expected three projected columns for key '{key}'");
+    };
+    match change_id {
+        Value::Text(value) => assert!(
+            uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil()),
+            "untracked state must expose a real change id, got '{value}' for key '{key}'"
+        ),
+        other => panic!("untracked state must expose a change id, got {other:?}"),
+    }
     assert_eq!(
-        row.values(),
-        &[Value::Null, Value::Null, Value::Boolean(true)],
-        "ordinary untracked state must expose neither a change nor commit id"
+        (commit_id, untracked),
+        (&Value::Null, &Value::Boolean(true)),
+        "ordinary untracked state must expose no commit id and stay untracked"
     );
 }
 
@@ -479,7 +526,7 @@ async fn change_count_for_key(
         .execute(
             &format!(
                 "SELECT id FROM lix_change WHERE schema_key = 'lix_key_value' \
-                 AND lix_json_get_text(entity_pk, 0) = '{key}'"
+                 AND row_pk ->> 0 = '{key}'"
             ),
             &[],
         )

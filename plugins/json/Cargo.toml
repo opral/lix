@@ -3,7 +3,7 @@ name = "plugin_json"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-description = "JSON plugin for the fused Lix Wasm Component API v1"
+description = "JSON plugin for the row-first Lix Wasm Component API v1"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -22,6 +22,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 base64 = "0.22"
 blake3 = "1"
-lix_plugin_api = { workspace = true }
+lix = { workspace = true, default-features = true }
 serde_json = { version = "1", features = ["raw_value"] }
 uuid = { version = "1", features = ["std"] }

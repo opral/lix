@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchOutcome, Value};
 
-const SEEDS: [u64; 6] = [0, 1, 2, 0x51ce_deed, u64::MAX - 1, u64::MAX];
+const DEFAULT_SEEDS: [u64; 6] = [0, 1, 2, 0x51ce_deed, u64::MAX - 1, u64::MAX];
 const STEPS_PER_SEED: usize = 48;
 const KEYS_PER_LANE: usize = 6;
 
@@ -12,13 +12,13 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
-        for seed in SEEDS {
+        for seed in crate::support::fuzz_seeds(&DEFAULT_SEEDS) {
             let prefix = format!("merge-fuzz-{seed:016x}-");
             let branch_id = format!(
                 "01930000-{:04x}-7000-8000-{:012x}",
@@ -35,7 +35,7 @@ simulation_test!(
                 .unwrap_or_else(|error| panic!("seed {seed:#018x}: create failed: {error:?}"));
             let source = sim.wrap_session(
                 engine
-                    .open_session(receipt.id)
+                    .open_session_at(receipt.id)
                     .await
                     .unwrap_or_else(|error| {
                         panic!("seed {seed:#018x}: source open failed: {error:?}")
@@ -58,7 +58,7 @@ simulation_test!(
                     "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
                     &[
                         Value::Text(fast_forward_key.clone()),
-                        Value::Json(fast_forward_value.clone()),
+                        Value::Jsonb(fast_forward_value.clone().into()),
                     ],
                 )
                 .await
@@ -126,7 +126,7 @@ simulation_test!(
                         .unwrap_or_else(|error| panic!("{label}: reopen failed: {error:?}"));
                     let reopened_main = sim.wrap_session(
                         reopened_engine
-                            .open_workspace_session()
+                            .open_session()
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("{label}: reopened main failed: {error:?}")
@@ -135,7 +135,7 @@ simulation_test!(
                     );
                     let reopened_source = sim.wrap_session(
                         reopened_engine
-                            .open_session(branch_id.clone())
+                            .open_session_at(branch_id.clone())
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("{label}: reopened source failed: {error:?}")
@@ -193,7 +193,7 @@ async fn mutate_lane(
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                &[Value::Text(key.clone()), Value::Json(value.clone())],
+                &[Value::Text(key.clone()), Value::Jsonb(value.clone().into())],
             )
             .await
             .unwrap_or_else(|error| panic!("{label}: upsert failed: {error:?}"));
@@ -221,7 +221,7 @@ async fn assert_state(
         .collect::<Vec<_>>();
     let expected = expected
         .iter()
-        .map(|(key, value)| vec![Value::Text(key.clone()), Value::Json(value.clone())])
+        .map(|(key, value)| vec![Value::Text(key.clone()), Value::Jsonb(value.clone().into())])
         .collect::<Vec<_>>();
     assert_eq!(actual, expected, "{label}: branch state diverged");
 }

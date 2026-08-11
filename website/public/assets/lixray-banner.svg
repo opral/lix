@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 334" role="img" aria-label="LixRay: one repo your team and your agents share. Any file type, every change tracked." font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
+  <!-- card background -->
+  <rect x="0.75" y="0.75" width="678.5" height="332.5" rx="12" fill="#FFFFFF"/>
+
+  <!-- preview area -->
+  <path d="M1.5 13.5 A12 12 0 0 1 13.5 1.5 H666.5 A12 12 0 0 1 678.5 13.5 V220 H1.5 Z" fill="#F7F6F1"/>
+
+  <!-- browser window -->
+  <path d="M90 40 A10 10 0 0 1 100 30 H580 A10 10 0 0 1 590 40 V220 H90 Z" fill="#FFFFFF"/>
+  <path d="M90 40 A10 10 0 0 1 100 30 H580 A10 10 0 0 1 590 40 V62 H90 Z" fill="#FDFCFA"/>
+  <line x1="90" y1="62" x2="590" y2="62" stroke="#EDEBE4" stroke-width="1"/>
+
+  <!-- title bar -->
+  <circle cx="106" cy="46" r="4.5" fill="#E0DED6"/>
+  <circle cx="120" cy="46" r="4.5" fill="#E0DED6"/>
+  <circle cx="134" cy="46" r="4.5" fill="#E0DED6"/>
+  <rect x="249" y="38" width="182" height="17" rx="5" fill="#F3F1EA"/>
+  <text x="259" y="50.5" font-size="10.5" fill="#6B7076">lixray.com/<tspan font-weight="700" fill="#15171B">@acme/repository</tspan></text>
+
+  <!-- repository panel -->
+  <text x="112" y="86" font-size="9" letter-spacing="0.9" fill="#8A8F96">REPOSITORY</text>
+
+  <g transform="translate(112, 101)"><path d="M1 2.5 C1 1.7 1.6 1 2.4 1 H4.8 L6.2 2.6 H11.6 C12.4 2.6 13 3.3 13 4.1 V9.5 C13 10.3 12.4 11 11.6 11 H2.4 C1.6 11 1 10.3 1 9.5 Z" fill="#54AEFF"/></g>
+  <text x="131" y="110" font-size="10.5" fill="#15171B">sales/<tspan dx="8" fill="#8A8F96">playbook.md · icp.md · leads.csv</tspan></text>
+
+  <g transform="translate(112, 127)"><path d="M1 2.5 C1 1.7 1.6 1 2.4 1 H4.8 L6.2 2.6 H11.6 C12.4 2.6 13 3.3 13 4.1 V9.5 C13 10.3 12.4 11 11.6 11 H2.4 C1.6 11 1 10.3 1 9.5 Z" fill="#54AEFF"/></g>
+  <text x="131" y="136" font-size="10.5" fill="#15171B">brand/<tspan dx="8" fill="#8A8F96">logo.png · deck.pdf · launch.mp4</tspan></text>
+
+  <g transform="translate(112, 153)"><path d="M1 2.5 C1 1.7 1.6 1 2.4 1 H4.8 L6.2 2.6 H11.6 C12.4 2.6 13 3.3 13 4.1 V9.5 C13 10.3 12.4 11 11.6 11 H2.4 C1.6 11 1 10.3 1 9.5 Z" fill="#54AEFF"/></g>
+  <text x="131" y="162" font-size="10.5" fill="#15171B">skills/<tspan dx="8" fill="#8A8F96">call-prep · research</tspan></text>
+
+  <g transform="translate(112, 179)"><path d="M1 2.5 C1 1.7 1.6 1 2.4 1 H4.8 L6.2 2.6 H11.6 C12.4 2.6 13 3.3 13 4.1 V9.5 C13 10.3 12.4 11 11.6 11 H2.4 C1.6 11 1 10.3 1 9.5 Z" fill="#54AEFF"/></g>
+  <text x="131" y="188" font-size="10.5" fill="#15171B">automations/<tspan dx="8" fill="#8A8F96">crm-sync.py · weekly-report.js</tspan></text>
+
+  <!-- shared-with panel -->
+  <line x1="440" y1="62" x2="440" y2="220" stroke="#EDEBE4" stroke-width="1"/>
+  <text x="462" y="86" font-size="9" letter-spacing="0.9" fill="#8A8F96">SHARED WITH</text>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, sans-serif" font-size="9" font-weight="700" text-anchor="middle">
+    <circle cx="472" cy="106" r="10" fill="#DDF4FF" stroke="#B6E3FF"/>
+    <text x="472" y="109.5" fill="#0969DA">JM</text>
+    <circle cx="496" cy="106" r="10" fill="#FFF1E5" stroke="#FFD8B5"/>
+    <text x="496" y="109.5" fill="#BC4C00">AL</text>
+    <circle cx="520" cy="106" r="10" fill="#EBF0FF" stroke="#D0DBFF"/>
+    <text x="520" y="109.5" fill="#4056C9">+6</text>
+  </g>
+
+  <!-- window border, drawn on top so the frame stays crisp -->
+  <path d="M90 220 V40 A10 10 0 0 1 100 30 H580 A10 10 0 0 1 590 40 V220" fill="none" stroke="#E6E4DD" stroke-width="1"/>
+  <line x1="1.5" y1="220" x2="678.5" y2="220" stroke="#E6E4DD" stroke-width="1"/>
+
+  <!-- footer bar -->
+  <g transform="translate(28, 242) scale(0.22)">
+    <path fill="#E8590C" fill-rule="evenodd" d="M32 8 H68 A24 24 0 0 1 92 32 V68 A24 24 0 0 1 68 92 H32 A24 24 0 0 1 8 68 V32 A24 24 0 0 1 32 8 Z M31 72 H69 Q74 72 74 67 V34 Q74 27 69 33 L56 44.5 L26 23.8 A2.75 2.75 0 0 0 23.8 26 L49 51 L31 67 Q26 72 31 72 Z M55.5 60 a4.5 4.5 0 1 0 9 0 a4.5 4.5 0 1 0 -9 0 Z"/>
+  </g>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, sans-serif">
+    <text x="58" y="259" font-size="19" font-weight="700" letter-spacing="-0.3" fill="#15171B">LixRay</text>
+    <text x="28" y="288" font-size="14" fill="#6B7076">One repo your team and your agents share.</text>
+    <text x="28" y="308" font-size="14" fill="#6B7076">Any file type, every change tracked.</text>
+    <rect x="522" y="256" width="130" height="42" rx="8" fill="#07B6D5"/>
+    <text x="587" y="282" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">Try LixRay →</text>
+  </g>
+
+  <!-- card border -->
+  <rect x="0.75" y="0.75" width="678.5" height="332.5" rx="12" fill="none" stroke="#E6E4DD" stroke-width="1.5"/>
+</svg>

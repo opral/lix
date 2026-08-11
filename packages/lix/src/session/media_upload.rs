@@ -8,18 +8,22 @@ use crate::storage_adapter::{
     MAX_SCAN_PAGE_ROWS, Storage, StorageBeginScanOptions, StorageCoreProjection,
     StorageGetManyRequest, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition,
     StorageProjectedValue, StorageReadOptions, StorageSpace, StorageSpaceId, StorageValue,
-    StorageWriteOptions, exact_get_many,
+    StorageWriteOptions, ValueSemantics, exact_get_many,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError};
 
 use super::SessionContext;
 
-const UPLOAD_STATE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0007_0006), "session.file_upload.v2");
-const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const UPLOAD_STATE_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0007_0006),
+    "session.file_upload.v2",
+    ValueSemantics::Mutable,
+);
+pub(crate) const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0007_0007),
     "session.file_upload_manifest_leaf.v2",
+    ValueSemantics::Mutable,
 );
 pub const FILE_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_UPLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -51,8 +55,11 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
         )
         .await?;
     loop {
-        let page = state_cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        for entry in page.entries {
+        let (page, page_has_more) = state_cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
+            .await?
+            .into_parts();
+        for entry in page {
             let upload_id = std::str::from_utf8(&entry.key.0)
                 .map_err(|_| invalid_upload_storage("upload state key is not UTF-8"))?
                 .to_owned();
@@ -66,7 +73,7 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
                 .map_err(|_| invalid_upload_storage("upload state value is invalid JSON"))?;
             states.push((upload_id, state));
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -100,8 +107,11 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
         )
         .await?;
     loop {
-        let page = leaf_cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        for entry in page.entries {
+        let (page, page_has_more) = leaf_cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
+            .await?
+            .into_parts();
+        for entry in page {
             let upload_id = decode_upload_manifest_leaf_upload_id(&entry.key)?;
             if !open_ids.contains(&upload_id) {
                 // Finalized or state-less receipts are not active roots; the
@@ -134,7 +144,7 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
                 }
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -214,7 +224,7 @@ where
     /// Up to four 16 MiB parts may complete out of order. Each request persists
     /// one manifest leaf plus its missing immutable payloads; publication folds
     /// the leaves into the root manifest atomically with ordinary file history.
-    pub async fn upsert_file_content_part(
+    pub(crate) async fn upsert_file_content_part(
         &self,
         upload_id: String,
         path: String,
@@ -264,7 +274,7 @@ where
             let chunks = if content.is_empty() {
                 Vec::new()
             } else {
-                writer.stage_fixed_part(&content).await?
+                writer.stage_upload_part(&content).await?
             };
             drop(writer);
             let leaf = UploadManifestLeaf {
@@ -334,7 +344,8 @@ where
                 }
                 Some(UploadState::Complete(_)) => unreachable!("complete state returned above"),
             }
-            crate::binary_cas::stage_mutation_epoch(&read, &mut writes, &mut preconditions).await?;
+            crate::binary_cas::stage_cas_publication_fence(&read, &mut writes, &mut preconditions)
+                .await?;
             drop(read);
 
             let commit_boundary = self.transaction_commit_boundary();
@@ -406,7 +417,7 @@ where
         let receipt = self
             .binary_cas
             .writer_skipping_existing_chunks(&read, &mut finalization_writes)
-            .stage_fixed_manifest(&receipts)?;
+            .stage_upload_manifest(&receipts)?;
         let complete = UploadState::Complete(UploadComplete {
             path: state.path.clone(),
             total_size: state.total_size,
@@ -654,12 +665,12 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
     let part_size = u64::from_be_bytes(
         value[8..16]
             .try_into()
-            .expect("fixed upload manifest leaf part size"),
+            .expect("upload manifest leaf part size"),
     );
     let chunk_count = u32::from_be_bytes(
         value[16..20]
             .try_into()
-            .expect("fixed upload manifest leaf chunk count"),
+            .expect("upload manifest leaf chunk count"),
     ) as usize;
     let expected_len = HEADER_BYTES
         .checked_add(chunk_count.saturating_mul(40))
@@ -677,7 +688,7 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
         let size_bytes = u64::from_be_bytes(
             encoded[32..]
                 .try_into()
-                .expect("fixed upload manifest leaf chunk size"),
+                .expect("upload manifest leaf chunk size"),
         );
         chunks.push(BlobChunkReceipt {
             hash: ChunkHash::from_bytes(hash),
@@ -736,8 +747,8 @@ async fn load_upload_progress(
         )
         .await?;
     'pages: loop {
-        let page = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        for entry in &page.entries {
+        let (page, page_has_more) = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
+        for entry in &page {
             let part_number = decode_upload_manifest_leaf_part_number(upload_id, &entry.key)?;
             if part_number != expected_part {
                 break 'pages;
@@ -746,7 +757,7 @@ async fn load_upload_progress(
                 .checked_add(1)
                 .ok_or_else(|| invalid_upload("upload part count exceeds u32"))?;
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -781,8 +792,8 @@ async fn load_upload_manifest_leaves(
         )
         .await?;
     loop {
-        let page = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        for entry in &page.entries {
+        let (page, page_has_more) = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
+        for entry in &page {
             let part_number = decode_upload_manifest_leaf_part_number(upload_id, &entry.key)?;
             if part_number != next_part {
                 return Err(LixError::new(
@@ -810,7 +821,7 @@ async fn load_upload_manifest_leaves(
                 .checked_add(1)
                 .ok_or_else(|| invalid_upload("upload part count exceeds u32"))?;
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -889,6 +900,112 @@ mod tests {
     use crate::{Memory, engine::Engine};
     use std::ops::Bound;
 
+    #[tokio::test]
+    async fn direct_file_helpers_create_update_read_and_validate_paths() {
+        let lix = crate::open_lix().await.expect("open lix");
+
+        assert_eq!(
+            lix.upsert_file_content("/native/file.bin", b"first".as_slice())
+                .await
+                .expect("create file"),
+            1
+        );
+        assert_eq!(
+            lix.upsert_file_content("/native/file.bin", b"second".as_slice())
+                .await
+                .expect("update file"),
+            1
+        );
+        let read = lix
+            .read_file_content("/native/file.bin", None)
+            .await
+            .expect("read file")
+            .expect("file exists");
+        assert_eq!(read.content().as_ref(), b"second");
+
+        lix.upsert_file_content("/native/file.bin", Vec::<u8>::new())
+            .await
+            .expect("write empty file");
+        let empty = lix
+            .read_file_content("/native/file.bin", None)
+            .await
+            .expect("read empty file")
+            .expect("empty file exists");
+        assert!(empty.content().is_empty());
+        assert!(
+            lix.read_file_content("/native/missing.bin", None)
+                .await
+                .expect("read missing file")
+                .is_none()
+        );
+
+        let relative = lix
+            .upsert_file_content("relative.bin", b"invalid".as_slice())
+            .await
+            .expect_err("relative path is invalid");
+        assert_eq!(relative.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+        let nul = lix
+            .upsert_file_content("/nul\0name.bin", b"invalid".as_slice())
+            .await
+            .expect_err("NUL path is invalid");
+        assert_eq!(nul.code, "LIX_ERROR_PATH_NUL");
+    }
+
+    #[tokio::test]
+    async fn direct_file_batch_is_atomic_and_rejects_invalid_input() {
+        let lix = crate::open_lix().await.expect("open lix");
+        let writes = vec![
+            ("/native/one.bin".to_owned(), Blob::from(b"one".as_slice())),
+            ("/native/two.bin".to_owned(), Blob::from(b"two".as_slice())),
+            ("/native/empty.bin".to_owned(), Blob::from(Vec::<u8>::new())),
+        ];
+        assert_eq!(
+            lix.upsert_file_content_batch(writes)
+                .await
+                .expect("write batch"),
+            3
+        );
+        for (path, expected) in [
+            ("/native/one.bin", b"one".as_slice()),
+            ("/native/two.bin", b"two".as_slice()),
+            ("/native/empty.bin", b"".as_slice()),
+        ] {
+            let read = lix
+                .read_file_content(path, None)
+                .await
+                .expect("read batch file")
+                .expect("batch file exists");
+            assert_eq!(read.content().as_ref(), expected);
+        }
+
+        let empty = lix
+            .upsert_file_content_batch(Vec::new())
+            .await
+            .expect_err("empty batch is invalid");
+        assert_eq!(empty.code, LixError::CODE_INVALID_PARAM);
+        let duplicate = lix
+            .upsert_file_content_batch(vec![
+                (
+                    "/native/duplicate.bin".to_owned(),
+                    Blob::from(b"one".as_slice()),
+                ),
+                (
+                    "/native/duplicate.bin".to_owned(),
+                    Blob::from(b"two".as_slice()),
+                ),
+            ])
+            .await
+            .expect_err("duplicate path is invalid");
+        assert_eq!(duplicate.code, LixError::CODE_INVALID_PARAM);
+        assert!(
+            lix.read_file_content("/native/duplicate.bin", None)
+                .await
+                .expect("read duplicate target")
+                .is_none(),
+            "a rejected batch must not partially commit"
+        );
+    }
+
     async fn seed_orphan_upload_chunk(
         storage: &StorageAdapter<Memory>,
         payload: &[u8],
@@ -900,16 +1017,68 @@ mod tests {
         let mut writes = storage.new_write_set();
         let receipts = crate::binary_cas::BinaryCasContext::new()
             .writer_skipping_existing_chunks(&read, &mut writes)
-            .stage_fixed_part(payload)
+            .stage_upload_part(payload)
             .await
-            .expect("orphan fixed chunk should stage");
+            .expect("orphan upload chunk should stage");
         assert_eq!(receipts.len(), 1);
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("orphan fixed chunk should commit");
+            .expect("orphan upload chunk should commit");
         receipts[0].hash
+    }
+
+    /// A resumable upload keeps four parts in flight by design, and the engine —
+    /// not the caller — owns that window. Parts staged from one snapshot write
+    /// disjoint manifest leaves over content-addressed payloads, so they are
+    /// independent publications: every one of them must commit.
+    ///
+    /// Making publishers share a compare-and-set row broke exactly this. It was
+    /// invisible at the public surface because `upsert_file_content_part` retries
+    /// a bounded number of times — a full window plus any other concurrent writer
+    /// exhausts that budget, which is how the movie-repository qualification fails
+    /// its upload acknowledgement.
+    #[tokio::test]
+    async fn concurrent_upload_part_publications_from_one_snapshot_all_commit() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = b"windowed-upload-part-payload";
+        seed_orphan_upload_chunk(&storage, payload).await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("upload window read should open");
+        let mut window = Vec::new();
+        for part in 0..4 {
+            window.push(
+                stage_deduplicated_receipt_publication(
+                    &storage,
+                    &read,
+                    &format!("windowed-part-{part}"),
+                    payload,
+                    true,
+                )
+                .await,
+            );
+        }
+        drop(read);
+
+        for (part, (writes, preconditions)) in window.into_iter().enumerate() {
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "every part of one upload window must commit; part {part} was rejected: {error:?}"
+                    )
+                });
+        }
     }
 
     async fn stage_deduplicated_receipt_publication(
@@ -922,7 +1091,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let chunks = crate::binary_cas::BinaryCasContext::new()
             .writer_skipping_existing_chunks(read, &mut writes)
-            .stage_fixed_part(payload)
+            .stage_upload_part(payload)
             .await
             .expect("deduplicated receipt chunk should stage");
         assert_eq!(
@@ -960,9 +1129,9 @@ mod tests {
                 key: state_key,
             },
         ];
-        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_publication_fence(read, &mut writes, &mut preconditions)
             .await
-            .expect("deduplicated receipt epoch should stage");
+            .expect("deduplicated receipt publication fence should stage");
         (writes, preconditions)
     }
 
@@ -984,9 +1153,9 @@ mod tests {
         .await
         .expect("stale CAS sweep should stage");
         assert_eq!(swept.reclaimed_chunk_rows, 1);
-        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+        crate::binary_cas::stage_cas_reclamation_fence(read, &mut writes, &mut preconditions)
             .await
-            .expect("stale sweep epoch should stage");
+            .expect("stale sweep reclamation fence should stage");
         (writes, preconditions)
     }
 
@@ -1009,11 +1178,12 @@ mod tests {
             )
             .await
             .expect("chunk verification scan should succeed");
-        let page = cursor
+        let (page, _page_has_more) = cursor
             .next_page(1)
             .await
-            .expect("chunk verification page should succeed");
-        !page.entries.is_empty()
+            .expect("chunk verification page should succeed")
+            .into_parts();
+        !page.is_empty()
     }
 
     #[tokio::test]
@@ -1337,10 +1507,7 @@ mod tests {
             .await
             .expect("initialize storage");
         let engine = Engine::new(storage.clone()).await.expect("open engine");
-        let first_session = engine
-            .open_workspace_session()
-            .await
-            .expect("open first session");
+        let first_session = engine.open_session().await.expect("open first session");
         let first = vec![0x31; FILE_UPLOAD_PART_BYTES];
         let tail = vec![0x72; 123];
         let total = (first.len() + tail.len()) as u64;
@@ -1365,10 +1532,7 @@ mod tests {
                 .is_none()
         );
 
-        let resumed_session = engine
-            .open_workspace_session()
-            .await
-            .expect("open resumed session");
+        let resumed_session = engine.open_session().await.expect("open resumed session");
         let progress = resumed_session
             .upsert_file_content_part(
                 "movie-proxy-1".into(),
@@ -1409,12 +1573,13 @@ mod tests {
             )
             .await
             .expect("begin temporary upload receipt scan");
-        let temporary_receipts = cursor
+        let (temporary_receipts, _temporary_receipts_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan temporary upload receipts");
+            .expect("scan temporary upload receipts")
+            .into_parts();
         assert!(
-            temporary_receipts.entries.is_empty(),
+            temporary_receipts.is_empty(),
             "publication must atomically remove temporary chunk receipts",
         );
         drop(cursor);
@@ -1502,16 +1667,13 @@ mod tests {
             )
             .await
             .expect("begin CAS chunk scan");
-        let chunks = cursor
+        let (chunks, chunks_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan CAS chunks");
-        assert!(!chunks.has_more);
-        assert_eq!(
-            chunks.entries.len(),
-            2,
-            "identical media must reuse payloads"
-        );
+            .expect("scan CAS chunks")
+            .into_parts();
+        assert!(!chunks_has_more);
+        assert_eq!(chunks.len(), 2, "identical media must reuse payloads");
     }
 
     #[tokio::test]
@@ -1521,7 +1683,7 @@ mod tests {
             .await
             .expect("initialize storage");
         let engine = Engine::new(storage.clone()).await.expect("open engine");
-        let session = engine.open_workspace_session().await.expect("open session");
+        let session = engine.open_session().await.expect("open session");
         let total_size = 4 * FILE_UPLOAD_PART_BYTES as u64;
 
         let second = session.upsert_file_content_part(
@@ -1568,17 +1730,26 @@ mod tests {
             )
             .await
             .expect("begin upload leaf scan");
-        let leaves = cursor
+        let (leaves, _leaves_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan upload leaves");
-        assert_eq!(leaves.entries.len(), 3);
-        for entry in leaves.entries {
+            .expect("scan upload leaves")
+            .into_parts();
+        assert_eq!(leaves.len(), 3);
+        for entry in leaves {
             let StorageProjectedValue::FullValue(value) = entry.value else {
                 panic!("manifest leaf scan must return values");
             };
             let leaf = decode_upload_manifest_leaf(&value).expect("decode manifest leaf");
-            assert_eq!(leaf.chunks.len(), FILE_UPLOAD_PART_BYTES / (1024 * 1024));
+            assert!(!leaf.chunks.is_empty());
+            assert_eq!(
+                leaf.chunks
+                    .iter()
+                    .map(|chunk| chunk.size_bytes)
+                    .sum::<u64>(),
+                FILE_UPLOAD_PART_BYTES as u64,
+                "a part's content-defined chunks must tile the part exactly"
+            );
         }
         drop(cursor);
         drop(read);

@@ -2,13 +2,9 @@ use bytes::Bytes;
 
 use crate::LixError;
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    REVISION_KEY_CATALOG, REVISION_SPACE, StorageAdapterRead, StorageValue, StorageWriteSet,
+    load_revision, revision_key,
 };
-
-const CATALOG_REVISION_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0007_0003), "catalog.schema_revision");
-const CATALOG_REVISION_KEY: &[u8] = b"global";
 
 /// Storage-snapshot identity for the visible registered-schema catalog.
 ///
@@ -18,8 +14,12 @@ const CATALOG_REVISION_KEY: &[u8] = b"global";
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CatalogRevision(Bytes);
 
-#[cfg(test)]
 impl CatalogRevision {
+    pub(crate) fn from_storage_bytes(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_test(value: &'static [u8]) -> Self {
         Self(Bytes::from_static(value))
     }
@@ -28,32 +28,15 @@ impl CatalogRevision {
 pub(crate) async fn load_catalog_revision(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Option<CatalogRevision>, LixError> {
-    let result = PointReadPlan::new(
-        CATALOG_REVISION_SPACE,
-        &[StorageKey(Bytes::from_static(CATALOG_REVISION_KEY))],
-    )
-    .materialize(
-        store,
-        StorageGetOptions {
-            projection: StorageCoreProjection::FullValue,
-        },
-    )
-    .await?;
-    Ok(result
-        .value
-        .into_iter()
-        .next()
-        .flatten()
-        .and_then(|value| match value {
-            StorageProjectedValue::FullValue(bytes) => Some(CatalogRevision(bytes)),
-            StorageProjectedValue::KeyOnly => None,
-        }))
+    Ok(load_revision(store, REVISION_KEY_CATALOG)
+        .await?
+        .map(CatalogRevision::from_storage_bytes))
 }
 
 pub(crate) fn stage_catalog_revision(writes: &mut StorageWriteSet) {
     writes.put(
-        CATALOG_REVISION_SPACE,
-        StorageKey(Bytes::from_static(CATALOG_REVISION_KEY)),
+        REVISION_SPACE,
+        revision_key(REVISION_KEY_CATALOG),
         StorageValue {
             bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
         },
@@ -124,7 +107,7 @@ mod tests {
             .await
             .expect("engine should open");
         let session = engine
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         session
@@ -143,7 +126,7 @@ mod tests {
         let no_op = session
             .execute(
                 "UPDATE lix_registered_schema SET value = value \
-                 WHERE lixcol_entity_pk = lix_json('[\"missing-schema\"]')",
+                 WHERE lixcol_row_pk = CAST('[\"missing-schema\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -158,8 +141,8 @@ mod tests {
         rolled_back
             .execute(
                 "INSERT INTO lix_registered_schema \
-                 (value, lixcol_global, lixcol_untracked) VALUES ($1, false, true)",
-                &[Value::Json(test_schema("rolled_back_schema", false))],
+                 (schema_key, value, lixcol_global, lixcol_untracked) VALUES ($1 ->> 'key', $1, false, true)",
+                &[Value::Jsonb(test_schema("rolled_back_schema", false).into())],
             )
             .await
             .expect("rolled-back schema should stage");
@@ -193,8 +176,10 @@ mod tests {
         let amended = session
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"tracked_revision_probe\"]')",
-                &[Value::Json(test_schema("tracked_revision_probe", true))],
+                 WHERE lixcol_row_pk = CAST('[\"tracked_revision_probe\"]' AS JSONB)",
+                &[Value::Jsonb(
+                    test_schema("tracked_revision_probe", true).into(),
+                )],
             )
             .await
             .expect("compatible tracked schema amendment should commit");
@@ -205,7 +190,7 @@ mod tests {
         let delete_error = session
             .execute(
                 "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"tracked_revision_probe\"]')",
+                 WHERE lixcol_row_pk = CAST('[\"tracked_revision_probe\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -228,11 +213,11 @@ mod tests {
             .await
             .expect("second engine should open");
         let session_a = engine_a
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("first session should open");
         let session_b = engine_b
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("second session should open");
 
@@ -302,7 +287,7 @@ mod tests {
             .await
             .expect("engine should open");
         let session = engine
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         let initial_head = engine
@@ -364,7 +349,7 @@ mod tests {
         let adapter = StorageAdapter::new(storage.clone());
         let engine = Engine::new(storage).await.expect("engine should open");
         let main = engine
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         let revision_before_branch = current_revision(&adapter).await;
@@ -377,7 +362,7 @@ mod tests {
         .expect("draft branch should be created");
         assert_ne!(current_revision(&adapter).await, revision_before_branch);
         let draft = engine
-            .open_session(draft_branch_id)
+            .open_session_at(draft_branch_id)
             .await
             .expect("draft session should open");
         if diverge_target {
@@ -438,26 +423,29 @@ mod tests {
     async fn register_schema(session: &SessionContext<Memory>, schema_key: &str, untracked: bool) {
         let sql = format!(
             "INSERT INTO lix_registered_schema \
-             (value, lixcol_global, lixcol_untracked) VALUES ($1, false, {untracked})"
+             (schema_key, value, lixcol_global, lixcol_untracked) VALUES ($1 ->> 'key', $1, false, {untracked})"
         );
         session
-            .execute(&sql, &[Value::Json(test_schema(schema_key, false))])
+            .execute(&sql, &[Value::Jsonb(test_schema(schema_key, false).into())])
             .await
             .expect("schema registration should commit");
     }
 
     fn test_schema(schema_key: &str, amended: bool) -> JsonValue {
         let mut schema = json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
         });
         if amended {
             schema["description"] = json!("compatible additive amendment");
-            schema["properties"]["title"] = json!({ "type": "string" });
+            schema["columns"]
+                .as_array_mut()
+                .expect("columns")
+                .push(json!({ "name": "title", "type": "text", "nullable": true }));
         }
         schema
     }

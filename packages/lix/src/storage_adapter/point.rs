@@ -31,7 +31,11 @@ where
             "exact point-read request cardinality overflowed usize".to_string(),
         ));
     };
-    let result = read.get_many(requests).await?;
+    // Keep adapter-specific point-read futures off the caller's stack. This
+    // boundary is reached from deeply nested authenticated state reads, and
+    // debug builds otherwise retain the concrete RocksDB/SlateDB future in
+    // every enclosing poll frame.
+    let result = Box::pin(read.get_many(requests)).await?;
     if result.values.len() != expected {
         return Err(StorageError::Corruption(format!(
             "exact point read returned {} values for {expected} requested keys in a {}-request batch",
@@ -249,11 +253,6 @@ impl PointValues<'_> {
 
     pub fn is_empty(&self) -> bool {
         self.requested_to_unique.is_empty()
-    }
-
-    pub fn value_at(&self, requested_index: usize) -> Option<&ProjectedValue> {
-        let unique_index = self.requested_to_unique.unique_index(requested_index)?;
-        self.unique_values.get(unique_index)?.as_ref()
     }
 
     pub fn materialize_caller_order(self) -> Vec<Option<ProjectedValue>> {

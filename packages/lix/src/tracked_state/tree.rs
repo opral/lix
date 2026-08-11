@@ -122,6 +122,119 @@ impl TrackedStateTree {
         storage::load_root(store, commit_id).await
     }
 
+    /// Returns the distinct schema identities that are physically present in
+    /// this authenticated root. Each schema run is discovered with one
+    /// lower-bound descent, so callers can plan schema/file-bounded work
+    /// without trusting the public registration catalog or materializing the
+    /// full tree.
+    pub(crate) async fn distinct_schema_keys(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+    ) -> Result<Vec<String>, LixError> {
+        let mut schema_keys = Vec::new();
+        let mut lower = Vec::new();
+        while let Some(encoded_key) = self
+            .first_key_at_or_after(store, root_id, &lower)
+            .await?
+        {
+            let key = decode_key(&encoded_key)?;
+            let schema_key = key.schema_key;
+            let Some(next_lower) =
+                lexicographic_successor(&encode_schema_key_prefix(&schema_key))
+            else {
+                schema_keys.push(schema_key);
+                break;
+            };
+            if next_lower <= lower {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "tracked-state schema inventory did not advance",
+                ));
+            }
+            schema_keys.push(schema_key);
+            lower = next_lower;
+        }
+        Ok(schema_keys)
+    }
+
+    async fn first_key_at_or_after(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        lower: &[u8],
+    ) -> Result<Option<Bytes>, LixError> {
+        let mut current = *root_id.as_bytes();
+        let mut expected_summary = None;
+        loop {
+            let node = self.load_node(store, &current).await?;
+            if let Some(expected) = expected_summary.take() {
+                validate_decoded_node_summary(&node, &expected)?;
+            }
+            match node {
+                DecodedNode::Leaf(leaf) => {
+                    let mut low = 0usize;
+                    let mut high = leaf.len();
+                    while low < high {
+                        let mid = low + (high - low) / 2;
+                        let key = leaf.key(mid)?.ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                "tracked-state leaf key disappeared during lower-bound seek",
+                            )
+                        })?;
+                        if key < lower {
+                            low = mid + 1;
+                        } else {
+                            high = mid;
+                        }
+                    }
+                    return Ok(leaf.entry_owned(low).map(|entry| entry.key));
+                }
+                DecodedNode::Internal(internal) => {
+                    let children = internal.into_children();
+                    for child in &children {
+                        self.authenticate_subtree_right_edge(store, child).await?;
+                    }
+                    let Some(child) = children
+                        .into_iter()
+                        .find(|child| child.last_key.as_ref() >= lower)
+                    else {
+                        return Ok(None);
+                    };
+                    current = child.child_hash;
+                    expected_summary = Some(child);
+                }
+            }
+        }
+    }
+
+    async fn authenticate_subtree_right_edge(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        summary: &ChildSummary,
+    ) -> Result<(), LixError> {
+        let mut current = summary.child_hash;
+        let mut expected = summary.clone();
+        loop {
+            let node = self.load_node(store, &current).await?;
+            validate_decoded_node_summary(&node, &expected)?;
+            match node {
+                DecodedNode::Leaf(_) => return Ok(()),
+                DecodedNode::Internal(internal) => {
+                    let Some(child) = internal.children().last().cloned() else {
+                        return Err(LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "tracked-state internal node has no right edge",
+                        ));
+                    };
+                    current = child.child_hash;
+                    expected = child;
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn get(
         &self,
@@ -173,7 +286,7 @@ impl TrackedStateTree {
             key_batch.push(TrackedStateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             });
         }
         let encoded_keys = key_batch.finish();
@@ -210,12 +323,23 @@ impl TrackedStateTree {
         if request.limit == Some(0) {
             return Ok(Vec::new());
         }
+        if !request.row_pks.is_empty()
+            && request.row_pks.iter().all(|row_pk| {
+                !crate::tracked_state::row_pk_satisfies_bounds(
+                    row_pk,
+                    request.row_pk_lower.as_ref(),
+                    request.row_pk_upper.as_ref(),
+                )
+            })
+        {
+            return Ok(Vec::new());
+        }
 
         let ranges = scan_ranges(request);
         let key_decode_hint = scan_key_decode_hint(request, &ranges);
         let row_capacity = if request.include_tombstones
             && request.schema_keys.is_empty()
-            && request.entity_pks.is_empty()
+            && request.row_pks.is_empty()
             && request.file_ids.is_empty()
         {
             let row_count = match self.load_node(store, root_id.as_bytes()).await? {
@@ -388,7 +512,7 @@ impl TrackedStateTree {
                     })?;
                 let chunk_bytes = chunks.data.len();
                 let chunks = chunks.finish();
-                overlay.stage_chunks(writes, &chunks);
+                overlay.stage_chunks(store, writes, &chunks).await?;
                 return Ok(TrackedStateApplyResult {
                     root_id: TrackedStateRootId::new(root.child_hash),
                     row_count: 0,
@@ -489,7 +613,7 @@ impl TrackedStateTree {
         };
         let chunk_bytes = chunks.data.len();
         let chunks = chunks.finish();
-        overlay.stage_chunks(writes, &chunks);
+        overlay.stage_chunks(store, writes, &chunks).await?;
         Ok(TrackedStateApplyResult {
             root_id,
             row_count,
@@ -934,7 +1058,7 @@ impl TrackedStateTree {
 
         let built = assembler.finish(self)?;
         let result = self
-            .persist_built_tree(writes, overlay, built, commit_id)
+            .persist_built_tree(store, writes, overlay, built, commit_id)
             .await?;
         Ok((result, cascaded_rows))
     }
@@ -1241,12 +1365,13 @@ impl TrackedStateTree {
 
     async fn persist_built_tree(
         &self,
+        store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         built: BuiltTree,
         _commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
-        overlay.stage_chunks(writes, &built.chunks);
+        overlay.stage_chunks(store, writes, &built.chunks).await?;
         Ok(TrackedStateApplyResult {
             root_id: built.root_id,
             row_count: built.row_count,
@@ -2020,7 +2145,7 @@ where
                 TrackedStateKeyRef {
                     schema_key: delta.schema_key,
                     file_id: delta.file_id,
-                    entity_pk: delta.entity_pk,
+                    row_pk: delta.row_pk,
                 },
             );
             pending.push((delta, mutation.require_absence, encoded_key));
@@ -2051,14 +2176,14 @@ where
 }
 
 fn duplicate_root_insert_error(delta: &TrackedStateDeltaRef<'_>) -> LixError {
-    let entity_pk = delta
-        .entity_pk
+    let row_pk = delta
+        .row_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
-            "primary-key constraint violation on schema '{}': INSERT would duplicate entity_pk '{entity_pk}'",
+            "primary-key constraint violation on schema '{}': INSERT would duplicate row_pk '{row_pk}'",
             delta.schema_key
         ),
     )
@@ -2489,7 +2614,7 @@ fn tree_diff_capacity_hint(node: &DecodedNode, request: &TrackedStateTreeScanReq
     let row_count = decoded_node_row_count(node);
     if request.include_tombstones
         && request.schema_keys.is_empty()
-        && request.entity_pks.is_empty()
+        && request.row_pks.is_empty()
         && request.file_ids.is_empty()
     {
         request
@@ -2510,6 +2635,46 @@ fn decoded_leaf_summary(
         child_hash: hash,
         subtree_count: leaf.len() as u64,
     }
+}
+
+fn validate_decoded_node_summary(
+    node: &DecodedNode,
+    expected: &ChildSummary,
+) -> Result<(), LixError> {
+    let (first_key, last_key, subtree_count) = match node {
+        DecodedNode::Leaf(leaf) => (
+            leaf.first_key().unwrap_or_default(),
+            leaf.last_key().unwrap_or_default(),
+            leaf.len() as u64,
+        ),
+        DecodedNode::Internal(internal) => {
+            let children = internal.children();
+            let first_key = children.first().map(|child| child.first_key.as_ref());
+            let last_key = children.last().map(|child| child.last_key.as_ref());
+            let subtree_count = children
+                .iter()
+                .try_fold(0_u64, |total, child| total.checked_add(child.subtree_count));
+            let (Some(first_key), Some(last_key), Some(subtree_count)) =
+                (first_key, last_key, subtree_count)
+            else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "tracked-state internal child summary is invalid",
+                ));
+            };
+            (first_key, last_key, subtree_count)
+        }
+    };
+    if first_key != expected.first_key.as_ref()
+        || last_key != expected.last_key.as_ref()
+        || subtree_count != expected.subtree_count
+    {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "tracked-state child summary does not match authenticated child contents",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2556,7 +2721,7 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
         return Vec::new();
     }
 
-    let can_bind_entity = !request.entity_pks.is_empty()
+    let can_bind_row = !request.row_pks.is_empty()
         && !request.file_ids.is_empty()
         && request
             .file_ids
@@ -2565,18 +2730,25 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
 
     let mut ranges = Vec::new();
     for schema_key in &request.schema_keys {
-        if can_bind_entity {
+        if can_bind_row {
             for file_filter in &request.file_ids {
                 let file_id = match file_filter {
                     NullableKeyFilter::Null => None,
                     NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
                     NullableKeyFilter::Any => unreachable!("filtered above"),
                 };
-                for entity_pk in &request.entity_pks {
+                for row_pk in &request.row_pks {
+                    if !crate::tracked_state::row_pk_satisfies_bounds(
+                        row_pk,
+                        request.row_pk_lower.as_ref(),
+                        request.row_pk_upper.as_ref(),
+                    ) {
+                        continue;
+                    }
                     let key = TrackedStateKey {
                         schema_key: schema_key.clone(),
                         file_id: file_id.clone(),
-                        entity_pk: entity_pk.clone(),
+                        row_pk: row_pk.clone(),
                     };
                     ranges.push(exact_scan_range(encode_key(&key)));
                 }
@@ -2595,14 +2767,21 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
         }
 
         for file_filter in &request.file_ids {
-            let prefix = match file_filter {
-                NullableKeyFilter::Null => encode_schema_file_prefix(schema_key, None),
-                NullableKeyFilter::Value(file_id) => {
-                    encode_schema_file_prefix(schema_key, Some(file_id))
-                }
+            let (prefix, file_id) = match file_filter {
+                NullableKeyFilter::Null => (encode_schema_file_prefix(schema_key, None), None),
+                NullableKeyFilter::Value(file_id) => (
+                    encode_schema_file_prefix(schema_key, Some(file_id)),
+                    Some(file_id.clone()),
+                ),
                 NullableKeyFilter::Any => unreachable!("handled above"),
             };
-            ranges.push(prefix_scan_range(prefix));
+            ranges.push(row_pk_scan_range(
+                schema_key,
+                file_id,
+                prefix,
+                request.row_pk_lower.as_ref(),
+                request.row_pk_upper.as_ref(),
+            ));
         }
     }
     ranges
@@ -2615,7 +2794,7 @@ fn scan_key_decode_hint<'a>(
     if ranges.len() != 1 || request.schema_keys.len() != 1 || request.file_ids.len() != 1 {
         return None;
     }
-    if !request.entity_pks.is_empty() {
+    if !request.row_pks.is_empty() {
         return None;
     }
     let file_id = match request.file_ids.first()? {
@@ -2626,7 +2805,7 @@ fn scan_key_decode_hint<'a>(
     Some(ScanKeyDecodeHint {
         schema_key: request.schema_keys.first()?.as_str(),
         file_id,
-        prefix_len: ranges.first()?.start.len(),
+        prefix_len: encode_schema_file_prefix(request.schema_keys.first()?, file_id).len(),
     })
 }
 
@@ -2642,6 +2821,46 @@ fn exact_scan_range(key: Vec<u8>) -> EncodedScanRange {
         end: lexicographic_successor(&key),
         start: key,
     }
+}
+
+fn row_pk_scan_range(
+    schema_key: &str,
+    file_id: Option<String>,
+    prefix: Vec<u8>,
+    lower: Option<&crate::tracked_state::RowPkRangeBound>,
+    upper: Option<&crate::tracked_state::RowPkRangeBound>,
+) -> EncodedScanRange {
+    let start = lower.map_or_else(
+        || prefix.clone(),
+        |bound| {
+            let key = encode_key(&TrackedStateKey {
+                schema_key: schema_key.to_owned(),
+                file_id: file_id.clone(),
+                row_pk: bound.row_pk.clone(),
+            });
+            if bound.inclusive {
+                key
+            } else {
+                lexicographic_successor(&key).unwrap_or(key)
+            }
+        },
+    );
+    let end = upper.map_or_else(
+        || lexicographic_successor(&prefix),
+        |bound| {
+            let key = encode_key(&TrackedStateKey {
+                schema_key: schema_key.to_owned(),
+                file_id,
+                row_pk: bound.row_pk.clone(),
+            });
+            if bound.inclusive {
+                lexicographic_successor(&key)
+            } else {
+                Some(key)
+            }
+        },
+    );
+    EncodedScanRange { start, end }
 }
 
 fn lexicographic_successor(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -2679,7 +2898,14 @@ fn key_matches_scan_filters(request: &TrackedStateTreeScanRequest, key: &Tracked
     if !request.schema_keys.is_empty() && !request.schema_keys.contains(&key.schema_key) {
         return false;
     }
-    if !request.entity_pks.is_empty() && !request.entity_pks.contains(&key.entity_pk) {
+    if !request.row_pks.is_empty() && !request.row_pks.contains(&key.row_pk) {
+        return false;
+    }
+    if !crate::tracked_state::row_pk_satisfies_bounds(
+        &key.row_pk,
+        request.row_pk_lower.as_ref(),
+        request.row_pk_upper.as_ref(),
+    ) {
         return false;
     }
     if !request.file_ids.is_empty()
@@ -2733,7 +2959,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::changelog::{ChangeId, CommitId};
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
     use crate::storage::{
         BeginScanOptions, GetManyResult, KeyRange, ProjectedValue, ScanCursor, Storage,
         StorageError, StorageRead,
@@ -2741,6 +2967,32 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageAdapterReadScope};
     use crate::tracked_state::codec::{encode_value, hash_bytes};
+
+    #[test]
+    fn schema_inventory_rejects_too_low_routing_boundary() {
+        let key = encode_key(&TrackedStateKey {
+            schema_key: "private_schema".to_string(),
+            file_id: Some("file-a".to_string()),
+            row_pk: RowPk::single("row-a"),
+        });
+        let value = encode_value(&value("change-a", Some("present")));
+        let bytes = Bytes::from(encode_leaf_node(&[EncodedLeafEntry {
+            key: Bytes::from(key.clone()),
+            value: Bytes::from(value),
+        }]));
+        let node = decode_node(&bytes).expect("fixture leaf should decode");
+        let error = validate_decoded_node_summary(
+            &node,
+            &ChildSummary {
+                first_key: Bytes::from(key),
+                last_key: Bytes::from_static(b"forged-too-low"),
+                child_hash: hash_bytes(&bytes),
+                subtree_count: 1,
+            },
+        )
+        .expect_err("hash-valid child with substituted boundary must fail closed");
+        assert!(error.message.contains("child summary does not match"));
+    }
 
     struct CountingChunkRead {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
@@ -2853,6 +3105,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_candidates_outside_primary_key_bounds_do_zero_tree_reads() {
+        let bytes = encode_leaf_node(&[]);
+        let hash = hash_bytes(&bytes);
+        let storage_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageAdapterReadScope::new(CountingChunkRead {
+            hash,
+            bytes,
+            storage_reads: Arc::clone(&storage_reads),
+            corrupt_first_read: false,
+        });
+        let rows = TrackedStateTree::new()
+            .scan(
+                &store,
+                &TrackedStateRootId::new(hash),
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema".to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    row_pks: vec![RowPk::single("a"), RowPk::single("b")],
+                    row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("c"),
+                        inclusive: true,
+                    }),
+                    row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("d"),
+                        inclusive: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("empty exact/range intersection should short circuit");
+        assert!(rows.is_empty());
+        assert_eq!(storage_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn oversized_node_loads_are_not_cached() {
         let bytes = encode_leaf_node(&[]);
         assert!(bytes.len() > 1, "test node must have an encoded body");
@@ -2916,7 +3204,7 @@ mod tests {
         let rows = (0..10_000)
             .map(|index| {
                 mutation_owned(
-                    key("schema", None, &format!("entity-{index:05}")),
+                    key("schema", None, &format!("row-{index:05}")),
                     value(&format!("change-{index}"), Some("{}")),
                 )
             })
@@ -2929,7 +3217,7 @@ mod tests {
             &storage,
             Some(&base.root_id),
             vec![mutation_owned(
-                key("schema", None, "entity-05000"),
+                key("schema", None, "row-05000"),
                 value("change-updated", Some("{}")),
             )],
             None,
@@ -2943,7 +3231,7 @@ mod tests {
             &storage,
             Some(&base.root_id),
             vec![mutation_owned(
-                key("schema", None, "entity-10000"),
+                key("schema", None, "row-10000"),
                 value("change-inserted", Some("{}")),
             )],
             None,
@@ -3018,7 +3306,7 @@ mod tests {
         let rows = (0..10_000)
             .map(|index| {
                 mutation_owned(
-                    key("schema", None, &format!("entity-{index:05}")),
+                    key("schema", None, &format!("row-{index:05}")),
                     value(&format!("change-{index}"), Some("{}")),
                 )
             })
@@ -3033,7 +3321,7 @@ mod tests {
                 &storage,
                 Some(&current),
                 vec![mutation_owned(
-                    key("schema", None, &format!("entity-{:05}", 5_000 + index)),
+                    key("schema", None, &format!("row-{:05}", 5_000 + index)),
                     value(&format!("updated-{index}"), Some("{}")),
                 )],
                 None,
@@ -3063,7 +3351,7 @@ mod tests {
         let base_rows = (0..512usize)
             .map(|index| {
                 (
-                    key("schema", None, &format!("entity-{:05}", index * 2)),
+                    key("schema", None, &format!("row-{:05}", index * 2)),
                     value(&format!("base-change-{index}"), Some("{}")),
                 )
             })
@@ -3100,10 +3388,10 @@ mod tests {
         let boundary_key = decode_key(&leaf_summaries[leaf_summaries.len() / 2].last_key)
             .expect("leaf boundary key should decode");
         let boundary_number = boundary_key
-            .entity_pk
+            .row_pk
             .as_single_string()
             .expect("fixture key should be scalar")
-            .strip_prefix("entity-")
+            .strip_prefix("row-")
             .expect("fixture key should have its prefix")
             .parse::<usize>()
             .expect("fixture key suffix should be numeric");
@@ -3123,28 +3411,28 @@ mod tests {
             key(
                 "schema",
                 None,
-                &format!("entity-{boundary_insert_number:05}"),
+                &format!("row-{boundary_insert_number:05}"),
             ),
             value("boundary-insert", Some("{}")),
         );
         changed_rows.insert(
-            key("schema", None, "entity--prepend"),
+            key("schema", None, "row--prepend"),
             value("prepend-insert", Some("{}")),
         );
         changed_rows.insert(
-            key("schema", None, &format!("entity-{middle_insert_number:05}")),
+            key("schema", None, &format!("row-{middle_insert_number:05}")),
             value("middle-insert", Some("{}")),
         );
         changed_rows.insert(
-            key("schema", None, "entity-99999"),
+            key("schema", None, "row-99999"),
             value("append-insert", Some("{}")),
         );
         changed_rows.insert(
-            key("schema", None, "entity-00020"),
+            key("schema", None, "row-00020"),
             value("updated-existing", Some("{}")),
         );
         changed_rows.insert(
-            key("schema", None, "entity-00040"),
+            key("schema", None, "row-00040"),
             value("tombstoned-existing", None),
         );
 
@@ -3193,7 +3481,7 @@ mod tests {
         let rows = (0..256usize)
             .map(|index| {
                 (
-                    key("schema", Some("file"), &format!("entity-{index:05}")),
+                    key("schema", Some("file"), &format!("row-{index:05}")),
                     value(&format!("change-{index}"), Some("{}")),
                 )
             })
@@ -3247,7 +3535,7 @@ mod tests {
         let mut transition = None;
 
         for index in 0..2_048usize {
-            let inserted_key = key("schema", None, &format!("entity-{index:05}"));
+            let inserted_key = key("schema", None, &format!("row-{index:05}"));
             let inserted_value = value(&format!("change-{index}"), Some("{}"));
             let next = apply_mutations_for_test(
                 &tree,
@@ -3300,7 +3588,7 @@ mod tests {
     async fn exact_read_roundtrips_from_applied_root() {
         let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
-        let key = key("schema", None, "entity");
+        let key = key("schema", None, "row");
         let value = value("change-1", Some("{}"));
         let result =
             apply_mutations_for_test(&tree, &storage, None, vec![mutation(&key, &value)], None)
@@ -3340,18 +3628,18 @@ mod tests {
                     2 => Some("file\0"),
                     _ => Some("文件"),
                 };
-                let entity_pk = if index % 2 == 0 {
-                    EntityPk::single(format!("entity\0{index:03}"))
+                let row_pk = if index % 2 == 0 {
+                    RowPk::single(format!("row-{index:03}"))
                 } else {
-                    EntityPk::from_parts_unchecked(vec![
-                        format!("entity-{index:03}"),
-                        "尾\0".to_string(),
+                    RowPk::from_parts_unchecked(vec![
+                        format!("row-{index:03}"),
+                        "尾-".to_string(),
                     ])
                 };
                 let key = TrackedStateKey {
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
-                    entity_pk,
+                    row_pk,
                 };
                 let value = value(&format!("change-{index}"), Some("{}"));
                 (key, value)
@@ -3409,7 +3697,7 @@ mod tests {
     async fn latest_mutation_for_key_wins() {
         let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
-        let key = key("schema", None, "entity");
+        let key = key("schema", None, "row");
         let old_value = value("change-old", Some("{\"v\":1}"));
         let new_value = value("change-new", Some("{\"v\":2}"));
         let result = apply_mutations_for_test(
@@ -3471,7 +3759,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let identities = rows
             .iter()
-            .map(|(key, _)| key.entity_pk.as_single_string_owned().expect("identity"))
+            .map(|(key, _)| key.row_pk.as_single_string_owned().expect("identity"))
             .collect::<Vec<_>>();
         assert_eq!(identities, vec!["deleted", "visible"]);
 
@@ -3489,13 +3777,13 @@ mod tests {
             .expect("live scan should succeed");
         let live_identities = live_rows
             .iter()
-            .map(|(key, _)| key.entity_pk.as_single_string_owned().expect("identity"))
+            .map(|(key, _)| key.row_pk.as_single_string_owned().expect("identity"))
             .collect::<Vec<_>>();
         assert_eq!(live_identities, vec!["visible"]);
     }
 
     #[tokio::test]
-    async fn scan_filters_by_schema_entity_and_file() {
+    async fn scan_filters_by_schema_row_and_file() {
         let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let result = apply_mutations_for_test(
@@ -3507,7 +3795,7 @@ mod tests {
                     key(
                         "schema-a",
                         Some("01920000-0000-7000-8000-0000000000a2"),
-                        "entity-a",
+                        "row-a",
                     ),
                     value("c1", Some("{}")),
                 ),
@@ -3515,7 +3803,7 @@ mod tests {
                     key(
                         "schema-a",
                         Some("01920000-0000-7000-8000-0000000000b2"),
-                        "entity-a",
+                        "row-a",
                     ),
                     value("c2", Some("{}")),
                 ),
@@ -3523,7 +3811,7 @@ mod tests {
                     key(
                         "schema-a",
                         Some("01920000-0000-7000-8000-0000000000a2"),
-                        "entity-b",
+                        "row-b",
                     ),
                     value("c3", Some("{}")),
                 ),
@@ -3531,7 +3819,7 @@ mod tests {
                     key(
                         "schema-b",
                         Some("01920000-0000-7000-8000-0000000000a2"),
-                        "entity-a",
+                        "row-a",
                     ),
                     value("c4", Some("{}")),
                 ),
@@ -3551,7 +3839,7 @@ mod tests {
                 &result.root_id,
                 &TrackedStateTreeScanRequest {
                     schema_keys: vec!["schema-a".to_string()],
-                    entity_pks: vec![EntityPk::single("entity-a")],
+                    row_pks: vec![RowPk::single("row-a")],
                     file_ids: vec![NullableKeyFilter::Value(
                         "01920000-0000-7000-8000-0000000000a2".to_string(),
                     )],
@@ -3566,33 +3854,66 @@ mod tests {
         assert_eq!(
             rows[0]
                 .0
-                .entity_pk
+                .row_pk
                 .as_single_string_owned()
                 .expect("identity"),
-            "entity-a"
+            "row-a"
         );
         assert_eq!(
             rows[0].0.file_id.as_deref(),
             Some("01920000-0000-7000-8000-0000000000a2")
         );
 
-        // With no schema predicate there is no encoded scan range or trusted
-        // prefix. This exercises the decoded-key filter path directly.
-        let entity_only_rows = tree
+        let bounded_exact_rows = tree
             .scan(
                 &store,
                 &result.root_id,
                 &TrackedStateTreeScanRequest {
-                    entity_pks: vec![EntityPk::single("entity-b")],
+                    schema_keys: vec!["schema-a".to_string()],
+                    row_pks: vec![RowPk::single("row-a"), RowPk::single("row-b")],
+                    file_ids: vec![NullableKeyFilter::Value(
+                        "01920000-0000-7000-8000-0000000000a2".to_string(),
+                    )],
+                    row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("row-b"),
+                        inclusive: true,
+                    }),
+                    row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("row-b"),
+                        inclusive: true,
+                    }),
                     ..Default::default()
                 },
             )
             .await
-            .expect("entity-only scan should succeed");
-        assert_eq!(entity_only_rows.len(), 1);
-        assert_eq!(entity_only_rows[0].0.schema_key, "schema-a");
+            .expect("exact candidates must intersect range bounds");
+        assert_eq!(bounded_exact_rows.len(), 1);
         assert_eq!(
-            entity_only_rows[0].0.file_id.as_deref(),
+            bounded_exact_rows[0]
+                .0
+                .row_pk
+                .as_single_string_owned()
+                .expect("identity"),
+            "row-b"
+        );
+
+        // With no schema predicate there is no encoded scan range or trusted
+        // prefix. This exercises the decoded-key filter path directly.
+        let row_only_rows = tree
+            .scan(
+                &store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    row_pks: vec![RowPk::single("row-b")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("row-only scan should succeed");
+        assert_eq!(row_only_rows.len(), 1);
+        assert_eq!(row_only_rows[0].0.schema_key, "schema-a");
+        assert_eq!(
+            row_only_rows[0].0.file_id.as_deref(),
             Some("01920000-0000-7000-8000-0000000000a2")
         );
     }
@@ -3610,7 +3931,7 @@ mod tests {
                     key(
                         "schema-a",
                         Some("01920000-0000-7000-8000-0000000000a2"),
-                        "entity-a",
+                        "row-a",
                     ),
                     value("c1", Some("{}")),
                 ),
@@ -3618,7 +3939,7 @@ mod tests {
                     key(
                         "schema-a",
                         Some("01920000-0000-7000-8000-0000000000a2"),
-                        "entity-b",
+                        "row-b",
                     ),
                     value("c2", None),
                 ),
@@ -3626,7 +3947,7 @@ mod tests {
                     key(
                         "schema-a",
                         Some("01920000-0000-7000-8000-0000000000a2"),
-                        "entity-c",
+                        "row-c",
                     ),
                     value("c3", Some("{}")),
                 ),
@@ -3634,7 +3955,7 @@ mod tests {
                     key(
                         "schema-a",
                         Some("01920000-0000-7000-8000-0000000000b2"),
-                        "entity-d",
+                        "row-d",
                     ),
                     value("c4", Some("{}")),
                 ),
@@ -3670,9 +3991,82 @@ mod tests {
             && key.file_id.as_deref() == Some("01920000-0000-7000-8000-0000000000a2")));
         assert_eq!(
             rows.iter()
-                .map(|(key, _)| key.entity_pk.as_single_string_owned().expect("identity"))
+                .map(|(key, _)| key.row_pk.as_single_string_owned().expect("identity"))
                 .collect::<Vec<_>>(),
-            vec!["entity-a", "entity-c"]
+            vec!["row-a", "row-c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_schema_file_primary_key_range_honors_open_closed_and_empty_bounds() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::new();
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let result = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            ["row-a", "row-b", "row-c", "row-d"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, row_pk)| {
+                    mutation_owned(
+                        key("schema-a", Some(file_id), row_pk),
+                        value(&format!("range-c{index}"), Some("{}")),
+                    )
+                })
+                .collect(),
+            None,
+        )
+        .await
+        .expect("range fixture should apply");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("range read should open");
+        let request = |lower: (&str, bool), upper: (&str, bool)| {
+            TrackedStateTreeScanRequest {
+                schema_keys: vec!["schema-a".to_owned()],
+                file_ids: vec![NullableKeyFilter::Value(file_id.to_owned())],
+                row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                    row_pk: RowPk::single(lower.0),
+                    inclusive: lower.1,
+                }),
+                row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                    row_pk: RowPk::single(upper.0),
+                    inclusive: upper.1,
+                }),
+                ..Default::default()
+            }
+        };
+
+        let rows = tree
+            .scan(&store, &result.root_id, &request(("row-a", false), ("row-d", false)))
+            .await
+            .expect("open range should scan");
+        assert_eq!(
+            rows.into_iter()
+                .map(|(key, _)| key.row_pk.into_parts())
+                .collect::<Vec<_>>(),
+            vec![vec!["row-b"], vec!["row-c"]]
+        );
+
+        let rows = tree
+            .scan(&store, &result.root_id, &request(("row-b", true), ("row-c", true)))
+            .await
+            .expect("closed range should scan");
+        assert_eq!(
+            rows.into_iter()
+                .map(|(key, _)| key.row_pk.into_parts())
+                .collect::<Vec<_>>(),
+            vec![vec!["row-b"], vec!["row-c"]]
+        );
+
+        assert!(
+            tree.scan(&store, &result.root_id, &request(("row-d", true), ("row-a", true)))
+                .await
+                .expect("empty inverted range should not fail")
+                .is_empty()
         );
     }
 
@@ -3815,12 +4209,12 @@ mod tests {
         let rows = (0..100)
             .map(|index| {
                 mutation_owned(
-                    key("schema", None, &format!("entity-{index:03}")),
+                    key("schema", None, &format!("record-{index:03}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
             })
             .collect::<Vec<_>>();
-        let changed_key = key("schema", None, "entity-000");
+        let changed_key = key("schema", None, "record-000");
         let changed_value = value("changed", Some("{\"v\":\"changed\"}"));
         let base = apply_mutations_for_test(&tree, &storage, None, rows, None)
             .await
@@ -3871,12 +4265,12 @@ mod tests {
         let rows = (0..100)
             .map(|index| {
                 mutation_owned(
-                    key("schema", None, &format!("entity-{index:03}")),
+                    key("schema", None, &format!("record-{index:03}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
             })
             .collect::<Vec<_>>();
-        let inserted_key = key("schema", None, "entity-050b");
+        let inserted_key = key("schema", None, "record-050b");
         let inserted_value = value("inserted", Some("{\"v\":\"inserted\"}"));
         let base = apply_mutations_for_test(&tree, &storage, None, rows, None)
             .await
@@ -3928,7 +4322,7 @@ mod tests {
         let rows = (0..100)
             .map(|index| {
                 mutation_owned(
-                    key("schema", None, &format!("entity-{index:03}")),
+                    key("schema", None, &format!("record-{index:03}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
             })
@@ -3938,7 +4332,7 @@ mod tests {
         let updates = (10..90)
             .map(|index| {
                 (
-                    key("schema", None, &format!("entity-{index:03}")),
+                    key("schema", None, &format!("record-{index:03}")),
                     value(
                         &format!("changed-{index}"),
                         Some(&format!("{{\"changed\":{index}}}")),
@@ -3992,6 +4386,9 @@ mod tests {
             min_chunk_bytes: 64,
             max_chunk_bytes: 256,
         });
+        // Preserve this arbitrary primary-key payload byte-for-byte: the
+        // regression is deliberately pinned to the page split geometry it
+        // produces. It is stored row data, not an engine/API term.
         let rows = (0..100)
             .map(|index| {
                 mutation_owned(
@@ -4003,9 +4400,9 @@ mod tests {
         let inserts = ["entity-050a", "entity-050b", "entity-050c"]
             .into_iter()
             .enumerate()
-            .map(|(index, entity_pk)| {
+            .map(|(index, row_pk)| {
                 (
-                    key("schema", None, entity_pk),
+                    key("schema", None, row_pk),
                     value(
                         &format!("inserted-{index}"),
                         Some(&format!("{{\"inserted\":{index}}}")),
@@ -4068,7 +4465,7 @@ mod tests {
         let initial = (0..192)
             .map(|index| {
                 mutation_owned(
-                    key("schema", None, &format!("entity-{index:04}")),
+                    key("schema", None, &format!("row-{index:04}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
             })
@@ -4087,7 +4484,7 @@ mod tests {
             } else {
                 192 + step
             };
-            let logical_key = key("schema", None, &format!("entity-{index:04}"));
+            let logical_key = key("schema", None, &format!("row-{index:04}"));
             let logical_value = value(
                 &format!("random-{step}"),
                 Some(&format!("{{\"step\":{step},\"state\":{state}}}")),
@@ -4145,7 +4542,7 @@ mod tests {
         let initial = (0..256)
             .map(|index| {
                 mutation_owned(
-                    key("schema", None, &format!("entity-{index:04}")),
+                    key("schema", None, &format!("row-{index:04}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
             })
@@ -4153,9 +4550,9 @@ mod tests {
         let base = apply_mutations_for_test(&tree, &storage, None, initial, None)
             .await
             .expect("base should build");
-        let first_key = key("schema", None, "entity-0010");
+        let first_key = key("schema", None, "row-0010");
         let first_value = value("first-updated", Some("{\"updated\":10}"));
-        let last_key = key("schema", None, "entity-0240");
+        let last_key = key("schema", None, "row-0240");
         let last_value = value("last-updated", Some("{\"updated\":240}"));
         let updated = apply_mutations_for_test(
             &tree,
@@ -4258,7 +4655,7 @@ mod tests {
     fn encoded_entries_with_change_id(change_id: &str) -> Vec<EncodedLeafEntry> {
         (0..64)
             .map(|index| {
-                let key = key("schema", None, &format!("entity-{index:03}"));
+                let key = key("schema", None, &format!("row-{index:03}"));
                 EncodedLeafEntry {
                     key: encode_key(&key).into(),
                     value: encode_value(&value(change_id, Some("{}"))).into(),
@@ -4288,11 +4685,11 @@ mod tests {
             .collect()
     }
 
-    fn key(schema_key: &str, file_id: Option<&str>, entity_pk: &str) -> TrackedStateKey {
+    fn key(schema_key: &str, file_id: Option<&str>, row_pk: &str) -> TrackedStateKey {
         TrackedStateKey {
             schema_key: schema_key.to_string(),
             file_id: file_id.map(str::to_string),
-            entity_pk: EntityPk::single(entity_pk),
+            row_pk: RowPk::single(row_pk),
         }
     }
 

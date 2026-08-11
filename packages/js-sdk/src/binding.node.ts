@@ -12,9 +12,8 @@ type NativeAddon = {
 		openMemory(
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
-		openLocalFilesystem(
+		openFilesystemStorage(
 			path: string,
-			lixDir: string | undefined,
 			syncAllFiles: boolean,
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
@@ -52,48 +51,80 @@ function resolveNativePath() {
 	throw packageResolutionError;
 }
 
-let addon: NativeAddon;
-try {
-	addon = require(resolveNativePath()) as NativeAddon;
-} catch (cause) {
-	const error = new Error(
-		`Failed to load @lix-js/sdk native addon for ${process.platform}-${process.arch}. ` +
-			"This package requires the matching optional native binary package. " +
-			"Run `npm run build` from packages/js-sdk for local development, or install a release that includes your platform binary.",
-	) as Error & { cause?: unknown };
-	error.cause = cause;
-	throw error;
+let addon: NativeAddon | undefined;
+let addonLoadError: Error | undefined;
+
+function loadNativeAddon(): NativeAddon {
+	if (addon) return addon;
+	if (addonLoadError) throw addonLoadError;
+	try {
+		addon = require(resolveNativePath()) as NativeAddon;
+		return addon;
+	} catch (cause) {
+		const error = new Error(
+			`Failed to load @lix-js/sdk native addon for ${process.platform}-${process.arch}. ` +
+				"This package requires the matching optional native binary package. " +
+				"Run `npm run build` from packages/js-sdk for local development, or install a release that includes your platform binary.",
+			{ cause },
+		);
+		addonLoadError = error;
+		throw error;
+	}
 }
 
-export function openLixBinding(
+export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
 ): Promise<LixBinding> {
-	const nativeTelemetry = telemetry
-		? (spanJson: string) => telemetry(JSON.parse(spanJson))
-		: undefined;
+	try {
+		return await openNativeLixBinding(storage, telemetry);
+	} catch (nativeError) {
+		if (storage.kind !== "memory") throw nativeError;
+		try {
+			const { openMemoryWasmBinding } = await import(
+				"./binding.node-wasm.js"
+			);
+			return await openMemoryWasmBinding(telemetry);
+		} catch (wasmError) {
+			throw new AggregateError(
+				[nativeError, wasmError],
+				"Failed to open in-memory Lix with either the native or WebAssembly binding.",
+			);
+		}
+	}
+}
+
+export async function openNativeLixBinding(
+	storage: LixStorageConfig,
+	telemetry?: TelemetryDispatch,
+): Promise<LixBinding> {
 	switch (storage.kind) {
-		case "memory":
-			if (storage.snapshot !== undefined) {
-				throw new Error(
-					"Memory snapshots are only available in the browser binding",
-				);
-			}
-			if (nativeTelemetry) return addon.Lix.openMemory(nativeTelemetry);
-			return addon.Lix.openMemory();
-		case "localFilesystem":
+		case "memory": {
+			const nativeAddon = loadNativeAddon();
+			const nativeTelemetry = telemetry
+				? (spanJson: string) => telemetry(JSON.parse(spanJson))
+				: undefined;
+			if (nativeTelemetry) return nativeAddon.Lix.openMemory(nativeTelemetry);
+			return nativeAddon.Lix.openMemory();
+		}
+		case "indexedDb":
+			throw new Error("IndexedDbStorage is only available in browsers");
+		case "filesystem": {
+			const nativeAddon = loadNativeAddon();
+			const nativeTelemetry = telemetry
+				? (spanJson: string) => telemetry(JSON.parse(spanJson))
+				: undefined;
 			if (nativeTelemetry) {
-				return addon.Lix.openLocalFilesystem(
+				return nativeAddon.Lix.openFilesystemStorage(
 					storage.path,
-					storage.lixDir,
 					storage.syncAllFiles,
 					nativeTelemetry,
 				);
 			}
-			return addon.Lix.openLocalFilesystem(
+			return nativeAddon.Lix.openFilesystemStorage(
 				storage.path,
-				storage.lixDir,
 				storage.syncAllFiles,
 			);
+		}
 	}
 }

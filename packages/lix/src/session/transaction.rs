@@ -18,6 +18,8 @@ use crate::transaction::{
     CommitBoundaryState, Transaction, TransactionCommitBoundary,
     open_transaction_with_runtime_boundary,
 };
+#[cfg(test)]
+use crate::transaction_types::{RawWriteBatch, TransactionWriteRow};
 
 use super::SessionContext;
 use super::context::{SessionWriteAccess, closed_error};
@@ -60,10 +62,10 @@ where
             .await;
         let (mut opened, deterministic_runtime_guard) =
             match open_transaction_with_runtime_boundary(
-                &self.mode,
+                &self.branch,
                 self.active_account_id.to_string(),
                 self.storage.clone(),
-                Arc::clone(&self.live_state),
+                Arc::clone(&self.hot_state),
                 Arc::clone(&self.tracked_state),
                 Arc::clone(&self.binary_cas),
                 self.plugin_host.clone(),
@@ -119,6 +121,17 @@ where
         self.transaction
             .as_mut()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stage_test_row(
+        &mut self,
+        row: TransactionWriteRow,
+    ) -> Result<(), LixError> {
+        self.transaction_mut()?
+            .stage_engine_test_rows(RawWriteBatch::from_test_rows(vec![row]))
+            .await?;
+        Ok(())
     }
 
     pub fn active_branch_id(&self) -> Result<&str, LixError> {

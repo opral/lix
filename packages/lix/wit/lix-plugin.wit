@@ -14,7 +14,7 @@ interface host {
     bytes: bytes,
   }
 
-  /// One immutable host-owned file and plugin-state version.
+  /// One immutable host-owned file and projection-state version.
   resource snapshot {
     file-len: func() -> u64;
     read-file: func(offset: u64, length: u32) -> result<bytes, host-error>;
@@ -25,17 +25,13 @@ interface host {
     ) -> result<option<record-chunk>, host-error>;
   }
 
-  /// One bounded, self-describing page of entity mutations.
-  record entity-page {
+  /// One bounded, self-describing page of row mutations.
+  record row-page {
     payload: bytes,
   }
 
-  resource entity-source {
-    /// Pull the same universal page envelope accepted by `emit-entities`.
-    next-page: func(
-      max-bytes: u32,
-    ) -> result<option<entity-page>, host-error>;
-    /// Read an oversized value referenced by the most recent page.
+  resource row-source {
+    next-page: func(max-bytes: u32) -> result<option<row-page>, host-error>;
     read-attachment: func(
       ordinal: u32,
       offset: u64,
@@ -43,67 +39,83 @@ interface host {
     ) -> result<option<bytes>, host-error>;
   }
 
-  /// The sole host-owned atomic output capability. Checkpoints and semantic
-  /// pages remain staged until the enclosing guest export succeeds.
+  record file-edit {
+    offset: u64,
+    delete-len: u64,
+    insert: bytes,
+  }
+
+  /// Host-owned atomic output shared by the four projection operations.
+  /// The SDK exposes only the methods appropriate for each operation.
   resource transition {
     max-batch-bytes: func() -> u32;
     put-state: func(key: bytes, value: bytes) -> result<_, host-error>;
     delete-state: func(key: bytes) -> result<_, host-error>;
-    emit-entities: func(page: entity-page) -> result<_, host-error>;
-    /// Stages one oversized entity snapshot. The returned ordinal is encoded
-    /// by the SDK in the next universal entity page.
-    begin-entity-attachment: func(total-length: u64) -> result<u32, host-error>;
-    write-entity-attachment: func(chunk: bytes) -> result<_, host-error>;
-    finish-entity-attachment: func() -> result<_, host-error>;
+    emit-rows: func(page: row-page) -> result<_, host-error>;
+    replace-all-rows: func() -> result<_, host-error>;
+    begin-row-attachment: func(total-length: u64) -> result<u32, host-error>;
+    write-row-attachment: func(chunk: bytes) -> result<_, host-error>;
+    finish-row-attachment: func() -> result<_, host-error>;
+    emit-file-edit: func(edit: file-edit) -> result<_, host-error>;
     begin-file-replacement: func(total-length: u64) -> result<_, host-error>;
     write-file-replacement: func(chunk: bytes) -> result<_, host-error>;
     finish-file-replacement: func() -> result<_, host-error>;
   }
 
-  enum conflict-side {
+  enum merge-side {
     base,
     a,
     b,
   }
 
-  record conflict-meta {
+  record column-merge-meta {
     ordinal: u32,
     schema-key: string,
-    entity-pk: list<string>,
+    row-pk: list<string>,
+    file-id: option<string>,
+    column: string,
     base-len: option<u64>,
     a-len: option<u64>,
     b-len: option<u64>,
+    base-row-len: u64,
+    a-row-len: u64,
+    b-row-len: u64,
   }
 
-  /// A bounded lazy view of canonically ordered semantic conflicts.
-  resource conflict-source {
+  /// Lazy access to overlapping column changes and their complete row context.
+  resource column-merge-source {
     len: func() -> u32;
-    get: func(index: u32) -> result<conflict-meta, host-error>;
+    get: func(index: u32) -> result<column-merge-meta, host-error>;
     read-value: func(
       index: u32,
-      side: conflict-side,
+      side: merge-side,
       offset: u64,
       length: u32,
     ) -> result<option<bytes>, host-error>;
+    read-row: func(
+      index: u32,
+      side: merge-side,
+      offset: u64,
+      length: u32,
+    ) -> result<bytes, host-error>;
   }
 
-  /// Ordered, host-staged conflict results. Replacement snapshots stream in
-  /// bounded chunks; a trap or validation failure publishes nothing.
-  resource resolution-sink {
+  /// Ordered column merge results. Omitted results are invalid; `use-lww`
+  /// explicitly accepts the host's higher-ranked `b` value.
+  resource column-merge-sink {
     max-batch-bytes: func() -> u32;
-    take: func(ordinal: u32, side: conflict-side) -> result<_, host-error>;
-    delete: func(ordinal: u32) -> result<_, host-error>;
+    use-lww: func(ordinal: u32) -> result<_, host-error>;
     begin-replace: func(
       ordinal: u32,
-      total-length: u64,
+      total-length: option<u64>,
     ) -> result<_, host-error>;
     write-replacement: func(chunk: bytes) -> result<_, host-error>;
     finish-replace: func() -> result<_, host-error>;
   }
 }
 
-interface api {
-  use host.{bytes, conflict-source, entity-source, resolution-sink, snapshot, transition};
+interface types {
+  use host.{bytes, file-edit, row-source, snapshot};
 
   variant plugin-error {
     invalid-input(string),
@@ -116,85 +128,89 @@ interface api {
     low: u32,
   }
 
-  record file-edit {
-    offset: u64,
-    delete-len: u64,
-    insert: bytes,
-  }
-
-  record open-request {
+  record parse-request {
+    file-id: string,
     path: string,
-    accepted: own<snapshot>,
+    file: own<snapshot>,
     creates: create-context,
   }
 
-  record file-changed-request {
-    before-path: string,
-    after-path: string,
-    /// Accepted predecessor bytes plus opaque plugin state. Byte updates do
-    /// not expose semantic entities through this snapshot; entities are
-    /// transition outputs and host authority. This contract is identical for
-    /// warm execution and durable cold restoration.
-    before: own<snapshot>,
-    edits: list<file-edit>,
-    creates: create-context,
-  }
-
-  record conflict-update {
-    path: string,
-    conflicts: own<conflict-source>,
-  }
-
-  record entities-changed-request {
-    before-path: string,
-    before: own<snapshot>,
-    changes: own<entity-source>,
-  }
-
-  record restore-request {
-    accepted: option<own<snapshot>>,
-    entities: own<entity-source>,
-  }
-
-  /// Rebuild an evicted actor directly as the successor of a byte transition.
-  /// Durable entities provide semantic identity while the accepted blob and
-  /// sparse edits provide byte authority.
-  record cold-file-changed-request {
+  record parse-changes-request {
+    file-id: string,
     before-path: string,
     after-path: string,
     before: own<snapshot>,
-    edits: list<file-edit>,
-    entities: own<entity-source>,
+    file-edits: list<file-edit>,
+    /// Cold execution receives current durable rows so a full-reparse fallback
+    /// can preserve semantic identities. Warm incremental execution omits them.
+    rows: option<own<row-source>>,
     creates: create-context,
   }
 
-  /// Every stateful file lifecycle enters through one operation and one
-  /// atomic output. The variant makes completeness explicit without growing
-  /// the exported ABI for each lifecycle case.
-  variant transition-request {
-    open(open-request),
-    file-changed(file-changed-request),
-    entities-changed(entities-changed-request),
-    restore(restore-request),
-    cold-file-changed(cold-file-changed-request),
+  record serialize-request {
+    file-id: string,
+    path: string,
+    rows: own<row-source>,
+    before: option<own<snapshot>>,
   }
 
-  /// All file transitions use one fused guest entry and one borrowed,
-  /// host-owned atomic output capability.
-  apply: func(
-    request: transition-request,
+  record serialize-changes-request {
+    file-id: string,
+    path: string,
+    before: own<snapshot>,
+    row-changes: own<row-source>,
+  }
+}
+
+interface column-merger {
+  use host.{column-merge-sink, column-merge-source};
+  use types.{plugin-error};
+
+  /// Called only for columns changed differently on both concurrent sides.
+  merge: func(
+    input: own<column-merge-source>,
+    output: borrow<column-merge-sink>,
+  ) -> result<_, plugin-error>;
+}
+
+interface file-projection {
+  use host.{transition};
+  use types.{parse-changes-request, parse-request, plugin-error,
+    serialize-changes-request, serialize-request};
+
+  parse: func(
+    input: parse-request,
     output: borrow<transition>,
   ) -> result<_, plugin-error>;
 
-  /// Stateless merge resolution: no document hydration and no returned cursor.
-  resolve-conflicts: func(
-    input: conflict-update,
-    output: borrow<resolution-sink>,
+  parse-changes: func(
+    input: parse-changes-request,
+    output: borrow<transition>,
   ) -> result<_, plugin-error>;
 
+  serialize: func(
+    input: serialize-request,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
+
+  serialize-changes: func(
+    input: serialize-changes-request,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
+}
+
+world column-merger-plugin {
+  import host;
+  export column-merger;
+}
+
+world file-projection-plugin {
+  import host;
+  export file-projection;
 }
 
 world plugin {
   import host;
-  export api;
+  export column-merger;
+  export file-projection;
 }

@@ -8,10 +8,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -91,14 +88,11 @@ simulation_test!(
 );
 
 simulation_test!(
-    delete_returning_supports_direct_and_like_filtered_entity_deletes,
+    delete_returning_supports_direct_and_like_filtered_row_deletes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -108,7 +102,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity fixture insert should succeed");
+            .expect("row fixture insert should succeed");
         let direct = session
             .execute(
                 "DELETE FROM lix_key_value WHERE key = 'returning-direct' \
@@ -116,14 +110,14 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("direct entity DELETE RETURNING should succeed");
+            .expect("direct row DELETE RETURNING should succeed");
         assert_eq!(direct.rows_affected(), 1);
         assert_eq!(direct.columns(), ["key", "before_value"]);
         assert_rows_eq(
             direct,
             vec![vec![
                 Value::Text("returning-direct".to_string()),
-                Value::Json(json!("before")),
+                Value::Jsonb(json!("before").into()),
             ]],
         );
 
@@ -134,7 +128,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("LIKE entity fixtures should insert");
+            .expect("LIKE row fixtures should insert");
         let matching = session
             .execute(
                 "DELETE FROM lix_key_value WHERE key LIKE 'returning-like-%' \
@@ -142,7 +136,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("entity DELETE LIKE RETURNING should succeed");
+            .expect("row DELETE LIKE RETURNING should succeed");
         assert_eq!(matching.rows_affected(), 2);
         let mut rows = matching
             .rows()
@@ -151,10 +145,10 @@ simulation_test!(
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| {
             let Value::Text(left) = &left[0] else {
-                panic!("entity key should be returned as text")
+                panic!("row key should be returned as text")
             };
             let Value::Text(right) = &right[0] else {
-                panic!("entity key should be returned as text")
+                panic!("row key should be returned as text")
             };
             left.cmp(right)
         });
@@ -163,11 +157,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("returning-like-a".to_string()),
-                    Value::Json(json!("A")),
+                    Value::Jsonb(json!("A").into()),
                 ],
                 vec![
                     Value::Text("returning-like-b".to_string()),
-                    Value::Json(json!("B")),
+                    Value::Jsonb(json!("B").into()),
                 ],
             ]
         );
@@ -179,10 +173,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 

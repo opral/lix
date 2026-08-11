@@ -1,6 +1,8 @@
+#[cfg(test)]
+use crate::changelog::ChangeId;
 use crate::changelog::CommitId;
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, ChangelogWriter,
+    ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, ChangelogWriter,
     CommitLoadRequest, CommitRecord,
 };
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
@@ -23,7 +25,7 @@ use crate::GLOBAL_BRANCH_ID;
 #[cfg(test)]
 use crate::branch::{BranchHeadControl, stage_branch_head_control};
 #[cfg(test)]
-use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
 
 #[cfg(test)]
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "01920000-0000-7000-8000-000000000001";
@@ -37,6 +39,7 @@ fn test_commit_id(value: &str) -> CommitId {
     CommitId::for_test_label(value)
 }
 
+#[cfg(test)]
 fn test_change_id(value: &str) -> ChangeId {
     ChangeId::for_test_label(value)
 }
@@ -84,7 +87,7 @@ pub(crate) async fn seed_branch_head_with_rows(
     .expect("tracked root should write");
 
     let branch_ref_change_id = test_change_id(&format!("branch-ref-{branch_id}"));
-    let branch_ref_entity_pk = crate::entity_pk::EntityPk::uuid_from_canonical(branch_id)
+    let branch_ref_row_pk = crate::row_pk::RowPk::uuid_from_canonical(branch_id)
         .expect("test branch ID must be a canonical UUID");
     let branch_ref_snapshot = serde_json::json!({
         "id": branch_id,
@@ -100,7 +103,7 @@ pub(crate) async fn seed_branch_head_with_rows(
                     format_version: 2,
                     change_id: branch_ref_change_id,
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                    entity_pk: branch_ref_entity_pk.clone(),
+                    row_pk: branch_ref_row_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::from_json(&branch_ref_snapshot),
@@ -140,7 +143,7 @@ pub(crate) async fn seed_branch_head_with_rows(
         .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
             schema_key: &row.schema_key,
             file_id: row.file_id.as_deref(),
-            entity_pk: &row.entity_pk,
+            row_pk: &row.row_pk,
             change_id: Some(row.change_id),
             commit_id: Some(row.commit_id),
             untracked: false,
@@ -174,7 +177,6 @@ pub(crate) async fn seed_branch_head_with_rows(
         BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -233,17 +235,9 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
         .as_ref()
         .map(|parent| vec![parent.clone()])
         .unwrap_or_default();
-    let commit_change_id = format!("{commit_id_text}:commit");
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &commit_change_id,
-        &parent_ids,
-        rows,
-        false,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_ids, rows, false)
+            .await?;
     let root_deltas = staged
         .change_commit_ids
         .iter()
@@ -253,7 +247,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
             TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id,
                 deleted: change.snapshot.is_none(),
@@ -328,16 +322,9 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
         .iter()
         .map(tracked_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &format!("{commit_id_text}:commit"),
-        &parent_id_texts,
-        rows,
-        true,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_id_texts, rows, true)
+            .await?;
     let root_deltas = staged
         .change_commit_ids
         .iter()
@@ -347,7 +334,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
             TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id,
                 deleted: change.snapshot.is_none(),
@@ -405,17 +392,9 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .iter()
         .map(tracked_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
-    let commit_change_id = format!("{commit_id_text}:commit");
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &commit_change_id,
-        &parent_id_texts,
-        rows,
-        false,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_id_texts, rows, false)
+            .await?;
     let root_deltas = staged
         .change_commit_ids
         .iter()
@@ -425,7 +404,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
+                row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: *change_commit_id,
                 deleted: change.snapshot.is_none(),
@@ -569,17 +548,8 @@ pub(crate) async fn stage_empty_changelog_commit(
         .as_ref()
         .map(|parent| vec![parent.clone()])
         .unwrap_or_default();
-    let commit_change_id = format!("{commit_id_text}:commit");
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &commit_change_id,
-        &parent_ids,
-        &[],
-        false,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_ids, &[], false).await?;
     let tracked_state = TrackedStateContext::new();
     let mut root_writer = tracked_state.writer(&*read, writes);
     root_writer
@@ -611,17 +581,9 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
         .iter()
         .map(|parent| test_commit_id(parent).to_string())
         .collect::<Vec<_>>();
-    let commit_change_id = format!("{commit_id_text}:commit");
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &commit_change_id,
-        &parent_id_texts,
-        &[],
-        false,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_id_texts, &[], false)
+            .await?;
     let first_parent = parent_id_texts.first().map(String::as_str);
     let tracked_state = TrackedStateContext::new();
     let mut root_writer = tracked_state.writer(&*read, writes);
@@ -646,7 +608,6 @@ async fn stage_test_changelog_commit(
     mut read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: &str,
-    commit_change_id: &str,
     parent_ids: &[String],
     rows: &[MaterializedTrackedStateRow],
     tracked_state_rootless: bool,
@@ -656,7 +617,6 @@ async fn stage_test_changelog_commit(
         .iter()
         .map(|parent| test_commit_id(parent))
         .collect::<Vec<_>>();
-    let typed_commit_change_id = test_change_id(commit_change_id);
     let parent_records = ChangelogContext::new()
         .reader(&mut *read)
         .load_commits(CommitLoadRequest {
@@ -699,6 +659,34 @@ async fn stage_test_changelog_commit(
                 .checked_add(1)
                 .ok_or_else(|| crate::LixError::unknown("test commit generation exceeds u64"))
         })?;
+    let parent_record = match typed_parent_ids.as_slice() {
+        [_] => parent_records
+            .iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .cloned(),
+        _ => None,
+    };
+    let parent_jump_record = if let Some(parent) = &parent_record {
+        ChangelogContext::new()
+            .reader(&mut *read)
+            .load_commits(CommitLoadRequest {
+                commit_ids: std::slice::from_ref(&parent.first_parent_jump_commit_id),
+            })
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+    } else {
+        None
+    };
+    let (first_parent_jump_commit_id, first_parent_jump_span) =
+        crate::changelog::next_first_parent_jump(
+            typed_commit_id,
+            &typed_parent_ids,
+            parent_record.as_ref(),
+            parent_jump_record.as_ref(),
+        )?;
     let winner_indices = final_state_row_winner_indices(rows)?;
     let mut append = ChangelogAppend::default();
     let mut change_commit_ids = Vec::new();
@@ -719,11 +707,13 @@ async fn stage_test_changelog_commit(
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
         .unwrap_or_else(test_timestamp);
     let record = CommitRecord {
-        format_version: 2,
+        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+        format_version: 4,
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,
-        change_id: typed_commit_change_id,
+        first_parent_jump_commit_id,
+        first_parent_jump_span,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at,
     };
@@ -753,13 +743,13 @@ fn final_state_row_winner_indices(
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<Vec<usize>, crate::LixError> {
     let mut winners =
-        BTreeMap::<(String, Option<String>, crate::entity_pk::EntityPk), usize>::new();
+        BTreeMap::<(String, Option<String>, crate::row_pk::RowPk), usize>::new();
     for (index, row) in rows.iter().enumerate() {
         winners.insert(
             (
                 row.schema_key.clone(),
                 row.file_id.clone(),
-                row.entity_pk.clone(),
+                row.row_pk.clone(),
             ),
             index,
         );
@@ -811,7 +801,7 @@ pub(crate) fn tracked_change_from_materialized(
         format_version: 1,
         change_id: row.change_id,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-        entity_pk: row.entity_pk.clone(),
+        row_pk: row.row_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot: row

@@ -12,9 +12,9 @@ import type {
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 	LixTelemetrySpan,
-	JsonValue,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
+import type { LixStorageAdapterConfig } from "./storage-adapter.js";
 
 export type BindingExecuteResult = {
 	statementIndex?: number;
@@ -57,10 +57,6 @@ export type LixBinding = {
 	beginTransaction(): Promise<LixTransactionBinding>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
-	clientStateEntries?(): Promise<Array<{ key: string; value: JsonValue }>>;
-	clientStateGet?(key: string): Promise<JsonValue | undefined>;
-	clientStateSet?(key: string, value: JsonValue): Promise<void>;
-	clientStateDelete?(key: string): Promise<void>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
 	createCheckpoint(): Promise<CreateCheckpointReceipt>;
 	undo(): Promise<UndoReceipt>;
@@ -70,7 +66,7 @@ export type LixBinding = {
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	syncDiskToLix(): Promise<void>;
-	/** Internal snapshot capability implemented by browser memory bindings. */
+	/** Explicit snapshot utility available on direct in-memory WASM bindings. */
 	exportSnapshot?(): Promise<Uint8Array>;
 	close(): Promise<void>;
 };
@@ -93,10 +89,6 @@ export type ObserveEventsBinding = {
 export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
 
 export type LixStorageConfig =
-	| { kind: "memory"; snapshot?: Uint8Array }
-	| {
-			kind: "localFilesystem";
-			path: string;
-			lixDir?: string;
-			syncAllFiles: boolean;
-	  };
+	| { kind: "memory" }
+	| { kind: "indexedDb"; name: string }
+	| LixStorageAdapterConfig;

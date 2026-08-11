@@ -12,7 +12,7 @@ pub(crate) enum BranchOperation {
     MergeBranch,
     MergeBranchPreview,
     CreateCheckpoint,
-    LoadWorkspaceSelector,
+    LoadDefaultBranch,
 }
 
 impl BranchOperation {
@@ -23,7 +23,7 @@ impl BranchOperation {
             Self::MergeBranch => "merge_branch",
             Self::MergeBranchPreview => "merge_branch_preview",
             Self::CreateCheckpoint => "create_checkpoint",
-            Self::LoadWorkspaceSelector => "load_workspace_branch_id",
+            Self::LoadDefaultBranch => "load_default_branch_id",
         }
     }
 }
@@ -32,7 +32,7 @@ impl BranchOperation {
 pub(crate) enum BranchReferenceRole {
     Source,
     Target,
-    WorkspaceSelector,
+    DefaultBranch,
     CommitSource,
 }
 
@@ -41,7 +41,7 @@ impl BranchReferenceRole {
         match self {
             Self::Source => "source",
             Self::Target => "target",
-            Self::WorkspaceSelector => "workspace_selector",
+            Self::DefaultBranch => "default_branch",
             Self::CommitSource => "commit_source",
         }
     }

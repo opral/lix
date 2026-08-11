@@ -10,7 +10,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 use crate::LixError;
 
 use super::error::lix_error_to_datafusion_error;
-use super::result_metadata::{LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json};
+use super::result_metadata::{LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, field_is_json};
 
 pub(crate) fn validate_json_predicate_filters(
     schema: &Schema,
@@ -142,7 +142,14 @@ fn canonicalize_json_text_literal(expr: Expr) -> Result<Expr, DataFusionError> {
     let canonical = match &literal {
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Some(canonical_json_text(value)?),
+        | ScalarValue::LargeUtf8(Some(value)) => Some(
+            crate::sql2::udfs::common::canonical_jsonb_text(value).map_err(|error| {
+                lix_error_to_datafusion_error(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("JSON comparison value is not valid JSON: {error}"),
+                ))
+            })?,
+        ),
         _ => None,
     };
     Ok(canonical.map_or_else(
@@ -151,21 +158,10 @@ fn canonicalize_json_text_literal(expr: Expr) -> Result<Expr, DataFusionError> {
     ))
 }
 
-fn canonical_json_text(raw: &str) -> Result<String, DataFusionError> {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .map(|value| value.to_string())
-        .map_err(|error| {
-            lix_error_to_datafusion_error(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("JSON comparison value is not valid JSON: {error}"),
-            ))
-        })
-}
-
 fn json_field_metadata() -> FieldMetadata {
     FieldMetadata::new(BTreeMap::from([(
         LIX_VALUE_TYPE_METADATA_KEY.to_string(),
-        LIX_VALUE_TYPE_JSON.to_string(),
+        LIX_VALUE_TYPE_JSONB.to_string(),
     )]))
 }
 
@@ -458,8 +454,11 @@ fn is_json_expr<'a>(
         Expr::Literal(_, Some(metadata)) => metadata
             .inner()
             .get(LIX_VALUE_TYPE_METADATA_KEY)
-            .is_some_and(|value| value == LIX_VALUE_TYPE_JSON),
-        Expr::ScalarFunction(function) => matches!(function.name(), "lix_json" | "lix_json_get"),
+            .is_some_and(|value| value == LIX_VALUE_TYPE_JSONB),
+        Expr::ScalarFunction(function) => matches!(
+            function.name(),
+            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+        ),
         Expr::Alias(alias) => is_json_expr(&alias.expr, lookup_field),
         Expr::Cast(cast) => is_json_expr(&cast.expr, lookup_field),
         Expr::TryCast(cast) => is_json_expr(&cast.expr, lookup_field),
@@ -469,7 +468,7 @@ fn is_json_expr<'a>(
 
 fn is_identity_json_expr(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(column) => matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk"),
+        Expr::Column(column) => matches!(column.name.as_str(), "row_pk" | "lixcol_row_pk"),
         Expr::Alias(alias) => is_identity_json_expr(&alias.expr),
         Expr::Cast(cast) => is_identity_json_expr(&cast.expr),
         Expr::TryCast(cast) => is_identity_json_expr(&cast.expr),
@@ -500,5 +499,5 @@ fn json_predicate_type_error(expr: &Expr) -> LixError {
         LixError::CODE_TYPE_MISMATCH,
         format!("JSON columns can only be compared with JSON expressions, got {expr}"),
     )
-    .with_hint("Wrap JSON text with lix_json(...), use lix_json_get(...) for JSON values, or use IS NULL for null checks.")
+    .with_hint("Cast JSON text with ::jsonb, use PostgreSQL -> or ->> for JSON access, or use IS NULL for null checks.")
 }

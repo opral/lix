@@ -1,6 +1,6 @@
 [package]
 name = "lix"
-version = "0.11.0"
+version.workspace = true
 authors.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -22,11 +22,23 @@ workspace = true
 default = ["default_wasm_runtime"]
 all-simulations = []
 storage-benches = []
+# Per-node cost attribution for commit-root replay (experiment AA). Kept out of
+# `storage-benches` so timing A/B runs never pay for the inline `Instant::now()`.
+root-replay-trace = ["storage-benches"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+server-protocol = [
+  "dep:async-stream",
+  "dep:futures-core",
+  "dep:getrandom",
+  "dep:http",
+  "dep:http-body",
+  "dep:serde_urlencoded",
+  "tokio/time",
+]
 
 [[test]]
-name = "integration"
-path = "tests/integration/main.rs"
+name = "preimage_route_census"
+path = "tests/preimage_route_census.rs"
 
 [[test]]
 name = "execute_result_allocations"
@@ -37,10 +49,6 @@ name = "third_party_storage_adapter"
 path = "tests/third_party_storage_adapter.rs"
 
 [[test]]
-name = "client_state"
-path = "tests/client_state.rs"
-
-[[test]]
 name = "runtime_contract"
 path = "tests/runtime_contract.rs"
 
@@ -49,16 +57,43 @@ name = "deterministic_sequence_corruption"
 path = "tests/deterministic_sequence_corruption.rs"
 
 [[test]]
-name = "semantic_merge"
-path = "tests/semantic_merge.rs"
-
-[[test]]
 name = "send_futures"
 path = "tests/send_futures.rs"
 
+# Benches that need nothing but `lix` itself. They ran in the e2e crate purely
+# because that is where benches happened to live, which meant measuring the SQL
+# and version-control surface pulled in RocksDB, SlateDB and their transitive
+# trees for no reason. The rule now: needs a real storage adapter or a wasm
+# plugin -> packages/e2e; needs only `lix` -> here.
 [[bench]]
-name = "profile_sql_result_streaming"
-path = "benches/profile_sql_result_streaming.rs"
+name = "diff_commands"
+path = "benches/diff_commands.rs"
+harness = false
+
+[[bench]]
+name = "undo_redo"
+path = "benches/undo_redo.rs"
+harness = false
+
+[[bench]]
+name = "row_default_values"
+path = "benches/row_default_values.rs"
+harness = false
+
+[[bench]]
+name = "row_pk_layout"
+path = "benches/row_pk_layout.rs"
+harness = false
+
+[[bench]]
+name = "registered_row_returning"
+path = "benches/registered_row_returning.rs"
+harness = false
+
+# `lix::storage_adapter` is only `pub` behind `storage-benches`.
+[[bench]]
+name = "commit_graph_scale"
+path = "benches/commit_graph_scale.rs"
 harness = false
 required-features = ["storage-benches"]
 
@@ -66,10 +101,27 @@ required-features = ["storage-benches"]
 name = "plugin_arena_scorecard"
 path = "tests/plugin_arena_scorecard.rs"
 
+# Its own process: `storage_bench` counters are process-global, and this target
+# asserts two *upper* bounds that a concurrent test could inflate into a
+# spurious failure.
+[[test]]
+name = "hot_index_range_probe"
+path = "tests/hot_index_range_probe.rs"
+
 [dependencies]
+lix_schema.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[target.'cfg(any(not(target_arch = "wasm32"), all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
+wit-bindgen = "0.57"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"))'.dependencies]
+uuid = { version = "1", features = ["std"] }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
 ahash = "0.8"
 async-trait = "0.1"
-cel = { version = "0.12.0", features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
 datafusion = { version = "53.0.0", default-features = false, features = [
     "sql",
@@ -80,11 +132,8 @@ datafusion = { version = "53.0.0", default-features = false, features = [
     "unicode_expressions",
 ] }
 musli = { version = "0.0.149", features = ["storage"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 smallvec = "1.15"
-jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
 globset = "0.4"
 jiff = { version = "0.2.27", default-features = false, features = ["std"] }
 lru = "0.18"
@@ -93,6 +142,7 @@ parking_lot = "0.12"
 uuid = { version = "1", features = ["v5", "v7", "std", "js", "fast-rng"] }
 web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-lite = "2"
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 blake3 = "1"
@@ -100,23 +150,37 @@ fastcdc = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
+async-stream = { version = "0.3", optional = true }
+futures-core = { version = "0.3", optional = true }
+getrandom = { version = "0.3", optional = true }
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+serde_urlencoded = { version = "0.7", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+wasmparser = { version = "0.247", features = ["component-model"] }
 wasmtime = { version = "45", default-features = false, features = ["cache", "component-model", "cranelift", "runtime", "std"], optional = true }
 wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 
 [dev-dependencies]
+async-executor = "1"
+criterion = { package = "codspeed-criterion-compat", version = "4" }
+flate2 = "1"
+http-body-util = "0.1"
+lix_collaboration_test_support = { path = "../collaboration-test-support" }
 paste = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
-plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
-plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tracing-subscriber = "0.3"
 wasm-encoder = "0.248"
 wit-parser = "0.247"
+
+[build-dependencies]
+wit-bindgen-rust = "0.57"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 zstd = "0.13"
 notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
 tokio = { version = "1", features = ["rt", "sync"] }
 
-[target.'cfg(target_family = "wasm")'.dependencies]
+[target.'cfg(all(target_family = "wasm", not(all(target_os = "wasi", target_env = "p2"))))'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }

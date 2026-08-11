@@ -13,11 +13,11 @@ use crate::catalog::snapshot::{
 };
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::{Domain, committed_row_ref_is_exact_branch_scoped};
-use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateRowRef,
+use crate::hot_state::{
+    HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
+    MaterializedHotStateRowRef,
 };
-use crate::schema::schema_key_from_definition;
+use crate::schema::schema_from_registered_snapshot;
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -71,22 +71,22 @@ impl CatalogContext {
 
     /// Returns the catalog captured by a transaction-opening storage snapshot.
     ///
-    /// The revision is loaded from the same pinned read as `live_state`. A
+    /// The revision is loaded from the same pinned read as `hot_state`. A
     /// matching `(domain, revision)` therefore proves that registered-schema
     /// visibility is identical without rescanning its tracked and untracked
     /// rows. Missing revisions conservatively retain the scan path for stores
     /// initialized by older engines.
     pub(crate) async fn compiled_catalog_for_transaction_open<R>(
         &self,
-        live_state: &R,
+        hot_state: &R,
         domain: &Domain,
         revision: Option<&CatalogRevision>,
     ) -> Result<Arc<CatalogSnapshot>, LixError>
     where
-        R: LiveStateReader + ?Sized,
+        R: HotStateReader + ?Sized,
     {
         let Some(revision) = revision else {
-            return self.compiled_catalog_for_domain(live_state, domain).await;
+            return self.compiled_catalog_for_domain(hot_state, domain).await;
         };
         let key = TransactionOpeningCatalogKey {
             domain: domain.clone(),
@@ -101,7 +101,7 @@ impl CatalogContext {
             return Ok(Arc::clone(snapshot));
         }
 
-        let snapshot = self.compiled_catalog_for_domain(live_state, domain).await?;
+        let snapshot = self.compiled_catalog_for_domain(hot_state, domain).await?;
         let mut cache = self
             .transaction_opening_catalogs
             .lock()
@@ -122,13 +122,13 @@ impl CatalogContext {
     /// canonicalization, but still require the live-state scans.
     pub(crate) async fn compiled_catalog_for_domain<R>(
         &self,
-        live_state: &R,
+        hot_state: &R,
         domain: &Domain,
     ) -> Result<Arc<CatalogSnapshot>, LixError>
     where
-        R: LiveStateReader + ?Sized,
+        R: HotStateReader + ?Sized,
     {
-        let catalog_rows = scan_catalog_rows(live_state, domain).await?;
+        let catalog_rows = scan_catalog_rows(hot_state, domain).await?;
         let mut hasher = blake3::Hasher::new();
         for (schema_domain, row) in catalog_rows.iter() {
             hash_fingerprint_part(&mut hasher, &schema_domain.fingerprint_component());
@@ -211,15 +211,15 @@ impl CatalogContext {
     #[cfg(test)]
     pub(crate) async fn schema_jsons_for_sql_read_planning<R>(
         &self,
-        live_state: &R,
+        hot_state: &R,
         branch_id: &str,
     ) -> Result<Vec<JsonValue>, LixError>
     where
-        R: LiveStateReader + ?Sized,
+        R: HotStateReader + ?Sized,
     {
         self.sql_read_schema_loads.fetch_add(1, Ordering::Relaxed);
         let facts = self
-            .schema_facts_for_domain(live_state, &Domain::schema_catalog(branch_id, true))
+            .schema_facts_for_domain(hot_state, &Domain::schema_catalog(branch_id, true))
             .await?;
         let mut schemas = BTreeMap::<String, JsonValue>::new();
         for fact in facts {
@@ -234,7 +234,7 @@ impl CatalogContext {
                         "SQL surface schema '{schema_key}' is visible from more than one schema catalog fact"
                     ),
                 )
-                .with_hint("SQL entity surfaces are named by schema_key. Keep exactly one visible schema per schema_key for SQL planning."));
+                .with_hint("SQL schema surfaces are named by schema_key. Keep exactly one visible schema per schema_key for SQL planning."));
             }
         }
         Ok(schemas.into_values().collect())
@@ -249,13 +249,13 @@ impl CatalogContext {
     #[cfg(test)]
     pub(crate) async fn schema_facts_for_domain<R>(
         &self,
-        live_state: &R,
+        hot_state: &R,
         domain: &Domain,
     ) -> Result<Vec<SchemaCatalogFact>, LixError>
     where
-        R: LiveStateReader + ?Sized,
+        R: HotStateReader + ?Sized,
     {
-        let catalog_rows = scan_catalog_rows(live_state, domain).await?;
+        let catalog_rows = scan_catalog_rows(hot_state, domain).await?;
         facts_from_catalog_rows(&catalog_rows)
     }
 }
@@ -267,7 +267,7 @@ struct CatalogRows {
 }
 
 impl CatalogRows {
-    fn iter(&self) -> impl Iterator<Item = (&Domain, MaterializedLiveStateRowRef<'_>)> {
+    fn iter(&self) -> impl Iterator<Item = (&Domain, MaterializedHotStateRowRef<'_>)> {
         self.domains.iter().flat_map(|domain_rows| {
             domain_rows.rows.iter().filter_map(move |row| {
                 row_belongs_to_schema_catalog_domain(row, &domain_rows.domain)
@@ -279,31 +279,31 @@ impl CatalogRows {
 
 struct CatalogDomainRows {
     domain: Domain,
-    rows: MaterializedLiveStateBatch,
+    rows: MaterializedHotStateBatch,
 }
 
-async fn scan_catalog_rows<R>(live_state: &R, domain: &Domain) -> Result<CatalogRows, LixError>
+async fn scan_catalog_rows<R>(hot_state: &R, domain: &Domain) -> Result<CatalogRows, LixError>
 where
-    R: LiveStateReader + ?Sized,
+    R: HotStateReader + ?Sized,
 {
     let schema_domains = domain.schema_catalog_domains();
     let mut catalog_rows = Vec::with_capacity(schema_domains.len());
     for schema_domain in schema_domains {
-        let request = LiveStateScanRequest {
-            filter: LiveStateFilter {
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
                 branch_ids: vec![schema_domain.branch_id().to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 untracked: Some(schema_domain.untracked()),
                 include_tombstones: false,
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         };
         let rows = if schema_domain.untracked() {
-            live_state.scan_batch(&request).await?
+            hot_state.scan_batch(&request).await?
         } else {
-            live_state.scan_tracked_batch(&request).await?
+            hot_state.scan_tracked_batch(&request).await?
         };
         catalog_rows.push(CatalogDomainRows {
             domain: schema_domain,
@@ -332,7 +332,7 @@ fn facts_from_catalog_rows(catalog_rows: &CatalogRows) -> Result<Vec<SchemaCatal
 }
 
 fn row_belongs_to_schema_catalog_domain(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     domain: &Domain,
 ) -> bool {
     row.schema_key() == REGISTERED_SCHEMA_KEY
@@ -344,7 +344,7 @@ fn row_belongs_to_schema_catalog_domain(
 }
 
 fn decode_registered_schema_row(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
 ) -> Result<Option<(crate::schema::SchemaKey, JsonValue)>, LixError> {
     if row.schema_key() != REGISTERED_SCHEMA_KEY {
         return Err(LixError::new(
@@ -366,13 +366,7 @@ fn decode_registered_schema_row(
             format!("invalid registered schema snapshot JSON: {err}"),
         )
     })?;
-    let schema = snapshot.get("value").cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "registered schema snapshot missing value",
-        )
-    })?;
-    let key = schema_key_from_definition(&schema)?;
+    let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
     Ok(Some((key, schema)))
 }
 
@@ -385,13 +379,13 @@ mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::ChangeId;
     use crate::common::LixTimestamp;
-    use crate::live_state::MaterializedLiveStateRow;
+    use crate::hot_state::MaterializedHotStateRow;
 
     #[tokio::test]
     async fn compiled_catalog_for_domain_hits_cache_without_decoding() {
         let context = CatalogContext::new();
         let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
-        let reader = RowsLiveStateReader::new(vec![
+        let reader = RowsHotStateReader::new(vec![
             registered_schema_row("alpha_schema"),
             registered_schema_row("beta_schema"),
         ]);
@@ -409,7 +403,7 @@ mod tests {
             "identical raw rows must return the cached snapshot"
         );
 
-        let changed_reader = RowsLiveStateReader::new(vec![
+        let changed_reader = RowsHotStateReader::new(vec![
             registered_schema_row("alpha_schema"),
             registered_schema_row("gamma_schema"),
         ]);
@@ -430,7 +424,7 @@ mod tests {
         let context = CatalogContext::new();
         let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
         let revision = CatalogRevision::for_test(b"revision-one");
-        let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
+        let reader = RowsHotStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
         let first = context
             .compiled_catalog_for_transaction_open(&reader, &domain, Some(&revision))
@@ -452,7 +446,7 @@ mod tests {
             "hot open must not rescan registered-schema rows"
         );
 
-        let changed_reader = RowsLiveStateReader::new(vec![registered_schema_row("beta_schema")]);
+        let changed_reader = RowsHotStateReader::new(vec![registered_schema_row("beta_schema")]);
         let changed = context
             .compiled_catalog_for_transaction_open(
                 &changed_reader,
@@ -472,7 +466,7 @@ mod tests {
         let sql_domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
         let tracked_domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false);
         let revision = CatalogRevision::for_test(b"revision-one");
-        let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
+        let reader = RowsHotStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
         context
             .compiled_catalog_for_transaction_open(&reader, &sql_domain, Some(&revision))
@@ -507,7 +501,7 @@ mod tests {
     async fn missing_transaction_opening_revision_conservatively_rescans() {
         let context = CatalogContext::new();
         let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
-        let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
+        let reader = RowsHotStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
         context
             .compiled_catalog_for_transaction_open(&reader, &domain, None)
@@ -552,14 +546,10 @@ mod tests {
             Domain::schema_catalog("main", false),
             crate::schema::SchemaKey::new(schema_key),
             json!({
-                "x-lix-key": schema_key,
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": schema_key,
+                "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                "primary_key": ["id"]
             }),
         )
     }
@@ -570,7 +560,7 @@ mod tests {
 
         let schemas = context
             .schema_jsons_for_sql_read_planning(
-                &RowsLiveStateReader::new(vec![
+                &RowsHotStateReader::new(vec![
                     registered_schema_row("lix_registered_schema"),
                     registered_schema_row("lix_key_value"),
                 ]),
@@ -580,10 +570,10 @@ mod tests {
             .expect("schema visibility should load");
 
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_registered_schema")
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_registered_schema")
         }));
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_key_value")
         }));
     }
 
@@ -592,7 +582,7 @@ mod tests {
         let context = CatalogContext::new();
         let mut tracked = registered_schema_row("zeta_tracked_schema");
         tracked.untracked = false;
-        let reader = RowsLiveStateReader::new(vec![
+        let reader = RowsHotStateReader::new(vec![
             registered_schema_row("alpha_untracked_schema"),
             tracked,
         ]);
@@ -617,14 +607,14 @@ mod tests {
 
         let schemas = context
             .schema_jsons_for_sql_read_planning(
-                &RowsLiveStateReader::new(vec![registered_schema_row("engine_dynamic_schema")]),
+                &RowsHotStateReader::new(vec![registered_schema_row("engine_dynamic_schema")]),
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
             )
             .await
             .expect("schema visibility should load");
 
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
+            schema.get("key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
         }));
     }
 
@@ -633,7 +623,7 @@ mod tests {
         let context = CatalogContext::new();
         let error = context
             .schema_jsons_for_sql_read_planning(
-                &RowsLiveStateReader::new(vec![
+                &RowsHotStateReader::new(vec![
                     registered_schema_row("engine_dynamic_schema"),
                     registered_schema_row("engine_dynamic_schema"),
                 ]),
@@ -654,7 +644,7 @@ mod tests {
 
         let facts = context
             .schema_facts_for_domain(
-                &RowsLiveStateReader::new(vec![
+                &RowsHotStateReader::new(vec![
                     seed_schema,
                     registered_schema_row("engine_dynamic_schema"),
                 ]),
@@ -668,10 +658,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_key_value")
         }));
         assert!(!schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
+            schema.get("key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
         }));
     }
 
@@ -681,7 +671,7 @@ mod tests {
 
         let facts = context
             .schema_facts_for_domain(
-                &RowsLiveStateReader::new(vec![registered_schema_row("lix_key_value")]),
+                &RowsHotStateReader::new(vec![registered_schema_row("lix_key_value")]),
                 &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false),
             )
             .await
@@ -692,7 +682,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_key_value")
         }));
     }
 
@@ -704,10 +694,7 @@ mod tests {
         global_only.branch_id = "main".into();
 
         let schemas = context
-            .schema_jsons_for_sql_read_planning(
-                &RowsLiveStateReader::new(vec![global_only]),
-                "main",
-            )
+            .schema_jsons_for_sql_read_planning(&RowsHotStateReader::new(vec![global_only]), "main")
             .await
             .expect("schema visibility should load");
 
@@ -725,18 +712,14 @@ mod tests {
 
         let facts = context
             .schema_facts_for_domain(
-                &RowsLiveStateReader::new(vec![
-                    valid_schema,
-                    file_scoped_schema,
-                    tombstoned_schema,
-                ]),
+                &RowsHotStateReader::new(vec![valid_schema, file_scoped_schema, tombstoned_schema]),
                 &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true),
             )
             .await
             .expect("schema facts should load");
         let schema_keys = facts
             .iter()
-            .filter_map(|fact| fact.schema().get("x-lix-key").and_then(JsonValue::as_str))
+            .filter_map(|fact| fact.schema().get("key").and_then(JsonValue::as_str))
             .collect::<Vec<_>>();
 
         assert_eq!(schema_keys, vec!["valid_schema"]);
@@ -748,7 +731,7 @@ mod tests {
 
         let schemas = context
             .schema_jsons_for_sql_read_planning(
-                &RowsLiveStateReader::new(Vec::new()),
+                &RowsHotStateReader::new(Vec::new()),
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
             )
             .await
@@ -757,13 +740,13 @@ mod tests {
         assert!(schemas.is_empty());
     }
 
-    struct RowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct RowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
         scan_count: AtomicUsize,
     }
 
-    impl RowsLiveStateReader {
-        fn new(rows: Vec<MaterializedLiveStateRow>) -> Self {
+    impl RowsHotStateReader {
+        fn new(rows: Vec<MaterializedHotStateRow>) -> Self {
             Self {
                 rows,
                 scan_count: AtomicUsize::new(0),
@@ -776,20 +759,20 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateReader for RowsLiveStateReader {
+    impl HotStateReader for RowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             self.scan_count.fetch_add(1, Ordering::Relaxed);
-            Ok(MaterializedLiveStateBatch::from_rows(
+            Ok(MaterializedHotStateBatch::from_rows(
                 self.rows
                     .iter()
                     .filter(|row| {
@@ -816,9 +799,9 @@ mod tests {
         }
     }
 
-    fn registered_schema_row(schema_key: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: registered_schema_entity_pk(schema_key),
+    fn registered_schema_row(schema_key: &str) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: registered_schema_row_pk(schema_key),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             branch_id: GLOBAL_BRANCH_ID.into(),
@@ -838,14 +821,12 @@ mod tests {
             ),
             snapshot_content: Some(
                 json!({
+                    "schema_key": schema_key,
                     "value": {
-                        "x-lix-key": schema_key,
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" }
-                        },
-                        "required": ["id"],
-                        "additionalProperties": false
+                        "$schema": "https://lix.dev/schema-v1.json",
+                        "key": schema_key,
+                        "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                        "primary_key": ["id"]
                     }
                 })
                 .to_string()
@@ -854,14 +835,10 @@ mod tests {
         }
     }
 
-    fn registered_schema_entity_pk(schema_key: &str) -> crate::entity_pk::EntityPk {
-        crate::entity_pk::EntityPk::from_primary_key_paths(
-            &json!({
-                "value": {
-                    "x-lix-key": schema_key,
-                }
-            }),
-            &[vec!["value".to_string(), "x-lix-key".to_string()]],
+    fn registered_schema_row_pk(schema_key: &str) -> crate::row_pk::RowPk {
+        crate::row_pk::RowPk::from_primary_key_paths(
+            &json!({ "schema_key": schema_key }),
+            &[vec!["schema_key".to_string()]],
         )
         .expect("registered schema identity should derive")
     }

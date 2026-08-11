@@ -20,18 +20,18 @@ use crate::branch::{
     branch_ref_stage_row, branch_ref_tombstone_row,
 };
 use crate::changelog::CommitId;
-use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
-    MaterializedLiveStateRowRef,
+use crate::row_pk::RowPk;
+use crate::hot_state::{
+    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
+    HotStateReader, HotStateScanRequest, MaterializedHotStateRowRef,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
     defaultable_text_insert_value, insert_column_is_omitted,
 };
-use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
-use crate::transaction::types::{
+use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextHotStateReader};
+use crate::transaction_types::{
     LogicalPrimaryKey, RawWriteBatch, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteRow,
 };
@@ -47,14 +47,14 @@ use super::values::{required_bool_value, required_string_value};
 pub(super) async fn register_lix_branch_read_provider(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    live_state: Arc<dyn LiveStateReader>,
+    hot_state: Arc<dyn HotStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     register_spec_table(
         session,
         surface_name,
         Arc::new(BranchSpec {
-            live_state,
+            hot_state,
             branch_ref,
             head_read_strategy: BranchHeadReadStrategy::Batch,
         }),
@@ -68,12 +68,12 @@ pub(super) async fn register_write_provider(
     write_ctx: SqlWriteContext,
     branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
-    let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+    let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
     register_spec_table(
         session,
         surface_name,
         Arc::new(BranchSpec {
-            live_state,
+            hot_state,
             branch_ref,
             head_read_strategy: BranchHeadReadStrategy::Point,
         }),
@@ -82,7 +82,7 @@ pub(super) async fn register_write_provider(
 }
 
 struct BranchSpec {
-    live_state: Arc<dyn LiveStateReader>,
+    hot_state: Arc<dyn HotStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     head_read_strategy: BranchHeadReadStrategy,
 }
@@ -131,15 +131,15 @@ impl TableSpec for BranchSpec {
             source: scan_row_source(
                 Arc::clone(&schema),
                 (
-                    Arc::clone(&self.live_state),
+                    Arc::clone(&self.hot_state),
                     Arc::clone(&self.branch_ref),
                     schema,
                     self.head_read_strategy,
                     descriptor_scope,
                 ),
-                |(live_state, branch_ref, schema, head_read_strategy, descriptor_scope)| async move {
+                |(hot_state, branch_ref, schema, head_read_strategy, descriptor_scope)| async move {
                     let rows = load_branch_rows_scoped(
-                        live_state,
+                        hot_state,
                         branch_ref,
                         head_read_strategy,
                         descriptor_scope,
@@ -290,7 +290,12 @@ impl TableSpec for BranchSpec {
                 let active_branch_id = active_branch_id.clone();
                 async move {
                     let branch_rows = branch_rows_from_batch(&matched_batch)?;
-                    reject_protected_branch_deletes(&branch_rows, &active_branch_id)?;
+                    let default_branch_id = load_default_branch_id(&write_ctx).await?;
+                    reject_protected_branch_deletes(
+                        &branch_rows,
+                        &active_branch_id,
+                        &default_branch_id,
+                    )?;
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("DELETE row count overflow".to_string())
                     })?;
@@ -431,13 +436,13 @@ impl BranchSpec {
         let descriptor_scope = BranchDescriptorScope::from_filters(filters);
         row_source(
             (
-                Arc::clone(&self.live_state),
+                Arc::clone(&self.hot_state),
                 Arc::clone(&self.branch_ref),
                 descriptor_scope,
             ),
-            |(live_state, branch_ref, descriptor_scope)| async move {
+            |(hot_state, branch_ref, descriptor_scope)| async move {
                 let rows = load_branch_rows_scoped(
-                    live_state,
+                    hot_state,
                     branch_ref,
                     BranchHeadReadStrategy::Point,
                     descriptor_scope,
@@ -561,12 +566,12 @@ impl UpsertSupport for BranchSpec {
 
         // Build fresh readers rather than reuse the session's cached branch
         // ref: a conflict update may have just staged a new branch head.
-        let live_state: Arc<dyn LiveStateReader> =
-            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let hot_state: Arc<dyn HotStateReader> =
+            Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
         let branch_ref: Arc<dyn BranchRefReader> = Arc::new(
             crate::sql2::WriteContextBranchRefReader::new(write_ctx.clone()),
         );
-        let rows = load_branch_rows(live_state, branch_ref, BranchHeadReadStrategy::Point)
+        let rows = load_branch_rows(hot_state, branch_ref, BranchHeadReadStrategy::Point)
             .await
             .map_err(lix_error_to_datafusion_error)?;
         let batch = LIX_BRANCH_COLS
@@ -611,7 +616,7 @@ impl UpsertSupport for BranchSpec {
         _target: &super::upsert::UpsertConflictTarget,
     ) -> Result<RecordBatch> {
         let rows = load_branch_rows(
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.hot_state),
             Arc::clone(&self.branch_ref),
             BranchHeadReadStrategy::Point,
         )
@@ -672,12 +677,12 @@ fn branch_batch_error(error: ColumnTableError) -> DataFusionError {
 }
 
 async fn load_branch_rows(
-    live_state: Arc<dyn LiveStateReader>,
+    hot_state: Arc<dyn HotStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     head_read_strategy: BranchHeadReadStrategy,
 ) -> Result<Vec<BranchRow>, LixError> {
     load_branch_rows_scoped(
-        live_state,
+        hot_state,
         branch_ref,
         head_read_strategy,
         BranchDescriptorScope::All,
@@ -702,18 +707,18 @@ impl BranchDescriptorScope {
 }
 
 async fn load_branch_rows_scoped(
-    live_state: Arc<dyn LiveStateReader>,
+    hot_state: Arc<dyn HotStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     head_read_strategy: BranchHeadReadStrategy,
     descriptor_scope: BranchDescriptorScope,
 ) -> Result<Vec<BranchRow>, LixError> {
-    let entity_pks = match descriptor_scope {
+    let row_pks = match descriptor_scope {
         BranchDescriptorScope::All => Vec::new(),
         BranchDescriptorScope::Ids(ids) if ids.is_empty() => return Ok(Vec::new().into()),
         BranchDescriptorScope::Ids(ids) => ids
             .into_iter()
             .map(|id| {
-                EntityPk::uuid_from_canonical(&id).map_err(|error| {
+                RowPk::uuid_from_canonical(&id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
                         format!("branch id must be a canonical UUID: {error}"),
@@ -722,15 +727,15 @@ async fn load_branch_rows_scoped(
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let descriptor_rows = live_state
-        .scan_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
+    let descriptor_rows = hot_state
+        .scan_batch(&HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec!["lix_branch_descriptor".to_string()],
                 branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
-                entity_pks,
-                ..LiveStateFilter::default()
+                row_pks,
+                ..HotStateFilter::default()
             },
-            projection: LiveStateProjection::default(),
+            projection: HotStateProjection::default(),
             limit: None,
         })
         .await?;
@@ -792,7 +797,7 @@ fn exact_branch_ids_from_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
 fn exact_canonical_branch_ids_from_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
     let ids = exact_branch_ids_from_filters(filters)?;
     ids.iter()
-        .all(|id| EntityPk::uuid_from_canonical(id).is_ok())
+        .all(|id| RowPk::uuid_from_canonical(id).is_ok())
         .then_some(ids)
 }
 
@@ -911,7 +916,7 @@ struct BranchDescriptor {
     hidden: bool,
 }
 
-fn parse_descriptor(row: MaterializedLiveStateRowRef<'_>) -> Result<BranchDescriptor, LixError> {
+fn parse_descriptor(row: MaterializedHotStateRowRef<'_>) -> Result<BranchDescriptor, LixError> {
     let snapshot = parse_snapshot(row, "lix_branch_descriptor")?;
     let id = snapshot
         .get("id")
@@ -931,7 +936,7 @@ fn parse_descriptor(row: MaterializedLiveStateRowRef<'_>) -> Result<BranchDescri
 }
 
 fn parse_snapshot(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     schema_key: &str,
 ) -> Result<JsonValue, LixError> {
     let snapshot_content = row
@@ -1022,7 +1027,48 @@ fn branch_rows_from_batch(batch: &RecordBatch) -> Result<Vec<BranchRow>> {
         .collect()
 }
 
-fn reject_protected_branch_deletes(rows: &[BranchRow], active_branch_id: &str) -> Result<()> {
+async fn load_default_branch_id(write_ctx: &SqlWriteContext) -> Result<String> {
+    let rows = write_ctx
+        .load_exact_hot_state_batch(&HotStateExactBatchRequest {
+            rows: vec![HotStateExactRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                row_pk: RowPk::single(crate::init::DEFAULT_BRANCH_KEY),
+                file_id: None,
+            }],
+            projection: HotStateProjection {
+                columns: vec!["snapshot_content".to_string()],
+            },
+            untracked: Some(false),
+            include_tombstones: false,
+        })
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+    let snapshot = rows
+        .row(0)
+        .and_then(MaterializedHotStateRowRef::snapshot_content)
+        .ok_or_else(|| {
+            DataFusionError::Execution("repository default branch is missing".to_string())
+        })?;
+    serde_json::from_str::<JsonValue>(snapshot)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DataFusionError::Execution("repository default branch is invalid".to_string())
+        })
+}
+
+fn reject_protected_branch_deletes(
+    rows: &[BranchRow],
+    active_branch_id: &str,
+    default_branch_id: &str,
+) -> Result<()> {
     for row in rows {
         if row.id == GLOBAL_BRANCH_ID {
             return Err(DataFusionError::Execution(
@@ -1032,6 +1078,12 @@ fn reject_protected_branch_deletes(rows: &[BranchRow], active_branch_id: &str) -
         if row.id == active_branch_id {
             return Err(DataFusionError::Execution(format!(
                 "DELETE FROM lix_branch cannot delete active branch '{}'",
+                row.id
+            )));
+        }
+        if row.id == default_branch_id {
+            return Err(DataFusionError::Execution(format!(
+                "DELETE FROM lix_branch cannot delete repository default branch '{}'",
                 row.id
             )));
         }
@@ -1141,7 +1193,7 @@ fn with_origin(
 
 fn lix_branch_origin(action: TransactionWriteOperation, branch_id: &str) -> TransactionWriteOrigin {
     TransactionWriteOrigin {
-        surface: crate::transaction::types::shared_origin_surface("lix_branch"),
+        surface: crate::transaction_types::shared_origin_surface("lix_branch"),
         operation: action,
         primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(branch_id))),
     }
@@ -1229,26 +1281,26 @@ mod tests {
 
     use super::*;
     use crate::common::LixTimestamp;
-    use crate::live_state::MaterializedLiveStateRow;
+    use crate::hot_state::MaterializedHotStateRow;
     use datafusion::common::Column;
 
-    struct RowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct RowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for RowsLiveStateReader {
+    impl HotStateReader for RowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             Ok(self.rows.clone().into())
         }
     }
@@ -1261,31 +1313,31 @@ mod tests {
         point_error_branch: Option<String>,
     }
 
-    struct RoutingLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
-        requests: StdMutex<Vec<LiveStateScanRequest>>,
+    struct RoutingHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
+        requests: StdMutex<Vec<HotStateScanRequest>>,
     }
 
     #[async_trait]
-    impl LiveStateReader for RoutingLiveStateReader {
+    impl HotStateReader for RoutingHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             self.requests.lock().unwrap().push(request.clone());
             Ok(self
                 .rows
                 .iter()
                 .filter(|row| {
-                    request.filter.entity_pks.is_empty()
-                        || request.filter.entity_pks.contains(&row.entity_pk)
+                    request.filter.row_pks.is_empty()
+                        || request.filter.row_pks.contains(&row.row_pk)
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -1343,9 +1395,9 @@ mod tests {
         }
     }
 
-    fn descriptor_row(id: &str, name: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: EntityPk::uuid_from_canonical(id).expect("fixture branch ID"),
+    fn descriptor_row(id: &str, name: &str) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: RowPk::uuid_from_canonical(id).expect("fixture branch ID"),
             schema_key: "lix_branch_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -1427,10 +1479,10 @@ mod tests {
 
     fn routing_spec() -> (
         BranchSpec,
-        Arc<RoutingLiveStateReader>,
+        Arc<RoutingHotStateReader>,
         Arc<RoutingBranchRefReader>,
     ) {
-        let live_state = Arc::new(RoutingLiveStateReader {
+        let hot_state = Arc::new(RoutingHotStateReader {
             rows: vec![
                 descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
                 descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
@@ -1447,28 +1499,28 @@ mod tests {
             point_read_ids: StdMutex::new(Vec::new()),
         });
         let spec = BranchSpec {
-            live_state: live_state.clone(),
+            hot_state: hot_state.clone(),
             branch_ref: branch_ref.clone(),
             head_read_strategy: BranchHeadReadStrategy::Point,
         };
-        (spec, live_state, branch_ref)
+        (spec, hot_state, branch_ref)
     }
 
     #[tokio::test]
     async fn branch_write_id_filter_routes_descriptor_and_head_point_reads() {
-        let (spec, live_state, branch_ref) = routing_spec();
+        let (spec, hot_state, branch_ref) = routing_spec();
         let source =
             spec.write_row_source(&[eq_filter("id", "01920000-0000-7000-8000-0000000000b1")]);
 
         let batch = source().await.unwrap();
 
         assert_eq!(batch.num_rows(), 1);
-        let requests = live_state.requests.lock().unwrap();
+        let requests = hot_state.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].filter.entity_pks,
+            requests[0].filter.row_pks,
             vec![
-                EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
+                RowPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
                     .expect("fixture branch ID")
             ]
         );
@@ -1480,7 +1532,7 @@ mod tests {
 
     #[tokio::test]
     async fn branch_read_id_filter_routes_descriptor_and_head_point_reads() {
-        let (mut spec, live_state, branch_ref) = routing_spec();
+        let (mut spec, hot_state, branch_ref) = routing_spec();
         spec.head_read_strategy = BranchHeadReadStrategy::Batch;
         let filter = eq_filter("id", "01920000-0000-7000-8000-0000000000b1");
         assert_eq!(
@@ -1495,12 +1547,12 @@ mod tests {
         let batch = planned.source.load_single_batch().await.unwrap();
 
         assert_eq!(batch.num_rows(), 1);
-        let requests = live_state.requests.lock().unwrap();
+        let requests = hot_state.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].filter.entity_pks,
+            requests[0].filter.row_pks,
             vec![
-                EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
+                RowPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
                     .expect("fixture branch ID")
             ]
         );
@@ -1525,7 +1577,7 @@ mod tests {
 
     #[tokio::test]
     async fn branch_write_or_filter_falls_back_to_full_candidate_source() {
-        let (spec, live_state, branch_ref) = routing_spec();
+        let (spec, hot_state, branch_ref) = routing_spec();
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a1")),
             Operator::Or,
@@ -1536,9 +1588,9 @@ mod tests {
         let batch = source().await.unwrap();
 
         assert_eq!(batch.num_rows(), 3);
-        let requests = live_state.requests.lock().unwrap();
+        let requests = hot_state.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].filter.entity_pks.is_empty());
+        assert!(requests[0].filter.row_pks.is_empty());
         assert_eq!(
             branch_ref.point_read_ids.lock().unwrap().as_slice(),
             &[
@@ -1581,7 +1633,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_head_read_joins_matching_descriptors_with_one_scan() {
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
                 descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
@@ -1600,13 +1652,9 @@ mod tests {
             point_error_branch: None,
         });
 
-        let rows = load_branch_rows(
-            live_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap();
+        let rows = load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+            .await
+            .unwrap();
 
         assert_eq!(
             rows,
@@ -1631,7 +1679,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_head_read_avoids_scan_for_single_descriptor() {
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![descriptor_row(
                 "01920000-0000-7000-8000-0000000000a1",
                 "Branch A",
@@ -1645,13 +1693,9 @@ mod tests {
             point_error_branch: None,
         });
 
-        let rows = load_branch_rows(
-            live_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap();
+        let rows = load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+            .await
+            .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 0);
@@ -1660,7 +1704,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_head_read_falls_back_to_point_reads_when_scan_fails() {
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
                 descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
@@ -1682,13 +1726,9 @@ mod tests {
             point_error_branch: None,
         });
 
-        let rows = load_branch_rows(
-            live_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap();
+        let rows = load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+            .await
+            .unwrap();
 
         assert_eq!(rows.len(), 3);
         assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
@@ -1697,7 +1737,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_head_read_still_rejects_a_malformed_selected_ref() {
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
                 descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
@@ -1719,13 +1759,9 @@ mod tests {
             point_error_branch: Some("01920000-0000-7000-8000-0000000000b1".to_string()),
         });
 
-        let error = load_branch_rows(
-            live_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap_err();
+        let error = load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+            .await
+            .unwrap_err();
 
         assert!(
             error
@@ -1743,7 +1779,7 @@ mod tests {
             LixError::CODE_STORAGE_FENCED,
             LixError::CODE_STORAGE_CLOSED,
         ] {
-            let live_state = Arc::new(RowsLiveStateReader {
+            let hot_state = Arc::new(RowsHotStateReader {
                 rows: vec![
                     descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
                     descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
@@ -1762,13 +1798,10 @@ mod tests {
                 point_error_branch: None,
             });
 
-            let error = load_branch_rows(
-                live_state,
-                branch_ref.clone(),
-                BranchHeadReadStrategy::Batch,
-            )
-            .await
-            .unwrap_err();
+            let error =
+                load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+                    .await
+                    .unwrap_err();
 
             assert_eq!(error.code, code);
             assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);

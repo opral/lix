@@ -231,6 +231,14 @@ impl DecodedInternalNode {
 
 const NODE_KIND_LEAF_V4: u8 = 5;
 const NODE_KIND_INTERNAL_V4: u8 = 6;
+/// Packed direct-address leaves store the one shared commit id plus the first
+/// packed change ordinal. Every row's exact change id is reconstructed from
+/// that authenticated sequence instead of repeating another 16-byte UUID.
+const NODE_KIND_DIRECT_LEAF_V1: u8 = 7;
+
+pub(crate) fn leaf_uses_direct_address_layout(encoded: &[u8]) -> bool {
+    encoded.first() == Some(&NODE_KIND_DIRECT_LEAF_V1)
+}
 
 #[derive(Debug, Clone, Copy)]
 struct MutationSpan {
@@ -355,7 +363,7 @@ pub(crate) struct TrackedStateMutationBatchBuilder {
 impl TrackedStateMutationBatchBuilder {
     pub(crate) fn with_row_capacity(row_count: usize) -> Self {
         Self {
-            // Tracked keys are normally short schema/file/entity identifiers.
+            // Tracked keys are normally short schema/file/row identifiers.
             // A conservative initial page keeps the happy path to one key
             // allocation while normal Vec growth still handles larger keys.
             key_arena: Vec::with_capacity(row_count.saturating_mul(96)),
@@ -396,7 +404,7 @@ impl TrackedStateMutationBatchBuilder {
             &mut self.key_arena,
             key.schema_key,
             key.file_id,
-            key.entity_pk,
+            key.row_pk,
         );
         let key_end = self.key_arena.len();
         let value_start = self.value_arena.len();
@@ -471,38 +479,49 @@ impl TrackedStateMutationBatchBuilder {
 }
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; TRACKED_STATE_HASH_BYTES] {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let digest = *blake3::hash(bytes).as_bytes();
+        crate::storage_bench::record_replay_node_hash(
+            start.elapsed().as_nanos() as u64,
+            bytes.len() as u64,
+        );
+        return digest;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
     *blake3::hash(bytes).as_bytes()
 }
 
 pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
-    encode_key_parts(&key.schema_key, key.file_id.as_deref(), &key.entity_pk)
+    encode_key_parts(&key.schema_key, key.file_id.as_deref(), &key.row_pk)
 }
 
 pub(crate) fn encode_key_ref(key: TrackedStateKeyRef<'_>) -> Vec<u8> {
-    encode_key_parts(key.schema_key, key.file_id, key.entity_pk)
+    encode_key_parts(key.schema_key, key.file_id, key.row_pk)
 }
 
 pub(crate) fn encode_key_ref_into(out: &mut Vec<u8>, key: TrackedStateKeyRef<'_>) -> Range<usize> {
     let start = out.len();
-    encode_key_parts_into(out, key.schema_key, key.file_id, key.entity_pk);
+    encode_key_parts_into(out, key.schema_key, key.file_id, key.row_pk);
     start..out.len()
 }
 
 /// Encodes the dominant one-component string identity without constructing
-/// an owned `EntityPk`. Typed SQL ingress has already certified this physical
+/// an owned `RowPk`. Typed SQL ingress has already certified this physical
 /// identity shape, so membership probes can stay borrowed until journal seal.
 pub(crate) fn encode_single_string_key_ref_into(
     out: &mut Vec<u8>,
     schema_key: &str,
     file_id: Option<&str>,
-    entity_pk: &str,
+    row_pk: &str,
 ) -> Range<usize> {
     let start = out.len();
     write_key_string(out, schema_key, KEY_PART_FINAL);
     write_file_id(out, file_id);
-    out.push(ENTITY_PK_CODEC_V1);
-    out.push(ENTITY_PK_STRING);
-    write_key_bytes(out, entity_pk.as_bytes(), KEY_PART_FINAL);
+    out.push(ROW_PK_CODEC_V1);
+    out.push(ROW_PK_STRING);
+    write_key_bytes(out, row_pk.as_bytes(), KEY_PART_FINAL);
     start..out.len()
 }
 
@@ -522,10 +541,29 @@ pub(crate) fn encode_schema_file_prefix(schema_key: &str, file_id: Option<&str>)
 
 pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
     let key = decode_key_borrowed(bytes)?;
+    #[cfg(feature = "storage-benches")]
+    {
+        // Counted here, inside the owned decode, because the whole question is
+        // how much `into_owned()` adds over the borrowed decode that already
+        // ran. A count taken at either caller cannot separate the two.
+        let mut owned_bytes = 0usize;
+        let mut escaped = 0u32;
+        if matches!(key.schema_key, Cow::Owned(_)) {
+            escaped += 1;
+        }
+        owned_bytes += key.schema_key.len();
+        if let Some(file_id) = key.file_id.as_ref() {
+            if matches!(file_id, Cow::Owned(_)) {
+                escaped += 1;
+            }
+            owned_bytes += file_id.len();
+        }
+        crate::storage_bench::record_key_decode_owned(bytes.len(), owned_bytes, escaped);
+    }
     Ok(TrackedStateKey {
         schema_key: key.schema_key.into_owned(),
         file_id: key.file_id.map(Cow::into_owned),
-        entity_pk: key.entity_pk,
+        row_pk: key.row_pk,
     })
 }
 
@@ -540,7 +578,7 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
 pub(crate) struct DecodedTrackedStateKey<'a> {
     pub(crate) schema_key: Cow<'a, str>,
     pub(crate) file_id: Option<Cow<'a, str>>,
-    pub(crate) entity_pk: crate::entity_pk::EntityPk,
+    pub(crate) row_pk: crate::row_pk::RowPk,
 }
 
 /// Fully shared decoded key retained by a tree-diff batch.
@@ -552,7 +590,7 @@ pub(crate) struct DecodedTrackedStateKey<'a> {
 pub(crate) struct DecodedTrackedStateKeyShared {
     pub(crate) schema_key: SharedStr,
     pub(crate) file_id: Option<SharedStr>,
-    pub(crate) entity_pk: crate::entity_pk::EntityPk,
+    pub(crate) row_pk: crate::row_pk::RowPk,
 }
 
 impl DecodedTrackedStateKeyShared {
@@ -560,7 +598,7 @@ impl DecodedTrackedStateKeyShared {
         TrackedStateKeyRef {
             schema_key: self.schema_key.as_str(),
             file_id: self.file_id.as_deref(),
-            entity_pk: &self.entity_pk,
+            row_pk: &self.row_pk,
         }
     }
 }
@@ -572,14 +610,14 @@ pub(crate) fn decode_key_borrowed(bytes: &[u8]) -> Result<DecodedTrackedStateKey
         return Err(key_codec_error("schema key has an invalid terminator"));
     }
     let file_id = read_file_id_cow(bytes, &mut offset)?;
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    let row_pk = read_row_pk(bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(key_codec_error("has trailing bytes"));
     }
     Ok(DecodedTrackedStateKey {
         schema_key,
         file_id,
-        entity_pk,
+        row_pk,
     })
 }
 
@@ -591,21 +629,21 @@ pub(crate) fn decode_key_shared(bytes: Bytes) -> Result<DecodedTrackedStateKeySh
         return Err(key_codec_error("schema key has an invalid terminator"));
     }
     let file_id = read_file_id_shared(&bytes, &mut offset)?;
-    let entity_pk = read_entity_pk_shared(&bytes, &mut offset)?;
+    let row_pk = read_row_pk_shared(&bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(key_codec_error("has trailing bytes"));
     }
     Ok(DecodedTrackedStateKeyShared {
         schema_key,
         file_id,
-        entity_pk,
+        row_pk,
     })
 }
 
 /// Decodes a key after the caller has already proven the schema/file prefix.
 ///
 /// This is for scan paths that have matched an encoded prefix range and only
-/// need to materialize the entity suffix plus the selected columns.
+/// need to materialize the row suffix plus the selected columns.
 pub(crate) fn decode_key_with_trusted_prefix(
     bytes: &[u8],
     schema_key: &str,
@@ -618,42 +656,35 @@ pub(crate) fn decode_key_with_trusted_prefix(
         ));
     }
     let mut offset = prefix_len;
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    let row_pk = read_row_pk(bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(key_codec_error("has trailing bytes"));
     }
     Ok(TrackedStateKey {
         schema_key: schema_key.to_string(),
         file_id: file_id.map(str::to_string),
-        entity_pk,
+        row_pk,
     })
 }
 
-const KEY_ESCAPE: u8 = 0xff;
-const KEY_PART_FINAL: u8 = 0x00;
-const KEY_PART_MORE: u8 = 0x01;
-const FILE_ID_NONE: u8 = 0x00;
-const FILE_ID_SOME: u8 = 0x01;
-const ENTITY_PK_CODEC_V1: u8 = 0x01;
-const ENTITY_PK_UUID: u8 = 0x00;
-const ENTITY_PK_INTEGER: u8 = 0x01;
-const ENTITY_PK_STRING: u8 = 0x02;
-const ENTITY_PK_BYTES: u8 = 0x03;
+// The key byte format is shared with the hot-head serving index and lives in
+// one place; see `crate::order_preserving_key`.
+use crate::order_preserving_key::*;
 
 /// Order-preserving tracked-state key encoding.
 ///
-/// NUL bytes are escaped as `00 ff`. Tags match [`EntityPk`]'s cross-type
+/// NUL bytes are escaped as `00 ff`. Tags match [`RowPk`]'s cross-type
 /// order. UUIDs use raw bytes and signed integers use sign-bit-flipped big
 /// endian, preserving logical order.
 fn encode_key_parts(
     schema_key: &str,
     file_id: Option<&str>,
-    entity_pk: &crate::entity_pk::EntityPk,
+    row_pk: &crate::row_pk::RowPk,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        schema_key.len() + file_id.map_or(0, str::len) + 6 + entity_pk.components.len() * 18,
+        schema_key.len() + file_id.map_or(0, str::len) + 6 + row_pk.components.len() * 18,
     );
-    encode_key_parts_into(&mut out, schema_key, file_id, entity_pk);
+    encode_key_parts_into(&mut out, schema_key, file_id, row_pk);
     out
 }
 
@@ -661,64 +692,11 @@ fn encode_key_parts_into(
     out: &mut Vec<u8>,
     schema_key: &str,
     file_id: Option<&str>,
-    entity_pk: &crate::entity_pk::EntityPk,
+    row_pk: &crate::row_pk::RowPk,
 ) {
     write_key_string(out, schema_key, KEY_PART_FINAL);
     write_file_id(out, file_id);
-    out.push(ENTITY_PK_CODEC_V1);
-    for (index, component) in entity_pk.components.iter().enumerate() {
-        let terminator = if index + 1 == entity_pk.components.len() {
-            KEY_PART_FINAL
-        } else {
-            KEY_PART_MORE
-        };
-        match component {
-            crate::entity_pk::EntityPkComponent::Uuid(bytes) => {
-                out.push(ENTITY_PK_UUID);
-                out.extend_from_slice(bytes);
-                out.push(terminator);
-            }
-            crate::entity_pk::EntityPkComponent::Integer(value) => {
-                out.push(ENTITY_PK_INTEGER);
-                let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
-                out.extend_from_slice(&ordered.to_be_bytes());
-                out.push(terminator);
-            }
-            crate::entity_pk::EntityPkComponent::String(value) => {
-                out.push(ENTITY_PK_STRING);
-                write_key_bytes(out, value.as_bytes(), terminator);
-            }
-            crate::entity_pk::EntityPkComponent::Bytes(value) => {
-                out.push(ENTITY_PK_BYTES);
-                write_key_bytes(out, value, terminator);
-            }
-        }
-    }
-}
-
-fn write_file_id(out: &mut Vec<u8>, file_id: Option<&str>) {
-    match file_id {
-        None => out.push(FILE_ID_NONE),
-        Some(file_id) => {
-            out.push(FILE_ID_SOME);
-            write_key_string(out, file_id, KEY_PART_FINAL);
-        }
-    }
-}
-
-fn write_key_string(out: &mut Vec<u8>, value: &str, terminator: u8) {
-    write_key_bytes(out, value.as_bytes(), terminator);
-}
-
-fn write_key_bytes(out: &mut Vec<u8>, value: &[u8], terminator: u8) {
-    for &byte in value {
-        if byte == 0 {
-            out.extend_from_slice(&[0, KEY_ESCAPE]);
-        } else {
-            out.push(byte);
-        }
-    }
-    out.extend_from_slice(&[0, terminator]);
+    write_row_pk(out, row_pk);
 }
 
 fn read_file_id_cow<'a>(
@@ -760,254 +738,267 @@ fn read_file_id_shared(bytes: &Bytes, offset: &mut usize) -> Result<Option<Share
     }
 }
 
-fn read_entity_pk_shared(
+fn read_row_pk_shared(
     bytes: &Bytes,
     offset: &mut usize,
-) -> Result<crate::entity_pk::EntityPk, LixError> {
+) -> Result<crate::row_pk::RowPk, LixError> {
     let version = bytes
         .get(*offset)
         .copied()
-        .ok_or_else(|| key_codec_error("entity primary key is empty or truncated"))?;
+        .ok_or_else(|| key_codec_error("row primary key is empty or truncated"))?;
     *offset += 1;
-    if version != ENTITY_PK_CODEC_V1 {
+    if version != ROW_PK_CODEC_V1 {
         return Err(key_codec_error(format!(
-            "entity primary key has unsupported codec version {version}"
+            "row primary key has unsupported codec version {version}"
         )));
     }
     if *offset >= bytes.len() {
-        return Err(key_codec_error("entity primary key is empty or truncated"));
+        return Err(key_codec_error("row primary key is empty or truncated"));
     }
-    let (first, terminator) = read_entity_pk_part_shared(bytes, offset)?;
+    let (first, terminator) = read_row_pk_part_shared(bytes, offset)?;
     if terminator == KEY_PART_FINAL {
-        return crate::entity_pk::EntityPk::from_components(smallvec::smallvec![first])
+        return crate::row_pk::RowPk::from_components(smallvec::smallvec![first])
             .map_err(|error| key_codec_error(error.to_string()));
     }
 
     let mut components = smallvec::smallvec![first];
     loop {
         if *offset >= bytes.len() {
-            return Err(key_codec_error("entity primary key is empty or truncated"));
+            return Err(key_codec_error("row primary key is empty or truncated"));
         }
-        let (part, terminator) = read_entity_pk_part_shared(bytes, offset)?;
+        let (part, terminator) = read_row_pk_part_shared(bytes, offset)?;
         components.push(part);
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
-            _ => unreachable!("shared key decoder validates terminators"),
+            // Sound because every arm of `read_row_pk_part_shared` gets its
+            // terminator past `is_key_part_terminator`: the string and bytes
+            // arms via `scan_key_part`, the fixed-width arms by checking it
+            // directly.
+            _ => unreachable!("scan_key_part validates terminators"),
         }
     }
-    crate::entity_pk::EntityPk::from_components(components).map_err(|error| {
+    crate::row_pk::RowPk::from_components(components).map_err(|error| {
         key_codec_error(format!(
-            "entity primary key decoded from storage is invalid: {error}"
+            "row primary key decoded from storage is invalid: {error}"
         ))
     })
 }
 
-fn read_entity_pk_part_shared(
+fn read_row_pk_part_shared(
     bytes: &Bytes,
     offset: &mut usize,
-) -> Result<(crate::entity_pk::EntityPkComponent, u8), LixError> {
+) -> Result<(crate::row_pk::RowPkComponent, u8), LixError> {
     let tag = bytes
         .get(*offset)
         .copied()
-        .ok_or_else(|| key_codec_error("entity primary-key part tag is truncated"))?;
+        .ok_or_else(|| key_codec_error("row primary-key part tag is truncated"))?;
     *offset += 1;
     match tag {
-        ENTITY_PK_STRING => {
+        ROW_PK_STRING => {
             let (value, terminator) =
-                read_key_string_shared(bytes, offset, "entity primary-key part")?;
+                read_key_string_shared(bytes, offset, "row primary-key part")?;
             Ok((
-                crate::entity_pk::EntityPkComponent::String(value),
+                crate::row_pk::RowPkComponent::String(value),
                 terminator,
             ))
         }
-        ENTITY_PK_BYTES => {
+        ROW_PK_BYTES => {
             let (value, terminator) =
-                read_key_bytes_shared(bytes, offset, "entity primary-key bytes")?;
+                read_key_bytes_shared(bytes, offset, "row primary-key bytes")?;
             Ok((
-                crate::entity_pk::EntityPkComponent::Bytes(value),
+                crate::row_pk::RowPkComponent::Bytes(value),
                 terminator,
             ))
         }
-        ENTITY_PK_UUID => {
+        ROW_PK_UUID => {
             let uuid_end = offset
-                .checked_add(16)
-                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key part is truncated"))?;
+                .checked_add(ROW_PK_UUID_BYTES)
+                .ok_or_else(|| key_codec_error("UUIDv7 row primary-key part is truncated"))?;
             let uuid_bytes: [u8; 16] = bytes
                 .get(*offset..uuid_end)
-                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key part is truncated"))?
+                .ok_or_else(|| key_codec_error("UUIDv7 row primary-key part is truncated"))?
                 .try_into()
                 .expect("UUIDv7 slice has fixed length");
             let terminator = bytes
                 .get(uuid_end)
                 .copied()
-                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key ending is truncated"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+                .ok_or_else(|| key_codec_error("UUIDv7 row primary-key ending is truncated"))?;
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(format!(
-                    "UUIDv7 entity primary-key part has invalid terminator {terminator}"
+                    "UUIDv7 row primary-key part has invalid terminator {terminator}"
                 )));
             }
             *offset = uuid_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Uuid(uuid_bytes),
+                crate::row_pk::RowPkComponent::Uuid(uuid_bytes),
                 terminator,
             ))
         }
-        ENTITY_PK_INTEGER => {
+        ROW_PK_INTEGER => {
             let integer_end = offset
-                .checked_add(8)
-                .ok_or_else(|| key_codec_error("integer entity primary-key part is truncated"))?;
+                .checked_add(ROW_PK_INTEGER_BYTES)
+                .ok_or_else(|| key_codec_error("integer row primary-key part is truncated"))?;
             let ordered = u64::from_be_bytes(
                 bytes
                     .get(*offset..integer_end)
-                    .ok_or_else(|| key_codec_error("integer entity primary-key part is truncated"))?
+                    .ok_or_else(|| key_codec_error("integer row primary-key part is truncated"))?
                     .try_into()
                     .expect("integer slice has fixed length"),
             );
             let terminator = bytes
                 .get(integer_end)
                 .copied()
-                .ok_or_else(|| key_codec_error("integer entity primary-key ending is truncated"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+                .ok_or_else(|| key_codec_error("integer row primary-key ending is truncated"))?;
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(format!(
-                    "integer entity primary-key part has invalid terminator {terminator}"
+                    "integer row primary-key part has invalid terminator {terminator}"
                 )));
             }
             *offset = integer_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
-                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
-                )),
+                crate::row_pk::RowPkComponent::Integer(i64_from_ordered_integer(ordered)),
                 terminator,
             ))
         }
         other => Err(key_codec_error(format!(
-            "entity primary-key part has unknown tag {other}"
+            "row primary-key part has unknown tag {other}"
         ))),
     }
 }
 
-fn read_entity_pk(
+/// Test-only shim; see `crate::order_preserving_key::tests`.
+#[cfg(test)]
+pub(crate) fn tree_decode_row_pk_probe(
+    bytes: &[u8],
+) -> Option<(crate::row_pk::RowPk, usize)> {
+    let mut offset = 0usize;
+    read_row_pk(bytes, &mut offset)
+        .ok()
+        .map(|row_pk| (row_pk, offset))
+}
+
+fn read_row_pk(
     bytes: &[u8],
     offset: &mut usize,
-) -> Result<crate::entity_pk::EntityPk, LixError> {
+) -> Result<crate::row_pk::RowPk, LixError> {
     let version = bytes
         .get(*offset)
         .copied()
-        .ok_or_else(|| key_codec_error("entity primary key is empty or truncated"))?;
+        .ok_or_else(|| key_codec_error("row primary key is empty or truncated"))?;
     *offset += 1;
-    if version != ENTITY_PK_CODEC_V1 {
+    if version != ROW_PK_CODEC_V1 {
         return Err(key_codec_error(format!(
-            "entity primary key has unsupported codec version {version}"
+            "row primary key has unsupported codec version {version}"
         )));
     }
     if *offset >= bytes.len() {
-        return Err(key_codec_error("entity primary key is empty or truncated"));
+        return Err(key_codec_error("row primary key is empty or truncated"));
     }
-    let (first, terminator) = read_entity_pk_part(bytes, offset)?;
+    let (first, terminator) = read_row_pk_part(bytes, offset)?;
     if terminator == KEY_PART_FINAL {
-        return crate::entity_pk::EntityPk::from_components(smallvec::smallvec![first])
+        return crate::row_pk::RowPk::from_components(smallvec::smallvec![first])
             .map_err(|error| key_codec_error(error.to_string()));
     }
 
     let mut components = smallvec::smallvec![first];
     loop {
         if *offset >= bytes.len() {
-            return Err(key_codec_error("entity primary key is empty or truncated"));
+            return Err(key_codec_error("row primary key is empty or truncated"));
         }
-        let (part, terminator) = read_entity_pk_part(bytes, offset)?;
+        let (part, terminator) = read_row_pk_part(bytes, offset)?;
         components.push(part);
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
-            _ => unreachable!("read_key_string validates terminators"),
+            // Same invariant as `read_row_pk_shared` above: `scan_key_part`
+            // is now the single place the terminator set is enforced.
+            _ => unreachable!("scan_key_part validates terminators"),
         }
     }
-    crate::entity_pk::EntityPk::from_components(components).map_err(|error| {
+    crate::row_pk::RowPk::from_components(components).map_err(|error| {
         key_codec_error(format!(
-            "entity primary key decoded from storage is invalid: {error}"
+            "row primary key decoded from storage is invalid: {error}"
         ))
     })
 }
 
-fn read_entity_pk_part(
+fn read_row_pk_part(
     bytes: &[u8],
     offset: &mut usize,
-) -> Result<(crate::entity_pk::EntityPkComponent, u8), LixError> {
+) -> Result<(crate::row_pk::RowPkComponent, u8), LixError> {
     let tag = bytes
         .get(*offset)
         .copied()
-        .ok_or_else(|| key_codec_error("entity primary-key part tag is truncated"))?;
+        .ok_or_else(|| key_codec_error("row primary-key part tag is truncated"))?;
     *offset += 1;
     match tag {
-        ENTITY_PK_STRING => {
-            let (value, terminator) = read_key_string(bytes, offset, "entity primary-key part")?;
+        ROW_PK_STRING => {
+            let (value, terminator) = read_key_string(bytes, offset, "row primary-key part")?;
             Ok((
-                crate::entity_pk::EntityPkComponent::String(value.into()),
+                crate::row_pk::RowPkComponent::String(value.into()),
                 terminator,
             ))
         }
-        ENTITY_PK_BYTES => {
-            let (value, terminator) = read_key_bytes(bytes, offset, "entity primary-key bytes")?;
+        ROW_PK_BYTES => {
+            let (value, terminator) = read_key_bytes(bytes, offset, "row primary-key bytes")?;
             Ok((
-                crate::entity_pk::EntityPkComponent::Bytes(value.into()),
+                crate::row_pk::RowPkComponent::Bytes(value.into()),
                 terminator,
             ))
         }
-        ENTITY_PK_UUID => {
+        ROW_PK_UUID => {
             let uuid_end = offset
-                .checked_add(16)
-                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key part is truncated"))?;
+                .checked_add(ROW_PK_UUID_BYTES)
+                .ok_or_else(|| key_codec_error("UUIDv7 row primary-key part is truncated"))?;
             let uuid_bytes: [u8; 16] = bytes
                 .get(*offset..uuid_end)
-                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key part is truncated"))?
+                .ok_or_else(|| key_codec_error("UUIDv7 row primary-key part is truncated"))?
                 .try_into()
                 .expect("UUIDv7 slice has fixed length");
             let terminator = bytes
                 .get(uuid_end)
                 .copied()
-                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key ending is truncated"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+                .ok_or_else(|| key_codec_error("UUIDv7 row primary-key ending is truncated"))?;
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(format!(
-                    "UUIDv7 entity primary-key part has invalid terminator {terminator}"
+                    "UUIDv7 row primary-key part has invalid terminator {terminator}"
                 )));
             }
             *offset = uuid_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Uuid(uuid_bytes),
+                crate::row_pk::RowPkComponent::Uuid(uuid_bytes),
                 terminator,
             ))
         }
-        ENTITY_PK_INTEGER => {
+        ROW_PK_INTEGER => {
             let integer_end = offset
-                .checked_add(8)
-                .ok_or_else(|| key_codec_error("integer entity primary-key part is truncated"))?;
+                .checked_add(ROW_PK_INTEGER_BYTES)
+                .ok_or_else(|| key_codec_error("integer row primary-key part is truncated"))?;
             let ordered = u64::from_be_bytes(
                 bytes
                     .get(*offset..integer_end)
-                    .ok_or_else(|| key_codec_error("integer entity primary-key part is truncated"))?
+                    .ok_or_else(|| key_codec_error("integer row primary-key part is truncated"))?
                     .try_into()
                     .expect("integer slice has fixed length"),
             );
             let terminator = bytes
                 .get(integer_end)
                 .copied()
-                .ok_or_else(|| key_codec_error("integer entity primary-key ending is truncated"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+                .ok_or_else(|| key_codec_error("integer row primary-key ending is truncated"))?;
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(format!(
-                    "integer entity primary-key part has invalid terminator {terminator}"
+                    "integer row primary-key part has invalid terminator {terminator}"
                 )));
             }
             *offset = integer_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
-                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
-                )),
+                crate::row_pk::RowPkComponent::Integer(i64_from_ordered_integer(ordered)),
                 terminator,
             ))
         }
         other => Err(key_codec_error(format!(
-            "entity primary-key part has unknown tag {other}"
+            "row primary-key part has unknown tag {other}"
         ))),
     }
 }
@@ -1060,51 +1051,29 @@ fn read_key_bytes(
         .map(|(value, terminator)| (value.into_owned(), terminator))
 }
 
+/// Maps the shared scanner's structured error into this plane's vocabulary.
+fn tree_key_part_error(error: KeyPartError, field: &str) -> LixError {
+    match error {
+        KeyPartError::Truncated => key_codec_error(format!("{field} is truncated")),
+        KeyPartError::EscapeTruncated => key_codec_error(format!("{field} escape is truncated")),
+        KeyPartError::UnknownEscape(other) => {
+            key_codec_error(format!("{field} has unknown escape {other}"))
+        }
+    }
+}
+
 fn read_key_bytes_cow<'a>(
     bytes: &'a [u8],
     offset: &mut usize,
     field: &str,
 ) -> Result<(Cow<'a, [u8]>, u8), LixError> {
-    let start = *offset;
-    let mut segment_start = start;
-    let mut decoded: Option<Vec<u8>> = None;
-    loop {
-        let tail = bytes
-            .get(segment_start..)
-            .ok_or_else(|| key_codec_error(format!("{field} is truncated")))?;
-        let relative_zero = memchr::memchr(0, tail)
-            .ok_or_else(|| key_codec_error(format!("{field} is truncated")))?;
-        let zero = segment_start + relative_zero;
-        let escape = *bytes
-            .get(zero + 1)
-            .ok_or_else(|| key_codec_error(format!("{field} escape is truncated")))?;
-        *offset = zero + 2;
-        match escape {
-            KEY_ESCAPE => {
-                let out = decoded.get_or_insert_with(|| {
-                    Vec::with_capacity(zero.saturating_sub(start).saturating_add(16))
-                });
-                out.extend_from_slice(&bytes[segment_start..zero]);
-                out.push(0);
-                segment_start = *offset;
-            }
-            KEY_PART_FINAL | KEY_PART_MORE => {
-                let value = decoded.map_or_else(
-                    || Cow::Borrowed(&bytes[start..zero]),
-                    |mut out| {
-                        out.extend_from_slice(&bytes[segment_start..zero]);
-                        Cow::Owned(out)
-                    },
-                );
-                return Ok((value, escape));
-            }
-            other => {
-                return Err(key_codec_error(format!(
-                    "{field} has unknown escape {other}"
-                )));
-            }
-        }
-    }
+    let part = scan_key_part(bytes, *offset).map_err(|error| tree_key_part_error(error, field))?;
+    *offset = part.end;
+    let value = match part.value {
+        ScannedKeyValue::Verbatim(range) => Cow::Borrowed(&bytes[range]),
+        ScannedKeyValue::Unescaped(value) => Cow::Owned(value),
+    };
+    Ok((value, part.terminator))
 }
 
 fn read_key_bytes_shared(
@@ -1112,46 +1081,14 @@ fn read_key_bytes_shared(
     offset: &mut usize,
     field: &str,
 ) -> Result<(Bytes, u8), LixError> {
-    let start = *offset;
-    let mut segment_start = start;
-    let mut decoded: Option<Vec<u8>> = None;
-    loop {
-        let tail = bytes
-            .get(segment_start..)
-            .ok_or_else(|| key_codec_error(format!("{field} is truncated")))?;
-        let relative_zero = memchr::memchr(0, tail)
-            .ok_or_else(|| key_codec_error(format!("{field} is truncated")))?;
-        let zero = segment_start + relative_zero;
-        let escape = *bytes
-            .get(zero + 1)
-            .ok_or_else(|| key_codec_error(format!("{field} escape is truncated")))?;
-        *offset = zero + 2;
-        match escape {
-            KEY_ESCAPE => {
-                let out = decoded.get_or_insert_with(|| {
-                    Vec::with_capacity(zero.saturating_sub(start).saturating_add(16))
-                });
-                out.extend_from_slice(&bytes[segment_start..zero]);
-                out.push(0);
-                segment_start = *offset;
-            }
-            KEY_PART_FINAL | KEY_PART_MORE => {
-                let value = decoded.map_or_else(
-                    || bytes.slice(start..zero),
-                    |mut out| {
-                        out.extend_from_slice(&bytes[segment_start..zero]);
-                        Bytes::from(out)
-                    },
-                );
-                return Ok((value, escape));
-            }
-            other => {
-                return Err(key_codec_error(format!(
-                    "{field} has unknown escape {other}"
-                )));
-            }
-        }
-    }
+    let part = scan_key_part(bytes.as_ref(), *offset)
+        .map_err(|error| tree_key_part_error(error, field))?;
+    *offset = part.end;
+    let value = match part.value {
+        ScannedKeyValue::Verbatim(range) => bytes.slice(range),
+        ScannedKeyValue::Unescaped(value) => Bytes::from(value),
+    };
+    Ok((value, part.terminator))
 }
 
 fn key_codec_error(message: impl Into<String>) -> LixError {
@@ -1437,12 +1374,27 @@ const VALUE_TAIL_DISTINCT_MAX: u8 =
 /// their tag declares the timestamp equality and byte widths.
 ///
 /// Entries within a node are sorted by key, so consecutive keys share the
-/// encoded schema-key/file-id prefix and most of the entity-pk; front-coding
+/// encoded schema-key/file-id prefix and most of the row-pk; front-coding
 /// removes that redundancy. Decode reconstructs the original value bytes
 /// exactly. Sortedness is a caller invariant (the tree builder always
 /// produces sorted entries); it is asserted in debug builds but not
 /// revalidated on every release-mode read.
 pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let encoded = encode_leaf_node_refs_inner(entries);
+        crate::storage_bench::record_replay_node_encode(
+            start.elapsed().as_nanos() as u64,
+            encoded.len() as u64,
+        );
+        return encoded;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    encode_leaf_node_refs_inner(entries)
+}
+
+fn encode_leaf_node_refs_inner(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
     debug_assert!(
         entries.windows(2).all(|pair| pair[0].key < pair[1].key),
         "leaf entries must be strictly sorted by key"
@@ -1463,6 +1415,9 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
                 "tracked-state leaf value must end after its v3 state tail"
             );
         }
+    }
+    if let Some((commit_id, first_packed)) = direct_leaf_sequence(entries) {
+        return encode_direct_leaf_v1(entries, commit_id, first_packed);
     }
     let commit_dictionary = repeated_dictionary::<16>(entries, VALUE_COMMIT_ID_START);
     let tail_dictionary = repeated_tail_dictionary(entries);
@@ -1493,6 +1448,71 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
         if commit_ref == 0 {
             out.extend_from_slice(&entry.value[VALUE_COMMIT_ID_START..VALUE_COMMIT_ID_END]);
         }
+        let tail = &entry.value[VALUE_STATE_TAIL_START..];
+        let tail_ref = slice_dictionary_ref(&tail_dictionary, tail);
+        write_varint(&mut out, tail_ref);
+        if tail_ref == 0 {
+            out.extend_from_slice(tail);
+        }
+        previous_key = entry.key;
+    }
+    #[cfg(debug_assertions)]
+    verify_leaf_round_trip(&out, entries);
+    out
+}
+
+fn direct_leaf_sequence(entries: &[EncodedLeafEntryRef<'_>]) -> Option<([u8; 16], u32)> {
+    let first = entries.first()?;
+    let commit_id: [u8; 16] = first.value[VALUE_COMMIT_ID_START..VALUE_COMMIT_ID_END]
+        .try_into()
+        .expect("validated tracked-state value has a commit id");
+    let first_change: [u8; 16] = first.value[..VALUE_CHANGE_ID_END]
+        .try_into()
+        .expect("validated tracked-state value has a change id");
+    if first_change[..12] != commit_id[..12] {
+        return None;
+    }
+    let first_packed = u32::from_be_bytes(
+        first_change[12..]
+            .try_into()
+            .expect("change-id suffix is a packed u32"),
+    );
+    for (ordinal, entry) in entries.iter().enumerate() {
+        if entry.value[VALUE_COMMIT_ID_START..VALUE_COMMIT_ID_END] != commit_id
+            || entry.value[..12] != commit_id[..12]
+            || u32::from_be_bytes(
+                entry.value[12..VALUE_CHANGE_ID_END]
+                    .try_into()
+                    .expect("change-id suffix is a packed u32"),
+            ) != first_packed.checked_add(u32::try_from(ordinal).ok()?)?
+        {
+            return None;
+        }
+    }
+    Some((commit_id, first_packed))
+}
+
+fn encode_direct_leaf_v1(
+    entries: &[EncodedLeafEntryRef<'_>],
+    commit_id: [u8; 16],
+    first_packed: u32,
+) -> Vec<u8> {
+    let tail_dictionary = repeated_tail_dictionary(entries);
+    let mut out = Vec::with_capacity(32 + entries.len() * 8);
+    out.push(NODE_KIND_DIRECT_LEAF_V1);
+    write_varint(&mut out, entries.len() as u64);
+    out.extend_from_slice(&commit_id);
+    out.extend_from_slice(&first_packed.to_be_bytes());
+    write_varint(&mut out, tail_dictionary.len() as u64);
+    for tail in &tail_dictionary {
+        out.extend_from_slice(tail);
+    }
+    let mut previous_key: &[u8] = &[];
+    for entry in entries {
+        let shared = shared_prefix_len(previous_key, entry.key);
+        write_varint(&mut out, shared as u64);
+        write_varint(&mut out, (entry.key.len() - shared) as u64);
+        out.extend_from_slice(&entry.key[shared..]);
         let tail = &entry.value[VALUE_STATE_TAIL_START..];
         let tail_ref = slice_dictionary_ref(&tail_dictionary, tail);
         write_varint(&mut out, tail_ref);
@@ -1728,6 +1748,151 @@ fn decode_leaf_v4(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
     })
 }
 
+fn decode_direct_leaf_v1(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+    fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
+        usize::try_from(value).map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("tracked-state direct leaf node {what} does not fit in usize"),
+            )
+        })
+    }
+    fn slice<'b>(body: &'b [u8], offset: &mut usize, len: usize) -> Result<&'b [u8], LixError> {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state direct leaf node length overflow",
+            )
+        })?;
+        let bytes = body.get(*offset..end).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state direct leaf node is truncated",
+            )
+        })?;
+        *offset = end;
+        Ok(bytes)
+    }
+
+    let mut offset = 0usize;
+    let entry_count = usize_from(
+        read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+        "entry count",
+    )?;
+    if entry_count == 0 {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state direct leaf node has no entries",
+        ));
+    }
+    let commit_id: [u8; 16] = slice(body, &mut offset, 16)?
+        .try_into()
+        .expect("fixed commit-id slice");
+    let first_packed = u32::from_be_bytes(
+        slice(body, &mut offset, 4)?
+            .try_into()
+            .expect("fixed packed-address slice"),
+    );
+    let tail_dict_len = usize_from(
+        read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+        "tail dictionary length",
+    )?;
+    let mut tail_dictionary = Vec::with_capacity(tail_dict_len.min(body.len()));
+    for _ in 0..tail_dict_len {
+        tail_dictionary.push(read_value_tail(
+            body,
+            &mut offset,
+            "tracked-state direct leaf node",
+        )?);
+    }
+    let omitted_value_bytes = entry_count.min(body.len()).saturating_mul(VALUE_MAX_BYTES);
+    let mut arena = Vec::with_capacity(body.len().saturating_add(omitted_value_bytes));
+    let mut entries = Vec::with_capacity(entry_count.min(body.len()));
+    let mut previous_key_start = 0usize;
+    let mut previous_key_end = 0usize;
+    for ordinal in 0..entry_count {
+        let shared = usize_from(
+            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+            "shared key length",
+        )?;
+        let suffix_len = usize_from(
+            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+            "key suffix length",
+        )?;
+        let previous_key_len = previous_key_end - previous_key_start;
+        if shared > previous_key_len {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state direct leaf node shares more key bytes than the previous key holds",
+            ));
+        }
+        let key_start = arena.len();
+        arena.extend_from_within(previous_key_start..previous_key_start + shared);
+        arena.extend_from_slice(slice(body, &mut offset, suffix_len)?);
+        let key_end = arena.len();
+        if !entries.is_empty()
+            && arena[previous_key_start..previous_key_end] >= arena[key_start..key_end]
+        {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state direct leaf node keys are not strictly ordered",
+            ));
+        }
+        let tail_ref = usize_from(
+            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+            "tail dictionary ref",
+        )?;
+        let tail = if tail_ref == 0 {
+            read_value_tail(body, &mut offset, "tracked-state direct leaf node")?
+        } else {
+            if tail_ref > tail_dict_len {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state direct leaf node tail dictionary ref is out of bounds",
+                ));
+            }
+            tail_dictionary[tail_ref - 1]
+        };
+        let packed = first_packed
+            .checked_add(u32::try_from(ordinal).map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state direct leaf node ordinal exceeds u32",
+                )
+            })?)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state direct leaf node address overflows u32",
+                )
+            })?;
+        let value_start = arena.len();
+        arena.extend_from_slice(&commit_id[..12]);
+        arena.extend_from_slice(&packed.to_be_bytes());
+        arena.extend_from_slice(&commit_id);
+        arena.extend_from_slice(tail);
+        let value_end = arena.len();
+        entries.push(LeafEntrySpan {
+            key_start,
+            key_end,
+            value_start,
+            value_end,
+        });
+        previous_key_start = key_start;
+        previous_key_end = key_end;
+    }
+    if offset != body.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state direct leaf node has trailing bytes",
+        ));
+    }
+    Ok(DecodedLeafNodeRef {
+        arena: Bytes::from(arena),
+        entries,
+    })
+}
+
 fn shared_prefix_len(left: &[u8], right: &[u8]) -> usize {
     left.iter()
         .zip(right.iter())
@@ -1781,6 +1946,21 @@ pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
 }
 
 pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let encoded = encode_internal_node_refs_inner(children);
+        crate::storage_bench::record_replay_node_encode(
+            start.elapsed().as_nanos() as u64,
+            encoded.len() as u64,
+        );
+        return encoded;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    encode_internal_node_refs_inner(children)
+}
+
+fn encode_internal_node_refs_inner(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
     assert!(
         !children.is_empty(),
         "tracked-state internal nodes must contain at least one child"
@@ -1906,6 +2086,20 @@ fn decode_internal_v4(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
             Some(first_key.clone()),
             &mut boundary_arena,
         )?;
+        if boundary_arena[first_key.clone()] > boundary_arena[last_key.clone()] {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node child has an inverted key range",
+            ));
+        }
+        if previous_last.as_ref().is_some_and(|previous_last| {
+            boundary_arena[previous_last.clone()] >= boundary_arena[first_key.clone()]
+        }) {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node children overlap or are unordered",
+            ));
+        }
         let child_hash = <[u8; TRACKED_STATE_HASH_BYTES]>::try_from(slice(
             body,
             &mut offset,
@@ -1955,12 +2149,28 @@ pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
 }
 
 pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        let start = std::time::Instant::now();
+        let decoded = decode_node_ref_inner(bytes);
+        crate::storage_bench::record_replay_node_decode(
+            start.elapsed().as_nanos() as u64,
+            bytes.len() as u64,
+        );
+        return decoded;
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    decode_node_ref_inner(bytes)
+}
+
+fn decode_node_ref_inner(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> {
     let (&kind, body) = bytes
         .split_first()
         .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
     match kind {
         NODE_KIND_LEAF_V4 => Ok(DecodedNodeRef::Leaf(decode_leaf_v4(body)?)),
         NODE_KIND_INTERNAL_V4 => Ok(DecodedNodeRef::Internal(decode_internal_v4(body)?)),
+        NODE_KIND_DIRECT_LEAF_V1 => Ok(DecodedNodeRef::Leaf(decode_direct_leaf_v1(body)?)),
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("tracked-state tree node has unknown kind byte {other}"),
@@ -2002,6 +2212,38 @@ mod tests {
         DecodedNodeRef as NodeRefForLeafTests, decode_node_ref as decode_node_ref_for_leaf_tests,
         encode_leaf_node_refs as encode_leaf_refs_for_tests,
     };
+
+    fn encode_unchecked_internal_boundaries(children: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut encoded = vec![NODE_KIND_INTERNAL_V4];
+        write_varint(&mut encoded, children.len() as u64);
+        let mut previous_last = &[][..];
+        for (index, (first_key, last_key)) in children.iter().enumerate() {
+            write_front_coded(&mut encoded, previous_last, first_key);
+            write_front_coded(&mut encoded, first_key, last_key);
+            encoded.extend_from_slice(&[index as u8 + 1; TRACKED_STATE_HASH_BYTES]);
+            write_varint(&mut encoded, 1);
+            previous_last = last_key;
+        }
+        encoded
+    }
+
+    #[test]
+    fn internal_node_rejects_reordered_sibling_ranges() {
+        let encoded = encode_unchecked_internal_boundaries(&[
+            (b"schema-z/a", b"schema-z/z"),
+            (b"schema-a/a", b"schema-a/z"),
+        ]);
+        let error = decode_node_ref(&encoded).expect_err("reordered siblings must fail closed");
+        assert!(error.message.contains("overlap or are unordered"));
+    }
+
+    #[test]
+    fn internal_node_rejects_inverted_child_range() {
+        let encoded =
+            encode_unchecked_internal_boundaries(&[(b"schema-z/z", b"schema-z/a")]);
+        let error = decode_node_ref(&encoded).expect_err("inverted range must fail closed");
+        assert!(error.message.contains("inverted key range"));
+    }
 
     fn raw_value(change: u8, commit: u8, tail: u8) -> Vec<u8> {
         let mut value = Vec::with_capacity(VALUE_MAX_BYTES);
@@ -2061,6 +2303,84 @@ mod tests {
     }
 
     #[test]
+    fn direct_leaf_reconstructs_exact_change_ids_without_per_row_uuid_bytes() {
+        let mut commit_id = [0x42; 16];
+        commit_id[12..].copy_from_slice(&0_u32.to_be_bytes());
+        let entries = (0_u32..128)
+            .map(|ordinal| {
+                let mut change_id = commit_id;
+                change_id[12..].copy_from_slice(&(513 + ordinal).to_be_bytes());
+                let mut value = Vec::new();
+                value.extend_from_slice(&change_id);
+                value.extend_from_slice(&commit_id);
+                write_value_tail(&mut value, false, 7, 7);
+                (format!("key-{ordinal:04}").into_bytes(), value)
+            })
+            .collect::<Vec<_>>();
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef { key, value })
+            .collect::<Vec<_>>();
+        let encoded = encode_leaf_refs_for_tests(&refs);
+        assert_eq!(encoded[0], NODE_KIND_DIRECT_LEAF_V1);
+        assert!(encoded.len() < entries.len() * 8);
+        leaf_entries_round_trip(&entries);
+    }
+
+    #[test]
+    fn direct_leaf_falls_back_for_mixed_or_nonsequential_change_ids() {
+        let mut commit_id = [0x42; 16];
+        commit_id[12..].copy_from_slice(&0_u32.to_be_bytes());
+        let mut entries = (0_u32..3)
+            .map(|ordinal| {
+                let mut change_id = commit_id;
+                change_id[12..].copy_from_slice(&(17 + ordinal).to_be_bytes());
+                let mut value = Vec::new();
+                value.extend_from_slice(&change_id);
+                value.extend_from_slice(&commit_id);
+                write_value_tail(&mut value, false, 9, 9);
+                (format!("key-{ordinal}").into_bytes(), value)
+            })
+            .collect::<Vec<_>>();
+        entries[1].1[0] ^= 0x80;
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef { key, value })
+            .collect::<Vec<_>>();
+
+        let encoded = encode_leaf_refs_for_tests(&refs);
+        assert_eq!(encoded[0], NODE_KIND_LEAF_V4);
+        leaf_entries_round_trip(&entries);
+    }
+
+    #[test]
+    fn direct_leaf_rejects_a_reconstructed_address_overflow() {
+        let mut commit_id = [0x42; 16];
+        commit_id[12..].copy_from_slice(&0_u32.to_be_bytes());
+        let entries = (0_u32..2)
+            .map(|ordinal| {
+                let mut change_id = commit_id;
+                change_id[12..].copy_from_slice(&(17 + ordinal).to_be_bytes());
+                let mut value = Vec::new();
+                value.extend_from_slice(&change_id);
+                value.extend_from_slice(&commit_id);
+                write_value_tail(&mut value, false, 9, 9);
+                (format!("key-{ordinal}").into_bytes(), value)
+            })
+            .collect::<Vec<_>>();
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef { key, value })
+            .collect::<Vec<_>>();
+        let mut encoded = encode_leaf_refs_for_tests(&refs);
+        // kind + one-byte entry count + shared commit id
+        encoded[18..22].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let error = decode_node_ref(&encoded).expect_err("second address must overflow");
+        assert!(error.message.contains("address overflows u32"));
+    }
+
+    #[test]
     fn leaf_v4_round_trips_dictionaries_with_variable_tail_widths() {
         leaf_entries_round_trip(&[
             (b"a".to_vec(), raw_value(1, 9, 0)),
@@ -2073,7 +2393,7 @@ mod tests {
     #[test]
     fn leaf_v4_round_trips_generated_sorted_keys() {
         // Deterministic pseudo-random keys with heavy shared prefixes,
-        // mimicking encoded (schema_key, file_id, entity_pk) keys.
+        // mimicking encoded (schema_key, file_id, row_pk) keys.
         let mut entries = (0..512usize)
             .map(|index| {
                 let mut state = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -2301,7 +2621,7 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
 
     fn timestamp(field: &str, value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse(field, value)
@@ -2327,12 +2647,12 @@ mod tests {
         let null_key = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::single("entity"),
+            row_pk: RowPk::single("row"),
         });
         let file_key = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            entity_pk: EntityPk::single("entity"),
+            row_pk: RowPk::single("row"),
         });
 
         assert_ne!(null_key, file_key);
@@ -2341,7 +2661,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema".to_string(),
                 file_id: None,
-                entity_pk: EntityPk::single("entity"),
+                row_pk: RowPk::single("row"),
             }
         );
         assert_eq!(
@@ -2349,18 +2669,18 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema".to_string(),
                 file_id: Some("file".to_string()),
-                entity_pk: EntityPk::single("entity"),
+                row_pk: RowPk::single("row"),
             }
         );
     }
 
     #[test]
-    fn borrowed_single_string_key_encoding_matches_owned_entity_pk() {
-        for value in ["entity", "nul\0escaped", "café"] {
+    fn borrowed_single_string_key_encoding_matches_owned_row_pk() {
+        for value in ["row", "nul\0escaped", "café"] {
             let expected = encode_key(&TrackedStateKey {
                 schema_key: "schema".to_string(),
                 file_id: None,
-                entity_pk: EntityPk::single(value),
+                row_pk: RowPk::single(value),
             });
             let mut actual = Vec::new();
             let encoded = encode_single_string_key_ref_into(&mut actual, "schema", None, value);
@@ -2373,7 +2693,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::from_parts_unchecked(vec![
+            row_pk: RowPk::from_parts_unchecked(vec![
                 "namespace".to_string(),
                 "true".to_string(),
                 "42".to_string(),
@@ -2390,9 +2710,9 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "shared_schema".to_string(),
             file_id: Some("shared_file".to_string()),
-            entity_pk: EntityPk::from_components(smallvec::smallvec![
-                crate::entity_pk::EntityPkComponent::String("entity".into()),
-                crate::entity_pk::EntityPkComponent::Bytes(Bytes::from_static(b"suffix")),
+            row_pk: RowPk::from_components(smallvec::smallvec![
+                crate::row_pk::RowPkComponent::String("row".into()),
+                crate::row_pk::RowPkComponent::Bytes(Bytes::from_static(b"suffix")),
             ])
             .expect("composite key"),
         };
@@ -2403,7 +2723,7 @@ mod tests {
 
         assert_eq!(decoded.schema_key, key.schema_key.as_str());
         assert_eq!(decoded.file_id.as_deref(), key.file_id.as_deref());
-        assert_eq!(decoded.entity_pk, key.entity_pk);
+        assert_eq!(decoded.row_pk, key.row_pk);
         let retained_in_arena = |pointer: *const u8, len: usize| {
             let start = pointer as usize;
             start >= arena_start && start.saturating_add(len) <= arena_end
@@ -2413,13 +2733,13 @@ mod tests {
         let file_id = decoded.file_id.as_ref().expect("file id");
         let (pointer, len) = file_id.retained_buffer_identity();
         assert!(retained_in_arena(pointer, len));
-        for component in decoded.entity_pk.components.iter() {
+        for component in decoded.row_pk.components.iter() {
             match component {
-                crate::entity_pk::EntityPkComponent::String(value) => {
+                crate::row_pk::RowPkComponent::String(value) => {
                     let (pointer, len) = value.retained_buffer_identity();
                     assert!(retained_in_arena(pointer, len));
                 }
-                crate::entity_pk::EntityPkComponent::Bytes(value) => {
+                crate::row_pk::RowPkComponent::Bytes(value) => {
                     assert!(retained_in_arena(value.as_ptr(), value.len()));
                 }
                 _ => {}
@@ -2428,11 +2748,11 @@ mod tests {
     }
 
     #[test]
-    fn key_codec_decodes_entity_suffix_with_trusted_prefix() {
+    fn key_codec_decodes_row_suffix_with_trusted_prefix() {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            entity_pk: EntityPk::from_parts_unchecked(vec![
+            row_pk: RowPk::from_parts_unchecked(vec![
                 "namespace".to_string(),
                 "id".to_string(),
             ]),
@@ -2452,7 +2772,7 @@ mod tests {
         let mut encoded = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::single("true"),
+            row_pk: RowPk::single("true"),
         });
         encoded.truncate(encoded.len() - 1);
 
@@ -2461,16 +2781,16 @@ mod tests {
     }
 
     #[test]
-    fn key_codec_rejects_empty_entity_pk() {
+    fn key_codec_rejects_empty_row_pk() {
         let encoded = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::from_parts_unchecked(Vec::new()),
+            row_pk: RowPk::from_parts_unchecked(Vec::new()),
         });
 
-        let error = decode_key(&encoded).expect_err("empty entity pk should reject");
+        let error = decode_key(&encoded).expect_err("empty row pk should reject");
 
-        assert!(error.message.contains("entity primary key is empty"));
+        assert!(error.message.contains("row primary key is empty"));
     }
 
     #[test]
@@ -2478,12 +2798,12 @@ mod tests {
         let prefix = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::single("a"),
+            row_pk: RowPk::single("a"),
         });
         let extended = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::from_parts_unchecked(vec!["a".to_string(), "b".to_string()]),
+            row_pk: RowPk::from_parts_unchecked(vec!["a".to_string(), "b".to_string()]),
         });
 
         assert!(prefix < extended);
@@ -2495,7 +2815,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "s\0".to_string(),
             file_id: Some(String::new()),
-            entity_pk: EntityPk::from_parts_unchecked(vec!["a\0".to_string(), String::new()]),
+            row_pk: RowPk::from_parts_unchecked(vec!["a!".to_string(), String::new()]),
         };
         let encoded = encode_key(&key);
 
@@ -2504,8 +2824,8 @@ mod tests {
             vec![
                 b's', 0, 0xff, 0, 0, // schema "s\\0"
                 1, 0, 0, // Some("")
-                1, // entity-pk codec v1
-                2, b'a', 0, 0xff, 0, 1, // string non-final PK component "a\\0"
+                1, // row-pk codec v1
+                2, b'a', b'!', 0, 1, // string non-final PK component "a!"
                 2, 0, 0, // string final empty PK component
             ]
         );
@@ -2514,7 +2834,7 @@ mod tests {
             encode_key_ref(TrackedStateKeyRef {
                 schema_key: &key.schema_key,
                 file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
+                row_pk: &key.row_pk,
             }),
             encoded
         );
@@ -2526,8 +2846,8 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "s".to_string(),
             file_id: None,
-            entity_pk: EntityPk::from_components(smallvec::smallvec![
-                crate::entity_pk::EntityPkComponent::Uuid(
+            row_pk: RowPk::from_components(smallvec::smallvec![
+                crate::row_pk::RowPkComponent::Uuid(
                     crate::storage_codec::id_string::uuid_bytes_from_canonical(uuid)
                         .expect("canonical UUID"),
                 ),
@@ -2540,8 +2860,8 @@ mod tests {
         assert_eq!(
             &encoded[prefix.len()..],
             &[
-                ENTITY_PK_CODEC_V1,
-                ENTITY_PK_UUID,
+                ROW_PK_CODEC_V1,
+                ROW_PK_UUID,
                 0x01,
                 0x9e,
                 0xb8,
@@ -2571,8 +2891,8 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "s".to_string(),
             file_id: None,
-            entity_pk: EntityPk::from_components(smallvec::smallvec![
-                crate::entity_pk::EntityPkComponent::Uuid(
+            row_pk: RowPk::from_components(smallvec::smallvec![
+                crate::row_pk::RowPkComponent::Uuid(
                     crate::storage_codec::id_string::uuid_bytes_from_canonical(uuid_v4)
                         .expect("canonical UUID"),
                 ),
@@ -2582,8 +2902,8 @@ mod tests {
         let encoded = encode_key(&key);
         let prefix = encode_schema_file_prefix("s", None);
 
-        assert_eq!(encoded[prefix.len()], ENTITY_PK_CODEC_V1);
-        assert_eq!(encoded[prefix.len() + 1], ENTITY_PK_UUID);
+        assert_eq!(encoded[prefix.len()], ROW_PK_CODEC_V1);
+        assert_eq!(encoded[prefix.len() + 1], ROW_PK_UUID);
         assert_eq!(decode_key(&encoded).expect("UUID key"), key);
     }
 
@@ -2592,8 +2912,8 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "s".to_string(),
             file_id: None,
-            entity_pk: EntityPk::from_components(smallvec::smallvec![
-                crate::entity_pk::EntityPkComponent::Uuid([7; 16]),
+            row_pk: RowPk::from_components(smallvec::smallvec![
+                crate::row_pk::RowPkComponent::Uuid([7; 16]),
             ])
             .expect("one UUID component"),
         };
@@ -2605,9 +2925,9 @@ mod tests {
     }
 
     #[test]
-    fn key_codec_rejects_pre_v1_entity_key_bytes() {
+    fn key_codec_rejects_pre_v1_row_key_bytes() {
         let mut legacy = encode_schema_file_prefix("s", None);
-        legacy.extend_from_slice(b"entity");
+        legacy.extend_from_slice(b"row");
         legacy.extend_from_slice(&[KEY_PART_FINAL, KEY_PART_FINAL]);
 
         let error = decode_key(&legacy).expect_err("legacy key must reject");
@@ -2635,12 +2955,12 @@ mod tests {
                     keys.push(TrackedStateKey {
                         schema_key: schema.to_string(),
                         file_id: file_id.map(str::to_string),
-                        entity_pk: EntityPk::single(first),
+                        row_pk: RowPk::single(first),
                     });
                     keys.push(TrackedStateKey {
                         schema_key: schema.to_string(),
                         file_id: file_id.map(str::to_string),
-                        entity_pk: EntityPk::from_parts_unchecked(vec![
+                        row_pk: RowPk::from_parts_unchecked(vec![
                             first.to_string(),
                             "tail".to_string(),
                         ]),
@@ -2649,19 +2969,19 @@ mod tests {
             }
         }
         for component in [
-            crate::entity_pk::EntityPkComponent::Uuid([0; 16]),
-            crate::entity_pk::EntityPkComponent::Uuid([u8::MAX; 16]),
-            crate::entity_pk::EntityPkComponent::Integer(i64::MIN),
-            crate::entity_pk::EntityPkComponent::Integer(-1),
-            crate::entity_pk::EntityPkComponent::Integer(0),
-            crate::entity_pk::EntityPkComponent::Integer(i64::MAX),
-            crate::entity_pk::EntityPkComponent::Bytes(Bytes::new()),
-            crate::entity_pk::EntityPkComponent::Bytes(Bytes::from_static(&[0, 1, 255])),
+            crate::row_pk::RowPkComponent::Uuid([0; 16]),
+            crate::row_pk::RowPkComponent::Uuid([u8::MAX; 16]),
+            crate::row_pk::RowPkComponent::Integer(i64::MIN),
+            crate::row_pk::RowPkComponent::Integer(-1),
+            crate::row_pk::RowPkComponent::Integer(0),
+            crate::row_pk::RowPkComponent::Integer(i64::MAX),
+            crate::row_pk::RowPkComponent::Bytes(Bytes::new()),
+            crate::row_pk::RowPkComponent::Bytes(Bytes::from_static(&[0, 1, 255])),
         ] {
             keys.push(TrackedStateKey {
                 schema_key: "typed".to_string(),
                 file_id: None,
-                entity_pk: EntityPk::from_components(smallvec::smallvec![component])
+                row_pk: RowPk::from_components(smallvec::smallvec![component])
                     .expect("one typed component"),
             });
         }
@@ -2696,17 +3016,17 @@ mod tests {
             TrackedStateKey {
                 schema_key: "a".to_string(),
                 file_id: None,
-                entity_pk: EntityPk::single("one"),
+                row_pk: RowPk::single("one"),
             },
             TrackedStateKey {
                 schema_key: "a".to_string(),
                 file_id: Some(String::new()),
-                entity_pk: EntityPk::single("two"),
+                row_pk: RowPk::single("two"),
             },
             TrackedStateKey {
                 schema_key: "a\0".to_string(),
                 file_id: None,
-                entity_pk: EntityPk::single("three"),
+                row_pk: RowPk::single("three"),
             },
         ];
         let encoded = keys.iter().map(encode_key).collect::<Vec<_>>();
@@ -2742,12 +3062,12 @@ mod tests {
         let short = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::single("a"),
+            row_pk: RowPk::single("a"),
         });
         let with_nul = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk::single("a\0"),
+            row_pk: RowPk::single("a\0"),
         });
         let shared = shared_prefix_len(&short, &with_nul);
         assert_eq!(short[shared - 1], 0);
@@ -2767,7 +3087,7 @@ mod tests {
         let mut missing_final = encode_key(&TrackedStateKey {
             schema_key: "s".to_string(),
             file_id: None,
-            entity_pk: EntityPk::single("pk"),
+            row_pk: RowPk::single("pk"),
         });
         *missing_final.last_mut().expect("key has terminator") = KEY_PART_MORE;
         assert!(decode_key(&missing_final).is_err());
@@ -2951,11 +3271,11 @@ mod tests {
         let row_count = 10_000;
         let mut builder = TrackedStateKeyBatchBuilder::with_row_capacity(row_count);
         for index in 0..row_count {
-            let entity_pk = EntityPk::single(format!("entity-{index:05}"));
+            let row_pk = RowPk::single(format!("row-{index:05}"));
             builder.push(TrackedStateKeyRef {
                 schema_key: "shared_batch_schema",
                 file_id: Some("shared.json"),
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             });
         }
 
@@ -2984,12 +3304,12 @@ mod tests {
         let commit_id = CommitId::for_test_label("shared-mutation-commit");
         let timestamp = timestamp("updated_at", "2026-01-02T00:00:00Z");
         for index in 0..row_count {
-            let entity_pk = EntityPk::single(format!("entity-{index:05}"));
+            let row_pk = RowPk::single(format!("row-{index:05}"));
             builder.push(
                 TrackedStateKeyRef {
                     schema_key: "shared_batch_schema",
                     file_id: Some("shared.json"),
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                 },
                 TrackedStateIndexValueRef {
                     change_id,

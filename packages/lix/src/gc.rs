@@ -6,7 +6,6 @@
 //! the same storage write set that publishes the compacted checkpoint.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -15,30 +14,23 @@ use crate::branch::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability,
     branch_head_control_precondition,
 };
-#[cfg(any(test, feature = "storage-benches"))]
-use crate::changelog::ChangeScanRequest;
-use crate::changelog::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangelogContext,
-    ChangelogReader, CommitId, CommitLoadRequest, GcLiveSet, GcPlan, GcRepairSet, GcRoot,
-    GcSweepSet, change_key, commit_change_id_key, commit_key,
-};
+use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
+#[cfg(any(test, feature = "storage-benches"))]
+use crate::changelog::{ChangeScanRequest, ChangelogContext, ChangelogReader};
 use crate::commit_graph::CommitGraphContext;
+use crate::hot_state::TrackedHeadContext;
+use crate::hot_state::stage_collect_stale_working_diff_indexes;
+use crate::json_store::{JsonRef, JsonSlot, JsonStoreContext};
 #[cfg(test)]
-use crate::json_store::JsonRef;
-#[cfg(test)]
-use crate::json_store::{
-    JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
-};
-use crate::live_state::TrackedHeadContext;
-#[cfg(test)]
-use crate::live_state::stage_collect_stale_working_diff_indexes;
+use crate::storage_adapter::StorageCoreProjection;
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
-    StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition, StoragePrefix,
-    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageGetOptions, StorageKey,
+    StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageSpace, StorageSpaceId,
+    StorageValue, StorageWriteSet,
 };
+use crate::tracked_state::RetainedPhysicalState;
 use crate::{LixError, storage_codec};
 
 pub(crate) const CHECKPOINT_RECOVERY_REF_NAMESPACE: &str = "checkpoint.recovery_ref.v3";
@@ -49,45 +41,9 @@ pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::mut
 pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
 pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
-/// Authenticated publication deltas are the sole ordinary-GC input.  The
-/// queue is mutable because its head/tail are CAS-protected, while each
-/// record is immutable after publication and addressed by a monotonic slot.
-pub(crate) const GC_REACHABILITY_DELTA_NAMESPACE: &str = "gc.reachability_delta.v1";
-pub(crate) const GC_REACHABILITY_DELTA_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0003), GC_REACHABILITY_DELTA_NAMESPACE);
-pub(crate) const GC_REACHABILITY_QUEUE_NAMESPACE: &str = "gc.reachability_queue.v1";
-pub(crate) const GC_REACHABILITY_QUEUE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0004), GC_REACHABILITY_QUEUE_NAMESPACE);
-/// Rebuildable metadata for an explicit tree-chunk sweep epoch. It is never
-/// consulted as a serving root; the active root closure is re-derived from
-/// branch/recovery controls and authenticated commit manifests.
-pub(crate) const GC_TREE_SWEEP_EPOCH_NAMESPACE: &str = "gc.tree_sweep_epoch.v1";
-pub(crate) const GC_TREE_SWEEP_EPOCH_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0005), GC_TREE_SWEEP_EPOCH_NAMESPACE);
-/// One rebuildable live-chunk mark per content hash for the current epoch.
-pub(crate) const GC_TREE_SWEEP_MARK_NAMESPACE: &str = "gc.tree_sweep_mark.v1";
-pub(crate) const GC_TREE_SWEEP_MARK_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0006), GC_TREE_SWEEP_MARK_NAMESPACE);
-/// CAS-protected bounded cursor for an in-progress tree-chunk enumeration.
-pub(crate) const GC_TREE_SWEEP_CURSOR_NAMESPACE: &str = "gc.tree_sweep_cursor.v1";
-pub(crate) const GC_TREE_SWEEP_CURSOR_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0007), GC_TREE_SWEEP_CURSOR_NAMESPACE);
-
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
-const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 2;
 const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
-const GC_REACHABILITY_FORMAT_VERSION: u32 = 2;
-const GC_REACHABILITY_QUEUE_KEY: &[u8] = b"queue";
-const GC_REACHABILITY_BATCH_LIMIT: usize = 64;
-#[allow(dead_code)]
-const GC_TREE_SWEEP_EPOCH_KEY: &[u8] = b"epoch";
-#[allow(dead_code)]
-const GC_TREE_SWEEP_CURSOR_KEY: &[u8] = b"cursor";
-#[allow(dead_code)]
-const GC_TREE_SWEEP_FORMAT_VERSION: u32 = 1;
-#[allow(dead_code)]
-const GC_TREE_SWEEP_PAGE_ROWS: usize = 64;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthenticatedControlCommitReachability {
     chronology_roots: BTreeSet<CommitId>,
@@ -182,6 +138,19 @@ pub(crate) struct CheckpointGcState {
     pub(crate) checkpoint_sequence: u64,
     pub(crate) last_gc_sequence: u64,
     pub(crate) collectible_interval_count: u64,
+    /// Live commit-manifest count observed by the last successful reclaim.
+    ///
+    /// Approximate between sweeps and trued up by every sweep, which already
+    /// enumerates the plane. This is a trigger heuristic and never an
+    /// authority: drift costs a slightly early or late sweep and nothing else.
+    pub(crate) live_manifest_estimate: u64,
+    /// Retired commits per collectible interval observed by the last
+    /// successful reclaim. Same status: approximate and self-correcting.
+    pub(crate) yield_per_interval_estimate: u64,
+    /// Consecutive reclaim attempts that failed before reaching
+    /// `mark_collected`. Damps the retry so a persistently failing sweep
+    /// cannot re-arm a full repository pass on every checkpoint.
+    pub(crate) consecutive_reclaim_failures: u64,
 }
 
 impl CheckpointGcState {
@@ -196,9 +165,20 @@ impl CheckpointGcState {
         self.collectible_interval_count > 0
     }
 
-    pub(crate) fn mark_collected(&mut self) {
+    /// Records one successful reclaim and re-derives both trigger estimates
+    /// from what that sweep actually observed.
+    pub(crate) fn mark_collected(&mut self, reclaimed_commits: u64, live_manifest_count: u64) {
+        let intervals = self.collectible_interval_count.max(1);
+        self.yield_per_interval_estimate = reclaimed_commits / intervals;
+        self.live_manifest_estimate = live_manifest_count;
         self.last_gc_sequence = self.checkpoint_sequence;
         self.collectible_interval_count = 0;
+        self.consecutive_reclaim_failures = 0;
+    }
+
+    /// Records one reclaim attempt that did not reach [`Self::mark_collected`].
+    pub(crate) fn note_reclaim_failure(&mut self) {
+        self.consecutive_reclaim_failures = self.consecutive_reclaim_failures.saturating_add(1);
     }
 }
 
@@ -231,130 +211,18 @@ struct StoredCheckpointGcState {
     checkpoint_sequence: u64,
     last_gc_sequence: u64,
     collectible_interval_count: u64,
-}
-
-/// One branch-root transition.  The digest fields bind the delta to the
-/// exact control bytes observed by the publisher; a queue record with a
-/// forged root or stale CAS token is rejected before any physical delete is
-/// staged.
-#[derive(Clone, musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredRootReachabilityDelta {
-    branch_id: String,
-    #[musli(with = storage_codec::option)]
-    old_root: Option<CommitId>,
-    #[musli(with = storage_codec::option)]
-    new_root: Option<CommitId>,
-    #[musli(with = storage_codec::option)]
-    old_control: Option<BranchHeadControl>,
-    #[musli(with = storage_codec::option)]
-    new_control: Option<BranchHeadControl>,
-    old_control_digest: [u8; 32],
-    new_control_digest: [u8; 32],
-}
-
-#[derive(musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredRootReachabilityBatch {
-    format_version: u32,
-    sequence: u64,
-    deltas: Vec<StoredRootReachabilityDelta>,
-    checkpoint_roots: Vec<CommitId>,
-    digest: [u8; 32],
-}
-
-#[derive(musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredRootReachabilityBatchBody {
-    format_version: u32,
-    sequence: u64,
-    deltas: Vec<StoredRootReachabilityDelta>,
-    checkpoint_roots: Vec<CommitId>,
-}
-
-#[derive(musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredReachabilityQueue {
-    format_version: u32,
-    head_sequence: u64,
-    tail_sequence: u64,
-    next_sequence: u64,
-}
-
-/// Authenticated metadata for one explicit tree-chunk sweep epoch. The root
-/// and closure digests are evidence for resumption only; immutable manifests
-/// and branch/recovery controls remain the sole logical root authority.
-#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-#[allow(dead_code)]
-struct StoredTreeSweepEpoch {
-    format_version: u32,
-    epoch_id: u64,
-    queue_digest: [u8; 32],
-    root_set_digest: [u8; 32],
-    live_chunk_digest: [u8; 32],
-    live_chunk_count: u64,
-}
-
-/// CAS-protected bounded enumeration cursor. A completed cursor is retained
-/// until the next epoch so an interrupted/reopened maintenance pass can
-/// distinguish a resumable epoch from a fresh one.
-#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-#[allow(dead_code)]
-struct StoredTreeSweepCursor {
-    format_version: u32,
-    epoch_id: u64,
-    #[musli(with = storage_codec::option)]
-    last_key: Option<Vec<u8>>,
-    scanned_rows: u64,
-    deleted_rows: u64,
-    complete: bool,
-}
-
-/// A mark is rebuildable inventory, not payload truth. The hash in the key,
-/// value, and epoch are all checked before a sweep can delete an unmarked
-/// tree chunk.
-#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-#[allow(dead_code)]
-struct StoredTreeSweepMark {
-    format_version: u32,
-    epoch_id: u64,
-    chunk_hash: [u8; 32],
-}
-
-/// In-memory state for one authenticated sweep epoch. The live set is loaded
-/// and verified once when the session starts or reopens; ordinary queue-prefix
-/// GC never consults it.
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub(crate) struct TreeSweepEpochSession {
-    epoch: StoredTreeSweepEpoch,
-    cursor: StoredTreeSweepCursor,
-    raw_cursor: Bytes,
-    live_chunks: BTreeSet<[u8; 32]>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RootReachabilityDelta {
-    pub(crate) branch_id: String,
-    pub(crate) old_root: Option<CommitId>,
-    pub(crate) new_root: Option<CommitId>,
-    pub(crate) old_control: Option<BranchHeadControl>,
-    pub(crate) new_control: Option<BranchHeadControl>,
-    pub(crate) old_control_digest: [u8; 32],
-    pub(crate) new_control_digest: [u8; 32],
+    live_manifest_estimate: u64,
+    yield_per_interval_estimate: u64,
+    consecutive_reclaim_failures: u64,
 }
 
 /// One authenticated checkpoint replacement that is still pending physical
 /// retirement.
 ///
-/// Callers receive only the typed canonical replacement. The queue remains
-/// GC-owned maintenance state and never becomes a merge-time chronology
-/// reader. A caller may use this proof only while publishing from the same
-/// coherent read: the ordinary reachability-batch writer then CASes the exact
-/// queue row observed by this resolver.
+/// The replacement is read straight off the branch's canonical recovery ref,
+/// which the checkpoint transaction rotates in the same atomic write set that
+/// publishes the checkpoint commit. There is no separate publication ledger to
+/// consult, and therefore no second place a stale replacement can survive.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct PendingCheckpointReplacement {
     pub(crate) checkpoint_commit_id: CommitId,
@@ -423,6 +291,9 @@ pub(crate) fn stage_checkpoint_gc_state(
             checkpoint_sequence: state.checkpoint_sequence,
             last_gc_sequence: state.last_gc_sequence,
             collectible_interval_count: state.collectible_interval_count,
+            live_manifest_estimate: state.live_manifest_estimate,
+            yield_per_interval_estimate: state.yield_per_interval_estimate,
+            consecutive_reclaim_failures: state.consecutive_reclaim_failures,
         },
     )?;
     writes.put(
@@ -435,385 +306,16 @@ pub(crate) fn stage_checkpoint_gc_state(
     Ok(())
 }
 
-/// Seeds the empty authenticated frontier during repository initialization.
-/// There is deliberately no reader-side migration: a repository without this
-/// control is an old protocol and ordinary GC fails closed.
-pub(crate) fn stage_reachability_queue_seed(writes: &mut StorageWriteSet) -> Result<(), LixError> {
-    let value = storage_codec::encode(
-        "GC reachability queue",
-        &StoredReachabilityQueue {
-            format_version: GC_REACHABILITY_FORMAT_VERSION,
-            head_sequence: 0,
-            tail_sequence: 0,
-            next_sequence: 1,
-        },
-    )?;
-    writes.put(
-        GC_REACHABILITY_QUEUE_SPACE,
-        StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        StorageValue {
-            bytes: Bytes::from(value),
-        },
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) async fn ensure_reachability_queue_for_test(
-    read: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-) -> Result<bool, LixError> {
-    let result = PointReadPlan::new(
-        GC_REACHABILITY_QUEUE_SPACE,
-        &[StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY))],
-    )
-    .materialize(read, StorageGetOptions::default())
-    .await?;
-    if result.value.into_iter().next().flatten().is_none() {
-        stage_reachability_queue_seed(writes)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn reachability_sequence_key(sequence: u64) -> StorageKey {
-    StorageKey(Bytes::copy_from_slice(&sequence.to_be_bytes()))
-}
-
-async fn load_reachability_queue(
-    store: &(impl StorageAdapterRead + ?Sized),
-) -> Result<(StoredReachabilityQueue, Bytes), LixError> {
-    let result = PointReadPlan::new(
-        GC_REACHABILITY_QUEUE_SPACE,
-        &[StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY))],
-    )
-    .materialize(store, StorageGetOptions::default())
-    .await?;
-    let Some(Some(StorageProjectedValue::FullValue(bytes))) = result.value.into_iter().next()
-    else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "authenticated GC reachability queue is missing",
-        ));
-    };
-    let queue: StoredReachabilityQueue = storage_codec::decode("GC reachability queue", &bytes)?;
-    if queue.format_version != GC_REACHABILITY_FORMAT_VERSION
-        || queue.next_sequence == 0
-        || (queue.head_sequence == 0) != (queue.tail_sequence == 0)
-        || (queue.head_sequence != 0 && queue.head_sequence > queue.tail_sequence)
-        || queue.tail_sequence >= queue.next_sequence
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "authenticated GC reachability queue has invalid bounds",
-        ));
-    }
-    Ok((queue, bytes))
-}
-
-fn root_control_digest(raw: Option<&Bytes>) -> [u8; 32] {
-    match raw {
-        Some(raw) => *blake3::hash(raw.as_ref()).as_bytes(),
-        None => *blake3::hash(b"lix.gc.root.absent.v1").as_bytes(),
-    }
-}
-
-fn validate_stored_root_reachability_delta(
-    delta: &StoredRootReachabilityDelta,
-) -> Result<(), LixError> {
-    if delta.branch_id.is_empty()
-        || delta.old_control_digest == [0; 32]
-        || delta.new_control_digest == [0; 32]
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "GC reachability delta has an invalid branch or control digest",
-        ));
-    }
-    if root_control_digest_for_control(delta.old_control.as_ref())? != delta.old_control_digest
-        || root_control_digest_for_control(delta.new_control.as_ref())? != delta.new_control_digest
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "GC reachability delta for branch '{}' has a control digest mismatch",
-                delta.branch_id
-            ),
-        ));
-    }
-    match (delta.old_root, delta.old_control) {
-        (Some(root), Some(control)) if control.head_commit_id == root => {}
-        (None, None) => {}
-        _ => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "GC reachability delta for branch '{}' has an invalid old-root binding",
-                    delta.branch_id
-                ),
-            ));
-        }
-    }
-    match (delta.new_root, delta.new_control) {
-        (Some(root), Some(control)) if control.head_commit_id == root => {}
-        (None, None) => {}
-        _ => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "GC reachability delta for branch '{}' has an invalid new-root binding",
-                    delta.branch_id
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn root_control_digest_for_control(
-    control: Option<&BranchHeadControl>,
-) -> Result<[u8; 32], LixError> {
-    let Some(control) = control else {
-        return Ok(root_control_digest(None));
-    };
-    let bytes = storage_codec::encode("branch-head control", control)?;
-    Ok(root_control_digest(Some(&Bytes::from(bytes))))
-}
-
-fn encode_reachability_batch_body(
-    sequence: u64,
-    deltas: Vec<StoredRootReachabilityDelta>,
-    checkpoint_roots: Vec<CommitId>,
-) -> Result<(StoredRootReachabilityBatchBody, [u8; 32]), LixError> {
-    let body = StoredRootReachabilityBatchBody {
-        format_version: GC_REACHABILITY_FORMAT_VERSION,
-        sequence,
-        deltas,
-        checkpoint_roots,
-    };
-    let encoded = storage_codec::encode("GC reachability delta body", &body)?;
-    Ok((body, *blake3::hash(&encoded).as_bytes()))
-}
-
-/// Appends one transaction's complete root transition set.  A single queue
-/// CAS makes branch advance/delete and checkpoint pin publication atomic with
-/// their controls; consumers never infer liveness from semantic parent rows.
-pub(crate) async fn stage_reachability_delta_batch(
-    read: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    deltas: &[RootReachabilityDelta],
-    checkpoint_roots: &[CommitId],
-    preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<(), LixError> {
-    // This is the central authenticated root-publication boundary. Rotate the
-    // binary-CAS epoch in this same atomic write even when the transition only
-    // revives an existing commit and stages no blob bytes.
-    crate::binary_cas::stage_mutation_epoch(read, writes, preconditions).await?;
-    if deltas.is_empty() && checkpoint_roots.is_empty() {
-        return Ok(());
-    }
-    let (mut queue, raw_queue) = load_reachability_queue(read).await?;
-    let sequence = queue.next_sequence;
-    queue.next_sequence = queue.next_sequence.checked_add(1).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "GC reachability queue sequence overflow",
-        )
-    })?;
-    if queue.head_sequence == 0 {
-        queue.head_sequence = sequence;
-    }
-    queue.tail_sequence = sequence;
-    let stored_deltas = deltas
-        .iter()
-        .map(|delta| StoredRootReachabilityDelta {
-            branch_id: delta.branch_id.clone(),
-            old_root: delta.old_root,
-            new_root: delta.new_root,
-            old_control: delta.old_control,
-            new_control: delta.new_control,
-            old_control_digest: delta.old_control_digest,
-            new_control_digest: delta.new_control_digest,
-        })
-        .collect::<Vec<_>>();
-    let checkpoint_roots = checkpoint_roots.to_vec();
-    let (body, digest) = encode_reachability_batch_body(sequence, stored_deltas, checkpoint_roots)?;
-    let batch = StoredRootReachabilityBatch {
-        format_version: GC_REACHABILITY_FORMAT_VERSION,
-        sequence,
-        deltas: body.deltas,
-        checkpoint_roots: body.checkpoint_roots,
-        digest,
-    };
-    writes.put(
-        GC_REACHABILITY_DELTA_SPACE,
-        reachability_sequence_key(sequence),
-        StorageValue {
-            bytes: Bytes::from(storage_codec::encode("GC reachability delta", &batch)?),
-        },
-    );
-    writes.put(
-        GC_REACHABILITY_QUEUE_SPACE,
-        StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        StorageValue {
-            bytes: Bytes::from(storage_codec::encode("GC reachability queue", &queue)?),
-        },
-    );
-    preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_REACHABILITY_QUEUE_SPACE,
-        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        expected: raw_queue,
-    });
-    Ok(())
-}
-
-async fn load_reachability_batches(
-    store: &(impl StorageAdapterRead + ?Sized),
-    queue: &StoredReachabilityQueue,
-) -> Result<Vec<(u64, StoredRootReachabilityBatch)>, LixError> {
-    fold_reachability_batches(
-        store,
-        queue,
-        Some(GC_REACHABILITY_BATCH_LIMIT),
-        Vec::new(),
-        |batches, sequence, batch| {
-            batches.push((sequence, batch));
-            Ok(())
-        },
-    )
-    .await
-}
-
-/// Authenticates and consumes a contiguous prefix of the queue in bounded
-/// pages. This is the single queue-row decoder for ordinary retirement,
-/// repository CAS marking, and tree-sweep root closure; the callback owns all
-/// domain-specific accumulation.
-///
-/// For `N` selected batches this performs `O(N)` row/decoding work and keeps
-/// `O(GC_REACHABILITY_BATCH_LIMIT + accumulator)` memory. `None` consumes the
-/// complete queue snapshot; `Some(limit)` consumes at most that many rows.
-/// The caller must bind publication to the raw queue token loaded alongside
-/// `queue` when the accumulated result can authorize deletion.
-async fn fold_reachability_batches<S, A, F>(
-    store: &S,
-    queue: &StoredReachabilityQueue,
-    limit: Option<usize>,
-    mut accumulator: A,
-    mut consume: F,
-) -> Result<A, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-    F: FnMut(&mut A, u64, StoredRootReachabilityBatch) -> Result<(), LixError>,
-{
-    if queue.head_sequence == 0 || limit == Some(0) {
-        return Ok(accumulator);
-    }
-    let queue_end = queue.tail_sequence.saturating_add(1);
-    let selected_end = limit.map_or(queue_end, |limit| {
-        queue
-            .head_sequence
-            .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
-            .min(queue_end)
-    });
-    let mut sequence = queue.head_sequence;
-    while sequence < selected_end {
-        let page_end = sequence
-            .saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64)
-            .min(selected_end);
-        let keys = (sequence..page_end)
-            .map(reachability_sequence_key)
-            .collect::<Vec<_>>();
-        let result = PointReadPlan::new(GC_REACHABILITY_DELTA_SPACE, &keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?;
-        for (expected_sequence, value) in (sequence..page_end).zip(result.value) {
-            let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("GC reachability delta {expected_sequence} is missing"),
-                ));
-            };
-            consume(
-                &mut accumulator,
-                expected_sequence,
-                decode_reachability_batch(expected_sequence, &bytes)?,
-            )?;
-        }
-        sequence = page_end;
-    }
-    Ok(accumulator)
-}
-
-fn decode_reachability_batch(
-    expected_sequence: u64,
-    bytes: &[u8],
-) -> Result<StoredRootReachabilityBatch, LixError> {
-    let batch: StoredRootReachabilityBatch = storage_codec::decode("GC reachability delta", bytes)?;
-    if batch.format_version != GC_REACHABILITY_FORMAT_VERSION || batch.sequence != expected_sequence
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("GC reachability delta {expected_sequence} has invalid identity"),
-        ));
-    }
-    let (_, digest) = encode_reachability_batch_body(
-        batch.sequence,
-        batch.deltas.clone(),
-        batch.checkpoint_roots.clone(),
-    )?;
-    if digest != batch.digest {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("GC reachability delta {expected_sequence} digest mismatch"),
-        ));
-    }
-    Ok(batch)
-}
-
-#[allow(dead_code)]
-fn tree_sweep_error(message: impl Into<String>) -> LixError {
-    LixError::new(LixError::CODE_INTERNAL_ERROR, message)
-}
-
-#[allow(dead_code)]
-fn tree_sweep_digest(hashes: &BTreeSet<[u8; 32]>) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    for hash in hashes {
-        hasher.update(hash);
-    }
-    *hasher.finalize().as_bytes()
-}
-
-async fn collect_all_reachability_checkpoint_roots<S>(
-    store: &S,
-    queue: &StoredReachabilityQueue,
-) -> Result<BTreeSet<CommitId>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    fold_reachability_batches(
-        store,
-        queue,
-        None,
-        BTreeSet::new(),
-        |checkpoint_roots, _, batch| {
-            checkpoint_roots.extend(batch.checkpoint_roots);
-            Ok(())
-        },
-    )
-    .await
-}
-
 /// Resolves a still-pending checkpoint replacement for an explicit branch
 /// source, or proves that the source remains reachable through ordinary
 /// canonical chronology.
 ///
-/// A checkpoint replacement is accepted only when one authenticated pending
-/// batch binds `source_commit_id -> checkpoint_commit_id` through matching
-/// branch controls and includes that checkpoint in the same batch's root set.
-/// Branch publication must retain this read through the ordinary reachability
-/// batch writer, whose queue CAS prevents GC consumption and branch creation
-/// from both committing from the same observation.
+/// A checkpoint replacement is accepted only when a branch's canonical
+/// recovery ref binds `source_commit_id -> checkpoint_commit_id` and that
+/// branch's live control still serves the same checkpoint. Recovery-ref
+/// rotation, checkpoint publication and the control move are one atomic write
+/// set, so this single read is the whole authority; branch publication holds
+/// the branch-control precondition that makes the observation binding.
 pub(crate) async fn resolve_pending_checkpoint_replacement<S>(
     store: &S,
     source_commit_id: CommitId,
@@ -821,34 +323,25 @@ pub(crate) async fn resolve_pending_checkpoint_replacement<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
-    let (queue, _) = load_reachability_queue(store).await?;
-    let candidates =
-        fold_reachability_batches(store, &queue, None, Vec::new(), |candidates, _, batch| {
-            let checkpoint_roots = batch
-                .checkpoint_roots
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            for delta in &batch.deltas {
-                validate_stored_root_reachability_delta(delta)?;
-                if delta.old_root != Some(source_commit_id) {
-                    continue;
-                }
-                let Some(checkpoint_commit_id) = delta.new_root else {
-                    continue;
-                };
-                let Some(new_control) = delta.new_control else {
-                    continue;
-                };
-                if new_control.working_diff_checkpoint_commit_id == Some(checkpoint_commit_id)
-                    && checkpoint_roots.contains(&checkpoint_commit_id)
-                {
-                    candidates.push((checkpoint_commit_id, delta.branch_id.clone()));
-                }
-            }
-            Ok(())
-        })
+    let controls = BranchHeadControlContext::new()
+        .reader(store.clone())
+        .scan()
         .await?;
+    let mut candidates = Vec::new();
+    for recovery in load_recovery_refs(store).await? {
+        if recovery.recovered_head_commit_id != source_commit_id {
+            continue;
+        }
+        let Some((_, control)) = controls
+            .iter()
+            .find(|(branch_id, _)| branch_id == &recovery.branch_id)
+        else {
+            continue;
+        };
+        if control.working_diff_checkpoint_commit_id == Some(recovery.checkpoint_commit_id) {
+            candidates.push((recovery.checkpoint_commit_id, recovery.branch_id));
+        }
+    }
     match candidates.len() {
         0 => {}
         1 => {
@@ -871,10 +364,6 @@ where
         }
     }
 
-    let controls = BranchHeadControlContext::new()
-        .reader(store.clone())
-        .scan()
-        .await?;
     let roots = controls
         .into_iter()
         .flat_map(|(_, control)| control.tracked_reachability().chronology_roots)
@@ -904,562 +393,6 @@ where
     ))
 }
 
-#[allow(dead_code)]
-async fn load_tree_sweep_root_closure<S>(
-    store: &S,
-) -> Result<([u8; 32], [u8; 32], Bytes, BTreeSet<[u8; 32]>), LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync,
-{
-    let controls = BranchHeadControlContext::new()
-        .reader(store.clone())
-        .scan()
-        .await?;
-    let (queue, raw_queue) = load_reachability_queue(store).await?;
-    let closure = load_authenticated_repository_retention(store, &controls, &queue).await?;
-    let mut roots = BTreeSet::new();
-    for manifest in closure.manifests.values() {
-        if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
-            roots.insert(*snapshot_root.root_id.as_bytes());
-            for parent in &snapshot_root.parent_roots {
-                roots.insert(*parent.root_id.as_bytes());
-            }
-        }
-    }
-    if roots.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep authenticated root set has no tracked tree roots",
-        ));
-    }
-    let root_set_digest = tree_sweep_digest(&roots);
-    let typed_roots = roots
-        .iter()
-        .copied()
-        .map(crate::tracked_state::TrackedStateRootId::new)
-        .collect::<Vec<_>>();
-    let live_chunks =
-        crate::tracked_state::collect_reachable_tree_chunk_hashes(store, &typed_roots).await?;
-    if live_chunks.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep authenticated root closure is empty",
-        ));
-    }
-    Ok((
-        root_set_digest,
-        tree_sweep_digest(&live_chunks),
-        raw_queue,
-        live_chunks,
-    ))
-}
-
-#[allow(dead_code)]
-async fn scan_tree_sweep_marks<S>(
-    store: &S,
-    expected_epoch: Option<u64>,
-) -> Result<(BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let range = StoragePrefix {
-        bytes: Bytes::new(),
-    }
-    .to_range()?;
-    let mut previous_key = None;
-    let mut current = BTreeSet::new();
-    let mut all = BTreeSet::new();
-    let mut cursor = store
-        .begin_scan(
-            GC_TREE_SWEEP_MARK_SPACE,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::FullValue,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    loop {
-        let page = cursor.next_page(GC_TREE_SWEEP_PAGE_ROWS).await?;
-        if page.has_more && page.entries.is_empty() {
-            return Err(tree_sweep_error(
-                "tree sweep mark scan reported has_more with an empty page",
-            ));
-        }
-        for entry in &page.entries {
-            if entry.key.0.len() != 32
-                || previous_key
-                    .as_ref()
-                    .is_some_and(|previous: &StorageKey| entry.key <= *previous)
-            {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan keys are malformed or non-increasing",
-                ));
-            }
-            let key_hash: [u8; 32] = entry
-                .key
-                .0
-                .as_ref()
-                .try_into()
-                .map_err(|_| tree_sweep_error("tree sweep mark key is not 32 bytes"))?;
-            let StorageProjectedValue::FullValue(bytes) = &entry.value else {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan returned a key-only value",
-                ));
-            };
-            let mark: StoredTreeSweepMark = storage_codec::decode("tree sweep mark", bytes)
-                .map_err(|error| {
-                    tree_sweep_error(format!("tree sweep mark is malformed: {error}"))
-                })?;
-            if mark.format_version != GC_TREE_SWEEP_FORMAT_VERSION || mark.chunk_hash != key_hash {
-                return Err(tree_sweep_error(
-                    "tree sweep mark identity or format is invalid",
-                ));
-            }
-            all.insert(key_hash);
-            if expected_epoch.is_none_or(|epoch| mark.epoch_id == epoch) {
-                current.insert(key_hash);
-            }
-            previous_key = Some(entry.key.clone());
-        }
-        if page.entries.is_empty() {
-            if page.has_more {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan has_more without a resume key",
-                ));
-            }
-            break;
-        }
-        if !page.has_more {
-            break;
-        }
-    }
-    Ok((current, all))
-}
-
-#[allow(dead_code)]
-async fn load_optional_tree_sweep_row<S, T>(
-    store: &S,
-    space: StorageSpace,
-    key: &'static [u8],
-    label: &'static str,
-) -> Result<Option<(T, Bytes)>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-    T: for<'de> musli::Decode<'de, musli::mode::Binary, musli::alloc::Global>,
-{
-    let key = StorageKey(Bytes::from_static(key));
-    let value = PointReadPlan::new(space, std::slice::from_ref(&key))
-        .materialize(store, StorageGetOptions::default())
-        .await?
-        .value
-        .into_iter()
-        .next()
-        .flatten();
-    let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-        return Ok(None);
-    };
-    let decoded = storage_codec::decode(label, &bytes)?;
-    Ok(Some((decoded, bytes)))
-}
-
-/// Starts a new authenticated tree sweep epoch. The expensive root closure
-/// and mark inventory are built once here; ordinary queue-prefix GC never
-/// calls this function.
-#[allow(dead_code)]
-pub(crate) async fn begin_tree_sweep_epoch<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<TreeSweepEpochSession, LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync,
-{
-    let old_epoch = load_optional_tree_sweep_row::<S, StoredTreeSweepEpoch>(
-        store,
-        GC_TREE_SWEEP_EPOCH_SPACE,
-        GC_TREE_SWEEP_EPOCH_KEY,
-        "tree sweep epoch",
-    )
-    .await?;
-    let old_cursor = load_optional_tree_sweep_row::<S, StoredTreeSweepCursor>(
-        store,
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        GC_TREE_SWEEP_CURSOR_KEY,
-        "tree sweep cursor",
-    )
-    .await?;
-    if old_epoch.is_some() != old_cursor.is_some() {
-        return Err(tree_sweep_error(
-            "tree sweep epoch and cursor lifecycle rows disagree",
-        ));
-    }
-    if old_cursor
-        .as_ref()
-        .is_some_and(|(cursor, _)| !cursor.complete)
-    {
-        return Err(tree_sweep_error(
-            "tree sweep epoch is already active; reopen it instead of creating a second epoch",
-        ));
-    }
-    let (root_set_digest, live_chunk_digest, raw_queue, live_chunks) =
-        load_tree_sweep_root_closure(store).await?;
-    let epoch_id = old_epoch
-        .as_ref()
-        .map_or(1, |(epoch, _)| epoch.epoch_id.saturating_add(1));
-    let epoch = StoredTreeSweepEpoch {
-        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-        epoch_id,
-        queue_digest: *blake3::hash(&raw_queue).as_bytes(),
-        root_set_digest,
-        live_chunk_digest,
-        live_chunk_count: live_chunks.len() as u64,
-    };
-    let cursor = StoredTreeSweepCursor {
-        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-        epoch_id,
-        last_key: None,
-        scanned_rows: 0,
-        deleted_rows: 0,
-        complete: false,
-    };
-    let (current_marks, all_marks) = scan_tree_sweep_marks(store, None).await?;
-    let _ = current_marks;
-    for hash in all_marks.difference(&live_chunks) {
-        writes.delete(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-        );
-    }
-    for hash in &live_chunks {
-        let mark = StoredTreeSweepMark {
-            format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-            epoch_id,
-            chunk_hash: *hash,
-        };
-        writes.put(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-            StorageValue {
-                bytes: Bytes::from(storage_codec::encode("tree sweep mark", &mark)?),
-            },
-        );
-    }
-    let epoch_bytes = Bytes::from(storage_codec::encode("tree sweep epoch", &epoch)?);
-    let cursor_bytes = Bytes::from(storage_codec::encode("tree sweep cursor", &cursor)?);
-    writes.put(
-        GC_TREE_SWEEP_EPOCH_SPACE,
-        StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-        StorageValue { bytes: epoch_bytes },
-    );
-    writes.put(
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        StorageValue {
-            bytes: cursor_bytes.clone(),
-        },
-    );
-    preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_REACHABILITY_QUEUE_SPACE,
-        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        expected: raw_queue,
-    });
-    if let Some((_, raw)) = old_epoch {
-        preconditions.push(StoragePrecondition::KeyValueEquals {
-            space: GC_TREE_SWEEP_EPOCH_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-            expected: raw,
-        });
-    } else {
-        preconditions.push(StoragePrecondition::KeyAbsent {
-            space: GC_TREE_SWEEP_EPOCH_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-        });
-    }
-    if let Some((_, raw)) = old_cursor {
-        preconditions.push(StoragePrecondition::KeyValueEquals {
-            space: GC_TREE_SWEEP_CURSOR_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-            expected: raw,
-        });
-    } else {
-        preconditions.push(StoragePrecondition::KeyAbsent {
-            space: GC_TREE_SWEEP_CURSOR_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        });
-    }
-    Ok(TreeSweepEpochSession {
-        epoch,
-        cursor,
-        raw_cursor: cursor_bytes,
-        live_chunks,
-    })
-}
-
-/// Reopens an active or completed epoch. Mark rows are fully authenticated
-/// against the persisted count/digest before any page may stage a delete.
-#[allow(dead_code)]
-pub(crate) async fn open_tree_sweep_epoch<S>(
-    store: &S,
-) -> Result<Option<TreeSweepEpochSession>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let Some((epoch, _)) = load_optional_tree_sweep_row::<S, StoredTreeSweepEpoch>(
-        store,
-        GC_TREE_SWEEP_EPOCH_SPACE,
-        GC_TREE_SWEEP_EPOCH_KEY,
-        "tree sweep epoch",
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    if epoch.format_version != GC_TREE_SWEEP_FORMAT_VERSION {
-        return Err(tree_sweep_error("tree sweep epoch format is unsupported"));
-    }
-    let Some((cursor, raw_cursor)) = load_optional_tree_sweep_row::<S, StoredTreeSweepCursor>(
-        store,
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        GC_TREE_SWEEP_CURSOR_KEY,
-        "tree sweep cursor",
-    )
-    .await?
-    else {
-        return Err(tree_sweep_error("tree sweep cursor is missing"));
-    };
-    if cursor.format_version != GC_TREE_SWEEP_FORMAT_VERSION || cursor.epoch_id != epoch.epoch_id {
-        return Err(tree_sweep_error("tree sweep cursor identity is invalid"));
-    }
-    let (live_chunks, all_marks) = scan_tree_sweep_marks(store, Some(epoch.epoch_id)).await?;
-    if live_chunks != all_marks
-        || live_chunks.len() as u64 != epoch.live_chunk_count
-        || tree_sweep_digest(&live_chunks) != epoch.live_chunk_digest
-    {
-        return Err(tree_sweep_error(
-            "tree sweep mark inventory disagrees with epoch closure or contains stale rows",
-        ));
-    }
-    Ok(Some(TreeSweepEpochSession {
-        epoch,
-        cursor,
-        raw_cursor,
-        live_chunks,
-    }))
-}
-
-/// Enumerates one bounded tree-chunk page and stages only chunks absent from
-/// the authenticated epoch mark set. Every key/value and cursor transition is
-/// validated before staging; the queue and cursor CAS fences make interruption
-/// and root publication races fail closed.
-#[allow(dead_code)]
-pub(crate) async fn stage_tree_sweep_epoch_page<S>(
-    store: &S,
-    session: &mut TreeSweepEpochSession,
-    writes: &mut StorageWriteSet,
-    preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if session.cursor.complete {
-        return Ok(true);
-    }
-    let (queue, raw_queue) = load_reachability_queue(store).await?;
-    if *blake3::hash(&raw_queue).as_bytes() != session.epoch.queue_digest {
-        return Err(tree_sweep_error(
-            "tree sweep root publication advanced during an active epoch",
-        ));
-    }
-    let range = StorageKeyRange {
-        lower: session
-            .cursor
-            .last_key
-            .as_ref()
-            .map_or(Bound::Unbounded, |key| {
-                Bound::Excluded(StorageKey(Bytes::copy_from_slice(key)))
-            }),
-        upper: Bound::Unbounded,
-    };
-    let mut cursor = store
-        .begin_scan(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::FullValue,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    let page = cursor.next_page(GC_TREE_SWEEP_PAGE_ROWS).await?;
-    if page.has_more && page.entries.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep tree-chunk scan reported has_more with an empty page",
-        ));
-    }
-    let previous = session.cursor.last_key.as_deref();
-    let mut hashes = Vec::with_capacity(page.entries.len());
-    for entry in &page.entries {
-        if entry.key.0.len() != 32
-            || previous.is_some_and(|previous| entry.key.0.as_ref() <= previous)
-            || hashes
-                .last()
-                .is_some_and(|last: &[u8; 32]| entry.key.0.as_ref() <= last.as_slice())
-        {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk keys are malformed or non-increasing",
-            ));
-        }
-        let hash: [u8; 32] = entry
-            .key
-            .0
-            .as_ref()
-            .try_into()
-            .map_err(|_| tree_sweep_error("tree sweep tree-chunk key is not 32 bytes"))?;
-        let StorageProjectedValue::FullValue(bytes) = &entry.value else {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk scan returned a key-only value",
-            ));
-        };
-        if *blake3::hash(bytes).as_bytes() != hash {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk value hash disagrees with its key",
-            ));
-        }
-        hashes.push(hash);
-    }
-    let mark_keys = hashes
-        .iter()
-        .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
-        .collect::<Vec<_>>();
-    let marks = if mark_keys.is_empty() {
-        Vec::new()
-    } else {
-        PointReadPlan::new(GC_TREE_SWEEP_MARK_SPACE, &mark_keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?
-            .value
-    };
-    if marks.len() != hashes.len() {
-        return Err(tree_sweep_error(
-            "tree sweep mark point read returned the wrong cardinality",
-        ));
-    }
-    let mut deletes = Vec::new();
-    for (hash, mark) in hashes.iter().zip(marks) {
-        let marked = match mark {
-            None => false,
-            Some(StorageProjectedValue::KeyOnly) => {
-                return Err(tree_sweep_error(
-                    "tree sweep mark point read returned a key-only value",
-                ));
-            }
-            Some(StorageProjectedValue::FullValue(bytes)) => {
-                let mark: StoredTreeSweepMark = storage_codec::decode("tree sweep mark", &bytes)
-                    .map_err(|error| {
-                        tree_sweep_error(format!("tree sweep mark is malformed: {error}"))
-                    })?;
-                if mark.format_version != GC_TREE_SWEEP_FORMAT_VERSION
-                    || mark.epoch_id != session.epoch.epoch_id
-                    || mark.chunk_hash != *hash
-                {
-                    return Err(tree_sweep_error(
-                        "tree sweep mark does not authenticate the current epoch chunk",
-                    ));
-                }
-                true
-            }
-        };
-        if marked != session.live_chunks.contains(hash) {
-            return Err(tree_sweep_error(
-                "tree sweep mark completeness disagrees with authenticated closure",
-            ));
-        }
-        if !marked {
-            deletes.push(*hash);
-        }
-    }
-
-    // A complete keyspace scan must prove that every authenticated live mark
-    // still has its physical chunk before any delete is staged.  This catches
-    // a live chunk deleted between epoch creation and the final page (the
-    // mark inventory alone cannot distinguish that from a clean sweep).
-    if !page.has_more {
-        let live_keys = session
-            .live_chunks
-            .iter()
-            .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
-            .collect::<Vec<_>>();
-        for chunk_keys in live_keys.chunks(GC_TREE_SWEEP_PAGE_ROWS) {
-            let values = PointReadPlan::new(
-                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-                chunk_keys,
-            )
-            .materialize(store, StorageGetOptions::default())
-            .await?
-            .value;
-            if values.len() != chunk_keys.len() {
-                return Err(tree_sweep_error(
-                    "tree sweep final live-chunk validation returned the wrong cardinality",
-                ));
-            }
-            for (key, value) in chunk_keys.iter().zip(values) {
-                let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-                    return Err(tree_sweep_error(
-                        "tree sweep final live-chunk validation found a missing or key-only chunk",
-                    ));
-                };
-                if blake3::hash(&bytes).as_bytes().as_slice() != key.0.as_ref() {
-                    return Err(tree_sweep_error(
-                        "tree sweep final live-chunk validation found a corrupt chunk",
-                    ));
-                }
-            }
-        }
-    }
-
-    for hash in &deletes {
-        writes.delete(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-        );
-    }
-    let next_cursor = StoredTreeSweepCursor {
-        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-        epoch_id: session.epoch.epoch_id,
-        last_key: page.entries.last().map(|entry| entry.key.0.to_vec()),
-        scanned_rows: session
-            .cursor
-            .scanned_rows
-            .saturating_add(hashes.len() as u64),
-        deleted_rows: session
-            .cursor
-            .deleted_rows
-            .saturating_add(deletes.len() as u64),
-        complete: !page.has_more,
-    };
-    let next_raw = Bytes::from(storage_codec::encode("tree sweep cursor", &next_cursor)?);
-    writes.put(
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        StorageValue {
-            bytes: next_raw.clone(),
-        },
-    );
-    preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_REACHABILITY_QUEUE_SPACE,
-        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        expected: raw_queue,
-    });
-    preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_TREE_SWEEP_CURSOR_SPACE,
-        key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        expected: session.raw_cursor.clone(),
-    });
-    session.cursor = next_cursor;
-    session.raw_cursor = next_raw;
-    let _ = queue;
-    Ok(session.cursor.complete)
-}
-
 /// Returns the exact standalone semantic facts and the authenticated reason
 /// currently known for each one. This is benchmark-only attribution: the
 /// ordinary collector never scans CHANGE_SPACE, and this helper is called
@@ -1476,24 +409,10 @@ where
         .iter()
         .map(|(_, control)| control.ref_change_id)
         .collect::<BTreeSet<_>>();
-    let (queue, _) = load_reachability_queue(store).await?;
-    let batches = load_reachability_batches(store, &queue).await?;
-    let closure = load_authenticated_repository_retention(store, &controls, &queue).await?;
-    let active_root_ids = closure.chronology_roots;
-    let active_dependency_ids = closure
-        .physical_authorities
-        .union(&closure.physical_dependencies)
-        .copied()
-        .chain(closure.semantic_dependencies.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let mut retired_refs = BTreeMap::new();
-    for (_, batch) in batches {
-        for delta in batch.deltas {
-            if let Some(control) = delta.old_control {
-                retired_refs.insert(control.ref_change_id, delta.old_root);
-            }
-        }
-    }
+    // Loading the closure is the point: the audit must fail exactly where the
+    // planner would, so a fixture that cannot be planned is never reported as
+    // a clean standalone-change inventory.
+    let _closure = load_authenticated_repository_retention(store, &controls).await?;
     let mut reader = ChangelogContext::new().reader(store);
     let mut entries = Vec::new();
     let mut start_after = None::<String>;
@@ -1507,28 +426,10 @@ where
         for change in batch.entries {
             let reason = if active_refs.contains(&change.change_id) {
                 "active_branch_ref"
-            } else if let Some(old_root) = retired_refs.get(&change.change_id) {
-                if let Some(root) = old_root {
-                    if active_root_ids.contains(root) {
-                        "retired_delta_old_control:active_root_pin"
-                    } else if active_dependency_ids.contains(root) {
-                        "retired_delta_old_control:history_dependency_pin"
-                    } else {
-                        "retired_delta_old_control:reclaimable"
-                    }
-                } else {
-                    "retired_delta_old_control:reclaimable"
-                }
             } else {
-                "unclassified_no_frontier_delta"
+                "unclassified_no_live_control"
             };
-            if let Some(old_root) = retired_refs.get(&change.change_id) {
-                entries.push(format!(
-                    "{}:{reason}:old_root={}",
-                    change.change_id,
-                    old_root.map_or_else(|| "none".to_owned(), |root| root.to_string())
-                ));
-            } else if reason == "unclassified_no_frontier_delta" {
+            if reason == "unclassified_no_live_control" {
                 entries.push(format!(
                     "{}:{reason}:schema={}:account={}:origin={}",
                     change.change_id,
@@ -1564,10 +465,11 @@ pub(crate) async fn load_recovery_refs(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?
+            .into_parts();
+        for entry in page {
             let StorageProjectedValue::FullValue(bytes) = entry.value else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -1605,57 +507,11 @@ pub(crate) async fn load_recovery_refs(
                 },
             );
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
     Ok(refs.into_values().collect())
-}
-
-#[cfg(test)]
-async fn stage_sweep_unreachable_content_nodes(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    space: StorageSpace,
-    live: &BTreeSet<[u8; 32]>,
-) -> Result<(), LixError> {
-    let range = StoragePrefix {
-        bytes: Bytes::new(),
-    }
-    .to_range()?;
-    let mut cursor = store
-        .begin_scan(
-            space,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    loop {
-        let page = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
-            let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "content-addressed space '{}' contains a malformed key",
-                        space.name
-                    ),
-                )
-            })?;
-            if !live.contains(&node_id) {
-                writes.delete(space, entry.key);
-            }
-        }
-        if !page.has_more {
-            break;
-        }
-    }
-    Ok(())
 }
 
 pub(crate) async fn load_recovery_ref(
@@ -1741,6 +597,9 @@ pub(crate) async fn load_checkpoint_gc_state(
         checkpoint_sequence: stored.checkpoint_sequence,
         last_gc_sequence: stored.last_gc_sequence,
         collectible_interval_count: stored.collectible_interval_count,
+        live_manifest_estimate: stored.live_manifest_estimate,
+        yield_per_interval_estimate: stored.yield_per_interval_estimate,
+        consecutive_reclaim_failures: stored.consecutive_reclaim_failures,
     };
     validate_checkpoint_gc_state(state)?;
     Ok(state)
@@ -1797,8 +656,14 @@ fn validate_stored_recovery_ref(
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepositoryGcSweep {
+    /// Live commit manifests this sweep had to scan to plan. Feeds the reclaim
+    /// trigger's inventory estimate; in-memory only, never persisted here.
+    pub(crate) live_manifest_count: u64,
     pub(crate) tracked_commit_roots: Vec<CommitId>,
     pub(crate) standalone_changes: Vec<ChangeId>,
+    /// Derived serving rows reclaimed from branch generations that no live
+    /// branch control selects any more.
+    pub(crate) reclaimed_generation_rows: u64,
     pub(crate) binary_cas: crate::binary_cas::BinaryCasGcSweep,
 }
 
@@ -1811,6 +676,10 @@ pub(crate) struct RepositoryGcPlan {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepositoryGcProfile {
+    /// Graph-reachable commits this sweep found with no physical manifest --
+    /// history a sweep predating the history-retention fix already reclaimed.
+    /// Reported so the condition is observable; never a retention input.
+    pub(crate) history_manifests_missing: u64,
     pub(crate) root_discovery_us: u64,
     pub(crate) changelog_us: u64,
     pub(crate) tracked_root_stage_us: u64,
@@ -1991,10 +860,19 @@ struct AuthenticatedServingDependencyClosure {
     physical_dependencies: BTreeSet<CommitId>,
     semantic_dependencies: BTreeSet<CommitId>,
     cas_logical_dependencies: BTreeSet<CommitId>,
-    manifests: BTreeMap<CommitId, crate::tracked_state::CommitStateManifest>,
     mutation_nodes: BTreeSet<[u8; 32]>,
     scoped_nodes: BTreeSet<[u8; 32]>,
     native_parts: BTreeSet<[u8; 32]>,
+    /// Payload-ref summary digests of the retained native current-state parts.
+    ///
+    /// The scoped-range descriptor is the only place the `content_digest ->
+    /// payload_refs_digest` pairing exists, so the walk has to carry it out.
+    /// Rediscovering it later would mean re-reading the scoped-range trees.
+    native_part_refs_digests: BTreeSet<[u8; 32]>,
+    /// Graph-reachable commits with no physical manifest, i.e. commits whose
+    /// history delta a pre-fix sweep already reclaimed. Counted so the
+    /// condition is observable; never a retention input.
+    history_manifests_missing: u64,
 }
 
 async fn load_authenticated_serving_dependency_closure<S>(
@@ -2002,6 +880,25 @@ async fn load_authenticated_serving_dependency_closure<S>(
     chronology_roots: BTreeSet<CommitId>,
     serving_dependencies: BTreeSet<CommitId>,
     history_dependencies: BTreeSet<CommitId>,
+    // Commits reachable from the roots through canonical parent links.
+    //
+    // These retain **both** planes. It is tempting to retain only the semantic
+    // projection here and let the physical delta segments go, on the grounds
+    // that compaction is supposed to free them — that is what this code did,
+    // and it silently truncated row history. A row `_history()` row is
+    // served out of the per-commit delta, not out of the projection:
+    // `CommitGraphContext::change_history_from_commit` walks the graph and then
+    // calls `load_member_changes`, which reads
+    // `load_commit_delta_members_with_payloads_for_schemas`. That function
+    // returns an empty member list for a commit whose replay state is gone, so
+    // a commit whose delta was retired is indistinguishable from a commit that
+    // changed nothing, and the history rows disappear without an error.
+    //
+    // What compaction frees is the *unreachable* interior: an intra-interval
+    // commit stops being on the canonical parent chain once the checkpoint
+    // supersedes it, so it never enters this set and is still retired. The set
+    // retained here is the checkpoint chain, which compaction shortens.
+    graph_reachable: BTreeSet<CommitId>,
 ) -> Result<AuthenticatedServingDependencyClosure, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
@@ -2024,6 +921,48 @@ where
     physical_dependencies.extend(history_dependencies.iter().copied());
     let mut semantic_dependencies = serving_dependencies;
     semantic_dependencies.extend(history_dependencies.iter().copied());
+    // Retain the delta of every graph-reachable commit that still has one.
+    //
+    // Tolerating absence is deliberate, and it is scoped to exactly this set.
+    // A repository swept by the code that shipped before this fix has commits
+    // that are graph-reachable and have no manifest, because that sweep deleted
+    // it; those manifests are gone and cannot be recomputed. Demanding one here
+    // would abort every future sweep on such a repository -- silently, because
+    // `collect_checkpoint_garbage_best_effort` swallows the error, so
+    // collection would simply stop forever while writes kept succeeding.
+    //
+    // Nothing else is relaxed. Serving dependencies, selected-source owners and
+    // physical authorities keep their existing hard demand, so a manifest
+    // missing from any of those classes still fails the sweep exactly as it
+    // does today. Within this set we *cannot* tell a commit swept before the
+    // fix from a manifest missing for a reason that should not happen -- after
+    // this fix no graph-reachable commit is ever swept, so absence is either
+    // legacy or corruption and nothing at hand separates them. Both are
+    // tolerated and both are counted, so the condition is observable rather
+    // than silent.
+    let graph_reachable_ids = graph_reachable.iter().copied().collect::<Vec<_>>();
+    let graph_reachable_manifests =
+        crate::tracked_state::load_commit_state_manifests(store, &graph_reachable_ids).await?;
+    let mut history_manifests_missing = 0u64;
+    for (commit_id, manifest) in graph_reachable_ids
+        .into_iter()
+        .zip(graph_reachable_manifests)
+    {
+        if manifest.is_some() {
+            physical_dependencies.insert(commit_id);
+        } else {
+            history_manifests_missing += 1;
+        }
+    }
+    if history_manifests_missing > 0 {
+        tracing::warn!(
+            history_manifests_missing,
+            "repository contains commits whose history delta was reclaimed by a garbage \
+             collection sweep predating the history-retention fix; their row history is \
+             permanently truncated and cannot be recovered"
+        );
+    }
+    semantic_dependencies.extend(graph_reachable);
     let mut cas_logical_dependencies = history_dependencies;
     let mut manifests = BTreeMap::new();
     let mut pending = chronology_roots.iter().copied().collect::<Vec<_>>();
@@ -2063,6 +1002,7 @@ where
 
     let mut scoped_nodes = BTreeSet::new();
     let mut native_parts = BTreeSet::new();
+    let mut native_part_refs_digests = BTreeSet::new();
     let scoped_roots = manifests
         .values()
         .filter_map(|manifest| {
@@ -2079,25 +1019,28 @@ where
         for part in reachable.parts {
             let descriptor =
                 crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
-            match descriptor.source_kind {
-                0 | 2 => {
+            match descriptor.source {
+                crate::tracked_state::CurrentStatePartSource::Replacement(source) => {
                     physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
-                        descriptor.owner_commit_id,
+                        source.owner_commit_id,
                     )));
                 }
-                1 => {
-                    native_parts.insert(descriptor.content_digest);
+                crate::tracked_state::CurrentStatePartSource::ColumnarPage(source) => {
+                    physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
+                        source.owner_commit_id,
+                    )));
                 }
-                _ => {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "active current-state scoped range has an unknown source kind",
-                    ));
+                crate::tracked_state::CurrentStatePartSource::NativeDataPart {
+                    payload_refs_digest,
+                } => {
+                    native_parts.insert(descriptor.content_digest);
+                    native_part_refs_digests.insert(payload_refs_digest);
                 }
             }
         }
     }
-    let native_commit_dependencies = validate_live_native_parts(store, &native_parts).await?;
+    let native_commit_dependencies =
+        crate::tracked_state::load_native_current_state_part_owners(store, &native_parts).await?;
     physical_dependencies.extend(native_commit_dependencies.iter().copied());
     semantic_dependencies.extend(native_commit_dependencies);
 
@@ -2200,17 +1143,17 @@ where
         physical_dependencies,
         semantic_dependencies,
         cas_logical_dependencies,
-        manifests,
         mutation_nodes,
         scoped_nodes,
         native_parts,
+        native_part_refs_digests,
+        history_manifests_missing,
     })
 }
 
 async fn load_authenticated_repository_retention<S>(
     store: &S,
     controls: &[(String, BranchHeadControl)],
-    queue: &StoredReachabilityQueue,
 ) -> Result<AuthenticatedServingDependencyClosure, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
@@ -2228,14 +1171,191 @@ where
                 ]
             }),
     );
-    chronology_roots.extend(collect_all_reachability_checkpoint_roots(store, queue).await?);
+    let graph_reachable = collect_ref_reachable_commit_ids(store, &chronology_roots).await?;
     load_authenticated_serving_dependency_closure(
         store,
         chronology_roots,
         control_reachability.serving_dependencies,
         control_reachability.history_dependencies,
+        graph_reachable,
     )
     .await
+}
+
+/// Every commit reachable from the authenticated roots through canonical parent
+/// links.
+///
+/// This is the reachability the public history surfaces actually read: a
+/// `_history()` query walks the commit graph, so a commit on that chain is
+/// load-bearing no matter how far below the serving checkpoint it sits — and
+/// load-bearing in **both** planes, because a row history row is served out
+/// of the commit delta while only the commit metadata comes from the
+/// projection. Retaining the projection alone leaves the walk finding the
+/// commit and reading zero members from it, which is silent truncation. The
+/// ledger expressed the same retention by pinning every checkpoint commit it
+/// had ever seen, forever, in a row it could never consume. Walking refs states
+/// it directly, costs one commit-record read per reachable commit, and shrinks
+/// as compaction shortens the chain.
+async fn collect_ref_reachable_commit_ids<S>(
+    store: &S,
+    roots: &BTreeSet<CommitId>,
+) -> Result<BTreeSet<CommitId>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let mut graph = CommitGraphContext::new().reader(store);
+    let mut reachable = BTreeSet::new();
+    let mut pending = roots.iter().copied().collect::<Vec<_>>();
+    while let Some(commit_id) = pending.pop() {
+        if !reachable.insert(commit_id) {
+            continue;
+        }
+        let Some(node) = graph.load_node(&commit_id).await? else {
+            continue;
+        };
+        pending.extend(node.parent_commit_ids.iter().copied());
+    }
+    Ok(reachable)
+}
+
+/// Derives this sweep's retirement candidates.
+///
+/// This replaces the `gc.reachability_delta.v1` publication ledger. That ledger
+/// stored one ~439 B row per branch-head publication recording an `old_root ->
+/// new_root` transition so a later sweep would know which commit had been
+/// superseded. The manifest plane already states the same thing and states it
+/// better: a commit owns a manifest exactly while it owns physical state, and
+/// [`crate::tracked_state::stage_retire_commit_physical_state`] deletes it. So
+/// the inventory *is* the outstanding-work list, it shrinks as work completes,
+/// and it needs no publication-time write at all.
+///
+/// Deliberately not a walk from refs. A commit can stop being reachable from
+/// any ref while still owning physical state — every commit of a deleted branch
+/// is in that position — and a refs walk cannot name those at all. Liveness
+/// still comes only from refs: this list is filtered against the authenticated
+/// retention closure, and nothing here is ever treated as a root.
+///
+/// The list is unordered on purpose. The ledger consumed a queue in
+/// publication order and stopped at the first blocked row, so one permanently
+/// live root at the head — genesis always is one, because engine-bootstrap rows
+/// authored at init stay live and keep naming it — froze every younger
+/// candidate behind it forever. Here a pinned candidate holds back only itself.
+async fn derive_retirement_candidates<S>(store: &S) -> Result<Vec<CommitId>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    crate::tracked_state::scan_commit_state_manifest_commit_ids(store).await
+}
+
+/// Plans which out-of-band JSON payloads this sweep may reclaim.
+///
+/// Every owner class that can hold a `JsonSlot::Ref` after the write set
+/// commits is enumerated here, and each one is reached from the walk rather
+/// than from a scan of the payload plane or of the changelog:
+///
+/// 1. **Published hot rows.** The serving plane of every live branch
+///    generation, tracked rows included. Untracked rows are the only owner of
+///    their payload; tracked rows are a derived cache, but a serving read
+///    materializes a payload straight out of this plane, so a ref here that no
+///    longer resolves is a read failure.
+/// 2. **Retained native current-state parts.** Their payload-ref summaries are
+///    carried out of the scoped-range walk by the retention closure.
+/// 3. **Surviving commit deltas.** `surviving_commits` is exactly the candidate
+///    set this sweep could not prove retirable, which is exactly the set of
+///    physical manifests still standing afterwards, so this is a bounded
+///    per-commit inventory walk over the commits GC has already decided to
+///    keep — not a repository-global commit scan.
+/// 4. **Standalone branch-ref facts.** The shipping sweep never deletes a
+///    standalone change, so the fact each control names stays an owner. Branch
+///    ref snapshots are small enough to inline today; enumerating them anyway
+///    costs one point read per branch and removes the dependence on that.
+///
+/// Being a superset here is always safe and being a subset never is, so where
+/// the two arguments were close — the tracked hot rows, the branch-ref facts —
+/// this deliberately takes the wider set.
+struct JsonPayloadReclamation {
+    live: BTreeSet<[u8; 32]>,
+    sweep: Vec<JsonRef>,
+}
+
+async fn plan_json_payload_reclamation<S>(
+    store: &S,
+    controls: &[(String, BranchHeadControl)],
+    retired_commits: &BTreeSet<CommitId>,
+    surviving_commits: &BTreeSet<CommitId>,
+    released_part_refs_digests: &BTreeSet<[u8; 32]>,
+    retained_part_refs_digests: &BTreeSet<[u8; 32]>,
+) -> Result<JsonPayloadReclamation, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    // Every await here is boxed. This planner is reached from
+    // `stage_repository_gc_with_preconditions`, whose future is already close
+    // to the test harness's 2 MiB worker stack; inlining these state machines
+    // aborted `cas_gc_history_retention` with a stack overflow, which passes on
+    // the parent commit. Keep them boxed.
+    //
+    // Candidates: named only by state this sweep is deleting.
+    let mut candidates = BTreeSet::new();
+    for commit_id in retired_commits {
+        Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
+            store,
+            *commit_id,
+            &mut candidates,
+        ))
+        .await?;
+    }
+    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
+        store,
+        released_part_refs_digests,
+        &mut candidates,
+    ))
+    .await?;
+
+    // Live: named by state that outlives this sweep.
+    let mut live = BTreeSet::new();
+    Box::pin(
+        TrackedHeadContext::new()
+            .reader(store.clone())
+            .collect_hot_json_refs(controls, false, &mut live),
+    )
+    .await?;
+    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
+        store,
+        retained_part_refs_digests,
+        &mut live,
+    ))
+    .await?;
+    for commit_id in surviving_commits {
+        Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
+            store, *commit_id, &mut live,
+        ))
+        .await?;
+    }
+    let ref_change_ids = controls
+        .iter()
+        .map(|(_, control)| control.ref_change_id)
+        .collect::<BTreeSet<_>>();
+    for record in Box::pin(crate::changelog::load_change_records(
+        store,
+        ref_change_ids.into_iter(),
+    ))
+    .await?
+    .values()
+    {
+        for slot in [&record.snapshot, &record.metadata] {
+            if let JsonSlot::Ref(json_ref) = slot {
+                live.insert(*json_ref.as_hash_array());
+            }
+        }
+    }
+
+    let sweep = candidates
+        .difference(&live)
+        .copied()
+        .map(JsonRef::from_hash_bytes)
+        .collect::<Vec<_>>();
+    Ok(JsonPayloadReclamation { live, sweep })
 }
 
 /// Plans and stages logical repository GC against one pinned read.
@@ -2243,13 +1363,43 @@ where
 /// The caller must serialize this operation with repository writes and commit
 /// `writes` atomically. Planning and mutation are deliberately separated from
 /// storage commit so checkpoint/session code can retain lifecycle control.
-/// Content-addressed tree/CAS orphan repair is intentionally an offline path;
-/// out-of-band JSON is reclaimed here only from explicit ownership-loss
-/// candidates.
-/// Ordinary GC consumes only authenticated publication deltas. Branch-head
-/// controls and checkpoint recovery refs are the complete active-root set;
-/// the only semantic walk permitted here is the exact point-replay dependency
-/// closure of those roots. Full-space inventory discovery remains forbidden.
+/// Content-addressed tree/CAS orphan repair is intentionally an offline path.
+///
+/// **Out-of-band JSON payloads are reclaimed here**, by descending the same
+/// walk one level further rather than by any second authority. Until this
+/// change the plane leaked at **one payload per superseded edit**, independent
+/// of checkpoint cadence: measured by `e2e/examples/e1_json_leak.rs` over a
+/// shape x cadence x edits matrix, rewriting one row 1000 times left 1004
+/// payload rows where 1 was live, at every cadence (never / every 10 / every
+/// 100). The `insert` control arm, where every payload stays live, leaked
+/// exactly 3 rows at every size, so `leaked = edits + 3` and the rewrite arm's
+/// growth was the superseded payloads and nothing else.
+///
+/// **That baseline is only meaningful because the probe checkpoints.** Without
+/// one the sweep proves *nothing* retirable -- 0 commit-state manifests retired
+/// across 1000 edits -- so "0 payloads reclaimed" was equally consistent with
+/// "the sweep had no work to do". With a checkpoint every 10 edits the same
+/// stream retires 1095 manifests, which is what established that the owning
+/// commits really were being retired underneath the payloads.
+///
+/// The reclamation keeps the plane's two halves on opposite sides of the
+/// retirement decision. A hash becomes a **candidate** only because this write
+/// set is deleting the row that named it — a retired commit's own delta
+/// members, or a native current-state part whose payload-ref summary this
+/// retirement removes. It is **live** if any owner that outlives the sweep
+/// names it; see [`plan_json_payload_reclamation`] for that enumeration.
+/// Neither half scans the payload plane, so an unreferenced row that no
+/// retirement produced is left alone rather than swept on the strength of a
+/// live set being complete.
+///
+/// Ordinary GC derives its candidates from the physical manifest inventory and
+/// proves liveness only from refs: branch-head controls and checkpoint recovery
+/// refs are the complete active-root set, and the walk from those roots through
+/// canonical parent links, plus the exact point-replay dependency closure, is
+/// the only reachability implementation. Semantic *inventory* discovery — a
+/// changelog or commit-space scan that rediscovers liveness — remains
+/// forbidden; the manifest scan is an inventory of the physical state being
+/// collected, never a source of retention.
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn stage_repository_gc<S>(
     store: S,
@@ -2296,60 +1446,39 @@ where
             observed.raw_token,
         )?);
     }
-    let (queue, raw_queue) = load_reachability_queue(&store).await?;
-    // Every repository sweep publishes against the exact queue snapshot used
-    // for root discovery, even when the bounded retirement window is empty or
-    // blocked and no queue row is consumed.
-    staged_preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_REACHABILITY_QUEUE_SPACE,
-        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        expected: raw_queue,
-    });
-    let batches = load_reachability_batches(&store, &queue).await?;
     let AuthenticatedServingDependencyClosure {
         chronology_roots: active_roots,
         physical_authorities: active_authority_ids,
         physical_dependencies: active_dependency_ids,
         semantic_dependencies: active_semantic_dependency_ids,
         cas_logical_dependencies: active_cas_dependency_ids,
-        manifests: _,
         mutation_nodes: active_mutation_nodes,
         scoped_nodes: active_scoped_nodes,
         native_parts: active_current_parts,
-    } = load_authenticated_repository_retention(&store, &controls, &queue).await?;
+        native_part_refs_digests: active_current_part_refs_digests,
+        history_manifests_missing,
+    } = load_authenticated_repository_retention(&store, &controls).await?;
+
+    // Retirement candidates are derived here, not read from a ledger.
+    let candidates = derive_retirement_candidates(&store).await?;
+    // The inventory this sweep had to scan. Feeds the reclaim trigger's
+    // self-correcting denominator; captured before `candidates` is consumed.
+    let live_manifest_count = candidates.len() as u64;
 
     // Derive both physical retirement and logical CAS retention from the one
     // authenticated serving closure. In particular, do not perform a second
-    // replay-graph walk for CAS: a queue-old root is retained exactly when it
+    // replay-graph walk for CAS: a candidate root is retained exactly when it
     // is already a dependency of the active closure. This makes the retained
     // owner set deterministic and prevents a separately reconstructed CAS
     // authority from racing semantic projection retirement.
-    let mut blocked_sequences = BTreeSet::new();
     let mut blocked_physical_dependency_ids = BTreeSet::new();
     let mut blocked_history_dependency_ids = BTreeSet::new();
-    for (sequence, batch) in &batches {
-        for delta in &batch.deltas {
-            validate_stored_root_reachability_delta(delta)?;
-            let Some(old_root) = delta.old_root else {
-                continue;
-            };
-            if !retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_authority_ids,
-                &active_dependency_ids,
-            ) {
-                blocked_sequences.insert(*sequence);
-                blocked_physical_dependency_ids.insert(old_root);
-            }
-            if !retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_roots,
-                &active_cas_dependency_ids,
-            ) {
-                blocked_history_dependency_ids.insert(old_root);
-            }
+    for commit_id in candidates.iter().copied() {
+        if !retirement_is_proven(commit_id, &active_authority_ids, &active_dependency_ids) {
+            blocked_physical_dependency_ids.insert(commit_id);
+        }
+        if !retirement_is_proven(commit_id, &active_roots, &active_cas_dependency_ids) {
+            blocked_history_dependency_ids.insert(commit_id);
         }
     }
 
@@ -2372,231 +1501,90 @@ where
         crate::filesystem::collect_gc_binary_blob_roots(&store, &controls, &retained_cas_root_ids)
             .await?;
     blob_roots.extend(
-        crate::plugin::collect_gc_wasm_blob_roots(&store, &controls, &retained_cas_root_ids)
-            .await?,
+        crate::plugin::runtime::collect_gc_wasm_blob_roots(
+            &store,
+            &controls,
+            &retained_cas_root_ids,
+        )
+        .await?,
     );
     let upload_chunks =
         crate::session::stage_reclaimable_upload_receipts(&store, writes, &blob_roots).await?;
     let binary_cas =
         crate::binary_cas::stage_gc_reclamation(&store, writes, &blob_roots, &upload_chunks)
             .await?;
-    crate::binary_cas::stage_mutation_epoch(&store, writes, &mut staged_preconditions).await?;
+    crate::binary_cas::stage_cas_reclamation_fence(&store, writes, &mut staged_preconditions)
+        .await?;
 
-    if batches.is_empty() {
-        preconditions.extend(staged_preconditions);
-        return Ok(RepositoryGcPlan {
-            changelog: GcPlan {
-                roots: active_roots
-                    .iter()
-                    .copied()
-                    .map(GcRoot::BranchHead)
-                    .collect(),
-                live: GcLiveSet {
-                    commits: retained_root_ids.into_iter().collect(),
-                    changes: Vec::new(),
-                    payloads: Vec::new(),
-                },
-                sweep: GcSweepSet {
-                    commits: Vec::new(),
-                    commit_change_ids: Vec::new(),
-                    changes: Vec::new(),
-                    json_payloads: Vec::new(),
-                },
-                repair: GcRepairSet::default(),
-            },
-            sweep: RepositoryGcSweep {
-                tracked_commit_roots: Vec::new(),
-                standalone_changes: Vec::new(),
-                binary_cas,
-            },
-            profile: RepositoryGcProfile {
-                root_discovery_us: elapsed_micros(started),
-                changelog_us: 0,
-                tracked_root_stage_us: 0,
-                total_us: elapsed_micros(started),
-            },
-        });
-    }
-
-    // A delta is a candidate until every active history/checkpoint/replay
-    // dependency releases the old root.  Never consume a batch containing a
-    // blocked candidate: dropping that signal would make the root permanently
-    // unreclaimable after the pin is later released.  The whole batch remains
-    // at the queue head; this intentionally delays later deltas but preserves
-    // the authenticated publication order and retry semantics.
-    let mut next_queue = queue;
-    let queue_head = next_queue.head_sequence;
-    let mut consumed_through = queue_head;
-    let mut queue_open = true;
+    // Retire the derived candidates. Nothing here is ordered and nothing is
+    // capped: a candidate that is still pinned holds back only itself, and the
+    // two planes prove retirement independently. The ledger could do neither —
+    // it consumed a queue in publication order and stopped at the first blocked
+    // row, so one permanently live root at the head froze every younger
+    // candidate behind it forever.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
-    let mut reclaimed_standalone_changes = BTreeSet::new();
-    let mut reclaimed_checkpoint_branches = BTreeSet::new();
-    for (sequence, batch) in batches {
-        if queue_open && blocked_sequences.contains(&sequence) {
-            queue_open = false;
+    let mut released_part_refs_digests = BTreeSet::new();
+    for commit_id in candidates {
+        if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
+            && reclaimed_semantic_commits.insert(commit_id)
+        {
+            crate::changelog::stage_delete_commit_projection(&store, writes, commit_id).await?;
         }
-        if queue_open {
-            consumed_through = sequence.saturating_add(1);
+        if blocked_physical_dependency_ids.contains(&commit_id) {
+            continue;
         }
-        for delta in batch.deltas {
-            validate_stored_root_reachability_delta(&delta)?;
-            // Branch checkpoint rows are derived serving state owned by the
-            // branch lifecycle, not by a tracked root.  Process the
-            // authenticated deletion signal before inspecting `old_root` so
-            // a branch deleted before its first rooted publication cannot
-            // strand its checkpoint prefix forever.  A recreated branch has
-            // a live control and therefore keeps the shared branch-id range.
-            if delta.new_control.is_none()
-                && !controls
-                    .iter()
-                    .any(|(active_branch_id, _)| active_branch_id == &delta.branch_id)
-                && reclaimed_checkpoint_branches.insert(delta.branch_id.clone())
-            {
-                crate::transaction::stage_delete_branch_plugin_checkpoints(
-                    &store,
-                    writes,
-                    &delta.branch_id,
-                )
-                .await?;
-            }
-            let Some(old_root) = delta.old_root else {
-                continue;
-            };
-            let physical_retirement = retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_authority_ids,
-                &active_dependency_ids,
-            );
-            let semantic_retirement = retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_roots,
-                &active_semantic_dependency_ids,
-            );
-            if semantic_retirement && reclaimed_semantic_commits.insert(old_root) {
-                stage_delete_semantic_commit_projection(&store, writes, old_root).await?;
-            }
-            if !physical_retirement {
-                continue;
-            }
-            if reclaimed_commits.insert(old_root) {
-                let manifest = crate::tracked_state::load_commit_state_manifest(&store, old_root)
-                    .await?
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("retired GC root '{old_root}' has no authenticated manifest"),
-                        )
-                    })?;
-                let retired_root =
-                    crate::tracked_state::load_commit_mutation_directory_roots(&store, &[old_root])
-                        .await?
-                        .into_iter()
-                        .next()
-                        .flatten();
-                if let Some(root) = retired_root {
-                    let nodes =
-                        crate::tracked_state::collect_mutation_directory_node_ids(&store, &root)
-                            .await?;
-                    for node_id in nodes.difference(&active_mutation_nodes) {
-                        writes.delete(
-                            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-                            StorageKey(Bytes::copy_from_slice(node_id)),
-                        );
-                    }
-                }
-                if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-                    let reachable = crate::tracked_state::validate_scoped_range_trees(
-                        &store,
-                        std::slice::from_ref(&root.tree),
-                    )
-                    .await?;
-                    for node_id in reachable.node_ids.difference(&active_scoped_nodes) {
-                        writes.delete(
-                            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-                            StorageKey(Bytes::copy_from_slice(node_id)),
-                        );
-                    }
-                    for part in reachable.parts {
-                        let descriptor =
-                            crate::tracked_state::current_state_descriptor_from_scoped_range_part(
-                                &part,
-                            )?;
-                        if descriptor.source_kind == 1
-                            && !active_current_parts.contains(&descriptor.content_digest)
-                        {
-                            writes.delete(
-                                crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-                                StorageKey(Bytes::copy_from_slice(&descriptor.content_digest)),
-                            );
-                            writes.delete(
-                                crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-                                StorageKey(Bytes::copy_from_slice(&descriptor.payload_refs_digest)),
-                            );
-                        }
-                    }
-                }
-                crate::tracked_state::stage_delete_commit_state_manifest_for_gc(
-                    &store, writes, old_root, &manifest,
-                )
-                .await?;
-            }
-            if let Some(control) = delta.old_control.as_ref() {
-                if !controls
-                    .iter()
-                    .any(|(_, active)| active.ref_change_id == control.ref_change_id)
-                {
-                    let key = StorageKey(Bytes::from(change_key(control.ref_change_id)));
-                    let existing = PointReadPlan::new(CHANGE_SPACE, std::slice::from_ref(&key))
-                        .materialize(&store, StorageGetOptions::default())
-                        .await?
-                        .value
-                        .into_iter()
-                        .next()
-                        .flatten();
-                    if existing.is_none() {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "retired branch control references missing standalone change '{}'",
-                                control.ref_change_id
-                            ),
-                        ));
-                    }
-                    writes.delete(CHANGE_SPACE, key);
-                    reclaimed_standalone_changes.insert(control.ref_change_id);
-                }
-            }
+        if reclaimed_commits.insert(commit_id) {
+            crate::tracked_state::stage_retire_commit_physical_state(
+                &store,
+                writes,
+                commit_id,
+                RetainedPhysicalState {
+                    mutation_nodes: &active_mutation_nodes,
+                    scoped_nodes: &active_scoped_nodes,
+                    native_parts: &active_current_parts,
+                },
+                &mut released_part_refs_digests,
+            )
+            .await?;
         }
     }
-
-    if consumed_through > queue_head {
-        consumed_through = consumed_through
-            .min(queue_head.saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64))
-            .min(next_queue.tail_sequence.saturating_add(1));
-        for sequence in next_queue.head_sequence..consumed_through {
-            writes.delete(
-                GC_REACHABILITY_DELTA_SPACE,
-                reachability_sequence_key(sequence),
-            );
-        }
-        if consumed_through > next_queue.tail_sequence {
-            next_queue.head_sequence = 0;
-            next_queue.tail_sequence = 0;
-        } else {
-            next_queue.head_sequence = consumed_through;
-        }
-        writes.put(
-            GC_REACHABILITY_QUEUE_SPACE,
-            StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-            StorageValue {
-                bytes: Bytes::from(storage_codec::encode("GC reachability queue", &next_queue)?),
-            },
-        );
+    // One boxed step, not three awaits inlined here. This function's future is
+    // already close to the harness's 2 MiB worker stack: three inline await
+    // points over the segment-decode and hot-scan chains aborted
+    // `cas_gc_history_retention` with a stack overflow, which passes on the
+    // parent commit.
+    let JsonPayloadReclamation {
+        live: live_json_hashes,
+        sweep: sweep_json_payloads,
+    } = Box::pin(plan_json_payload_reclamation(
+        &store,
+        &controls,
+        &reclaimed_commits,
+        &blocked_physical_dependency_ids,
+        &released_part_refs_digests,
+        &active_current_part_refs_digests,
+    ))
+    .await?;
+    if !sweep_json_payloads.is_empty() {
+        JsonStoreContext::new()
+            .writer()
+            .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
+        Box::pin(crate::json_store::stage_json_reclamation_fence(
+            &store,
+            writes,
+            &mut staged_preconditions,
+        ))
+        .await?;
+    }
+    if !reclaimed_semantic_commits.is_empty() {
         writes.seal_changelog_gc();
     }
+
+    // Checkpoint publication rotates the authenticated sparse dirty-index
+    // marker in O(1). Retire every now-unreachable epoch here, under the same
+    // observed branch-control preconditions as the rest of repository GC.
+    stage_collect_stale_working_diff_indexes(&store, writes).await?;
 
     preconditions.extend(staged_preconditions);
     Ok(RepositoryGcPlan {
@@ -2609,65 +1597,37 @@ where
             live: GcLiveSet {
                 commits: retained_root_ids.into_iter().collect(),
                 changes: Vec::new(),
-                payloads: Vec::new(),
+                payloads: live_json_hashes
+                    .into_iter()
+                    .map(JsonRef::from_hash_bytes)
+                    .collect(),
             },
             sweep: GcSweepSet {
                 commits: Vec::new(),
                 commit_change_ids: Vec::new(),
                 changes: Vec::new(),
-                json_payloads: Vec::new(),
+                json_payloads: sweep_json_payloads,
             },
             repair: GcRepairSet::default(),
         },
         sweep: RepositoryGcSweep {
+            live_manifest_count,
             tracked_commit_roots: reclaimed_commits.into_iter().collect(),
-            standalone_changes: reclaimed_standalone_changes.into_iter().collect(),
+            // Superseded branch-ref facts and stale serving generations are
+            // retired by the publication that supersedes them, in that same
+            // write set. A sweep has no such debt left to report.
+            standalone_changes: Vec::new(),
+            reclaimed_generation_rows: 0,
             binary_cas,
         },
         profile: RepositoryGcProfile {
+            history_manifests_missing,
             root_discovery_us: elapsed_micros(started),
             changelog_us: 0,
             tracked_root_stage_us: 0,
             total_us: elapsed_micros(started),
         },
     })
-}
-
-/// Every authenticated active scoped-range descriptor must have its native
-/// payload present before ordinary GC is allowed to stage any sweep.  The
-/// descriptor is authority for the digest, but not proof that the immutable
-/// payload still exists; treating a missing payload as an empty live set would
-/// silently turn corruption into deletion.
-async fn validate_live_native_parts<S>(
-    store: &S,
-    digests: &BTreeSet<[u8; 32]>,
-) -> Result<BTreeSet<CommitId>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if digests.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let keys = digests
-        .iter()
-        .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
-        .collect::<Vec<_>>();
-    let loaded = PointReadPlan::new(crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE, &keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    let mut commit_ids = BTreeSet::new();
-    for (digest, value) in digests.iter().zip(loaded.value) {
-        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "live current-state directory references a missing native data part",
-            ));
-        };
-        commit_ids.extend(
-            crate::tracked_state::decode_current_state_data_part_commit_ids(digest, &bytes)?,
-        );
-    }
-    Ok(commit_ids)
 }
 
 /// Recovery-only verifier retained for explicit rebuild tooling and tests.
@@ -2721,66 +1681,6 @@ where
     // maintenance work, but delta rows have no shared ownership and must be
     // reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    // Old serving generations are derived data. Removing them in the same
-    // atomic sweep as their untracked payload-root withdrawal prevents stale
-    // branch generations from accumulating indefinitely.
-    let stale_untracked_refs = TrackedHeadContext::new()
-        .stage_collect_stale_current_state_generations(&store, writes, &controls)
-        .await?;
-    // The changelog plan contains every payload reachable from tracked
-    // history plus the active untracked roots supplied above. A retired
-    // untracked JSON ref is only a deletion candidate: content-addressed
-    // payloads can be shared with another current row or reachable history,
-    // so absence from this complete live set is the required proof.
-    let live_payloads = changelog_plan
-        .live
-        .payloads
-        .iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
-    // `collect_garbage` already staged deletes for dead changelog payloads.
-    // Avoid emitting a second mutation for a content hash shared with a stale
-    // untracked generation; `StorageWriteSet` deliberately rejects duplicate
-    // final mutations, even when both are deletes.
-    let changelog_swept_payloads = changelog_plan
-        .sweep
-        .json_payloads
-        .iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
-    let mut reclaimable_untracked_refs = stale_untracked_refs
-        .into_iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
-    let mut consumed_candidate_keys = Vec::new();
-    for candidate in JsonStoreContext::new()
-        .scan_untracked_reclaim_candidates(&store)
-        .await?
-    {
-        let UntrackedJsonReclaimCandidate { key, json_ref } = candidate;
-        let Some(json_ref) = json_ref else {
-            // Candidate records are derived hints. A malformed one cannot
-            // safely name a JSON payload, but it must not become permanent
-            // maintenance debt.
-            consumed_candidate_keys.push(key);
-            continue;
-        };
-        if !live_payloads.contains(json_ref.as_hash_array()) {
-            reclaimable_untracked_refs.insert(*json_ref.as_hash_array());
-            consumed_candidate_keys.push(key);
-        }
-        // Keep a live candidate. If a shared owner later disappears through a
-        // different lifecycle path, the next GC can still prove reclamation
-        // without relying on that path to recreate this hint.
-    }
-    let reclaimable_untracked_refs = reclaimable_untracked_refs
-        .into_iter()
-        .filter(|hash| !live_payloads.contains(hash) && !changelog_swept_payloads.contains(hash))
-        .map(JsonRef::from_hash_bytes)
-        .collect::<Vec<_>>();
-    let json_writer = JsonStoreContext::new().writer();
-    json_writer.stage_delete_refs(writes, reclaimable_untracked_refs);
-    JsonStoreWriter::stage_delete_untracked_reclaim_candidates(writes, consumed_candidate_keys);
     // Checkpoint publication leaves prior dirty-index generations unreachable
     // in O(1). Reclaim those auxiliary records only in the asynchronous GC
     // pass so a foreground checkpoint never pays a history-sized delete cost.
@@ -2790,11 +1690,19 @@ where
     Ok(RepositoryGcPlan {
         changelog: changelog_plan,
         sweep: RepositoryGcSweep {
+            // The recovery-only rebuild path never feeds the reclaim trigger;
+            // it rediscovers liveness by scanning rather than from the
+            // manifest inventory, so it has no inventory figure to report.
+            live_manifest_count: 0,
             tracked_commit_roots: swept_snapshot_authorities,
             standalone_changes: Vec::new(),
+            reclaimed_generation_rows: 0,
             binary_cas: Default::default(),
         },
         profile: RepositoryGcProfile {
+            // The recovery-only rebuild path rediscovers liveness by scanning;
+            // it does not consult the graph-reachable manifest set at all.
+            history_manifests_missing: 0,
             root_discovery_us,
             changelog_us,
             tracked_root_stage_us,
@@ -3007,9 +1915,9 @@ where
     for part in reachable.parts {
         let descriptor =
             crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
-        match descriptor.source_kind {
-            0 => {
-                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+        match descriptor.source {
+            crate::tracked_state::CurrentStatePartSource::Replacement(source) => {
+                let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
                 if !packed.commits.contains_key(&owner) {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -3020,11 +1928,13 @@ where
                 }
                 retained_authority_commits.insert(owner);
             }
-            1 => {
+            crate::tracked_state::CurrentStatePartSource::NativeDataPart {
+                payload_refs_digest,
+            } => {
                 live_current_state_data_parts.insert(descriptor.content_digest);
                 if let Some(previous) = live_current_state_ref_summaries
-                    .insert(descriptor.content_digest, descriptor.payload_refs_digest)
-                    && previous != descriptor.payload_refs_digest
+                    .insert(descriptor.content_digest, payload_refs_digest)
+                    && previous != payload_refs_digest
                 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -3032,26 +1942,16 @@ where
                     ));
                 }
             }
-            2 => {
-                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+            crate::tracked_state::CurrentStatePartSource::ColumnarPage(source) => {
+                let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
                 if !packed.commits.contains_key(&owner) {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("live scoped range references missing columnar owner '{owner}'"),
                     ));
                 }
-                live_columnar_sources.insert((
-                    owner,
-                    descriptor.source_id,
-                    descriptor.content_digest,
-                ));
+                live_columnar_sources.insert((owner, source.source_id, descriptor.content_digest));
                 retained_authority_commits.insert(owner);
-            }
-            _ => {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "live scoped range contains an unknown part source",
-                ));
             }
         }
     }
@@ -3308,36 +2208,15 @@ where
         .collect::<Vec<_>>();
     crate::tracked_state::stage_change_locators(writes, &relocated_locators);
 
-    writes.delete_batch(
-        COMMIT_SPACE,
-        sweep_commits.iter().map(|commit_id| commit_key(*commit_id)),
-    );
-    stage_sweep_unreachable_content_nodes(
+    crate::changelog::stage_delete_commits(writes, sweep_commits.iter().copied());
+    crate::tracked_state::stage_sweep_unreachable_content_nodes(
         store,
         writes,
-        crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-        &live_scoped_range_nodes,
-    )
-    .await?;
-    stage_sweep_unreachable_content_nodes(
-        store,
-        writes,
-        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-        &live_mutation_directory_nodes,
-    )
-    .await?;
-    stage_sweep_unreachable_content_nodes(
-        store,
-        writes,
-        crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-        &live_current_state_data_parts,
-    )
-    .await?;
-    stage_sweep_unreachable_content_nodes(
-        store,
-        writes,
-        crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-        &live_current_state_data_parts,
+        RetainedPhysicalState {
+            mutation_nodes: &live_mutation_directory_nodes,
+            scoped_nodes: &live_scoped_range_nodes,
+            native_parts: &live_current_state_data_parts,
+        },
     )
     .await?;
     for commit_id in &sweep_authority_commits {
@@ -3351,7 +2230,7 @@ where
                 crate::columnar_row_group::stage_delete_row_group_set(
                     store,
                     writes,
-                    crate::live_state::entity_row_group_set_id(*commit_id, schema_key),
+                    crate::hot_state::row_group_set_id(*commit_id, schema_key),
                 )
                 .await?;
             }
@@ -3360,16 +2239,7 @@ where
             )?;
         }
     }
-    writes.delete_batch(
-        COMMIT_CHANGE_ID_SPACE,
-        sweep_commit_change_ids
-            .iter()
-            .map(|change_id| commit_change_id_key(*change_id)),
-    );
-    writes.delete_batch(
-        CHANGE_SPACE,
-        sweep_changes.iter().map(|change_id| change_key(*change_id)),
-    );
+    crate::changelog::stage_delete_changes(writes, sweep_changes.iter().copied());
     JsonStoreContext::new()
         .writer()
         .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
@@ -3460,12 +2330,13 @@ where
             }
             let parent_start = commits.parent_commit_ids.len();
             let parent_len = commit.parent_commit_ids.len();
+            let change_id = commit.change_id();
             commits
                 .parent_commit_ids
                 .extend(commit.parent_commit_ids.into_iter());
             commits.entries.push(GcCommitInventoryEntry {
                 commit_id: commit.commit_id,
-                change_id: commit.change_id,
+                change_id,
                 parent_start,
                 parent_len,
             });
@@ -3528,71 +2399,16 @@ fn elapsed_micros(started: Instant) -> u64 {
 }
 
 fn retirement_is_proven(
-    old_root: CommitId,
-    new_root: Option<CommitId>,
+    candidate: CommitId,
     active_authority_ids: &BTreeSet<CommitId>,
     active_dependency_ids: &BTreeSet<CommitId>,
 ) -> bool {
-    new_root != Some(old_root)
-        && !active_authority_ids.contains(&old_root)
-        && !active_dependency_ids.contains(&old_root)
-}
-
-/// Removes the semantic commit projection once its root interval is no longer
-/// reachable. Physical tracked-state authority may remain alive as a selected
-/// source or serving dependency, so this decision is intentionally separate
-/// from manifest/CAS retirement.
-async fn stage_delete_semantic_commit_projection<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    commit_id: CommitId,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let commit_ids = [commit_id];
-    let record = ChangelogContext::new()
-        .reader(store)
-        .load_commits(CommitLoadRequest {
-            commit_ids: &commit_ids,
-        })
-        .await?
-        .into_iter()
-        .next()
-        .and_then(|(_, record)| record);
-    let Some(record) = record else {
-        // A prior GC pass may already have removed the semantic projection
-        // while its physical authority remained pinned.
-        return Ok(());
-    };
-    if record.commit_id != commit_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit projection key for '{commit_id}' contains '{}'",
-                record.commit_id
-            ),
-        ));
-    }
-    writes.delete(COMMIT_SPACE, StorageKey(Bytes::from(commit_key(commit_id))));
-    writes.delete(
-        COMMIT_CHANGE_ID_SPACE,
-        StorageKey(Bytes::from(commit_change_id_key(record.change_id))),
-    );
-    writes.delete(
-        CHANGE_SPACE,
-        StorageKey(Bytes::from(change_key(record.change_id))),
-    );
-    Ok(())
+    !active_authority_ids.contains(&candidate) && !active_dependency_ids.contains(&candidate)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    #[cfg(feature = "default_wasm_runtime")]
-    use std::io::{Cursor, Write as _};
-    #[cfg(feature = "default_wasm_runtime")]
-    use std::path::Path;
     use std::sync::Arc;
 
     use crate::branch::{
@@ -3604,18 +2420,18 @@ mod tests {
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
     };
     use crate::common::LixTimestamp;
-    use crate::entity_pk::EntityPk;
+    use crate::row_pk::RowPk;
+    use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::json_store::{
         JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
-        NormalizedJsonRef, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
+        NormalizedJsonRef,
     };
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
-        Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StoragePrecondition, StorageReadOptions, StorageSpace, StorageValue,
-        StorageWriteOptions, StorageWriteSet,
+        MAX_SCAN_PAGE_ROWS, Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter,
+        StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey,
+        StoragePrefix, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
+        StorageWriteSet,
     };
-    use crate::storage_codec;
     use crate::tracked_state::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
@@ -3634,48 +2450,53 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
 
     use super::{
-        CheckpointGcState, CheckpointRecoveryRef, GC_REACHABILITY_DELTA_SPACE,
-        GC_REACHABILITY_QUEUE_SPACE, GC_TREE_SWEEP_FORMAT_VERSION, GC_TREE_SWEEP_MARK_SPACE,
-        RootReachabilityDelta, StoredTreeSweepMark, authenticated_control_commit_reachability,
-        begin_tree_sweep_epoch, collect_all_reachability_checkpoint_roots,
-        load_checkpoint_gc_state, load_reachability_batches, load_reachability_queue,
-        load_recovery_ref, load_recovery_refs, open_tree_sweep_epoch,
-        resolve_pending_checkpoint_replacement, retirement_is_proven,
-        root_control_digest_for_control, stage_checkpoint_gc_state, stage_delete_recovery_ref,
-        stage_reachability_delta_batch, stage_reachability_queue_seed, stage_recovery_ref_rotation,
-        stage_tree_sweep_epoch_page,
+        CHECKPOINT_GC_STATE_SPACE, CheckpointGcState, CheckpointRecoveryRef,
+        authenticated_control_commit_reachability, derive_retirement_candidates,
+        load_checkpoint_gc_state, load_recovery_ref, load_recovery_refs,
+        resolve_pending_checkpoint_replacement, retirement_is_proven, stage_checkpoint_gc_state,
+        stage_delete_recovery_ref, stage_recovery_ref_rotation,
     };
 
-    async fn append_checkpoint_batch(
-        storage: &StorageAdapter<Memory>,
-        checkpoint_roots: &[CommitId],
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("queue append read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &[],
-            checkpoint_roots,
-            &mut preconditions,
-        )
-        .await
-        .expect("checkpoint batch should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
+    async fn space_inventory<R>(read: &R, space: StorageSpace) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+    {
+        let range = StoragePrefix {
+            bytes: Bytes::new(),
+        }
+        .to_range()
+        .expect("valid empty test inventory prefix");
+        let mut cursor = read
+            .begin_scan(
+                space,
+                range,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    ..StorageBeginScanOptions::default()
                 },
             )
             .await
-            .expect("checkpoint batch should commit");
+            .expect("begin test inventory scan");
+        let mut inventory = Vec::new();
+        loop {
+            let (page, has_more) = cursor
+                .next_page(MAX_SCAN_PAGE_ROWS)
+                .await
+                .expect("scan complete test inventory")
+                .into_parts();
+            inventory.extend(page.into_iter().map(|entry| {
+                let value = match entry.value {
+                    crate::storage_adapter::StorageProjectedValue::KeyOnly => Vec::new(),
+                    crate::storage_adapter::StorageProjectedValue::FullValue(value) => {
+                        value.to_vec()
+                    }
+                };
+                (entry.key.0.to_vec(), value)
+            }));
+            if !has_more {
+                return inventory;
+            }
+        }
     }
 
     #[tokio::test]
@@ -3684,7 +2505,6 @@ mod tests {
             *CommitId::for_test_label("control-projection-head").as_uuid(),
         );
         let tracked_generation = CommitId::for_test_label("control-projection-tracked");
-        let untracked_generation = CommitId::for_test_label("control-projection-untracked");
         let working_diff = CommitId::with_change_address_space(
             *CommitId::for_test_label("control-projection-working-diff").as_uuid(),
         );
@@ -3695,7 +2515,6 @@ mod tests {
             BranchHeadControl {
                 head_commit_id: head,
                 tracked_generation,
-                untracked_generation,
                 current_state_revision: 7,
                 working_diff_checkpoint_commit_id: Some(working_diff),
                 created_at: timestamp,
@@ -3747,23 +2566,18 @@ mod tests {
         );
         assert!(reachability.serving_dependencies.is_empty());
         assert!(!reachability.chronology_roots.contains(&tracked_generation));
-        assert!(
-            !reachability
-                .chronology_roots
-                .contains(&untracked_generation)
-        );
     }
 
-    #[tokio::test]
-    async fn ordinary_gc_accepts_rootless_tracked_serving_generation() {
+    /// Builds `old_root -> active` with the head at `active`, optionally
+    /// omitting `old_root`'s physical manifest to model a repository already
+    /// swept by the code that shipped before the history-retention fix.
+    async fn history_retention_fixture(with_old_manifest: bool) -> super::RepositoryGcPlan {
         let storage = StorageAdapter::new(Memory::new());
-        let timestamp = LixTimestamp::expect_parse(
-            "rootless serving generation timestamp",
-            "2026-01-01T00:00:00Z",
-        );
-        let old_root = replay_commit_record("rootless-serving-old", 0, None, timestamp);
+        let timestamp =
+            LixTimestamp::expect_parse("history retention timestamp", "2026-01-01T00:00:00Z");
+        let old_root = replay_commit_record("history-retained-old", 0, None, timestamp);
         let active = replay_commit_record(
-            "rootless-serving-active",
+            "history-retained-active",
             1,
             Some(old_root.commit_id),
             timestamp,
@@ -3777,36 +2591,122 @@ mod tests {
         active_manifest.replay_debt = CommitStateReplayDebt::default();
         active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
 
+        let control_ref = ChangeId::for_test_label("history-retained-control");
+        let active_control = replay_branch_control(active.commit_id, control_ref, timestamp);
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(&mut writes, "main", active_control)
+            .expect("history retention control should stage");
+        let manifests = if with_old_manifest {
+            vec![old_manifest, active_manifest]
+        } else {
+            vec![active_manifest]
+        };
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[old_root.clone(), active.clone()],
+            &manifests,
+        )
+        .await;
+
+        let plan = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            !plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&old_root.commit_id),
+            "an ancestor of the live head is what _history() reads; it must not be retired"
+        );
+        plan
+    }
+
+    /// The fix: a commit reachable from the head through parent links keeps its
+    /// physical delta, because that delta is what a row `_history()` row is
+    /// served out of.
+    #[tokio::test]
+    async fn ordinary_gc_retains_the_delta_of_a_graph_reachable_commit() {
+        let plan = history_retention_fixture(true).await;
+        assert_eq!(
+            plan.profile.history_manifests_missing, 0,
+            "a repository with intact history reports nothing missing"
+        );
+    }
+
+    /// The tolerance, and its inversion against the test above: the same
+    /// repository with that manifest already reclaimed by a pre-fix sweep must
+    /// still complete a sweep, and must say so rather than tolerating silently.
+    ///
+    /// Demanding the manifest here would abort every future sweep on such a
+    /// repository, and `collect_checkpoint_garbage_best_effort` swallows the
+    /// error, so collection would stop permanently while writes kept
+    /// succeeding. Worse, `checkpoint_gc_due` derives its age limit from
+    /// `last_gc_sequence`, which only a *successful* sweep advances, so the
+    /// due-predicate would latch: every later checkpoint would pay for a
+    /// doomed full-repository sweep, forever.
+    #[tokio::test]
+    async fn ordinary_gc_tolerates_and_counts_history_reclaimed_before_the_fix() {
+        let plan = history_retention_fixture(false).await;
+        assert_eq!(
+            plan.profile.history_manifests_missing, 1,
+            "the commit whose delta a pre-fix sweep reclaimed must be counted, not swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_gc_accepts_rootless_tracked_serving_generation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp = LixTimestamp::expect_parse(
+            "rootless serving generation timestamp",
+            "2026-01-01T00:00:00Z",
+        );
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `old_root`, which is what compaction actually produces: `old_root` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `old_root` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `old_root` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // row `_history()` row is served out of. The release under test here
+        // is a rootless tracked serving generation, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("rootless-serving-base", 0, None, timestamp);
+        let old_root =
+            replay_commit_record("rootless-serving-old", 1, Some(base.commit_id), timestamp);
+        let active = replay_commit_record(
+            "rootless-serving-active",
+            1,
+            Some(base.commit_id),
+            timestamp,
+        );
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
+        let mut old_manifest =
+            test_commit_state_manifest(&old_root, CommitStateMutationInventory::default());
+        old_manifest.replay_debt = CommitStateReplayDebt::default();
+        old_manifest.snapshot_root = Some(Box::new(test_snapshot_root(old_root.commit_id)));
+        let mut active_manifest =
+            test_commit_state_manifest(&active, CommitStateMutationInventory::default());
+        active_manifest.replay_debt = CommitStateReplayDebt::default();
+        active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
+
         let control_ref = ChangeId::for_test_label("rootless-serving-control");
-        let old_control = replay_branch_control(old_root.commit_id, control_ref, timestamp);
+        let _old_control = replay_branch_control(old_root.commit_id, control_ref, timestamp);
         let serving_generation = CommitId::for_test_label("rootless-serving-generation");
         let mut active_control = replay_branch_control(active.commit_id, control_ref, timestamp);
         active_control.tracked_generation = serving_generation;
 
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("rootless serving queue should seed");
         stage_branch_head_control(&mut writes, "main", active_control)
             .expect("rootless serving control should stage");
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[old_root.clone(), active.clone()],
-            &[old_manifest, active_manifest],
-        )
-        .await;
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(old_root.commit_id),
-                new_root: Some(active.commit_id),
-                old_control: Some(old_control),
-                new_control: Some(active_control),
-                old_control_digest: root_control_digest_for_control(Some(&old_control))
-                    .expect("old rootless serving control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&active_control))
-                    .expect("active rootless serving control should encode"),
-            },
+            &[base.clone(), old_root.clone(), active.clone()],
+            &[base_manifest, old_manifest, active_manifest],
         )
         .await;
 
@@ -3833,6 +2733,14 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&serving_generation)
+        );
+        // The interval base is still on the head's first-parent chain, so it is
+        // what `_history()` reads and must survive the same sweep. Without this
+        // the fixture would pass just as well against a collector that retires
+        // the whole chain.
+        assert!(
+            !plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "a commit reachable from the live head owns row history and must not be retired"
         );
     }
 
@@ -4225,6 +3133,7 @@ mod tests {
             BTreeSet::from([active.commit_id]),
             BTreeSet::new(),
             BTreeSet::new(),
+            BTreeSet::new(),
         )
         .await
         .expect("rootless selected owner must remain valid physical authority");
@@ -4233,22 +3142,54 @@ mod tests {
         assert!(!closure.cas_logical_dependencies.contains(&owner.commit_id));
     }
 
+    // `crate::storage_bench` exists only under `feature = "storage-benches"`,
+    // so every `#[cfg(test)]` item that reaches into it must carry the same
+    // gate. Without it `cargo check -p lix --tests` — `cfg(test)` with the
+    // feature off, which is what a plain `cargo test -p lix` builds — fails
+    // to compile the whole lib test target, while `--all-features` and CI
+    // stay green.
+    #[cfg(feature = "storage-benches")]
     #[tokio::test]
     async fn ordinary_gc_releases_finite_selected_owner_only_after_checkpoint_release() {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("selected owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("selected-owner-source", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // row `_history()` row is served out of. The release under test here
+        // is the finite selected-source owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("selected-owner-base", 0, None, timestamp);
+        let owner =
+            replay_commit_record("selected-owner-source", 1, Some(base.commit_id), timestamp);
         let checkpoint = replay_commit_record(
             "selected-owner-checkpoint",
             1,
-            Some(owner.commit_id),
+            Some(base.commit_id),
             timestamp,
         );
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
+        // `released` parents onto the interval base too, because the commit
+        // holding the selection is itself interior. A commit that is still
+        // graph-reachable keeps its delta, and that delta is what names the
+        // selected source -- so while the selecting commit is on the chain the
+        // owner is correctly pinned by it, and the release under test could
+        // never be reached. Superseding the selector is the event that
+        // releases the owner, which is exactly what this test is named for.
         let released = replay_commit_record(
             "selected-owner-released",
-            2,
-            Some(checkpoint.commit_id),
+            1,
+            Some(base.commit_id),
             timestamp,
         );
         let selected_change = packed_change(
@@ -4258,12 +3199,16 @@ mod tests {
         );
 
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("selected-owner queue should seed");
         let owner_deltas =
             commit_delta_refs(owner.commit_id, std::slice::from_ref(&selected_change));
         let owner_stage = stage_commit_deltas_for_commit_state(&mut writes, &owner_deltas)
             .expect("selected owner payload should stage");
         stage_change_locators(&mut writes, &owner_stage.locators);
+        let selected_locator_change_id = owner_stage
+            .locators
+            .first()
+            .expect("the owner stages one locator")
+            .change_id;
         let mut checkpoint_deltas =
             commit_delta_refs(checkpoint.commit_id, std::slice::from_ref(&selected_change));
         checkpoint_deltas[0].authored = false;
@@ -4286,7 +3231,7 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("selected-owner-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
         let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
@@ -4295,23 +3240,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
-        )
-        .await;
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(owner.commit_id),
-                new_root: Some(checkpoint.commit_id),
-                old_control: Some(owner_control),
-                new_control: Some(checkpoint_control),
-                old_control_digest: root_control_digest_for_control(Some(&owner_control))
-                    .expect("owner control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("checkpoint control should encode"),
-            },
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -4332,8 +3267,16 @@ mod tests {
         let closure = load_audited_repository_retention(&storage).await;
         assert!(closure.physical_authorities.contains(&owner.commit_id));
 
+        // The not-yet-published `released` commit is a candidate the moment its
+        // manifest exists, and reclaiming it is correct: nothing references it.
+        // What must not move is the pinned owner.
         let retained_plan = run_ordinary_repository_gc(&storage).await;
-        assert!(retained_plan.sweep.tracked_commit_roots.is_empty());
+        assert!(
+            !retained_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&owner.commit_id)
+        );
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -4345,46 +3288,16 @@ mod tests {
                 .is_some(),
             "the finite selected locator keeps its physical owner live"
         );
+        // Co-ownership guard for locator reclamation: the checkpoint also
+        // carries this change as a selected member, so a sweep that retired
+        // anything must not have taken the row out from under the live owner.
+        assert!(
+            locator_row_exists(&read, selected_locator_change_id).await,
+            "a locator whose owner is retained must survive the sweep"
+        );
         drop(read);
 
-        let mut writes = storage.new_write_set();
-        stage_branch_head_control(&mut writes, "main", released_control)
-            .expect("released control should stage");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("selected-owner release read should open");
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &[RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(checkpoint.commit_id),
-                new_root: Some(released.commit_id),
-                old_control: Some(checkpoint_control),
-                new_control: Some(released_control),
-                old_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("checkpoint control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&released_control))
-                    .expect("released control should encode"),
-            }],
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("selected-owner release delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("selected-owner release should publish atomically");
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
 
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
@@ -4392,6 +3305,13 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
+        );
+        assert!(
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns row history"
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4404,6 +3324,26 @@ mod tests {
                 .is_none(),
             "the owner is reclaimable after the final checkpoint releases the selection"
         );
+        assert!(
+            !locator_row_exists(&read, selected_locator_change_id).await,
+            "retiring the owning commit reclaims its change-locator row"
+        );
+    }
+
+    #[cfg(feature = "storage-benches")]
+    /// Is there still a row in the change-locator plane for `change_id`?
+    async fn locator_row_exists<R>(read: &R, change_id: ChangeId) -> bool
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+    {
+        let wanted = change_id.as_uuid().as_bytes().to_vec();
+        space_inventory(
+            read,
+            crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+        )
+        .await
+        .into_iter()
+        .any(|(key, _)| key == wanted)
     }
 
     #[tokio::test]
@@ -4411,13 +3351,26 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("scoped owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("scoped-part-owner", 0, None, timestamp);
-        let checkpoint = replay_commit_record(
-            "scoped-part-checkpoint",
-            1,
-            Some(owner.commit_id),
-            timestamp,
-        );
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // row `_history()` row is served out of. The release under test here
+        // is the scoped-descriptor owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("scoped-part-base", 0, None, timestamp);
+        let owner = replay_commit_record("scoped-part-owner", 1, Some(base.commit_id), timestamp);
+        let checkpoint =
+            replay_commit_record("scoped-part-checkpoint", 1, Some(base.commit_id), timestamp);
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
         let released = replay_commit_record(
             "scoped-part-released",
             2,
@@ -4428,16 +3381,15 @@ mod tests {
             schema_key: "scoped_part_owner".to_owned(),
             file_id: None,
         };
-        let entity_pk = EntityPk::single("row");
+        let row_pk = RowPk::single("row");
         let encoded_key =
             crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
                 schema_key: &scope.schema_key,
                 file_id: None,
-                entity_pk: &entity_pk,
+                row_pk: &row_pk,
             });
 
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("scoped owner queue should seed");
         let owner_inventory = stage_replacement_inventory(
             &mut writes,
             owner.commit_id,
@@ -4449,17 +3401,17 @@ mod tests {
             first_key: encoded_key.clone(),
             last_key: encoded_key,
             content_digest: owner_inventory.replacement_part_digests[0],
-            payload_refs_digest: [0; 32],
-            source_kind: 0,
-            source_id: [0; 16],
-            owner_commit_id: *owner.commit_id.as_uuid().as_bytes(),
-            part_index: 0,
-            source_page_index: 0,
+            source: crate::tracked_state::CurrentStatePartSource::Replacement(
+                crate::tracked_state::ReplacementPartSource {
+                    owner_commit_id: *owner.commit_id.as_uuid().as_bytes(),
+                    part_index: 0,
+                    uniform_created_at: timestamp,
+                    uniform_updated_at: timestamp,
+                },
+            ),
             source_row_offset: 0,
             row_count: 1,
             fragmented: false,
-            uniform_created_at: timestamp,
-            uniform_updated_at: timestamp,
         };
         let part = crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor(
             &scope,
@@ -4499,7 +3451,7 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("scoped-owner-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
         let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
@@ -4508,23 +3460,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
-        )
-        .await;
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(owner.commit_id),
-                new_root: Some(checkpoint.commit_id),
-                old_control: Some(owner_control),
-                new_control: Some(checkpoint_control),
-                old_control_digest: root_control_digest_for_control(Some(&owner_control))
-                    .expect("scoped owner control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("scoped checkpoint control should encode"),
-            },
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -4532,11 +3474,11 @@ mod tests {
         assert!(closure.physical_authorities.contains(&owner.commit_id));
 
         assert!(
-            run_ordinary_repository_gc(&storage)
+            !run_ordinary_repository_gc(&storage)
                 .await
                 .sweep
                 .tracked_commit_roots
-                .is_empty()
+                .contains(&owner.commit_id)
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4550,13 +3492,20 @@ mod tests {
         );
         drop(read);
 
-        publish_replay_root_release(&storage, "main", checkpoint_control, released_control).await;
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
             released_plan
                 .sweep
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
+        );
+        assert!(
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns row history"
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4575,9 +3524,26 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("native row owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("native-row-owner", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // row `_history()` row is served out of. The release under test here
+        // is the native-row owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("native-row-base", 0, None, timestamp);
+        let owner = replay_commit_record("native-row-owner", 1, Some(base.commit_id), timestamp);
         let checkpoint =
-            replay_commit_record("native-row-checkpoint", 1, Some(owner.commit_id), timestamp);
+            replay_commit_record("native-row-checkpoint", 1, Some(base.commit_id), timestamp);
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
         let released = replay_commit_record(
             "native-row-released",
             2,
@@ -4609,17 +3575,12 @@ mod tests {
             first_key: encoded.first_key.clone(),
             last_key: encoded.last_key.clone(),
             content_digest: encoded.digest,
-            payload_refs_digest: encoded.refs_digest,
-            source_kind: 1,
-            source_id: [0; 16],
-            owner_commit_id: [0; 16],
-            part_index: 0,
-            source_page_index: 0,
+            source: crate::tracked_state::CurrentStatePartSource::NativeDataPart {
+                payload_refs_digest: encoded.refs_digest,
+            },
             source_row_offset: 0,
             row_count: encoded.row_count,
             fragmented: false,
-            uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
         };
         let part = crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor(
             &scope,
@@ -4633,7 +3594,6 @@ mod tests {
         };
 
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("native row queue should seed");
         writes.put(
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
             StorageKey(Bytes::copy_from_slice(&encoded.digest)),
@@ -4653,7 +3613,7 @@ mod tests {
             [(marker, vec![part])],
         )
         .expect("native row scoped tree should stage");
-        let snapshot_entity_pk = EntityPk::single("native-row");
+        let snapshot_row_pk = RowPk::single("native-row");
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -4667,7 +3627,7 @@ mod tests {
                 [TrackedStateDeltaRef {
                     schema_key: &scope.schema_key,
                     file_id: None,
-                    entity_pk: &snapshot_entity_pk,
+                    row_pk: &snapshot_row_pk,
                     change_id: row.value.change_id,
                     commit_id: row.value.commit_id,
                     deleted: false,
@@ -4707,7 +3667,7 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("native-row-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let mut checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
         let serving_generation = CommitId::for_test_label("native-row-serving-generation");
@@ -4726,23 +3686,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
-        )
-        .await;
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(owner.commit_id),
-                new_root: Some(checkpoint.commit_id),
-                old_control: Some(owner_control),
-                new_control: Some(checkpoint_control),
-                old_control_digest: root_control_digest_for_control(Some(&owner_control))
-                    .expect("native owner control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("native checkpoint control should encode"),
-            },
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -4751,9 +3701,12 @@ mod tests {
             .await
             .expect("native dependency read should open");
         assert_eq!(
-            super::validate_live_native_parts(&read, &BTreeSet::from([encoded.digest]))
-                .await
-                .expect("native owner should decode"),
+            crate::tracked_state::load_native_current_state_part_owners(
+                &read,
+                &BTreeSet::from([encoded.digest]),
+            )
+            .await
+            .expect("native owner should decode"),
             BTreeSet::from([owner.commit_id])
         );
         drop(read);
@@ -4826,11 +3779,11 @@ mod tests {
             .expect("authenticated native part restoration should commit");
 
         assert!(
-            run_ordinary_repository_gc(&storage)
+            !run_ordinary_repository_gc(&storage)
                 .await
                 .sweep
                 .tracked_commit_roots
-                .is_empty()
+                .contains(&owner.commit_id)
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4844,44 +3797,7 @@ mod tests {
         );
         drop(read);
 
-        let mut writes = storage.new_write_set();
-        stage_branch_head_control(&mut writes, "main", released_control)
-            .expect("native released control should stage");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("native release read should open");
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &[RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(checkpoint.commit_id),
-                new_root: Some(released.commit_id),
-                old_control: Some(checkpoint_control),
-                new_control: Some(released_control),
-                old_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("native checkpoint control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&released_control))
-                    .expect("native released control should encode"),
-            }],
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("native owner release should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("native owner release should publish");
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
 
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
@@ -4889,6 +3805,13 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
+        );
+        assert!(
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns row history"
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4902,7 +3825,7 @@ mod tests {
         );
     }
 
-    async fn tree_sweep_fixture() -> (
+    async fn gc_sweep_fixture() -> (
         StorageAdapter<Memory>,
         CommitId,
         [u8; 32],
@@ -4933,14 +3856,11 @@ mod tests {
                 changed_key_count: 0,
                 row_count_estimate: 0,
                 tree_height: 1,
-                primary_chunk_count: 1,
-                primary_chunk_bytes: root_bytes.len() as u64,
             })),
         };
         let control = BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,
@@ -4949,7 +3869,6 @@ mod tests {
             schema_presence_bloom: [0; 4],
         };
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("queue should stage");
         stage_commit_state_manifest(&mut writes, &manifest).expect("manifest should stage");
         stage_branch_head_control(&mut writes, "main", control).expect("control should stage");
         for (hash, bytes) in [
@@ -4972,8 +3891,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_sweep_branch_guard_rejects_concurrent_publication() {
-        let (storage, commit_id, _root_hash, _dead_hash, _dead_hash_two) =
-            tree_sweep_fixture().await;
+        let (storage, commit_id, _root_hash, _dead_hash, _dead_hash_two) = gc_sweep_fixture().await;
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -4993,7 +3911,6 @@ mod tests {
         let mut advanced = observed.control.expect("fixture control should exist");
         advanced.head_commit_id = CommitId::for_test_label("concurrent-head");
         advanced.tracked_generation = advanced.head_commit_id;
-        advanced.untracked_generation = advanced.head_commit_id;
         advanced.current_state_revision = advanced.current_state_revision.saturating_add(1);
         stage_branch_head_control(&mut concurrent, "main", advanced)
             .expect("concurrent control should stage");
@@ -5004,7 +3921,7 @@ mod tests {
 
         let mut stale_sweep = storage.new_write_set();
         stale_sweep.put(
-            GC_REACHABILITY_QUEUE_SPACE,
+            CHECKPOINT_GC_STATE_SPACE,
             StorageKey(Bytes::from_static(b"stale-sweep-marker")),
             StorageValue {
                 bytes: Bytes::from_static(b"stale-sweep-marker"),
@@ -5025,7 +3942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_sweep_and_audit_share_retained_physical_owner_closure() {
+    async fn retention_closure_and_audit_share_retained_physical_owner() {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("shared offline owner timestamp", "2026-01-01T00:00:00Z");
@@ -5044,8 +3961,6 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: owner_bytes.len() as u64,
         };
         let active_root = TrackedStateCommitRoot {
             commit_id: active,
@@ -5057,8 +3972,6 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: active_bytes.len() as u64,
         };
         let manifest = |commit_id, snapshot_root| CommitStateManifest {
             commit_id,
@@ -5069,10 +3982,9 @@ mod tests {
             current_state_scoped_ranges: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
-        let owner_control = replay_branch_control(owner, retired_ref, timestamp);
+        let _owner_control = replay_branch_control(owner, retired_ref, timestamp);
         let active_control = replay_branch_control(active, active_ref, timestamp);
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("shared offline queue should seed");
         stage_branch_head_control(&mut writes, "main", active_control)
             .expect("shared offline control should stage");
         stage_commit_state_manifest(&mut writes, &manifest(owner, owner_root))
@@ -5109,21 +4021,6 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("shared offline fixture should commit");
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(owner),
-                new_root: Some(active),
-                old_control: Some(owner_control),
-                new_control: Some(active_control),
-                old_control_digest: root_control_digest_for_control(Some(&owner_control))
-                    .expect("shared offline old control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&active_control))
-                    .expect("shared offline active control should encode"),
-            },
-        )
-        .await;
 
         let read = SharedStorageAdapterRead::new(
             storage
@@ -5136,289 +4033,52 @@ mod tests {
             .scan()
             .await
             .expect("shared offline controls should load");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("shared offline queue should load");
-        let closure = super::load_authenticated_repository_retention(&read, &controls, &queue)
+        let closure = super::load_authenticated_repository_retention(&read, &controls)
             .await
             .expect("shared offline owner closure should authenticate");
         assert!(closure.physical_dependencies.contains(&owner));
-        let (_, _, _, live_chunks) = super::load_tree_sweep_root_closure(&read)
-            .await
-            .expect("offline sweep should retain the physical owner tree");
-        assert_eq!(live_chunks, BTreeSet::from([owner_hash, active_hash]));
+        // The one retention closure is also what keeps the retired owner's
+        // tracked tree root alive; there is no second root walk to consult.
+        let retained_ids = closure
+            .physical_authorities
+            .union(&closure.physical_dependencies)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(retained_ids, vec![owner.min(active), owner.max(active)]);
+        let closure_tree_roots =
+            crate::tracked_state::load_commit_state_manifests(&read, &retained_ids)
+                .await
+                .expect("retained manifests should load")
+                .into_iter()
+                .flatten()
+                .filter_map(|manifest| manifest.snapshot_root)
+                .flat_map(|root| {
+                    std::iter::once(*root.root_id.as_bytes()).chain(
+                        root.parent_roots
+                            .iter()
+                            .map(|parent| *parent.root_id.as_bytes())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+        assert_eq!(
+            closure_tree_roots,
+            BTreeSet::from([owner_hash, active_hash])
+        );
         let audit = super::audit_repository_gc_standalone_refs(&read)
             .await
             .expect("standalone audit should consume the same closure");
+        // With the publication ledger gone the audit no longer has a stored
+        // `old_control` to attribute a superseded ref change to. A branch-ref
+        // change that no live control claims is simply unclassified: the
+        // publication that supersedes it now deletes it in the same write set,
+        // so a surviving one is a fixture artefact, not deferred GC debt.
         assert_eq!(
             audit,
             vec![format!(
-                "{}:retired_delta_old_control:history_dependency_pin:old_root={owner}",
-                retired_ref
+                "{retired_ref}:unclassified_no_live_control:schema=authority_gc:account={}:origin=none",
+                crate::ANONYMOUS_ACCOUNT_ID
             )]
-        );
-    }
-
-    #[tokio::test]
-    async fn tree_sweep_epoch_closes_roots_once_and_reclaims_only_unmarked_chunks() {
-        let (storage, _commit_id, _root_hash, dead_hash, dead_hash_two) =
-            tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::<StoragePrecondition>::new();
-        let _session = begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch closure should build once");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch metadata should publish atomically");
-        drop(read);
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("reopened epoch read should open");
-        let mut reopened = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should reopen")
-            .expect("epoch should exist");
-        assert_eq!(reopened.epoch.live_chunk_count, 1);
-        assert_eq!(reopened.live_chunks.len(), 1);
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
-        assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut reopened,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .expect("tree page should stage")
-        );
-        storage
-            .commit_write_set(
-                page_writes,
-                StorageWriteOptions {
-                    preconditions: page_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("tree page should commit");
-        drop(read);
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("post-sweep read should open");
-        let keys = [
-            StorageKey(Bytes::copy_from_slice(&dead_hash)),
-            StorageKey(Bytes::copy_from_slice(&dead_hash_two)),
-        ];
-        let result =
-            PointReadPlan::new(crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE, &keys)
-                .materialize(&read, StorageGetOptions::default())
-                .await
-                .expect("post-sweep chunks should read");
-        assert!(result.value.into_iter().all(|value| value.is_none()));
-        assert!(
-            open_tree_sweep_epoch(&read)
-                .await
-                .expect("completed epoch should reopen")
-                .expect("completed epoch should remain")
-                .cursor
-                .complete
-        );
-    }
-
-    #[tokio::test]
-    async fn tree_sweep_epoch_fails_closed_on_missing_mark_or_corrupt_chunk() {
-        let (storage, _commit_id, _root_hash, dead_hash, _dead_hash_two) =
-            tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch should begin");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch should publish");
-        drop(read);
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("reopened epoch read should open");
-        let session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should load")
-            .expect("epoch should exist");
-        let live_hash = *session.live_chunks.iter().next().expect("root mark");
-        let epoch_id = session.epoch.epoch_id;
-        drop(read);
-        let mut remove_mark = storage.new_write_set();
-        remove_mark.delete(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&live_hash)),
-        );
-        storage
-            .commit_write_set(remove_mark, StorageWriteOptions::default())
-            .await
-            .expect("test mark deletion should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("missing-mark read should open");
-        assert!(
-            open_tree_sweep_epoch(&read)
-                .await
-                .expect_err("missing live mark must fail closed")
-                .to_string()
-                .contains("mark inventory")
-        );
-        drop(read);
-
-        // Restore the mark and corrupt an unmarked chunk. The page validates
-        // every key/value before it stages any delete, so the failed page has
-        // an empty write set and cannot partially reclaim its siblings.
-        let mut restore = storage.new_write_set();
-        restore.put(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&live_hash)),
-            StorageValue {
-                bytes: Bytes::from(
-                    storage_codec::encode(
-                        "tree sweep mark",
-                        &StoredTreeSweepMark {
-                            format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-                            epoch_id,
-                            chunk_hash: live_hash,
-                        },
-                    )
-                    .expect("mark should encode"),
-                ),
-            },
-        );
-        storage
-            .commit_write_set(restore, StorageWriteOptions::default())
-            .await
-            .expect("mark restoration should commit");
-        let mut corrupt = storage.new_write_set();
-        corrupt.put(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&dead_hash)),
-            StorageValue {
-                bytes: Bytes::from_static(b"corrupt-tree-chunk"),
-            },
-        );
-        storage
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("test corruption should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("corruption read should open");
-        let mut session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("restored epoch should load")
-            .expect("restored epoch should exist");
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
-        assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut session,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .is_err()
-        );
-        assert!(page_writes.is_empty(), "failed page must stage zero writes");
-    }
-
-    #[tokio::test]
-    async fn tree_sweep_epoch_fails_closed_when_live_chunk_disappears() {
-        let (storage, _commit_id, root_hash, _dead_hash, _dead_hash_two) =
-            tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch should begin");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch should publish");
-        drop(read);
-
-        let mut remove_root = storage.new_write_set();
-        remove_root.delete(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&root_hash)),
-        );
-        storage
-            .commit_write_set(remove_root, StorageWriteOptions::default())
-            .await
-            .expect("test root deletion should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("missing-root read should open");
-        let mut session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should load")
-            .expect("epoch should exist");
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
-        assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut session,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .is_err(),
-            "missing live chunk must fail closed"
-        );
-        assert!(
-            page_writes.is_empty(),
-            "missing live chunk must stage zero deletes"
         );
     }
 
@@ -5492,248 +4152,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachability_delta_queue_round_trips_with_authenticated_digest() {
+    async fn recovery_ref_without_live_serving_control_is_not_branchable_authority() {
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("queue seed should commit");
-
-        let old_root = CommitId::for_test_label("delta-old-root");
-        let new_root = CommitId::for_test_label("delta-new-root");
-        let timestamp =
-            LixTimestamp::expect_parse("reachability delta test timestamp", "2026-01-01T00:00:00Z");
-        let old_control = BranchHeadControl {
-            head_commit_id: old_root,
-            tracked_generation: old_root,
-            untracked_generation: old_root,
-            current_state_revision: 0,
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("delta-old-control"),
-            schema_presence_bloom: [0; 4],
-        };
-        let new_control = BranchHeadControl {
-            head_commit_id: new_root,
-            tracked_generation: new_root,
-            untracked_generation: new_root,
-            current_state_revision: 0,
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("delta-new-control"),
-            schema_presence_bloom: [0; 4],
-        };
-        let delta = RootReachabilityDelta {
-            branch_id: "main".to_string(),
-            old_root: Some(old_root),
-            new_root: Some(new_root),
-            old_control: Some(old_control),
-            new_control: Some(new_control),
-            old_control_digest: root_control_digest_for_control(Some(&old_control))
-                .expect("old control should encode"),
-            new_control_digest: root_control_digest_for_control(Some(&new_control))
-                .expect("new control should encode"),
-        };
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("queue read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            std::slice::from_ref(&delta),
-            &[new_root],
-            &mut preconditions,
-        )
-        .await
-        .expect("delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("delta should commit atomically");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("queue read should reopen");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("queue should decode");
-        let batches = load_reachability_batches(&read, &queue)
-            .await
-            .expect("delta should decode");
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].1.checkpoint_roots, vec![new_root]);
-        assert_eq!(batches[0].1.deltas[0].old_root, Some(old_root));
-    }
-
-    fn checkpoint_replacement_delta(
-        label: &str,
-        old_root: CommitId,
-        new_root: CommitId,
-    ) -> RootReachabilityDelta {
-        let timestamp = LixTimestamp::expect_parse(
-            "checkpoint replacement test timestamp",
-            "2026-01-01T00:00:00Z",
-        );
-        let old_control = BranchHeadControl {
-            head_commit_id: old_root,
-            tracked_generation: old_root,
-            untracked_generation: old_root,
-            current_state_revision: 0,
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label(&format!("{label}-old-control")),
-            schema_presence_bloom: [0; 4],
-        };
-        let new_control = BranchHeadControl {
-            head_commit_id: new_root,
-            tracked_generation: new_root,
-            untracked_generation: new_root,
-            current_state_revision: 1,
-            working_diff_checkpoint_commit_id: Some(new_root),
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label(&format!("{label}-new-control")),
-            schema_presence_bloom: [0; 4],
-        };
-        RootReachabilityDelta {
-            branch_id: label.to_owned(),
-            old_root: Some(old_root),
-            new_root: Some(new_root),
-            old_control: Some(old_control),
-            new_control: Some(new_control),
-            old_control_digest: root_control_digest_for_control(Some(&old_control))
-                .expect("old replacement control should encode"),
-            new_control_digest: root_control_digest_for_control(Some(&new_control))
-                .expect("new replacement control should encode"),
-        }
-    }
-
-    async fn append_replacement_delta(
-        storage: &StorageAdapter<Memory>,
-        delta: RootReachabilityDelta,
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("replacement publication read should open");
-        let checkpoint = delta.new_root.expect("replacement has a new root");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            std::slice::from_ref(&delta),
-            &[checkpoint],
-            &mut preconditions,
-        )
-        .await
-        .expect("replacement delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("replacement delta should commit");
-    }
-
-    #[tokio::test]
-    async fn pending_checkpoint_replacement_is_unique_and_queue_cas_fenced() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut seed = storage.new_write_set();
-        stage_reachability_queue_seed(&mut seed).expect("queue seed should stage");
-        storage
-            .commit_write_set(seed, StorageWriteOptions::default())
-            .await
-            .expect("queue seed should commit");
-
-        let recovered = CommitId::for_test_label("pending-replacement-recovered");
-        let checkpoint = CommitId::for_test_label("pending-replacement-checkpoint");
-        append_replacement_delta(
-            &storage,
-            checkpoint_replacement_delta("main", recovered, checkpoint),
-        )
-        .await;
-
-        let stale_read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("branch publication read should open"),
-        );
-        let proof = resolve_pending_checkpoint_replacement(&stale_read, recovered)
-            .await
-            .expect("unique pending replacement should authenticate")
-            .expect("pending replacement should exist");
-        assert_eq!(proof.checkpoint_commit_id, checkpoint);
-        assert_eq!(proof.checkpoint_branch_id, "main");
-
-        let mut stale_writes = storage.new_write_set();
-        let mut stale_preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &stale_read,
-            &mut stale_writes,
-            &[],
-            &[checkpoint],
-            &mut stale_preconditions,
-        )
-        .await
-        .expect("branch-side queue fence should stage");
-
-        let second_checkpoint = CommitId::for_test_label("pending-replacement-checkpoint-2");
-        append_replacement_delta(
-            &storage,
-            checkpoint_replacement_delta("main", recovered, second_checkpoint),
-        )
-        .await;
-        let stale_error = storage
-            .commit_write_set(
-                stale_writes,
-                StorageWriteOptions {
-                    preconditions: stale_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect_err("stale branch publication must lose the queue CAS");
-        assert!(stale_error.to_string().contains("precondition"));
-
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("ambiguous replacement read should open"),
-        );
-        let ambiguous = resolve_pending_checkpoint_replacement(&read, recovered)
-            .await
-            .expect_err("two pending direct replacements must fail closed");
-        assert!(ambiguous.message.contains("ambiguous"));
-    }
-
-    #[tokio::test]
-    async fn recovery_ref_without_pending_replacement_is_not_branchable_authority() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
         let recovered = CommitId::for_test_label("consumed-replacement-recovered");
         let checkpoint = CommitId::for_test_label("consumed-replacement-checkpoint");
         stage_recovery_ref_rotation(
@@ -5759,426 +4180,349 @@ mod tests {
         );
         let error = resolve_pending_checkpoint_replacement(&read, recovered)
             .await
-            .expect_err("a mutable recovery ref must not replace a consumed queue proof");
+            .expect_err("a recovery ref no live control still serves is not a branchable root");
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn malformed_pending_checkpoint_replacement_fails_closed() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut seed = storage.new_write_set();
-        stage_reachability_queue_seed(&mut seed).expect("queue seed should stage");
-        storage
-            .commit_write_set(seed, StorageWriteOptions::default())
-            .await
-            .expect("queue seed should commit");
-
-        let recovered = CommitId::for_test_label("malformed-replacement-recovered");
-        let checkpoint = CommitId::for_test_label("malformed-replacement-checkpoint");
-        let mut malformed = checkpoint_replacement_delta("main", recovered, checkpoint);
-        malformed
-            .new_control
-            .as_mut()
-            .expect("replacement has new control")
-            .working_diff_checkpoint_commit_id = None;
-        malformed.new_control_digest =
-            root_control_digest_for_control(malformed.new_control.as_ref())
-                .expect("malformed control should still encode");
-        append_replacement_delta(&storage, malformed).await;
-
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("malformed replacement read should open"),
-        );
-        let error = resolve_pending_checkpoint_replacement(&read, recovered)
-            .await
-            .expect_err("mapping without an exact checkpoint baseline must fail closed");
-        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn authenticated_queue_fold_streams_beyond_one_page_and_fails_closed_on_corruption() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("queue seed should commit");
-        let roots = (0..65)
-            .map(|index| CommitId::for_test_label(&format!("queue-root-{index}")))
-            .collect::<Vec<_>>();
-        for root in &roots {
-            append_checkpoint_batch(&storage, std::slice::from_ref(root)).await;
+    /// A snapshot whose normalized JSON is comfortably past
+    /// `JSON_INLINE_MAX_BYTES`, and distinct for every `revision`.
+    ///
+    /// Both properties are load-bearing and both were got wrong by an earlier
+    /// probe: a payload at or under 1 KiB never reaches the store at all, and
+    /// the store is content addressed, so re-writing byte-identical content
+    /// dedups onto one row and leaks nothing.
+    #[cfg(feature = "storage-benches")]
+    fn out_of_band_payload(revision: usize) -> String {
+        let filler = format!("rev-{revision:08}-");
+        let mut body = String::with_capacity(2_048);
+        while body.len() < 1_800 {
+            body.push_str(&filler);
         }
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("full queue read should open");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("queue should load");
-        assert_eq!(
-            load_reachability_batches(&read, &queue)
-                .await
-                .expect("bounded retirement batches should load")
-                .len(),
-            64
-        );
-        assert_eq!(
-            collect_all_reachability_checkpoint_roots(&read, &queue)
-                .await
-                .expect("full root fold should load"),
-            roots.iter().copied().collect()
-        );
-        drop(read);
-
-        let mut corrupt = storage.new_write_set();
-        corrupt.put(
-            GC_REACHABILITY_DELTA_SPACE,
-            super::reachability_sequence_key(65),
-            StorageValue {
-                bytes: Bytes::from_static(b"corrupt-authenticated-queue-batch"),
-            },
-        );
-        storage
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("queue corruption fixture should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("corrupt queue read should open");
-        assert!(
-            collect_all_reachability_checkpoint_roots(&read, &queue)
-                .await
-                .is_err(),
-            "the shared decoder must authenticate every page"
-        );
+        serde_json::json!({ "revision": revision, "body": body }).to_string()
     }
 
-    async fn stage_root_only_branch_publication(
-        storage: &StorageAdapter<Memory>,
-        new_control: BranchHeadControl,
-    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("new branch publication read should open");
-        let mut publication = storage.new_write_set();
-        stage_branch_head_control(&mut publication, "queue-race-branch", new_control)
-            .expect("new branch control should stage");
-        let delta = RootReachabilityDelta {
-            branch_id: "queue-race-branch".to_owned(),
-            old_root: None,
-            new_root: Some(new_control.head_commit_id),
-            old_control: None,
-            new_control: Some(new_control),
-            old_control_digest: root_control_digest_for_control(None).unwrap(),
-            new_control_digest: root_control_digest_for_control(Some(&new_control)).unwrap(),
-        };
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(&read, &mut publication, &[delta], &[], &mut preconditions)
-            .await
-            .expect("new branch queue batch should stage");
-        (publication, preconditions)
-    }
-
-    async fn queue_publication_race_rejects_stale_peer(blocked_queue: bool, gc_first: bool) {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("race repository should initialize");
-        let storage = StorageAdapter::new(backend);
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("orphan staging read should open");
-        let mut orphan_writes = storage.new_write_set();
-        let orphan = crate::binary_cas::BinaryCasContext::new()
-            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
-            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
-                b"queue-race-orphan".to_vec(),
-            ))
-            .await
-            .expect("orphan payload should stage");
-        drop(read);
-        storage
-            .commit_write_set(orphan_writes, StorageWriteOptions::default())
-            .await
-            .expect("orphan payload should commit");
-
-        let (main_branch_id, main_control) = BranchHeadControlContext::new()
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("main control read should open"),
-            )
-            .scan()
-            .await
-            .expect("branch controls should load")
-            .into_iter()
-            .find(|(branch_id, _)| branch_id != GLOBAL_BRANCH_ID)
-            .expect("workspace branch control should exist");
-        if blocked_queue {
-            let read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("blocked batch read should open");
-            let mut writes = storage.new_write_set();
-            let mut preconditions = Vec::new();
-            let delta = RootReachabilityDelta {
-                branch_id: main_branch_id,
-                old_root: Some(main_control.head_commit_id),
-                new_root: Some(main_control.head_commit_id),
-                old_control: Some(main_control),
-                new_control: Some(main_control),
-                old_control_digest: root_control_digest_for_control(Some(&main_control)).unwrap(),
-                new_control_digest: root_control_digest_for_control(Some(&main_control)).unwrap(),
-            };
-            stage_reachability_delta_batch(&read, &mut writes, &[delta], &[], &mut preconditions)
-                .await
-                .expect("blocked batch should stage");
-            drop(read);
-            storage
-                .commit_write_set(
-                    writes,
-                    StorageWriteOptions {
-                        preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-                .expect("blocked batch should commit");
-        }
-
-        let stale_read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("stale sweep read should open"),
-        );
-        let mut stale_writes = storage.new_write_set();
-        let mut stale_preconditions = Vec::new();
-        let plan = super::stage_repository_gc_with_preconditions(
-            stale_read,
-            &mut stale_writes,
-            &mut stale_preconditions,
-        )
-        .await
-        .expect("stale sweep should stage");
-        assert_eq!(plan.sweep.binary_cas.reclaimed_chunk_rows, 1);
-
-        let mut new_control = main_control;
-        new_control.ref_change_id = ChangeId::for_test_label("queue-race-new-branch-ref");
-        let (publication, publication_preconditions) =
-            stage_root_only_branch_publication(&storage, new_control).await;
-        if gc_first {
-            storage
-                .commit_write_set(
-                    stale_writes,
-                    StorageWriteOptions {
-                        preconditions: stale_preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-                .expect("GC should win the root-publication epoch");
-            let error = storage
-                .commit_write_set(
-                    publication,
-                    StorageWriteOptions {
-                        preconditions: publication_preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-                .expect_err("stale root-only publication must lose after GC");
-            assert!(error.to_string().contains("precondition"));
-            let (retry, retry_preconditions) =
-                stage_root_only_branch_publication(&storage, new_control).await;
-            storage
-                .commit_write_set(
-                    retry,
-                    StorageWriteOptions {
-                        preconditions: retry_preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-                .expect("fresh root-only publication retry should commit");
-            let control = BranchHeadControlContext::new()
-                .reader(
-                    storage
-                        .begin_read(StorageReadOptions::default())
-                        .await
-                        .expect("root-only retry verification read should open"),
-                )
-                .load("queue-race-branch")
-                .await
-                .expect("root-only retry control should load");
-            assert_eq!(control, Some(new_control));
-            let read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("GC-first orphan verification read should open");
-            let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-            assert!(
-                reader
-                    .load_bytes_many(&[orphan.hash])
-                    .await
-                    .expect("GC-first orphan verification should load")
-                    .into_vec()[0]
-                    .is_none()
-            );
-            return;
-        }
-        storage
-            .commit_write_set(
-                publication,
-                StorageWriteOptions {
-                    preconditions: publication_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("new branch publication should commit");
-
-        let error = storage
-            .commit_write_set(
-                stale_writes,
-                StorageWriteOptions {
-                    preconditions: stale_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect_err("stale sweep must not commit after queue publication");
-        assert!(error.to_string().contains("precondition"));
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("orphan verification read should open");
-        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-        assert!(
-            reader
-                .load_bytes_many(&[orphan.hash])
-                .await
-                .expect("orphan should remain readable")
-                .into_vec()[0]
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn repository_gc_epoch_serializes_root_only_publication_in_both_orders() {
-        queue_publication_race_rejects_stale_peer(false, false).await;
-        queue_publication_race_rejects_stale_peer(true, false).await;
-        queue_publication_race_rejects_stale_peer(false, true).await;
-        queue_publication_race_rejects_stale_peer(true, true).await;
-    }
-
-    #[tokio::test]
-    async fn repository_gc_marks_binary_roots_from_checkpoint_batches_beyond_retirement_window() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("full-queue repository should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("full-queue repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("full-queue session should open");
-        let live_bytes = b"checkpoint-batch-65-live-blob";
+    /// Registers one of several **identically shaped** payload tables.
+    ///
+    /// A row's out-of-band payload is its whole snapshot, and the snapshot
+    /// carries the row's primary key — so two rows can only share a payload
+    /// when their snapshots are byte-identical, which means the same key with
+    /// the same value under a *different* schema. The schema key lives in the
+    /// storage key, not in the snapshot, so these tables are exactly the
+    /// distinct owners a co-ownership fixture needs. (An earlier version used
+    /// two different paths, believed it had proved dedup, and was measuring two
+    /// unrelated payloads.)
+    #[cfg(feature = "storage-benches")]
+    async fn register_payload_schema<S>(
+        session: &crate::session::SessionContext<S>,
+        schema_key: &str,
+    ) where
+        S: crate::storage::Storage + Clone + Send + Sync + 'static,
+    {
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
+        });
         session
             .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/queued.bin', $1)",
-                &[Value::Blob(live_bytes.to_vec().into())],
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (CAST($1 AS JSONB), false, false)",
+                &[Value::Text(schema.to_string())],
             )
             .await
-            .expect("queued file should publish");
-        let retained_commit = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .expect("payload fixture schema should register");
+    }
+
+    /// Undo-to-last-checkpoint must survive reclaim at any cadence.
+    ///
+    /// The retention floor for the undo interval is
+    /// `BranchHeadTrackedReachability::serving_checkpoint_commit_id`, read from
+    /// the *live* branch head control at sweep time -- see
+    /// `authenticated_control_commit_reachability`. It is not derived from the
+    /// reclaim schedule or from any stored sequence, so no cadence can move it.
+    ///
+    /// This test pins that property mechanically by running the full shipping
+    /// sweep after **every single commit**, which is strictly more aggressive
+    /// than any cadence the engine would ever schedule. If a future change ties
+    /// the undo floor to reclaim scheduling, this fails loudly.
+    ///
+    /// # Two things this fixture already paid for
+    ///
+    /// **1. The churn ordering is load-bearing.** `update -> checkpoint ->
+    /// sweep` retires commits; `checkpoint -> update -> sweep` retires
+    /// *nothing*, because the sweep then never observes a released interval.
+    /// Two earlier versions of this test used the second ordering and retired
+    /// zero across every iteration. If you reorder the churn loop below, expect
+    /// the `retired_total` guard to fire — that is the guard working, not a
+    /// broken fixture. Measured onset with the correct ordering, checkpointing
+    /// every revision: `tracked_roots` is 0, 1, 0, then 2 from revision 4 on.
+    ///
+    /// **2. `tracked_commit_roots` is the counter that observes retirement.**
+    /// The plausibly-named `plan.changelog.sweep.commits` reads **0 at every
+    /// iteration** on this fixture while `tracked_commit_roots` is non-zero, so
+    /// a guard written against it would fail forever against working code — and
+    /// would eventually be "fixed" by deleting the guard. Do not swap the
+    /// counter without re-running the measurement.
+    ///
+    /// # Keep the non-vacuity guard
+    ///
+    /// `retired_total > 0` is the most important line here. It failed two
+    /// fixtures that would otherwise have gone green while proving nothing at
+    /// all about undo retention: a sweep that retires nothing trivially
+    /// preserves undo. The assertions below are only evidence because the sweep
+    /// underneath them is doing real work.
+    /// # This test is about undo, not history
+    ///
+    /// **Undo survives reclaim; row history does not.** These are different
+    /// properties over different planes, and this test asserts only the first.
+    /// Do not read its name as "reclaim is safe for history".
+    ///
+    /// Undo reads current state, which the sweep leaves intact. `_history()`
+    /// reads each commit's *delta*, and the sweep deletes those. The commit
+    /// record survives -- `collect_ref_reachable_commit_ids` feeds
+    /// `graph_reachable` into `semantic_dependencies`, so
+    /// `stage_delete_commit_projection` retains it -- but the delta does not,
+    /// because `graph_reachable` never reaches `physical_dependencies`, so
+    /// `stage_retire_commit_physical_state` frees it. The loss is silent by
+    /// construction: `load_point_replay_commit_state` returning `None` makes a
+    /// commit whose manifest was retired indistinguishable from one that
+    /// changed nothing, so the walk emits zero rows and no error is possible.
+    ///
+    /// Measured on this engine -- checkpointed rounds, then one sweep, history
+    /// depth before -> after: 4 -> 3, 8 -> 3, 12 -> 3, with **zero** semantic
+    /// projections deleted in every case. The survivor count is a constant,
+    /// not a fraction, so the loss grows without bound as a repository ages.
+    ///
+    /// This is a known defect under repair at the time of writing; the
+    /// retention fix belongs to `physical_dependencies`, not here. When it
+    /// lands, a sibling test should pin history the way this one pins undo.
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn undo_to_last_checkpoint_survives_reclaim_after_every_commit() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
             .await
-            .expect("retained commit should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("retained commit id should exist");
-        let retained_commit = CommitId::parse_lix(&retained_commit, "retained queued commit")
-            .expect("retained commit id should parse");
+            .expect("repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("repository should open");
+        let session = engine.open_session().await.expect("session should open");
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "gc_undo_cadence_fixture",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["path"],
+        });
         session
-            .execute("DELETE FROM lix_file WHERE path = '/queued.bin'", &[])
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
+                &[Value::Text(schema.to_string())],
+            )
             .await
-            .expect("queued file should retire from current state");
-        let current_commit = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .expect("undo cadence fixture schema should register");
+        session
+            .execute(
+                "INSERT INTO gc_undo_cadence_fixture (path, value) VALUES ('/row', 'v0')",
+                &[],
+            )
             .await
-            .expect("current commit should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("current commit id should exist");
-        let current_commit = CommitId::parse_lix(&current_commit, "current queued commit")
-            .expect("current commit id should parse");
+            .expect("seed row should publish");
 
-        let storage = StorageAdapter::new(backend.clone());
-        loop {
-            let read = storage
-                .begin_read(StorageReadOptions::default())
+        // Churn phase: `update -> checkpoint -> sweep`, the ordering that
+        // actually retires. See the note above before changing it.
+        const CHURN: usize = 8;
+        let mut retired_total = 0usize;
+        for revision in 1..=CHURN {
+            session
+                .execute(
+                    "UPDATE gc_undo_cadence_fixture SET value = $1 WHERE path = '/row'",
+                    &[Value::Text(format!("v{revision}"))],
+                )
                 .await
-                .expect("queue length read should open");
-            let (queue, _) = load_reachability_queue(&read)
+                .expect("churn commit should publish");
+            session
+                .create_checkpoint()
                 .await
-                .expect("queue length should load");
-            let pending = if queue.head_sequence == 0 {
-                0
-            } else {
-                queue.tail_sequence - queue.head_sequence + 1
-            };
-            drop(read);
-            if pending >= 64 {
-                break;
-            }
-            append_checkpoint_batch(&storage, &[current_commit]).await;
+                .expect("churn checkpoint should publish");
+            let plan = run_shipping_repository_gc(&backend).await;
+            retired_total += plan.sweep.tracked_commit_roots.len();
         }
-        append_checkpoint_batch(&storage, &[retained_commit]).await;
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("orphan staging read should open");
-        let mut orphan_writes = storage.new_write_set();
-        let orphan = crate::binary_cas::BinaryCasContext::new()
-            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
-            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
-                b"unrelated-full-queue-orphan".to_vec(),
-            ))
-            .await
-            .expect("unrelated orphan should stage");
-        drop(read);
-        storage
-            .commit_write_set(orphan_writes, StorageWriteOptions::default())
-            .await
-            .expect("unrelated orphan should commit");
+        // Non-vacuity. Do not remove: a sweep that never retires anything would
+        // let every assertion below pass while proving nothing about retention.
+        assert!(
+            retired_total > 0,
+            "the fixture must actually retire commits, or the undo assertions below are vacuous"
+        );
 
+        // Undo phase: two commits past the last checkpoint, still sweeping
+        // after each, so the retained undo interval is exactly {v9, v10}.
+        for revision in (CHURN + 1)..=(CHURN + 2) {
+            session
+                .execute(
+                    "UPDATE gc_undo_cadence_fixture SET value = $1 WHERE path = '/row'",
+                    &[Value::Text(format!("v{revision}"))],
+                )
+                .await
+                .expect("post-checkpoint commit should publish");
+            run_shipping_repository_gc(&backend).await;
+        }
+
+        // Undo must walk back to the last checkpoint's state (v8). Undo *past*
+        // the last checkpoint is deliberately not asserted: checkpointing is
+        // permitted to retire the last-1 interval.
+        for expected in ["v9", "v8"] {
+            session
+                .undo()
+                .await
+                .expect("undo must survive reclaim at every commit");
+            let value = session
+                .execute(
+                    "SELECT value FROM gc_undo_cadence_fixture WHERE path = '/row'",
+                    &[],
+                )
+                .await
+                .expect("undone row should read")
+                .rows()[0]
+                .get::<String>("value")
+                .expect("undone row should have a value");
+            assert_eq!(
+                value, expected,
+                "undo landed on the wrong revision after reclaim"
+            );
+        }
+    }
+
+    /// Demonstrates, mechanically, that the in-record `format_version` cannot
+    /// gate an arity change to `StoredCheckpointGcState`.
+    ///
+    /// Every storage record is `#[musli(packed)]` -- positional and untagged --
+    /// so a reader's field count is part of its wire contract. Decoding fails on
+    /// **arity**, before any field value (including `format_version`) can be
+    /// inspected. The upgrade mechanism for such a change is therefore
+    /// `REPOSITORY_PROTOCOL_VALUE`, which makes `Engine::new` reject the
+    /// repository outright, not the per-record version field.
+    ///
+    /// Reading the derive is not evidence for this; the readers below are
+    /// constructed and run.
+    #[test]
+    fn packed_arity_change_cannot_be_gated_by_the_in_record_format_version() {
+        // Today's shipping shape: format_version + 3 counters.
+        #[derive(musli::Encode, musli::Decode)]
+        #[musli(packed)]
+        struct ArityOld {
+            format_version: u32,
+            checkpoint_sequence: u64,
+            last_gc_sequence: u64,
+            collectible_interval_count: u64,
+        }
+
+        // Proposed shape: the same, plus the two self-correcting estimates the
+        // ratio trigger needs.
+        #[derive(musli::Encode, musli::Decode)]
+        #[musli(packed)]
+        struct ArityNew {
+            format_version: u32,
+            checkpoint_sequence: u64,
+            last_gc_sequence: u64,
+            collectible_interval_count: u64,
+            live_manifest_estimate: u64,
+            yield_per_interval_estimate: u64,
+        }
+
+        let new_bytes = crate::storage_codec::encode(
+            "arity demo new",
+            &ArityNew {
+                format_version: 2,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+                live_manifest_estimate: 512,
+                yield_per_interval_estimate: 9,
+            },
+        )
+        .expect("new record should encode");
+
+        let old_bytes = crate::storage_codec::encode(
+            "arity demo old",
+            &ArityOld {
+                format_version: 1,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+            },
+        )
+        .expect("old record should encode");
+
+        // Direction 1: an OLD reader against a NEW record.
+        let old_reads_new = crate::storage_codec::decode::<ArityOld>("arity demo", &new_bytes);
+        let old_reads_new_err = old_reads_new
+            .err()
+            .expect("a 4-field reader must reject a 6-field record");
+        println!(
+            "ARITY old_reader_vs_new_record: {}",
+            old_reads_new_err.message
+        );
+
+        // Direction 2: a NEW reader against an OLD record.
+        let new_reads_old = crate::storage_codec::decode::<ArityNew>("arity demo", &old_bytes);
+        let new_reads_old_err = new_reads_old
+            .err()
+            .expect("a 6-field reader must reject a 4-field record");
+        println!(
+            "ARITY new_reader_vs_old_record: {}",
+            new_reads_old_err.message
+        );
+
+        // The sharp point: bumping `format_version` inside the record does not
+        // help, because a same-arity record still decodes cleanly and a
+        // different-arity record never reaches the field at all. So the version
+        // field can express "same shape, new meaning" and can never express
+        // "new shape".
+        let bumped = crate::storage_codec::encode(
+            "arity demo bumped",
+            &ArityOld {
+                format_version: 999,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+            },
+        )
+        .expect("bumped record should encode");
+        let decoded = crate::storage_codec::decode::<ArityOld>("arity demo", &bumped)
+            .expect("a same-arity record decodes regardless of its version value");
+        assert_eq!(
+            decoded.format_version, 999,
+            "the version field is only observable once arity already matched"
+        );
+        println!(
+            "ARITY same_arity_decodes_despite_version=999 checkpoint_sequence={}",
+            decoded.checkpoint_sequence
+        );
+    }
+
+    #[cfg(feature = "storage-benches")]
+    async fn run_shipping_repository_gc(backend: &Memory) -> super::RepositoryGcPlan {
+        let storage = StorageAdapter::new(backend.clone());
         let read = SharedStorageAdapterRead::new(
             storage
                 .begin_read(StorageReadOptions::default())
                 .await
-                .expect("repository sweep read should open"),
+                .expect("payload GC read should open"),
         );
         let mut writes = storage.new_write_set();
         let mut preconditions = Vec::new();
         let plan =
             super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
                 .await
-                .expect("full-queue repository sweep should stage");
-        assert!(plan.sweep.binary_cas.reclaimed_chunk_rows >= 1);
+                .expect("payload GC should stage");
         storage
             .commit_write_set(
                 writes,
@@ -6188,30 +4532,353 @@ mod tests {
                 },
             )
             .await
-            .expect("full-queue repository sweep should commit");
+            .expect("payload GC should commit");
+        plan
+    }
 
-        drop(session);
-        drop(engine);
-        let _reopened = Engine::new(backend.clone())
-            .await
-            .expect("repository should reopen after full-queue sweep");
-        let read = StorageAdapter::new(backend)
+    #[cfg(feature = "storage-benches")]
+    async fn json_payload_refs(backend: &Memory) -> BTreeSet<JsonRef> {
+        let storage = StorageAdapter::new(backend.clone());
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("cold CAS read should open");
-        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-        let blobs = reader
-            .load_bytes_many(&[
-                crate::binary_cas::BlobId::from_content(live_bytes),
-                orphan.hash,
-            ])
+            .expect("payload census read should open");
+        space_inventory(&read, crate::json_store::JSON_SPACE)
             .await
-            .expect("cold CAS read should succeed")
-            .into_vec();
-        assert_eq!(blobs[0].as_deref(), Some(live_bytes.as_slice()));
+            .into_iter()
+            .map(|(key, _)| {
+                JsonRef::from_hash_bytes(
+                    <[u8; 32]>::try_from(key.as_ref()).expect("payload keys are 32-byte hashes"),
+                )
+            })
+            .collect()
+    }
+
+    /// Names the payload row one statement added, without reproducing the
+    /// engine's JSON normalization in the test. Re-deriving the content address
+    /// here would make the fixture depend on a normalization detail rather than
+    /// on the reachability behaviour under test.
+    #[cfg(feature = "storage-benches")]
+    async fn payload_ref_added_by<F, Fut>(backend: &Memory, publish: F) -> JsonRef
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let before = json_payload_refs(backend).await;
+        publish().await;
+        let after = json_payload_refs(backend).await;
+        let mut added = after.difference(&before).copied().collect::<Vec<_>>();
+        assert_eq!(
+            added.len(),
+            1,
+            "the fixture statement must add exactly one out-of-band payload row"
+        );
+        added.pop().expect("one added payload ref")
+    }
+
+    /// A payload named by two owners, one of which this sweep retires, must
+    /// survive.
+    ///
+    /// This is the case the reclamation exists to *not* break, and it states
+    /// the dedup hazard exactly: the store is content addressed, so the second
+    /// owner does **not** write a second payload — it resolves onto the row the
+    /// first owner already produced. Retiring the commit that happened to
+    /// author it first must therefore not be read as "nobody names this".
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn repository_gc_keeps_a_payload_a_second_owner_still_names() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("shared-payload repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("shared-payload repository should open");
+        let session = engine
+            .open_session()
+            .await
+            .expect("shared-payload session should open");
+        register_payload_schema(&session, "gc_payload_row").await;
+        register_payload_schema(&session, "gc_payload_mirror").await;
+
+        let shared = out_of_band_payload(0);
+        let shared_ref = payload_ref_added_by(&backend, || async {
+            session
+                .execute(
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
+                    &[Value::Text(shared.clone())],
+                )
+                .await
+                .expect("first owner should publish");
+        })
+        .await;
+        let before_mirror = json_payload_refs(&backend).await;
+        session
+            .execute(
+                "INSERT INTO gc_payload_mirror (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
+                &[Value::Text(shared.clone())],
+            )
+            .await
+            .expect("second owner should publish");
+        assert_eq!(
+            json_payload_refs(&backend).await,
+            before_mirror,
+            "the premise of this test is that identical content dedups onto one row"
+        );
+
+        // Churn only the first owner, so the commit that authored the shared
+        // payload becomes retirable while the mirror row keeps naming it.
+        for revision in 1..=8 {
+            session
+                .execute(
+                    "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/shared'",
+                    &[Value::Text(out_of_band_payload(revision))],
+                )
+                .await
+                .expect("churn should publish");
+            session
+                .create_checkpoint()
+                .await
+                .expect("churn checkpoint should publish");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("releasing checkpoint should publish");
+
+        let plan = run_shipping_repository_gc(&backend).await;
         assert!(
-            blobs[1].is_none(),
-            "unrelated CAS garbage must be reclaimed"
+            !plan.sweep.tracked_commit_roots.is_empty(),
+            "the fixture must actually retire commits, or nothing is being tested"
+        );
+        assert!(
+            !plan.changelog.sweep.json_payloads.contains(&shared_ref),
+            "a payload a second owner still names must never be proposed for deletion"
+        );
+        assert!(
+            plan.changelog.live.payloads.contains(&shared_ref),
+            "the shared payload must be proven live, not merely absent from the sweep"
+        );
+        assert!(
+            json_ref_exists(&backend, crate::json_store::JSON_SPACE, shared_ref).await,
+            "the shared payload row must survive the sweep"
+        );
+
+        let value = session
+            .execute(
+                "SELECT value FROM gc_payload_mirror WHERE path = '/shared'",
+                &[],
+            )
+            .await
+            .expect("second owner should still read")
+            .rows()[0]
+            .get::<serde_json::Value>("value")
+            .expect("second owner should still carry its payload");
+        assert!(
+            value.to_string().contains("rev-00000000-"),
+            "the surviving owner must materialize the original payload: {value}"
+        );
+    }
+
+    /// The co-ownership case a naive per-commit delete gets wrong: one payload
+    /// named by tracked history *and* by more than one untracked row.
+    ///
+    /// Untracked rows live only in the hot serving plane — no commit names
+    /// them — so a live set derived from commits alone deletes this payload out
+    /// from under both of them.
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn repository_gc_keeps_a_payload_co_owned_by_history_and_untracked_rows() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("co-owned payload repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("co-owned payload repository should open");
+        let session = engine
+            .open_session()
+            .await
+            .expect("co-owned payload session should open");
+        for schema_key in [
+            "gc_payload_row",
+            "gc_payload_untracked_a",
+            "gc_payload_untracked_b",
+        ] {
+            register_payload_schema(&session, schema_key).await;
+        }
+
+        let shared = out_of_band_payload(0);
+        let shared_ref = payload_ref_added_by(&backend, || async {
+            session
+                .execute(
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/co', CAST($1 AS JSONB))",
+                    &[Value::Text(shared.clone())],
+                )
+                .await
+                .expect("tracked owner should publish");
+        })
+        .await;
+        let before_untracked = json_payload_refs(&backend).await;
+        for table in ["gc_payload_untracked_a", "gc_payload_untracked_b"] {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} (path, value, lixcol_untracked) \
+                         VALUES ('/co', CAST($1 AS JSONB), true)"
+                    ),
+                    &[Value::Text(shared.clone())],
+                )
+                .await
+                .expect("untracked owner should publish");
+        }
+        assert_eq!(
+            json_payload_refs(&backend).await,
+            before_untracked,
+            "both untracked rows must resolve onto the payload row history already owns"
+        );
+
+        // Retire the tracked owner's commit while both untracked rows stay.
+        session
+            .execute("DELETE FROM gc_payload_row WHERE path = '/co'", &[])
+            .await
+            .expect("tracked owner should delete");
+        for revision in 1..=6 {
+            session
+                .execute(
+                    "INSERT INTO gc_payload_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
+                    &[
+                        Value::Text(format!("/churn-{revision}")),
+                        Value::Text(out_of_band_payload(revision)),
+                    ],
+                )
+                .await
+                .expect("churn should publish");
+            session
+                .create_checkpoint()
+                .await
+                .expect("churn checkpoint should publish");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("releasing checkpoint should publish");
+
+        let plan = run_shipping_repository_gc(&backend).await;
+        assert!(
+            !plan.sweep.tracked_commit_roots.is_empty(),
+            "the fixture must actually retire commits, or nothing is being tested"
+        );
+        assert!(
+            !plan.changelog.sweep.json_payloads.contains(&shared_ref),
+            "a payload two untracked rows still name must never be proposed for deletion"
+        );
+        assert!(
+            json_ref_exists(&backend, crate::json_store::JSON_SPACE, shared_ref).await,
+            "the co-owned payload row must survive the sweep"
+        );
+        for table in ["gc_payload_untracked_a", "gc_payload_untracked_b"] {
+            let rows = session
+                .execute(
+                    &format!("SELECT value FROM {table} WHERE path = '/co'"),
+                    &[],
+                )
+                .await
+                .expect("untracked owner should still read");
+            assert_eq!(
+                rows.rows().len(),
+                1,
+                "untracked row in '{table}' must survive"
+            );
+            let value = rows.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("untracked owner should still carry its payload");
+            assert!(
+                value.to_string().contains("rev-00000000-"),
+                "the untracked owner must materialize the original payload: {value}"
+            );
+        }
+    }
+
+    /// The leak this reclamation exists to close: superseded payloads are
+    /// actually reclaimed, and the live one is not.
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn repository_gc_reclaims_superseded_out_of_band_payloads() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("superseded payload repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("superseded payload repository should open");
+        let session = engine
+            .open_session()
+            .await
+            .expect("superseded payload session should open");
+        register_payload_schema(&session, "gc_payload_row").await;
+
+        session
+            .execute(
+                "INSERT INTO gc_payload_row (path, value) VALUES ('/row', CAST($1 AS JSONB))",
+                &[Value::Text(out_of_band_payload(0))],
+            )
+            .await
+            .expect("first revision should publish");
+        let mut live_ref = JsonRef::default();
+        for revision in 1..=16 {
+            live_ref = payload_ref_added_by(&backend, || async {
+                session
+                    .execute(
+                        "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/row'",
+                        &[Value::Text(out_of_band_payload(revision))],
+                    )
+                    .await
+                    .expect("rewrite should publish");
+            })
+            .await;
+            if revision % 4 == 0 {
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("cadence checkpoint should publish");
+            }
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("releasing checkpoint should publish");
+
+        let before = json_payload_refs(&backend).await.len();
+        let plan = run_shipping_repository_gc(&backend).await;
+        let after = json_payload_refs(&backend).await.len();
+        assert!(
+            !plan.changelog.sweep.json_payloads.is_empty(),
+            "superseded payloads must be proposed for deletion"
+        );
+        assert_eq!(
+            before - after,
+            plan.changelog.sweep.json_payloads.len(),
+            "every proposed payload delete must actually remove a row"
+        );
+        assert!(
+            after < before,
+            "the payload plane must shrink: {before} -> {after}"
+        );
+        assert!(
+            json_ref_exists(&backend, crate::json_store::JSON_SPACE, live_ref).await,
+            "the surviving revision's payload must not be reclaimed"
+        );
+        let value = session
+            .execute("SELECT value FROM gc_payload_row WHERE path = '/row'", &[])
+            .await
+            .expect("live row should still read")
+            .rows()[0]
+            .get::<serde_json::Value>("value")
+            .expect("live row should still carry its payload");
+        assert!(
+            value.to_string().contains("rev-00000016-"),
+            "the live row must still materialize its payload: {value}"
         );
     }
 
@@ -6225,7 +4892,7 @@ mod tests {
             .await
             .expect("untracked-file repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("untracked-file session should open");
         let live_bytes = b"current-only-untracked-file-blob";
@@ -6287,7 +4954,7 @@ mod tests {
             .await
             .expect("repository should cold reopen after untracked-file GC");
         let reopened_session = reopened
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("cold untracked-file session should open");
         let content = reopened_session
@@ -6319,6 +4986,7 @@ mod tests {
     }
 
     #[cfg(feature = "default_wasm_runtime")]
+    #[cfg(any())]
     #[tokio::test]
     async fn repository_gc_keeps_plugin_wasm_for_cold_runtime_execution() {
         let backend = Memory::new();
@@ -6327,12 +4995,12 @@ mod tests {
             .expect("plugin-GC repository should initialize");
         let engine = Engine::new_with_wasm_runtime(
             backend.clone(),
-            crate::default_wasm_runtime::runtime().expect("WASM runtime should initialize"),
+            crate::plugin::runtime::default::runtime().expect("WASM runtime should initialize"),
         )
         .await
         .expect("plugin-GC repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("plugin-GC session should open");
         let (archive, wasm) = gc_csv_plugin_archive();
@@ -6383,12 +5051,13 @@ mod tests {
         drop(engine);
         let engine = Engine::new_with_wasm_runtime(
             backend.clone(),
-            crate::default_wasm_runtime::runtime().expect("cold WASM runtime should initialize"),
+            crate::plugin::runtime::default::runtime()
+                .expect("cold WASM runtime should initialize"),
         )
         .await
         .expect("plugin-GC repository should cold reopen");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("cold plugin-GC session should open");
         session
@@ -6413,6 +5082,7 @@ mod tests {
     }
 
     #[cfg(feature = "default_wasm_runtime")]
+    #[cfg(any())]
     #[tokio::test]
     async fn repository_gc_reclaims_plugin_wasm_only_after_final_registry_root_releases() {
         let backend = Memory::new();
@@ -6421,12 +5091,12 @@ mod tests {
             .expect("shared-plugin repository should initialize");
         let engine = Engine::new_with_wasm_runtime(
             backend.clone(),
-            crate::default_wasm_runtime::runtime().expect("WASM runtime should initialize"),
+            crate::plugin::runtime::default::runtime().expect("WASM runtime should initialize"),
         )
         .await
         .expect("shared-plugin repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("shared-plugin session should open");
         let (archive, wasm) = gc_csv_plugin_archive();
@@ -6485,7 +5155,7 @@ mod tests {
             .expect("corrupt-registry repository should initialize");
         let storage = StorageAdapter::new(backend.clone());
         let corrupt_registry = serde_json::json!({
-            "key": crate::plugin::PLUGIN_REGISTRY_KEY,
+            "key": crate::plugin::runtime::PLUGIN_REGISTRY_KEY,
             "value": {
                 "version": 1,
                 "plugin_count": 1,
@@ -6506,10 +5176,10 @@ mod tests {
             .expect("corrupt-registry controls should load")
             .into_iter()
             .find(|(branch_id, _)| branch_id != GLOBAL_BRANCH_ID)
-            .expect("workspace branch control should exist");
+            .expect("repository branch control should exist");
         let timestamp =
             LixTimestamp::expect_parse("corrupt registry timestamp", "2026-01-01T00:00:00Z");
-        let entity_pk = EntityPk::single(crate::plugin::PLUGIN_REGISTRY_KEY);
+        let row_pk = RowPk::single(crate::plugin::runtime::PLUGIN_REGISTRY_KEY);
         let mut writes = storage.new_write_set();
         let mut coverage = WorkingDiffIndexCoverage::default();
         TrackedHeadContext::new()
@@ -6521,7 +5191,7 @@ mod tests {
                 &[CurrentStateDeltaRef {
                     schema_key: "lix_key_value",
                     file_id: None,
-                    entity_pk: &entity_pk,
+                    row_pk: &row_pk,
                     change_id: Some(ChangeId::for_test_label("corrupt-plugin-registry")),
                     commit_id: Some(control.head_commit_id),
                     untracked: false,
@@ -6571,6 +5241,7 @@ mod tests {
     }
 
     #[cfg(feature = "default_wasm_runtime")]
+    #[cfg(any())]
     fn gc_csv_plugin_archive() -> (Vec<u8>, Vec<u8>) {
         let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")))
             .expect("CSV plugin WASM should read");
@@ -6608,47 +5279,88 @@ mod tests {
         )
     }
 
-    async fn run_binary_repository_gc(storage: &StorageAdapter<Memory>) {
+    /// The derivation replaces `gc.reachability_delta.v1`. It must name every
+    /// commit that still owns physical state — including one no ref can reach,
+    /// which is what a deleted branch leaves behind and what a walk from refs
+    /// structurally cannot find — and it must shrink as retirement succeeds.
+    #[tokio::test]
+    async fn derived_candidates_are_the_commits_that_still_own_physical_state() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("derived candidate timestamp", "2026-01-01T00:00:00Z");
+        let head = replay_commit_record("derived-candidate-head", 0, None, timestamp);
+        // No commit record and no parent link binds this one to anything.
+        let orphan = replay_commit_record("derived-candidate-orphan", 0, None, timestamp);
+        let mut head_manifest =
+            test_commit_state_manifest(&head, CommitStateMutationInventory::default());
+        head_manifest.replay_debt = CommitStateReplayDebt::default();
+        head_manifest.snapshot_root = Some(Box::new(test_snapshot_root(head.commit_id)));
+        let mut orphan_manifest =
+            test_commit_state_manifest(&orphan, CommitStateMutationInventory::default());
+        orphan_manifest.replay_debt = CommitStateReplayDebt::default();
+        orphan_manifest.snapshot_root = Some(Box::new(test_snapshot_root(orphan.commit_id)));
+        persist_replay_closure_fixture(
+            &storage,
+            storage.new_write_set(),
+            &[head.clone()],
+            &[head_manifest, orphan_manifest],
+        )
+        .await;
+
         let read = SharedStorageAdapterRead::new(
             storage
                 .begin_read(StorageReadOptions::default())
                 .await
-                .expect("binary repository-GC read should open"),
+                .expect("derived candidate read should open"),
+        );
+        let derived = derive_retirement_candidates(&read)
+            .await
+            .expect("candidates should derive from the manifest plane alone");
+        assert_eq!(
+            derived.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([head.commit_id, orphan.commit_id]),
+            "every commit owning physical state is a candidate, reachable or not"
+        );
+        drop(read);
+
+        // Retiring the physical state is what removes a candidate. Nothing is
+        // remembered about the retirement; the inventory simply gets shorter.
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("retirement read should open"),
         );
         let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
-            .await
-            .expect("binary repository GC should stage");
+        crate::tracked_state::stage_retire_commit_physical_state(
+            &read,
+            &mut writes,
+            orphan.commit_id,
+            crate::tracked_state::RetainedPhysicalState {
+                mutation_nodes: &BTreeSet::new(),
+                scoped_nodes: &BTreeSet::new(),
+                native_parts: &BTreeSet::new(),
+            },
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect("orphan physical state should retire");
+        drop(read);
         storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
+            .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("binary repository GC should commit");
-    }
+            .expect("orphan retirement should commit");
 
-    async fn assert_binary_cas_presence(
-        storage: &StorageAdapter<Memory>,
-        hash: crate::binary_cas::BlobId,
-        expected: bool,
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("post-retirement read should open"),
+        );
+        let derived = derive_retirement_candidates(&read)
             .await
-            .expect("binary-CAS presence read should open");
-        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-        let present = reader
-            .load_bytes_many(&[hash])
-            .await
-            .expect("binary-CAS presence should load")
-            .into_vec()[0]
-            .is_some();
-        assert_eq!(present, expected);
+            .expect("candidates should derive after retirement");
+        assert_eq!(derived, vec![head.commit_id]);
     }
 
     #[test]
@@ -6657,25 +5369,29 @@ mod tests {
         let new = CommitId::for_test_label("history-new");
         let active = BTreeSet::from([new]);
         let mut dependencies = BTreeSet::from([old]);
-        assert!(!retirement_is_proven(
-            old,
-            Some(new),
-            &active,
-            &dependencies
-        ));
+        assert!(!retirement_is_proven(old, &active, &dependencies));
         // Once history/diff/undo/redo/checkpoint pins release the old root,
-        // the delta is a valid physical-retirement proof.
+        // the derived candidate is a valid physical-retirement proof.
         dependencies.clear();
-        assert!(retirement_is_proven(old, Some(new), &active, &dependencies));
+        assert!(retirement_is_proven(old, &active, &dependencies));
+        // A live root is never a candidate: chronology roots are the authority
+        // set, so the retirement proof rejects them without a second check.
+        assert!(!retirement_is_proven(new, &active, &dependencies));
     }
 
     #[tokio::test]
     async fn repository_gc_state_round_trips() {
         let storage = StorageAdapter::new(Memory::new());
+        // Distinct values per field: a positional `#[musli(packed)]` record
+        // will round-trip a permuted field order undetected if the values
+        // collide.
         let expected = CheckpointGcState {
             checkpoint_sequence: 129,
             last_gc_sequence: 64,
             collectible_interval_count: 65,
+            live_manifest_estimate: 4_096,
+            yield_per_interval_estimate: 7,
+            consecutive_reclaim_failures: 3,
         };
         let mut writes = storage.new_write_set();
         stage_checkpoint_gc_state(&mut writes, &expected)
@@ -6729,16 +5445,17 @@ mod tests {
             .expect("shared-node read should open");
         let mut sweep = storage.new_write_set();
         let live = BTreeSet::from([live_id]);
-        for space in [
-            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-        ] {
-            super::stage_sweep_unreachable_content_nodes(&read, &mut sweep, space, &live)
-                .await
-                .expect("content-addressed sweep should stage");
-        }
+        crate::tracked_state::stage_sweep_unreachable_content_nodes(
+            &read,
+            &mut sweep,
+            crate::tracked_state::RetainedPhysicalState {
+                mutation_nodes: &live,
+                scoped_nodes: &live,
+                native_parts: &live,
+            },
+        )
+        .await
+        .expect("content-addressed sweep should stage");
         drop(read);
         storage
             .commit_write_set(sweep, StorageWriteOptions::default())
@@ -6823,497 +5540,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_gc_reclaims_retired_untracked_update_without_inventory_sweep() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let old_value = serde_json::json!({
-            "payload": "old-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let old_json = old_value.to_string();
-        let old_ref = key_value_snapshot_ref("gc-update-untracked", &old_value);
-        let new_value = serde_json::json!({
-            "payload": "new-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let new_json = new_value.to_string();
-        let new_ref = key_value_snapshot_ref("gc-update-untracked", &new_value);
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-                 VALUES ('gc-update-untracked', lix_json($1), true)",
-                &[Value::Text(old_json)],
-            )
-            .await
-            .expect("old untracked value should write");
-        session
-            .execute(
-                "UPDATE lix_key_value SET value = lix_json($1) \
-                 WHERE key = 'gc-update-untracked'",
-                &[Value::Text(new_json)],
-            )
-            .await
-            .expect("untracked value should update in the same generation");
-
-        // A bare JSON object has no reclaim candidate. It proves this GC is
-        // deliberately targeted rather than a full JSON-store inventory scan.
-        let bare_orphan_ref =
-            stage_bare_json(&storage, &format!("\"{}\"", "bare-".repeat(1024))).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, old_ref).await,
-            "the superseded untracked payload should be reclaimed"
-        );
-        assert!(
-            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, new_ref).await,
-            "the current untracked payload must remain stored"
-        );
-        assert!(
-            json_ref_exists(
-                &storage,
-                crate::json_store::store::JSON_SPACE,
-                bare_orphan_ref,
-            )
-            .await,
-            "candidate GC must not scan and sweep unrelated JSON"
-        );
-        assert!(
-            !json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, old_ref,).await,
-            "a dead payload should consume its reclamation candidate"
-        );
-
-        let visible = session
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'gc-update-untracked'",
-                &[],
-            )
-            .await
-            .expect("live untracked value should remain readable after GC");
-        assert_eq!(visible.rows()[0].values(), &[Value::Json(new_value)]);
-    }
-
-    #[tokio::test]
-    async fn repository_gc_retains_active_history_diff_undo_redo_and_reclaims_deleted_branch_refs()
-    {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let schema = serde_json::json!({
-            "x-lix-key": "gc_history_fixture",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
-            },
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .expect("history fixture schema should register");
-        let baseline = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .expect("history baseline should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("history baseline should have a commit id");
-        session
-            .execute(
-                "INSERT INTO gc_history_fixture (path, value) VALUES ('/row', lix_json('{\"v\":1}'))",
-                &[],
-            )
-            .await
-            .expect("history fixture first commit should publish");
-        session
-            .execute(
-                "UPDATE gc_history_fixture SET value = lix_json('{\"v\":2}') WHERE path = '/row'",
-                &[],
-            )
-            .await
-            .expect("history fixture second commit should publish");
-        let branch = session
-            .create_branch(crate::CreateBranchOptions {
-                id: Some("01990000-0000-7000-8000-000000000009".to_owned()),
-                name: "gc-history-dead".to_owned(),
-                from_commit_id: None,
-            })
-            .await
-            .expect("history fixture branch should create");
-        session
-            .execute(
-                "DELETE FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch.id)],
-            )
-            .await
-            .expect("history fixture branch should delete");
-
-        let before_changes = {
-            let storage_adapter = StorageAdapter::new(storage.clone());
-            let read = storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("history fixture pre-GC read should open");
-            super::scan_all_gc_standalone_changes(read)
-                .await
-                .expect("history fixture standalone scan should load")
-        };
-        let active_refs_before = {
-            let storage_adapter = StorageAdapter::new(storage.clone());
-            let read = storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("history fixture control read should open");
-            BranchHeadControlContext::new()
-                .reader(read)
-                .scan()
-                .await
-                .expect("history fixture controls should load")
-                .into_iter()
-                .map(|(_, control)| control.ref_change_id)
-                .collect::<BTreeSet<_>>()
-        };
-        run_repository_gc(&storage).await;
-        let after_changes = {
-            let storage_adapter = StorageAdapter::new(storage.clone());
-            let read = storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("history fixture post-GC read should open");
-            super::scan_all_gc_standalone_changes(read)
-                .await
-                .expect("history fixture standalone post-GC scan should load")
-        };
-        let reclaimed = before_changes
-            .keys()
-            .filter(|change_id| !after_changes.contains_key(change_id))
-            .copied()
-            .collect::<BTreeSet<_>>();
-        assert!(
-            !reclaimed.is_empty(),
-            "deleted branch refs should be reclaimed"
-        );
-        assert!(
-            reclaimed.is_disjoint(&active_refs_before),
-            "GC must not reclaim an active branch reference"
-        );
-        assert!(
-            reclaimed.iter().any(|change_id| {
-                before_changes
-                    .get(change_id)
-                    .is_some_and(|change| change.schema_key == "lix_branch_ref")
-            }),
-            "the retired branch's standalone reference must be reclaimed"
-        );
-        let after = after_changes.len();
-        let before = before_changes.len();
-        assert!(after < before, "deleted branch refs should be reclaimed");
-
-        drop(session);
-        let reopened_engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should reopen after GC");
-        let session = reopened_engine
-            .open_workspace_session()
-            .await
-            .expect("reopened workspace session should open");
-        let head = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .expect("history head should remain readable")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("history head should have a commit id");
-        let diff = session
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'gc_history_fixture'",
-                &[Value::Text(baseline), Value::Text(head)],
-            )
-            .await
-            .expect("active history diff should survive GC");
-        assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
-        session.undo().await.expect("active undo should survive GC");
-        session.redo().await.expect("active redo should survive GC");
-    }
-
-    #[tokio::test]
-    async fn repository_gc_retains_historical_file_blob_until_replay_dependency_releases() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("historical blob repository should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("historical blob repository should open");
-        let main = engine
-            .open_workspace_session()
-            .await
-            .expect("historical blob main session should open");
-        let branch = main
-            .create_branch(crate::CreateBranchOptions {
-                id: Some("01990000-0000-7000-8000-00000000000a".to_owned()),
-                name: "gc-history-disposable".to_owned(),
-                from_commit_id: None,
-            })
-            .await
-            .expect("historical disposable branch should create");
-        let branch_id = branch.id;
-        let session = engine
-            .open_session(branch_id.clone())
-            .await
-            .expect("historical disposable session should open");
-        let v1 = b"historical-file-v1";
-        let v2 = vec![0xa5; 256];
-        let v1_hash = crate::binary_cas::BlobId::from_content(v1);
-        let v2_hash = crate::binary_cas::BlobId::from_content(&v2);
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/history.bin', $1)",
-                &[Value::Blob(v1.to_vec().into())],
-            )
-            .await
-            .expect("historical file v1 should publish");
-        let root_a = session
-            .execute(
-                "SELECT commit_id FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch_id.clone())],
-            )
-            .await
-            .expect("historical root A should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("historical root A should exist");
-        session
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE path = '/history.bin'",
-                &[Value::Blob(v2.clone().into())],
-            )
-            .await
-            .expect("historical file v2 should publish");
-        let root_b = session
-            .execute(
-                "SELECT commit_id FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch_id.clone())],
-            )
-            .await
-            .expect("historical root B should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("historical root B should exist");
-        let storage = StorageAdapter::new(backend.clone());
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, v1_hash, true).await;
-        assert_binary_cas_presence(&storage, v2_hash, true).await;
-
-        drop(session);
-        drop(main);
-        drop(engine);
-        let reopened = Engine::new(backend.clone())
-            .await
-            .expect("historical blob repository should cold reopen");
-        let session = reopened
-            .open_session(branch_id.clone())
-            .await
-            .expect("historical disposable branch should cold reopen");
-        let diff = session
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'lix_binary_blob_ref'",
-                &[Value::Text(root_a), Value::Text(root_b)],
-            )
-            .await
-            .expect("historical blob diff should remain authenticated");
-        assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
-        session
-            .undo()
-            .await
-            .expect("historical blob undo should remain available");
-        let undone = session
-            .execute(
-                "SELECT content FROM lix_file WHERE path = '/history.bin'",
-                &[],
-            )
-            .await
-            .expect("historical v1 should read after undo");
-        assert_eq!(undone.rows()[0].get::<Vec<u8>>("content").unwrap(), v1);
-        session
-            .redo()
-            .await
-            .expect("historical blob redo should remain available");
-        let redone = session
-            .execute(
-                "SELECT content FROM lix_file WHERE path = '/history.bin'",
-                &[],
-            )
-            .await
-            .expect("historical v2 should read after redo");
-        assert_eq!(redone.rows()[0].get::<Vec<u8>>("content").unwrap(), v2);
-        drop(session);
-
-        let main = reopened
-            .open_workspace_session()
-            .await
-            .expect("historical main session should reopen");
-        main.execute(
-            "DELETE FROM lix_branch WHERE id = $1",
-            &[Value::Text(branch_id.clone())],
-        )
-        .await
-        .expect("historical disposable branch should delete");
-        drop(main);
-        drop(reopened);
-
-        // Deletion publishes the authenticated B -> None retirement frontier.
-        // This fixture is below the queue page limit, so one production sweep
-        // must consume that frontier without creating a checkpoint alias for A.
-        run_binary_repository_gc(&storage).await;
-        assert_binary_cas_presence(&storage, v1_hash, false).await;
-        assert_binary_cas_presence(&storage, v2_hash, false).await;
-
-        let final_engine = Engine::new(backend)
-            .await
-            .expect("historical repository should reopen after branch retirement");
-        let final_main = final_engine
-            .open_workspace_session()
-            .await
-            .expect("historical main should open after branch retirement");
-        let branches = final_main
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch_id)],
-            )
-            .await
-            .expect("retired branch absence should read");
-        assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn repository_gc_reclaims_retired_untracked_delete() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let deleted_value = serde_json::json!({
-            "payload": "delete-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let deleted_json = deleted_value.to_string();
-        let deleted_ref = key_value_snapshot_ref("gc-delete-untracked", &deleted_value);
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-                 VALUES ('gc-delete-untracked', lix_json($1), true)",
-                &[Value::Text(deleted_json)],
-            )
-            .await
-            .expect("untracked value should write");
-        session
-            .execute(
-                "DELETE FROM lix_key_value WHERE key = 'gc-delete-untracked'",
-                &[],
-            )
-            .await
-            .expect("untracked value should delete physically");
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, deleted_ref,).await,
-            "a deleted untracked payload should be reclaimed"
-        );
-        assert!(
-            !json_ref_exists(
-                &storage,
-                UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-                deleted_ref,
-            )
-            .await,
-            "a reclaimed deletion should consume its candidate"
-        );
-    }
-
-    #[tokio::test]
-    async fn repository_gc_keeps_candidate_reachable_from_tracked_history() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let shared_value = serde_json::json!({
-            "payload": "shared-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let shared_json = shared_value.to_string();
-        let shared_ref = key_value_snapshot_ref("gc-tracked-candidate", &shared_value);
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('gc-tracked-candidate', lix_json($1))",
-                &[Value::Text(shared_json)],
-            )
-            .await
-            .expect("tracked owner should write");
-
-        // Candidate records are merely ownership-loss hints. Injecting one
-        // for a tracked payload exercises the exact same liveness proof that
-        // protects a hash shared with retained history.
-        stage_untracked_reclaim_candidate(&storage, shared_ref).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "reachable tracked history must retain a candidate payload"
-        );
-        assert!(
-            json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "a candidate rooted by history must survive for later re-evaluation"
-        );
-        let tracked = session
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'gc-tracked-candidate'",
-                &[],
-            )
-            .await
-            .expect("tracked owner should remain readable");
-        assert_eq!(tracked.rows()[0].values(), &[Value::Json(shared_value)]);
-    }
-
-    #[tokio::test]
     async fn authority_gc_rejects_missing_live_commit_state_before_staging_deletes() {
         let storage = StorageAdapter::new(Memory::new());
         let live = gc_authority_record("gc-missing-live-authority");
@@ -7378,38 +5604,46 @@ mod tests {
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
         let commits = [
             CommitRecord {
-                format_version: 2,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: source_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
+                first_parent_jump_commit_id: source_commit,
+                first_parent_jump_span: 0,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: alias_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
+                first_parent_jump_commit_id: alias_commit,
+                first_parent_jump_span: 0,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: authority_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
+                first_parent_jump_commit_id: authority_commit,
+                first_parent_jump_span: 0,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
+                first_parent_jump_commit_id: live_head,
+                first_parent_jump_span: 0,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
@@ -7621,29 +5855,35 @@ mod tests {
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
             CommitRecord {
-                format_version: 2,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: live_parent,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
+                first_parent_jump_commit_id: live_parent,
+                first_parent_jump_span: 0,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![live_parent],
-                change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
+                first_parent_jump_commit_id: live_head,
+                first_parent_jump_span: 0,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                format_version: 4,
                 commit_id: dead_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("authority-gc-dead-header"),
+                first_parent_jump_commit_id: dead_commit,
+                first_parent_jump_span: 0,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
@@ -7708,7 +5948,7 @@ mod tests {
         for commit_id in [live_parent, dead_commit] {
             crate::columnar_row_group::stage_row_group_set(
                 &mut writes,
-                crate::live_state::entity_row_group_set_id(commit_id, "authority_gc"),
+                crate::hot_state::row_group_set_id(commit_id, "authority_gc"),
                 &sidecar,
             )
             .expect("stage GC sidecar");
@@ -7840,7 +6080,7 @@ mod tests {
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
-                crate::live_state::entity_row_group_set_id(live_parent, "authority_gc"),
+                crate::hot_state::row_group_set_id(live_parent, "authority_gc"),
             )
             .await
             .expect("load live sidecar")
@@ -7850,7 +6090,7 @@ mod tests {
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
-                crate::live_state::entity_row_group_set_id(dead_commit, "authority_gc"),
+                crate::hot_state::row_group_set_id(dead_commit, "authority_gc"),
             )
             .await
             .expect("load retained authority sidecar")
@@ -7877,145 +6117,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn repository_gc_reclaims_candidate_after_last_live_untracked_owner_disappears() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let shared_ref = stage_bare_json(
-            &storage,
-            &serde_json::json!({
-                "payload": "shared-untracked-"
-                    .repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-            })
-            .to_string(),
-        )
-        .await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-a", Some(shared_ref)).await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-b", Some(shared_ref)).await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-a", None).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "the second live untracked owner must retain its payload"
-        );
-        assert!(
-            json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "the candidate must survive until the last untracked owner disappears"
-        );
-
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-b", None).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "the final owner's payload should be reclaimed after its deletion"
-        );
-        assert!(
-            !json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "reclaiming the payload should consume the durable candidate"
-        );
-    }
-
-    async fn stage_untracked_current_owner(
-        storage: &Memory,
-        entity_pk_value: &str,
-        snapshot: Option<JsonRef>,
-    ) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let read = storage_adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("current-state owner read should open");
-        let control = BranchHeadControlContext::new()
-            .reader(&read)
-            .load(GLOBAL_BRANCH_ID)
-            .await
-            .expect("global control should load")
-            .expect("global control should exist");
-        let entity_pk = EntityPk::single(entity_pk_value);
-        let snapshot_slot = snapshot.map_or(JsonSlot::None, JsonSlot::Ref);
-        let timestamp =
-            LixTimestamp::expect_parse("untracked GC owner timestamp", "2026-01-01T00:00:00Z");
-        let mut writes = storage_adapter.new_write_set();
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        TrackedHeadContext::new()
-            .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
-                GLOBAL_BRANCH_ID,
-                Some(control.tracked_generation),
-                control.head_commit_id,
-                &[CurrentStateDeltaRef {
-                    schema_key: "gc_untracked_owner",
-                    file_id: None,
-                    entity_pk: &entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: snapshot.is_none(),
-                    created_at: timestamp,
-                    updated_at: timestamp,
-                    snapshot: snapshot_slot.as_ref_slot(),
-                    metadata: JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }],
-                &BTreeSet::new(),
-                None,
-                None,
-                None,
-                &mut coverage,
-            )
-            .await
-            .expect("untracked current-state owner should stage");
-        stage_branch_head_control(
-            &mut writes,
-            GLOBAL_BRANCH_ID,
-            control
-                .next_current_state_revision()
-                .expect("current-state revision should advance"),
-        )
-        .expect("current-state control should stage");
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("untracked current-state owner should commit");
-    }
-
-    async fn stage_untracked_reclaim_candidate(storage: &Memory, json_ref: JsonRef) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let mut writes = storage_adapter.new_write_set();
-        crate::json_store::JsonStoreWriter::stage_untracked_reclaim_candidates(
-            &mut writes,
-            [json_ref],
-        );
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("reclaim candidate should commit");
-    }
-
-    async fn run_repository_gc(storage: &Memory) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let read = SharedStorageAdapterRead::new(
-            storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("GC read should open"),
-        );
-        let mut writes = storage_adapter.new_write_set();
-        super::stage_repository_gc_full_recovery(read, &mut writes)
-            .await
-            .expect("repository GC should stage");
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("repository GC should commit");
-    }
-
     async fn stage_bare_json(storage: &Memory, content: &str) -> JsonRef {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let normalized = NormalizedJson::from_arc_unchecked(Arc::from(content));
@@ -8037,12 +6138,12 @@ mod tests {
         json_ref
     }
 
-    fn packed_change(change_label: &str, entity_label: &str, snapshot: JsonSlot) -> ChangeRecord {
+    fn packed_change(change_label: &str, row_label: &str, snapshot: JsonSlot) -> ChangeRecord {
         ChangeRecord {
             format_version: 2,
             change_id: ChangeId::for_test_label(change_label),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            entity_pk: EntityPk::single(entity_label),
+            row_pk: RowPk::single(row_label),
             schema_key: "authority_gc".to_string(),
             file_id: None,
             snapshot,
@@ -8056,12 +6157,15 @@ mod tests {
     }
 
     fn gc_authority_record(label: &str) -> CommitRecord {
+        let commit_id = CommitId::for_test_label(label);
         CommitRecord {
-            format_version: 2,
-            commit_id: CommitId::for_test_label(label),
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 4,
+            commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            change_id: ChangeId::for_test_label(&format!("{label}-header")),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse(
                 "authority GC record timestamp",
@@ -8078,12 +6182,16 @@ mod tests {
     ) -> CommitRecord {
         let commit_id =
             CommitId::with_change_address_space(*CommitId::for_test_label(label).as_uuid());
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            parent.map_or((commit_id, 0), |parent| (parent, 1));
         CommitRecord {
-            format_version: 2,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 4,
             commit_id,
             generation,
             parent_commit_ids: parent.into_iter().collect(),
-            change_id: ChangeId::for_test_label(&format!("{label}-header")),
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at,
         }
@@ -8097,7 +6205,6 @@ mod tests {
         BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,
@@ -8132,7 +6239,7 @@ mod tests {
             std::iter::once(Ok(TrackedStateSingleStringReplacementRef {
                 schema_key,
                 file_id: None,
-                entity_pk: "row",
+                row_pk: "row",
                 commit_id,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -8189,82 +6296,19 @@ mod tests {
             .expect("replay fixture should commit");
     }
 
-    async fn stage_replay_root_delta(
-        storage: &StorageAdapter<Memory>,
-        delta: RootReachabilityDelta,
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("replay delta read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            std::slice::from_ref(&delta),
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("replay delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("replay delta should commit");
-    }
-
-    async fn publish_replay_root_release(
+    /// Moves a branch head. With the reachability ledger gone this is the whole
+    /// publication a sweep needs to see: the superseded root is derived from the
+    /// new head's canonical parent links.
+    async fn publish_branch_head_release(
         storage: &StorageAdapter<Memory>,
         branch_id: &str,
-        old_control: BranchHeadControl,
         new_control: BranchHeadControl,
+        manifest: CommitStateManifest,
     ) {
         let mut writes = storage.new_write_set();
         stage_branch_head_control(&mut writes, branch_id, new_control)
-            .expect("released replay control should stage");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("replay release read should open");
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &[RootReachabilityDelta {
-                branch_id: branch_id.to_owned(),
-                old_root: Some(old_control.head_commit_id),
-                new_root: Some(new_control.head_commit_id),
-                old_control: Some(old_control),
-                new_control: Some(new_control),
-                old_control_digest: root_control_digest_for_control(Some(&old_control))
-                    .expect("old replay control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&new_control))
-                    .expect("new replay control should encode"),
-            }],
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("replay release delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("replay release should publish");
+            .expect("released control should stage");
+        persist_replay_closure_fixture(storage, writes, &[], std::slice::from_ref(&manifest)).await;
     }
 
     async fn run_ordinary_repository_gc(
@@ -8295,6 +6339,175 @@ mod tests {
         plan
     }
 
+    /// Counts serving rows still addressed by one branch generation.
+    async fn hot_generation_rows(
+        storage: &StorageAdapter<Memory>,
+        branch_id: &str,
+        generation: CommitId,
+    ) -> usize {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("generation census read should open");
+        let prefix = StoragePrefix {
+            bytes: Bytes::from(crate::hot_state::hot_generation_scope_prefix(
+                branch_id, generation,
+            )),
+        };
+        let mut rows = 0;
+        let mut cursor = crate::storage_adapter::StorageAdapterRead::begin_scan(
+            &read,
+            crate::hot_state::ROW_SPACE,
+            prefix.to_range().expect("generation prefix should range"),
+            StorageBeginScanOptions::default(),
+        )
+        .await
+        .expect("generation census scan should open");
+        loop {
+            let (page, page_has_more) = cursor
+                .next_page(MAX_SCAN_PAGE_ROWS)
+                .await
+                .expect("generation census page should load")
+                .into_parts();
+            rows += page.len();
+            if !page_has_more {
+                break;
+            }
+        }
+        rows
+    }
+
+    /// A deleted branch strands its whole serving generation. The one
+    /// reachability walk already knows which generations the live controls
+    /// select, so the ordinary pass must reclaim it — no second sweeper, no
+    /// retention ledger.
+    #[tokio::test]
+    async fn branch_deletion_reclaims_its_serving_generation_without_a_sweep() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("generation fixture should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("generation fixture should open");
+        let session = engine
+            .open_session()
+            .await
+            .expect("generation fixture session should open");
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "gc_generation_fixture",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("generation fixture schema should register");
+        for row in 0..16 {
+            session
+                .execute(
+                    "INSERT INTO gc_generation_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
+                    &[
+                        Value::Text(format!("/row/{row}")),
+                        Value::Text(format!(r#"{{"v":{row}}}"#)),
+                    ],
+                )
+                .await
+                .expect("generation fixture row should publish");
+        }
+        let branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-0000000000a1".to_owned()),
+                name: "gc-generation-dead".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("generation fixture branch should create");
+        let branch_session = engine
+            .open_session_at(branch.id.clone())
+            .await
+            .expect("generation fixture branch session should open");
+        for row in 0..16 {
+            branch_session
+                .execute(
+                    "UPDATE gc_generation_fixture SET value = CAST($2 AS JSONB) WHERE path = $1",
+                    &[
+                        Value::Text(format!("/row/{row}")),
+                        Value::Text(format!(r#"{{"v":{}}}"#, row + 100)),
+                    ],
+                )
+                .await
+                .expect("generation fixture branch row should publish");
+        }
+        let storage = StorageAdapter::new(backend.clone());
+        let generation = {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("generation control read should open");
+            BranchHeadControlContext::new()
+                .reader(&read)
+                .scan()
+                .await
+                .expect("generation controls should load")
+                .into_iter()
+                .find(|(branch_id, _)| branch_id == &branch.id)
+                .expect("the disposable branch must have a control")
+                .1
+                .tracked_generation
+        };
+        let seeded = hot_generation_rows(&storage, &branch.id, generation).await;
+        assert!(
+            seeded > 0,
+            "the disposable branch must materialize its own serving generation"
+        );
+
+        drop(branch_session);
+        session
+            .execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch.id.clone())],
+            )
+            .await
+            .expect("generation fixture branch should delete");
+        // A serving generation is reachable from exactly one place: its branch
+        // control. Deleting that control retires the generation in the same
+        // atomic write set, so there is nothing left for a sweep to find and
+        // nothing for a publication ledger to remember on its behalf.
+        assert_eq!(
+            hot_generation_rows(&storage, &branch.id, generation).await,
+            0,
+            "branch deletion must retire its own serving generation ({seeded} rows)"
+        );
+        let plan = run_ordinary_repository_gc(&storage).await;
+        assert_eq!(
+            plan.sweep.reclaimed_generation_rows, 0,
+            "the sweep has no generation debt left to collect"
+        );
+        assert_eq!(
+            hot_generation_rows(&storage, &branch.id, generation).await,
+            0,
+            "no serving row of a deleted branch generation may survive GC"
+        );
+
+        // The surviving branch must still read exactly what it wrote.
+        let survivors = session
+            .execute("SELECT COUNT(*) AS rows FROM gc_generation_fixture", &[])
+            .await
+            .expect("surviving branch should still read")
+            .rows()[0]
+            .get::<i64>("rows")
+            .expect("row count should decode");
+        assert_eq!(survivors, 16);
+    }
+
     async fn load_audited_repository_retention(
         storage: &StorageAdapter<Memory>,
     ) -> super::AuthenticatedServingDependencyClosure {
@@ -8309,10 +6522,7 @@ mod tests {
             .scan()
             .await
             .expect("audited retention controls should load");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("audited retention queue should load");
-        let closure = super::load_authenticated_repository_retention(&read, &controls, &queue)
+        let closure = super::load_authenticated_repository_retention(&read, &controls)
             .await
             .expect("serving-dependency closure should authenticate");
         super::audit_repository_gc_standalone_refs(&read)
@@ -8331,7 +6541,7 @@ mod tests {
                 delta: TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
                     file_id: change.file_id.as_deref(),
-                    entity_pk: &change.entity_pk,
+                    row_pk: &change.row_pk,
                     change_id: change.change_id,
                     commit_id,
                     deleted: change.snapshot.is_none(),
@@ -8371,7 +6581,7 @@ mod tests {
     }
 
     fn test_snapshot_root(commit_id: CommitId) -> TrackedStateCommitRoot {
-        let (root_hash, root_bytes) = test_snapshot_chunk(commit_id);
+        let (root_hash, _root_bytes) = test_snapshot_chunk(commit_id);
         TrackedStateCommitRoot {
             commit_id,
             root_id: TrackedStateRootId::new(root_hash),
@@ -8379,12 +6589,13 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: root_bytes.len() as u64,
         }
     }
 
-    async fn assert_offline_sweep_and_audit_fail_closed(
+    /// The retention closure is the single reachability implementation, and the
+    /// standalone audit reads it. Both must reject the same malformed authority
+    /// with the same reason.
+    async fn assert_retention_closure_and_audit_fail_closed(
         storage: &StorageAdapter<Memory>,
         expected_message: &str,
     ) {
@@ -8394,28 +6605,36 @@ mod tests {
                 .await
                 .expect("offline authority read should open"),
         );
-        let sweep_error = super::load_tree_sweep_root_closure(&read)
+        let controls = BranchHeadControlContext::new()
+            .reader(read.clone())
+            .scan()
             .await
-            .expect_err("offline tree sweep must fail closed");
+            .expect("offline authority controls should load");
+        let closure_error = super::load_authenticated_repository_retention(&read, &controls)
+            .await
+            .expect_err("the retention closure must fail closed");
         let audit_error = super::audit_repository_gc_standalone_refs(&read)
             .await
             .expect_err("standalone audit must fail closed");
-        assert_eq!(sweep_error.message, audit_error.message);
+        assert_eq!(closure_error.message, audit_error.message);
         assert!(
-            sweep_error.message.contains(expected_message),
+            closure_error.message.contains(expected_message),
             "unexpected shared authority error: {}",
-            sweep_error.message
+            closure_error.message
         );
     }
 
     #[tokio::test]
-    async fn offline_sweep_and_audit_reject_missing_and_malformed_required_authority() {
-        const MUTABLE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
-            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id,
-            "tracked_state.commit_state_manifest.v7",
-        );
+    async fn retention_closure_and_audit_reject_missing_and_malformed_required_authority() {
+        // States the corruption-test need at the call site instead of smuggling
+        // it in as a second `StorageSpace::mutable` declaration that reads like
+        // a canonical one. This was the last raw re-declaration in the engine,
+        // and closing it lets `UNCHECKED_SPACE_IDS` go empty.
+        const MUTABLE_MANIFEST_SPACE: StorageSpace =
+            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                .mutable_view_for_corruption_test();
 
-        let (storage, commit_id, _, _, _) = tree_sweep_fixture().await;
+        let (storage, commit_id, _, _, _) = gc_sweep_fixture().await;
         let mut writes = storage.new_write_set();
         writes.delete(
             MUTABLE_MANIFEST_SPACE,
@@ -8425,10 +6644,13 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("required manifest removal should commit");
-        assert_offline_sweep_and_audit_fail_closed(&storage, "incomplete split physical authority")
-            .await;
+        assert_retention_closure_and_audit_fail_closed(
+            &storage,
+            "incomplete split physical authority",
+        )
+        .await;
 
-        let (storage, commit_id, _, _, _) = tree_sweep_fixture().await;
+        let (storage, commit_id, _, _, _) = gc_sweep_fixture().await;
         let mut writes = storage.new_write_set();
         writes.put(
             MUTABLE_MANIFEST_SPACE,
@@ -8441,11 +6663,11 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("malformed manifest should commit");
-        assert_offline_sweep_and_audit_fail_closed(&storage, "unsupported format").await;
+        assert_retention_closure_and_audit_fail_closed(&storage, "unsupported format").await;
     }
 
     #[tokio::test]
-    async fn offline_sweep_and_audit_reject_non_decreasing_and_cyclic_replay_authority() {
+    async fn retention_closure_and_audit_reject_non_decreasing_and_cyclic_replay_authority() {
         let timestamp = LixTimestamp::expect_parse(
             "offline replay authority timestamp",
             "2026-01-01T00:00:00Z",
@@ -8466,7 +6688,6 @@ mod tests {
             test_commit_state_manifest(&child, CommitStateMutationInventory::default());
         child_manifest.replay_debt.depth = 2;
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("replay-debt queue should seed");
         stage_branch_head_control(
             &mut writes,
             "main",
@@ -8484,7 +6705,7 @@ mod tests {
             &[root_manifest, child_manifest],
         )
         .await;
-        assert_offline_sweep_and_audit_fail_closed(&storage, "replay debt disagrees").await;
+        assert_retention_closure_and_audit_fail_closed(&storage, "replay debt disagrees").await;
 
         let storage = StorageAdapter::new(Memory::new());
         let root = replay_commit_record("offline-replay-cycle-root", 0, None, timestamp);
@@ -8501,7 +6722,6 @@ mod tests {
             timestamp,
         );
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("replay-cycle queue should seed");
         let left_inventory = stage_replacement_inventory(
             &mut writes,
             left.commit_id,
@@ -8537,7 +6757,7 @@ mod tests {
             ],
         )
         .await;
-        assert_offline_sweep_and_audit_fail_closed(&storage, "dependency cycle").await;
+        assert_retention_closure_and_audit_fail_closed(&storage, "dependency cycle").await;
     }
 
     async fn json_ref_exists(storage: &Memory, space: StorageSpace, json_ref: JsonRef) -> bool {
@@ -8558,15 +6778,6 @@ mod tests {
         .next()
         .flatten()
         .is_some()
-    }
-
-    fn key_value_snapshot_ref(key: &str, value: &serde_json::Value) -> JsonRef {
-        let snapshot = serde_json::json!({
-            "key": key,
-            "value": value,
-        })
-        .to_string();
-        JsonRef::for_content(snapshot.as_bytes())
     }
 
     fn recovery(branch_id: &str, recovered_head: &str, checkpoint: &str) -> CheckpointRecoveryRef {
