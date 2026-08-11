@@ -1935,15 +1935,19 @@ fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
     assert_eq!(stats.read_stats.scan_full_value_chunks, 0);
 
     match case.scan {
+        // Only the prefix mode lowers a `Prefix` into a `KeyRange`, so
+        // `prefix_lowered` belongs to the prefix arm. The two expectations
+        // were swapped, which stayed invisible while the page-count assert
+        // above aborted the target first.
         ScanChunkingMode::Range => {
             assert_eq!(stats.read_stats.range_scan_chunks, expected_chunks as u64);
             assert_eq!(stats.read_stats.prefix_scan_chunks, 0);
-            assert_eq!(stats.read_stats.prefix_lowered, 1);
+            assert_eq!(stats.read_stats.prefix_lowered, 0);
         }
         ScanChunkingMode::Prefix => {
             assert_eq!(stats.read_stats.range_scan_chunks, 0);
             assert_eq!(stats.read_stats.prefix_scan_chunks, expected_chunks as u64);
-            assert_eq!(stats.read_stats.prefix_lowered, 0);
+            assert_eq!(stats.read_stats.prefix_lowered, 1);
         }
     }
 }
