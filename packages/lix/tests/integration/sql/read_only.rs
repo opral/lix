@@ -62,6 +62,15 @@ simulation_test!(
         );
 
         for surface_name in [
+            "lix_state",
+            "lix_state_by_branch",
+            "lix_state_history",
+            "lix_label",
+            "lix_label_by_branch",
+            "lix_label_history",
+            "lix_label_assignment",
+            "lix_label_assignment_by_branch",
+            "lix_label_assignment_history",
             "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",

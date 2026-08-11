@@ -484,6 +484,31 @@ fn x_lix_entity_views_is_rejected() {
 }
 
 #[test]
+fn x_lix_state_foreign_keys_is_rejected() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-state-foreign-keys": [
+            ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
+        ],
+        "properties": {
+            "target_entity_pk": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "target_schema_key": { "type": "string" },
+            "target_file_id": { "type": ["string", "null"] }
+        },
+        "required": ["target_entity_pk", "target_schema_key", "target_file_id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("x-lix-state-foreign-keys should be rejected");
+    assert!(err.to_string().contains("x-lix-state-foreign-keys"));
+}
+
+#[test]
 fn x_lix_primary_key_is_optional() {
     let schema = json!({
         "type": "object",

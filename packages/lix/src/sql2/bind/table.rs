@@ -297,6 +297,15 @@ mod tests {
             );
         }
         for surface_name in [
+            "lix_state",
+            "lix_state_by_branch",
+            "lix_state_history",
+            "lix_label",
+            "lix_label_by_branch",
+            "lix_label_history",
+            "lix_label_assignment",
+            "lix_label_assignment_by_branch",
+            "lix_label_assignment_history",
             "lix_checkpoint_marker",
             "lix_undo_redo_marker",
             "lix_collection_generation",
