@@ -314,6 +314,7 @@ impl EntitySpec {
         .map_err(lix_error_to_datafusion_error)?;
         apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
+        apply_exact_file_id_filter(&mut request, exact_file_ids_from_filters(filters)?);
         Ok((projected_schema, request, row_filters))
     }
 
@@ -526,7 +527,10 @@ impl TableSpec for EntitySpec {
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
         let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
-        if ExactBranchIdFilterAnalyzer.supports(filter) || primary_key_analyzer.supports(filter) {
+        if ExactBranchIdFilterAnalyzer.supports(filter)
+            || ExactFileIdFilterAnalyzer.supports(filter)
+            || primary_key_analyzer.supports(filter)
+        {
             TableProviderFilterPushDown::Exact
         } else if row_filter_analyzer.supports(filter) {
             // Retain a DataFusion residual even when the row-shaped fallback
@@ -1701,6 +1705,125 @@ fn apply_exact_branch_id_filter(
         }
         request.filter.branch_ids = branch_ids;
     }
+}
+
+/// Extracts the exact `lixcol_file_id` selector so a file-scoped entity read
+/// becomes a physical seek instead of a schema-wide scan.
+///
+/// `HOT_ROW` is keyed `schema_key ++ file_id ++ entity_pk`, so a
+/// `schema_key + file_id` filter is a contiguous prefix
+/// (`hot_file_scan_prefixes`). The other three live-state authorities that can
+/// hold rows with no branch-local `HOT_ROW` — the packed current base, the
+/// certified entity batches, and the root current base — each already apply
+/// `LiveStateFilter::file_ids` (two of them with their own file-scoped seek),
+/// so the merged answer stays complete. Without this analyzer the predicate
+/// only ever survived as a DataFusion residual and every file-scoped read paid
+/// O(rows in the branch).
+fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
+    let analyzer = ExactFileIdFilterAnalyzer;
+    let mut file_ids: Option<BTreeSet<String>> = None;
+    for filter in filters {
+        let Some(filter_ids) = analyzer.analyze(filter)? else {
+            continue;
+        };
+        file_ids = Some(match file_ids {
+            Some(existing_ids) => existing_ids.intersection(&filter_ids).cloned().collect(),
+            None => filter_ids,
+        });
+    }
+    Ok(file_ids.map(|ids| ids.into_iter().collect()))
+}
+
+fn apply_exact_file_id_filter(request: &mut LiveStateScanRequest, file_ids: Option<Vec<String>>) {
+    if let Some(file_ids) = file_ids {
+        if file_ids.is_empty() {
+            request.filter.rows = LiveStateRowFilter::None;
+        }
+        request.filter.file_ids = file_ids
+            .into_iter()
+            .map(crate::NullableKeyFilter::Value)
+            .collect();
+    }
+}
+
+struct ExactFileIdFilterAnalyzer;
+
+impl ExactFileIdFilterAnalyzer {
+    fn supports(&self, expr: &Expr) -> bool {
+        self.analyze(expr)
+            .is_ok_and(|constraint| constraint.is_some())
+    }
+
+    #[expect(clippy::self_only_used_in_recursion)]
+    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<String>>> {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+                let Some(left) = self.analyze(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                Ok(Some(left.intersection(&right).cloned().collect()))
+            }
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+                let Some(mut left) = self.analyze(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                left.extend(right);
+                Ok(Some(left))
+            }
+            Expr::BinaryExpr(binary_expr) => {
+                Ok(file_id_from_binary_filter(binary_expr).map(|value| BTreeSet::from([value])))
+            }
+            Expr::InList(in_list) => {
+                Ok(file_ids_from_in_list_filter(in_list).map(|values| values.into_iter().collect()))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn file_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
+    if binary_expr.op != Operator::Eq {
+        return None;
+    }
+    file_id_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
+        .or_else(|| file_id_from_column_literal_filter(&binary_expr.right, &binary_expr.left))
+}
+
+fn file_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
+    if in_list.negated {
+        return None;
+    }
+    let Expr::Column(column) = in_list.expr.as_ref() else {
+        return None;
+    };
+    if column.name != "lixcol_file_id" {
+        return None;
+    }
+    let values = in_list
+        .list
+        .iter()
+        .map(string_expr_literal)
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() {
+        return None;
+    }
+    Some(values)
+}
+
+fn file_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr) -> Option<String> {
+    let Expr::Column(column) = column_expr else {
+        return None;
+    };
+    if column.name != "lixcol_file_id" {
+        return None;
+    }
+    string_expr_literal(literal_expr)
 }
 
 pub(super) struct EntityPrimaryKeyFilterAnalyzer<'a> {
