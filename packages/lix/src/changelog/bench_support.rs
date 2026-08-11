@@ -227,11 +227,14 @@ pub fn append_ordered_commits(
         let commit_index = first_commit_index
             .checked_add(offset)
             .ok_or_else(|| LixError::unknown("ordered benchmark commit index overflow"))?;
+        let commit_id = CommitId::new(ordered_bench_uuid(commit_index, 0));
         append.commits.push(CommitRecord {
-            format_version: 2,
-            commit_id: CommitId::new(ordered_bench_uuid(commit_index, 0)),
+            format_version: 3,
+            commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
             change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -250,11 +253,21 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
     let mut parent_commit_id = None;
     for commit_index in 0..commit_count {
         let commit_id = CommitId::new(ordered_bench_uuid(commit_index, 0));
+        let parent_commit_ids = parent_commit_id.into_iter().collect::<Vec<_>>();
+        let parent = append.commits.last();
+        let parent_jump = parent.map(|parent| {
+            &append.commits[usize::try_from(parent.generation - parent.first_parent_jump_span)
+                .expect("benchmark jump generation fits usize")]
+        });
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            super::next_first_parent_jump(commit_id, &parent_commit_ids, parent, parent_jump)?;
         append.commits.push(CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation: u64::try_from(commit_index).expect("benchmark commit index fits u64"),
-            parent_commit_ids: parent_commit_id.into_iter().collect(),
+            parent_commit_ids,
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -613,10 +626,12 @@ fn direct_append_with_shape(
             next_change += 1;
         }
         append.commits.push(CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id: typed_commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: typed_commit_id,
+            first_parent_jump_span: 0,
             change_id: ChangeId::for_test_label(&commit_change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(

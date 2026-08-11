@@ -30,6 +30,8 @@ pub(crate) struct CommitGraphNode {
     pub(crate) account_id: String,
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
+    pub(crate) first_parent_jump_commit_id: CommitId,
+    pub(crate) first_parent_jump_span: u64,
     pub(crate) created_at: LixTimestamp,
 }
 
@@ -72,6 +74,11 @@ pub(crate) fn commit_edges(commits: &[CommitGraphNode]) -> Vec<CommitGraphEdge> 
 }
 
 /// Filter for canonical change history from a chosen traversal start commit.
+///
+/// `max_depth` and `limit` are traversal bounds, not post-filters. The reader
+/// stops walking the commit graph as soon as neither can produce another row,
+/// so a narrow history query never pays for the unreachable remainder of the
+/// graph.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryRequest {
     pub(crate) entity_pks: Vec<EntityPk>,
@@ -80,6 +87,12 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
     pub(crate) min_depth: Option<u32>,
     pub(crate) max_depth: Option<u32>,
     pub(crate) include_tombstones: bool,
+    /// Maximum number of history rows the caller will consume.
+    ///
+    /// Only set this when the caller returns the produced entries 1:1 as its
+    /// output rows. Row-shaping surfaces must leave it unset because they can
+    /// collapse or drop entries after the graph read.
+    pub(crate) limit: Option<usize>,
 }
 
 /// Canonical change observed while walking commit history from a start commit.

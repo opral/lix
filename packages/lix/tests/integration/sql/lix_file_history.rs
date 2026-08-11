@@ -338,6 +338,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     else {
         panic!("ancestor source changes should be JSON");
     };
+    let sources = sources.to_value();
     assert_eq!(
         sources[0]["entity_pk"],
         json!(["863f406b-3ce8-724d-8548-6dc1e41d451d"])
@@ -426,6 +427,7 @@ simulation_test!(
         else {
             panic!("rename sources should be JSON");
         };
+        let rename_sources = rename_sources.to_value();
         assert_eq!(rename_sources.as_array().map(Vec::len), Some(1));
         assert_eq!(
             rename_sources[0]["entity_pk"],
@@ -573,6 +575,7 @@ simulation_test!(
         else {
             panic!("grouped file sources should be JSON");
         };
+        let file_sources = file_sources.to_value();
         let source_ids = file_sources
             .as_array()
             .expect("grouped file sources should be an array")
@@ -607,6 +610,7 @@ simulation_test!(
         else {
             panic!("grouped directory sources should be JSON");
         };
+        let directory_sources = directory_sources.to_value();
         assert_eq!(directory_sources.as_array().map(Vec::len), Some(2));
     }
 );
@@ -782,6 +786,7 @@ simulation_test!(
         else {
             panic!("delete sources should be JSON");
         };
+        let delete_sources = delete_sources.to_value();
         let deleted_directory_ids = delete_sources
             .as_array()
             .expect("delete sources should be an array")
@@ -854,6 +859,7 @@ simulation_test!(
         else {
             panic!("restore sources should be JSON");
         };
+        let restore_sources = restore_sources.to_value();
         let restored_directory_ids = restore_sources
             .as_array()
             .expect("restore sources should be an array")
@@ -991,6 +997,7 @@ simulation_test!(
         let Value::Json(source_changes) = source_changes else {
             panic!("source_changes should be semantic JSON, got {source_changes:?}");
         };
+        let source_changes = source_changes.to_value();
         assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
         assert_eq!(
             source_changes[0]["schema_key"],
@@ -1169,6 +1176,7 @@ simulation_test!(
                 let Value::Json(source_changes) = source_changes else {
                     panic!("source changes should be JSON, got {source_changes:?}");
                 };
+                let source_changes = source_changes.to_value();
                 assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
                 match row
                     .get::<Value>("lixcol_observed_commit_id")
@@ -1573,6 +1581,7 @@ simulation_test!(
         let Value::Json(latest_sources) = &latest[3] else {
             panic!("latest source changes should be JSON, got {:?}", latest[3]);
         };
+        let latest_sources = latest_sources.to_value();
         assert_eq!(latest_sources.as_array().map(Vec::len), Some(1));
         assert_eq!(
             latest_sources[0]["schema_key"],
@@ -1585,6 +1594,7 @@ simulation_test!(
                 result.rows()[1].values()[3]
             );
         };
+        let initial_sources = initial_sources.to_value();
         assert_eq!(initial_sources.as_array().map(Vec::len), Some(2));
         let source_schema_keys = initial_sources
             .as_array()

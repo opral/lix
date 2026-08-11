@@ -25,7 +25,7 @@ use crate::branch::{
     BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
 };
 use crate::catalog::{
-    CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId, load_catalog_revision,
+    CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, SchemaPlanId,
     stage_catalog_revision,
 };
 use crate::changelog::{
@@ -94,7 +94,8 @@ use crate::storage_adapter::{
     StorageWriteSetStats,
 };
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
+    REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION, SharedStorageAdapterRead, StorageAdapter,
+    StorageAdapterRead, StorageAdapterReadScope, load_revisions,
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateKey,
@@ -1537,8 +1538,17 @@ where
             let runtime_functions = FunctionContext::prepare(&read).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
+            // Transaction open needs the catalog revision and the tracked
+            // mutation fence from the same pinned snapshot. Both live in the
+            // one revision space, so one batched point read over two adjacent
+            // keys replaces two independent lookups.
+            let [catalog_revision, opening_tracked_mutation_revision] = load_revisions(
+                &read,
+                [REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION],
+            )
+            .await?;
+            let catalog_revision = catalog_revision.map(CatalogRevision::from_storage_bytes);
             let (sql_schema_catalog, tracked_schema_catalog) = {
-                let catalog_revision = load_catalog_revision(&read).await?;
                 let visible_live_state = live_state.reader(&read);
                 let sql_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
@@ -1560,9 +1570,6 @@ where
                     .await?;
                 (sql_schema_catalog, tracked_schema_catalog)
             };
-            let opening_tracked_mutation_revision =
-                StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(&read)
-                    .await?;
             let branch_reader = branch_ctx.ref_reader(&read);
             let opening_active_branch_head =
                 branch_reader.load_head_commit_id(&active_branch_id).await?;

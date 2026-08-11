@@ -909,13 +909,17 @@ fn profile_sql_session_operation(
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ROUTE_ACCOUNTING").is_some() {
         let accounting = lix::storage_bench::take_crud_current_state_scoped_range_accounting();
         println!(
-            "tracked_state_crud current-state scoped-range accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} ordered_delta_fallbacks={}",
+            "tracked_state_crud current-state scoped-range accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} ordered_delta_fallbacks={} commit_delta_direct_segments={} commit_delta_direct_rows={} commit_delta_generic_segments={} commit_delta_generic_rows={}",
             accounting.attempts,
             accounting.hits,
             accounting.errors,
             accounting.sealed_manifest_loads,
             accounting.replay_manifest_loads,
             accounting.ordered_delta_fallbacks,
+            accounting.commit_delta_direct_segments,
+            accounting.commit_delta_direct_rows,
+            accounting.commit_delta_generic_segments,
+            accounting.commit_delta_generic_rows,
         );
     }
 }
@@ -1289,6 +1293,16 @@ fn bench_sql_session(
             BatchSize::LargeInput,
         );
     });
+    group.bench_function(
+        format!("read_all_rows_consumed/{}", row_label(rows.len())),
+        |b| {
+            b.iter_batched_ref(
+                || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
+                |fixture| black_box(runtime.block_on(fixture.read_all_rows_consumed())),
+                BatchSize::LargeInput,
+            );
+        },
+    );
     group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),

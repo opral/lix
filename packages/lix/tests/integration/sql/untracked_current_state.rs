@@ -73,7 +73,7 @@ simulation_test!(
             .expect("untracked row should read");
         assert_eq!(
             visible.rows()[0].values(),
-            &[Value::Json(serde_json::json!("two"))]
+            &[Value::Json(serde_json::json!("two").into())]
         );
         assert_untracked_current_state(&session, "untracked-current-overwrite").await;
         assert_eq!(
@@ -208,11 +208,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("untracked-current-normal-tracked".to_string()),
-                    Value::Json(serde_json::json!("tracked")),
+                    Value::Json(serde_json::json!("tracked").into()),
                 ],
                 vec![
                     Value::Text("untracked-current-normal-untracked".to_string()),
-                    Value::Json(serde_json::json!("untracked")),
+                    Value::Json(serde_json::json!("untracked").into()),
                 ],
             ],
             "ordinary SQL has no retention lane: it returns both current members"

@@ -33,6 +33,18 @@ pub(crate) struct CachedReadPlan {
     pub(crate) expected_parameter_count: usize,
 }
 
+/// One reusable physical read template plus the optimized logical plan it was
+/// planned from.
+///
+/// Both are stripped of snapshot-bound table providers. Keeping the optimized
+/// plan with the template is what makes a warm execution skip DataFusion's
+/// analyzer and logical optimizer entirely: the only work left is grafting the
+/// current snapshot's providers back on and re-planning the leaf scans.
+pub(crate) struct CachedPhysicalRead {
+    pub(crate) optimized: LogicalPlan,
+    pub(crate) template: Arc<dyn ExecutionPlan>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ParameterType {
     Null,
@@ -97,7 +109,7 @@ pub(crate) struct SqlPlanningCache<CatalogKey> {
     write_plans: Mutex<LruCache<WritePlanCacheKey<CatalogKey>, Arc<LogicalWritePlan>>>,
     read_plans: Mutex<LruCache<ReadPlanCacheKey<CatalogKey>, Arc<CachedReadPlan>>>,
     physical_read_plans:
-        Mutex<LruCache<PhysicalReadPlanCacheKey<CatalogKey>, Arc<dyn ExecutionPlan>>>,
+        Mutex<LruCache<PhysicalReadPlanCacheKey<CatalogKey>, Arc<CachedPhysicalRead>>>,
 }
 
 impl<CatalogKey> std::fmt::Debug for SqlPlanningCache<CatalogKey> {
@@ -166,7 +178,12 @@ where
                 ));
             }
         }
-        let state = session.state();
+        // Borrow the live session state instead of cloning it. `SessionState`
+        // owns `String`-keyed registries for every built-in scalar, aggregate
+        // and window function, so a clone here would deep-copy hundreds of
+        // keys just to diff two name sets.
+        let state_ref = session.state_ref();
+        let state = state_ref.read();
         let execution_scalar_functions = state
             .scalar_functions()
             .keys()
@@ -180,6 +197,7 @@ where
             .cloned()
             .collect::<Vec<_>>();
         drop(state);
+        drop(state_ref);
         for name in execution_scalar_functions {
             session.deregister_udf(&name);
         }
@@ -217,16 +235,16 @@ where
     pub(crate) fn physical_read_plan(
         &self,
         key: &PhysicalReadPlanCacheKey<CatalogKey>,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
+    ) -> Option<Arc<CachedPhysicalRead>> {
         lock_or_recover(&self.physical_read_plans).get(key).cloned()
     }
 
     pub(crate) fn remember_physical_read_plan(
         &self,
         key: PhysicalReadPlanCacheKey<CatalogKey>,
-        plan: Arc<dyn ExecutionPlan>,
+        plan: CachedPhysicalRead,
     ) {
-        lock_or_recover(&self.physical_read_plans).put(key, plan);
+        lock_or_recover(&self.physical_read_plans).put(key, Arc::new(plan));
     }
 
     pub(crate) fn forget_physical_read_plan(&self, key: &PhysicalReadPlanCacheKey<CatalogKey>) {

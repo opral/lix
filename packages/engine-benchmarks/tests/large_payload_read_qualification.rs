@@ -367,8 +367,8 @@ async fn large_media_foreground_lifecycle() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(64);
     assert!(
-        matches!(size_mib, 64 | 512),
-        "qualification size must be 64 or 512 MiB"
+        matches!(size_mib, 64 | 256 | 512),
+        "qualification size must be 64, 256, or 512 MiB"
     );
     let temp = tempfile::tempdir().expect("create media qualification directory");
     let database = temp.path().join("database");

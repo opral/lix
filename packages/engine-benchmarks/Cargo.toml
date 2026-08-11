@@ -44,6 +44,7 @@ ahash = "0.8"
 async-trait = "0.1"
 blake3 = "1"
 bytes = "1"
+fastcdc = "3"
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -60,6 +61,11 @@ uuid = { version = "1", features = ["std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [[example]]
+name = "space_growth"
+path = "examples/space_growth.rs"
+required-features = ["storage-benches"]
+
+[[example]]
 name = "storage_layout"
 path = "examples/storage_layout.rs"
 required-features = ["storage-benches", "slatedb"]
@@ -67,6 +73,15 @@ required-features = ["storage-benches", "slatedb"]
 [[example]]
 name = "revision_pack_oracle"
 path = "examples/revision_pack_oracle.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "chunking_oracle"
+path = "examples/chunking_oracle.rs"
+
+[[example]]
+name = "cas_sharing"
+path = "examples/cas_sharing.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
@@ -272,6 +287,12 @@ required-features = ["storage-benches", "slatedb"]
 [[bench]]
 name = "branch_checkpoint_retirement"
 path = "benches/branch_checkpoint_retirement.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "branch_storage_sharing"
+path = "benches/branch_storage_sharing.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]
 

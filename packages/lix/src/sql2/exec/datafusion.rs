@@ -20,8 +20,12 @@ use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::{GLOBAL_BRANCH_ID, LixError, LixNotice, SqlQueryResult, Value};
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::{
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, PrimitiveArray, StringArray,
+    StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use datafusion::arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -420,7 +424,9 @@ async fn create_logical_plan_in_session_from_parsed(
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
 
-    let physical_plan_cacheable = cacheable_statement && !logical_plan_has_scalar_function(&plan);
+    let physical_plan_cacheable = cacheable_statement
+        && !logical_plan_has_scalar_function(&plan)
+        && !logical_plan_has_subquery_expression(&plan);
     if physical_plan_cacheable && let Some((cache, catalog)) = &session.planning_environment {
         cache.remember_read_plan(
             sql,
@@ -503,6 +509,43 @@ async fn rebind_cached_read_plan(
     })
     .map(|transformed| transformed.data)
     .map_err(datafusion_error_to_lix_error)
+}
+
+/// Reports whether any expression in `plan` carries a nested subquery plan.
+///
+/// `LogicalPlan`'s tree traversal walks plan inputs only; the plans hidden
+/// inside `Expr::ScalarSubquery`, `Expr::InSubquery` and `Expr::Exists` are
+/// invisible to it. `detach_cached_read_plan` therefore cannot swap their
+/// `TableScan` sources for placeholders, so caching such a plan would park
+/// live snapshot-bound providers in an engine-lifetime LRU: the read scope
+/// then fails `finish()` with leaked handles, and a later cache hit would
+/// execute against a storage read that has already been released.
+///
+/// Planning-cache participation is an optimization, so the safe answer is to
+/// keep these statements out of the cache entirely rather than grow a second
+/// subquery-aware rewrite path that has to stay in sync with `detach`/`rebind`.
+fn logical_plan_has_subquery_expression(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        for expression in node.expressions() {
+            let _ = expression.apply(|expression| {
+                if matches!(
+                    expression,
+                    Expr::ScalarSubquery(_) | Expr::InSubquery(_) | Expr::Exists(_)
+                ) {
+                    found = true;
+                    Ok(TreeNodeRecursion::Stop)
+                } else {
+                    Ok(TreeNodeRecursion::Continue)
+                }
+            });
+            if found {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 fn logical_plan_has_scalar_function(plan: &LogicalPlan) -> bool {
@@ -1495,20 +1538,26 @@ fn retain_columnar_result(fields: &[Field], batches: &[RecordBatch]) -> bool {
         fields.iter().enumerate().any(|(column_index, field)| {
             let array = batch.column(column_index);
             match field.data_type() {
-                DataType::Float32 => array
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Float32Array>()
-                    .is_some_and(|values| {
-                        (0..values.len())
-                            .any(|index| values.is_valid(index) && !values.value(index).is_finite())
-                    }),
-                DataType::Float64 => array
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Float64Array>()
-                    .is_some_and(|values| {
-                        (0..values.len())
-                            .any(|index| values.is_valid(index) && !values.value(index).is_finite())
-                    }),
+                DataType::Float32 => {
+                    array
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .is_some_and(|values| {
+                            (0..values.len()).any(|index| {
+                                values.is_valid(index) && !values.value(index).is_finite()
+                            })
+                        })
+                }
+                DataType::Float64 => {
+                    array
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .is_some_and(|values| {
+                            (0..values.len()).any(|index| {
+                                values.is_valid(index) && !values.value(index).is_finite()
+                            })
+                        })
+                }
                 _ => false,
             }
         })
@@ -2029,7 +2078,7 @@ fn datafusion_dml_returning(
     };
     let df_schema =
         DFSchema::try_from(table_schema.clone()).map_err(datafusion_error_to_lix_error)?;
-    let props = session.state().execution_props().clone();
+    let props = session.state_ref().read().execution_props().clone();
     let mut fields = Vec::with_capacity(returning.items.len());
     let mut expressions = Vec::with_capacity(returning.items.len());
     let mut required_columns = BTreeSet::new();
@@ -2185,7 +2234,7 @@ fn datafusion_conflict_assignments(
     }
     let augmented = Schema::new(fields);
     let df_schema = DFSchema::try_from(augmented).map_err(datafusion_error_to_lix_error)?;
-    let props = session.state().execution_props().clone();
+    let props = session.state_ref().read().execution_props().clone();
 
     assignments
         .iter()
@@ -2945,74 +2994,287 @@ pub(crate) fn query_result_from_batches(
         .iter()
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
-    let mut rows = Vec::<Vec<Value>>::new();
+    let mut rows =
+        Vec::<Vec<Value>>::with_capacity(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
     for batch in batches {
-        for row_index in 0..batch.num_rows() {
-            rows.push(row_values_from_batch(result_fields, batch, row_index)?);
-        }
+        append_batch_rows(result_fields, batch, &mut rows)?;
     }
 
     Ok(SqlQueryResult {
         rows,
-        columns: result_columns.clone(),
+        columns: result_columns,
         notices: Vec::new(),
     })
 }
 
+/// Appends one batch to `rows`, filling it column by column.
+///
+/// Rows are grown to their final width first, then each column is downcast once
+/// and written across every row. Reading a column top to bottom keeps both the
+/// Arrow side and the type dispatch out of the inner loop: the array kind is
+/// matched once per column instead of once per cell.
+fn append_batch_rows(
+    result_fields: &[Field],
+    batch: &RecordBatch,
+    rows: &mut Vec<Vec<Value>>,
+) -> Result<(), LixError> {
+    let row_base = rows.len();
+    let column_count = batch.num_columns();
+    rows.resize_with(row_base + batch.num_rows(), || {
+        Vec::<Value>::with_capacity(column_count)
+    });
+    let batch_rows = &mut rows[row_base..];
+    for (column_index, array) in batch.columns().iter().enumerate() {
+        let cursor = column_cursor(result_fields.get(column_index), array.as_ref())?;
+        cursor.append_column(batch_rows)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "storage-benches", test))]
 pub(crate) fn row_values_from_batch(
     result_fields: &[Field],
     batch: &RecordBatch,
     row_index: usize,
 ) -> Result<Vec<Value>, LixError> {
-    let mut row = Vec::<Value>::with_capacity(batch.num_columns());
-    for (column_index, array) in batch.columns().iter().enumerate() {
-        let scalar = ScalarValue::try_from_array(array.as_ref(), row_index)
-            .map_err(datafusion_error_to_lix_error)?;
-        let field = result_fields.get(column_index);
-        row.push(scalar_value_to_lix_value(scalar, field)?);
-    }
-    Ok(row)
+    // Slicing is an offset adjustment, not a copy, so one row reuses exactly
+    // the same column fill as a whole batch.
+    let row = batch.slice(row_index, 1);
+    let mut rows = Vec::<Vec<Value>>::with_capacity(1);
+    append_batch_rows(result_fields, &row, &mut rows)?;
+    rows.pop().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "result row index out of range",
+        )
+    })
 }
 
-fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Result<Value, LixError> {
-    match value {
-        ScalarValue::Null => Ok(Value::Null),
-        ScalarValue::Boolean(Some(value)) => Ok(Value::Boolean(value)),
-        ScalarValue::Boolean(None) => Ok(Value::Null),
-        ScalarValue::Int8(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::Int8(None) => Ok(Value::Null),
-        ScalarValue::Int16(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::Int16(None) => Ok(Value::Null),
-        ScalarValue::Int32(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::Int32(None) => Ok(Value::Null),
-        ScalarValue::Int64(Some(value)) => Ok(Value::Integer(value)),
-        ScalarValue::Int64(None) => Ok(Value::Null),
-        ScalarValue::UInt8(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::UInt8(None) => Ok(Value::Null),
-        ScalarValue::UInt16(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::UInt16(None) => Ok(Value::Null),
-        ScalarValue::UInt32(Some(value)) => Ok(Value::Integer(i64::from(value))),
-        ScalarValue::UInt32(None) => Ok(Value::Null),
-        ScalarValue::UInt64(Some(value)) => match i64::try_from(value) {
-            Ok(value) => Ok(Value::Integer(value)),
-            Err(_) => Ok(Value::Text(value.to_string())),
-        },
-        ScalarValue::UInt64(None) => Ok(Value::Null),
-        ScalarValue::Float32(Some(value)) => finite_query_float(f64::from(value)),
-        ScalarValue::Float32(None) => Ok(Value::Null),
-        ScalarValue::Float64(Some(value)) => finite_query_float(value),
-        ScalarValue::Float64(None) => Ok(Value::Null),
-        ScalarValue::Utf8(Some(value))
-        | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => string_scalar_to_lix_value(value, field),
-        ScalarValue::Utf8(None) | ScalarValue::Utf8View(None) | ScalarValue::LargeUtf8(None) => {
-            Ok(Value::Null)
+/// One result column of one `RecordBatch`, already downcast to its concrete
+/// Arrow array.
+///
+/// Result materialization used to build a `ScalarValue` per cell, which meant
+/// one dynamic downcast plus one owned allocation for every cell of every scan.
+/// The batch is uniform by construction, so the downcast is hoisted here and
+/// the row loop reads straight out of the typed array into `Value`.
+enum ColumnCursor<'a> {
+    Null,
+    Boolean(&'a BooleanArray),
+    Int8(&'a Int8Array),
+    Int16(&'a Int16Array),
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    UInt8(&'a UInt8Array),
+    UInt16(&'a UInt16Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Float32(&'a Float32Array),
+    Float64(&'a Float64Array),
+    Utf8(&'a StringArray, TextKind),
+    LargeUtf8(&'a LargeStringArray, TextKind),
+    Utf8View(&'a StringViewArray, TextKind),
+    Binary(&'a BinaryArray),
+    LargeBinary(&'a LargeBinaryArray),
+}
+
+/// Whether a string column carries JSON payloads, decided once per batch from
+/// the result field metadata rather than re-tested per cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextKind {
+    Text,
+    Json,
+}
+
+fn column_cursor<'a>(
+    field: Option<&Field>,
+    array: &'a dyn Array,
+) -> Result<ColumnCursor<'a>, LixError> {
+    let text_kind = if field.is_some_and(field_is_json) {
+        TextKind::Json
+    } else {
+        TextKind::Text
+    };
+    let cursor = match array.data_type() {
+        DataType::Null => ColumnCursor::Null,
+        DataType::Boolean => ColumnCursor::Boolean(downcast_column(array)?),
+        DataType::Int8 => ColumnCursor::Int8(downcast_column(array)?),
+        DataType::Int16 => ColumnCursor::Int16(downcast_column(array)?),
+        DataType::Int32 => ColumnCursor::Int32(downcast_column(array)?),
+        DataType::Int64 => ColumnCursor::Int64(downcast_column(array)?),
+        DataType::UInt8 => ColumnCursor::UInt8(downcast_column(array)?),
+        DataType::UInt16 => ColumnCursor::UInt16(downcast_column(array)?),
+        DataType::UInt32 => ColumnCursor::UInt32(downcast_column(array)?),
+        DataType::UInt64 => ColumnCursor::UInt64(downcast_column(array)?),
+        DataType::Float32 => ColumnCursor::Float32(downcast_column(array)?),
+        DataType::Float64 => ColumnCursor::Float64(downcast_column(array)?),
+        DataType::Utf8 => ColumnCursor::Utf8(downcast_column(array)?, text_kind),
+        DataType::LargeUtf8 => ColumnCursor::LargeUtf8(downcast_column(array)?, text_kind),
+        DataType::Utf8View => ColumnCursor::Utf8View(downcast_column(array)?, text_kind),
+        DataType::Binary => ColumnCursor::Binary(downcast_column(array)?),
+        DataType::LargeBinary => ColumnCursor::LargeBinary(downcast_column(array)?),
+        other => {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("SQL query produced an unsupported result column type {other}"),
+            )
+            .with_hint(
+                "Cast the column to a supported Lix result type such as TEXT, BIGINT, DOUBLE, BOOLEAN, or BYTEA.",
+            ));
         }
-        ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)) => {
-            Ok(Value::Blob(value.into()))
+    };
+    Ok(cursor)
+}
+
+fn downcast_column<'a, ArrayType: 'static>(
+    array: &'a dyn Array,
+) -> Result<&'a ArrayType, LixError> {
+    array.as_any().downcast_ref::<ArrayType>().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!(
+                "SQL result column declares Arrow type {} but carries a different array layout",
+                array.data_type()
+            ),
+        )
+    })
+}
+
+impl ColumnCursor<'_> {
+    /// Pushes this column's value onto every row of the batch.
+    ///
+    /// `rows` is exactly the batch's row window, so row `n` of the slice is row
+    /// `n` of the array.
+    fn append_column(&self, rows: &mut [Vec<Value>]) -> Result<(), LixError> {
+        match self {
+            Self::Null => {
+                for row in rows.iter_mut() {
+                    row.push(Value::Null);
+                }
+            }
+            Self::Boolean(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Boolean(values.value(row_index))
+                    });
+                }
+            }
+            Self::Int8(values) => append_integers(values, rows),
+            Self::Int16(values) => append_integers(values, rows),
+            Self::Int32(values) => append_integers(values, rows),
+            Self::Int64(values) => append_integers(values, rows),
+            Self::UInt8(values) => append_integers(values, rows),
+            Self::UInt16(values) => append_integers(values, rows),
+            Self::UInt32(values) => append_integers(values, rows),
+            Self::UInt64(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        let value = values.value(row_index);
+                        match i64::try_from(value) {
+                            Ok(value) => Value::Integer(value),
+                            // Unsigned values past the signed range have no
+                            // integer representation in a Lix row, so they are
+                            // preserved exactly as decimal text.
+                            Err(_) => Value::Text(value.to_string()),
+                        }
+                    });
+                }
+            }
+            Self::Float32(values) => append_reals(values, rows)?,
+            Self::Float64(values) => append_reals(values, rows)?,
+            Self::Utf8(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::LargeUtf8(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::Utf8View(values, kind) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        text_value(values.value(row_index), *kind)
+                    });
+                }
+            }
+            Self::Binary(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Blob(values.value(row_index).into())
+                    });
+                }
+            }
+            Self::LargeBinary(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Blob(values.value(row_index).into())
+                    });
+                }
+            }
         }
-        ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Ok(Value::Null),
-        other => Ok(Value::Text(other.to_string())),
+        Ok(())
+    }
+}
+
+fn append_integers<NativeType>(values: &PrimitiveArray<NativeType>, rows: &mut [Vec<Value>])
+where
+    NativeType: ArrowPrimitiveType,
+    NativeType::Native: Into<i64>,
+{
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        row.push(if values.is_null(row_index) {
+            Value::Null
+        } else {
+            Value::Integer(values.value(row_index).into())
+        });
+    }
+}
+
+fn append_reals<NativeType>(
+    values: &PrimitiveArray<NativeType>,
+    rows: &mut [Vec<Value>],
+) -> Result<(), LixError>
+where
+    NativeType: ArrowPrimitiveType,
+    NativeType::Native: Into<f64>,
+{
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        row.push(if values.is_null(row_index) {
+            Value::Null
+        } else {
+            finite_query_float(values.value(row_index).into())?
+        });
+    }
+    Ok(())
+}
+
+fn text_value(value: &str, kind: TextKind) -> Value {
+    match kind {
+        // The write boundary canonicalizes every JSON payload before it reaches
+        // storage, and the projection decoder copies those bytes into Arrow
+        // verbatim. Re-parsing here only rebuilt a DOM that was immediately
+        // re-serialized, so the bytes are retained directly instead.
+        TextKind::Json => Value::Json(crate::Json::from_canonical_text(value)),
+        TextKind::Text => Value::Text(value.to_owned()),
     }
 }
 
@@ -3024,25 +3286,6 @@ fn finite_query_float(value: f64) -> Result<Value, LixError> {
         ));
     }
     Ok(Value::Real(value))
-}
-
-fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Value, LixError> {
-    if field.is_some_and(field_is_json) {
-        return serde_json::from_str::<serde_json::Value>(&value)
-            .map(Value::Json)
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_INVALID_JSON",
-                    format!(
-                        "column '{}' is marked as JSON but contains invalid JSON: {error}",
-                        field
-                            .map(|field| field.name().as_str())
-                            .unwrap_or("<unknown>")
-                    ),
-                )
-            });
-    }
-    Ok(Value::Text(value))
 }
 
 #[cfg(test)]
@@ -3063,8 +3306,8 @@ mod tests {
 
     use super::{
         SqlExecutionContext, SqlWriteExecutionContext, build_write_session_with_options,
-        execute_sql, scalar_value_to_lix_value, write_provider_selection, write_session_options,
-        write_target_table_name,
+        execute_sql, query_result_from_batches, row_values_from_batch, write_provider_selection,
+        write_session_options, write_target_table_name,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
@@ -3098,12 +3341,109 @@ mod tests {
     };
     use crate::{LixError, NullableKeyFilter, Value};
     use bytes::Bytes;
-    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::array::{
+        ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
+        StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::common::ScalarValue;
     use datafusion::error::DataFusionError;
     use datafusion::physical_plan::RecordBatchStream;
+
+    #[test]
+    fn direct_typed_public_rows_match_generic_scalar_conversion_for_every_supported_type() {
+        const ROWS: usize = 242;
+        let present = |index: usize| index % 7 != 0;
+        let fields = vec![
+            Field::new("null", DataType::Null, true),
+            Field::new("bool", DataType::Boolean, true),
+            Field::new("i8", DataType::Int8, true),
+            Field::new("i16", DataType::Int16, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("i64", DataType::Int64, true),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("u16", DataType::UInt16, true),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("u64", DataType::UInt64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("utf8", DataType::Utf8, true),
+            Field::new("utf8_view", DataType::Utf8View, true),
+            Field::new("large_utf8", DataType::LargeUtf8, true),
+            Field::new("binary", DataType::Binary, true),
+            Field::new("large_binary", DataType::LargeBinary, true),
+        ];
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(NullArray::new(ROWS)),
+            Arc::new(BooleanArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index % 2 == 0)),
+            )),
+            Arc::new(Int8Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some((index % 101) as i8 - 50)),
+            )),
+            Arc::new(Int16Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i16 - 120)),
+            )),
+            Arc::new(Int32Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i32 - 130)),
+            )),
+            Arc::new(Int64Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as i64 - 140)),
+            )),
+            Arc::new(UInt8Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u8)),
+            )),
+            Arc::new(UInt16Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u16 * 3)),
+            )),
+            Arc::new(UInt32Array::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(index as u32 * 5)),
+            )),
+            Arc::new(UInt64Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(if index == 1 {
+                    u64::MAX
+                } else {
+                    index as u64 * 7
+                })
+            }))),
+            Arc::new(Float32Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(index as f32 * 0.25 - 10.0)
+            }))),
+            Arc::new(Float64Array::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(index as f64 * 0.5 - 20.0)
+            }))),
+            Arc::new(StringArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("utf8")),
+            )),
+            Arc::new(StringViewArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("utf8-view")),
+            )),
+            Arc::new(LargeStringArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some("large-utf8")),
+            )),
+            Arc::new(BinaryArray::from_iter(
+                (0..ROWS).map(|index| present(index).then_some(b"binary".as_slice())),
+            )),
+            Arc::new(LargeBinaryArray::from_iter((0..ROWS).map(|index| {
+                present(index).then_some(b"large-binary".as_slice())
+            }))),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), arrays)
+            .expect("all ordinary result arrays share one schema");
+
+        let generic_rows = (0..ROWS)
+            .map(|row_index| row_values_from_batch(&fields, &batch, row_index))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("generic scalar conversion");
+        let direct = query_result_from_batches(&fields, &[batch]).expect("direct typed conversion");
+
+        assert_eq!(
+            direct.columns,
+            fields.iter().map(Field::name).cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(direct.rows, generic_rows);
+    }
 
     struct DummyBlobReader;
     struct StaticBlobReader {
@@ -3235,17 +3575,71 @@ mod tests {
     }
 
     #[test]
-    fn result_scalar_conversion_moves_blob_payload() {
-        let payload = vec![0x41, 0x42, 0x43];
-        let payload_pointer = payload.as_ptr();
-
-        let result = scalar_value_to_lix_value(ScalarValue::LargeBinary(Some(payload)), None)
-            .expect("blob scalar should convert");
-        let Value::Blob(bytes) = result else {
-            panic!("expected blob result");
+    fn typed_row_conversion_covers_every_supported_result_column_type() {
+        use datafusion::arrow::array::{
+            BooleanArray, Float64Array, LargeBinaryArray, NullArray, StringArray, UInt64Array,
         };
 
-        assert_eq!(bytes.as_ptr(), payload_pointer);
+        let fields = vec![
+            Field::new("nothing", DataType::Null, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("ordinal", DataType::Int64, true),
+            Field::new("big", DataType::UInt64, true),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new("label", DataType::Utf8, true),
+            crate::sql2::result_metadata::json_field("document", true),
+            Field::new("payload", DataType::LargeBinary, true),
+        ];
+        let schema = Arc::new(Schema::new(fields.clone()));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(NullArray::new(2)),
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+                Arc::new(Int64Array::from(vec![Some(7i64), None])),
+                Arc::new(UInt64Array::from(vec![Some(u64::MAX), None])),
+                Arc::new(Float64Array::from(vec![Some(1.5f64), None])),
+                Arc::new(StringArray::from(vec![Some("hello"), None])),
+                Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some([0x41u8, 0x42, 0x43].as_slice()),
+                    None,
+                ])),
+            ],
+        )
+        .expect("test batch should match schema");
+
+        assert_eq!(
+            row_values_from_batch(&fields, &batch, 0).expect("typed row conversion"),
+            vec![
+                Value::Null,
+                Value::Boolean(true),
+                Value::Integer(7),
+                Value::Text(u64::MAX.to_string()),
+                Value::Real(1.5),
+                Value::Text("hello".to_owned()),
+                Value::Json(crate::Json::from_canonical_text(r#"{"a":1}"#)),
+                Value::Blob(vec![0x41, 0x42, 0x43].into()),
+            ]
+        );
+        assert_eq!(
+            row_values_from_batch(&fields, &batch, 1).expect("typed row conversion"),
+            vec![Value::Null; 8]
+        );
+    }
+
+    #[test]
+    fn unsupported_result_column_types_are_rejected_once_per_batch() {
+        use datafusion::arrow::array::Date32Array;
+
+        let fields = vec![Field::new("day", DataType::Date32, true)];
+        let schema = Arc::new(Schema::new(fields.clone()));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Date32Array::from(vec![0i32]))])
+            .expect("test batch should match schema");
+
+        let error = row_values_from_batch(&fields, &batch, 0)
+            .expect_err("unsupported column types must be rejected");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
     }
 
     #[derive(Default)]
@@ -5303,7 +5697,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("A".to_string()));
         assert_eq!(rows[0][1], Value::Integer(7));
-        assert_eq!(rows[0][2], Value::Json(json!(["entity-history"])));
+        assert_eq!(rows[0][2], Value::Json(json!(["entity-history"]).into()));
         assert!(matches!(rows[0][3], Value::Integer(_)));
     }
 
@@ -6565,7 +6959,7 @@ mod tests {
             &[
                 Value::Text("/multi/param-a.md".to_string()),
                 Value::Blob(b"param-a".to_vec().into()),
-                Value::Json(json!({"source": "json-param"})),
+                Value::Json(json!({"source": "json-param"}).into()),
                 Value::Text("/multi/param-b.md".to_string()),
                 Value::Blob(b"param-b".to_vec().into()),
                 Value::Text(r#"{"source":"text-param"}"#.to_string()),
@@ -6637,7 +7031,7 @@ mod tests {
         let params = [
             Value::Text("/docs/existing.md".to_string()),
             Value::Blob(b"updated".to_vec().into()),
-            Value::Json(json!({"source": "upload"})),
+            Value::Json(json!({"source": "upload"}).into()),
         ];
 
         let (fast_result, fast_path) =
@@ -6709,7 +7103,7 @@ mod tests {
             &[
                 Value::Text("/invalid.md".to_string()),
                 Value::Blob(b"content".to_vec().into()),
-                Value::Json(json!(["not", "an", "object"])),
+                Value::Json(json!(["not", "an", "object"]).into()),
             ],
             WriteExecutorMode::ForceFast,
         )
@@ -7556,7 +7950,7 @@ mod tests {
         let sql = "UPDATE lix_file SET content = $1, lixcol_metadata = $2 WHERE id = $3";
         let params = [
             Value::Blob(b"parameterized".to_vec().into()),
-            Value::Json(serde_json::json!({"source": "git"})),
+            Value::Json(serde_json::json!({"source": "git"}).into()),
             Value::Text("01920000-0000-7000-8000-0000000000d2".to_string()),
         ];
 
@@ -8287,7 +8681,7 @@ mod tests {
                 assert_eq!(result.columns, vec!["value", "lixcol_entity_pk"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
-                assert_eq!(result.rows[0][1], Value::Json(json!(["entity-a"])));
+                assert_eq!(result.rows[0][1], Value::Json(json!(["entity-a"]).into()));
             })
         });
     }

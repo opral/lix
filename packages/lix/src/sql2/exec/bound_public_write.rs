@@ -784,7 +784,11 @@ async fn try_execute_entity_update_batch(
             }
             affected_by_statement.push(affected);
         }
-        let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
+        // SAFETY: the arena contains only JSON syntax literals and text
+        // emitted by the canonical JSON append helpers above.
+        let snapshots = unsafe {
+            TransactionJson::from_validated_certified_row_content_arena(normalized, offsets)?
+        };
         for ((row_index, candidate), snapshot) in matched_candidates.into_iter().zip(snapshots) {
             append_direct_path_value_replacement_prepared_row(
                 &mut write_rows,
@@ -1251,6 +1255,7 @@ async fn try_execute_direct_path_value_replacement_batch(
     };
     let mut snapshot_offsets = Vec::with_capacity(replacement_capacity);
     let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
+    let mut replacement_predecessors = Vec::with_capacity(replacement_capacity);
     let mut affected_by_statement =
         (!certified_generation_identity).then(|| vec![0_u64; row_count]);
     let mut candidate_index = 0;
@@ -1306,6 +1311,16 @@ async fn try_execute_direct_path_value_replacement_batch(
         normalized.push(b'}');
         snapshot_offsets.push((start, normalized.len()));
         replacement_entity_pks.push(entity_pk.clone());
+        replacement_predecessors.push(
+            (!certified_generation_identity)
+                .then(|| {
+                    candidates
+                        .row(candidate_index)
+                        .durable_predecessor()
+                        .cloned()
+                })
+                .flatten(),
+        );
         if let Some(ordinals) = &sorted_statement_ordinals {
             for &affected_statement in &ordinals[first_statement_index..=last_statement_index] {
                 if let Some(affected_by_statement) = &mut affected_by_statement {
@@ -1321,9 +1336,15 @@ async fn try_execute_direct_path_value_replacement_batch(
     }
     if !replacement_entity_pks.is_empty() {
         let normalized_len = normalized.len();
-        let snapshots =
-            TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-        let rows = CertifiedParameterReplacementBatch::new(
+        // SAFETY: the arena contains only JSON syntax literals and text
+        // emitted by the canonical JSON append helpers above.
+        let snapshots = unsafe {
+            TransactionJson::from_validated_certified_row_content_arena(
+                normalized,
+                snapshot_offsets,
+            )?
+        };
+        let mut rows = CertifiedParameterReplacementBatch::new(
             replacement_entity_pks,
             snapshots,
             spec.schema_key.as_str().into(),
@@ -1348,6 +1369,9 @@ async fn try_execute_direct_path_value_replacement_batch(
                     .flatten(),
             },
         )?;
+        for (index, predecessor) in replacement_predecessors.into_iter().enumerate() {
+            rows.set_durable_predecessor(index, predecessor);
+        }
         ctx.stage_certified_parameter_batch_replace(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
@@ -1594,12 +1618,9 @@ fn append_direct_path_value_replacement_row<'a>(
     let candidate = candidate.into();
     let mut normalized = Vec::new();
     append_direct_path_value_replacement_json(&mut normalized, candidate, params, replacement)?;
-    let normalized = SharedStr::from_utf8(bytes::Bytes::from(normalized)).map_err(|error| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!("certified replacement row is not UTF-8: {error}"),
-        )
-    })?;
+    // SAFETY: the row is assembled from UTF-8 literals, existing row text,
+    // and canonical JSON parameter text.
+    let normalized = unsafe { SharedStr::from_utf8_unchecked(bytes::Bytes::from(normalized)) };
     append_direct_path_value_replacement_prepared_row(
         rows,
         spec,
@@ -2846,8 +2867,9 @@ fn eval_fast_file_metadata(
             Some(Value::Null) => return Ok(None),
             Some(Value::Text(value)) => parse_row_metadata_value(value, "lix_file")?,
             Some(Value::Json(value)) => {
-                validate_row_metadata(value, "lix_file")?;
-                value.clone()
+                let value = value.to_value();
+                validate_row_metadata(&value, "lix_file")?;
+                value
             }
             Some(_) => {
                 return Err(LixError::new(
@@ -3262,10 +3284,13 @@ pub(crate) fn prepare_path_value_replacement_row_known_live(
     let mut normalized = Vec::with_capacity(primary_key.len().saturating_add(32));
     let (start, end) =
         append_path_value_replacement_snapshot(program, primary_key, params, &mut normalized)?;
-    let snapshot =
-        TransactionJson::from_certified_row_content_arena(normalized, vec![(start, end)])?
-            .pop()
-            .expect("one certified replacement snapshot");
+    // SAFETY: `append_path_value_replacement_snapshot` appends only UTF-8
+    // literals, `str` identities, and canonical JSON parameter text.
+    let snapshot = unsafe {
+        TransactionJson::from_validated_certified_row_content_arena(normalized, vec![(start, end)])?
+    }
+    .pop()
+    .expect("one certified replacement snapshot");
     Ok(PreparedPathValueReplacementRow {
         entity_pk,
         snapshot,
@@ -3789,7 +3814,7 @@ fn entity_returning_value(
                 Value::Null
             }
             EntityEvalValue::SqlText(value) => Value::Text(value),
-            EntityEvalValue::Json(value) => Value::Json(value),
+            EntityEvalValue::Json(value) => Value::Json(value.into()),
         });
     }
     if let Some(column) = visible_entity_column(expr, spec) {
@@ -3816,7 +3841,7 @@ fn entity_returning_value(
             .or_else(|| value.as_f64().map(Value::Real))
             .unwrap_or_else(|| Value::Text(value.to_string())),
         EntityEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
-            Value::Json(value)
+            Value::Json(value.into())
         }
     })
 }
@@ -4963,7 +4988,11 @@ fn certified_direct_parameter_insert_batch(
     }
     let tracked_keys_strictly_ordered =
         shared_string_primary_keys || unordered_entity_pks.is_none();
-    let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
+    // SAFETY: each row is assembled from UTF-8 literals, validated text
+    // parameters, and canonical JSON serializer output.
+    let snapshots = unsafe {
+        TransactionJson::from_validated_certified_row_content_arena(normalized, offsets)?
+    };
     let schema_key: SharedStr = layout.schema_key.as_str().into();
     let branch_id: SharedStr = ctx.active_branch_id().into();
     let certificate = CertifiedRawWriteBatchPreparation {
@@ -5213,8 +5242,11 @@ fn certified_direct_path_value_insert_batch(
             )
         })
         .collect::<Vec<_>>();
-    let snapshots =
-        TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
+    // SAFETY: each row is assembled from UTF-8 literals, `str` paths, and
+    // serde_json output.
+    let snapshots = unsafe {
+        TransactionJson::from_validated_certified_row_content_arena(normalized, snapshot_offsets)?
+    };
     let mut rows = CertifiedParameterInsertBatch::new_with_lane(
         entity_pks,
         snapshots,
@@ -5548,7 +5580,11 @@ fn certified_entity_insert_rows<'a>(
     }
 
     let row_count = offsets.len();
-    let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
+    // SAFETY: each row is assembled from UTF-8 literals, validated text
+    // parameters, and canonical JSON serializer output.
+    let snapshots = unsafe {
+        TransactionJson::from_validated_certified_row_content_arena(normalized, offsets)?
+    };
     let mut rows = RawWriteBatch::with_capacity(row_count);
     for ((entity_pk, snapshot), row) in entity_pks.into_iter().zip(snapshots).zip(row_parts) {
         rows.push_parts(
@@ -7003,7 +7039,7 @@ fn value_json(value: &Value) -> JsonValue {
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         Value::Text(value) => JsonValue::String(value.clone()),
-        Value::Json(value) => value.clone(),
+        Value::Json(value) => value.to_value(),
         Value::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
         }

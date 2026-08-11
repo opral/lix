@@ -63,6 +63,10 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -399,6 +403,20 @@ pub struct CrudCurrentStateScopedRangeAccounting {
     pub sealed_manifest_loads: u64,
     pub replay_manifest_loads: u64,
     pub ordered_delta_fallbacks: u64,
+    pub commit_delta_direct_segments: u64,
+    pub commit_delta_direct_rows: u64,
+    pub commit_delta_generic_segments: u64,
+    pub commit_delta_generic_rows: u64,
+}
+
+pub(crate) fn record_commit_delta_leaf_layout(rows: usize, direct: bool) {
+    let (segments, encoded_rows) = if direct {
+        (&COMMIT_DELTA_DIRECT_SEGMENTS, &COMMIT_DELTA_DIRECT_ROWS)
+    } else {
+        (&COMMIT_DELTA_GENERIC_SEGMENTS, &COMMIT_DELTA_GENERIC_ROWS)
+    };
+    segments.fetch_add(1, Ordering::Relaxed);
+    encoded_rows.fetch_add(rows as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn record_crud_current_state_scoped_range_attempt() {
@@ -433,6 +451,10 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_segments: COMMIT_DELTA_DIRECT_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_rows: COMMIT_DELTA_DIRECT_ROWS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_segments: COMMIT_DELTA_GENERIC_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_rows: COMMIT_DELTA_GENERIC_ROWS.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -476,7 +498,19 @@ pub enum CommitGraphBenchMode {
     LegacyAllNodes,
     ReachableNodes,
     LegacyReachableNodes,
+    /// Whole reachable history for one member schema.
+    HistoryFull,
+    /// History restricted to the head commit (`lixcol_depth = 0`).
+    HistoryDepth0,
+    /// History for a bounded row demand (`LIMIT 10`).
+    HistoryLimit10,
 }
+
+/// Row demand a bounded history benchmark mode asks for.
+const COMMIT_GRAPH_BENCH_HISTORY_LIMIT: usize = 10;
+
+/// Schema key that [`seed_commit_graph_members_for_bench`] writes per commit.
+const COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY: &str = "commit_graph_bench_member";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CommitGraphBenchResult {
@@ -527,8 +561,9 @@ where
             "merge-base benchmark ancestry must be positive",
         ));
     }
-    let mut records = Vec::new();
-    let mut generations = std::collections::HashMap::new();
+    let mut records = Vec::<crate::changelog::CommitRecord>::new();
+    let mut generations = std::collections::HashMap::<crate::changelog::CommitId, u64>::new();
+    let mut record_indices = std::collections::HashMap::<crate::changelog::CommitId, usize>::new();
     let scenario_name = match scenario {
         MergeBaseBenchScenario::EqualHeads => "equal",
         MergeBaseBenchScenario::AncestorDescendant => "ancestor",
@@ -552,11 +587,23 @@ where
             .max()
             .map_or(0, |generation| generation.saturating_add(1));
         let commit_id = crate::changelog::CommitId::for_test_label(&label);
+        let parent = parents
+            .as_slice()
+            .first()
+            .and_then(|parent_id| record_indices.get(parent_id))
+            .map(|index| &records[*index]);
+        let parent_jump = parent
+            .and_then(|parent| record_indices.get(&parent.first_parent_jump_commit_id))
+            .map(|index| &records[*index]);
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation,
             parent_commit_ids: parents,
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -565,6 +612,7 @@ where
             ),
         });
         generations.insert(commit_id, generation);
+        record_indices.insert(commit_id, records.len() - 1);
         Ok(commit_id)
     };
 
@@ -694,28 +742,19 @@ where
         reader.merge_base(&left, &right).await?
     };
     let mut reader = crate::tracked_state::TrackedStateContext::new().reader(&read);
-    let target_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            left_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
-    let source_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            right_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
+    let analysis = crate::session::analyze_merge_for_bench(
+        &mut reader,
+        crate::session::MergeCommitsForBench {
+            base_commit_id: base,
+            target_commit_id: left,
+            source_commit_id: right,
+        },
+    )
+    .await?;
     Ok(MergePreparationBenchResult {
-        base_commit_id: base.to_string(),
-        target_entries,
-        source_entries,
+        base_commit_id: analysis.commits.base_commit_id.to_string(),
+        target_entries: analysis.target_diff.entries.len(),
+        source_entries: analysis.source_diff.entries.len(),
     })
 }
 
@@ -737,6 +776,36 @@ where
     let mut reader = crate::commit_graph::CommitGraphContext::new().reader(read);
     let head_commit_id =
         crate::changelog::CommitId::parse_lix(head_commit_id, "commit graph benchmark head")?;
+    if let Some((max_depth, limit)) = match mode {
+        CommitGraphBenchMode::HistoryFull => Some((None, None)),
+        CommitGraphBenchMode::HistoryDepth0 => Some((Some(0), None)),
+        CommitGraphBenchMode::HistoryLimit10 => {
+            Some((None, Some(COMMIT_GRAPH_BENCH_HISTORY_LIMIT)))
+        }
+        _ => None,
+    } {
+        let history = reader
+            .change_history_from_commit(
+                &head_commit_id,
+                &crate::commit_graph::CommitGraphChangeHistoryRequest {
+                    entity_pks: Vec::new(),
+                    schema_keys: vec![COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY.to_string()],
+                    file_ids: Vec::new(),
+                    min_depth: None,
+                    max_depth,
+                    include_tombstones: true,
+                    limit,
+                },
+            )
+            .await?;
+        let entries = history.entries.len();
+        std::hint::black_box(history);
+        return Ok(CommitGraphBenchResult {
+            nodes: 0,
+            edges: 0,
+            member_changes: entries,
+        });
+    }
     let nodes = match mode {
         CommitGraphBenchMode::AllNodes | CommitGraphBenchMode::LegacyAllNodes => {
             reader.all_nodes().await?
@@ -747,6 +816,9 @@ where
             .iter()
             .map(|reachable| reachable.commit.clone())
             .collect(),
+        CommitGraphBenchMode::HistoryFull
+        | CommitGraphBenchMode::HistoryDepth0
+        | CommitGraphBenchMode::HistoryLimit10 => unreachable!("history modes returned above"),
     };
     let node_count = nodes.len();
     let edges = crate::commit_graph::commit_edges(&nodes).len();
@@ -825,7 +897,7 @@ where
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
                 delta: crate::tracked_state::TrackedStateDeltaRef {
-                    schema_key: "commit_graph_bench_member",
+                    schema_key: COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY,
                     file_id: None,
                     entity_pk: &entity_pk,
                     change_id: crate::changelog::ChangeId::for_test_label(&format!(
@@ -2208,41 +2280,12 @@ pub fn layout_space_catalog() -> Vec<(u32, &'static str)> {
         .collect()
 }
 
+/// Every registered storage space, in physical key order.
+///
+/// Layout accounting derives from the one registry so a newly added space
+/// appears in every layout report without a second list to maintain.
 fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
-    &[
-        crate::init::REPOSITORY_PROTOCOL_SPACE,
-        crate::branch::BRANCH_HEAD_CONTROL_SPACE,
-        crate::live_state::HOT_ROW_SPACE,
-        crate::live_state::HOT_FILE_SPACE,
-        crate::live_state::HOT_DIFF_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_SPACE,
-        crate::live_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        crate::live_state::ROOT_CURRENT_BASE_SPACE,
-        crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
-        crate::transaction::plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE,
-        crate::json_store::store::JSON_SPACE,
-        crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-        crate::gc::GC_TREE_SWEEP_EPOCH_SPACE,
-        crate::gc::GC_TREE_SWEEP_MARK_SPACE,
-        crate::gc::GC_TREE_SWEEP_CURSOR_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
-        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-        crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
-        crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
-        crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
-        crate::changelog::COMMIT_SPACE,
-        crate::changelog::CHANGE_SPACE,
-        crate::changelog::COMMIT_CHANGE_ID_SPACE,
-    ]
+    crate::storage_spaces::ALL_STORAGE_SPACES
 }
 
 async fn scan_layout_space<R>(
@@ -2608,12 +2651,17 @@ mod tests {
             first.staged_deletes
         );
         assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
-        // GC also stages the mandatory five-byte binary-CAS epoch key. Its
-        // put shares the key arena with the UUID-keyed delete descriptors.
+        // GC also stages the mandatory binary-CAS epoch key. Its put shares the
+        // key arena with the UUID-keyed delete descriptors. Since the revision
+        // singletons were consolidated into one space, the epoch's *logical* key
+        // is a single byte (`b"b"`) and the 4-byte space id is prepended at the
+        // physical layer, so derive the width from the constant rather than
+        // restating it.
+        const EPOCH_KEY_BYTES: usize = crate::storage_adapter::REVISION_KEY_BINARY_CAS_EPOCH.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
         assert_eq!(
             first.key_shared_bytes,
-            first.staged_deletes as usize * 16 + 5
+            first.staged_deletes as usize * 16 + EPOCH_KEY_BYTES
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);

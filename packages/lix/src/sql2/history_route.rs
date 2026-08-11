@@ -314,9 +314,11 @@ pub(crate) fn validate_history_anchor_filter(expr: &Expr) -> Result<(), LixError
 pub(crate) fn commit_graph_history_request(
     route: &HistoryRoute,
     schema_keys: Vec<String>,
+    limit: Option<usize>,
 ) -> Option<CommitGraphChangeHistoryRequest> {
     let schema_keys = effective_schema_keys(route, schema_keys)?;
     Some(CommitGraphChangeHistoryRequest {
+        limit,
         entity_pks: if route.resolved_entity_pks.is_empty() {
             route
                 .entity_pks
@@ -338,6 +340,10 @@ pub(crate) fn commit_graph_history_request(
 ///
 /// Providers pass the schema keys they know how to shape. An empty list means
 /// "do not constrain by provider schema".
+///
+/// `limit` is a traversal bound, not a truncation. Only pass it from a provider
+/// that emits one output row per returned entry; a row-shaping provider must
+/// pass `None` because it can collapse or discard entries afterwards.
 pub(crate) async fn load_history_entries<S>(
     descriptor: HistoryViewDescriptor<'_>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
@@ -345,6 +351,7 @@ pub(crate) async fn load_history_entries<S>(
     route: &HistoryRoute,
     schema_keys: Vec<String>,
     metadata_projection: HistoryMetadataProjection,
+    limit: Option<usize>,
 ) -> Result<Vec<HistoryEntry>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -358,7 +365,7 @@ where
     if route.is_contradictory() {
         return Ok(Vec::new());
     }
-    let Some(request) = commit_graph_history_request(route, schema_keys) else {
+    let Some(request) = commit_graph_history_request(route, schema_keys, limit) else {
         return Ok(Vec::new());
     };
     let as_of_commit_ids = if route.as_of_commit_ids.is_empty() {
@@ -370,6 +377,11 @@ where
 
     let mut rows = Vec::new();
     for as_of_commit_id in as_of_commit_ids {
+        // A bounded caller truncates to `limit`; nothing after this point can
+        // change the rows it keeps.
+        if limit.is_some_and(|limit| rows.len() >= limit) {
+            break;
+        }
         let as_of_commit_id =
             CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
         let (entries, reachable_nodes) = {
@@ -424,6 +436,10 @@ where
                 as_of_commit_id: entry.start_commit_id.to_string(),
                 depth: entry.depth,
             });
+        }
+
+        if limit.is_some_and(|limit| rows.len() >= limit) {
+            continue;
         }
 
         let certified_commit_ids = reachable_by_id
@@ -952,6 +968,7 @@ mod tests {
             &HistoryRoute::default(),
             vec!["message".to_string()],
             HistoryMetadataProjection::default(),
+            None,
         )
         .await
         .expect("history load should succeed without commit metadata");
@@ -983,6 +1000,7 @@ mod tests {
             },
             vec!["message".to_string()],
             HistoryMetadataProjection::from_scan(&metadata_schema, &[]),
+            None,
         )
         .await
         .expect("history load should enrich commit metadata");
@@ -1026,6 +1044,7 @@ mod tests {
             },
             vec!["message".to_string()],
             HistoryMetadataProjection::from_scan(&metadata_schema, &[]),
+            None,
         )
         .await
         .expect_err("missing commit metadata must be an explicit error");
@@ -1064,6 +1083,8 @@ mod tests {
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     generation: 0,
                     parent_commit_ids: Vec::new(),
+                    first_parent_jump_commit_id: self.start_commit_id,
+                    first_parent_jump_span: 0,
                     created_at: commit_timestamp(),
                 },
                 depth: 0,
@@ -1084,6 +1105,8 @@ mod tests {
                         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                         generation: 0,
                         parent_commit_ids: Vec::new(),
+                        first_parent_jump_commit_id: self.start_commit_id,
+                        first_parent_jump_span: 0,
                         created_at: commit_timestamp(),
                     },
                     depth: 0,

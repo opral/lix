@@ -890,7 +890,7 @@ simulation_test!(
             &[
                 Value::Json(JsonValue::Array(vec![JsonValue::String(
                     "draft-merge-source".to_string()
-                )])),
+                )]).into()),
                 Value::Text("added".to_string()),
             ],
             "the selected source delta must remain visible against the target checkpoint"
@@ -900,7 +900,7 @@ simulation_test!(
             &[
                 Value::Json(JsonValue::Array(vec![JsonValue::String(
                     "main-merge-target".to_string()
-                )])),
+                )]).into()),
                 Value::Text("added".to_string()),
             ],
             "the target delta must remain visible against the target checkpoint"
@@ -1962,7 +1962,7 @@ async fn assert_key_value(
             assert_eq!(rows.len(), 1);
             let expected_json = serde_json::from_str::<JsonValue>(value)
                 .expect("expected key-value should be valid JSON");
-            assert_eq!(rows.rows()[0].values(), &[Value::Json(expected_json)]);
+            assert_eq!(rows.rows()[0].values(), &[Value::Json(expected_json.into())]);
         }
         None => assert_eq!(rows.len(), 0),
     }
