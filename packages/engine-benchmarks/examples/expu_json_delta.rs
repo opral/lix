@@ -55,8 +55,8 @@ const ZSTD_MIN_JSON_BYTES: usize = 512;
 const MIN_ZSTD_SAVINGS_BYTES: usize = 128;
 /// Mirrors `json_store::types::JSON_INLINE_MAX_BYTES`.
 const JSON_INLINE_MAX_BYTES: usize = 1024;
-/// Mirrors the store's compression level.
-const ZSTD_LEVEL: i32 = 1;
+/// Mirrors `json_store::compression::JSON_ZSTD_LEVEL`.
+const ZSTD_LEVEL: i32 = 3;
 /// A delta row must name its base. One content address, 32 bytes.
 const DELTA_BASE_REF_BYTES: usize = 32;
 
@@ -633,7 +633,7 @@ fn oracle(log_path: &Path) {
     // Bounded-chain arms. `1` is "no delta at all" and the largest value is an
     // unbounded chain; everything between is a periodic full snapshot.
     let depths = [1_usize, 2, 4, 8, 16, usize::MAX];
-    let levels = [ZSTD_LEVEL, 3, 9, 19];
+    let levels = [1, ZSTD_LEVEL, 9, 19];
 
     let mut raw_bytes = 0_u64;
     let mut level_bytes = [0_u64; 4];
