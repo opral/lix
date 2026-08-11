@@ -2674,8 +2674,13 @@ async fn restage_exact_closure_collection_control(
         schema_key: EXACT_CLOSURE_SCHEMA_KEY,
         file_id: None,
     };
+    let marker_entity_pk =
+        EntityPk::single(crate::collection_generation::collection_scope_key(scope));
     let filter = TrackedStateFilter {
-        schema_keys: vec![EXACT_CLOSURE_SCHEMA_KEY.to_owned()],
+        schema_keys: vec![
+            EXACT_CLOSURE_SCHEMA_KEY.to_owned(),
+            crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+        ],
         include_tombstones: true,
         ..TrackedStateFilter::default()
     };
@@ -2688,7 +2693,16 @@ async fn restage_exact_closure_collection_control(
     };
     let mut rows: HotRowMap = BTreeMap::new();
     for (identity, bytes) in entries {
-        rows.insert(identity.into_row_identity(), bytes);
+        let identity = identity.into_row_identity();
+        // Markers for *other* scopes must not enter this map: they would make
+        // the complete-control pass emit a zero-count control for a scope this
+        // recompute never counted.
+        if identity.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+            && identity.entity_pk != marker_entity_pk
+        {
+            continue;
+        }
+        rows.insert(identity, bytes);
     }
     // The publication's own values win over the stored pre-image.
     for (identity, value) in staged {
@@ -2700,22 +2714,6 @@ async fn restage_exact_closure_collection_control(
                 rows.remove(identity);
             }
         }
-    }
-    // Carry the scope's collection-generation marker, if any, so the
-    // recomputed control keeps the same active generation and fence.
-    let marker_identity = HeadRowIdentity {
-        schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
-        entity_pk: EntityPk::single(crate::collection_generation::collection_scope_key(scope)),
-        file_id: None,
-    };
-    if let Some(marker) =
-        hot_load_primary_identity_bytes(store, std::slice::from_ref(&marker_identity))
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-    {
-        rows.insert(marker_identity, marker);
     }
     stage_complete_collection_controls(writes, branch_id, generation, &rows)
 }
@@ -7595,9 +7593,7 @@ where
                             entity_pk: delta.entity_pk.clone(),
                             file_id: delta.file_id.map(str::to_owned),
                         },
-                        range
-                            .as_ref()
-                            .map(|range| next_value_bytes.slice(range.offset()..range.offset() + range.len())),
+                        range.as_ref().map(|range| next_value_bytes.slice(range.clone())),
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
