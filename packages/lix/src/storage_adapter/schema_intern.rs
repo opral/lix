@@ -277,14 +277,6 @@ impl SchemaIntern {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn durable_len(&self) -> u32 {
-        self.inner
-            .read()
-            .expect("schema intern lock poisoned")
-            .loaded_len
-    }
-
     /// Read-path lookup. `None` means no hot key visible to the resolving
     /// snapshot can carry this schema: the mapping row commits atomically with
     /// the first hot key that uses it, so once the table has been refreshed
@@ -415,6 +407,50 @@ impl SchemaInternHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn refresh_confirms_committed_ids_and_keeps_pending_ones() {
+        use crate::storage::{Memory, WriteOptions};
+        use crate::storage_adapter::StorageAdapter;
+
+        let storage = StorageAdapter::new(Memory::new());
+        let intern = SchemaIntern::default();
+
+        let mut writes = StorageWriteSet::new();
+        let committed = intern
+            .assign("lix_key_value", &mut writes)
+            .expect("assign committed id");
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .await
+            .expect("publish mapping row");
+
+        let mut pending = StorageWriteSet::new();
+        let staged = intern
+            .assign("markdown_block", &mut pending)
+            .expect("assign pending id");
+
+        let read = storage
+            .begin_read(crate::storage::ReadOptions::default())
+            .await
+            .expect("open read");
+        intern.ensure_current(&read).await.expect("refresh");
+
+        // The committed id is confirmed, so it is not staged twice.
+        let mut second = StorageWriteSet::new();
+        assert_eq!(
+            intern.assign("lix_key_value", &mut second).expect("assign"),
+            committed
+        );
+        assert_eq!(second.stats().staged_puts, 0);
+        // The uncommitted id survives the refresh and still re-stages.
+        let mut third = StorageWriteSet::new();
+        assert_eq!(
+            intern.assign("markdown_block", &mut third).expect("assign"),
+            staged
+        );
+        assert_eq!(third.stats().staged_puts, 1);
+    }
 
     #[test]
     fn assignment_is_sequential_and_stable() {
