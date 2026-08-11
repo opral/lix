@@ -11,7 +11,7 @@
 //!    bytes, so a "64-byte prefix" on a 181-byte compressed row is a third of
 //!    the row, not a rounding error.
 //! 2. **How much of that near-duplication zstd already captured.** Every
-//!    payload is individually zstd-compressed at level 1 today. A delta only
+//!    payload is individually zstd-compressed at `ZSTD_LEVEL` today. A delta only
 //!    earns the bytes zstd left on the table.
 //! 3. **What a delta base costs to reach.** A payload's natural base is the
 //!    previous version of the same entity, which is a different content
@@ -28,7 +28,7 @@
 //! Every corpus is seeded through `SessionContext` SQL, so the write log is
 //! exactly the payload stream an ordinary commit stages. The oracle never
 //! touches engine internals: it replays the store's own encoder rule
-//! (`>= 512` bytes, zstd level 1, keep raw unless it saves `>= 128` bytes,
+//! (`>= 512` bytes, zstd `ZSTD_LEVEL`, keep raw unless it saves `>= 128` bytes,
 //! plus a 20-byte envelope) so "bytes today" is the real stored size.
 
 #![allow(clippy::large_futures)]
@@ -696,7 +696,15 @@ fn oracle(log_path: &Path) {
     edit_ratios.sort_by(|a, b| a.partial_cmp(b).expect("finite ratio"));
     edit_spans.sort_unstable();
     chain_lengths.sort_unstable();
-    let today_bytes = level_bytes[0];
+    // "Today" is whatever level the store actually writes, which is the level
+    // `stored_len_today` replays. Indexing slot 0 hard-codes the assumption
+    // that the store's level is first in `levels`, which stopped being true the
+    // moment the store's level moved.
+    let today_slot = levels
+        .iter()
+        .position(|level| *level == ZSTD_LEVEL)
+        .expect("levels must contain the store's own compression level");
+    let today_bytes = level_bytes[today_slot];
 
     println!(
         "EDIT_SPAN\tpairs={}\tspan_p10={}\tspan_p50={}\tspan_p90={}\tspan_p99={}\tratio_p10={:.4}\tratio_p50={:.4}\tratio_p90={:.4}\tratio_p99={:.4}",
@@ -784,8 +792,36 @@ fn oracle(log_path: &Path) {
         ),
     );
 
-    encode_cost(&order, &by_entity, &levels);
+    encode_cost(&order, &by_entity, &encode_levels());
     reconstruction_latency(&order, &by_entity);
+}
+
+/// Which levels `encode_cost` times, and in which slot order.
+///
+/// Separate from the byte-accounting `levels` on purpose. A timing comparison
+/// needs the same level to appear in more than one slot so the run carries its
+/// own null control: two slots running byte-identical code bound the harness's
+/// resolution, and any delta smaller than that spread is unresolvable. Listing
+/// a level both early and late also rotates arm order, which cancels
+/// position-dependent drift (cache warmup, thermal ramp) that a fixed
+/// first-to-last ordering would otherwise charge entirely to the first arm.
+///
+/// `LIX_EXPU_ENCODE_LEVELS=1,3,3,1` is the null-control-plus-rotation form.
+fn encode_levels() -> Vec<i32> {
+    let Ok(raw) = std::env::var("LIX_EXPU_ENCODE_LEVELS") else {
+        return vec![1, ZSTD_LEVEL, 9, 19];
+    };
+    let levels = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(|field| field.parse().expect("LIX_EXPU_ENCODE_LEVELS must be i32s"))
+        .collect::<Vec<i32>>();
+    assert!(
+        !levels.is_empty(),
+        "LIX_EXPU_ENCODE_LEVELS must name at least one level"
+    );
+    levels
 }
 
 /// Write-path CPU of each encoding arm, per payload.
@@ -813,8 +849,13 @@ fn encode_cost(order: &[String], by_entity: &HashMap<String, Vec<Vec<u8>>>, leve
     // whichever went first pay every cold-cache and page-fault cost, which is
     // how "level 3 is cheaper than level 1" appears out of nowhere.
     let reps = env_usize("LIX_EXPU_ENCODE_REPS", 9);
-    let mut timings = vec![Vec::with_capacity(reps); levels.len() + 1];
-    let mut sinks = vec![0_usize; levels.len() + 1];
+    // The delta arm is the expensive one (a fresh dictionary context per row)
+    // and is irrelevant when the question is only "level A versus level B", so
+    // it can be switched off to keep a rotated null-control run cheap.
+    let delta_arm = std::env::var("LIX_EXPU_ENCODE_DELTA").as_deref() != Ok("0");
+    let arms = levels.len() + usize::from(delta_arm);
+    let mut timings = vec![Vec::with_capacity(reps); arms];
+    let mut sinks = vec![0_usize; arms];
     for _ in 0..reps {
         for (slot, level) in levels.iter().enumerate() {
             let start = std::time::Instant::now();
@@ -825,27 +866,33 @@ fn encode_cost(order: &[String], by_entity: &HashMap<String, Vec<Vec<u8>>>, leve
             timings[slot].push(start.elapsed().as_nanos() as f64 / samples.len() as f64);
             sinks[slot] = sink;
         }
-        let start = std::time::Instant::now();
-        let mut sink = 0_usize;
-        for (raw, base) in &samples {
-            let mut compressor = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, base)
-                .expect("dictionary compressor");
-            sink += compressor.compress(raw).expect("delta compress").len();
+        if delta_arm {
+            let start = std::time::Instant::now();
+            let mut sink = 0_usize;
+            for (raw, base) in &samples {
+                let mut compressor = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, base)
+                    .expect("dictionary compressor");
+                sink += compressor.compress(raw).expect("delta compress").len();
+            }
+            timings[levels.len()].push(start.elapsed().as_nanos() as f64 / samples.len() as f64);
+            sinks[levels.len()] = sink;
         }
-        timings[levels.len()].push(start.elapsed().as_nanos() as f64 / samples.len() as f64);
-        sinks[levels.len()] = sink;
     }
     for (slot, timing) in timings.iter_mut().enumerate() {
         timing.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        // The slot is part of the arm name because the same level may be timed
+        // in several slots as a null control, and then "level1" alone no longer
+        // identifies a row.
         let arm = if slot == levels.len() {
-            "delta_level1".to_owned()
+            "delta".to_owned()
         } else {
             format!("level{}", levels[slot])
         };
         println!(
-            "ENCODE\tarm={arm}\treps={reps}\tns_median={:.0}\tns_p95={:.0}\tframe_bytes={}\tframe_bytes_per_payload={}",
+            "ENCODE\tarm={arm}\tslot={slot}\treps={reps}\tns_median={:.0}\tns_p95={:.0}\tns_min={:.0}\tframe_bytes={}\tframe_bytes_per_payload={}",
             percentile(timing, 0.5),
             percentile(timing, 0.95),
+            timing.first().copied().unwrap_or_default(),
             sinks[slot],
             sinks[slot] / samples.len(),
         );
