@@ -28,6 +28,8 @@ mod transaction;
 mod undo_redo;
 
 pub(crate) use media_upload::stage_reclaimable_upload_receipts;
+#[cfg(feature = "storage-benches")]
+pub(crate) use merge::{MergeCommitsForBench, analyze_merge_for_bench};
 
 pub use crate::common::{
     ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,

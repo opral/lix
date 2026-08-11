@@ -63,6 +63,10 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_DIRECT_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_GENERIC_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -399,6 +403,20 @@ pub struct CrudCurrentStateScopedRangeAccounting {
     pub sealed_manifest_loads: u64,
     pub replay_manifest_loads: u64,
     pub ordered_delta_fallbacks: u64,
+    pub commit_delta_direct_segments: u64,
+    pub commit_delta_direct_rows: u64,
+    pub commit_delta_generic_segments: u64,
+    pub commit_delta_generic_rows: u64,
+}
+
+pub(crate) fn record_commit_delta_leaf_layout(rows: usize, direct: bool) {
+    let (segments, encoded_rows) = if direct {
+        (&COMMIT_DELTA_DIRECT_SEGMENTS, &COMMIT_DELTA_DIRECT_ROWS)
+    } else {
+        (&COMMIT_DELTA_GENERIC_SEGMENTS, &COMMIT_DELTA_GENERIC_ROWS)
+    };
+    segments.fetch_add(1, Ordering::Relaxed);
+    encoded_rows.fetch_add(rows as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn record_crud_current_state_scoped_range_attempt() {
@@ -433,6 +451,10 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_segments: COMMIT_DELTA_DIRECT_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_direct_rows: COMMIT_DELTA_DIRECT_ROWS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_segments: COMMIT_DELTA_GENERIC_SEGMENTS.swap(0, Ordering::Relaxed),
+        commit_delta_generic_rows: COMMIT_DELTA_GENERIC_ROWS.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -539,8 +561,9 @@ where
             "merge-base benchmark ancestry must be positive",
         ));
     }
-    let mut records = Vec::new();
-    let mut generations = std::collections::HashMap::new();
+    let mut records = Vec::<crate::changelog::CommitRecord>::new();
+    let mut generations = std::collections::HashMap::<crate::changelog::CommitId, u64>::new();
+    let mut record_indices = std::collections::HashMap::<crate::changelog::CommitId, usize>::new();
     let scenario_name = match scenario {
         MergeBaseBenchScenario::EqualHeads => "equal",
         MergeBaseBenchScenario::AncestorDescendant => "ancestor",
@@ -564,11 +587,23 @@ where
             .max()
             .map_or(0, |generation| generation.saturating_add(1));
         let commit_id = crate::changelog::CommitId::for_test_label(&label);
+        let parent = parents
+            .as_slice()
+            .first()
+            .and_then(|parent_id| record_indices.get(parent_id))
+            .map(|index| &records[*index]);
+        let parent_jump = parent
+            .and_then(|parent| record_indices.get(&parent.first_parent_jump_commit_id))
+            .map(|index| &records[*index]);
+        let (first_parent_jump_commit_id, first_parent_jump_span) =
+            crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id,
             generation,
             parent_commit_ids: parents,
+            first_parent_jump_commit_id,
+            first_parent_jump_span,
             change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -577,6 +612,7 @@ where
             ),
         });
         generations.insert(commit_id, generation);
+        record_indices.insert(commit_id, records.len() - 1);
         Ok(commit_id)
     };
 
@@ -706,28 +742,19 @@ where
         reader.merge_base(&left, &right).await?
     };
     let mut reader = crate::tracked_state::TrackedStateContext::new().reader(&read);
-    let target_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            left_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
-    let source_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            right_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
+    let analysis = crate::session::analyze_merge_for_bench(
+        &mut reader,
+        crate::session::MergeCommitsForBench {
+            base_commit_id: base,
+            target_commit_id: left,
+            source_commit_id: right,
+        },
+    )
+    .await?;
     Ok(MergePreparationBenchResult {
-        base_commit_id: base.to_string(),
-        target_entries,
-        source_entries,
+        base_commit_id: analysis.commits.base_commit_id.to_string(),
+        target_entries: analysis.target_diff.entries.len(),
+        source_entries: analysis.source_diff.entries.len(),
     })
 }
 

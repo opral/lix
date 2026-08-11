@@ -313,16 +313,272 @@ pub(crate) struct ChangelogAppend {
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitRecord {
-    /// Version 2 removes physical replay policy from the semantic commit row.
+    /// Version 3 adds the authenticated first-parent jump certified below.
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
     /// smaller generation, enabling bounded priority graph walks.
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
+    /// Myers applicative-random-access-stack jump. It is derived from this
+    /// record's first parent and lives in the same immutable authority.
+    pub(crate) first_parent_jump_commit_id: CommitId,
+    /// Number of first-parent edges covered by the jump. Roots and merge
+    /// commits reset the linear lane with a self jump of span zero.
+    pub(crate) first_parent_jump_span: u64,
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
+}
+
+/// Derives the one-pointer Myers jump owned by a new immutable commit.
+///
+/// If the parent's jump and its jump cover equal spans, the child composes
+/// them; otherwise it points to its parent. The resulting random-access stack
+/// answers level-ancestor and linear LCA queries in at most logarithmic hops
+/// with one pointer per node.
+///
+/// See Eugene W. Myers, “An Applicative Random-Access Stack,” Information
+/// Processing Letters 17(5), 1983, doi:10.1016/0020-0190(83)90106-0.
+pub(crate) fn next_first_parent_jump(
+    commit_id: CommitId,
+    parent_commit_ids: &[CommitId],
+    parent: Option<&CommitRecord>,
+    parent_jump: Option<&CommitRecord>,
+) -> Result<(CommitId, u64), LixError> {
+    match parent_commit_ids {
+        [parent_commit_id] => {
+            let parent = parent.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has no parent jump metadata"),
+                )
+            })?;
+            if parent.commit_id != *parent_commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' resolved the wrong parent jump record"),
+                ));
+            }
+            let jump = parent_jump.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has no parent jump target"),
+                )
+            })?;
+            if jump.commit_id != parent.first_parent_jump_commit_id
+                || parent.generation.checked_sub(jump.generation)
+                    != Some(parent.first_parent_jump_span)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "commit '{}' has invalid first-parent jump metadata",
+                        parent.commit_id
+                    ),
+                ));
+            }
+            if parent.first_parent_jump_span == jump.first_parent_jump_span {
+                let span = 1u64
+                    .checked_add(parent.first_parent_jump_span)
+                    .and_then(|value| value.checked_add(jump.first_parent_jump_span))
+                    .ok_or_else(|| LixError::unknown("first-parent jump span exceeds u64"))?;
+                Ok((jump.first_parent_jump_commit_id, span))
+            } else {
+                Ok((parent.commit_id, 1))
+            }
+        }
+        _ => Ok((commit_id, 0)),
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::{ChangeId, CommitId, CommitRecord, next_first_parent_jump};
+    use crate::common::LixTimestamp;
+
+    #[test]
+    fn myers_jumps_are_logarithmic_for_every_level_ancestor_through_4096() {
+        let mut records = vec![record(0, None, None)];
+        for depth in 1..=4_096u64 {
+            let parent = records.last().expect("linear parent");
+            let jump = &records[usize::try_from(parent.generation - parent.first_parent_jump_span)
+                .expect("jump depth fits usize")];
+            let commit_id = id(depth);
+            let (jump_id, jump_span) =
+                next_first_parent_jump(commit_id, &[parent.commit_id], Some(parent), Some(jump))
+                    .expect("derive Myers jump");
+            records.push(record(
+                depth,
+                Some(parent.commit_id),
+                Some((jump_id, jump_span)),
+            ));
+        }
+
+        for start in 1..records.len() {
+            for target in 0..start {
+                let mut cursor = start;
+                let mut hops = 0usize;
+                while cursor > target {
+                    let node = &records[cursor];
+                    let jump = cursor
+                        - usize::try_from(node.first_parent_jump_span)
+                            .expect("jump span fits usize");
+                    cursor = if jump >= target { jump } else { cursor - 1 };
+                    hops += 1;
+                }
+                // Myers' bound is expressed with the ceiling logarithm of
+                // the stack length; `start` is one less than that length.
+                let ceil_log =
+                    usize::try_from(usize::BITS - start.leading_zeros()).expect("log fits usize");
+                let bound = 3 * ceil_log - 2;
+                assert!(
+                    hops <= bound,
+                    "start={start} target={target} hops={hops} bound={bound}"
+                );
+            }
+        }
+
+        let merge = id(5_000);
+        assert_eq!(
+            next_first_parent_jump(merge, &[id(1), id(2)], None, None).expect("merge resets jump"),
+            (merge, 0)
+        );
+    }
+
+    #[test]
+    fn myers_lca_matches_parent_walker_for_exhaustive_branch_splits() {
+        #[derive(Clone, Copy)]
+        struct Node {
+            parent: Option<usize>,
+            jump: usize,
+            span: usize,
+            depth: usize,
+        }
+
+        fn push(nodes: &mut Vec<Node>, parent: Option<usize>) -> usize {
+            let index = nodes.len();
+            let Some(parent_index) = parent else {
+                nodes.push(Node {
+                    parent: None,
+                    jump: index,
+                    span: 0,
+                    depth: 0,
+                });
+                return index;
+            };
+            let parent = nodes[parent_index];
+            let parent_jump = nodes[parent.jump];
+            let (jump, span) = if parent.span == parent_jump.span {
+                (parent_jump.jump, 1 + parent.span + parent_jump.span)
+            } else {
+                (parent_index, 1)
+            };
+            nodes.push(Node {
+                parent: Some(parent_index),
+                jump,
+                span,
+                depth: parent.depth + 1,
+            });
+            index
+        }
+
+        fn general_lca(nodes: &[Node], mut left: usize, mut right: usize) -> usize {
+            while nodes[left].depth > nodes[right].depth {
+                left = nodes[left].parent.expect("non-root has parent");
+            }
+            while nodes[right].depth > nodes[left].depth {
+                right = nodes[right].parent.expect("non-root has parent");
+            }
+            while left != right {
+                left = nodes[left].parent.expect("fork side has parent");
+                right = nodes[right].parent.expect("fork side has parent");
+            }
+            left
+        }
+
+        fn myers_lca(nodes: &[Node], mut left: usize, mut right: usize) -> (usize, usize) {
+            let mut hops = 0;
+            while nodes[left].depth != nodes[right].depth {
+                let (deeper, target) = if nodes[left].depth > nodes[right].depth {
+                    (&mut left, nodes[right].depth)
+                } else {
+                    (&mut right, nodes[left].depth)
+                };
+                let jump = nodes[*deeper].jump;
+                *deeper = if nodes[jump].depth >= target {
+                    jump
+                } else {
+                    nodes[*deeper].parent.expect("non-root has parent")
+                };
+                hops += 1;
+            }
+            while left != right {
+                if nodes[left].jump == nodes[right].jump {
+                    left = nodes[left].parent.expect("fork side has parent");
+                    right = nodes[right].parent.expect("fork side has parent");
+                } else {
+                    left = nodes[left].jump;
+                    right = nodes[right].jump;
+                }
+                hops += 1;
+            }
+            (left, hops)
+        }
+
+        let mut nodes = Vec::new();
+        let root = push(&mut nodes, None);
+        let mut trunk = vec![root];
+        for _ in 0..64 {
+            trunk.push(push(&mut nodes, trunk.last().copied()));
+        }
+        for (split_depth, fork) in trunk.iter().copied().enumerate() {
+            for left_len in 1..=32 {
+                let mut left = fork;
+                for _ in 0..left_len {
+                    left = push(&mut nodes, Some(left));
+                }
+                for right_len in 1..=32 {
+                    let mut right = fork;
+                    for _ in 0..right_len {
+                        right = push(&mut nodes, Some(right));
+                    }
+                    let expected = general_lca(&nodes, left, right);
+                    let (actual, hops) = myers_lca(&nodes, left, right);
+                    let max_depth = nodes[left].depth.max(nodes[right].depth);
+                    let bound =
+                        6 * usize::try_from((max_depth + 1).ilog2()).expect("log fits usize") + 2;
+                    assert_eq!(
+                        actual, expected,
+                        "split={split_depth} left={left_len} right={right_len}"
+                    );
+                    assert!(
+                        hops <= bound,
+                        "split={split_depth} left={left_len} right={right_len} hops={hops} bound={bound}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn id(depth: u64) -> CommitId {
+        CommitId::for_test_label(&format!("myers-{depth}"))
+    }
+
+    fn record(depth: u64, parent: Option<CommitId>, jump: Option<(CommitId, u64)>) -> CommitRecord {
+        let commit_id = id(depth);
+        CommitRecord {
+            format_version: 3,
+            commit_id,
+            generation: depth,
+            parent_commit_ids: parent.into_iter().collect(),
+            first_parent_jump_commit_id: jump.map_or(commit_id, |jump| jump.0),
+            first_parent_jump_span: jump.map_or(0, |jump| jump.1),
+            change_id: ChangeId::for_test_label(&format!("myers-change-{depth}")),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: LixTimestamp::expect_parse("Myers test timestamp", "2026-08-11T00:00:00Z"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
