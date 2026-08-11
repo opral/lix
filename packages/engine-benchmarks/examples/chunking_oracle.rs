@@ -30,6 +30,10 @@ enum Policy {
     Cdc {
         avg_bytes: usize,
         anchor_bytes: Option<usize>,
+        /// Divisor for the minimum chunk size. FastCDC skips `min` bytes
+        /// without hashing at the start of every chunk, so a larger minimum is
+        /// directly less CPU per written byte.
+        min_divisor: usize,
     },
 }
 
@@ -40,11 +44,18 @@ impl Policy {
             Self::Cdc {
                 avg_bytes,
                 anchor_bytes: None,
-            } => format!("cdc/{}", human(*avg_bytes)),
+                min_divisor,
+            } => format!("cdc/{}/min{}", human(*avg_bytes), min_divisor),
             Self::Cdc {
                 avg_bytes,
                 anchor_bytes: Some(anchor),
-            } => format!("cdc/{}@{}", human(*avg_bytes), human(*anchor)),
+                min_divisor,
+            } => format!(
+                "cdc/{}@{}/min{}",
+                human(*avg_bytes),
+                human(*anchor),
+                min_divisor
+            ),
         }
     }
 
@@ -57,15 +68,20 @@ impl Policy {
             Self::Cdc {
                 avg_bytes,
                 anchor_bytes,
+                min_divisor,
             } => {
                 let span = anchor_bytes.unwrap_or(usize::MAX);
                 let mut out = Vec::new();
                 let mut base = 0usize;
                 while base < data.len() {
                     let end = base.saturating_add(span).min(data.len());
-                    out.extend(cdc_ranges(&data[base..end], *avg_bytes).into_iter().map(
-                        |(start, stop)| (base.saturating_add(start), base.saturating_add(stop)),
-                    ));
+                    out.extend(
+                        cdc_ranges(&data[base..end], *avg_bytes, *min_divisor)
+                            .into_iter()
+                            .map(|(start, stop)| {
+                                (base.saturating_add(start), base.saturating_add(stop))
+                            }),
+                    );
                     base = end;
                 }
                 out
@@ -74,11 +90,11 @@ impl Policy {
     }
 }
 
-fn cdc_ranges(data: &[u8], avg_bytes: usize) -> Vec<(usize, usize)> {
+fn cdc_ranges(data: &[u8], avg_bytes: usize, min_divisor: usize) -> Vec<(usize, usize)> {
     if data.is_empty() {
         return Vec::new();
     }
-    let min = (avg_bytes / 4).max(64) as u32;
+    let min = (avg_bytes * 1 / min_divisor).max(64) as u32;
     let avg = avg_bytes as u32;
     let max = (avg_bytes * 4) as u32;
     fastcdc::v2020::FastCDC::new(data, min, avg, max)
@@ -94,37 +110,64 @@ fn human(bytes: usize) -> String {
     }
 }
 
-const POLICIES: &[Policy] = &[
-    Policy::Fixed {
-        chunk_bytes: 1 << 20,
+/// A scenario names the policy that chunked v1 and the policy that chunks v2.
+/// They differ only for `mixed/*`, which models gating the chunker on write
+/// context: v1 arrives as an initial write, v2 as a rewrite.
+struct Scenario {
+    label: &'static str,
+    v1: Policy,
+    v2: Policy,
+}
+
+const FIXED_1M: Policy = Policy::Fixed {
+    chunk_bytes: 1 << 20,
+};
+const CDC_1M: Policy = Policy::Cdc {
+    avg_bytes: 1 << 20,
+    anchor_bytes: Some(16 << 20),
+    min_divisor: 4,
+};
+const CDC_1M_MIN2: Policy = Policy::Cdc {
+    avg_bytes: 1 << 20,
+    anchor_bytes: Some(16 << 20),
+    min_divisor: 2,
+};
+const CDC_1M_MIN1_33: Policy = Policy::Cdc {
+    avg_bytes: 1 << 20,
+    anchor_bytes: Some(16 << 20),
+    min_divisor: 1,
+};
+
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        label: "fixed/1m",
+        v1: FIXED_1M,
+        v2: FIXED_1M,
     },
-    Policy::Fixed {
-        chunk_bytes: 256 << 10,
+    Scenario {
+        label: "cdc/1m@16m/min4",
+        v1: CDC_1M,
+        v2: CDC_1M,
     },
-    Policy::Fixed {
-        chunk_bytes: 64 << 10,
+    Scenario {
+        label: "cdc/1m@16m/min2",
+        v1: CDC_1M_MIN2,
+        v2: CDC_1M_MIN2,
     },
-    Policy::Cdc {
-        avg_bytes: 1 << 20,
-        anchor_bytes: None,
+    Scenario {
+        label: "cdc/1m@16m/min1",
+        v1: CDC_1M_MIN1_33,
+        v2: CDC_1M_MIN1_33,
     },
-    Policy::Cdc {
-        avg_bytes: 256 << 10,
-        anchor_bytes: None,
-    },
-    Policy::Cdc {
-        avg_bytes: 64 << 10,
-        anchor_bytes: None,
-    },
-    Policy::Cdc {
-        avg_bytes: 1 << 20,
-        anchor_bytes: Some(16 << 20),
-    },
-    Policy::Cdc {
-        avg_bytes: 256 << 10,
-        anchor_bytes: Some(16 << 20),
+    // The proposed gate: fixed chunking on the initial write, CDC on rewrites.
+    Scenario {
+        label: "mixed/fixed-v1_cdc-v2",
+        v1: FIXED_1M,
+        v2: CDC_1M,
     },
 ];
+
+const THROUGHPUT_POLICIES: &[Policy] = &[FIXED_1M, CDC_1M, CDC_1M_MIN2, CDC_1M_MIN1_33];
 
 const EDIT_BYTES: usize = 4 << 10;
 
@@ -149,8 +192,8 @@ fn main() {
             .into_owned();
         let base = fs::read(case.join("base.bin")).expect("read case base.bin");
         for (shape, v2) in shapes(&case, &base) {
-            for policy in POLICIES {
-                report(&name, &shape, *policy, &base, &v2);
+            for scenario in SCENARIOS {
+                report(&name, &shape, scenario, &base, &v2);
             }
         }
     }
@@ -168,7 +211,7 @@ fn main() {
             largest = data;
         }
     }
-    for policy in POLICIES {
+    for policy in THROUGHPUT_POLICIES {
         let mut best = f64::MAX;
         for _ in 0..9 {
             let started = Instant::now();
@@ -245,9 +288,9 @@ fn shapes(case: &Path, base: &[u8]) -> Vec<(String, Vec<u8>)> {
     shapes
 }
 
-fn report(case: &str, shape: &str, policy: Policy, base: &[u8], v2: &[u8]) {
-    let base_ranges = policy.ranges(base);
-    let v2_ranges = policy.ranges(v2);
+fn report(case: &str, shape: &str, scenario: &Scenario, base: &[u8], v2: &[u8]) {
+    let base_ranges = scenario.v1.ranges(base);
+    let v2_ranges = scenario.v2.ranges(v2);
     let known = base_ranges
         .iter()
         .map(|&(start, end)| *blake3::hash(&base[start..end]).as_bytes())
@@ -269,7 +312,7 @@ fn report(case: &str, shape: &str, policy: Policy, base: &[u8], v2: &[u8]) {
          v1_bytes={},v2_bytes={},v1_chunks={},v2_chunks={},\
          new_chunks={new_chunks},new_bytes={new_bytes},shared_bytes={shared},\
          sharing_ratio={:.4},mean_chunk_bytes={}",
-        policy.label(),
+        scenario.label,
         base.len(),
         v2.len(),
         base_ranges.len(),
