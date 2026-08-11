@@ -15,7 +15,7 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitRecord,
     CommitScanRequest,
 };
-use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_nodes};
+use crate::commit_graph::walker::{ReachableWalk, best_common_ancestors, walk_reachable_nodes};
 use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
     CommitGraphHistory, CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
@@ -70,7 +70,10 @@ where
 {
     store: S,
     node_cache: HashMap<CommitId, Option<CommitGraphNode>>,
-    reachable_nodes_cache: HashMap<CommitId, Arc<[ReachableCommitGraphNode]>>,
+    /// Keyed by traversal head and depth bound. A bounded walk is a distinct
+    /// result from the unbounded one, but an already materialized unbounded
+    /// walk answers every bounded request without touching storage again.
+    reachable_nodes_cache: HashMap<(CommitId, Option<u32>), Arc<[ReachableCommitGraphNode]>>,
     // A reader is bound to one pinned storage snapshot for the duration of a
     // SQL statement. File-history shaping asks the same reader for distinct
     // schema slices of that history, so retain immutable change records here.
@@ -218,12 +221,33 @@ where
         &mut self,
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
-        if let Some(nodes) = self.reachable_nodes_cache.get(head_commit_id) {
+        self.reachable_nodes_within_depth(head_commit_id, None).await
+    }
+
+    /// Walks from `head_commit_id` and stops once `max_depth` is complete.
+    async fn reachable_nodes_within_depth(
+        &mut self,
+        head_commit_id: &CommitId,
+        max_depth: Option<u32>,
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+        if let Some(nodes) = self.reachable_nodes_cache.get(&(*head_commit_id, max_depth)) {
             return Ok(Arc::clone(nodes));
         }
-        let nodes = Arc::from(walk_reachable_nodes(self, head_commit_id).await?);
+        if let Some(max_depth_value) = max_depth
+            && let Some(nodes) = self.reachable_nodes_cache.get(&(*head_commit_id, None))
+        {
+            let bounded = nodes
+                .iter()
+                .take_while(|reachable| reachable.depth <= max_depth_value)
+                .cloned()
+                .collect::<Arc<[_]>>();
+            self.reachable_nodes_cache
+                .insert((*head_commit_id, max_depth), Arc::clone(&bounded));
+            return Ok(bounded);
+        }
+        let nodes = Arc::from(walk_reachable_nodes(self, head_commit_id, max_depth).await?);
         self.reachable_nodes_cache
-            .insert(*head_commit_id, Arc::clone(&nodes));
+            .insert((*head_commit_id, max_depth), Arc::clone(&nodes));
         Ok(nodes)
     }
 
@@ -400,70 +424,117 @@ where
         start_commit_id: &CommitId,
         request: &CommitGraphChangeHistoryRequest,
     ) -> Result<CommitGraphHistory, LixError> {
-        let nodes = self.reachable_nodes(start_commit_id).await?;
-        let member_schema_keys = request
-            .schema_keys
-            .iter()
-            .filter(|schema_key| schema_key.as_str() != COMMIT_SCHEMA_KEY)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut member_schema_keys = member_schema_keys;
-        member_schema_keys.sort();
-        member_schema_keys.dedup();
-        let may_include_members = request.schema_keys.is_empty() || !member_schema_keys.is_empty();
-        let may_include_commits = request.schema_keys.is_empty()
-            || request
-                .schema_keys
-                .iter()
-                .any(|schema_key| schema_key == COMMIT_SCHEMA_KEY);
-        let mut entries = Vec::new();
-        let mut seen_changes = BTreeSet::new();
+        let shaping = HistoryShaping::new(request);
+        let mut state = HistoryCollection::default();
 
-        for reachable in nodes.iter() {
-            if !depth_matches(reachable.depth, request) {
-                continue;
+        // Unbounded row demand still materializes and caches the whole
+        // depth-bounded topology, because callers reuse it for commit metadata.
+        let Some(limit) = request.limit else {
+            let nodes = self
+                .reachable_nodes_within_depth(start_commit_id, request.max_depth)
+                .await?;
+            for reachable in nodes.iter() {
+                self.extend_history_entries(
+                    start_commit_id,
+                    &reachable.commit,
+                    reachable.depth,
+                    request,
+                    &shaping,
+                    &mut state,
+                )
+                .await?;
             }
+            return Ok(CommitGraphHistory {
+                entries: state.entries,
+                reachable_nodes: nodes,
+            });
+        };
 
-            let node = &reachable.commit;
-            if may_include_commits {
-                let canonical_change = canonical_commit_change(node);
-                if seen_changes.insert(history_change_identity(&canonical_change))
-                    && change_matches_history_request(&canonical_change, request)
-                {
-                    entries.push(CommitGraphChangeHistoryEntry {
-                        change: canonical_change,
-                        observed_commit_id: node.commit_id,
-                        start_commit_id: *start_commit_id,
-                        depth: reachable.depth,
-                    });
+        // Bounded row demand stops the traversal itself. Breadth-first layers
+        // arrive in the same order the entries are published, so the first
+        // `limit` entries are exactly the ones an unbounded read would expose.
+        let mut walk = ReachableWalk::new(*start_commit_id);
+        let mut reachable_nodes = Vec::new();
+        while state.entries.len() < limit {
+            let Some(layer) = walk.next_layer(self).await? else {
+                break;
+            };
+            let depth = layer.depth;
+            for node in layer.commits {
+                self.extend_history_entries(
+                    start_commit_id,
+                    &node,
+                    depth,
+                    request,
+                    &shaping,
+                    &mut state,
+                )
+                .await?;
+                reachable_nodes.push(ReachableCommitGraphNode { commit: node, depth });
+                if state.entries.len() >= limit {
+                    break;
                 }
             }
-
-            if !may_include_members {
-                continue;
-            }
-            for change in self
-                .load_member_changes(node.commit_id, &member_schema_keys)
-                .await?
-            {
-                if !seen_changes.insert(history_change_identity(&change)) {
-                    continue;
-                }
-                if change_matches_history_request(&change, request) {
-                    entries.push(CommitGraphChangeHistoryEntry {
-                        change,
-                        observed_commit_id: node.commit_id,
-                        start_commit_id: *start_commit_id,
-                        depth: reachable.depth,
-                    });
-                }
+            if request.max_depth.is_some_and(|max_depth| depth >= max_depth) {
+                break;
             }
         }
 
         Ok(CommitGraphHistory {
-            entries,
-            reachable_nodes: nodes,
+            entries: state.entries,
+            reachable_nodes: Arc::from(reachable_nodes),
         })
+    }
+
+    async fn extend_history_entries(
+        &mut self,
+        start_commit_id: &CommitId,
+        node: &CommitGraphNode,
+        depth: u32,
+        request: &CommitGraphChangeHistoryRequest,
+        shaping: &HistoryShaping,
+        state: &mut HistoryCollection,
+    ) -> Result<(), LixError> {
+        if !depth_matches(depth, request) {
+            return Ok(());
+        }
+
+        if shaping.may_include_commits {
+            let canonical_change = canonical_commit_change(node);
+            if state
+                .seen_changes
+                .insert(history_change_identity(&canonical_change))
+                && change_matches_history_request(&canonical_change, request)
+            {
+                state.entries.push(CommitGraphChangeHistoryEntry {
+                    change: canonical_change,
+                    observed_commit_id: node.commit_id,
+                    start_commit_id: *start_commit_id,
+                    depth,
+                });
+            }
+        }
+
+        if !shaping.may_include_members {
+            return Ok(());
+        }
+        for change in self
+            .load_member_changes(node.commit_id, &shaping.member_schema_keys)
+            .await?
+        {
+            if !state.seen_changes.insert(history_change_identity(&change)) {
+                continue;
+            }
+            if change_matches_history_request(&change, request) {
+                state.entries.push(CommitGraphChangeHistoryEntry {
+                    change,
+                    observed_commit_id: node.commit_id,
+                    start_commit_id: *start_commit_id,
+                    depth,
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn load_member_changes(
@@ -497,6 +568,44 @@ where
             .insert(commit_id, changes.clone());
         Ok(changes)
     }
+}
+
+/// Request-derived shaping decisions that do not change while a history read
+/// walks the graph.
+struct HistoryShaping {
+    member_schema_keys: Vec<String>,
+    may_include_members: bool,
+    may_include_commits: bool,
+}
+
+impl HistoryShaping {
+    fn new(request: &CommitGraphChangeHistoryRequest) -> Self {
+        let mut member_schema_keys = request
+            .schema_keys
+            .iter()
+            .filter(|schema_key| schema_key.as_str() != COMMIT_SCHEMA_KEY)
+            .cloned()
+            .collect::<Vec<_>>();
+        member_schema_keys.sort();
+        member_schema_keys.dedup();
+        let may_include_members = request.schema_keys.is_empty() || !member_schema_keys.is_empty();
+        let may_include_commits = request.schema_keys.is_empty()
+            || request
+                .schema_keys
+                .iter()
+                .any(|schema_key| schema_key == COMMIT_SCHEMA_KEY);
+        Self {
+            member_schema_keys,
+            may_include_members,
+            may_include_commits,
+        }
+    }
+}
+
+#[derive(Default)]
+struct HistoryCollection {
+    entries: Vec<CommitGraphChangeHistoryEntry>,
+    seen_changes: BTreeSet<(ChangeId, String, Option<String>, EntityPk)>,
 }
 
 fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphChange {
@@ -1004,6 +1113,106 @@ mod tests {
                     1
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_history_stops_traversing_instead_of_truncating() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                entity_change("change-root", "entity-root", "test_schema", "{}"),
+                entity_change("change-middle", "entity-middle", "test_schema", "{}"),
+                entity_change("change-head", "entity-head", "test_schema", "{}"),
+                commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
+                commit_change(
+                    "commit-middle-change",
+                    "commit-middle",
+                    &["change-middle"],
+                    &["commit-root"],
+                ),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-head"],
+                    &["commit-middle"],
+                ),
+            ],
+        )
+        .await;
+
+        let commit_head = commit_id("commit-head");
+        let base_request = CommitGraphChangeHistoryRequest {
+            schema_keys: vec!["test_schema".to_string()],
+            include_tombstones: true,
+            ..CommitGraphChangeHistoryRequest::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let full = reader
+            .change_history_from_commit(&commit_head, &base_request)
+            .await
+            .expect("full history should resolve");
+        assert_eq!(full.entries.len(), 3);
+        assert_eq!(full.reachable_nodes.len(), 3);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let limited = reader
+            .change_history_from_commit(
+                &commit_head,
+                &CommitGraphChangeHistoryRequest {
+                    limit: Some(1),
+                    ..base_request.clone()
+                },
+            )
+            .await
+            .expect("bounded history should resolve");
+        assert_eq!(
+            limited
+                .entries
+                .iter()
+                .map(|entry| entry.change.id)
+                .collect::<Vec<_>>(),
+            full.entries[..1]
+                .iter()
+                .map(|entry| entry.change.id)
+                .collect::<Vec<_>>(),
+            "a bounded read must expose the same prefix an unbounded read would"
+        );
+        assert_eq!(
+            limited.reachable_nodes.len(),
+            1,
+            "a satisfied row bound must stop the walk, not truncate afterwards"
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let shallow = reader
+            .change_history_from_commit(
+                &commit_head,
+                &CommitGraphChangeHistoryRequest {
+                    max_depth: Some(0),
+                    ..base_request
+                },
+            )
+            .await
+            .expect("depth-bounded history should resolve");
+        assert_eq!(shallow.entries.len(), 1);
+        assert_eq!(
+            shallow.reachable_nodes.len(),
+            1,
+            "a depth bound must stop the walk, not filter it afterwards"
         );
     }
 

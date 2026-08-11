@@ -10,18 +10,116 @@ use crate::storage_adapter::StorageAdapterRead;
 /// Walks parent links from `head_commit_id` and returns reachable commits
 /// nearest-first.
 ///
+/// `max_depth` bounds the walk itself. A caller that only wants the first few
+/// generations pays for those generations, not for the whole graph.
+///
 /// The walker is intentionally storage-free. It asks `CommitGraphReader` to
-/// load parsed commit facts and owns only traversal concerns: caching, cycle
+/// load parsed commit facts and owns only traversal concerns: batching, cycle
 /// detection, and nearest-depth selection.
 pub(crate) async fn walk_reachable_nodes<S>(
     reader: &mut CommitGraphStoreReader<S>,
     head_commit_id: &CommitId,
+    max_depth: Option<u32>,
 ) -> Result<Vec<ReachableCommitGraphNode>, LixError>
 where
     S: StorageAdapterRead,
 {
-    let mut loader = NodeTraversalLoader::new(reader);
-    loader.walk(head_commit_id).await
+    let mut walk = ReachableWalk::new(*head_commit_id);
+    let mut commits = Vec::new();
+    while let Some(layer) = walk.next_layer(reader).await? {
+        let depth = layer.depth;
+        commits.extend(
+            layer
+                .commits
+                .into_iter()
+                .map(|commit| ReachableCommitGraphNode { commit, depth }),
+        );
+        if max_depth.is_some_and(|max_depth| depth >= max_depth) {
+            break;
+        }
+    }
+    Ok(commits)
+}
+
+/// One nearest-depth generation of a reachable-commit walk.
+pub(crate) struct ReachableLayer {
+    pub(crate) depth: u32,
+    pub(crate) commits: Vec<CommitGraphNode>,
+}
+
+/// Resumable breadth-first cursor over the reachable commit graph.
+///
+/// Breadth-first order is the order the history surfaces already publish
+/// (nearest depth first, commit id within a depth), so a caller that has
+/// collected enough rows can simply stop asking for the next layer instead of
+/// materializing the remainder of the graph and truncating afterwards.
+///
+/// Each layer is loaded with one batched point read rather than one storage
+/// round-trip per commit.
+pub(crate) struct ReachableWalk {
+    seen: BTreeSet<CommitId>,
+    /// Frontier entries carry the generation of the child that discovered them.
+    /// Commit generations are strictly increasing away from the roots, so a
+    /// parent that fails to sit below its child proves a corrupt cycle.
+    frontier: Vec<(CommitId, u64)>,
+    depth: u32,
+}
+
+impl ReachableWalk {
+    pub(crate) fn new(head_commit_id: CommitId) -> Self {
+        Self {
+            seen: BTreeSet::from([head_commit_id]),
+            frontier: vec![(head_commit_id, u64::MAX)],
+            depth: 0,
+        }
+    }
+
+    pub(crate) async fn next_layer<S>(
+        &mut self,
+        reader: &mut CommitGraphStoreReader<S>,
+    ) -> Result<Option<ReachableLayer>, LixError>
+    where
+        S: StorageAdapterRead,
+    {
+        if self.frontier.is_empty() {
+            return Ok(None);
+        }
+        let depth = self.depth;
+        let mut frontier = std::mem::take(&mut self.frontier);
+        frontier.sort_unstable();
+        let commit_ids = frontier
+            .iter()
+            .map(|(commit_id, _)| *commit_id)
+            .collect::<Vec<_>>();
+        let loaded = reader.load_nodes(&commit_ids).await?;
+        let mut commits = Vec::with_capacity(commit_ids.len());
+        let mut next_frontier = Vec::new();
+        for ((commit_id, node), (_, child_generation)) in loaded.into_iter().zip(frontier.iter()) {
+            let Some(node) = node else {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("commit_graph missing commit '{commit_id}'"),
+                ));
+            };
+            if node.generation >= *child_generation {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "commit_graph cycle detected at commit '{commit_id}': it does not have a lower generation than the child that reaches it"
+                    ),
+                ));
+            }
+            for parent_commit_id in &node.parent_commit_ids {
+                if self.seen.insert(*parent_commit_id) {
+                    next_frontier.push((*parent_commit_id, node.generation));
+                }
+            }
+            commits.push(node);
+        }
+        self.frontier = next_frontier;
+        self.depth = depth.saturating_add(1);
+        Ok(Some(ReachableLayer { depth, commits }))
+    }
 }
 
 /// Returns the best common ancestors shared by two commit heads.
@@ -140,84 +238,6 @@ where
         Ok(best)
     }
 
-    async fn walk(
-        &mut self,
-        head_commit_id: &CommitId,
-    ) -> Result<Vec<ReachableCommitGraphNode>, LixError> {
-        let mut visiting = BTreeSet::new();
-        let mut nearest_depths = BTreeMap::new();
-        self.walk_commit(head_commit_id, 0, &mut visiting, &mut nearest_depths)
-            .await?;
-        let mut commits = Vec::with_capacity(nearest_depths.len());
-        for (commit_id, depth) in nearest_depths {
-            commits.push(ReachableCommitGraphNode {
-                commit: self.load_node(&commit_id).await?,
-                depth,
-            });
-        }
-        commits.sort_by(|left, right| {
-            left.depth
-                .cmp(&right.depth)
-                .then_with(|| left.commit.commit_id.cmp(&right.commit.commit_id))
-        });
-        Ok(commits)
-    }
-
-    async fn walk_commit(
-        &mut self,
-        commit_id: &CommitId,
-        depth: u32,
-        visiting: &mut BTreeSet<CommitId>,
-        nearest_depths: &mut BTreeMap<CommitId, u32>,
-    ) -> Result<(), LixError> {
-        let mut stack = vec![TraversalFrame {
-            commit_id: *commit_id,
-            depth,
-            expanded: false,
-        }];
-
-        while let Some(frame) = stack.pop() {
-            if frame.expanded {
-                visiting.remove(&frame.commit_id);
-                continue;
-            }
-
-            if visiting.contains(&frame.commit_id) {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "commit_graph cycle detected at commit '{}'",
-                        frame.commit_id
-                    ),
-                ));
-            }
-
-            if let Some(previous_depth) = nearest_depths.get(&frame.commit_id) {
-                if *previous_depth <= frame.depth {
-                    continue;
-                }
-            }
-
-            let commit = self.load_node(&frame.commit_id).await?;
-            nearest_depths.insert(frame.commit_id, frame.depth);
-
-            visiting.insert(frame.commit_id);
-            stack.push(TraversalFrame {
-                commit_id: frame.commit_id,
-                depth: frame.depth,
-                expanded: true,
-            });
-            for parent_commit_id in commit.parent_commit_ids.iter().rev() {
-                stack.push(TraversalFrame {
-                    commit_id: *parent_commit_id,
-                    depth: frame.depth + 1,
-                    expanded: false,
-                });
-            }
-        }
-        Ok(())
-    }
-
     async fn load_node(&mut self, commit_id: &CommitId) -> Result<CommitGraphNode, LixError> {
         let Some(commit) = self.reader.load_node(commit_id).await? else {
             return Err(LixError::new(
@@ -227,12 +247,6 @@ where
         };
         Ok(commit)
     }
-}
-
-struct TraversalFrame {
-    commit_id: CommitId,
-    depth: u32,
-    expanded: bool,
 }
 
 #[cfg(test)]
