@@ -264,7 +264,7 @@ where
             let chunks = if content.is_empty() {
                 Vec::new()
             } else {
-                writer.stage_fixed_part(&content).await?
+                writer.stage_upload_part(&content).await?
             };
             drop(writer);
             let leaf = UploadManifestLeaf {
@@ -411,7 +411,7 @@ where
         let receipt = self
             .binary_cas
             .writer_skipping_existing_chunks(&read, &mut finalization_writes)
-            .stage_fixed_manifest(&receipts)?;
+            .stage_upload_manifest(&receipts)?;
         let complete = UploadState::Complete(UploadComplete {
             path: state.path.clone(),
             total_size: state.total_size,
@@ -905,7 +905,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let receipts = crate::binary_cas::BinaryCasContext::new()
             .writer_skipping_existing_chunks(&read, &mut writes)
-            .stage_fixed_part(payload)
+            .stage_upload_part(payload)
             .await
             .expect("orphan fixed chunk should stage");
         assert_eq!(receipts.len(), 1);
@@ -979,7 +979,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let chunks = crate::binary_cas::BinaryCasContext::new()
             .writer_skipping_existing_chunks(read, &mut writes)
-            .stage_fixed_part(payload)
+            .stage_upload_part(payload)
             .await
             .expect("deduplicated receipt chunk should stage");
         assert_eq!(
