@@ -104,6 +104,11 @@ name = "cas_publication_epoch_qualification"
 path = "examples/cas_publication_epoch_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
+[[example]]
+name = "expW_hot_row_anatomy"
+path = "examples/expW_hot_row_anatomy.rs"
+required-features = ["storage-benches", "slatedb"]
+
 [[test]]
 name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"
