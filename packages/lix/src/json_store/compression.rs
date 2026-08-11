@@ -4,10 +4,20 @@ use crate::compression::decompress_zstd;
 /// Compression level for JSON-store payloads.
 ///
 /// Level 3 is zstd's own default and is better tuned than level 1 for the
-/// multi-kilobyte JSON this store holds: measured across six corpora it emits
-/// 2.9-8.9% smaller frames at equal or lower encode CPU. Decode is unaffected
-/// because a zstd frame carries its own parameters, so the level is a writer
-/// choice only and nothing on the read path needs to know it.
+/// multi-kilobyte JSON this store holds. Measured across seven corpora on the
+/// current head, it is better on every axis and worse on none: 2.8-8.8% smaller
+/// stored bytes, 2.5-8.4% *less* encode CPU, and 23% less decode CPU, because a
+/// level-3 frame spends its bytes on longer matches instead of literals and the
+/// decoder therefore copies more per token.
+///
+/// The level is a writer choice only. A zstd frame carries its own parameters,
+/// so nothing on the read path knows or needs to know which level wrote it —
+/// which is why raising it needs no migration and no fallback reader.
+///
+/// Not higher: level 9 buys a further 6.8-12.0% of bytes but costs 5.9-12.9x
+/// the encode CPU, and level 19 costs 60-99x. Level 3 is the only step that is
+/// free; past it, physical bytes are bought with OLTP write latency, which the
+/// trade-off ranking does not allow.
 #[cfg(not(target_family = "wasm"))]
 const JSON_ZSTD_LEVEL: i32 = 3;
 
