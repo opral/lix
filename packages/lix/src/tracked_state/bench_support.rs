@@ -32,12 +32,28 @@ fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
 ) -> Result<Vec<super::storage::CommitDeltaChangeLocator>, crate::LixError> {
-    let staged = super::storage::stage_commit_deltas_for_commit_state(writes, deltas)?;
+    let (mutations, locators) = if packed_history_addressable_ids() {
+        let staged = super::storage::stage_ordered_addressable_commit_deltas(
+            writes,
+            deltas.iter().copied().map(Ok),
+            false,
+            false,
+        )?
+        .ok_or_else(|| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "addressable packed-history fixture is not strictly ordered",
+            )
+        })?;
+        (staged.mutation_inventory().clone(), Vec::new())
+    } else {
+        let staged = super::storage::stage_commit_deltas_for_commit_state(writes, deltas)?;
+        (staged.mutation_inventory().clone(), staged.locators)
+    };
     let commit_id = deltas
         .first()
         .map(|delta| delta.delta.commit_id)
         .unwrap_or_default();
-    let mutations = staged.mutation_inventory().clone();
     super::storage::stage_commit_state_manifest(
         writes,
         &CommitStateManifest {
@@ -54,7 +70,7 @@ fn stage_bench_commit_deltas(
             snapshot_root: None,
         },
     )?;
-    Ok(staged.locators)
+    Ok(locators)
 }
 
 #[derive(Clone, Debug)]
@@ -1069,11 +1085,11 @@ impl PackedHistoryDelta {
             .expect("packed-history change index should not overflow");
         let entity_pk = match options.shape {
             BenchPackedHistoryShape::UniqueInserts => {
-                format!("packed-history-entity-{commit_index}-{row_index}")
+                format!("packed-history-entity-{commit_index:012}-{row_index:012}")
             }
             BenchPackedHistoryShape::RepeatedUpdates | BenchPackedHistoryShape::DeleteReinsert => {
                 format!(
-                    "packed-history-entity-{}",
+                    "packed-history-entity-{:012}",
                     change_index % options.live_entities
                 )
             }
@@ -1082,7 +1098,7 @@ impl PackedHistoryDelta {
             && (change_index / options.live_entities) % 2 == 1;
         Self {
             change_id: packed_history_change_id(commit_index, row_index),
-            commit_id: CommitId::new(packed_history_uuid(commit_index, 0, 0x43)),
+            commit_id: packed_history_commit_id(commit_index),
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "packed_history".to_string(),
             deleted,
@@ -1135,7 +1151,28 @@ impl PackedHistoryDelta {
 }
 
 fn packed_history_change_id(commit_index: usize, row_index: usize) -> ChangeId {
+    if packed_history_addressable_ids() {
+        return super::storage::change_id_from_packed_address(
+            packed_history_commit_id(commit_index),
+            u32::try_from(row_index)
+                .expect("packed-history row index fits u32")
+                .checked_add(1)
+                .expect("packed-history packed address fits u32"),
+        );
+    }
     ChangeId::new(packed_history_uuid(commit_index, row_index, 0x68))
+}
+
+fn packed_history_commit_id(commit_index: usize) -> CommitId {
+    let mut bytes = *packed_history_uuid(commit_index, 0, 0x43).as_bytes();
+    if packed_history_addressable_ids() {
+        bytes[12..].copy_from_slice(&0_u32.to_be_bytes());
+    }
+    CommitId::new(uuid::Uuid::from_bytes(bytes))
+}
+
+fn packed_history_addressable_ids() -> bool {
+    std::env::var("LIX_PACKED_HISTORY_ID_SHAPE").is_ok_and(|shape| shape == "addressable")
 }
 
 fn packed_history_uuid(commit_index: usize, ordinal: usize, discriminator: u8) -> uuid::Uuid {

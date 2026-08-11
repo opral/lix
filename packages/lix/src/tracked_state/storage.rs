@@ -100,8 +100,11 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // payload-less certified-reference encoding is intentionally rejected. The
 // version also binds ordered mutation parts to the canonical 512-row geometry;
 // LXCD14 is intentionally rejected rather than read through a compatibility
+// decoder. Version 16 permits direct-address leaves to reconstruct the exact
+// per-row ChangeId from one shared commit id and the first packed ordinal.
+// LXCD15 is deliberately rejected rather than read through a compatibility
 // decoder.
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD15";
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD16";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
@@ -11174,6 +11177,11 @@ fn encode_commit_delta_segment_layout(
 ) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     debug_assert_eq!(entries.len(), payloads.len());
     let leaf = encode_leaf_node_refs(entries);
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_leaf_layout(
+        entries.len(),
+        crate::tracked_state::codec::leaf_uses_direct_address_layout(&leaf),
+    );
     let authored_inline = payloads.iter().all(|payload| {
         payload.authored
             && matches!(payload.snapshot, crate::json_store::JsonSlotRef::Inline(_))

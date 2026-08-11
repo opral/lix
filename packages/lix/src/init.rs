@@ -42,13 +42,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V64 embeds the Myers first-parent jump in each immutable commit record.
-/// The hard cut rejects repositories whose commits predate that topology
-/// authority instead of maintaining a second derived index.
+/// V65 removes per-row ChangeId copies from directly addressable immutable
+/// mutation leaves. The hard cut rejects repositories whose packed history
+/// predates that physical authority instead of retaining a second decoder.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"myers-first-parent-jump.v64";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"direct-change-id-leaf.v65";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
