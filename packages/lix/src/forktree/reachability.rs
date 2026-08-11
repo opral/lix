@@ -888,6 +888,9 @@ where
                     .copied()
                     .map(|id| typed(id, ObjectDomain::CommitChangePageV2)),
             );
+            if let Some(root) = value.member_page_index_root {
+                edges.push(typed(root, ObjectDomain::OrderedTreeNode));
+            }
             edges.extend([
                 typed(value.global_state_root, ObjectDomain::OrderedTreeNode),
                 typed(value.local_state_root, ObjectDomain::OrderedTreeNode),

@@ -432,6 +432,17 @@ struct DecodedCollectionTransitionPage {
 }
 
 impl CommitChangePageV2 {
+    pub(crate) fn collection_change_id(
+        commit_id: CommitId,
+        zero_based_ordinal: usize,
+    ) -> Result<ChangeId, StorageError> {
+        let ordinal = u32::try_from(zero_based_ordinal)
+            .map_err(|_| corruption("collection transition ordinal exceeds u32"))?
+            .checked_add(1)
+            .ok_or_else(|| corruption("collection transition ordinal overflows u32"))?;
+        packed_change_id(commit_id, ordinal)
+    }
+
     pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
         self.validate()?;
         let mut body = Encoder::default();
@@ -727,6 +738,7 @@ impl CommitChangePageV2 {
             // envelope remains the sole authority for the empty membership.
             return Ok(PreparedCommitChangePages {
                 objects: Vec::new(),
+                page_start_ordinals: Vec::new(),
                 member_locations: Vec::new(),
                 member_change_ids: Vec::new(),
             });
@@ -785,6 +797,10 @@ impl CommitChangePageV2 {
         }
 
         let mut encoded = Vec::with_capacity(chunks.len());
+        let page_start_ordinals = chunks
+            .iter()
+            .map(|(start_ordinal, _)| *start_ordinal)
+            .collect();
         let mut member_locations = Vec::with_capacity(members.len());
         for (start_ordinal, page_members) in chunks {
             let page = Self {
@@ -800,13 +816,9 @@ impl CommitChangePageV2 {
             }));
             encoded.push((id, bytes));
         }
-        if encoded.len() + 2 > AUTHENTICATED_EDGE_PAGE_ENTRIES {
-            return Err(corruption(
-                "commit change-page vector exceeds its edge bound",
-            ));
-        }
         Ok(PreparedCommitChangePages {
             objects: encoded,
+            page_start_ordinals,
             member_locations,
             member_change_ids: members.iter().map(CommitMemberV1::change_id).collect(),
         })
@@ -825,6 +837,7 @@ impl CommitChangePageV2 {
             ));
         }
         let mut objects = Vec::new();
+        let mut page_start_ordinals = Vec::new();
         let mut member_locations = Vec::with_capacity(rows.len());
         let mut member_change_ids = Vec::with_capacity(rows.len());
         let mut start = 0usize;
@@ -882,15 +895,12 @@ impl CommitChangePageV2 {
                 member_change_ids.push(packed_change_id(commit_id, ordinal)?);
             }
             objects.push((id, bytes));
+            page_start_ordinals.push(start_ordinal);
             start = end;
-        }
-        if objects.len() + 2 > AUTHENTICATED_EDGE_PAGE_ENTRIES {
-            return Err(corruption(
-                "collection transition page vector exceeds its edge bound",
-            ));
         }
         Ok(PreparedCommitChangePages {
             objects,
+            page_start_ordinals,
             member_locations,
             member_change_ids,
         })
@@ -906,6 +916,7 @@ pub(crate) struct StatePageLocation {
 #[derive(Debug)]
 pub(crate) struct PreparedCommitChangePages {
     pub(crate) objects: Vec<(ObjectId, Bytes)>,
+    pub(crate) page_start_ordinals: Vec<u32>,
     pub(crate) member_locations: Vec<StatePageLocation>,
     pub(crate) member_change_ids: Vec<ChangeId>,
 }
@@ -1102,6 +1113,11 @@ pub(crate) struct CommitObjectV1 {
     pub(crate) parent_commit_object_ids: Vec<ObjectId>,
     pub(crate) members: Vec<CommitMemberV1>,
     pub(crate) member_page_object_ids: Vec<ObjectId>,
+    /// Complete collection transitions authenticate their unbounded ordered
+    /// page closure through one ForkTree root rather than a bounded flat edge
+    /// vector. Ordinary small commits continue to use `member_page_object_ids`.
+    pub(crate) member_page_index_root: Option<ObjectId>,
+    pub(crate) indexed_member_count: u32,
     pub(crate) global_state_root: ObjectId,
     pub(crate) local_state_root: ObjectId,
     /// Authenticated, branch-bound first-parent checkpoint chronology.
@@ -1355,7 +1371,10 @@ impl CommitObjectV1 {
             .validate(self.parent_commit_object_ids.is_empty())?;
         let parent_count = u32::try_from(self.parent_commit_object_ids.len())
             .map_err(|_| corruption("commit has too many parents"))?;
-        if !self.members.is_empty() && self.member_page_object_ids.is_empty() {
+        if !self.members.is_empty()
+            && self.member_page_object_ids.is_empty()
+            && self.member_page_index_root.is_none()
+        {
             return Err(corruption(
                 "nonempty commit members have no authenticated pages",
             ));
@@ -1373,6 +1392,14 @@ impl CommitObjectV1 {
             );
             for page_id in &self.member_page_object_ids {
                 encode_id(encoder, *page_id);
+            }
+            match self.member_page_index_root {
+                None => encoder.u8(0),
+                Some(root) => {
+                    encoder.u8(1);
+                    encode_id(encoder, root);
+                    encoder.u32(self.indexed_member_count);
+                }
             }
             encode_id(encoder, self.global_state_root);
             encode_id(encoder, self.local_state_root);
@@ -1432,12 +1459,19 @@ impl CommitObjectV1 {
         for _ in 0..page_count {
             member_page_object_ids.push(decode_id(&mut decoder)?);
         }
+        let (member_page_index_root, indexed_member_count) = match decoder.u8()? {
+            0 => (None, 0),
+            1 => (Some(decode_id(&mut decoder)?), decoder.u32()?),
+            _ => return Err(corruption("commit collection-page index tag is invalid")),
+        };
         let value = Self {
             commit_id,
             generation,
             parent_commit_object_ids,
             members: Vec::new(),
             member_page_object_ids,
+            member_page_index_root,
+            indexed_member_count,
             global_state_root: decode_id(&mut decoder)?,
             local_state_root: decode_id(&mut decoder)?,
             checkpoint_cursor: match decoder.u8()? {
@@ -1488,6 +1522,18 @@ impl CommitObjectV1 {
 
     fn validate_edge_bound(&self) -> Result<(), StorageError> {
         validate_nonzero_ids("commit change page", &self.member_page_object_ids)?;
+        if let Some(root) = self.member_page_index_root {
+            validate_nonzero_ids("commit collection-page index", &[root])?;
+            if self.indexed_member_count == 0 || !self.member_page_object_ids.is_empty() {
+                return Err(corruption(
+                    "commit collection-page index has incompatible member ownership",
+                ));
+            }
+        } else if self.indexed_member_count != 0 {
+            return Err(corruption(
+                "commit collection member count has no authenticated index root",
+            ));
+        }
         if self
             .member_page_object_ids
             .windows(2)
@@ -1499,6 +1545,7 @@ impl CommitObjectV1 {
             .parent_commit_object_ids
             .len()
             .checked_add(self.member_page_object_ids.len())
+            .and_then(|count| count.checked_add(usize::from(self.member_page_index_root.is_some())))
             .and_then(|count| count.checked_add(2))
             .and_then(|count| count.checked_add(self.checkpoint_cursor.edges().count()))
             .is_none_or(|count| count > AUTHENTICATED_EDGE_PAGE_ENTRIES)
@@ -1514,6 +1561,14 @@ impl CommitObjectV1 {
     /// member vector remains available to the writer-side validation path, but
     /// the persisted commit envelope carries only the authenticated page root.
     pub(crate) fn prepare_member_pages(&mut self) -> Result<Vec<(ObjectId, Bytes)>, StorageError> {
+        if self.member_page_index_root.is_some() {
+            if self.member_page_object_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(corruption(
+                "indexed collection commit also carries ordinary member pages",
+            ));
+        }
         if !self.member_page_object_ids.is_empty() && self.members.is_empty() {
             return Ok(Vec::new());
         }
@@ -3281,5 +3336,24 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn commit_page_index_authenticates_more_than_one_edge_page() {
+        let pages = (0_u32..257)
+            .map(|page| {
+                let mut object_id = [0_u8; 32];
+                object_id[..4].copy_from_slice(&page.checked_add(1).unwrap().to_be_bytes());
+                (page * 256, ObjectId::from_bytes(object_id))
+            })
+            .collect::<Vec<_>>();
+        let index = super::super::tree::build_commit_page_index(&pages)
+            .expect("build authenticated multi-level commit-page index");
+        assert_eq!(index.root.entry_count, 257);
+        assert!(index.objects.iter().count() > 1);
+
+        let mut duplicate = pages;
+        duplicate[256].0 = duplicate[255].0;
+        assert!(super::super::tree::build_commit_page_index(&duplicate).is_err());
     }
 }

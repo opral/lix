@@ -29,6 +29,7 @@ enum TreeKind {
     ChangeCatalog = 2,
     Receipt = 3,
     State = 4,
+    CommitPages = 5,
 }
 
 impl TreeKind {
@@ -38,6 +39,7 @@ impl TreeKind {
             2 => Ok(Self::ChangeCatalog),
             3 => Ok(Self::Receipt),
             4 => Ok(Self::State),
+            5 => Ok(Self::CommitPages),
             _ => Err(corruption(format!("unknown ordered-tree kind {value}"))),
         }
     }
@@ -45,7 +47,7 @@ impl TreeKind {
     fn limits(self) -> (usize, usize) {
         match self {
             Self::Receipt => (RECEIPT_TREE_LEAF_ENTRIES, RECEIPT_TREE_FANOUT),
-            Self::CommitCatalog | Self::ChangeCatalog | Self::State => {
+            Self::CommitCatalog | Self::ChangeCatalog | Self::State | Self::CommitPages => {
                 (CATALOG_TREE_LEAF_ENTRIES, CATALOG_TREE_FANOUT)
             }
         }
@@ -294,6 +296,12 @@ pub(super) fn ordered_tree_edges(
                         );
                         object_ids.push((id, ObjectDomain::UploadPart));
                     }
+                    TreeKind::CommitPages => {
+                        let id = ObjectId::from_bytes(entry.value.as_slice().try_into().map_err(
+                            |_| corruption("commit-page index value is not an ObjectId"),
+                        )?);
+                        object_ids.push((id, ObjectDomain::CommitChangePageV2));
+                    }
                 }
             }
         }
@@ -373,6 +381,60 @@ pub(super) fn build_state_tree(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<TreeBui
         })
         .collect::<Result<Vec<_>, StorageError>>()?;
     build_tree(TreeKind::State, &entries)
+}
+
+/// Builds the sole authenticated ordered owner for an arbitrarily large
+/// commit-page closure. The commit authenticates one root instead of a flat,
+/// bounded page-ID vector; leaves retain page order by their start ordinal.
+pub(crate) fn build_commit_page_index(
+    pages: &[(u32, ObjectId)],
+) -> Result<TreeBuild, StorageError> {
+    if pages.is_empty() {
+        return Err(corruption("commit-page index is empty"));
+    }
+    let entries = pages
+        .iter()
+        .map(|(start_ordinal, page_id)| {
+            if *page_id == ObjectId::ZERO {
+                return Err(corruption("commit-page index contains a zero page ID"));
+            }
+            Ok(LeafEntry {
+                key: start_ordinal.to_be_bytes().to_vec(),
+                value: page_id.as_bytes().to_vec(),
+                receipt: None,
+            })
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    build_tree(TreeKind::CommitPages, &entries)
+}
+
+pub(super) async fn load_commit_page_index_on_read<R>(
+    root: ObjectId,
+    read: &R,
+) -> Result<Vec<(u32, ObjectId)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let rows = scan_range_on_read(root, "commit-pages", None, None, None, read).await?;
+    rows.into_iter()
+        .map(|(key, value)| {
+            let start_ordinal = u32::from_be_bytes(
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| corruption("commit-page index key is not a u32"))?,
+            );
+            let page_id = ObjectId::from_bytes(
+                value
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| corruption("commit-page index value is not an ObjectId"))?,
+            );
+            if page_id == ObjectId::ZERO {
+                return Err(corruption("commit-page index contains a zero page ID"));
+            }
+            Ok((start_ordinal, page_id))
+        })
+        .collect()
 }
 
 /// Applies distinct, sorted mutations by copying only each affected root-to-leaf
@@ -3013,6 +3075,9 @@ fn validate_entries(kind: TreeKind, entries: &[LeafEntry]) -> Result<(), Storage
             TreeKind::Receipt if entry.key.len() != 8 || entry.value.len() != 32 => {
                 return Err(corruption("receipt entry key/value width is invalid"));
             }
+            TreeKind::CommitPages if entry.key.len() != 4 || entry.value.len() != 32 => {
+                return Err(corruption("commit-page index key/value width is invalid"));
+            }
             _ => {}
         }
         if kind == TreeKind::Receipt && entry.receipt.is_none() {
@@ -3085,6 +3150,7 @@ fn parse_kind(value: &str) -> Result<TreeKind, StorageError> {
         "change" => Ok(TreeKind::ChangeCatalog),
         "receipt" => Ok(TreeKind::Receipt),
         "state" => Ok(TreeKind::State),
+        "commit-pages" => Ok(TreeKind::CommitPages),
         _ => Err(corruption(format!("unknown tree lookup kind {value}"))),
     }
 }

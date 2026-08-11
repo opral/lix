@@ -61,7 +61,7 @@ pub(crate) fn introduced_checkpoint_marker(
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, SelectedHistoricalMemberBatch, StateTreeEdit};
 use super::state::StateKey;
-use super::tree::{ImmutableObjectSet, ReceiptTreeEdit};
+use super::tree::{ImmutableObjectSet, ReceiptTreeEdit, TreeBuild, build_commit_page_index};
 use super::view::{CoherentView, SELECTOR_SPACE};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,7 +81,8 @@ pub(crate) struct BranchStateTransition {
     pub(crate) semantic_commit: CommitObjectV1,
     /// Prebuilt compact pages are accepted only for the hard-cut complete
     /// collection transition. Ordinary commits derive pages from `members`.
-    pub(crate) collection_member_pages: Vec<(ObjectId, Bytes)>,
+    pub(crate) indexed_member_pages: Vec<(ObjectId, Bytes)>,
+    pub(crate) member_page_index: Option<TreeBuild>,
     pub(crate) changes: Vec<ChangeObjectV1>,
     pub(crate) branch_snapshot: BranchSnapshotV1,
     pub(crate) repository_root: RepositoryRootV1,
@@ -1226,7 +1227,8 @@ impl PreparedPublication {
             commit_catalog_edit,
             change_catalog_edit,
             mut semantic_commit,
-            collection_member_pages,
+            indexed_member_pages,
+            member_page_index,
             changes,
             branch_snapshot,
             repository_root,
@@ -1269,38 +1271,89 @@ impl PreparedPublication {
                 "semantic commit first parent is not the selected branch head",
             ));
         }
-        let mut compact_member_ids = None;
-        let member_pages = if collection_member_pages.is_empty() {
-            semantic_commit.prepare_member_pages()?
-        } else {
-            if !semantic_commit.members.is_empty()
-                || collection_member_pages
-                    .iter()
-                    .map(|(id, _)| *id)
-                    .ne(semantic_commit.member_page_object_ids.iter().copied())
+        let mut compact_member_count = None;
+        let member_pages = if indexed_member_pages.is_empty() {
+            if member_page_index.is_some()
+                || semantic_commit.member_page_index_root.is_some()
+                || semantic_commit.indexed_member_count != 0
             {
                 return Err(corruption(
-                    "compact collection pages disagree with the semantic commit envelope",
+                    "ordinary state transition carries a collection-page index",
                 ));
             }
-            let mut ids = Vec::new();
-            for (expected_start, (page_id, page_bytes)) in
-                collection_member_pages.iter().enumerate()
-            {
-                let (page_commit_id, start_ordinal, page_ids) =
-                    CommitChangePageV2::collection_member_ids(*page_id, page_bytes)?;
-                if page_commit_id != semantic_commit.commit_id
-                    || usize::try_from(start_ordinal).ok() != Some(ids.len())
-                    || expected_start >= semantic_commit.member_page_object_ids.len()
-                {
+            semantic_commit.prepare_member_pages()?
+        } else {
+            if !semantic_commit.member_page_object_ids.is_empty() {
+                return Err(corruption(
+                    "indexed commit pages disagree with the semantic commit envelope",
+                ));
+            }
+            let index = member_page_index.as_ref().ok_or_else(|| {
+                corruption("indexed commit pages have no authenticated ordered index")
+            })?;
+            if semantic_commit.member_page_index_root != Some(index.root.object_id) {
+                return Err(corruption(
+                    "commit page index disagrees with the semantic commit envelope",
+                ));
+            }
+            let is_compact_collection = semantic_commit.members.is_empty();
+            let mut expected_start = 0_u32;
+            let mut index_entries = Vec::with_capacity(indexed_member_pages.len());
+            for (page_id, page_bytes) in &indexed_member_pages {
+                let (page_commit_id, start_ordinal, page_member_count) = if is_compact_collection {
+                    let (commit_id, start_ordinal, page_ids) =
+                        CommitChangePageV2::collection_member_ids(*page_id, page_bytes)?;
+                    (commit_id, start_ordinal, page_ids.len())
+                } else {
+                    let page = CommitChangePageV2::decode(*page_id, page_bytes)?;
+                    let start = usize::try_from(page.start_ordinal).map_err(|_| {
+                        corruption("indexed commit page start ordinal exceeds usize")
+                    })?;
+                    let end = start
+                        .checked_add(page.members.len())
+                        .ok_or_else(|| corruption("indexed commit page member range overflows"))?;
+                    if semantic_commit.members.get(start..end) != Some(page.members.as_slice()) {
+                        return Err(corruption(
+                            "indexed commit page disagrees with its certified member sequence",
+                        ));
+                    }
+                    (page.commit_id, page.start_ordinal, page.members.len())
+                };
+                if page_commit_id != semantic_commit.commit_id || start_ordinal != expected_start {
                     return Err(corruption(
-                        "compact collection page is not in its authenticated commit position",
+                        "indexed commit page is not in its authenticated commit position",
                     ));
                 }
-                ids.extend(page_ids);
+                expected_start =
+                    expected_start
+                        .checked_add(u32::try_from(page_member_count).map_err(|_| {
+                            corruption("indexed commit page member count exceeds u32")
+                        })?)
+                        .ok_or_else(|| corruption("indexed commit member count overflows"))?;
+                index_entries.push((start_ordinal, *page_id));
             }
-            compact_member_ids = Some(ids);
-            collection_member_pages
+            if expected_start != semantic_commit.indexed_member_count {
+                return Err(corruption(
+                    "indexed commit page count disagrees with its commit envelope",
+                ));
+            }
+            if !is_compact_collection
+                && usize::try_from(expected_start).ok() != Some(semantic_commit.members.len())
+            {
+                return Err(corruption(
+                    "indexed commit pages do not cover the certified member sequence",
+                ));
+            }
+            let rebuilt = build_commit_page_index(&index_entries)?;
+            if rebuilt.root != index.root {
+                return Err(corruption(
+                    "commit page index does not authenticate its exact pages",
+                ));
+            }
+            if is_compact_collection {
+                compact_member_count = Some(expected_start);
+            }
+            indexed_member_pages
         };
         let (commit_id, commit_bytes) = semantic_commit.encode()?;
         if state_edit
@@ -1418,26 +1471,19 @@ impl PreparedPublication {
                 ));
             }
         }
-        if let Some(member_ids) = &compact_member_ids {
-            let mut unique = BTreeSet::new();
-            for (ordinal, change_id) in member_ids.iter().copied().enumerate() {
-                if !unique.insert(change_id) {
-                    return Err(corruption(
-                        "compact collection transition repeats one ChangeId",
-                    ));
-                }
-                let expected = super::model::ChangeCatalogEntry {
-                    owner: super::model::ChangeCatalogOwner::CommitMember {
-                        commit_object_id: commit_id,
-                        ordinal: u32::try_from(ordinal)
-                            .map_err(|_| corruption("semantic commit ordinal exceeds u32"))?,
-                    },
-                };
-                if change_catalog_edit.change_entries.get(&change_id) != Some(&expected) {
-                    return Err(corruption(
-                        "compact semantic ChangeCatalog owner does not match commit ordinal",
-                    ));
-                }
+        if let Some(member_count) = compact_member_count {
+            let packed_id =
+                super::model::ChangeId::from_bytes(*semantic_commit.commit_id.as_bytes());
+            let expected = super::model::ChangeCatalogEntry {
+                owner: super::model::ChangeCatalogOwner::PackedCommit {
+                    commit_object_id: commit_id,
+                    member_count,
+                },
+            };
+            if change_catalog_edit.change_entries.get(&packed_id) != Some(&expected) {
+                return Err(corruption(
+                    "compact semantic ChangeCatalog owner does not match its indexed commit",
+                ));
             }
         }
         let ref_id = branch_snapshot
@@ -1487,6 +1533,9 @@ impl PreparedPublication {
         self.stage_catalog_edit(change_catalog_edit)?;
         for (page_id, page_bytes) in member_pages {
             self.stage_encoded_object(page_id, page_bytes)?;
+        }
+        if let Some(index) = member_page_index {
+            self.stage_object_set(index.objects)?;
         }
         self.stage_encoded_object(commit_id, commit_bytes)?;
         for (id, (_, bytes)) in encoded_changes {

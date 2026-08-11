@@ -21,9 +21,9 @@ use super::state::{
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
-    apply_ordered_mutations_idempotent_inserts, delete_ordered_range, lookup_many_on_read,
-    lookup_on_read, replace_ordered_range, scan_bounded_page_on_read, scan_page_on_read,
-    scan_ranges_on_read, validate_root_on_read,
+    apply_ordered_mutations_idempotent_inserts, delete_ordered_range,
+    load_commit_page_index_on_read, lookup_many_on_read, lookup_on_read, replace_ordered_range,
+    scan_bounded_page_on_read, scan_page_on_read, scan_ranges_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE};
 
@@ -40,16 +40,16 @@ pub(crate) async fn load_commit_members<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    if commit.member_page_object_ids.is_empty() {
+    let page_ids = load_commit_page_ids(read, commit).await?;
+    if page_ids.is_empty() {
         return Ok(commit.members.clone());
     }
     if !commit.members.is_empty() {
         return Err(corruption("paged commit carries an inline member closure"));
     }
     let mut members = Vec::new();
-    let pages =
-        super::view::load_object_map(read, commit.member_page_object_ids.iter().copied()).await?;
-    for page_id in &commit.member_page_object_ids {
+    let pages = super::view::load_object_map(read, page_ids.iter().copied()).await?;
+    for page_id in &page_ids {
         let bytes = pages
             .get(page_id)
             .ok_or_else(|| corruption("commit change page is absent"))?;
@@ -71,7 +71,40 @@ where
             return Err(corruption("commit member page chain repeats a ChangeId"));
         }
     }
+    if commit.member_page_index_root.is_some()
+        && usize::try_from(commit.indexed_member_count).ok() != Some(members.len())
+    {
+        return Err(corruption(
+            "indexed collection member count disagrees with its decoded pages",
+        ));
+    }
     Ok(members)
+}
+
+async fn load_commit_page_ids<R>(
+    read: &R,
+    commit: &CommitObjectV1,
+) -> Result<Vec<ObjectId>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    match commit.member_page_index_root {
+        None => Ok(commit.member_page_object_ids.clone()),
+        Some(root) => {
+            if !commit.member_page_object_ids.is_empty() || !commit.members.is_empty() {
+                return Err(corruption(
+                    "indexed collection commit carries an alternate member closure",
+                ));
+            }
+            let entries = load_commit_page_index_on_read(root, read).await?;
+            if entries.first().map(|(start, _)| *start) != Some(0) {
+                return Err(corruption(
+                    "indexed collection page closure does not start at ordinal zero",
+                ));
+            }
+            Ok(entries.into_iter().map(|(_, id)| id).collect())
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2677,6 +2710,7 @@ where
     if let Some(member) = cache.members.get(&cache_key) {
         return Ok((commit, member.0.clone(), member.1));
     }
+    let member_page_object_ids = load_commit_page_ids(read, &commit).await?;
     for (root, expected_global) in [
         (commit.local_state_root, false),
         (commit.global_state_root, true),
@@ -2688,9 +2722,7 @@ where
         let page_bytes = super::view::load_object_bytes(read, value_ref.page_object_id).await?;
         let page = super::model::CommitChangePageV2::decode(value_ref.page_object_id, &page_bytes)?;
         if page.commit_id != commit.commit_id
-            || !commit
-                .member_page_object_ids
-                .contains(&value_ref.page_object_id)
+            || !member_page_object_ids.contains(&value_ref.page_object_id)
         {
             return Err(corruption(
                 "authenticated source state page is not owned by its Commit",
@@ -2704,7 +2736,7 @@ where
             binding_id,
             commit_object_id,
             commit.commit_id,
-            &commit.member_page_object_ids,
+            &member_page_object_ids,
             value_ref.page_object_id,
             &page,
             cache,
@@ -2859,19 +2891,27 @@ where
         }
     }
 
+    let mut page_ids_by_commit = BTreeMap::<ObjectId, Vec<ObjectId>>::new();
+    for lookup in &pending {
+        if !page_ids_by_commit.contains_key(&lookup.request.commit_object_id) {
+            page_ids_by_commit.insert(
+                lookup.request.commit_object_id,
+                load_commit_page_ids(read, &lookup.commit).await?,
+            );
+        }
+    }
     let mut page_owners = BTreeMap::<ObjectId, (ObjectId, CommitId)>::new();
     for lookup in &pending {
-        let selected_index = lookup
-            .commit
-            .member_page_object_ids
+        let member_page_object_ids = page_ids_by_commit
+            .get(&lookup.request.commit_object_id)
+            .ok_or_else(|| corruption("authenticated commit page index is absent"))?;
+        let selected_index = member_page_object_ids
             .iter()
             .position(|id| *id == lookup.value_ref.page_object_id)
             .ok_or_else(|| {
                 corruption("authenticated source state page is not owned by its Commit")
             })?;
-        for page_object_id in lookup
-            .commit
-            .member_page_object_ids
+        for page_object_id in member_page_object_ids
             .iter()
             .take(selected_index.saturating_add(2))
         {
@@ -2932,7 +2972,9 @@ where
             binding_id,
             lookup.request.commit_object_id,
             lookup.commit.commit_id,
-            &lookup.commit.member_page_object_ids,
+            page_ids_by_commit
+                .get(&lookup.request.commit_object_id)
+                .ok_or_else(|| corruption("authenticated commit page index is absent"))?,
             lookup.value_ref.page_object_id,
             &page,
             cache,
@@ -4363,8 +4405,8 @@ where
             page_commits.insert(page.commit_id, cached.clone());
             cached
         };
-    if !target_commit
-        .member_page_object_ids
+    if !load_commit_page_ids(read, &target_commit)
+        .await?
         .contains(&page_object_id)
     {
         return Err(corruption(
@@ -4935,13 +4977,14 @@ where
     validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit).await?;
     validate_root_on_read(commit.global_state_root, "state", read).await?;
     validate_root_on_read(commit.local_state_root, "state", read).await?;
+    let member_page_object_ids = load_commit_page_ids(read, &commit).await?;
     let summary = StaleCommitSummary {
         commit_id: catalog_id,
         commit_object_id: entry.commit_object_id,
         generation: commit.generation,
         global_state_root: commit.global_state_root,
         local_state_root: commit.local_state_root,
-        member_page_object_ids: commit.member_page_object_ids.clone(),
+        member_page_object_ids,
     };
     cache.entries.insert(commit_id, summary);
     Ok(cache

@@ -8515,6 +8515,8 @@ mod tests {
             parent_commit_object_ids: vec![parent_id],
             members,
             member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
+            member_page_index_root: None,
+            indexed_member_count: 0,
             global_state_root: state_edit.root,
             local_state_root: initial_view.branch_snapshot().local_state_root,
             checkpoint_cursor: crate::forktree::CheckpointCursorV1::after_first_parent(
@@ -8606,7 +8608,8 @@ mod tests {
             commit_catalog_edit,
             change_catalog_edit,
             semantic_commit,
-            collection_member_pages: Vec::new(),
+            indexed_member_pages: Vec::new(),
+            member_page_index: None,
             changes: vec![branch_ref],
             branch_snapshot,
             repository_root: RepositoryRootV1 {

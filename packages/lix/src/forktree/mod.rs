@@ -52,10 +52,10 @@ pub(crate) use state::{
     encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
     exclusive_prefix_upper_bound,
 };
-pub(crate) use tree::diff_roots;
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
 };
+pub(crate) use tree::{build_commit_page_index, diff_roots};
 pub(crate) use view::{
     AuthenticatedHistoricalStateView, CoherentView, ForkTreeReadFacade, SELECTOR_SPACE,
     load_object_bytes, open_coherent_view, open_coherent_view_on_read,

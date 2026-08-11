@@ -29,9 +29,10 @@ use crate::forktree::{
     CommitMemberV1, CommitObjectV1, HistoricalMemberSelection, ObjectId,
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1,
     SelectedHistoricalMember, StateKey, StateKeyRef, StateMutationAudit, StateSource,
-    StateTreeMutation, StateValueRef, encode_state_entity_prefix_bounds, encode_state_key,
-    encode_state_value, introduced_checkpoint_marker, load_commit, load_commit_summary,
-    open_coherent_view_on_read, select_historical_commit_members, state_points,
+    StateTreeMutation, StateValueRef, build_commit_page_index, encode_state_entity_prefix_bounds,
+    encode_state_key, encode_state_value, introduced_checkpoint_marker, load_commit,
+    load_commit_summary, open_coherent_view_on_read, select_historical_commit_members,
+    state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -323,19 +324,24 @@ where
             "one transaction commit mixes global and branch-local state roots",
         ));
     }
+    let root_transition = complete_replacement_bounds.is_some();
 
     // The catalog identity set is authenticated before any ChangeObject is
     // encoded. Keep this canonical order separate from the caller's member
     // and result-slot order below.
-    let mut catalog_change_ids = Vec::with_capacity(tracked_rows.len() + 1);
-    for row in &tracked_rows {
-        let change_id = row
-            .change_id
-            .ok_or_else(|| writer_error("tracked row has no change identity"))?;
-        catalog_change_ids.push(forktree_change_id(change_id));
-    }
-    catalog_change_ids.push(forktree_change_id(change_refs.branch_ref_change_id));
-    let catalog_order = canonical_change_order(&catalog_change_ids)?;
+    let catalog_order = if root_transition {
+        None
+    } else {
+        let mut catalog_change_ids = Vec::with_capacity(tracked_rows.len() + 1);
+        for row in &tracked_rows {
+            let change_id = row
+                .change_id
+                .ok_or_else(|| writer_error("tracked row has no change identity"))?;
+            catalog_change_ids.push(forktree_change_id(change_id));
+        }
+        catalog_change_ids.push(forktree_change_id(change_refs.branch_ref_change_id));
+        Some(canonical_change_order(&catalog_change_ids)?)
+    };
 
     let tracked_keys = tracked_rows
         .iter()
@@ -347,7 +353,6 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let root_transition = complete_replacement_bounds.is_some();
     let replacement_schema_key = root_transition.then(|| tracked_rows[0].schema_key.to_string());
     let previous_rows = if complete_replacement_bounds.is_some() {
         // The complete-set certificate proves that every ordered identity is
@@ -365,17 +370,22 @@ where
         ));
     }
     let mut members = Vec::with_capacity(tracked_rows.len());
-    let mut prepared_change_ids = Vec::with_capacity(tracked_rows.len());
+    let mut prepared_change_ids = Vec::with_capacity(if root_transition {
+        0
+    } else {
+        tracked_rows.len()
+    });
     let mut collection_rows = Vec::with_capacity(if root_transition {
         tracked_rows.len()
     } else {
         0
     });
     let mut pending_rows = Vec::with_capacity(tracked_rows.len());
-    for ((row, key), previous) in tracked_rows
+    for (row_index, ((row, key), previous)) in tracked_rows
         .into_iter()
         .zip(tracked_keys)
         .zip(previous_rows)
+        .enumerate()
     {
         let row_commit_id = row
             .commit_id
@@ -388,7 +398,21 @@ where
         let change_id = row
             .change_id
             .ok_or_else(|| writer_error("tracked row has no change identity"))?;
-        prepared_change_ids.push(forktree_change_id(change_id));
+        let prepared_change_id = forktree_change_id(change_id);
+        if root_transition {
+            if prepared_change_id
+                != CommitChangePageV2::collection_change_id(
+                    forktree_commit_id(commit_id),
+                    row_index,
+                )?
+            {
+                return Err(writer_error(
+                    "collection transition change identity differs from its packed ordinal",
+                ));
+            }
+        } else {
+            prepared_change_ids.push(prepared_change_id);
+        }
         let canonical_snapshot = canonical_snapshot_for_row(
             row,
             &prepared_blob_manifests,
@@ -455,11 +479,22 @@ where
     } else {
         CommitChangePageV2::encode_pages(forktree_commit_id(commit_id), &members)?
     };
-    if member_pages.member_change_ids != prepared_change_ids {
+    if !root_transition && member_pages.member_change_ids != prepared_change_ids {
         return Err(writer_error(
             "collection transition change identities do not match packed commit ordinals",
         ));
     }
+    let member_page_index = if member_pages.objects.is_empty() {
+        None
+    } else {
+        let entries = member_pages
+            .page_start_ordinals
+            .iter()
+            .copied()
+            .zip(member_pages.objects.iter().map(|(id, _)| *id))
+            .collect::<Vec<_>>();
+        Some(build_commit_page_index(&entries)?)
+    };
     let mut state_mutations = Vec::with_capacity(pending_rows.len());
     let mut replacement_entries = complete_replacement_bounds
         .as_ref()
@@ -551,7 +586,12 @@ where
         .checked_add(1)
         .ok_or_else(|| writer_error("commit generation overflows u64"))?;
 
-    let semantic_change_ids = member_pages.member_change_ids.clone();
+    let semantic_change_count = member_pages.member_locations.len();
+    let semantic_change_ids = if root_transition {
+        None
+    } else {
+        Some(member_pages.member_change_ids.clone())
+    };
     let current_repository_root = publication.current_repository_root();
     let global_state_root = if global {
         state_edit.root
@@ -583,7 +623,14 @@ where
         generation,
         parent_commit_object_ids: parent_object_ids,
         members,
-        member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
+        member_page_object_ids: Vec::new(),
+        member_page_index_root: member_page_index.as_ref().map(|index| index.root.object_id),
+        indexed_member_count: if member_page_index.is_some() {
+            u32::try_from(semantic_change_count)
+                .map_err(|_| writer_error("packed commit member count exceeds u32"))?
+        } else {
+            0
+        },
         global_state_root,
         local_state_root,
         checkpoint_cursor,
@@ -636,32 +683,15 @@ where
             )],
         )
         .await?;
-    let mut change_entries = Vec::with_capacity(catalog_order.len());
-    for index in catalog_order {
-        if let Some(change_id) = semantic_change_ids.get(index) {
-            change_entries.push((
-                *change_id,
-                ChangeCatalogEntry {
-                    owner: ChangeCatalogOwner::CommitMember {
-                        commit_object_id,
-                        ordinal: u32::try_from(index)
-                            .map_err(|_| writer_error("commit member ordinal exceeds u32"))?,
-                    },
-                },
-            ));
-        } else {
-            debug_assert_eq!(index, semantic_change_ids.len());
-            change_entries.push((
-                forktree_change_id(change_refs.branch_ref_change_id),
-                ChangeCatalogEntry {
-                    owner: ChangeCatalogOwner::BranchRef {
-                        ref_change_object_id: ref_object_id,
-                        branch_id: publication_branch_id,
-                    },
-                },
-            ));
-        }
-    }
+    let branch_ref_catalog_entry = (
+        forktree_change_id(change_refs.branch_ref_change_id),
+        ChangeCatalogEntry {
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_object_id,
+                branch_id: publication_branch_id,
+            },
+        },
+    );
     // A complete collection replacement is already authenticated twice: its
     // state leaves point at the exact commit-member pages and the semantic
     // commit authenticates both those pages and the resulting state root.
@@ -670,39 +700,58 @@ where
     // commit marker plus the independently-addressable branch-ref change;
     // the authenticated member closure remains the canonical root-to-root
     // history owner.
-    let persisted_change_entries = if root_transition {
-        let mut entries = change_entries
-            .iter()
-            .filter(|(_, entry)| matches!(entry.owner, ChangeCatalogOwner::BranchRef { .. }))
-            .copied()
-            .collect::<Vec<_>>();
-        entries.push((
-            ForkTreeChangeId::from_bytes(*semantic_commit.commit_id.as_bytes()),
-            ChangeCatalogEntry {
-                owner: ChangeCatalogOwner::PackedCommit {
-                    commit_object_id,
-                    member_count: u32::try_from(semantic_change_ids.len())
-                        .map_err(|_| writer_error("packed commit member count exceeds u32"))?,
+    let change_entries = if root_transition {
+        let mut entries = vec![
+            branch_ref_catalog_entry,
+            (
+                ForkTreeChangeId::from_bytes(*semantic_commit.commit_id.as_bytes()),
+                ChangeCatalogEntry {
+                    owner: ChangeCatalogOwner::PackedCommit {
+                        commit_object_id,
+                        member_count: u32::try_from(semantic_change_count)
+                            .map_err(|_| writer_error("packed commit member count exceeds u32"))?,
+                    },
                 },
-            },
-        ));
+            ),
+        ];
         entries.sort_unstable_by_key(|(id, _)| *id);
         entries
     } else {
-        change_entries.clone()
+        let semantic_change_ids = semantic_change_ids
+            .as_ref()
+            .expect("ordinary transition has explicit change identities");
+        let mut entries = Vec::with_capacity(
+            catalog_order
+                .as_ref()
+                .expect("ordinary transition has canonical catalog order")
+                .len(),
+        );
+        for index in catalog_order.expect("ordinary transition has canonical catalog order") {
+            if let Some(change_id) = semantic_change_ids.get(index) {
+                entries.push((
+                    *change_id,
+                    ChangeCatalogEntry {
+                        owner: ChangeCatalogOwner::CommitMember {
+                            commit_object_id,
+                            ordinal: u32::try_from(index)
+                                .map_err(|_| writer_error("commit member ordinal exceeds u32"))?,
+                        },
+                    },
+                ));
+            } else {
+                debug_assert_eq!(index, semantic_change_ids.len());
+                entries.push(branch_ref_catalog_entry);
+            }
+        }
+        entries
     };
-    let mut change_catalog_edit = publication
+    let change_catalog_edit = publication
         .put_change_catalog_entries(
             &view,
             current_repository_root.change_catalog_root,
-            &persisted_change_entries,
+            &change_entries,
         )
         .await?;
-    if root_transition {
-        // Publication validates the exact commit/member ownership map before
-        // writing. These ephemeral entries are not a durable second index.
-        change_catalog_edit.change_entries.extend(change_entries);
-    }
     let repository_root = RepositoryRootV1 {
         global_state_root: if global {
             state_edit.root
@@ -712,7 +761,7 @@ where
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
     };
-    let collection_member_pages = if root_transition {
+    let indexed_member_pages = if member_page_index.is_some() {
         std::mem::take(&mut member_pages.objects)
     } else {
         Vec::new()
@@ -722,7 +771,8 @@ where
         commit_catalog_edit,
         change_catalog_edit,
         semantic_commit,
-        collection_member_pages,
+        indexed_member_pages,
+        member_page_index,
         changes,
         branch_snapshot: BranchSnapshotV1 {
             branch_id: publication_branch_id,
@@ -1462,6 +1512,8 @@ where
             parent_commit_object_ids: parent_object_ids,
             members: content.members.clone(),
             member_page_object_ids: content.member_page_object_ids.clone(),
+            member_page_index_root: None,
+            indexed_member_count: 0,
             global_state_root,
             local_state_root,
             checkpoint_cursor,
