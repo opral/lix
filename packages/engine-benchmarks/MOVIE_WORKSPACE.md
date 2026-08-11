@@ -31,6 +31,61 @@ this workload, so the larger CAS unit did not improve ingest and slightly
 regressed save p95. The engine therefore retains 1 MiB chunks; remote
 object-store latency profiles may justify revisiting the choice.
 
+## Each actor runs as its own task
+
+Ingest, project saves and the two proxy streams are spawned as four separate
+tokio tasks. They were previously branches of a single `tokio::join!` future,
+which put all four on one task: a slow write in any branch could not overlap a
+playback read, and the resulting scheduling delay was charged to the playback
+deadline.
+
+That is not a hypothetical. On SlateDB one project save per run — the save at
+t = 1200 ms — takes ~110 ms while every other save takes under 8 ms. Joined on
+one task, that save delayed both playback wake-ups by 69-70 ms against an 80 ms
+budget, and `stream_N_late` flipped to 1 whenever concurrent ingest pushed the
+delay past 80 ms. The proxy reads themselves were never slow: p99 5.6 ms, max
+5.9 ms, against the same 80 ms budget.
+
+The null control (`slatedb_movie_workspace_playback_control`, identical
+schedule with the ingest removed) reproduced the same 69-70 ms delay in 6 of 6
+stream-runs, which is what identified the save rather than ingest interference
+as the cause. `LIX_MOVIE_PLAYBACK_TRACE=1` prints per-sample read latency, per
+save latency, upload-window completion times, and a spawned runtime watchdog
+whose worst gap stayed at 2.0-2.6 ms throughout — proving the executor was not
+starved and the stall was confined to the joined task.
+
+The ~110 ms SlateDB save and the ~200 ms fixed cost of every
+`resumable_initial_write` in `large_blob_updates` are unexplained write-path
+stalls, tracked separately. Neither is a read-path defect.
+
+## Diagnostic environment variables
+
+None of these are set by the qualification itself.
+
+| Variable | Effect |
+| --- | --- |
+| `LIX_MOVIE_PLAYBACK_TRACE=1` | per-sample playback/save traces, upload-window times, runtime watchdog |
+| `LIX_MOVIE_WORKER_THREADS=N` | runtime width; the qualification profile is 4 |
+| `LIX_MOVIE_STREAM_SAMPLES=N` | playback sample count, for looking past the 40-sample window |
+| `LIX_MOVIE_UPLOAD_CONCURRENCY=N` | upload parts in flight, 1-4 |
+
+## First-window upload contention
+
+`chunk_hash_bytes_including_retries` measures payload actually hashed,
+including optimistic retries, so re-hashed parts are visible directly. For the
+512 MiB timed ingest it is exactly `512 MiB + (concurrency - 1) x 16 MiB`:
+
+| Upload concurrency | Hashed bytes | Re-hashed | Ingest |
+| ---: | ---: | ---: | ---: |
+| 1 | 536,870,912 (512 MiB) | 0 | 153.1 MiB/s |
+| 2 | 553,648,128 (528 MiB) | 16 MiB | 152.8 MiB/s |
+| 4 | 587,202,560 (560 MiB) | 48 MiB | 153.1 MiB/s |
+
+Exactly one part per extra in-flight part is re-hashed, and only in the first
+window, where `UPLOAD_STATE_SPACE` is absent for every concurrent part and the
+losers retry. It is bounded wasted work, not a scaling term, and ingest on this
+local-filesystem profile does not move with concurrency at all.
+
 ## Artificial object-store latency
 
 The latency qualification wraps the local object store and delays every
