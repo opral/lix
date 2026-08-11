@@ -10,15 +10,17 @@
 mod hot;
 
 pub(crate) use crate::live_state::LiveStateReadDomain;
+#[cfg(test)]
+pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
-    DeferredFreshHotRowRef, DeferredFreshHotRows, EntityColumnarOverlayRow, HOT_DIFF_SPACE,
-    HOT_COLLECTION_CONTROL_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotStateTransactionCache,
-    HotTrackedSnapshot,
-    PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
-    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
-    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
+    DeferredFreshHotRowRef, DeferredFreshHotRows, EntityColumnarOverlayRow,
+    HOT_COLLECTION_CONTROL_SPACE, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE,
+    HotStateTransactionCache, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, materialize_certified_root_rows,
+    scan_certified_history_rows, stage_certified_entity_batches, stage_retire_hot_generation,
 };
 
 /// Stable physical address of a row in an immutable columnar base.

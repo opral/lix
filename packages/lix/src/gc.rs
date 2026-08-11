@@ -6,7 +6,6 @@
 //! the same storage write set that publishes the compacted checkpoint.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -15,15 +14,11 @@ use crate::branch::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability,
     branch_head_control_precondition,
 };
-#[cfg(any(test, feature = "storage-benches"))]
-use crate::changelog::ChangeScanRequest;
-use crate::changelog::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangelogContext,
-    ChangelogReader, CommitId, CommitLoadRequest, GcLiveSet, GcPlan, GcRepairSet, GcRoot,
-    GcSweepSet, change_key, commit_change_id_key, commit_key,
-};
+use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
+#[cfg(any(test, feature = "storage-benches"))]
+use crate::changelog::{ChangeScanRequest, ChangelogContext, ChangelogReader};
 use crate::commit_graph::CommitGraphContext;
 #[cfg(test)]
 use crate::json_store::JsonRef;
@@ -34,11 +29,14 @@ use crate::json_store::{
 use crate::live_state::TrackedHeadContext;
 #[cfg(test)]
 use crate::live_state::stage_collect_stale_working_diff_indexes;
+#[cfg(test)]
+use crate::storage_adapter::StorageCoreProjection;
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
-    StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition, StoragePrefix,
-    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageGetOptions, StorageKey,
+    StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageSpace, StorageSpaceId,
+    StorageValue, StorageWriteSet,
 };
+use crate::tracked_state::RetainedPhysicalState;
 use crate::{LixError, storage_codec};
 
 pub(crate) const CHECKPOINT_RECOVERY_REF_NAMESPACE: &str = "checkpoint.recovery_ref.v3";
@@ -58,36 +56,12 @@ pub(crate) const GC_REACHABILITY_DELTA_SPACE: StorageSpace =
 pub(crate) const GC_REACHABILITY_QUEUE_NAMESPACE: &str = "gc.reachability_queue.v1";
 pub(crate) const GC_REACHABILITY_QUEUE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0004), GC_REACHABILITY_QUEUE_NAMESPACE);
-/// Rebuildable metadata for an explicit tree-chunk sweep epoch. It is never
-/// consulted as a serving root; the active root closure is re-derived from
-/// branch/recovery controls and authenticated commit manifests.
-pub(crate) const GC_TREE_SWEEP_EPOCH_NAMESPACE: &str = "gc.tree_sweep_epoch.v1";
-pub(crate) const GC_TREE_SWEEP_EPOCH_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0005), GC_TREE_SWEEP_EPOCH_NAMESPACE);
-/// One rebuildable live-chunk mark per content hash for the current epoch.
-pub(crate) const GC_TREE_SWEEP_MARK_NAMESPACE: &str = "gc.tree_sweep_mark.v1";
-pub(crate) const GC_TREE_SWEEP_MARK_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0006), GC_TREE_SWEEP_MARK_NAMESPACE);
-/// CAS-protected bounded cursor for an in-progress tree-chunk enumeration.
-pub(crate) const GC_TREE_SWEEP_CURSOR_NAMESPACE: &str = "gc.tree_sweep_cursor.v1";
-pub(crate) const GC_TREE_SWEEP_CURSOR_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0007), GC_TREE_SWEEP_CURSOR_NAMESPACE);
-
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
 const GC_REACHABILITY_FORMAT_VERSION: u32 = 2;
 const GC_REACHABILITY_QUEUE_KEY: &[u8] = b"queue";
 const GC_REACHABILITY_BATCH_LIMIT: usize = 64;
-#[allow(dead_code)]
-const GC_TREE_SWEEP_EPOCH_KEY: &[u8] = b"epoch";
-#[allow(dead_code)]
-const GC_TREE_SWEEP_CURSOR_KEY: &[u8] = b"cursor";
-#[allow(dead_code)]
-const GC_TREE_SWEEP_FORMAT_VERSION: u32 = 1;
-#[allow(dead_code)]
-const GC_TREE_SWEEP_PAGE_ROWS: usize = 64;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthenticatedControlCommitReachability {
     chronology_roots: BTreeSet<CommitId>,
@@ -279,61 +253,6 @@ struct StoredReachabilityQueue {
     head_sequence: u64,
     tail_sequence: u64,
     next_sequence: u64,
-}
-
-/// Authenticated metadata for one explicit tree-chunk sweep epoch. The root
-/// and closure digests are evidence for resumption only; immutable manifests
-/// and branch/recovery controls remain the sole logical root authority.
-#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-#[allow(dead_code)]
-struct StoredTreeSweepEpoch {
-    format_version: u32,
-    epoch_id: u64,
-    queue_digest: [u8; 32],
-    root_set_digest: [u8; 32],
-    live_chunk_digest: [u8; 32],
-    live_chunk_count: u64,
-}
-
-/// CAS-protected bounded enumeration cursor. A completed cursor is retained
-/// until the next epoch so an interrupted/reopened maintenance pass can
-/// distinguish a resumable epoch from a fresh one.
-#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-#[allow(dead_code)]
-struct StoredTreeSweepCursor {
-    format_version: u32,
-    epoch_id: u64,
-    #[musli(with = storage_codec::option)]
-    last_key: Option<Vec<u8>>,
-    scanned_rows: u64,
-    deleted_rows: u64,
-    complete: bool,
-}
-
-/// A mark is rebuildable inventory, not payload truth. The hash in the key,
-/// value, and epoch are all checked before a sweep can delete an unmarked
-/// tree chunk.
-#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-#[allow(dead_code)]
-struct StoredTreeSweepMark {
-    format_version: u32,
-    epoch_id: u64,
-    chunk_hash: [u8; 32],
-}
-
-/// In-memory state for one authenticated sweep epoch. The live set is loaded
-/// and verified once when the session starts or reopens; ordinary queue-prefix
-/// GC never consults it.
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub(crate) struct TreeSweepEpochSession {
-    epoch: StoredTreeSweepEpoch,
-    cursor: StoredTreeSweepCursor,
-    raw_cursor: Bytes,
-    live_chunks: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -770,20 +689,6 @@ fn decode_reachability_batch(
     Ok(batch)
 }
 
-#[allow(dead_code)]
-fn tree_sweep_error(message: impl Into<String>) -> LixError {
-    LixError::new(LixError::CODE_INTERNAL_ERROR, message)
-}
-
-#[allow(dead_code)]
-fn tree_sweep_digest(hashes: &BTreeSet<[u8; 32]>) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    for hash in hashes {
-        hasher.update(hash);
-    }
-    *hasher.finalize().as_bytes()
-}
-
 async fn collect_all_reachability_checkpoint_roots<S>(
     store: &S,
     queue: &StoredReachabilityQueue,
@@ -902,562 +807,6 @@ where
     .with_hint(
         "The commit is no longer an authenticated branchable root after checkpoint compaction.",
     ))
-}
-
-#[allow(dead_code)]
-async fn load_tree_sweep_root_closure<S>(
-    store: &S,
-) -> Result<([u8; 32], [u8; 32], Bytes, BTreeSet<[u8; 32]>), LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync,
-{
-    let controls = BranchHeadControlContext::new()
-        .reader(store.clone())
-        .scan()
-        .await?;
-    let (queue, raw_queue) = load_reachability_queue(store).await?;
-    let closure = load_authenticated_repository_retention(store, &controls, &queue).await?;
-    let mut roots = BTreeSet::new();
-    for manifest in closure.manifests.values() {
-        if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
-            roots.insert(*snapshot_root.root_id.as_bytes());
-            for parent in &snapshot_root.parent_roots {
-                roots.insert(*parent.root_id.as_bytes());
-            }
-        }
-    }
-    if roots.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep authenticated root set has no tracked tree roots",
-        ));
-    }
-    let root_set_digest = tree_sweep_digest(&roots);
-    let typed_roots = roots
-        .iter()
-        .copied()
-        .map(crate::tracked_state::TrackedStateRootId::new)
-        .collect::<Vec<_>>();
-    let live_chunks =
-        crate::tracked_state::collect_reachable_tree_chunk_hashes(store, &typed_roots).await?;
-    if live_chunks.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep authenticated root closure is empty",
-        ));
-    }
-    Ok((
-        root_set_digest,
-        tree_sweep_digest(&live_chunks),
-        raw_queue,
-        live_chunks,
-    ))
-}
-
-#[allow(dead_code)]
-async fn scan_tree_sweep_marks<S>(
-    store: &S,
-    expected_epoch: Option<u64>,
-) -> Result<(BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let range = StoragePrefix {
-        bytes: Bytes::new(),
-    }
-    .to_range()?;
-    let mut previous_key = None;
-    let mut current = BTreeSet::new();
-    let mut all = BTreeSet::new();
-    let mut cursor = store
-        .begin_scan(
-            GC_TREE_SWEEP_MARK_SPACE,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::FullValue,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    loop {
-        let page = cursor.next_page(GC_TREE_SWEEP_PAGE_ROWS).await?;
-        if page.has_more && page.entries.is_empty() {
-            return Err(tree_sweep_error(
-                "tree sweep mark scan reported has_more with an empty page",
-            ));
-        }
-        for entry in &page.entries {
-            if entry.key.0.len() != 32
-                || previous_key
-                    .as_ref()
-                    .is_some_and(|previous: &StorageKey| entry.key <= *previous)
-            {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan keys are malformed or non-increasing",
-                ));
-            }
-            let key_hash: [u8; 32] = entry
-                .key
-                .0
-                .as_ref()
-                .try_into()
-                .map_err(|_| tree_sweep_error("tree sweep mark key is not 32 bytes"))?;
-            let StorageProjectedValue::FullValue(bytes) = &entry.value else {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan returned a key-only value",
-                ));
-            };
-            let mark: StoredTreeSweepMark = storage_codec::decode("tree sweep mark", bytes)
-                .map_err(|error| {
-                    tree_sweep_error(format!("tree sweep mark is malformed: {error}"))
-                })?;
-            if mark.format_version != GC_TREE_SWEEP_FORMAT_VERSION || mark.chunk_hash != key_hash {
-                return Err(tree_sweep_error(
-                    "tree sweep mark identity or format is invalid",
-                ));
-            }
-            all.insert(key_hash);
-            if expected_epoch.is_none_or(|epoch| mark.epoch_id == epoch) {
-                current.insert(key_hash);
-            }
-            previous_key = Some(entry.key.clone());
-        }
-        if page.entries.is_empty() {
-            if page.has_more {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan has_more without a resume key",
-                ));
-            }
-            break;
-        }
-        if !page.has_more {
-            break;
-        }
-    }
-    Ok((current, all))
-}
-
-#[allow(dead_code)]
-async fn load_optional_tree_sweep_row<S, T>(
-    store: &S,
-    space: StorageSpace,
-    key: &'static [u8],
-    label: &'static str,
-) -> Result<Option<(T, Bytes)>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-    T: for<'de> musli::Decode<'de, musli::mode::Binary, musli::alloc::Global>,
-{
-    let key = StorageKey(Bytes::from_static(key));
-    let value = PointReadPlan::new(space, std::slice::from_ref(&key))
-        .materialize(store, StorageGetOptions::default())
-        .await?
-        .value
-        .into_iter()
-        .next()
-        .flatten();
-    let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-        return Ok(None);
-    };
-    let decoded = storage_codec::decode(label, &bytes)?;
-    Ok(Some((decoded, bytes)))
-}
-
-/// Starts a new authenticated tree sweep epoch. The expensive root closure
-/// and mark inventory are built once here; ordinary queue-prefix GC never
-/// calls this function.
-#[allow(dead_code)]
-pub(crate) async fn begin_tree_sweep_epoch<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<TreeSweepEpochSession, LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync,
-{
-    let old_epoch = load_optional_tree_sweep_row::<S, StoredTreeSweepEpoch>(
-        store,
-        GC_TREE_SWEEP_EPOCH_SPACE,
-        GC_TREE_SWEEP_EPOCH_KEY,
-        "tree sweep epoch",
-    )
-    .await?;
-    let old_cursor = load_optional_tree_sweep_row::<S, StoredTreeSweepCursor>(
-        store,
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        GC_TREE_SWEEP_CURSOR_KEY,
-        "tree sweep cursor",
-    )
-    .await?;
-    if old_epoch.is_some() != old_cursor.is_some() {
-        return Err(tree_sweep_error(
-            "tree sweep epoch and cursor lifecycle rows disagree",
-        ));
-    }
-    if old_cursor
-        .as_ref()
-        .is_some_and(|(cursor, _)| !cursor.complete)
-    {
-        return Err(tree_sweep_error(
-            "tree sweep epoch is already active; reopen it instead of creating a second epoch",
-        ));
-    }
-    let (root_set_digest, live_chunk_digest, raw_queue, live_chunks) =
-        load_tree_sweep_root_closure(store).await?;
-    let epoch_id = old_epoch
-        .as_ref()
-        .map_or(1, |(epoch, _)| epoch.epoch_id.saturating_add(1));
-    let epoch = StoredTreeSweepEpoch {
-        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-        epoch_id,
-        queue_digest: *blake3::hash(&raw_queue).as_bytes(),
-        root_set_digest,
-        live_chunk_digest,
-        live_chunk_count: live_chunks.len() as u64,
-    };
-    let cursor = StoredTreeSweepCursor {
-        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-        epoch_id,
-        last_key: None,
-        scanned_rows: 0,
-        deleted_rows: 0,
-        complete: false,
-    };
-    let (current_marks, all_marks) = scan_tree_sweep_marks(store, None).await?;
-    let _ = current_marks;
-    for hash in all_marks.difference(&live_chunks) {
-        writes.delete(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-        );
-    }
-    for hash in &live_chunks {
-        let mark = StoredTreeSweepMark {
-            format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-            epoch_id,
-            chunk_hash: *hash,
-        };
-        writes.put(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-            StorageValue {
-                bytes: Bytes::from(storage_codec::encode("tree sweep mark", &mark)?),
-            },
-        );
-    }
-    let epoch_bytes = Bytes::from(storage_codec::encode("tree sweep epoch", &epoch)?);
-    let cursor_bytes = Bytes::from(storage_codec::encode("tree sweep cursor", &cursor)?);
-    writes.put(
-        GC_TREE_SWEEP_EPOCH_SPACE,
-        StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-        StorageValue { bytes: epoch_bytes },
-    );
-    writes.put(
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        StorageValue {
-            bytes: cursor_bytes.clone(),
-        },
-    );
-    preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_REACHABILITY_QUEUE_SPACE,
-        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        expected: raw_queue,
-    });
-    if let Some((_, raw)) = old_epoch {
-        preconditions.push(StoragePrecondition::KeyValueEquals {
-            space: GC_TREE_SWEEP_EPOCH_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-            expected: raw,
-        });
-    } else {
-        preconditions.push(StoragePrecondition::KeyAbsent {
-            space: GC_TREE_SWEEP_EPOCH_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-        });
-    }
-    if let Some((_, raw)) = old_cursor {
-        preconditions.push(StoragePrecondition::KeyValueEquals {
-            space: GC_TREE_SWEEP_CURSOR_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-            expected: raw,
-        });
-    } else {
-        preconditions.push(StoragePrecondition::KeyAbsent {
-            space: GC_TREE_SWEEP_CURSOR_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        });
-    }
-    Ok(TreeSweepEpochSession {
-        epoch,
-        cursor,
-        raw_cursor: cursor_bytes,
-        live_chunks,
-    })
-}
-
-/// Reopens an active or completed epoch. Mark rows are fully authenticated
-/// against the persisted count/digest before any page may stage a delete.
-#[allow(dead_code)]
-pub(crate) async fn open_tree_sweep_epoch<S>(
-    store: &S,
-) -> Result<Option<TreeSweepEpochSession>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let Some((epoch, _)) = load_optional_tree_sweep_row::<S, StoredTreeSweepEpoch>(
-        store,
-        GC_TREE_SWEEP_EPOCH_SPACE,
-        GC_TREE_SWEEP_EPOCH_KEY,
-        "tree sweep epoch",
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    if epoch.format_version != GC_TREE_SWEEP_FORMAT_VERSION {
-        return Err(tree_sweep_error("tree sweep epoch format is unsupported"));
-    }
-    let Some((cursor, raw_cursor)) = load_optional_tree_sweep_row::<S, StoredTreeSweepCursor>(
-        store,
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        GC_TREE_SWEEP_CURSOR_KEY,
-        "tree sweep cursor",
-    )
-    .await?
-    else {
-        return Err(tree_sweep_error("tree sweep cursor is missing"));
-    };
-    if cursor.format_version != GC_TREE_SWEEP_FORMAT_VERSION || cursor.epoch_id != epoch.epoch_id {
-        return Err(tree_sweep_error("tree sweep cursor identity is invalid"));
-    }
-    let (live_chunks, all_marks) = scan_tree_sweep_marks(store, Some(epoch.epoch_id)).await?;
-    if live_chunks != all_marks
-        || live_chunks.len() as u64 != epoch.live_chunk_count
-        || tree_sweep_digest(&live_chunks) != epoch.live_chunk_digest
-    {
-        return Err(tree_sweep_error(
-            "tree sweep mark inventory disagrees with epoch closure or contains stale rows",
-        ));
-    }
-    Ok(Some(TreeSweepEpochSession {
-        epoch,
-        cursor,
-        raw_cursor,
-        live_chunks,
-    }))
-}
-
-/// Enumerates one bounded tree-chunk page and stages only chunks absent from
-/// the authenticated epoch mark set. Every key/value and cursor transition is
-/// validated before staging; the queue and cursor CAS fences make interruption
-/// and root publication races fail closed.
-#[allow(dead_code)]
-pub(crate) async fn stage_tree_sweep_epoch_page<S>(
-    store: &S,
-    session: &mut TreeSweepEpochSession,
-    writes: &mut StorageWriteSet,
-    preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if session.cursor.complete {
-        return Ok(true);
-    }
-    let (queue, raw_queue) = load_reachability_queue(store).await?;
-    if *blake3::hash(&raw_queue).as_bytes() != session.epoch.queue_digest {
-        return Err(tree_sweep_error(
-            "tree sweep root publication advanced during an active epoch",
-        ));
-    }
-    let range = StorageKeyRange {
-        lower: session
-            .cursor
-            .last_key
-            .as_ref()
-            .map_or(Bound::Unbounded, |key| {
-                Bound::Excluded(StorageKey(Bytes::copy_from_slice(key)))
-            }),
-        upper: Bound::Unbounded,
-    };
-    let mut cursor = store
-        .begin_scan(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::FullValue,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    let page = cursor.next_page(GC_TREE_SWEEP_PAGE_ROWS).await?;
-    if page.has_more && page.entries.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep tree-chunk scan reported has_more with an empty page",
-        ));
-    }
-    let previous = session.cursor.last_key.as_deref();
-    let mut hashes = Vec::with_capacity(page.entries.len());
-    for entry in &page.entries {
-        if entry.key.0.len() != 32
-            || previous.is_some_and(|previous| entry.key.0.as_ref() <= previous)
-            || hashes
-                .last()
-                .is_some_and(|last: &[u8; 32]| entry.key.0.as_ref() <= last.as_slice())
-        {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk keys are malformed or non-increasing",
-            ));
-        }
-        let hash: [u8; 32] = entry
-            .key
-            .0
-            .as_ref()
-            .try_into()
-            .map_err(|_| tree_sweep_error("tree sweep tree-chunk key is not 32 bytes"))?;
-        let StorageProjectedValue::FullValue(bytes) = &entry.value else {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk scan returned a key-only value",
-            ));
-        };
-        if *blake3::hash(bytes).as_bytes() != hash {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk value hash disagrees with its key",
-            ));
-        }
-        hashes.push(hash);
-    }
-    let mark_keys = hashes
-        .iter()
-        .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
-        .collect::<Vec<_>>();
-    let marks = if mark_keys.is_empty() {
-        Vec::new()
-    } else {
-        PointReadPlan::new(GC_TREE_SWEEP_MARK_SPACE, &mark_keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?
-            .value
-    };
-    if marks.len() != hashes.len() {
-        return Err(tree_sweep_error(
-            "tree sweep mark point read returned the wrong cardinality",
-        ));
-    }
-    let mut deletes = Vec::new();
-    for (hash, mark) in hashes.iter().zip(marks) {
-        let marked = match mark {
-            None => false,
-            Some(StorageProjectedValue::KeyOnly) => {
-                return Err(tree_sweep_error(
-                    "tree sweep mark point read returned a key-only value",
-                ));
-            }
-            Some(StorageProjectedValue::FullValue(bytes)) => {
-                let mark: StoredTreeSweepMark = storage_codec::decode("tree sweep mark", &bytes)
-                    .map_err(|error| {
-                        tree_sweep_error(format!("tree sweep mark is malformed: {error}"))
-                    })?;
-                if mark.format_version != GC_TREE_SWEEP_FORMAT_VERSION
-                    || mark.epoch_id != session.epoch.epoch_id
-                    || mark.chunk_hash != *hash
-                {
-                    return Err(tree_sweep_error(
-                        "tree sweep mark does not authenticate the current epoch chunk",
-                    ));
-                }
-                true
-            }
-        };
-        if marked != session.live_chunks.contains(hash) {
-            return Err(tree_sweep_error(
-                "tree sweep mark completeness disagrees with authenticated closure",
-            ));
-        }
-        if !marked {
-            deletes.push(*hash);
-        }
-    }
-
-    // A complete keyspace scan must prove that every authenticated live mark
-    // still has its physical chunk before any delete is staged.  This catches
-    // a live chunk deleted between epoch creation and the final page (the
-    // mark inventory alone cannot distinguish that from a clean sweep).
-    if !page.has_more {
-        let live_keys = session
-            .live_chunks
-            .iter()
-            .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
-            .collect::<Vec<_>>();
-        for chunk_keys in live_keys.chunks(GC_TREE_SWEEP_PAGE_ROWS) {
-            let values = PointReadPlan::new(
-                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-                chunk_keys,
-            )
-            .materialize(store, StorageGetOptions::default())
-            .await?
-            .value;
-            if values.len() != chunk_keys.len() {
-                return Err(tree_sweep_error(
-                    "tree sweep final live-chunk validation returned the wrong cardinality",
-                ));
-            }
-            for (key, value) in chunk_keys.iter().zip(values) {
-                let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-                    return Err(tree_sweep_error(
-                        "tree sweep final live-chunk validation found a missing or key-only chunk",
-                    ));
-                };
-                if blake3::hash(&bytes).as_bytes().as_slice() != key.0.as_ref() {
-                    return Err(tree_sweep_error(
-                        "tree sweep final live-chunk validation found a corrupt chunk",
-                    ));
-                }
-            }
-        }
-    }
-
-    for hash in &deletes {
-        writes.delete(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-        );
-    }
-    let next_cursor = StoredTreeSweepCursor {
-        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-        epoch_id: session.epoch.epoch_id,
-        last_key: page.entries.last().map(|entry| entry.key.0.to_vec()),
-        scanned_rows: session
-            .cursor
-            .scanned_rows
-            .saturating_add(hashes.len() as u64),
-        deleted_rows: session
-            .cursor
-            .deleted_rows
-            .saturating_add(deletes.len() as u64),
-        complete: !page.has_more,
-    };
-    let next_raw = Bytes::from(storage_codec::encode("tree sweep cursor", &next_cursor)?);
-    writes.put(
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        StorageValue {
-            bytes: next_raw.clone(),
-        },
-    );
-    preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_REACHABILITY_QUEUE_SPACE,
-        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        expected: raw_queue,
-    });
-    preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_TREE_SWEEP_CURSOR_SPACE,
-        key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        expected: session.raw_cursor.clone(),
-    });
-    session.cursor = next_cursor;
-    session.raw_cursor = next_raw;
-    let _ = queue;
-    Ok(session.cursor.complete)
 }
 
 /// Returns the exact standalone semantic facts and the authenticated reason
@@ -1612,52 +961,6 @@ pub(crate) async fn load_recovery_refs(
     Ok(refs.into_values().collect())
 }
 
-#[cfg(test)]
-async fn stage_sweep_unreachable_content_nodes(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    space: StorageSpace,
-    live: &BTreeSet<[u8; 32]>,
-) -> Result<(), LixError> {
-    let range = StoragePrefix {
-        bytes: Bytes::new(),
-    }
-    .to_range()?;
-    let mut cursor = store
-        .begin_scan(
-            space,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    loop {
-        let page = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
-            let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "content-addressed space '{}' contains a malformed key",
-                        space.name
-                    ),
-                )
-            })?;
-            if !live.contains(&node_id) {
-                writes.delete(space, entry.key);
-            }
-        }
-        if !page.has_more {
-            break;
-        }
-    }
-    Ok(())
-}
-
 pub(crate) async fn load_recovery_ref(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -1799,6 +1102,9 @@ fn validate_stored_recovery_ref(
 pub(crate) struct RepositoryGcSweep {
     pub(crate) tracked_commit_roots: Vec<CommitId>,
     pub(crate) standalone_changes: Vec<ChangeId>,
+    /// Derived serving rows reclaimed from branch generations that no live
+    /// branch control selects any more.
+    pub(crate) reclaimed_generation_rows: u64,
     pub(crate) binary_cas: crate::binary_cas::BinaryCasGcSweep,
 }
 
@@ -1991,7 +1297,6 @@ struct AuthenticatedServingDependencyClosure {
     physical_dependencies: BTreeSet<CommitId>,
     semantic_dependencies: BTreeSet<CommitId>,
     cas_logical_dependencies: BTreeSet<CommitId>,
-    manifests: BTreeMap<CommitId, crate::tracked_state::CommitStateManifest>,
     mutation_nodes: BTreeSet<[u8; 32]>,
     scoped_nodes: BTreeSet<[u8; 32]>,
     native_parts: BTreeSet<[u8; 32]>,
@@ -2097,7 +1402,8 @@ where
             }
         }
     }
-    let native_commit_dependencies = validate_live_native_parts(store, &native_parts).await?;
+    let native_commit_dependencies =
+        crate::tracked_state::load_native_current_state_part_owners(store, &native_parts).await?;
     physical_dependencies.extend(native_commit_dependencies.iter().copied());
     semantic_dependencies.extend(native_commit_dependencies);
 
@@ -2200,7 +1506,6 @@ where
         physical_dependencies,
         semantic_dependencies,
         cas_logical_dependencies,
-        manifests,
         mutation_nodes,
         scoped_nodes,
         native_parts,
@@ -2312,7 +1617,6 @@ where
         physical_dependencies: active_dependency_ids,
         semantic_dependencies: active_semantic_dependency_ids,
         cas_logical_dependencies: active_cas_dependency_ids,
-        manifests: _,
         mutation_nodes: active_mutation_nodes,
         scoped_nodes: active_scoped_nodes,
         native_parts: active_current_parts,
@@ -2408,6 +1712,7 @@ where
             sweep: RepositoryGcSweep {
                 tracked_commit_roots: Vec::new(),
                 standalone_changes: Vec::new(),
+                reclaimed_generation_rows: 0,
                 binary_cas,
             },
             profile: RepositoryGcProfile {
@@ -2433,6 +1738,21 @@ where
     let mut reclaimed_semantic_commits = BTreeSet::new();
     let mut reclaimed_standalone_changes = BTreeSet::new();
     let mut reclaimed_checkpoint_branches = BTreeSet::new();
+    // Derived serving generations are reachable from exactly one place: the
+    // live branch controls this pass already read for root discovery. Reusing
+    // that root set is what keeps generation reclamation inside the single
+    // reachability walk instead of needing a second retention ledger.
+    let live_generations = controls
+        .iter()
+        .flat_map(|(branch_id, control)| {
+            [
+                (branch_id.as_str(), control.tracked_generation),
+                (branch_id.as_str(), control.untracked_generation),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    let mut retired_generations = BTreeSet::new();
+    let mut reclaimed_generation_rows = 0_u64;
     for (sequence, batch) in batches {
         if queue_open && blocked_sequences.contains(&sequence) {
             queue_open = false;
@@ -2461,6 +1781,41 @@ where
                 )
                 .await?;
             }
+            // A branch generation is a disposable serving cache reachable from
+            // exactly one place: a branch control. Once no live control selects
+            // it, nothing can ever read it again, so retire it.
+            //
+            // This deliberately does not wait for the batch to be consumable.
+            // A blocked batch means a *commit root* is still pinned by history,
+            // undo, or replay — all of which read tracked-state records, never
+            // these derived rows. Coupling the two would strand a whole
+            // generation behind an unrelated pin, exactly like the retired
+            // branch-checkpoint prefix immediately above.
+            if let Some(old_control) = delta.old_control.as_ref() {
+                for generation in [
+                    old_control.tracked_generation,
+                    old_control.untracked_generation,
+                ] {
+                    if delta.new_control.is_some_and(|new_control| {
+                        new_control.tracked_generation == generation
+                            || new_control.untracked_generation == generation
+                    }) || live_generations.contains(&(delta.branch_id.as_str(), generation))
+                    {
+                        continue;
+                    }
+                    if retired_generations.insert((delta.branch_id.clone(), generation)) {
+                        reclaimed_generation_rows = reclaimed_generation_rows.saturating_add(
+                            crate::live_state::stage_retire_hot_generation(
+                                &store,
+                                writes,
+                                &delta.branch_id,
+                                generation,
+                            )
+                            .await?,
+                        );
+                    }
+                }
+            }
             let Some(old_root) = delta.old_root else {
                 continue;
             };
@@ -2477,98 +1832,36 @@ where
                 &active_semantic_dependency_ids,
             );
             if semantic_retirement && reclaimed_semantic_commits.insert(old_root) {
-                stage_delete_semantic_commit_projection(&store, writes, old_root).await?;
+                crate::changelog::stage_delete_commit_projection(&store, writes, old_root).await?;
             }
             if !physical_retirement {
                 continue;
             }
             if reclaimed_commits.insert(old_root) {
-                let manifest = crate::tracked_state::load_commit_state_manifest(&store, old_root)
-                    .await?
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("retired GC root '{old_root}' has no authenticated manifest"),
-                        )
-                    })?;
-                let retired_root =
-                    crate::tracked_state::load_commit_mutation_directory_roots(&store, &[old_root])
-                        .await?
-                        .into_iter()
-                        .next()
-                        .flatten();
-                if let Some(root) = retired_root {
-                    let nodes =
-                        crate::tracked_state::collect_mutation_directory_node_ids(&store, &root)
-                            .await?;
-                    for node_id in nodes.difference(&active_mutation_nodes) {
-                        writes.delete(
-                            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-                            StorageKey(Bytes::copy_from_slice(node_id)),
-                        );
-                    }
-                }
-                if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-                    let reachable = crate::tracked_state::validate_scoped_range_trees(
-                        &store,
-                        std::slice::from_ref(&root.tree),
-                    )
-                    .await?;
-                    for node_id in reachable.node_ids.difference(&active_scoped_nodes) {
-                        writes.delete(
-                            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-                            StorageKey(Bytes::copy_from_slice(node_id)),
-                        );
-                    }
-                    for part in reachable.parts {
-                        let descriptor =
-                            crate::tracked_state::current_state_descriptor_from_scoped_range_part(
-                                &part,
-                            )?;
-                        if descriptor.source_kind == 1
-                            && !active_current_parts.contains(&descriptor.content_digest)
-                        {
-                            writes.delete(
-                                crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-                                StorageKey(Bytes::copy_from_slice(&descriptor.content_digest)),
-                            );
-                            writes.delete(
-                                crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-                                StorageKey(Bytes::copy_from_slice(&descriptor.payload_refs_digest)),
-                            );
-                        }
-                    }
-                }
-                crate::tracked_state::stage_delete_commit_state_manifest_for_gc(
-                    &store, writes, old_root, &manifest,
+                crate::tracked_state::stage_retire_commit_physical_state(
+                    &store,
+                    writes,
+                    old_root,
+                    RetainedPhysicalState {
+                        mutation_nodes: &active_mutation_nodes,
+                        scoped_nodes: &active_scoped_nodes,
+                        native_parts: &active_current_parts,
+                    },
                 )
                 .await?;
             }
-            if let Some(control) = delta.old_control.as_ref() {
-                if !controls
+            if let Some(control) = delta.old_control.as_ref()
+                && !controls
                     .iter()
                     .any(|(_, active)| active.ref_change_id == control.ref_change_id)
-                {
-                    let key = StorageKey(Bytes::from(change_key(control.ref_change_id)));
-                    let existing = PointReadPlan::new(CHANGE_SPACE, std::slice::from_ref(&key))
-                        .materialize(&store, StorageGetOptions::default())
-                        .await?
-                        .value
-                        .into_iter()
-                        .next()
-                        .flatten();
-                    if existing.is_none() {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "retired branch control references missing standalone change '{}'",
-                                control.ref_change_id
-                            ),
-                        ));
-                    }
-                    writes.delete(CHANGE_SPACE, key);
-                    reclaimed_standalone_changes.insert(control.ref_change_id);
-                }
+            {
+                crate::changelog::stage_delete_standalone_change(
+                    &store,
+                    writes,
+                    control.ref_change_id,
+                )
+                .await?;
+                reclaimed_standalone_changes.insert(control.ref_change_id);
             }
         }
     }
@@ -2623,6 +1916,7 @@ where
         sweep: RepositoryGcSweep {
             tracked_commit_roots: reclaimed_commits.into_iter().collect(),
             standalone_changes: reclaimed_standalone_changes.into_iter().collect(),
+            reclaimed_generation_rows,
             binary_cas,
         },
         profile: RepositoryGcProfile {
@@ -2632,43 +1926,6 @@ where
             total_us: elapsed_micros(started),
         },
     })
-}
-
-/// Every authenticated active scoped-range descriptor must have its native
-/// payload present before ordinary GC is allowed to stage any sweep.  The
-/// descriptor is authority for the digest, but not proof that the immutable
-/// payload still exists; treating a missing payload as an empty live set would
-/// silently turn corruption into deletion.
-async fn validate_live_native_parts<S>(
-    store: &S,
-    digests: &BTreeSet<[u8; 32]>,
-) -> Result<BTreeSet<CommitId>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if digests.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let keys = digests
-        .iter()
-        .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
-        .collect::<Vec<_>>();
-    let loaded = PointReadPlan::new(crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE, &keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    let mut commit_ids = BTreeSet::new();
-    for (digest, value) in digests.iter().zip(loaded.value) {
-        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "live current-state directory references a missing native data part",
-            ));
-        };
-        commit_ids.extend(
-            crate::tracked_state::decode_current_state_data_part_commit_ids(digest, &bytes)?,
-        );
-    }
-    Ok(commit_ids)
 }
 
 /// Recovery-only verifier retained for explicit rebuild tooling and tests.
@@ -2793,6 +2050,7 @@ where
         sweep: RepositoryGcSweep {
             tracked_commit_roots: swept_snapshot_authorities,
             standalone_changes: Vec::new(),
+            reclaimed_generation_rows: 0,
             binary_cas: Default::default(),
         },
         profile: RepositoryGcProfile {
@@ -3309,36 +2567,15 @@ where
         .collect::<Vec<_>>();
     crate::tracked_state::stage_change_locators(writes, &relocated_locators);
 
-    writes.delete_batch(
-        COMMIT_SPACE,
-        sweep_commits.iter().map(|commit_id| commit_key(*commit_id)),
-    );
-    stage_sweep_unreachable_content_nodes(
+    crate::changelog::stage_delete_commits(writes, sweep_commits.iter().copied());
+    crate::tracked_state::stage_sweep_unreachable_content_nodes(
         store,
         writes,
-        crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-        &live_scoped_range_nodes,
-    )
-    .await?;
-    stage_sweep_unreachable_content_nodes(
-        store,
-        writes,
-        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-        &live_mutation_directory_nodes,
-    )
-    .await?;
-    stage_sweep_unreachable_content_nodes(
-        store,
-        writes,
-        crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-        &live_current_state_data_parts,
-    )
-    .await?;
-    stage_sweep_unreachable_content_nodes(
-        store,
-        writes,
-        crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-        &live_current_state_data_parts,
+        RetainedPhysicalState {
+            mutation_nodes: &live_mutation_directory_nodes,
+            scoped_nodes: &live_scoped_range_nodes,
+            native_parts: &live_current_state_data_parts,
+        },
     )
     .await?;
     for commit_id in &sweep_authority_commits {
@@ -3361,16 +2598,11 @@ where
             )?;
         }
     }
-    writes.delete_batch(
-        COMMIT_CHANGE_ID_SPACE,
-        sweep_commit_change_ids
-            .iter()
-            .map(|change_id| commit_change_id_key(*change_id)),
+    crate::changelog::stage_delete_commit_change_ids(
+        writes,
+        sweep_commit_change_ids.iter().copied(),
     );
-    writes.delete_batch(
-        CHANGE_SPACE,
-        sweep_changes.iter().map(|change_id| change_key(*change_id)),
-    );
+    crate::changelog::stage_delete_changes(writes, sweep_changes.iter().copied());
     JsonStoreContext::new()
         .writer()
         .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
@@ -3539,54 +2771,6 @@ fn retirement_is_proven(
         && !active_dependency_ids.contains(&old_root)
 }
 
-/// Removes the semantic commit projection once its root interval is no longer
-/// reachable. Physical tracked-state authority may remain alive as a selected
-/// source or serving dependency, so this decision is intentionally separate
-/// from manifest/CAS retirement.
-async fn stage_delete_semantic_commit_projection<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    commit_id: CommitId,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let commit_ids = [commit_id];
-    let record = ChangelogContext::new()
-        .reader(store)
-        .load_commits(CommitLoadRequest {
-            commit_ids: &commit_ids,
-        })
-        .await?
-        .into_iter()
-        .next()
-        .and_then(|(_, record)| record);
-    let Some(record) = record else {
-        // A prior GC pass may already have removed the semantic projection
-        // while its physical authority remained pinned.
-        return Ok(());
-    };
-    if record.commit_id != commit_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit projection key for '{commit_id}' contains '{}'",
-                record.commit_id
-            ),
-        ));
-    }
-    writes.delete(COMMIT_SPACE, StorageKey(Bytes::from(commit_key(commit_id))));
-    writes.delete(
-        COMMIT_CHANGE_ID_SPACE,
-        StorageKey(Bytes::from(commit_change_id_key(record.change_id))),
-    );
-    writes.delete(
-        CHANGE_SPACE,
-        StorageKey(Bytes::from(change_key(record.change_id))),
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -3616,7 +2800,6 @@ mod tests {
         StorageKey, StoragePrecondition, StorageReadOptions, StorageSpace, StorageValue,
         StorageWriteOptions, StorageWriteSet,
     };
-    use crate::storage_codec;
     use crate::tracked_state::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
@@ -3636,15 +2819,13 @@ mod tests {
 
     use super::{
         CheckpointGcState, CheckpointRecoveryRef, GC_REACHABILITY_DELTA_SPACE,
-        GC_REACHABILITY_QUEUE_SPACE, GC_TREE_SWEEP_FORMAT_VERSION, GC_TREE_SWEEP_MARK_SPACE,
-        RootReachabilityDelta, StoredTreeSweepMark, authenticated_control_commit_reachability,
-        begin_tree_sweep_epoch, collect_all_reachability_checkpoint_roots,
+        GC_REACHABILITY_QUEUE_SPACE, RootReachabilityDelta,
+        authenticated_control_commit_reachability, collect_all_reachability_checkpoint_roots,
         load_checkpoint_gc_state, load_reachability_batches, load_reachability_queue,
-        load_recovery_ref, load_recovery_refs, open_tree_sweep_epoch,
-        resolve_pending_checkpoint_replacement, retirement_is_proven,
-        root_control_digest_for_control, stage_checkpoint_gc_state, stage_delete_recovery_ref,
-        stage_reachability_delta_batch, stage_reachability_queue_seed, stage_recovery_ref_rotation,
-        stage_tree_sweep_epoch_page,
+        load_recovery_ref, load_recovery_refs, resolve_pending_checkpoint_replacement,
+        retirement_is_proven, root_control_digest_for_control, stage_checkpoint_gc_state,
+        stage_delete_recovery_ref, stage_reachability_delta_batch, stage_reachability_queue_seed,
+        stage_recovery_ref_rotation,
     };
 
     async fn append_checkpoint_batch(
@@ -4752,9 +3933,12 @@ mod tests {
             .await
             .expect("native dependency read should open");
         assert_eq!(
-            super::validate_live_native_parts(&read, &BTreeSet::from([encoded.digest]))
-                .await
-                .expect("native owner should decode"),
+            crate::tracked_state::load_native_current_state_part_owners(
+                &read,
+                &BTreeSet::from([encoded.digest]),
+            )
+            .await
+            .expect("native owner should decode"),
             BTreeSet::from([owner.commit_id])
         );
         drop(read);
@@ -4903,7 +4087,7 @@ mod tests {
         );
     }
 
-    async fn tree_sweep_fixture() -> (
+    async fn gc_sweep_fixture() -> (
         StorageAdapter<Memory>,
         CommitId,
         [u8; 32],
@@ -4973,8 +4157,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_sweep_branch_guard_rejects_concurrent_publication() {
-        let (storage, commit_id, _root_hash, _dead_hash, _dead_hash_two) =
-            tree_sweep_fixture().await;
+        let (storage, commit_id, _root_hash, _dead_hash, _dead_hash_two) = gc_sweep_fixture().await;
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -5026,7 +4209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_sweep_and_audit_share_retained_physical_owner_closure() {
+    async fn retention_closure_and_audit_share_retained_physical_owner() {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("shared offline owner timestamp", "2026-01-01T00:00:00Z");
@@ -5144,10 +4327,34 @@ mod tests {
             .await
             .expect("shared offline owner closure should authenticate");
         assert!(closure.physical_dependencies.contains(&owner));
-        let (_, _, _, live_chunks) = super::load_tree_sweep_root_closure(&read)
-            .await
-            .expect("offline sweep should retain the physical owner tree");
-        assert_eq!(live_chunks, BTreeSet::from([owner_hash, active_hash]));
+        // The one retention closure is also what keeps the retired owner's
+        // tracked tree root alive; there is no second root walk to consult.
+        let retained_ids = closure
+            .physical_authorities
+            .union(&closure.physical_dependencies)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(retained_ids, vec![owner.min(active), owner.max(active)]);
+        let closure_tree_roots =
+            crate::tracked_state::load_commit_state_manifests(&read, &retained_ids)
+                .await
+                .expect("retained manifests should load")
+                .into_iter()
+                .flatten()
+                .filter_map(|manifest| manifest.snapshot_root)
+                .flat_map(|root| {
+                    std::iter::once(*root.root_id.as_bytes()).chain(
+                        root.parent_roots
+                            .iter()
+                            .map(|parent| *parent.root_id.as_bytes())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+        assert_eq!(
+            closure_tree_roots,
+            BTreeSet::from([owner_hash, active_hash])
+        );
         let audit = super::audit_repository_gc_standalone_refs(&read)
             .await
             .expect("standalone audit should consume the same closure");
@@ -5157,269 +4364,6 @@ mod tests {
                 "{}:retired_delta_old_control:history_dependency_pin:old_root={owner}",
                 retired_ref
             )]
-        );
-    }
-
-    #[tokio::test]
-    async fn tree_sweep_epoch_closes_roots_once_and_reclaims_only_unmarked_chunks() {
-        let (storage, _commit_id, _root_hash, dead_hash, dead_hash_two) =
-            tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::<StoragePrecondition>::new();
-        let _session = begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch closure should build once");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch metadata should publish atomically");
-        drop(read);
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("reopened epoch read should open");
-        let mut reopened = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should reopen")
-            .expect("epoch should exist");
-        assert_eq!(reopened.epoch.live_chunk_count, 1);
-        assert_eq!(reopened.live_chunks.len(), 1);
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
-        assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut reopened,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .expect("tree page should stage")
-        );
-        storage
-            .commit_write_set(
-                page_writes,
-                StorageWriteOptions {
-                    preconditions: page_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("tree page should commit");
-        drop(read);
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("post-sweep read should open");
-        let keys = [
-            StorageKey(Bytes::copy_from_slice(&dead_hash)),
-            StorageKey(Bytes::copy_from_slice(&dead_hash_two)),
-        ];
-        let result =
-            PointReadPlan::new(crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE, &keys)
-                .materialize(&read, StorageGetOptions::default())
-                .await
-                .expect("post-sweep chunks should read");
-        assert!(result.value.into_iter().all(|value| value.is_none()));
-        assert!(
-            open_tree_sweep_epoch(&read)
-                .await
-                .expect("completed epoch should reopen")
-                .expect("completed epoch should remain")
-                .cursor
-                .complete
-        );
-    }
-
-    #[tokio::test]
-    async fn tree_sweep_epoch_fails_closed_on_missing_mark_or_corrupt_chunk() {
-        let (storage, _commit_id, _root_hash, dead_hash, _dead_hash_two) =
-            tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch should begin");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch should publish");
-        drop(read);
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("reopened epoch read should open");
-        let session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should load")
-            .expect("epoch should exist");
-        let live_hash = *session.live_chunks.iter().next().expect("root mark");
-        let epoch_id = session.epoch.epoch_id;
-        drop(read);
-        let mut remove_mark = storage.new_write_set();
-        remove_mark.delete(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&live_hash)),
-        );
-        storage
-            .commit_write_set(remove_mark, StorageWriteOptions::default())
-            .await
-            .expect("test mark deletion should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("missing-mark read should open");
-        assert!(
-            open_tree_sweep_epoch(&read)
-                .await
-                .expect_err("missing live mark must fail closed")
-                .to_string()
-                .contains("mark inventory")
-        );
-        drop(read);
-
-        // Restore the mark and corrupt an unmarked chunk. The page validates
-        // every key/value before it stages any delete, so the failed page has
-        // an empty write set and cannot partially reclaim its siblings.
-        let mut restore = storage.new_write_set();
-        restore.put(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&live_hash)),
-            StorageValue {
-                bytes: Bytes::from(
-                    storage_codec::encode(
-                        "tree sweep mark",
-                        &StoredTreeSweepMark {
-                            format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-                            epoch_id,
-                            chunk_hash: live_hash,
-                        },
-                    )
-                    .expect("mark should encode"),
-                ),
-            },
-        );
-        storage
-            .commit_write_set(restore, StorageWriteOptions::default())
-            .await
-            .expect("mark restoration should commit");
-        let mut corrupt = storage.new_write_set();
-        corrupt.put(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&dead_hash)),
-            StorageValue {
-                bytes: Bytes::from_static(b"corrupt-tree-chunk"),
-            },
-        );
-        storage
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("test corruption should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("corruption read should open");
-        let mut session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("restored epoch should load")
-            .expect("restored epoch should exist");
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
-        assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut session,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .is_err()
-        );
-        assert!(page_writes.is_empty(), "failed page must stage zero writes");
-    }
-
-    #[tokio::test]
-    async fn tree_sweep_epoch_fails_closed_when_live_chunk_disappears() {
-        let (storage, _commit_id, root_hash, _dead_hash, _dead_hash_two) =
-            tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch should begin");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch should publish");
-        drop(read);
-
-        let mut remove_root = storage.new_write_set();
-        remove_root.delete(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&root_hash)),
-        );
-        storage
-            .commit_write_set(remove_root, StorageWriteOptions::default())
-            .await
-            .expect("test root deletion should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("missing-root read should open");
-        let mut session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should load")
-            .expect("epoch should exist");
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
-        assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut session,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .is_err(),
-            "missing live chunk must fail closed"
-        );
-        assert!(
-            page_writes.is_empty(),
-            "missing live chunk must stage zero deletes"
         );
     }
 
@@ -6730,16 +5674,17 @@ mod tests {
             .expect("shared-node read should open");
         let mut sweep = storage.new_write_set();
         let live = BTreeSet::from([live_id]);
-        for space in [
-            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-        ] {
-            super::stage_sweep_unreachable_content_nodes(&read, &mut sweep, space, &live)
-                .await
-                .expect("content-addressed sweep should stage");
-        }
+        crate::tracked_state::stage_sweep_unreachable_content_nodes(
+            &read,
+            &mut sweep,
+            crate::tracked_state::RetainedPhysicalState {
+                mutation_nodes: &live,
+                scoped_nodes: &live,
+                native_parts: &live,
+            },
+        )
+        .await
+        .expect("content-addressed sweep should stage");
         drop(read);
         storage
             .commit_write_set(sweep, StorageWriteOptions::default())
@@ -7311,7 +6256,10 @@ mod tests {
             )
             .await
             .expect("tracked owner should remain readable");
-        assert_eq!(tracked.rows()[0].values(), &[Value::Json(shared_value.into())]);
+        assert_eq!(
+            tracked.rows()[0].values(),
+            &[Value::Json(shared_value.into())]
+        );
     }
 
     #[tokio::test]
@@ -8289,6 +7237,103 @@ mod tests {
             .expect("replay release should publish");
     }
 
+    /// Reproduction of a known, unfixed defect: the retirement ledger never
+    /// drains, so `gc.reachability_delta.v1` grows one ~439 B row per branch
+    /// publication forever.
+    ///
+    /// Measured cause (this test, plus `expv_blind_space_growth commits`): it
+    /// is *not* head-of-line blocking and not the 64-row consumption cap. Every
+    /// delta is blocked on its own merits, because every commit that still owns
+    /// a live current-state scoped-range part is inserted into
+    /// `physical_authorities` (see the `source_kind` 0 | 2 arm of
+    /// `load_authenticated_serving_dependency_closure`). In an append-only
+    /// workload that is every commit, so `retirement_is_proven` is false for
+    /// every `old_root` even after a checkpoint releases the undo interval.
+    ///
+    /// Fixing it therefore requires either compacting live current state so old
+    /// commits stop owning live parts, or deriving retirement candidates from
+    /// the manifests instead of storing a per-publication ledger. Both are
+    /// larger than this change, so the reproduction is kept and ignored rather
+    /// than deleted.
+    #[tokio::test]
+    #[ignore = "reproduces the unfixed retirement-ledger leak; see the doc comment"]
+    async fn ordinary_gc_drains_the_reachability_queue_past_a_pinned_head() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("queue drain fixture should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("queue drain fixture should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("queue drain session should open");
+        let schema = serde_json::json!({
+            "x-lix-key": "gc_queue_drain_fixture",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("queue drain schema should register");
+        for row in 0..24 {
+            session
+                .execute(
+                    "INSERT INTO gc_queue_drain_fixture (path, value) VALUES ($1, lix_json($2))",
+                    &[
+                        Value::Text(format!("/row/{row}")),
+                        Value::Text(format!(r#"{{"v":{row}}}"#)),
+                    ],
+                )
+                .await
+                .expect("queue drain row should publish");
+        }
+        // A checkpoint releases the undo interval, so every commit below it is
+        // provably retirable and its delta is consumable.
+        session
+            .create_checkpoint()
+            .await
+            .expect("queue drain checkpoint should publish");
+
+        let storage = StorageAdapter::new(backend.clone());
+        let queue_depth = async |storage: &StorageAdapter<Memory>| {
+            let read = SharedStorageAdapterRead::new(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("queue depth read should open"),
+            );
+            let (queue, _) = load_reachability_queue(&read)
+                .await
+                .expect("queue depth should load");
+            queue.tail_sequence.saturating_sub(queue.head_sequence)
+        };
+        let before = queue_depth(&storage).await;
+        assert!(before > 0, "the fixture must leave a non-empty queue");
+
+        // Repeated sweeps must converge, not plateau.
+        let mut after = before;
+        for _ in 0..8 {
+            run_ordinary_repository_gc(&storage).await;
+            after = queue_depth(&storage).await;
+        }
+        assert!(
+            after < before,
+            "repeated GC left the retirement ledger at {after} of {before} deltas"
+        );
+    }
+
     async fn run_ordinary_repository_gc(
         storage: &StorageAdapter<Memory>,
     ) -> super::RepositoryGcPlan {
@@ -8315,6 +7360,169 @@ mod tests {
             .await
             .expect("ordinary GC should commit");
         plan
+    }
+
+    /// Counts serving rows still addressed by one branch generation.
+    async fn hot_generation_rows(
+        storage: &StorageAdapter<Memory>,
+        branch_id: &str,
+        generation: CommitId,
+    ) -> usize {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("generation census read should open");
+        let prefix = crate::storage_adapter::StoragePrefix {
+            bytes: Bytes::from(crate::live_state::hot_generation_scope_prefix(
+                branch_id, generation,
+            )),
+        };
+        let mut rows = 0;
+        let mut cursor = crate::storage_adapter::StorageAdapterRead::begin_scan(
+            &read,
+            crate::live_state::HOT_ROW_SPACE,
+            prefix.to_range().expect("generation prefix should range"),
+            crate::storage_adapter::StorageBeginScanOptions::default(),
+        )
+        .await
+        .expect("generation census scan should open");
+        loop {
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await
+                .expect("generation census page should load");
+            rows += page.entries.len();
+            if !page.has_more {
+                break;
+            }
+        }
+        rows
+    }
+
+    /// A deleted branch strands its whole serving generation. The one
+    /// reachability walk already knows which generations the live controls
+    /// select, so the ordinary pass must reclaim it — no second sweeper, no
+    /// retention ledger.
+    #[tokio::test]
+    async fn ordinary_gc_reclaims_the_serving_generation_of_a_deleted_branch() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("generation fixture should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("generation fixture should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("generation fixture session should open");
+        let schema = serde_json::json!({
+            "x-lix-key": "gc_generation_fixture",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("generation fixture schema should register");
+        for row in 0..16 {
+            session
+                .execute(
+                    "INSERT INTO gc_generation_fixture (path, value) VALUES ($1, lix_json($2))",
+                    &[
+                        Value::Text(format!("/row/{row}")),
+                        Value::Text(format!(r#"{{"v":{row}}}"#)),
+                    ],
+                )
+                .await
+                .expect("generation fixture row should publish");
+        }
+        let branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-0000000000a1".to_owned()),
+                name: "gc-generation-dead".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("generation fixture branch should create");
+        let branch_session = engine
+            .open_session(branch.id.clone())
+            .await
+            .expect("generation fixture branch session should open");
+        for row in 0..16 {
+            branch_session
+                .execute(
+                    "UPDATE gc_generation_fixture SET value = lix_json($2) WHERE path = $1",
+                    &[
+                        Value::Text(format!("/row/{row}")),
+                        Value::Text(format!(r#"{{"v":{}}}"#, row + 100)),
+                    ],
+                )
+                .await
+                .expect("generation fixture branch row should publish");
+        }
+        let storage = StorageAdapter::new(backend.clone());
+        let generation = {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("generation control read should open");
+            BranchHeadControlContext::new()
+                .reader(&read)
+                .scan()
+                .await
+                .expect("generation controls should load")
+                .into_iter()
+                .find(|(branch_id, _)| branch_id == &branch.id)
+                .expect("the disposable branch must have a control")
+                .1
+                .tracked_generation
+        };
+        let seeded = hot_generation_rows(&storage, &branch.id, generation).await;
+        assert!(
+            seeded > 0,
+            "the disposable branch must materialize its own serving generation"
+        );
+
+        drop(branch_session);
+        session
+            .execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch.id.clone())],
+            )
+            .await
+            .expect("generation fixture branch should delete");
+        let plan = run_ordinary_repository_gc(&storage).await;
+
+        assert!(
+            plan.sweep.reclaimed_generation_rows >= seeded as u64,
+            "ordinary GC reclaimed {} of {seeded} stranded serving rows",
+            plan.sweep.reclaimed_generation_rows
+        );
+        assert_eq!(
+            hot_generation_rows(&storage, &branch.id, generation).await,
+            0,
+            "no serving row of a deleted branch generation may survive GC"
+        );
+
+        // The surviving branch must still read exactly what it wrote.
+        let survivors = session
+            .execute("SELECT COUNT(*) AS rows FROM gc_generation_fixture", &[])
+            .await
+            .expect("surviving branch should still read")
+            .rows()[0]
+            .get::<i64>("rows")
+            .expect("row count should decode");
+        assert_eq!(survivors, 16);
     }
 
     async fn load_audited_repository_retention(
@@ -8406,7 +7614,10 @@ mod tests {
         }
     }
 
-    async fn assert_offline_sweep_and_audit_fail_closed(
+    /// The retention closure is the single reachability implementation, and the
+    /// standalone audit reads it. Both must reject the same malformed authority
+    /// with the same reason.
+    async fn assert_retention_closure_and_audit_fail_closed(
         storage: &StorageAdapter<Memory>,
         expected_message: &str,
     ) {
@@ -8416,28 +7627,37 @@ mod tests {
                 .await
                 .expect("offline authority read should open"),
         );
-        let sweep_error = super::load_tree_sweep_root_closure(&read)
+        let controls = BranchHeadControlContext::new()
+            .reader(read.clone())
+            .scan()
             .await
-            .expect_err("offline tree sweep must fail closed");
+            .expect("offline authority controls should load");
+        let (queue, _) = load_reachability_queue(&read)
+            .await
+            .expect("offline authority queue should load");
+        let closure_error =
+            super::load_authenticated_repository_retention(&read, &controls, &queue)
+                .await
+                .expect_err("the retention closure must fail closed");
         let audit_error = super::audit_repository_gc_standalone_refs(&read)
             .await
             .expect_err("standalone audit must fail closed");
-        assert_eq!(sweep_error.message, audit_error.message);
+        assert_eq!(closure_error.message, audit_error.message);
         assert!(
-            sweep_error.message.contains(expected_message),
+            closure_error.message.contains(expected_message),
             "unexpected shared authority error: {}",
-            sweep_error.message
+            closure_error.message
         );
     }
 
     #[tokio::test]
-    async fn offline_sweep_and_audit_reject_missing_and_malformed_required_authority() {
+    async fn retention_closure_and_audit_reject_missing_and_malformed_required_authority() {
         const MUTABLE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
             crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id,
             "tracked_state.commit_state_manifest.v7",
         );
 
-        let (storage, commit_id, _, _, _) = tree_sweep_fixture().await;
+        let (storage, commit_id, _, _, _) = gc_sweep_fixture().await;
         let mut writes = storage.new_write_set();
         writes.delete(
             MUTABLE_MANIFEST_SPACE,
@@ -8447,10 +7667,13 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("required manifest removal should commit");
-        assert_offline_sweep_and_audit_fail_closed(&storage, "incomplete split physical authority")
-            .await;
+        assert_retention_closure_and_audit_fail_closed(
+            &storage,
+            "incomplete split physical authority",
+        )
+        .await;
 
-        let (storage, commit_id, _, _, _) = tree_sweep_fixture().await;
+        let (storage, commit_id, _, _, _) = gc_sweep_fixture().await;
         let mut writes = storage.new_write_set();
         writes.put(
             MUTABLE_MANIFEST_SPACE,
@@ -8463,11 +7686,11 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("malformed manifest should commit");
-        assert_offline_sweep_and_audit_fail_closed(&storage, "unsupported format").await;
+        assert_retention_closure_and_audit_fail_closed(&storage, "unsupported format").await;
     }
 
     #[tokio::test]
-    async fn offline_sweep_and_audit_reject_non_decreasing_and_cyclic_replay_authority() {
+    async fn retention_closure_and_audit_reject_non_decreasing_and_cyclic_replay_authority() {
         let timestamp = LixTimestamp::expect_parse(
             "offline replay authority timestamp",
             "2026-01-01T00:00:00Z",
@@ -8506,7 +7729,7 @@ mod tests {
             &[root_manifest, child_manifest],
         )
         .await;
-        assert_offline_sweep_and_audit_fail_closed(&storage, "replay debt disagrees").await;
+        assert_retention_closure_and_audit_fail_closed(&storage, "replay debt disagrees").await;
 
         let storage = StorageAdapter::new(Memory::new());
         let root = replay_commit_record("offline-replay-cycle-root", 0, None, timestamp);
@@ -8559,7 +7782,7 @@ mod tests {
             ],
         )
         .await;
-        assert_offline_sweep_and_audit_fail_closed(&storage, "dependency cycle").await;
+        assert_retention_closure_and_audit_fail_closed(&storage, "dependency cycle").await;
     }
 
     async fn json_ref_exists(storage: &Memory, space: StorageSpace, json_ref: JsonRef) -> bool {

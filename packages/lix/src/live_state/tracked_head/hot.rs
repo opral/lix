@@ -11236,6 +11236,76 @@ fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8;
     }
 }
 
+/// Every serving plane whose key begins with `(branch_id, generation)`.
+///
+/// These are derived caches of one branch generation, so a generation that no
+/// live branch control selects is exactly one contiguous key range per space.
+/// Content-addressed planes (the certified entity batches) are deliberately
+/// absent: their rows are shared across generations and are reclaimed by
+/// content reachability, not by scope.
+const GENERATION_SCOPED_SPACES: &[StorageSpace] = &[
+    HOT_ROW_SPACE,
+    HOT_FILE_SPACE,
+    HOT_COLLECTION_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE,
+    PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    ROOT_CURRENT_BASE_SPACE,
+];
+
+/// The `(branch_id, generation)` key prefix that scopes every derived serving
+/// plane. Exposed for GC census assertions.
+#[cfg(test)]
+pub(crate) fn hot_generation_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
+    encode_scope_prefix(branch_id, generation)
+}
+
+/// Retires every derived serving row of one branch generation.
+///
+/// The caller proves the generation is unreachable from the live branch
+/// controls; this stages the deletes. Work is bounded by the rows actually
+/// reclaimed — each space is entered at the generation's key prefix, never
+/// scanned whole — so a repository sweep costs what its garbage costs.
+pub(crate) async fn stage_retire_hot_generation<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+) -> Result<u64, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let prefix = StoragePrefix {
+        bytes: Bytes::from(encode_scope_prefix(branch_id, generation)),
+    };
+    let mut deleted = 0_u64;
+    for space in GENERATION_SCOPED_SPACES {
+        let mut cursor = store
+            .begin_scan(
+                *space,
+                prefix.to_range()?,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await?;
+        loop {
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await?;
+            for entry in page.entries {
+                writes.delete(*space, entry.key);
+                deleted = deleted.saturating_add(1);
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+    }
+    Ok(deleted)
+}
+
 #[cfg(test)]
 pub(crate) async fn stage_collect_stale_hot_generations<S>(
     store: &S,
