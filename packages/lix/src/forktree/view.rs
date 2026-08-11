@@ -95,6 +95,26 @@ where
         &self.read
     }
 
+    /// Diffs two historical commits through this selector-bound retained
+    /// read. Changed rows are authenticated with the selective state-key /
+    /// commit-page proof rather than by decoding each source commit's entire
+    /// semantic member closure.
+    pub(crate) async fn diff_state_rows_between_commits(
+        &self,
+        before: crate::changelog::CommitId,
+        after: crate::changelog::CommitId,
+    ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
+        Ok(stale_state_changes_between_commits_on_read(
+            &self.read,
+            self.view_instance_id,
+            before,
+            after,
+            true,
+        )
+        .await?
+        .complete)
+    }
+
     /// Builds the publication's temporary object overlay without exposing
     /// this view's retained storage handle to callers. Staged objects must
     /// still be read through the same authenticated view identity.
@@ -1034,11 +1054,15 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        Ok(
-            stale_state_changes_between_commits_on_read(self, before, after, true)
-                .await?
-                .complete,
+        Ok(stale_state_changes_between_commits_on_read(
+            &self.read,
+            self.operation_id,
+            before,
+            after,
+            true,
         )
+        .await?
+        .complete)
     }
 
     /// Diffs only the branch-local state domain for checkpoint and working
@@ -1061,11 +1085,15 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateIdentityChange>, crate::LixError> {
-        Ok(
-            stale_state_changes_between_commits_on_read(self, before, after, true)
-                .await?
-                .identities,
+        Ok(stale_state_changes_between_commits_on_read(
+            &self.read,
+            self.operation_id,
+            before,
+            after,
+            true,
         )
+        .await?
+        .identities)
     }
 
     /// Returns payload and write-identity changes from one authenticated root
@@ -1077,7 +1105,14 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<StaleStateChanges, crate::LixError> {
-        stale_state_changes_between_commits_on_read(self, before, after, true).await
+        stale_state_changes_between_commits_on_read(
+            &self.read,
+            self.operation_id,
+            before,
+            after,
+            true,
+        )
+        .await
     }
 
     /// Loads the authenticated commit summary used by stale reconciliation.
@@ -1193,7 +1228,8 @@ pub(crate) struct StaleStateChanges {
 }
 
 async fn stale_state_changes_between_commits_on_read<R>(
-    view: &ForkTreeReadFacade<R>,
+    read: &R,
+    binding_id: u64,
     before: crate::changelog::CommitId,
     after: crate::changelog::CommitId,
     include_global: bool,
@@ -1201,11 +1237,16 @@ async fn stale_state_changes_between_commits_on_read<R>(
 where
     R: StorageAdapterRead,
 {
-    let repository = super::serving::load_repository_root(&view.read).await?;
-    let mut summary_cache = super::serving::StaleCommitSummaryCache::new(view.operation_id());
-    let before_roots = view
-        .load_stale_commit_state_roots(&repository, before, &mut summary_cache)
-        .await?;
+    let repository = super::serving::load_repository_root(read).await?;
+    let mut summary_cache = super::serving::StaleCommitSummaryCache::new(binding_id);
+    let before_roots = super::serving::load_historical_commit_state_roots_for_stale(
+        read,
+        binding_id,
+        &repository,
+        before,
+        &mut summary_cache,
+    )
+    .await?;
     if before == after {
         return Ok(StaleStateChanges {
             payload: Vec::new(),
@@ -1213,19 +1254,24 @@ where
             identities: Vec::new(),
         });
     }
-    let after_roots = view
-        .load_stale_commit_state_roots(&repository, after, &mut summary_cache)
-        .await?;
+    let after_roots = super::serving::load_historical_commit_state_roots_for_stale(
+        read,
+        binding_id,
+        &repository,
+        after,
+        &mut summary_cache,
+    )
+    .await?;
     let local_changes = super::tree::diff_roots(
         Some(before_roots.local_state_root()),
         Some(after_roots.local_state_root()),
-        &view.read,
+        read,
     )
     .await?;
     let global_changes = super::tree::diff_roots(
         Some(before_roots.global_state_root()),
         Some(after_roots.global_state_root()),
-        &view.read,
+        read,
     )
     .await?;
     let keys = merge_sorted_state_keys(local_changes, global_changes);
@@ -1252,8 +1298,8 @@ where
         before_roots,
         &encoded,
         true,
-        view.operation_id(),
-        &view.read,
+        binding_id,
+        read,
     )
     .await?;
     let after_rows = super::serving::state_points_on_read_for_stale(
@@ -1261,8 +1307,8 @@ where
         after_roots,
         &encoded,
         true,
-        view.operation_id(),
-        &view.read,
+        binding_id,
+        read,
     )
     .await?;
 

@@ -6,7 +6,7 @@
 //! generic state module.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
@@ -98,6 +98,91 @@ impl MergeDiff {
         }
     }
 
+    /// Projects a ForkTree-owned selectively authenticated historical diff
+    /// directly into merge planning. The historical reader has already bound
+    /// each endpoint's StateKey, source commit, member page/ordinal,
+    /// ChangeCatalog owner, and payload on one retained view; rebuilding a
+    /// generic ChangeRecord batch here would repeat the complete source-member
+    /// closure that this path is designed to avoid.
+    pub(crate) fn from_historical(
+        entries: Vec<crate::forktree::HistoricalStateDiffEntry>,
+    ) -> Result<Self, LixError> {
+        let mut payloads = BTreeMap::<ChangeId, (JsonSlot, JsonSlot)>::new();
+        let mut projected = Vec::with_capacity(entries.len());
+        for entry in entries {
+            for row in [entry.before.as_ref(), entry.after.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                let snapshot = if row.deleted {
+                    JsonSlot::None
+                } else if let Some(value) = row.snapshot_content.as_ref() {
+                    JsonSlot::Inline(Box::<str>::from(value.as_ref()))
+                } else {
+                    JsonSlot::Inline("null".into())
+                };
+                let metadata = row.metadata.as_ref().map_or(JsonSlot::None, |value| {
+                    JsonSlot::Inline(Box::<str>::from(value.as_ref()))
+                });
+                if let Some(previous) = payloads.insert(row.change_id, (snapshot, metadata))
+                    && previous != payloads[&row.change_id]
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "authenticated historical change '{}' has conflicting payloads",
+                            row.change_id
+                        ),
+                    ));
+                }
+            }
+
+            let identity = entry
+                .after
+                .as_ref()
+                .or(entry.before.as_ref())
+                .expect("historical diff entry has an endpoint")
+                .key
+                .clone();
+            if entry
+                .before
+                .as_ref()
+                .zip(entry.after.as_ref())
+                .is_some_and(|(before, after)| before.key != after.key)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "authenticated historical diff endpoints have different StateKeys",
+                ));
+            }
+            let before = entry.before.as_ref().map(merge_row_from_historical);
+            let after = entry.after.as_ref().map(merge_row_from_historical);
+            let before_live = before.as_ref().is_some_and(|row| !row.deleted);
+            let after_live = after.as_ref().is_some_and(|row| !row.deleted);
+            let kind = match (before_live, after_live) {
+                (false, true) => MergeDiffKind::Added,
+                (true, false) => MergeDiffKind::Removed,
+                (true, true) => MergeDiffKind::Modified,
+                (false, false) => continue,
+            };
+            projected.push(MergeDiffEntry {
+                identity,
+                kind,
+                before,
+                after,
+            });
+        }
+        let payloads = MergePayloadBatch::from_payloads(
+            payloads
+                .into_iter()
+                .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
+        )?;
+        Ok(Self {
+            entries: projected,
+            payloads,
+        })
+    }
+
     pub(crate) fn from_entries_with_payloads(
         entries: Vec<MergeDiffEntry>,
         payloads: MergePayloadBatch,
@@ -107,6 +192,16 @@ impl MergeDiff {
 
     pub(crate) fn payloads(&self) -> &MergePayloadBatch {
         &self.payloads
+    }
+}
+
+fn merge_row_from_historical(row: &crate::forktree::HistoricalStateRow) -> MergeRow {
+    MergeRow {
+        deleted: row.deleted,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        change_id: row.change_id,
+        commit_id: row.commit_id,
     }
 }
 
@@ -348,6 +443,7 @@ fn row_payload_eq(
 mod tests {
     use super::*;
     use crate::entity_pk::EntityPk;
+    use crate::forktree::{HistoricalStateDiffEntry, HistoricalStateRow};
 
     fn key(entity: &str) -> StateKey {
         StateKey {
@@ -368,6 +464,26 @@ mod tests {
             updated_at: timestamp(),
             change_id: ChangeId::for_test_label(change),
             commit_id: CommitId::for_test_label(&format!("{change}-commit")),
+        }
+    }
+
+    fn historical_row(
+        entity: &str,
+        change: &str,
+        snapshot_content: Option<&str>,
+        deleted: bool,
+    ) -> HistoricalStateRow {
+        HistoricalStateRow {
+            key: key(entity),
+            global: false,
+            change_id: ChangeId::for_test_label(change),
+            commit_id: CommitId::for_test_label(&format!("{change}-commit")),
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            snapshot_content: snapshot_content.map(SharedStr::from),
+            metadata: Some(SharedStr::from(r#"{"source":"test"}"#)),
+            deleted,
+            blob_manifest_object_ids: Vec::new(),
         }
     }
 
@@ -437,6 +553,57 @@ mod tests {
         assert_eq!(pick_entities(&plan, &source), vec!["entity-a"]);
         assert_eq!(plan.picks[0].change_id, ChangeId::for_test_label("source"));
         assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn selectively_authenticated_historical_rows_project_without_change_reload() {
+        let before = historical_row("entity-a", "before", Some(r#"{"value":1}"#), false);
+        let after = historical_row("entity-a", "after", Some(r#"{"value":2}"#), false);
+        let diff = MergeDiff::from_historical(vec![HistoricalStateDiffEntry {
+            before: Some(before),
+            after: Some(after),
+        }])
+        .expect("authenticated historical endpoints should project");
+
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(diff.entries[0].kind, MergeDiffKind::Modified);
+        let (before_snapshot, before_metadata) = diff
+            .payloads()
+            .get(ChangeId::for_test_label("before"))
+            .expect("before payload should be projected");
+        assert_eq!(before_snapshot, &JsonSlot::Inline(r#"{"value":1}"#.into()));
+        assert_eq!(
+            before_metadata,
+            &JsonSlot::Inline(r#"{"source":"test"}"#.into())
+        );
+        let (after_snapshot, after_metadata) = diff
+            .payloads()
+            .get(ChangeId::for_test_label("after"))
+            .expect("after payload should be projected");
+        assert_eq!(after_snapshot, &JsonSlot::Inline(r#"{"value":2}"#.into()));
+        assert_eq!(
+            after_metadata,
+            &JsonSlot::Inline(r#"{"source":"test"}"#.into())
+        );
+    }
+
+    #[test]
+    fn historical_projection_rejects_conflicting_payload_for_one_change_identity() {
+        let first = historical_row("entity-a", "shared", Some(r#"{"value":1}"#), false);
+        let second = historical_row("entity-b", "shared", Some(r#"{"value":2}"#), false);
+        let error = MergeDiff::from_historical(vec![
+            HistoricalStateDiffEntry {
+                before: None,
+                after: Some(first),
+            },
+            HistoricalStateDiffEntry {
+                before: None,
+                after: Some(second),
+            },
+        ])
+        .expect_err("one authenticated change identity cannot carry conflicting payloads");
+
+        assert!(error.message.contains("conflicting payloads"));
     }
 
     #[test]

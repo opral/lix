@@ -215,13 +215,27 @@ where
     }
 
     /// Loads authenticated change records through this view's retained read.
-    /// Merge analysis uses this only to bind native state-diff values to their
-    /// immutable change payloads; it never opens a second read.
+    /// Topology-backed SQL providers use this to project immutable change
+    /// metadata without opening a second read.
     pub(crate) async fn load_change_records(
         &self,
         ids: &[crate::changelog::ChangeId],
     ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
         crate::forktree::load_change_records(self.view.retained_read(), ids).await
+    }
+
+    /// Diffs two authenticated commits and resolves only the changed
+    /// StateKey/member pages. The retained ForkTree view owns commit, page,
+    /// ordinal, ChangeCatalog, and payload authentication; merge callers do
+    /// not receive or seed proof state.
+    pub(crate) async fn diff_commits(
+        &self,
+        before: crate::changelog::CommitId,
+        after: crate::changelog::CommitId,
+    ) -> Result<Vec<crate::forktree::HistoricalStateDiffEntry>, LixError> {
+        self.view
+            .diff_state_rows_between_commits(before, after)
+            .await
     }
 
     /// Checks authorship against the authenticated ForkTree ChangeCatalog.
