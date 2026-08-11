@@ -3019,10 +3019,29 @@ enum ColumnCursor<'a> {
 
 /// Whether a string column carries JSON payloads, decided once per batch from
 /// the result field metadata rather than re-tested per cell.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// A JSON column additionally retains its Arrow value buffer as shared bytes.
+/// `Value::Json` stores a `SharedStr`, which is a validated range over a shared
+/// buffer, so every JSON cell of the batch becomes a view over the bytes Arrow
+/// already holds instead of its own heap copy.
 enum TextKind {
     Text,
-    Json,
+    Json { backing: Option<bytes::Bytes> },
+}
+
+/// Adapts an Arrow value buffer to the `AsRef<[u8]>` owner contract that
+/// `bytes::Bytes::from_owner` requires, so the buffer can back `SharedStr`
+/// views without being copied.
+struct ArrowValueBuffer(datafusion::arrow::buffer::Buffer);
+
+impl AsRef<[u8]> for ArrowValueBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+fn shared_value_buffer(buffer: &datafusion::arrow::buffer::Buffer) -> bytes::Bytes {
+    bytes::Bytes::from_owner(ArrowValueBuffer(buffer.clone()))
 }
 
 fn column_cursors<'a>(
@@ -3041,11 +3060,7 @@ fn column_cursor<'a>(
     field: Option<&Field>,
     array: &'a dyn Array,
 ) -> Result<ColumnCursor<'a>, LixError> {
-    let text_kind = if field.is_some_and(field_is_json) {
-        TextKind::Json
-    } else {
-        TextKind::Text
-    };
+    let json_column = field.is_some_and(field_is_json);
     let cursor = match array.data_type() {
         DataType::Null => ColumnCursor::Null,
         DataType::Boolean => ColumnCursor::Boolean(downcast_column(array)?),
@@ -3059,9 +3074,20 @@ fn column_cursor<'a>(
         DataType::UInt64 => ColumnCursor::UInt64(downcast_column(array)?),
         DataType::Float32 => ColumnCursor::Float32(downcast_column(array)?),
         DataType::Float64 => ColumnCursor::Float64(downcast_column(array)?),
-        DataType::Utf8 => ColumnCursor::Utf8(downcast_column(array)?, text_kind),
-        DataType::LargeUtf8 => ColumnCursor::LargeUtf8(downcast_column(array)?, text_kind),
-        DataType::Utf8View => ColumnCursor::Utf8View(downcast_column(array)?, text_kind),
+        DataType::Utf8 => {
+            let values: &StringArray = downcast_column(array)?;
+            ColumnCursor::Utf8(values, text_kind(json_column, Some(values.values())))
+        }
+        DataType::LargeUtf8 => {
+            let values: &LargeStringArray = downcast_column(array)?;
+            ColumnCursor::LargeUtf8(values, text_kind(json_column, Some(values.values())))
+        }
+        // A string view either inlines short payloads into the view struct or
+        // spreads long ones across several data buffers, so there is no single
+        // buffer to view; these cells are copied out individually.
+        DataType::Utf8View => {
+            ColumnCursor::Utf8View(downcast_column(array)?, text_kind(json_column, None))
+        }
         DataType::Binary => ColumnCursor::Binary(downcast_column(array)?),
         DataType::LargeBinary => ColumnCursor::LargeBinary(downcast_column(array)?),
         other => {
@@ -3075,6 +3101,19 @@ fn column_cursor<'a>(
         }
     };
     Ok(cursor)
+}
+
+fn text_kind(
+    json_column: bool,
+    value_buffer: Option<&datafusion::arrow::buffer::Buffer>,
+) -> TextKind {
+    if json_column {
+        TextKind::Json {
+            backing: value_buffer.map(shared_value_buffer),
+        }
+    } else {
+        TextKind::Text
+    }
 }
 
 fn downcast_column<'a, ArrayType: 'static>(
@@ -3121,17 +3160,17 @@ impl ColumnCursor<'_> {
             Self::Utf8(values, kind) => Ok(if values.is_null(row_index) {
                 Value::Null
             } else {
-                text_value(values.value(row_index), *kind)
+                text_value(values.value(row_index), kind)
             }),
             Self::LargeUtf8(values, kind) => Ok(if values.is_null(row_index) {
                 Value::Null
             } else {
-                text_value(values.value(row_index), *kind)
+                text_value(values.value(row_index), kind)
             }),
             Self::Utf8View(values, kind) => Ok(if values.is_null(row_index) {
                 Value::Null
             } else {
-                text_value(values.value(row_index), *kind)
+                text_value(values.value(row_index), kind)
             }),
             Self::Binary(values) => Ok(if values.is_null(row_index) {
                 Value::Null
@@ -3173,13 +3212,21 @@ where
     finite_query_float(values.value(row_index).into())
 }
 
-fn text_value(value: &str, kind: TextKind) -> Value {
+fn text_value(value: &str, kind: &TextKind) -> Value {
     match kind {
         // The write boundary canonicalizes every JSON payload before it reaches
         // storage, and the projection decoder copies those bytes into Arrow
         // verbatim. Re-parsing here only rebuilt a DOM that was immediately
-        // re-serialized, so the bytes are retained directly instead.
-        TextKind::Json => Value::Json(crate::Json::from_canonical_text(value)),
+        // re-serialized, so the bytes are viewed in place instead: the payload
+        // stays in the Arrow buffer and `SharedStr` retains a validated range
+        // over it.
+        TextKind::Json { backing } => {
+            let text = backing
+                .as_ref()
+                .and_then(|bytes| crate::SharedStr::from_utf8_slice(bytes.clone(), value))
+                .unwrap_or_else(|| crate::SharedStr::from(value));
+            Value::Json(crate::Json::from_canonical_text(text))
+        }
         TextKind::Text => Value::Text(value.to_owned()),
     }
 }
@@ -3434,6 +3481,31 @@ mod tests {
             row_values_from_batch(&fields, &batch, 1).expect("typed row conversion"),
             vec![Value::Null; 8]
         );
+    }
+
+    #[test]
+    fn json_result_cells_view_the_arrow_buffer_instead_of_copying_it() {
+        use datafusion::arrow::array::StringArray;
+
+        let fields = vec![crate::sql2::result_metadata::json_field("document", true)];
+        let schema = Arc::new(Schema::new(fields.clone()));
+        let documents = StringArray::from(vec![Some(r#"{"a":1}"#), Some(r#"{"b":2}"#)]);
+        let arrow_pointers = [documents.value(0).as_ptr(), documents.value(1).as_ptr()];
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(documents)])
+            .expect("test batch should match schema");
+
+        for (row_index, arrow_pointer) in arrow_pointers.into_iter().enumerate() {
+            let values =
+                row_values_from_batch(&fields, &batch, row_index).expect("typed row conversion");
+            let [Value::Json(document)] = values.as_slice() else {
+                panic!("expected one JSON cell");
+            };
+            assert_eq!(
+                document.as_str().as_ptr(),
+                arrow_pointer,
+                "JSON cells must be retained as views over the Arrow value buffer"
+            );
+        }
     }
 
     #[test]
