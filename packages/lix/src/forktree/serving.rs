@@ -2468,7 +2468,8 @@ where
 pub(super) struct StaleMemberAuthCache {
     binding_id: u64,
     commits: BTreeMap<ObjectId, CommitObjectV1>,
-    members: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), (CommitMemberV1, u32)>,
+    members: BTreeMap<(ObjectId, u32, ChangeId, Vec<u8>), CommitMemberV1>,
+    source_values: BTreeMap<(ObjectId, u32, ChangeId, Vec<u8>), (StateValue, bool)>,
     pages: BTreeMap<(ObjectId, ObjectId), super::model::CommitChangePageV2>,
     change_catalog_entries: BTreeMap<ChangeId, ChangeCatalogEntry>,
 }
@@ -2479,6 +2480,7 @@ impl StaleMemberAuthCache {
             binding_id,
             commits: BTreeMap::new(),
             members: BTreeMap::new(),
+            source_values: BTreeMap::new(),
             pages: BTreeMap::new(),
             change_catalog_entries: BTreeMap::new(),
         }
@@ -2546,11 +2548,10 @@ where
     Ok(page)
 }
 
-/// Proves the selected page's position in the commit's authenticated ordered
-/// page vector without loading the unrelated member closure.  The selected
-/// page and its immediate neighbors establish ordinal adjacency; duplicate
-/// vector entries are rejected globally because they make the vector
-/// ambiguous even when the duplicate is not selected by this request.
+/// Proves one selected page's absolute position in the commit's authenticated
+/// ordered page vector. Every prefix page through the selection is checked so
+/// a consistently shifted suffix cannot forge an ordinal; pages after the
+/// selected page remain lazy except for the immediate successor boundary.
 pub(super) async fn validate_stale_page_position<R>(
     read: &R,
     binding_id: u64,
@@ -2658,11 +2659,12 @@ where
 /// The commit envelope/catalog/topology bind both roots, the exact state key
 /// selects the authenticated page, and that page binds ordinal and ChangeId.
 /// No complete historical member closure is loaded.
-async fn load_stale_member_at_key<R>(
+async fn load_stale_member_at_ordinal<R>(
     read: &R,
     binding_id: u64,
     commit_catalog_root: ObjectId,
     commit_object_id: ObjectId,
+    expected_ordinal: u32,
     state_key: &[u8],
     expected_change_id: ChangeId,
     cache: &mut StaleMemberAuthCache,
@@ -2673,123 +2675,214 @@ where
     cache.assert_binding(binding_id)?;
     let cache_key = (
         commit_object_id,
+        expected_ordinal,
+        expected_change_id,
         state_key.to_vec(),
-        expected_change_id.as_bytes().to_vec(),
     );
-    let commit = load_stale_commit(
-        read,
-        binding_id,
-        commit_catalog_root,
-        commit_object_id,
-        cache,
-    )
-    .await?;
-    if let Some(member) = cache.members.get(&cache_key) {
-        return Ok((commit, member.0.clone(), member.1));
-    }
-    for (root, expected_global) in [
-        (commit.local_state_root, false),
-        (commit.global_state_root, true),
-    ] {
-        let Some(encoded) = lookup_on_read(root, "state", state_key, read).await? else {
-            continue;
-        };
-        let source = if expected_global {
-            StateSource::Global
-        } else {
-            StateSource::Branch
-        };
-        let pack_row = load_current_pack_rows(read, &[Some((state_key.to_vec(), encoded, source))])
-            .await?
-            .pop()
-            .flatten()
-            .map(|(row, _)| row)
-            .ok_or_else(|| corruption("authenticated source state pack row is absent"))?;
-        let page_bytes =
-            super::view::load_object_bytes(read, pack_row.history_page_object_id).await?;
-        let page =
-            super::model::CommitChangePageV2::decode(pack_row.history_page_object_id, &page_bytes)?;
-        if page.commit_id != commit.commit_id
-            || !commit
-                .member_page_object_ids
-                .contains(&pack_row.history_page_object_id)
-        {
-            return Err(corruption(
-                "authenticated source state page is not owned by its Commit",
-            ));
-        }
-        cache.pages.insert(
-            (commit_object_id, pack_row.history_page_object_id),
-            page.clone(),
-        );
-        validate_stale_page_position(
+    if let Some(member) = cache.members.get(&cache_key).cloned() {
+        let commit = load_stale_commit(
             read,
             binding_id,
+            commit_catalog_root,
             commit_object_id,
-            commit.commit_id,
-            &commit.member_page_object_ids,
-            pack_row.history_page_object_id,
-            &page,
             cache,
         )
         .await?;
-        let page_ordinal = usize::try_from(pack_row.history_page_ordinal)
-            .map_err(|_| corruption("authenticated source page ordinal overflows usize"))?;
-        let member = page
-            .members
-            .get(page_ordinal)
-            .cloned()
-            .ok_or_else(|| corruption("authenticated source state page ordinal is absent"))?;
-        if member.change_id() != expected_change_id {
-            return Err(corruption(
-                "authenticated source state key resolves to a different ChangeId",
-            ));
-        }
-        if let CommitMemberV1::Introduced { global, .. } = &member
-            && *global != expected_global
-        {
-            return Err(corruption(
-                "authenticated source state scope differs from its member",
-            ));
-        }
-        let member_ordinal = page
-            .start_ordinal
-            .checked_add(pack_row.history_page_ordinal)
-            .ok_or_else(|| corruption("authenticated source member ordinal overflows u32"))?;
-        cache
-            .members
-            .insert(cache_key, (member.clone(), member_ordinal));
-        return Ok((commit, member, member_ordinal));
+        return Ok((commit, member, expected_ordinal));
     }
-    Err(corruption(
-        "authenticated source state key does not contain its expected ChangeId",
-    ))
+    prime_stale_member_lookups(
+        read,
+        binding_id,
+        commit_catalog_root,
+        &[StaleMemberLookup {
+            commit_object_id,
+            member_ordinal: expected_ordinal,
+            state_key: state_key.to_vec(),
+            expected_change_id,
+        }],
+        cache,
+    )
+    .await?;
+    let commit = cache
+        .commits
+        .get(&commit_object_id)
+        .cloned()
+        .ok_or_else(|| corruption("authenticated source Commit proof is incomplete"))?;
+    let member = cache
+        .members
+        .get(&cache_key)
+        .cloned()
+        .ok_or_else(|| corruption("authenticated source member proof is incomplete"))?;
+    Ok((commit, member, expected_ordinal))
+}
+
+/// Authenticates a breadth of source Commit/member closures in one retained
+/// read. Commit objects, catalog identities, state roots, immediate parents,
+/// parent catalog back-edges, and member pages are acquired in bounded
+/// batches. Nothing is installed in the operation-local cache until the
+/// complete breadth validates, so a malformed peer cannot leave a partial
+/// positive proof behind.
+async fn prime_stale_commits<R>(
+    read: &R,
+    binding_id: u64,
+    commit_catalog_root: ObjectId,
+    commit_object_ids: &BTreeSet<ObjectId>,
+    cache: &mut StaleMemberAuthCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    cache.assert_binding(binding_id)?;
+    let missing = commit_object_ids
+        .iter()
+        .filter(|id| !cache.commits.contains_key(id))
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let commit_bytes = super::view::load_object_map(read, missing.iter().copied()).await?;
+    let mut pending_commits = BTreeMap::<ObjectId, CommitObjectV1>::new();
+    let mut catalog_keys = Vec::with_capacity(missing.len());
+    for object_id in &missing {
+        let bytes = commit_bytes
+            .get(object_id)
+            .ok_or_else(|| corruption("authenticated source Commit object is absent"))?;
+        let commit = CommitObjectV1::decode(*object_id, bytes)?;
+        catalog_keys.push(commit.commit_id.as_bytes().to_vec());
+        pending_commits.insert(*object_id, commit);
+    }
+    let catalog_values =
+        lookup_many_on_read(commit_catalog_root, "commit", &catalog_keys, read).await?;
+    if catalog_values.len() != missing.len() {
+        return Err(corruption(
+            "batched source CommitCatalog lookup returned the wrong number of values",
+        ));
+    }
+    for (object_id, value) in missing.iter().zip(catalog_values) {
+        let entry = CommitCatalogEntry::decode(
+            &value.ok_or_else(|| corruption("source Commit has no CommitCatalog identity"))?,
+        )?;
+        if entry.commit_object_id != *object_id {
+            return Err(corruption(
+                "source CommitCatalog identity names a different object",
+            ));
+        }
+    }
+
+    let mut related_ids = BTreeSet::new();
+    for commit in pending_commits.values() {
+        related_ids.insert(commit.global_state_root);
+        related_ids.insert(commit.local_state_root);
+        related_ids.extend(commit.parent_commit_object_ids.iter().copied());
+    }
+    let related = super::view::load_object_map(read, related_ids.iter().copied()).await?;
+
+    let mut parent_back_edges = BTreeMap::<CommitId, ObjectId>::new();
+    for commit in pending_commits.values() {
+        super::tree::validate_root_bytes(
+            commit.global_state_root,
+            "state",
+            related
+                .get(&commit.global_state_root)
+                .ok_or_else(|| corruption("source Commit global state root is absent"))?,
+        )?;
+        super::tree::validate_root_bytes(
+            commit.local_state_root,
+            "state",
+            related
+                .get(&commit.local_state_root)
+                .ok_or_else(|| corruption("source Commit local state root is absent"))?,
+        )?;
+        let mut unique_parent_ids = BTreeSet::new();
+        let mut unique_parent_objects = BTreeSet::new();
+        for parent_object_id in &commit.parent_commit_object_ids {
+            if !unique_parent_objects.insert(*parent_object_id) {
+                return Err(corruption(
+                    "source Commit topology repeats a parent object edge",
+                ));
+            }
+            let parent = CommitObjectV1::decode(
+                *parent_object_id,
+                related
+                    .get(parent_object_id)
+                    .ok_or_else(|| corruption("source Commit parent object is absent"))?,
+            )?;
+            if parent.generation >= commit.generation || !unique_parent_ids.insert(parent.commit_id)
+            {
+                return Err(corruption(
+                    "source Commit parent identity or generation is invalid",
+                ));
+            }
+            match parent_back_edges.entry(parent.commit_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(*parent_object_id);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if *entry.get() != *parent_object_id =>
+                {
+                    return Err(corruption(
+                        "one source parent CommitId resolves to multiple objects",
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    let parent_ids = parent_back_edges.keys().copied().collect::<Vec<_>>();
+    let parent_keys = parent_ids
+        .iter()
+        .map(|id| id.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let parent_values =
+        lookup_many_on_read(commit_catalog_root, "commit", &parent_keys, read).await?;
+    if parent_values.len() != parent_ids.len() {
+        return Err(corruption(
+            "batched parent CommitCatalog lookup returned the wrong number of values",
+        ));
+    }
+    for ((parent_id, expected_object_id), value) in parent_back_edges.iter().zip(parent_values) {
+        let entry = CommitCatalogEntry::decode(
+            &value.ok_or_else(|| corruption("source Commit parent has no catalog back-edge"))?,
+        )?;
+        if entry.commit_object_id != *expected_object_id {
+            return Err(corruption(format!(
+                "source Commit parent {parent_id:?} has an invalid catalog back-edge"
+            )));
+        }
+    }
+
+    cache.commits.extend(pending_commits);
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct StaleMemberLookup {
     commit_object_id: ObjectId,
+    member_ordinal: u32,
     state_key: Vec<u8>,
     expected_change_id: ChangeId,
 }
 
 impl StaleMemberLookup {
-    fn cache_key(&self) -> (ObjectId, Vec<u8>, Vec<u8>) {
+    fn cache_key(&self) -> (ObjectId, u32, ChangeId, Vec<u8>) {
         (
             self.commit_object_id,
+            self.member_ordinal,
+            self.expected_change_id,
             self.state_key.clone(),
-            self.expected_change_id.as_bytes().to_vec(),
         )
     }
 }
 
 /// Resolves a breadth of source-member StateKeys with one retained read.
 ///
-/// Requests are grouped by source Commit. Each source local/global root is
-/// traversed once for the complete key batch, and every selected page prefix
-/// needed to prove member position is loaded in one object batch. Results are
-/// installed only in the operation-local stale cache after the Commit, root,
-/// page domain, page position, ChangeId, and state scope all validate.
+/// Requests are grouped by source Commit. Commit envelopes, roots, immediate
+/// topology, and catalog back-edges are authenticated once for the complete
+/// breadth. Exact StateKeys then select only the referenced member pages and
+/// ordinals; unrelated pages are neither fetched nor decoded. Results are
+/// installed only after the whole batch validates.
 async fn prime_stale_member_lookups<R>(
     read: &R,
     binding_id: u64,
@@ -2801,36 +2894,50 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     cache.assert_binding(binding_id)?;
-    let mut requests_by_commit = BTreeMap::<ObjectId, Vec<StaleMemberLookup>>::new();
-    for request in requests {
-        if !cache.members.contains_key(&request.cache_key()) {
-            requests_by_commit
-                .entry(request.commit_object_id)
-                .or_default()
-                .push(request.clone());
-        }
-    }
-    if requests_by_commit.is_empty() {
+    let pending_requests = requests
+        .iter()
+        .filter(|request| !cache.members.contains_key(&request.cache_key()))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if pending_requests.is_empty() {
         return Ok(());
     }
+    let source_commits = pending_requests
+        .iter()
+        .map(|request| request.commit_object_id)
+        .collect::<BTreeSet<_>>();
+    prime_stale_commits(
+        read,
+        binding_id,
+        commit_catalog_root,
+        &source_commits,
+        cache,
+    )
+    .await?;
 
-    struct PendingLookup {
+    struct PendingMember {
         request: StaleMemberLookup,
         commit: CommitObjectV1,
         pack_row: ResolvedCurrentPackRow,
         expected_global: bool,
     }
 
-    let mut pending = Vec::new();
-    for (commit_object_id, commit_requests) in requests_by_commit {
-        let commit = load_stale_commit(
-            read,
-            binding_id,
-            commit_catalog_root,
-            commit_object_id,
-            cache,
-        )
-        .await?;
+    let mut by_commit = BTreeMap::<ObjectId, Vec<StaleMemberLookup>>::new();
+    for request in pending_requests {
+        by_commit
+            .entry(request.commit_object_id)
+            .or_default()
+            .push(request);
+    }
+    let mut pending_members = Vec::new();
+    for (commit_object_id, commit_requests) in by_commit {
+        let commit = cache
+            .commits
+            .get(&commit_object_id)
+            .cloned()
+            .ok_or_else(|| corruption("batched source Commit proof is incomplete"))?;
         let keys = commit_requests
             .iter()
             .map(|request| request.state_key.clone())
@@ -2861,10 +2968,10 @@ where
             .into_iter()
             .zip(global)
             .collect::<BTreeMap<_, _>>();
-        let mut selected_rows = Vec::with_capacity(commit_requests.len());
-        let mut pending_requests = Vec::with_capacity(commit_requests.len());
-        for (slot, (request, local)) in commit_requests.into_iter().zip(local).enumerate() {
-            let (encoded, expected_global) = match local {
+        let mut selected = Vec::with_capacity(commit_requests.len());
+        let mut expected_global = Vec::with_capacity(commit_requests.len());
+        for (slot, (request, local)) in commit_requests.iter().zip(local).enumerate() {
+            let (encoded, is_global) = match local {
                 Some(encoded) => (encoded, false),
                 None => (
                     global_by_slot.remove(&slot).flatten().ok_or_else(|| {
@@ -2875,138 +2982,123 @@ where
                     true,
                 ),
             };
-            selected_rows.push(Some((
+            selected.push(Some((
                 request.state_key.clone(),
                 encoded,
-                if expected_global {
+                if is_global {
                     StateSource::Global
                 } else {
                     StateSource::Branch
                 },
             )));
-            pending_requests.push((request, expected_global));
+            expected_global.push(is_global);
         }
-        let resolved_rows = load_current_pack_rows(read, &selected_rows).await?;
-        for ((request, expected_global), resolved) in
-            pending_requests.into_iter().zip(resolved_rows)
+        let pack_rows = load_current_pack_rows(read, &selected).await?;
+        for ((request, is_global), pack_row) in commit_requests
+            .into_iter()
+            .zip(expected_global)
+            .zip(pack_rows)
         {
-            let (pack_row, _) = resolved.ok_or_else(|| {
-                corruption("authenticated source current-state pack row is absent")
-            })?;
-            pending.push(PendingLookup {
+            let (pack_row, source) = pack_row
+                .ok_or_else(|| corruption("authenticated source state pack row is absent"))?;
+            if (source == StateSource::Global) != is_global {
+                return Err(corruption(
+                    "authenticated source state scope changed during member proof",
+                ));
+            }
+            pending_members.push(PendingMember {
                 request,
                 commit: commit.clone(),
                 pack_row,
-                expected_global,
+                expected_global: is_global,
             });
         }
     }
 
-    let mut page_owners = BTreeMap::<ObjectId, (ObjectId, CommitId)>::new();
-    for lookup in &pending {
-        let selected_index = lookup
-            .commit
-            .member_page_object_ids
-            .iter()
-            .position(|id| *id == lookup.pack_row.history_page_object_id)
-            .ok_or_else(|| {
-                corruption("authenticated source state page is not owned by its Commit")
-            })?;
-        for page_object_id in lookup
-            .commit
-            .member_page_object_ids
-            .iter()
-            .take(selected_index.saturating_add(2))
+    let selected_page_ids = pending_members
+        .iter()
+        .map(|pending| pending.pack_row.history_page_object_id)
+        .collect::<BTreeSet<_>>();
+    let page_bytes = super::view::load_object_map(read, selected_page_ids).await?;
+    let mut page_validation = StaleMemberAuthCache::new(binding_id);
+    for pending in &pending_members {
+        let page_id = pending.pack_row.history_page_object_id;
+        if page_validation
+            .pages
+            .contains_key(&(pending.request.commit_object_id, page_id))
         {
-            match page_owners.entry(*page_object_id) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((lookup.request.commit_object_id, lookup.commit.commit_id));
-                }
-                std::collections::btree_map::Entry::Occupied(entry)
-                    if *entry.get()
-                        != (lookup.request.commit_object_id, lookup.commit.commit_id) =>
-                {
-                    return Err(corruption(
-                        "commit change page is claimed by more than one Commit",
-                    ));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
+            continue;
         }
-    }
-    let missing_page_ids = page_owners
-        .keys()
-        .filter(|page_object_id| {
-            let (commit_object_id, _) = page_owners
-                .get(page_object_id)
-                .expect("page owner key came from the same map");
-            !cache
-                .pages
-                .contains_key(&(*commit_object_id, **page_object_id))
-        })
-        .copied()
-        .collect::<Vec<_>>();
-    let page_bytes = super::view::load_object_map(read, missing_page_ids).await?;
-    for (page_object_id, bytes) in page_bytes {
-        let (commit_object_id, commit_id) = page_owners
-            .get(&page_object_id)
-            .copied()
-            .ok_or_else(|| corruption("batched stale page has no expected owner"))?;
-        let page = super::model::CommitChangePageV2::decode(page_object_id, &bytes)?;
-        if page.commit_id != commit_id {
-            return Err(corruption(
-                "commit change page belongs to a different Commit",
-            ));
-        }
-        cache.pages.insert((commit_object_id, page_object_id), page);
+        let page = super::model::CommitChangePageV2::decode(
+            page_id,
+            page_bytes
+                .get(&page_id)
+                .ok_or_else(|| corruption("authenticated source member page is absent"))?,
+        )?;
+        page_validation
+            .pages
+            .insert((pending.request.commit_object_id, page_id), page);
     }
 
-    for lookup in pending {
-        let page = cache
+    let mut resolved = Vec::with_capacity(pending_members.len());
+    let mut selected_change_ids = BTreeSet::new();
+    for pending in pending_members {
+        let page_id = pending.pack_row.history_page_object_id;
+        let page = page_validation
             .pages
-            .get(&(
-                lookup.request.commit_object_id,
-                lookup.pack_row.history_page_object_id,
-            ))
+            .get(&(pending.request.commit_object_id, page_id))
             .cloned()
-            .ok_or_else(|| corruption("authenticated source state page is absent"))?;
+            .ok_or_else(|| corruption("authenticated source member page is absent"))?;
         validate_stale_page_position(
             read,
             binding_id,
-            lookup.request.commit_object_id,
-            lookup.commit.commit_id,
-            &lookup.commit.member_page_object_ids,
-            lookup.pack_row.history_page_object_id,
+            pending.request.commit_object_id,
+            pending.commit.commit_id,
+            &pending.commit.member_page_object_ids,
+            page_id,
             &page,
-            cache,
+            &mut page_validation,
         )
         .await?;
-        let page_ordinal = usize::try_from(lookup.pack_row.history_page_ordinal)
-            .map_err(|_| corruption("authenticated source page ordinal overflows usize"))?;
+        let page_ordinal = pending.pack_row.history_page_ordinal;
+        let absolute_ordinal = page
+            .start_ordinal
+            .checked_add(page_ordinal)
+            .ok_or_else(|| corruption("authenticated source member ordinal overflows u32"))?;
         let member = page
             .members
-            .get(page_ordinal)
+            .get(page_ordinal as usize)
             .cloned()
-            .ok_or_else(|| corruption("authenticated source state page ordinal is absent"))?;
-        if member.change_id() != lookup.request.expected_change_id {
+            .ok_or_else(|| corruption("authenticated source member page ordinal is absent"))?;
+        if absolute_ordinal != pending.request.member_ordinal
+            || member.change_id() != pending.request.expected_change_id
+        {
             return Err(corruption(
-                "authenticated source state key resolves to a different ChangeId",
+                "authenticated source StateKey resolves to a different ordinal or ChangeId",
             ));
         }
         if let CommitMemberV1::Introduced { global, .. } = &member
-            && *global != lookup.expected_global
+            && *global != pending.expected_global
         {
             return Err(corruption(
                 "authenticated source state scope differs from its member",
             ));
         }
-        let member_ordinal = page
-            .start_ordinal
-            .checked_add(lookup.pack_row.history_page_ordinal)
-            .ok_or_else(|| corruption("authenticated source member ordinal overflows u32"))?;
-        cache
-            .members
-            .insert(lookup.request.cache_key(), (member, member_ordinal));
+        if !selected_change_ids.insert((pending.request.commit_object_id, member.change_id())) {
+            return Err(corruption(
+                "selected source member pages repeat one Commit ChangeId",
+            ));
+        }
+        resolved.push((
+            pending.request.cache_key(),
+            member,
+            (pending.pack_row.value, pending.expected_global),
+        ));
+    }
+    cache.pages.extend(page_validation.pages);
+    for (key, member, value) in resolved {
+        cache.members.insert(key.clone(), member);
+        cache.source_values.insert(key, value);
     }
     Ok(())
 }
@@ -3034,10 +3126,11 @@ where
                 .change_catalog_entries
                 .get(&member.change_id())
                 .ok_or_else(|| corruption("selected stale member has no ChangeCatalog owner"))?;
-            let owner = match entry.owner {
+            let (owner, owner_ordinal) = match entry.owner {
                 ChangeCatalogOwner::CommitMember {
-                    commit_object_id, ..
-                } => commit_object_id,
+                    commit_object_id,
+                    ordinal,
+                } => (commit_object_id, ordinal),
                 ChangeCatalogOwner::BranchRef { .. } => {
                     return Err(corruption(
                         "semantic commit member resolves to a branch-ref catalog owner",
@@ -3051,12 +3144,14 @@ where
             };
             requests.insert(StaleMemberLookup {
                 commit_object_id: owner,
+                member_ordinal: owner_ordinal,
                 state_key: state_key.clone(),
                 expected_change_id: member.change_id(),
             });
-            if let Some((source_commit_object_id, _)) = member.source() {
+            if let Some((source_commit_object_id, source_ordinal)) = member.source() {
                 requests.insert(StaleMemberLookup {
                     commit_object_id: source_commit_object_id,
+                    member_ordinal: source_ordinal,
                     state_key,
                     expected_change_id: member.change_id(),
                 });
@@ -3076,7 +3171,7 @@ where
                 let member = cache
                     .members
                     .get(&request.cache_key())
-                    .map(|(member, _)| member.clone())
+                    .cloned()
                     .ok_or_else(|| corruption("batched stale member proof is incomplete"))?;
                 Ok((member, request.state_key))
             })
@@ -3106,11 +3201,12 @@ where
             ordinal,
         } => {
             let (_introduction_commit, introduction_member, introduction_ordinal) =
-                load_stale_member_at_key(
+                load_stale_member_at_ordinal(
                     read,
                     binding_id,
                     commit_catalog_root,
                     commit_object_id,
+                    ordinal,
                     state_key,
                     member.change_id(),
                     cache,
@@ -3146,16 +3242,18 @@ where
             }
         }
         Some((source_commit_object_id, source_ordinal)) => {
-            let (source_commit, source_member, source_member_ordinal) = load_stale_member_at_key(
-                read,
-                binding_id,
-                commit_catalog_root,
-                source_commit_object_id,
-                state_key,
-                member.change_id(),
-                cache,
-            )
-            .await?;
+            let (source_commit, source_member, source_member_ordinal) =
+                load_stale_member_at_ordinal(
+                    read,
+                    binding_id,
+                    commit_catalog_root,
+                    source_commit_object_id,
+                    source_ordinal,
+                    state_key,
+                    member.change_id(),
+                    cache,
+                )
+                .await?;
             if source_commit.generation >= target_generation {
                 return Err(corruption(
                     "selected membership source generation is not earlier than its target",
@@ -3196,10 +3294,22 @@ where
     let mut ordinal = target_ordinal;
     let mut visited = BTreeSet::new();
     let mut selected_created_at = None;
+    let mut source_value_keys = Vec::new();
 
     loop {
         if !visited.insert((owner, ordinal as u32)) {
             return Err(corruption("selected member source ownership is cyclic"));
+        }
+        let current_ordinal = u32::try_from(ordinal)
+            .map_err(|_| corruption("selected member source ordinal exceeds u32"))?;
+        let source_value_key = (
+            owner,
+            current_ordinal,
+            current.change_id(),
+            state_key.to_vec(),
+        );
+        if cache.source_values.contains_key(&source_value_key) {
+            source_value_keys.push(source_value_key);
         }
         let entry = if let Some(entry) = cache.change_catalog_entries.get(&current.change_id()) {
             entry.clone()
@@ -3251,14 +3361,35 @@ where
                         "selected member source changes its authenticated ChangeId",
                     ));
                 }
-                return Ok(ResolvedSemanticMember {
+                let resolved = ResolvedSemanticMember {
                     change_id,
                     payload,
                     global,
                     updated_at,
                     selected_created_at,
                     blob_manifest_object_ids,
-                });
+                };
+                for source_value_key in source_value_keys {
+                    let commit = cache
+                        .commits
+                        .get(&source_value_key.0)
+                        .ok_or_else(|| corruption("authenticated source Commit proof is absent"))?;
+                    let (actual, expected_global) =
+                        cache.source_values.get(&source_value_key).ok_or_else(|| {
+                            corruption("authenticated source StateKey value proof is absent")
+                        })?;
+                    let expected = state_value_from_resolved_semantic_member(
+                        resolved.clone(),
+                        state_key,
+                        commit.commit_id,
+                    )?;
+                    if resolved.global != *expected_global || *actual != expected {
+                        return Err(corruption(
+                            "authenticated source StateKey value differs from its semantic member",
+                        ));
+                    }
+                }
+                return Ok(resolved);
             }
             CommitMemberV1::Selected {
                 change_id,
@@ -3273,11 +3404,12 @@ where
                 }
                 selected_created_at.get_or_insert(created_at);
                 let (source_commit, source_member, source_member_ordinal) =
-                    load_stale_member_at_key(
+                    load_stale_member_at_ordinal(
                         read,
                         binding_id,
                         commit_catalog_root,
                         source_commit_object_id,
+                        source_ordinal,
                         state_key,
                         expected_change_id,
                         cache,
@@ -3301,6 +3433,56 @@ where
         }
     }
 }
+
+fn state_value_from_resolved_semantic_member(
+    resolved: ResolvedSemanticMember,
+    encoded_key: &[u8],
+    commit_id: CommitId,
+) -> Result<StateValue, StorageError> {
+    let public_change_id =
+        crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
+    let record =
+        crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
+            .map_err(|error| corruption(error.to_string()))?;
+    if encode_state_key(super::state::StateKeyRef {
+        schema_key: &record.schema_key,
+        file_id: record.file_id.as_deref(),
+        entity_pk: &record.entity_pk,
+    }) != encoded_key
+    {
+        return Err(corruption(
+            "semantic member identity differs from its authenticated StateKey",
+        ));
+    }
+    let cell = match record.snapshot {
+        crate::json_store::JsonSlot::None => StateCell::Tombstone,
+        crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
+        crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
+        crate::json_store::JsonSlot::ForkTreeObject(_) => {
+            return Err(corruption(
+                "semantic member contains an out-of-page JSON reference",
+            ));
+        }
+    };
+    let metadata = match record.metadata {
+        crate::json_store::JsonSlot::None => None,
+        crate::json_store::JsonSlot::Inline(value) => Some(value),
+        crate::json_store::JsonSlot::ForkTreeObject(_) => {
+            return Err(corruption("semantic member contains out-of-page metadata"));
+        }
+    };
+    Ok(StateValue {
+        change_id: public_change_id,
+        commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*commit_id.as_bytes())),
+        created_at: resolved.selected_created_at.unwrap_or(record.created_at),
+        updated_at: resolved.updated_at,
+        cell,
+        metadata: metadata.map(Into::into),
+        origin_key: record.origin_key,
+        blob_manifest_object_ids: resolved.blob_manifest_object_ids,
+    })
+}
+
 /// One ordered-history identity selected from an already published commit.
 ///
 /// Callers identify the semantic member and state row only. Catalog roots,
@@ -3928,6 +4110,41 @@ pub(super) async fn state_points_on_read_for_stale<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let mut summary_cache = StaleCommitSummaryCache::new(binding_id);
+    let mut stale_member_cache = StaleMemberAuthCache::new(binding_id);
+    state_points_on_read_for_stale_with_cache(
+        repository,
+        summary,
+        keys,
+        include_tombstone,
+        binding_id,
+        read,
+        &mut summary_cache,
+        &mut stale_member_cache,
+    )
+    .await
+}
+
+/// Retained-operation variant used by VCS analysis. The caches are private
+/// authenticated proof products bound to `binding_id`; callers can neither
+/// seed nor inspect them. Reusing them across base/source/target batches
+/// avoids re-authenticating one source commit and member page for every
+/// endpoint while preserving the same fail-closed proof path.
+pub(super) async fn state_points_on_read_for_stale_with_cache<R>(
+    repository: &RepositoryRootV1,
+    summary: StaleCommitSummary,
+    keys: &[Vec<u8>],
+    include_tombstone: bool,
+    binding_id: u64,
+    read: &R,
+    summary_cache: &mut StaleCommitSummaryCache,
+    stale_member_cache: &mut StaleMemberAuthCache,
+) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    summary_cache.assert_binding(binding_id)?;
+    stale_member_cache.assert_binding(binding_id)?;
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -3975,9 +4192,24 @@ where
     for (id, bytes) in pages {
         decoded_pages.insert(id, super::model::CommitChangePageV2::decode(id, &bytes)?);
     }
+    let endpoint_commit_ids = decoded_pages
+        .values()
+        .map(|page| {
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*page.commit_id.as_bytes()))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    prime_historical_commit_state_roots_for_stale(
+        read,
+        binding_id,
+        repository,
+        &endpoint_commit_ids,
+        summary_cache,
+        stale_member_cache,
+    )
+    .await?;
 
-    let mut summary_cache = StaleCommitSummaryCache::new(binding_id);
-    let mut stale_member_cache = StaleMemberAuthCache::new(binding_id);
     let change_ids = selected
         .iter()
         .zip(&pack_rows)
@@ -4022,15 +4254,11 @@ where
             .ok_or_else(|| corruption("state value page is absent"))?;
         let page_changelog_id =
             crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*page.commit_id.as_bytes()));
-        let page_summary = load_historical_commit_state_roots_for_stale(
-            read,
-            binding_id,
-            repository,
-            page_changelog_id,
-            &mut summary_cache,
-        )
-        .await
-        .map_err(|error| corruption(error.to_string()))?;
+        let page_summary = summary_cache
+            .entries
+            .get(&page_changelog_id)
+            .cloned()
+            .ok_or_else(|| corruption("batched endpoint Commit summary is absent"))?;
         if !page_summary
             .member_page_object_ids
             .contains(&pack_row.history_page_object_id)
@@ -4047,7 +4275,7 @@ where
             &page_summary.member_page_object_ids,
             pack_row.history_page_object_id,
             page,
-            &mut stale_member_cache,
+            stale_member_cache,
         )
         .await?;
         let member = page
@@ -4062,7 +4290,7 @@ where
         binding_id,
         repository.commit_catalog_root,
         &proof_seeds,
-        &mut stale_member_cache,
+        stale_member_cache,
     )
     .await?;
 
@@ -4084,15 +4312,11 @@ where
         let page_commit_id = page.commit_id;
         let page_changelog_id =
             crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*page_commit_id.as_bytes()));
-        let page_summary = load_historical_commit_state_roots_for_stale(
-            read,
-            binding_id,
-            repository,
-            page_changelog_id,
-            &mut summary_cache,
-        )
-        .await
-        .map_err(|error| corruption(error.to_string()))?;
+        let page_summary = summary_cache
+            .entries
+            .get(&page_changelog_id)
+            .cloned()
+            .ok_or_else(|| corruption("batched endpoint Commit summary is absent"))?;
         if !page_summary
             .member_page_object_ids
             .contains(&pack_row.history_page_object_id)
@@ -4109,7 +4333,7 @@ where
             &page_summary.member_page_object_ids,
             pack_row.history_page_object_id,
             page,
-            &mut stale_member_cache,
+            stale_member_cache,
         )
         .await?;
         let page_ordinal = pack_row.history_page_ordinal as usize;
@@ -4131,7 +4355,7 @@ where
             target_ordinal,
             repository.commit_catalog_root,
             repository.change_catalog_root,
-            &mut stale_member_cache,
+            stale_member_cache,
         )
         .await?;
         let expected_global = *source == StateSource::Global;
@@ -4140,53 +4364,8 @@ where
                 "state value page domain differs from its state root",
             ));
         }
-        let public_change_id =
-            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
-        let record =
-            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
-                .map_err(|error| corruption(error.to_string()))?;
-        let created_at = resolved.selected_created_at.unwrap_or(record.created_at);
-        if encode_state_key(super::state::StateKeyRef {
-            schema_key: &record.schema_key,
-            file_id: record.file_id.as_deref(),
-            entity_pk: &record.entity_pk,
-        }) != *encoded_key
-        {
-            return Err(corruption(
-                "state value page identity differs from its state key",
-            ));
-        }
-        let cell = match record.snapshot {
-            crate::json_store::JsonSlot::None => StateCell::Tombstone,
-            crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => {
-                StateCell::Null
-            }
-            crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
-            crate::json_store::JsonSlot::ForkTreeObject(_) => {
-                return Err(corruption(
-                    "state value page contains an out-of-page JSON reference",
-                ));
-            }
-        };
-        let metadata = match record.metadata {
-            crate::json_store::JsonSlot::None => None,
-            crate::json_store::JsonSlot::Inline(value) => Some(value),
-            crate::json_store::JsonSlot::ForkTreeObject(_) => {
-                return Err(corruption("state value page contains out-of-page metadata"));
-            }
-        };
-        let historical_value = StateValue {
-            change_id: public_change_id,
-            commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-                *page.commit_id.as_bytes(),
-            )),
-            created_at,
-            updated_at: resolved.updated_at,
-            cell,
-            metadata: metadata.map(Into::into),
-            origin_key: record.origin_key,
-            blob_manifest_object_ids: resolved.blob_manifest_object_ids,
-        };
+        let historical_value =
+            state_value_from_resolved_semantic_member(resolved, encoded_key, page.commit_id)?;
         if historical_value != pack_row.value {
             return Err(corruption(
                 "current-state pack value differs from its stale-authenticated history member",
@@ -5027,6 +5206,95 @@ impl StaleCommitSummary {
     pub(super) fn local_state_root(&self) -> ObjectId {
         self.local_state_root
     }
+}
+
+/// Resolves endpoint Commit summaries as one authenticated breadth and primes
+/// the same operation-local member closure cache consumed by stale semantic
+/// proof. Public Commit IDs are resolved through one CommitCatalog batch;
+/// commit/root/topology/page authentication then remains entirely inside the
+/// ForkTree retained-view owner. No caller-provided object or proof can seed
+/// either cache.
+async fn prime_historical_commit_state_roots_for_stale<R>(
+    read: &R,
+    binding_id: u64,
+    repository: &RepositoryRootV1,
+    commit_ids: &[crate::changelog::CommitId],
+    summary_cache: &mut StaleCommitSummaryCache,
+    member_cache: &mut StaleMemberAuthCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    summary_cache.assert_binding(binding_id)?;
+    member_cache.assert_binding(binding_id)?;
+    let missing = commit_ids
+        .iter()
+        .filter(|id| !summary_cache.entries.contains_key(id))
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let catalog_keys = missing
+        .iter()
+        .map(|id| id.as_uuid().as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let catalog_values = lookup_many_on_read(
+        repository.commit_catalog_root,
+        "commit",
+        &catalog_keys,
+        read,
+    )
+    .await?;
+    if catalog_values.len() != missing.len() {
+        return Err(corruption(
+            "batched endpoint CommitCatalog lookup returned the wrong number of values",
+        ));
+    }
+    let mut by_id = Vec::with_capacity(missing.len());
+    let mut object_ids = BTreeSet::new();
+    for (id, value) in missing.iter().zip(catalog_values) {
+        let entry = CommitCatalogEntry::decode(
+            &value.ok_or_else(|| corruption("endpoint Commit is absent from CommitCatalog"))?,
+        )?;
+        by_id.push((*id, entry.commit_object_id));
+        object_ids.insert(entry.commit_object_id);
+    }
+    prime_stale_commits(
+        read,
+        binding_id,
+        repository.commit_catalog_root,
+        &object_ids,
+        member_cache,
+    )
+    .await?;
+
+    let mut pending = Vec::with_capacity(by_id.len());
+    for (public_id, object_id) in by_id {
+        let commit = member_cache
+            .commits
+            .get(&object_id)
+            .ok_or_else(|| corruption("batched endpoint Commit proof is incomplete"))?;
+        let catalog_id = CommitId::from_bytes(*public_id.as_uuid().as_bytes());
+        if commit.commit_id != catalog_id {
+            return Err(corruption(
+                "endpoint CommitCatalog key does not match Commit object",
+            ));
+        }
+        pending.push((
+            public_id,
+            StaleCommitSummary {
+                commit_id: catalog_id,
+                commit_object_id: object_id,
+                generation: commit.generation,
+                global_state_root: commit.global_state_root,
+                local_state_root: commit.local_state_root,
+                member_page_object_ids: commit.member_page_object_ids.clone(),
+            },
+        ));
+    }
+    summary_cache.entries.extend(pending);
+    Ok(())
 }
 
 /// Authenticates only the commit envelope and root/topology summary required

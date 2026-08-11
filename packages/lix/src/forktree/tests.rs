@@ -838,7 +838,7 @@ async fn stale_page_prefix_gap_before_selected_page_fails_closed() {
 }
 
 #[tokio::test]
-async fn stale_page_prefix_wrong_commit_fails_closed() {
+async fn stale_page_prefix_wrong_commit_and_selected_page_fail_closed() {
     let (commit_id, mut objects, page_ids, pages) = four_page_stale_fixture();
     let mut wrong_first = pages[0].clone();
     wrong_first.commit_id = CommitId::from_bytes(raw_id(0xd2));
@@ -849,19 +849,31 @@ async fn stale_page_prefix_wrong_commit_fails_closed() {
     assert!(
         validate_four_page_stale_fixture(
             commit_id,
-            objects,
-            page_ids,
+            objects.clone(),
+            page_ids.clone(),
             selected_page_object_id,
             &pages[3],
         )
         .await
         .is_err(),
-        "a wrong-commit prefix page must fail closed"
+        "a selected page must be anchored through a valid page-zero prefix"
+    );
+    assert!(
+        validate_four_page_stale_fixture(
+            commit_id,
+            objects,
+            page_ids,
+            wrong_first_id,
+            &wrong_first,
+        )
+        .await
+        .is_err(),
+        "the same wrong-commit page must fail closed when selected"
     );
 }
 
 #[tokio::test]
-async fn stale_page_prefix_missing_page_fails_closed() {
+async fn stale_page_missing_prefix_fails_closed() {
     let (commit_id, objects, page_ids, pages) = four_page_stale_fixture();
     let missing_id = content_id(0xd3);
     let page_ids = vec![page_ids[0], missing_id, page_ids[2], page_ids[3]];
@@ -876,7 +888,30 @@ async fn stale_page_prefix_missing_page_fails_closed() {
         )
         .await
         .is_err(),
-        "a missing prefix page must fail closed"
+        "a missing prefix page must fail before accepting a later absolute ordinal"
+    );
+}
+
+#[tokio::test]
+async fn stale_page_unvisited_suffix_remains_lazy() {
+    let (commit_id, mut objects, page_ids, pages) = four_page_stale_fixture();
+    let mut wrong_last = pages[3].clone();
+    wrong_last.commit_id = CommitId::from_bytes(raw_id(0xd4));
+    let (wrong_last_id, wrong_last_bytes) = wrong_last.encode().expect("wrong suffix page");
+    objects.push((wrong_last_id, wrong_last_bytes));
+    let page_ids = vec![page_ids[0], page_ids[1], page_ids[2], wrong_last_id];
+    let selected_page_id = page_ids[0];
+    assert!(
+        validate_four_page_stale_fixture(
+            commit_id,
+            objects,
+            page_ids,
+            selected_page_id,
+            &pages[0],
+        )
+        .await
+        .is_ok(),
+        "a corrupt suffix after the selected page must remain lazy"
     );
 }
 

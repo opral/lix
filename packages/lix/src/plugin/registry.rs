@@ -455,7 +455,7 @@ impl PluginRegistry {
 }
 
 pub(crate) async fn load_plugin_registry_on_historical_view<R>(
-    view: &crate::forktree::AuthenticatedHistoricalStateView<'_, R>,
+    view: &crate::forktree::AuthenticatedVcsHistoricalStateView<'_, R>,
     commit_id: &str,
 ) -> Result<PluginRegistry, LixError>
 where

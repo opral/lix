@@ -49,8 +49,8 @@ pub(crate) use serving::{
     state_points, state_points_on_read, state_range,
 };
 pub(crate) use state::{
-    HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
-    decode_state_key, decode_state_value, encode_state_entity_prefix,
+    HistoricalStateDiffEntry, HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef,
+    StateValue, StateValueRef, decode_state_key, decode_state_value, encode_state_entity_prefix,
     encode_state_entity_prefix_bounds, encode_state_key, encode_state_value,
     exclusive_prefix_upper_bound,
 };
@@ -59,8 +59,9 @@ pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
 };
 pub(crate) use view::{
-    AuthenticatedHistoricalStateView, CoherentView, ForkTreeReadFacade, SELECTOR_SPACE,
-    load_object_bytes, open_coherent_view, open_coherent_view_on_read,
+    AuthenticatedHistoricalStateView, AuthenticatedVcsHistoricalStateView, CoherentView,
+    ForkTreeReadFacade, SELECTOR_SPACE, load_object_bytes, open_coherent_view,
+    open_coherent_view_on_read,
 };
 
 #[cfg(test)]

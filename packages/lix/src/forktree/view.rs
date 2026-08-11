@@ -545,6 +545,92 @@ pub(crate) struct AuthenticatedHistoricalStateView<'a, R: ?Sized> {
     local_state_root: ObjectId,
 }
 
+/// A historical state endpoint opened specifically for VCS analysis.
+///
+/// Construction authenticates the CommitCatalog envelope, topology and state
+/// roots on the facade's retained read. Exact rows then use the ForkTree-owned
+/// selective member-page proof, so opening base/target/source does not decode
+/// unrelated commit members. There is no alternate reader or raw-state path.
+pub(crate) struct AuthenticatedVcsHistoricalStateView<'a, R: ?Sized> {
+    read: &'a R,
+    repository: RepositoryRootV1,
+    summary: super::serving::StaleCommitSummary,
+    operation_id: u64,
+}
+
+impl<R> AuthenticatedVcsHistoricalStateView<'_, R>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    pub(crate) async fn load_state_value(
+        &self,
+        key: &[u8],
+        include_tombstone: bool,
+    ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, crate::LixError>
+    {
+        let mut values = super::serving::state_points_on_read_for_stale(
+            &self.repository,
+            self.summary.clone(),
+            &[key.to_vec()],
+            include_tombstone,
+            self.operation_id,
+            self.read,
+        )
+        .await?;
+        Ok(values.pop().flatten())
+    }
+
+    pub(crate) async fn load_state_rows(
+        &self,
+        keys: &[super::state::StateKey],
+    ) -> Result<Vec<Option<super::state::HistoricalStateRow>>, crate::LixError> {
+        let encoded_keys = keys
+            .iter()
+            .map(|key| {
+                super::state::encode_state_key(super::state::StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                })
+            })
+            .collect::<Vec<_>>();
+        let values = super::serving::state_points_on_read_for_stale(
+            &self.repository,
+            self.summary.clone(),
+            &encoded_keys,
+            true,
+            self.operation_id,
+            self.read,
+        )
+        .await?;
+        Ok(keys
+            .iter()
+            .zip(values)
+            .map(|(key, value)| {
+                value.map(|(value, source)| {
+                    let (snapshot_content, deleted) = match value.cell {
+                        super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+                        super::state::StateCell::Null => (None, false),
+                        super::state::StateCell::Tombstone => (None, true),
+                    };
+                    super::state::HistoricalStateRow {
+                        key: key.clone(),
+                        global: source == super::serving::StateSource::Global,
+                        snapshot_content,
+                        metadata: value.metadata,
+                        deleted,
+                        blob_manifest_object_ids: value.blob_manifest_object_ids,
+                        created_at: value.created_at,
+                        updated_at: value.updated_at,
+                        change_id: value.change_id,
+                        commit_id: value.commit_id,
+                    }
+                })
+            })
+            .collect())
+    }
+}
+
 impl<R> AuthenticatedHistoricalStateView<'_, R>
 where
     R: StorageAdapterRead + ?Sized,
@@ -696,6 +782,36 @@ where
             global_state_root,
             local_state_root,
         })
+    }
+
+    /// Opens a batch of VCS historical endpoints on this facade's one retained
+    /// read. Repository identity and commit summaries are authenticated once;
+    /// member payloads remain lazy until an exact changed/conflicting key is
+    /// requested from one of the returned views.
+    pub(crate) async fn vcs_historical_state_views(
+        &self,
+        commit_ids: &[crate::changelog::CommitId],
+    ) -> Result<Vec<AuthenticatedVcsHistoricalStateView<'_, R>>, crate::LixError> {
+        let repository = super::serving::load_repository_root(&self.read).await?;
+        let mut cache = super::serving::StaleCommitSummaryCache::new(self.operation_id);
+        let mut views = Vec::with_capacity(commit_ids.len());
+        for commit_id in commit_ids {
+            let summary = super::serving::load_historical_commit_state_roots_for_stale(
+                &self.read,
+                self.operation_id,
+                &repository,
+                *commit_id,
+                &mut cache,
+            )
+            .await?;
+            views.push(AuthenticatedVcsHistoricalStateView {
+                read: &self.read,
+                repository,
+                summary,
+                operation_id: self.operation_id,
+            });
+        }
+        Ok(views)
     }
 
     /// Consumes this operation-owned facade into one retained authenticated
@@ -1041,6 +1157,87 @@ where
         )
     }
 
+    /// Produces both sides of a three-way VCS diff from one retained read and
+    /// one operation-local authenticated member-proof index. The base keys
+    /// are acquired once as the union of both structural root frontiers;
+    /// source Commit/page/ChangeCatalog proofs are then shared across all
+    /// three endpoints without becoming caller-visible authority.
+    pub(crate) async fn diff_state_rows_for_merge(
+        &self,
+        base: crate::changelog::CommitId,
+        target: crate::changelog::CommitId,
+        source: crate::changelog::CommitId,
+    ) -> Result<
+        (
+            Vec<super::state::HistoricalStateDiffEntry>,
+            Vec<super::state::HistoricalStateDiffEntry>,
+        ),
+        crate::LixError,
+    > {
+        let repository = super::serving::load_repository_root(&self.read).await?;
+        let mut summary_cache = super::serving::StaleCommitSummaryCache::new(self.operation_id());
+        let base_summary = self
+            .load_stale_commit_state_roots(&repository, base, &mut summary_cache)
+            .await?;
+        let target_summary = self
+            .load_stale_commit_state_roots(&repository, target, &mut summary_cache)
+            .await?;
+        let source_summary = self
+            .load_stale_commit_state_roots(&repository, source, &mut summary_cache)
+            .await?;
+
+        let source_keys = changed_state_keys(&self.read, &base_summary, &source_summary).await?;
+        let target_keys = if target == base {
+            Vec::new()
+        } else {
+            changed_state_keys(&self.read, &base_summary, &target_summary).await?
+        };
+        let base_keys = merge_sorted_state_keys(source_keys.clone(), target_keys.clone());
+        let base_encoded = encode_state_keys(&base_keys);
+        let source_encoded = encode_state_keys(&source_keys);
+        let target_encoded = encode_state_keys(&target_keys);
+        let mut member_cache = super::serving::StaleMemberAuthCache::new(self.operation_id());
+
+        let base_values = super::serving::state_points_on_read_for_stale_with_cache(
+            &repository,
+            base_summary,
+            &base_encoded,
+            true,
+            self.operation_id(),
+            &self.read,
+            &mut summary_cache,
+            &mut member_cache,
+        )
+        .await?;
+        let source_values = super::serving::state_points_on_read_for_stale_with_cache(
+            &repository,
+            source_summary,
+            &source_encoded,
+            true,
+            self.operation_id(),
+            &self.read,
+            &mut summary_cache,
+            &mut member_cache,
+        )
+        .await?;
+        let target_values = super::serving::state_points_on_read_for_stale_with_cache(
+            &repository,
+            target_summary,
+            &target_encoded,
+            true,
+            self.operation_id(),
+            &self.read,
+            &mut summary_cache,
+            &mut member_cache,
+        )
+        .await?;
+
+        let base_rows = historical_rows_by_encoded_key(base_keys, base_values)?;
+        let source_diff = historical_diff_for_side(&source_keys, &base_rows, source_values)?;
+        let target_diff = historical_diff_for_side(&target_keys, &base_rows, target_values)?;
+        Ok((source_diff, target_diff))
+    }
+
     /// Diffs only the branch-local state domain for checkpoint and working
     /// diff projections. Global rows remain visible through the complete
     /// historical API above, but are not re-staged into a branch checkpoint.
@@ -1335,6 +1532,98 @@ fn historical_state_row_from_point(
         change_id: value.change_id,
         commit_id: value.commit_id,
     }))
+}
+
+async fn changed_state_keys<R>(
+    read: &R,
+    before: &super::serving::StaleCommitSummary,
+    after: &super::serving::StaleCommitSummary,
+) -> Result<Vec<super::state::StateKey>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let local = super::tree::diff_roots(
+        Some(before.local_state_root()),
+        Some(after.local_state_root()),
+        read,
+    )
+    .await?;
+    let global = super::tree::diff_roots(
+        Some(before.global_state_root()),
+        Some(after.global_state_root()),
+        read,
+    )
+    .await?;
+    Ok(merge_sorted_state_keys(local, global))
+}
+
+fn encode_state_keys(keys: &[super::state::StateKey]) -> Vec<Vec<u8>> {
+    keys.iter()
+        .map(|key| {
+            super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            })
+        })
+        .collect()
+}
+
+fn historical_rows_by_encoded_key(
+    keys: Vec<super::state::StateKey>,
+    values: Vec<Option<(super::state::StateValue, super::serving::StateSource)>>,
+) -> Result<BTreeMap<Vec<u8>, Option<super::state::HistoricalStateRow>>, crate::LixError> {
+    if keys.len() != values.len() {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            "VCS base point batch returned a different number of slots than requested",
+        ));
+    }
+    keys.into_iter()
+        .zip(values)
+        .map(|(key, value)| {
+            let encoded = super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            Ok((encoded, historical_state_row_from_point(key, value, true)?))
+        })
+        .collect()
+}
+
+fn historical_diff_for_side(
+    keys: &[super::state::StateKey],
+    base_rows: &BTreeMap<Vec<u8>, Option<super::state::HistoricalStateRow>>,
+    side_values: Vec<Option<(super::state::StateValue, super::serving::StateSource)>>,
+) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
+    if keys.len() != side_values.len() {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            "VCS side point batch returned a different number of slots than requested",
+        ));
+    }
+    let mut output = Vec::with_capacity(keys.len());
+    for (key, side_value) in keys.iter().cloned().zip(side_values) {
+        let encoded = super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        });
+        let before = base_rows.get(&encoded).cloned().ok_or_else(|| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "VCS base point union omitted a changed side key",
+            )
+        })?;
+        let after = historical_state_row_from_point(key, side_value, true)?;
+        let payload_changed = historical_state_payloads_differ(before.as_ref(), after.as_ref());
+        let identity_changed = historical_state_identity_changed(before.as_ref(), after.as_ref());
+        if historical_state_change_is_public(payload_changed, identity_changed) {
+            output.push(super::state::HistoricalStateDiffEntry { before, after });
+        }
+    }
+    Ok(output)
 }
 
 pub(super) fn merge_sorted_state_keys(

@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::forktree::{StateCell, StateKey, StateValue};
+use crate::forktree::{
+    HistoricalStateDiffEntry, HistoricalStateRow, StateCell, StateKey, StateValue,
+};
 use crate::json_store::JsonSlot;
 use crate::state::StateDiffEntry;
 
@@ -108,6 +110,104 @@ impl MergeDiff {
     pub(crate) fn payloads(&self) -> &MergePayloadBatch {
         &self.payloads
     }
+
+    /// Converts one ForkTree-owned authenticated historical diff directly
+    /// into merge evidence. The retained-view diff has already bound every
+    /// endpoint row to its StateKey, source member page/ordinal, ChangeCatalog
+    /// owner, and semantic payload, so merge analysis must not reopen those
+    /// commits or rebuild complete member closures through `load_change_records`.
+    pub(crate) fn from_historical(
+        entries: Vec<HistoricalStateDiffEntry>,
+    ) -> Result<Self, LixError> {
+        let mut converted = Vec::with_capacity(entries.len());
+        let mut payloads = HashMap::new();
+        for entry in entries {
+            let identity = entry
+                .after
+                .as_ref()
+                .or(entry.before.as_ref())
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "authenticated historical diff entry has no endpoint",
+                    )
+                })?
+                .key
+                .clone();
+            if entry
+                .before
+                .as_ref()
+                .zip(entry.after.as_ref())
+                .is_some_and(|(before, after)| before.key != after.key)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "authenticated historical diff endpoint keys disagree",
+                ));
+            }
+            for row in [entry.before.as_ref(), entry.after.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                let payload = historical_payload(row);
+                if let Some(previous) = payloads.insert(row.change_id, payload.clone())
+                    && previous != payload
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "authenticated historical diff has conflicting payloads for change '{}'",
+                            row.change_id
+                        ),
+                    ));
+                }
+            }
+            let before = entry.before.as_ref().map(merge_row_from_historical);
+            let after = entry.after.as_ref().map(merge_row_from_historical);
+            let before_live = before.as_ref().is_some_and(|row| !row.deleted);
+            let after_live = after.as_ref().is_some_and(|row| !row.deleted);
+            let kind = match (before_live, after_live) {
+                (false, true) => MergeDiffKind::Added,
+                (true, false) => MergeDiffKind::Removed,
+                (true, true) => MergeDiffKind::Modified,
+                (false, false) => continue,
+            };
+            converted.push(MergeDiffEntry {
+                identity,
+                kind,
+                before,
+                after,
+            });
+        }
+        Ok(Self {
+            entries: converted,
+            payloads: MergePayloadBatch { values: payloads },
+        })
+    }
+}
+
+fn merge_row_from_historical(row: &HistoricalStateRow) -> MergeRow {
+    MergeRow {
+        deleted: row.deleted,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        change_id: row.change_id,
+        commit_id: row.commit_id,
+    }
+}
+
+fn historical_payload(row: &HistoricalStateRow) -> (JsonSlot, JsonSlot) {
+    let snapshot = if row.deleted {
+        JsonSlot::None
+    } else {
+        JsonSlot::Inline(row.snapshot_content.as_deref().unwrap_or("null").into())
+    };
+    let metadata = row
+        .metadata
+        .as_deref()
+        .map(|value| JsonSlot::Inline(value.into()))
+        .unwrap_or(JsonSlot::None);
+    (snapshot, metadata)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

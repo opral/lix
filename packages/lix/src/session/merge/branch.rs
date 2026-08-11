@@ -9,7 +9,7 @@ use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
-    AuthenticatedHistoricalStateView, ForkTreeReadFacade, HistoricalStateRow, StateKey,
+    AuthenticatedVcsHistoricalStateView, ForkTreeReadFacade, HistoricalStateRow, StateKey,
 };
 use crate::plugin::{
     ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
@@ -554,9 +554,9 @@ struct DerivedPluginConflictIndex {
 }
 
 struct MergeHistoricalState<'a, R: ?Sized> {
-    base: AuthenticatedHistoricalStateView<'a, R>,
-    target: AuthenticatedHistoricalStateView<'a, R>,
-    source: AuthenticatedHistoricalStateView<'a, R>,
+    base: AuthenticatedVcsHistoricalStateView<'a, R>,
+    target: AuthenticatedVcsHistoricalStateView<'a, R>,
+    source: AuthenticatedVcsHistoricalStateView<'a, R>,
 }
 
 impl<'a, R> MergeHistoricalState<'a, R>
@@ -567,15 +567,17 @@ where
         facade: &'a ForkTreeReadFacade<R>,
         analysis: &super::analysis::MergeAnalysis,
     ) -> Result<Self, LixError> {
-        let base = facade
-            .historical_state_view(&analysis.commits.base_commit_id.to_string())
-            .await?;
-        let target = facade
-            .historical_state_view(&analysis.commits.target_commit_id.to_string())
-            .await?;
-        let source = facade
-            .historical_state_view(&analysis.commits.source_commit_id.to_string())
-            .await?;
+        let mut views = facade
+            .vcs_historical_state_views(&[
+                analysis.commits.base_commit_id,
+                analysis.commits.target_commit_id,
+                analysis.commits.source_commit_id,
+            ])
+            .await?
+            .into_iter();
+        let base = views.next().expect("three VCS historical views requested");
+        let target = views.next().expect("three VCS historical views requested");
+        let source = views.next().expect("three VCS historical views requested");
         Ok(Self {
             base,
             target,
@@ -1131,7 +1133,7 @@ fn common_historical_path(
 }
 
 async fn historical_file_path<R>(
-    historical: &AuthenticatedHistoricalStateView<'_, R>,
+    historical: &AuthenticatedVcsHistoricalStateView<'_, R>,
     scope_file_id: Option<&str>,
     descriptor: &HistoricalFileDescriptor,
 ) -> Result<Option<String>, LixError>
@@ -1592,7 +1594,7 @@ fn push_transaction_row_from_tracked_row_ref(
 }
 
 async fn materialized_plugin_merge_rows<R>(
-    source: &AuthenticatedHistoricalStateView<'_, R>,
+    source: &AuthenticatedVcsHistoricalStateView<'_, R>,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &DerivedPluginConflictIndex,
     target_branch_id: &SharedStr,
@@ -1665,7 +1667,7 @@ where
 }
 
 async fn plugin_resolution_change_stats<R>(
-    target: &AuthenticatedHistoricalStateView<'_, R>,
+    target: &AuthenticatedVcsHistoricalStateView<'_, R>,
     resolved_rows: &RawWriteBatch,
 ) -> Result<MergeChangeStats, LixError>
 where
