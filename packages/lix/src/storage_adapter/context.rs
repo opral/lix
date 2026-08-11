@@ -63,17 +63,16 @@ where
         &self,
         opts: ReadOptions,
     ) -> Result<StorageAdapterReadScope<StorageImpl::Read<'_>>, StorageError> {
-        let scope = self.storage.begin_read(opts).await.map(|read| {
+        // No intern I/O here: opening a snapshot must stay a pure storage
+        // operation for every plane. Hot-plane entry points call
+        // `SchemaIntern::ensure_current` on their own snapshot instead, which
+        // scans once per adapter and then catches up with bounded point reads.
+        self.storage.begin_read(opts).await.map(|read| {
             StorageAdapterReadScope::new_with_intern(
                 read,
                 std::sync::Arc::clone(&self.schema_intern),
             )
-        })?;
-        // The intern table is a strict superset of every id reachable through
-        // this snapshot: it loads here, through this same snapshot, before the
-        // caller observes any hot-plane key.
-        self.schema_intern.ensure_loaded(&scope).await?;
-        Ok(scope)
+        })
     }
 
     pub fn new_write_set(&self) -> StorageWriteSet {

@@ -83,6 +83,8 @@ pub struct StorageWriteSet {
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
     exclusive_range_deletes: Vec<(StorageSpace, KeyRange)>,
     deferred_final_puts: Vec<Box<dyn DeferredFinalPutSource>>,
+    /// Write-once keys this set requires to be absent at commit time.
+    key_absent_preconditions: Vec<(StorageSpace, Key)>,
     stats: StorageWriteSetStats,
     // Domain stores can seal a write lane after planning a destructive sweep.
     // The flag carries no storage representation; it only prevents a later
@@ -350,12 +352,21 @@ impl StorageWriteSet {
             .stage_put(key.0, value.bytes);
     }
 
-    /// Stages a put unless a byte-identical `(key, value)` put is already
-    /// staged in the same space. Intended for tiny write-once mapping rows
-    /// that several staging passes may repeat within one write set; the check
-    /// is a linear scan over the space's staged puts, so keep it away from
-    /// high-volume lanes.
-    pub(crate) fn put_if_absent<S, K, V>(&mut self, space: S, key: K, value: V)
+    /// Keys this write set requires to be absent in storage at commit time.
+    ///
+    /// Drained by the commit path into its precondition list, so a racing
+    /// writer that published the same key loses the CAS and retries instead of
+    /// silently overwriting a write-once record.
+    pub(crate) fn take_key_absent_preconditions(&mut self) -> Vec<(StorageSpace, Key)> {
+        std::mem::take(&mut self.key_absent_preconditions)
+    }
+
+    /// Stages a write-once put: skipped when a byte-identical `(key, value)`
+    /// put is already staged in the same space, and guarded by a
+    /// key-absent precondition so a concurrent writer cannot publish a
+    /// different value under the same key. The staged-put check is a linear
+    /// scan over the space's puts, so keep this away from high-volume lanes.
+    pub(crate) fn put_write_once<S, K, V>(&mut self, space: S, key: K, value: V)
     where
         S: IntoStorageSpace,
         K: IntoStorageKey,
@@ -374,6 +385,7 @@ impl StorageWriteSet {
         }
         self.stats.staged_puts += 1;
         self.stats.written_bytes += value.bytes.len() as u64;
+        self.key_absent_preconditions.push((space, key.clone()));
         self.group_mut(space).stage_put(key.0, value.bytes);
     }
 
@@ -1096,6 +1108,7 @@ impl Default for StorageWriteSet {
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
             exclusive_range_deletes: Vec::new(),
             deferred_final_puts: Vec::new(),
+            key_absent_preconditions: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }

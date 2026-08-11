@@ -185,7 +185,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // this commit's snapshot first so ids published by other engines over the
     // same storage are never re-allocated to different schemas.
     crate::storage_adapter::schema_intern_of(read)
-        .load(read)
+        .ensure_current(read)
         .await?;
     Box::pin(validate_active_account_and_account_rows(
         read,
@@ -557,6 +557,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         && engine_rows.is_empty()
         && writes.is_empty()
     {
+        drain_write_once_preconditions(&mut writes, &mut preconditions);
         return Ok((writes, preconditions));
     }
 
@@ -861,7 +862,24 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
     }
+    drain_write_once_preconditions(&mut writes, &mut preconditions);
     Ok((writes, preconditions))
+}
+
+/// Promotes write-once staged keys (currently the schema-intern mapping rows)
+/// into commit preconditions, so a concurrent commit that already published
+/// the same id makes this one fail its CAS and retry against the published
+/// mapping instead of overwriting it.
+fn drain_write_once_preconditions(
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+) {
+    preconditions.extend(
+        writes
+            .take_key_absent_preconditions()
+            .into_iter()
+            .map(|(space, key)| StoragePrecondition::KeyAbsent { space, key }),
+    );
 }
 
 fn certified_batch_requires_root_expansion(batch: &crate::wasm::WasmCertifiedEntityBatch) -> bool {

@@ -25,8 +25,8 @@ use bytes::Bytes;
 use crate::LixError;
 use crate::common::SharedStr;
 use crate::storage::{
-    BeginScanOptions, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId, StorageError,
-    StorageSpace,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange,
+    MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId, StorageError, StorageSpace,
 };
 use crate::storage_adapter::read_scope::StorageAdapterRead;
 use crate::storage_adapter::write_set::StorageWriteSet;
@@ -74,6 +74,9 @@ struct SchemaInternInner {
 #[derive(Default)]
 pub struct SchemaIntern {
     inner: RwLock<SchemaInternInner>,
+    /// Set once the whole space has been scanned; before that a miss cannot
+    /// be distinguished from an unloaded table.
+    scanned: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for SchemaIntern {
@@ -89,10 +92,84 @@ impl std::fmt::Debug for SchemaIntern {
 
 impl SchemaIntern {
     const UNMAPPED_RAW: u32 = u32::MAX;
+    /// Ids probed per round when catching up with another engine's writes.
+    const TAIL_PROBE_WIDTH: u32 = 8;
 
-    /// Loads the persisted table once per adapter, replacing any prior
-    /// in-memory state.
-    pub(crate) async fn load<S>(&self, store: &S) -> Result<(), StorageError>
+    /// Brings the table up to date with `store`'s snapshot.
+    ///
+    /// The first call scans the (tiny) space once. Afterwards the table is a
+    /// dense `0..len` prefix, so catching up only has to probe the ids past
+    /// `len`: one batched point read that misses in the steady state, no
+    /// iterator setup and no per-operation scan. Callers must invoke this at
+    /// the async boundary before any synchronous `resolve`/`name` on the same
+    /// snapshot.
+    pub(crate) async fn ensure_current<S>(&self, store: &S) -> Result<(), StorageError>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        if !self.scanned.load(std::sync::atomic::Ordering::Acquire) {
+            self.load(store).await?;
+            self.scanned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
+        self.probe_tail(store).await
+    }
+
+    /// Point-reads the dense ids past the in-memory end until one is absent.
+    async fn probe_tail<S>(&self, store: &S) -> Result<(), StorageError>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        loop {
+            let start = {
+                let inner = self.inner.read().expect("schema intern lock poisoned");
+                inner.by_id.len() as u32
+            };
+            let keys = (start..start.saturating_add(Self::TAIL_PROBE_WIDTH))
+                .map(|id| Key(Bytes::copy_from_slice(&id.to_be_bytes())))
+                .collect::<Vec<_>>();
+            let result = crate::storage_adapter::exact_get_many(
+                store,
+                &[GetManyRequest {
+                    space: SCHEMA_INTERN_SPACE,
+                    keys: &keys,
+                    opts: GetOptions {
+                        projection: CoreProjection::FullValue,
+                    },
+                }],
+            )
+            .await?;
+            let mut appended = 0_u32;
+            let mut inner = self.inner.write().expect("schema intern lock poisoned");
+            for (offset, value) in result.values.into_iter().enumerate() {
+                let Some(value) = value else { break };
+                let ProjectedValue::FullValue(bytes) = value else {
+                    return Err(intern_corruption("value projection"));
+                };
+                let id = start.saturating_add(offset as u32);
+                if inner.by_id.len() as u32 != id {
+                    // Another thread already merged this id.
+                    continue;
+                }
+                let name =
+                    SharedStr::from_utf8(bytes).map_err(|_| intern_corruption("schema key utf-8"))?;
+                if inner.by_name.insert(name.clone(), id).is_some() {
+                    return Err(intern_corruption("duplicate schema key"));
+                }
+                inner.by_id.push(name);
+                inner.loaded_len = inner.by_id.len() as u32;
+                appended += 1;
+            }
+            if appended < Self::TAIL_PROBE_WIDTH {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Scans the whole persisted table. Used once per adapter; afterwards
+    /// `ensure_current` catches up with bounded point reads instead.
+    async fn load<S>(&self, store: &S) -> Result<(), StorageError>
     where
         S: StorageAdapterRead + ?Sized,
     {
@@ -159,11 +236,11 @@ impl SchemaIntern {
         inner.by_name.get(schema_key).copied().map(SchemaInternId)
     }
 
-    /// Re-reads the persisted table through `store` when any of `schema_keys`
-    /// is unknown in memory. Engines sharing one storage publish mappings the
-    /// others have not seen; the merge is idempotent, so refreshing on a miss
-    /// makes resolution exact for the calling snapshot.
-    pub(crate) async fn refresh_if_missing<'a, S>(
+    /// Cheap variant of `ensure_current` for operations whose schema set is
+    /// known up front: when every name already resolves, no storage read is
+    /// issued at all. A miss means either the schema has no rows or another
+    /// engine published it, and only then is the table caught up.
+    pub(crate) async fn ensure_current_for<'a, S>(
         &self,
         store: &S,
         mut schema_keys: impl Iterator<Item = &'a str>,
@@ -173,12 +250,13 @@ impl SchemaIntern {
     {
         let all_known = {
             let inner = self.inner.read().expect("schema intern lock poisoned");
-            schema_keys.all(|schema_key| inner.by_name.contains_key(schema_key))
+            self.scanned.load(std::sync::atomic::Ordering::Acquire)
+                && schema_keys.all(|schema_key| inner.by_name.contains_key(schema_key))
         };
         if all_known {
             return Ok(());
         }
-        self.load(store).await
+        self.ensure_current(store).await
     }
 
     /// Decode-path lookup; a miss is corruption because assignment always
@@ -243,9 +321,9 @@ impl SchemaIntern {
 }
 
 fn stage_mapping_row(writes: &mut StorageWriteSet, id: u32, schema_key: &str) {
-    writes.put_if_absent(
+    writes.put_write_once(
         SCHEMA_INTERN_SPACE,
-        crate::storage::Key(Bytes::copy_from_slice(&id.to_be_bytes())),
+        Key(Bytes::copy_from_slice(&id.to_be_bytes())),
         crate::storage::StoredValue {
             bytes: Bytes::copy_from_slice(schema_key.as_bytes()),
         },
@@ -264,22 +342,11 @@ fn intern_corruption(what: &str) -> StorageError {
 #[derive(Debug, Default)]
 pub struct SchemaInternHandle {
     intern: SchemaIntern,
-    loaded: tokio::sync::OnceCell<()>,
 }
 
 impl SchemaInternHandle {
     pub(crate) fn intern(&self) -> &SchemaIntern {
         &self.intern
-    }
-
-    pub(crate) async fn ensure_loaded<S>(&self, store: &S) -> Result<(), StorageError>
-    where
-        S: StorageAdapterRead + ?Sized,
-    {
-        self.loaded
-            .get_or_try_init(|| self.intern.load(store))
-            .await?;
-        Ok(())
     }
 }
 
