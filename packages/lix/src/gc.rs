@@ -2790,7 +2790,7 @@ mod tests {
             &storage,
             writes,
             &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
+            &[owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -2834,25 +2834,7 @@ mod tests {
         );
         drop(read);
 
-        let mut writes = storage.new_write_set();
-        stage_branch_head_control(&mut writes, "main", released_control)
-            .expect("released control should stage");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("selected-owner release read should open");
-        let mut preconditions = Vec::new();
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("selected-owner release should publish atomically");
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
 
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
@@ -2976,7 +2958,7 @@ mod tests {
             &storage,
             writes,
             &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
+            &[owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3002,7 +2984,7 @@ mod tests {
         );
         drop(read);
 
-        publish_branch_head_release(&storage, "main", released_control).await;
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
             released_plan
@@ -3178,7 +3160,7 @@ mod tests {
             &storage,
             writes,
             &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
+            &[owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3283,25 +3265,7 @@ mod tests {
         );
         drop(read);
 
-        let mut writes = storage.new_write_set();
-        stage_branch_head_control(&mut writes, "main", released_control)
-            .expect("native released control should stage");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("native release read should open");
-        let mut preconditions = Vec::new();
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("native owner release should publish");
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
 
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
@@ -5776,14 +5740,12 @@ mod tests {
         storage: &StorageAdapter<Memory>,
         branch_id: &str,
         new_control: BranchHeadControl,
+        manifest: CommitStateManifest,
     ) {
         let mut writes = storage.new_write_set();
         stage_branch_head_control(&mut writes, branch_id, new_control)
             .expect("released control should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("release should publish");
+        persist_replay_closure_fixture(storage, writes, &[], std::slice::from_ref(&manifest)).await;
     }
 
     async fn run_ordinary_repository_gc(
