@@ -2288,6 +2288,104 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
     crate::storage_spaces::ALL_STORAGE_SPACES
 }
 
+/// How a storage space derives its key from the bytes it stores.
+///
+/// Content addressing is what makes identical payloads cost one row instead
+/// of many. The rule is stated once here so an audit can prove the invariant
+/// rather than assume it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentAddressRule {
+    /// The key carries an identity (commit id, entity path, ordinal) that is
+    /// independent of the value bytes. Equal payloads under distinct keys are
+    /// stored twice by construction.
+    NotContentAddressed,
+    /// `key == blake3(value)`.
+    Blake3Value,
+    /// `key == blake3::derive_key(context, value)`.
+    Blake3KeyedValue(&'static str),
+    /// `key == blake3(chunk payload)` after the stored chunk envelope is
+    /// decoded.
+    BinaryCasChunkPayload,
+    /// `key == blake3(json text)` after the stored JSON envelope is decoded.
+    JsonStorePayload,
+    /// The key is a content address, but its payload lives in another space:
+    /// this space stores keys only. Nothing here can be verified against the
+    /// row's own (empty) value.
+    ContentAddressedKeyOnlyMirror,
+}
+
+/// The content-address rule for one physical space id.
+#[must_use]
+pub fn content_address_rule(space_id: u32) -> ContentAddressRule {
+    match space_id {
+        // tracked_state.tree_chunk
+        0x0004_0001 => ContentAddressRule::Blake3Value,
+        // tracked_state.commit_mutation_directory_node.v1
+        0x0004_002d => {
+            ContentAddressRule::Blake3KeyedValue("lix commit mutation directory node v1")
+        }
+        // tracked_state.current_state_data_part.v1
+        0x0004_002f => {
+            ContentAddressRule::Blake3KeyedValue("lix native current-state data part v1")
+        }
+        // tracked_state.current_state_data_part_refs.v1
+        0x0004_0030 => {
+            ContentAddressRule::Blake3KeyedValue("lix native current-state data part refs v1")
+        }
+        // tracked_state.scoped_range.v3
+        0x0004_0032 => {
+            ContentAddressRule::Blake3KeyedValue("lix scoped current-state range node v3")
+        }
+        // binary_cas.chunk
+        0x0005_0003 => ContentAddressRule::BinaryCasChunkPayload,
+        // json_store.json
+        0x0002_0001 => ContentAddressRule::JsonStorePayload,
+        // json_store.untracked_reclaim_candidate.v1
+        0x0002_0002 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
+        // binary_cas.chunk_presence
+        0x0005_0004 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
+        _ => ContentAddressRule::NotContentAddressed,
+    }
+}
+
+/// Recomputes the content address one row *should* have from the bytes it
+/// stores.
+///
+/// `Ok(None)` means the space is not content-addressed (or stores keys only),
+/// so there is nothing to check. `Ok(Some(digest))` must equal the row key.
+pub fn recompute_content_address(
+    space_id: u32,
+    value: &[u8],
+) -> Result<Option<[u8; 32]>, crate::LixError> {
+    Ok(match content_address_rule(space_id) {
+        ContentAddressRule::NotContentAddressed
+        | ContentAddressRule::ContentAddressedKeyOnlyMirror => None,
+        ContentAddressRule::Blake3Value => Some(*blake3::hash(value).as_bytes()),
+        ContentAddressRule::Blake3KeyedValue(context) => Some(
+            *blake3::Hasher::new_derive_key(context)
+                .update(value)
+                .finalize()
+                .as_bytes(),
+        ),
+        ContentAddressRule::BinaryCasChunkPayload => {
+            let (_codec, _len, payload) = crate::binary_cas::decode_binary_cas_chunk(value)?;
+            Some(*blake3::hash(payload).as_bytes())
+        }
+        ContentAddressRule::JsonStorePayload => {
+            let json = crate::json_store::store::decode_stored_json(value)?;
+            Some(*blake3::hash(&json).as_bytes())
+        }
+    })
+}
+
+/// Decodes one `binary_cas.manifest_chunk` row into the chunk it references
+/// and that chunk's logical size.
+pub fn decode_binary_cas_chunk_reference(
+    value: &[u8],
+) -> Result<([u8; 32], u64), crate::LixError> {
+    crate::binary_cas::decode_binary_cas_manifest_chunk(value)
+}
+
 async fn scan_layout_space<R>(
     read: &R,
     space: crate::storage_adapter::StorageSpace,

@@ -71,6 +71,11 @@ path = "examples/storage_layout.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
+name = "duplicate_audit"
+path = "examples/duplicate_audit.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
 name = "revision_pack_oracle"
 path = "examples/revision_pack_oracle.rs"
 required-features = ["storage-benches", "slatedb"]
