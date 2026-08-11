@@ -108,15 +108,17 @@ async fn stale_transaction_composes_disjoint_semantic_writes() {
 /// they touch disjoint files, disjoint payload rows, and disjoint branch state.
 /// Neither may be rejected because the other committed first.
 ///
-/// This is the shape that the ignored `slatedb_movie_workspace_interference`
-/// qualification exercises with a 1 TiB corpus. Resumable upload parts commit
-/// straight to storage rather than through the collaboration write gate, so
-/// they land inside an ordinary commit's precondition window — which is exactly
-/// where a shared compare-and-set turns into a false `LIX_TRANSACTION_CONFLICT`.
+/// This is the shape the ignored `slatedb_movie_workspace_interference`
+/// qualification exercises with a 1 TiB corpus, reduced to the one interleaving
+/// that matters. Resumable upload parts commit straight to storage instead of
+/// through the collaboration write gate, so an ingest part lands squarely inside
+/// an ordinary commit's precondition window: between the save's commit-time
+/// snapshot and the save's storage write. The gate below parks the save exactly
+/// there rather than leaving the interleaving to the scheduler.
 #[tokio::test]
-async fn concurrent_media_ingest_does_not_conflict_with_project_saves() {
-    const ROUNDS: usize = 12;
-    let storage = InterleavingStorage::default();
+async fn committed_media_ingest_part_does_not_invalidate_a_concurrent_project_save() {
+    let storage = InterferingStorage::new();
+    let gate = storage.gate();
     Engine::initialize(storage.clone())
         .await
         .expect("storage should initialize");
@@ -131,124 +133,58 @@ async fn concurrent_media_ingest_does_not_conflict_with_project_saves() {
         .open_workspace_session()
         .await
         .expect("project-save session should open");
+    saver
+        .upsert_file_content(
+            "/project/edit.json".to_owned(),
+            br#"{"timelineRevision":0}"#.to_vec().into(),
+        )
+        .await
+        .expect("seed project file should save");
 
-    let ingest_future = async {
-        for round in 0..ROUNDS {
-            let payload = vec![round as u8 | 0x40; 4096];
-            let progress = ingest
-                .upsert_file_content_part(
-                    format!("media-ingest-{round}"),
-                    format!("/media/clip-{round}.bin"),
-                    0,
-                    payload.len() as u64,
-                    payload.into(),
-                )
-                .await
-                .expect("media ingest must not conflict with an unrelated concurrent writer");
-            assert!(progress.finalized, "single-part upload should finalize");
-        }
-    };
+    gate.arm();
     let save_future = async {
-        for round in 0..ROUNDS {
-            saver
-                .upsert_file_content(
-                    "/project/edit.json".to_owned(),
-                    format!("{{\"timelineRevision\":{round}}}")
-                        .into_bytes()
-                        .into(),
-                )
-                .await
-                .expect("project-file save must not conflict with concurrent media ingest");
-        }
+        saver
+            .upsert_file_content(
+                "/project/edit.json".to_owned(),
+                br#"{"timelineRevision":1}"#.to_vec().into(),
+            )
+            .await
     };
-    tokio::join!(ingest_future, save_future);
+    let ingest_future = async {
+        // Only start once the save is parked on its storage write, so this
+        // publisher is guaranteed to commit inside the save's precondition
+        // window. One part of a two-part upload: the upload does not finalize,
+        // so this path never needs the collaboration write gate the save holds.
+        gate.wait_until_a_write_is_parked().await;
+        let progress = ingest
+            .upsert_file_content_part(
+                "concurrent-ingest".to_owned(),
+                "/media/import.mov".to_owned(),
+                0,
+                2 * lix::FILE_UPLOAD_PART_BYTES as u64,
+                vec![0x5a; lix::FILE_UPLOAD_PART_BYTES].into(),
+            )
+            .await;
+        gate.release_parked_write();
+        progress
+    };
+    let (save_result, ingest_result) =
+        tokio::time::timeout(TEST_WAIT_TIMEOUT * 15, async move {
+            tokio::join!(save_future, ingest_future)
+        })
+        .await
+        .expect("interfering writers should not deadlock");
+
+    ingest_result.expect("media ingest part should commit");
+    save_result
+        .expect("a committed media ingest part must not invalidate a concurrent project save");
 
     let saved = saver
         .read_file_content("/project/edit.json".to_owned(), None)
         .await
         .expect("saved project file should read")
         .expect("saved project file should exist");
-    assert_eq!(
-        saved.content().as_ref(),
-        format!("{{\"timelineRevision\":{}}}", ROUNDS - 1).as_bytes(),
-        "the last committed save must be the visible one"
-    );
-    let ingested = ingest
-        .read_file_content(format!("/media/clip-{}.bin", ROUNDS - 1), None)
-        .await
-        .expect("ingested media should read")
-        .expect("ingested media should exist");
-    assert_eq!(ingested.content().len(), 4096);
-}
-
-/// A resumable upload keeps four parts in flight by design, and the engine —
-/// not the caller — owns that window. Parts of one upload stage disjoint
-/// manifest leaves and content-addressed payloads, so all four must be able to
-/// commit even while an unrelated writer commits alongside them. Losing this is
-/// how the qualification's `upload()` window fails its acknowledgement assert.
-#[tokio::test]
-async fn concurrent_upload_window_parts_commit_alongside_a_project_save() {
-    let storage = InterleavingStorage::default();
-    Engine::initialize(storage.clone())
-        .await
-        .expect("storage should initialize");
-    let engine = Engine::new(storage)
-        .await
-        .expect("initialized storage should create an engine");
-    let ingest = engine
-        .open_workspace_session()
-        .await
-        .expect("media ingest session should open");
-    let saver = engine
-        .open_workspace_session()
-        .await
-        .expect("project-save session should open");
-
-    // The smallest four-part window the upload contract admits: non-final parts
-    // must be exactly one part size, so three full parts plus a one-byte tail.
-    let part_bytes = lix::FILE_UPLOAD_PART_BYTES;
-    let total_size = 3 * part_bytes as u64 + 1;
-    let part = |index: usize| {
-        let len = if index == 3 { 1 } else { part_bytes };
-        ingest.upsert_file_content_part(
-            "windowed-ingest".to_owned(),
-            "/media/window.mov".to_owned(),
-            index as u64 * part_bytes as u64,
-            total_size,
-            vec![0x70 | index as u8; len].into(),
-        )
-    };
-    let window = async {
-        let (first, second, third, fourth) =
-            tokio::join!(part(0), part(1), part(2), part(3));
-        for progress in [first, second, third, fourth] {
-            progress.expect("every part of one upload window must commit");
-        }
-    };
-    let save_future = async {
-        for round in 0..6 {
-            saver
-                .upsert_file_content(
-                    "/project/edit.json".to_owned(),
-                    format!("{{\"timelineRevision\":{round}}}")
-                        .into_bytes()
-                        .into(),
-                )
-                .await
-                .expect("project-file save must not conflict with a concurrent upload window");
-        }
-    };
-    tokio::join!(window, save_future);
-
-    let published = ingest
-        .read_file_content(
-            "/media/window.mov".to_owned(),
-            Some(total_size - 1..total_size),
-        )
-        .await
-        .expect("published upload should read")
-        .expect("published upload should exist");
-    assert_eq!(published.content().as_ref(), &[0x73]);
+    assert_eq!(saved.content().as_ref(), br#"{"timelineRevision":1}"#);
 }
 
 #[tokio::test]
@@ -1342,21 +1278,36 @@ async fn session_read_waits_for_automatic_write_instead_of_rejecting() {
     assert_eq!(result.len(), 1);
 }
 
-/// In-memory storage that yields to the executor at every storage boundary.
+/// In-memory storage that can park one storage write and hand control to
+/// another writer.
 ///
-/// Concurrency defects on the commit path live in the window between a
-/// transaction's commit-time snapshot and its storage write. On the current
-/// thread runtime these tests use, two futures joined together would otherwise
-/// each run to completion without ever being suspended inside that window, so
-/// the race the qualification hits would never be sampled. Yielding at
-/// `begin_read`/`begin_write` makes the interleaving deterministic instead of
-/// leaving it to the scheduler.
-#[derive(Clone, Default)]
-struct InterleavingStorage {
+/// Commit-path concurrency defects live in the window between a transaction's
+/// commit-time snapshot and its storage write. Sampling that window by racing
+/// two futures is unreliable — on a current-thread runtime the phase
+/// relationship between them is fixed, and the interleaving that matters may
+/// never occur. Parking the first write after [`InterferenceGate::arm`] and
+/// resuming it only after the other writer has committed makes the interleaving
+/// a property of the test rather than of the scheduler.
+#[derive(Clone)]
+struct InterferingStorage {
     inner: Memory,
+    gate: Arc<InterferenceGate>,
 }
 
-impl Storage for InterleavingStorage {
+impl InterferingStorage {
+    fn new() -> Self {
+        Self {
+            inner: Memory::new(),
+            gate: Arc::new(InterferenceGate::new()),
+        }
+    }
+
+    fn gate(&self) -> Arc<InterferenceGate> {
+        Arc::clone(&self.gate)
+    }
+}
+
+impl Storage for InterferingStorage {
     type Read<'a>
         = MemoryRead
     where
@@ -1368,13 +1319,57 @@ impl Storage for InterleavingStorage {
         Self: 'a;
 
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
-        tokio::task::yield_now().await;
         self.inner.begin_read(opts).await
     }
 
     async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
-        tokio::task::yield_now().await;
+        self.gate.park_if_armed().await;
         self.inner.begin_write(opts).await
+    }
+}
+
+struct InterferenceGate {
+    armed: std::sync::atomic::AtomicBool,
+    parked: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl InterferenceGate {
+    fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            parked: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Parks the next storage write only. Disarming before announcing means the
+    /// writer woken by `wait_until_a_write_is_parked` is never itself parked.
+    async fn park_if_armed(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.parked.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("interference gate should stay open")
+                .forget();
+        }
+    }
+
+    async fn wait_until_a_write_is_parked(&self) {
+        self.parked
+            .acquire()
+            .await
+            .expect("interference gate should stay open")
+            .forget();
+    }
+
+    fn release_parked_write(&self) {
+        self.release.add_permits(1);
     }
 }
 
