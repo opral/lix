@@ -213,9 +213,9 @@ async fn run<StorageImpl>(
     // `lixcol_file_id` into `TrackedStateFilter::file_ids` (its
     // `filter_pushdown` only recognizes branch-id and primary-key analyzers),
     // so this measures a full schema scan with a residual filter. Reported to
-    // keep that gap visible: `entity_rows` stays fixed at `rows_per_file`
+    // keep that gap visible: `entity_scan_rows` stays fixed at `rows_per_file`
     // while the latency tracks the whole schema.
-    let proxy_sql = format!("SELECT id FROM {SCHEMA_KEY} WHERE lixcol_file_id = $1");
+    let entity_scan_sql = format!("SELECT id FROM {SCHEMA_KEY} WHERE lixcol_file_id = $1");
     let file_params = vec![Value::Text(probe_file.clone())];
     let file_schema_params = vec![
         Value::Text(probe_file.clone()),
@@ -232,18 +232,18 @@ async fn run<StorageImpl>(
     let full_rows = rows(&session, full_sql, &[]).await;
     let file_schema_rows = rows(&session, file_schema_sql, &file_schema_params).await;
     let point_rows = rows(&session, point_sql, &point_params).await;
-    let proxy_rows = rows(&session, &proxy_sql, &file_params).await;
+    let entity_scan_rows_count = rows(&session, &entity_scan_sql, &file_params).await;
 
     let file = sample(&session, file_sql, &file_params, reps).await;
     let full = sample(&session, full_sql, &[], reps).await;
     let file_schema = sample(&session, file_schema_sql, &file_schema_params, reps).await;
     let point = sample(&session, point_sql, &point_params, reps).await;
-    let proxy = sample(&session, &proxy_sql, &file_params, reps).await;
+    let entity_scan = sample(&session, &entity_scan_sql, &file_params, reps).await;
 
     println!(
         "working_diff_file_scope backend={backend} files={files} total_dirty={full_rows} \
          file_rows={file_rows} full_rows={full_rows} file_schema_rows={file_schema_rows} \
-         point_rows={point_rows} entity_scan_rows={proxy_rows} reps={reps} \
+         point_rows={point_rows} entity_scan_rows={entity_scan_rows_count} reps={reps} \
          file_p50_ms={:.3} file_min_ms={:.3} file_max_ms={:.3} \
          full_p50_ms={:.3} full_min_ms={:.3} full_max_ms={:.3} \
          file_schema_p50_ms={:.3} file_schema_min_ms={:.3} file_schema_max_ms={:.3} \
@@ -261,9 +261,9 @@ async fn run<StorageImpl>(
         millis(point.0),
         millis(point.1),
         millis(point.2),
-        millis(proxy.0),
-        millis(proxy.1),
-        millis(proxy.2),
+        millis(entity_scan.0),
+        millis(entity_scan.1),
+        millis(entity_scan.2),
     );
     drop(session);
     drop(engine);
