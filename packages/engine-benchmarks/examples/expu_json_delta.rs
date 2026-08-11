@@ -935,6 +935,30 @@ async fn store_report(dir: &Path) {
         percent(raw_bytes.saturating_sub(stored_bytes), raw_bytes),
     );
 
+    // Decode cost of exactly these frames. Point one build of this tool at two
+    // stores written at different compression levels and the only variable left
+    // is the frame itself, which is how "zstd decode is level-independent" gets
+    // proved rather than assumed.
+    let reps = env_usize("LIX_EXPU_DECODE_REPS", 9);
+    let mut decode_ns = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let start = std::time::Instant::now();
+        let mut sink = 0_usize;
+        for (_, value) in &inventory {
+            sink += decode_stored_json(value).len();
+        }
+        decode_ns.push(start.elapsed().as_nanos() as f64 / inventory.len() as f64);
+        assert_eq!(sink as u64, raw_bytes);
+    }
+    decode_ns.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    println!(
+        "DECODE\treps={reps}\trows={}\tns_per_payload_median={:.0}\tns_per_payload_p95={:.0}\tns_per_kib={:.1}",
+        inventory.len(),
+        percentile(&decode_ns, 0.5),
+        percentile(&decode_ns, 0.95),
+        percentile(&decode_ns, 0.5) * 1024.0 * inventory.len() as f64 / raw_bytes as f64,
+    );
+
     // The same near-duplicate probe the auditor runs, but on the *logical*
     // JSON and with widths expressed as a fraction of payload length. A fixed
     // 64-byte window against a 181-byte compressed row is a third of the row;
