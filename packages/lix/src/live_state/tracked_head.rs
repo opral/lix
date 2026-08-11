@@ -371,8 +371,29 @@ pub(crate) struct PackedHeadValue {
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    checkpoint_commit_id: Option<CommitId>,
+    working_diff_baseline: PackedWorkingDiffBaseline,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
+}
+
+/// Checkpoint-relative position of a current-state base row that is served
+/// without a branch-local hot row.
+///
+/// The two bases are not interchangeable and must not share one encoding. A
+/// *packed* current base is a collection published **inside** the active
+/// working interval, so its rows were absent at the checkpoint. A *root*
+/// current base is the referenced head itself, so its rows **are** the
+/// checkpoint state. Collapsing both onto "has an active checkpoint id" made
+/// the first branch-local mutation of a checkpointed identity look like a
+/// creation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PackedWorkingDiffBaseline {
+    /// No active checkpoint owns this generation.
+    Disabled,
+    /// Published inside the active working interval: absent at the checkpoint.
+    AbsentAtCheckpoint { checkpoint_commit_id: CommitId },
+    /// Served from the referenced root current base: present at the active
+    /// checkpoint and unchanged since.
+    CleanAtCheckpoint,
 }
 
 impl<'a> CurrentStateDeltaRef<'a> {
@@ -1405,18 +1426,25 @@ impl CertifiedCurrentStatePredecessor {
                 deleted: value.deleted,
                 created_at: value.created_at,
                 updated_at: value.updated_at,
-                // Packed current bases are immutable post-checkpoint inserts.
-                // Their active-epoch before image is therefore absent; no
-                // payload fingerprint is needed to preserve that baseline.
+                // Neither base materializes its JSON slots here. A packed base
+                // has no active-epoch before image at all, and a root base
+                // relies on `WorkingDiffVersion::payload_eq` short-circuiting
+                // on change id: a genuine mutation always mints a new change
+                // record. The residual cost is that restoring the checkpoint
+                // payload on a root-backed generation reports `modified`
+                // rather than a net no-op.
                 snapshot: HeadSlotView::None,
                 metadata: HeadSlotView::None,
                 columnar_base_coordinate: value.columnar_base_coordinate,
-                working_diff_baseline: value.checkpoint_commit_id.map_or(
-                    WorkingDiffBaseline::Disabled,
-                    |checkpoint_commit_id| WorkingDiffBaseline::BeforeAbsent {
+                working_diff_baseline: match value.working_diff_baseline {
+                    PackedWorkingDiffBaseline::Disabled => WorkingDiffBaseline::Disabled,
+                    PackedWorkingDiffBaseline::AbsentAtCheckpoint {
+                        checkpoint_commit_id,
+                    } => WorkingDiffBaseline::BeforeAbsent {
                         checkpoint_commit_id,
                     },
-                ),
+                    PackedWorkingDiffBaseline::CleanAtCheckpoint => WorkingDiffBaseline::Clean,
+                },
             }),
         }
     }

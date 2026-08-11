@@ -3087,6 +3087,19 @@ fn packed_exact_keys_for_filter(filter: &TrackedStateFilter) -> Option<Vec<Track
     Some(keys)
 }
 
+/// A packed current base is a collection published inside the active working
+/// interval, so its rows were absent when that checkpoint was taken.
+fn packed_current_base_working_diff_baseline(
+    active_checkpoint_commit_id: Option<CommitId>,
+) -> PackedWorkingDiffBaseline {
+    match active_checkpoint_commit_id {
+        Some(checkpoint_commit_id) => PackedWorkingDiffBaseline::AbsentAtCheckpoint {
+            checkpoint_commit_id,
+        },
+        None => PackedWorkingDiffBaseline::Disabled,
+    }
+}
+
 fn push_root_current_base_row(
     rows: &mut MaterializedLiveStateBatchBuilder,
     row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
@@ -3116,7 +3129,15 @@ fn push_root_current_base_row(
             deleted: row.deleted(),
             created_at: row.created_at(),
             updated_at: row.updated_at(),
-            checkpoint_commit_id: active_checkpoint_commit_id,
+            // The root current base *is* the branch's checkpoint state, so
+            // these rows are clean at the active checkpoint. Reporting them as
+            // absent made the first branch-local mutation of a checkpointed
+            // identity look like a creation and gave `lix_revert` an empty
+            // before image.
+            working_diff_baseline: match active_checkpoint_commit_id {
+                Some(_) => PackedWorkingDiffBaseline::CleanAtCheckpoint,
+                None => PackedWorkingDiffBaseline::Disabled,
+            },
             columnar_base_coordinate: None,
         }),
     );
@@ -3887,7 +3908,9 @@ async fn load_packed_current_base_exact(
             deleted: false,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            checkpoint_commit_id: active_checkpoint_commit_id,
+            working_diff_baseline: packed_current_base_working_diff_baseline(
+                active_checkpoint_commit_id,
+            ),
             columnar_base_coordinate,
         });
         let snapshot = materialize_packed_slot(
@@ -7248,7 +7271,9 @@ where
                 deleted: packed_value.deleted,
                 created_at: packed_value.created_at,
                 updated_at: packed_value.updated_at,
-                checkpoint_commit_id: working_diff_capture_checkpoint_commit_id,
+                working_diff_baseline: packed_current_base_working_diff_baseline(
+                    working_diff_capture_checkpoint_commit_id,
+                ),
                 columnar_base_coordinate: base_coordinate.map(|coordinate| {
                     ColumnarBaseCoordinate {
                         base_commit_id: coordinate.base_commit_id,
