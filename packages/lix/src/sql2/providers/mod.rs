@@ -148,7 +148,11 @@ pub(crate) fn read_provider_selection(
     statements: &[datafusion::sql::parser::Statement],
 ) -> ProviderSelection {
     let mut names = BTreeSet::new();
-    let state = session.state();
+    // Resolving references only reads the SQL parser configuration. Borrowing
+    // the session state avoids deep-copying its `String`-keyed function
+    // registries once per statement.
+    let state_ref = session.state_ref();
+    let state = state_ref.read();
     for statement in statements {
         if statement_requires_all_providers(statement) {
             return ProviderSelection::All;

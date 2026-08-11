@@ -2029,7 +2029,7 @@ fn datafusion_dml_returning(
     };
     let df_schema =
         DFSchema::try_from(table_schema.clone()).map_err(datafusion_error_to_lix_error)?;
-    let props = session.state().execution_props().clone();
+    let props = session.state_ref().read().execution_props().clone();
     let mut fields = Vec::with_capacity(returning.items.len());
     let mut expressions = Vec::with_capacity(returning.items.len());
     let mut required_columns = BTreeSet::new();
@@ -2185,7 +2185,7 @@ fn datafusion_conflict_assignments(
     }
     let augmented = Schema::new(fields);
     let df_schema = DFSchema::try_from(augmented).map_err(datafusion_error_to_lix_error)?;
-    let props = session.state().execution_props().clone();
+    let props = session.state_ref().read().execution_props().clone();
 
     assignments
         .iter()
