@@ -11280,6 +11280,10 @@ where
     };
     let mut deleted = 0_u64;
     for space in GENERATION_SCOPED_SPACES {
+        // A publication that supersedes this generation stages its own
+        // lifecycle mutations first. Restating one of those keys here is a
+        // duplicate mutation, not an idempotent delete.
+        let declared = writes.declared_keys(*space);
         let mut cursor = store
             .begin_scan(
                 *space,
@@ -11295,6 +11299,9 @@ where
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
             for entry in page.entries {
+                if declared.contains(entry.key.0.as_ref()) {
+                    continue;
+                }
                 writes.delete(*space, entry.key);
                 deleted = deleted.saturating_add(1);
             }
