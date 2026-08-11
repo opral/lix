@@ -7604,13 +7604,13 @@ where
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
-            restage_exact_closure_collection_control(
+            Box::pin(restage_exact_closure_collection_control(
                 self.store,
                 self.writes,
                 branch_id,
                 generation,
                 &staged,
-            )
+            ))
             .await?;
         }
 
