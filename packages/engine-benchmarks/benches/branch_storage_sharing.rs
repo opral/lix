@@ -302,6 +302,7 @@ fn scenario_changed_rows(scenario: &str, rows: usize) -> usize {
         "branch_1pct" | "merge_1pct" | "delete_gc_1pct" => (rows / 100).max(1),
         "branch_10pct" => (rows / 10).max(1),
         "branches_10_1row" => 10,
+        "branches_2_disjoint_1pct" | "branches_2_identical_1pct" => 2 * (rows / 100).max(1),
         _ => 0,
     }
 }
@@ -354,9 +355,27 @@ where
         "branches_10_1row" => {
             for index in 0..10 {
                 let branch = create_branch(main, &format!("branch-{index}")).await;
-                modify_rows(engine, &branch, index, 1).await;
+                modify_rows(engine, &branch, index * 7, 1).await;
             }
             10
+        }
+        // Two branches, disjoint 1% windows: an honest two-diff price.
+        "branches_2_disjoint_1pct" => {
+            let first = create_branch(main, "branch-0").await;
+            modify_rows(engine, &first, 0, one_percent).await;
+            let second = create_branch(main, "branch-1").await;
+            modify_rows(engine, &second, one_percent, one_percent).await;
+            2
+        }
+        // Two branches making byte-identical edits to the same 1% window. If
+        // the payload planes were content-addressed end to end this would cost
+        // materially less than the disjoint case.
+        "branches_2_identical_1pct" => {
+            let first = create_branch(main, "branch-0").await;
+            modify_rows(engine, &first, 0, one_percent).await;
+            let second = create_branch(main, "branch-1").await;
+            modify_rows(engine, &second, 0, one_percent).await;
+            2
         }
         "merge_1pct" => {
             let branch = create_branch(main, "branch-0").await;
@@ -401,9 +420,11 @@ where
     .id
 }
 
-/// Updates `count` rows inside `branch`, offsetting the touched window per
-/// branch so concurrent branches touch disjoint rows.
-async fn modify_rows<S>(engine: &Engine<S>, branch: &str, branch_index: usize, count: usize)
+/// Updates the `count` rows starting at `start` inside `branch`. The written
+/// value depends only on the row index, so two branches given the same window
+/// produce byte-identical content — which is what makes cross-branch content
+/// dedup observable.
+async fn modify_rows<S>(engine: &Engine<S>, branch: &str, start: usize, count: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -419,12 +440,12 @@ where
             .await
             .expect("begin branch-sharing modification");
         for offset in 0..batch {
-            let index = branch_index * 7 + written + offset;
+            let index = start + written + offset;
             transaction
                 .execute(
                     "UPDATE branch_fixture SET value = lix_json($1) WHERE path = $2",
                     &[
-                        Value::Text(format!(r#"{{"seed":{index},"pad":"{PAD}"}}"#)),
+                        Value::Text(format!(r#"{{"seed":{index},"edited":true,"pad":"{PAD}"}}"#)),
                         Value::Text(row_path(index)),
                     ],
                 )
