@@ -22,6 +22,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, EmissionType};
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::limit::LimitStream;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -263,14 +264,29 @@ async fn plan_current_spec_scans(
     Ok(Some(replacements))
 }
 
+/// Operators a reusable template may contain.
+///
+/// Every entry must rebuild into a fresh operator that carries no state from a
+/// prior execution. `SortExec` qualifies only without a fetch: a top-k sort
+/// owns a shared dynamic filter that its ordinary clone deliberately keeps
+/// alive, so it is rejected rather than rebuilt.
+fn template_operator_is_reusable(plan: &dyn ExecutionPlan) -> bool {
+    match plan.name() {
+        "ProjectionExec" | "HashJoinExec" | "FilterExec" | "CooperativeExec"
+        | "CoalesceBatchesExec" | "CoalescePartitionsExec" | "SortPreservingMergeExec" => true,
+        "SortExec" => plan
+            .as_any()
+            .downcast_ref::<SortExec>()
+            .is_some_and(|sort| sort.fetch().is_none()),
+        _ => false,
+    }
+}
+
 fn detach_physical_plan_template(plan: Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     if let Some(scan) = plan.as_any().downcast_ref::<SpecScanExec>() {
         return Some(Arc::new(DetachedSpecScanExec::new(scan)));
     }
-    if !matches!(
-        plan.name(),
-        "ProjectionExec" | "HashJoinExec" | "FilterExec" | "CooperativeExec"
-    ) {
+    if !template_operator_is_reusable(plan.as_ref()) {
         return None;
     }
     let children = plan
@@ -325,6 +341,20 @@ fn rebuild_template_node(
             .reset_state()
             .build_exec()
             .ok();
+    }
+    if let Some(sort) = plan.as_any().downcast_ref::<SortExec>() {
+        // `SortExec::with_new_children` clones the operator, which shares its
+        // metrics set and top-k dynamic filter with the template. Build a fresh
+        // sort instead; `template_operator_is_reusable` already excluded the
+        // fetch variants that own a dynamic filter.
+        if sort.fetch().is_some() {
+            return None;
+        }
+        let [child] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).ok()?;
+        return Some(Arc::new(
+            SortExec::new(sort.expr().clone(), child)
+                .with_preserve_partitioning(sort.preserve_partitioning()),
+        ));
     }
     plan.with_new_children(children).ok()
 }
