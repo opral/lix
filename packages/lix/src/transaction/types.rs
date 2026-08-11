@@ -5566,6 +5566,37 @@ mod tests {
     }
 
     #[test]
+    fn certified_transaction_arena_preserves_utf8_and_offset_validation() {
+        assert!(
+            TransactionJson::from_certified_row_content_arena(vec![0xff], vec![(0, 1)]).is_err(),
+            "the fallible constructor must reject invalid producer bytes"
+        );
+
+        let normalized = "é".as_bytes().to_vec();
+        let split_offsets = vec![(0, 1), (1, normalized.len())];
+        assert!(
+            TransactionJson::from_certified_row_content_arena(
+                normalized.clone(),
+                split_offsets.clone(),
+            )
+            .is_err(),
+            "the fallible constructor must reject offsets inside a UTF-8 scalar"
+        );
+        // SAFETY: the complete arena is valid UTF-8. This intentionally gives
+        // the trusted constructor bad offsets to verify it still checks them.
+        assert!(
+            unsafe {
+                TransactionJson::from_validated_certified_row_content_arena(
+                    normalized,
+                    split_offsets,
+                )
+            }
+            .is_err(),
+            "the trusted constructor must retain UTF-8 boundary checks"
+        );
+    }
+
+    #[test]
     fn certified_row_content_remains_decodable_until_validation_release() {
         let normalized = br#"{"id":"entity-1"}"#.to_vec();
         let normalized_len = normalized.len();
