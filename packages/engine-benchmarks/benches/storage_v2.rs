@@ -16,9 +16,9 @@ use criterion::{
 };
 use lix::storage::{
     BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
-    KeyRange, Memory, Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk,
-    ScanCursor, SpaceId, Storage, StorageError, StorageRead, StorageScanSource, StorageWrite,
-    StoredValue, WriteOptions, WriteStats,
+    KeyRange, MAX_SCAN_PAGE_ROWS, Memory, Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions,
+    ScanChunk, ScanCursor, SpaceId, Storage, StorageError, StorageRead, StorageScanSource,
+    StorageWrite, StoredValue, WriteOptions, WriteStats,
 };
 use lix::storage_adapter::{
     PointReadPlan, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope, StorageReadStats,
@@ -119,6 +119,24 @@ struct ScanChunkingCase {
     rows: usize,
     chunk_size: usize,
     scan: ScanChunkingMode,
+}
+
+/// `ScanCursor::next_page` clamps the requested limit to
+/// [`MAX_SCAN_PAGE_ROWS`], so a case may request a larger page than the cursor
+/// will ever hand back. Every page-count expectation must be derived from the
+/// clamped size, not from the requested one.
+fn effective_page_rows(chunk_size: usize) -> usize {
+    chunk_size.min(MAX_SCAN_PAGE_ROWS)
+}
+
+impl ScanChunkingCase {
+    fn effective_chunk_size(&self) -> usize {
+        effective_page_rows(self.chunk_size)
+    }
+
+    fn expected_chunks(&self) -> usize {
+        self.rows.div_ceil(self.effective_chunk_size())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -348,6 +366,9 @@ const DELETE_RANGE_CASES: &[DeleteRangeCase] = &[
     },
 ];
 
+// The `_single` cases request a page larger than the whole seeded range on
+// purpose: they exercise the `ScanCursor` clamp to `MAX_SCAN_PAGE_ROWS`, so
+// they drain in `rows / MAX_SCAN_PAGE_ROWS` pages rather than one.
 const SCAN_CHUNKING_CASES: &[ScanChunkingCase] = &[
     ScanChunkingCase {
         name: "drain_range_q10000_single",
@@ -916,7 +937,10 @@ where
                     .expect("delete range fallback");
                     assert_eq!(stats.scanned, case.rows);
                     assert_eq!(stats.deleted, case.rows);
-                    assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
+                    assert_eq!(
+                        stats.chunks,
+                        case.rows.div_ceil(effective_page_rows(case.chunk_size))
+                    );
                     assert_eq!(stats.write_stats.staged_deletes, case.rows as u64);
                     black_box(stats);
                 },
@@ -1094,7 +1118,7 @@ where
                     ))
                     .expect("drain chunked materialized scan");
                     assert_eq!(stats.scanned, case.rows);
-                    assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
+                    assert_eq!(stats.chunks, case.expected_chunks());
                     assert_scan_drain_stats(&stats, case);
                     black_box(stats);
                 });
@@ -1829,6 +1853,10 @@ where
     R: StorageRead,
 {
     let mut stats = ScanDrainStats::default();
+    // The cursor clamps every requested page to `MAX_SCAN_PAGE_ROWS`; account
+    // for that here so the recorded limit stats describe the pages the cursor
+    // actually served.
+    let effective_chunk = effective_page_rows(chunk_size);
     let (range, prefix) = match scan {
         ScanChunkingMode::Range => (point_scan_range(), false),
         ScanChunkingMode::Prefix => (
@@ -1863,9 +1891,11 @@ where
         stats.read_stats.storage_calls += 1;
         stats.read_stats.scan_rows += entries.len() as u64;
         stats.read_stats.scan_has_more += u64::from(chunk.has_more);
-        stats.read_stats.scan_limit_rows_total += chunk_size as u64;
-        stats.read_stats.scan_limit_rows_max =
-            stats.read_stats.scan_limit_rows_max.max(chunk_size as u64);
+        stats.read_stats.scan_limit_rows_total += effective_chunk as u64;
+        stats.read_stats.scan_limit_rows_max = stats
+            .read_stats
+            .scan_limit_rows_max
+            .max(effective_chunk as u64);
         stats.read_stats.scan_key_only_chunks += 1;
         if prefix {
             stats.read_stats.prefix_scan_chunks += 1;
@@ -1880,13 +1910,14 @@ where
 
     assert_eq!(
         stats.storage_calls,
-        expected_rows.div_ceil(chunk_size) as u64
+        expected_rows.div_ceil(effective_chunk) as u64
     );
     Ok(stats)
 }
 
 fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
-    let expected_chunks = case.rows.div_ceil(case.chunk_size);
+    let effective_chunk = case.effective_chunk_size();
+    let expected_chunks = case.expected_chunks();
     let expected_has_more = expected_chunks.saturating_sub(1) as u64;
 
     assert_eq!(stats.read_stats.storage_calls, expected_chunks as u64);
@@ -1894,9 +1925,9 @@ fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
     assert_eq!(stats.read_stats.scan_has_more, expected_has_more);
     assert_eq!(
         stats.read_stats.scan_limit_rows_total,
-        (expected_chunks * case.chunk_size) as u64
+        (expected_chunks * effective_chunk) as u64
     );
-    assert_eq!(stats.read_stats.scan_limit_rows_max, case.chunk_size as u64);
+    assert_eq!(stats.read_stats.scan_limit_rows_max, effective_chunk as u64);
     assert_eq!(
         stats.read_stats.scan_key_only_chunks,
         expected_chunks as u64
