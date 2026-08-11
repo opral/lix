@@ -730,28 +730,19 @@ where
         reader.merge_base(&left, &right).await?
     };
     let mut reader = crate::tracked_state::TrackedStateContext::new().reader(&read);
-    let target_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            left_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
-    let source_entries = reader
-        .diff_commits(
-            &base.to_string(),
-            right_commit_id,
-            &crate::tracked_state::TrackedStateDiffRequest::default(),
-        )
-        .await?
-        .entries
-        .len();
+    let analysis = crate::session::analyze_merge_for_bench(
+        &mut reader,
+        crate::session::MergeCommitsForBench {
+            base_commit_id: base,
+            target_commit_id: left,
+            source_commit_id: right,
+        },
+    )
+    .await?;
     Ok(MergePreparationBenchResult {
-        base_commit_id: base.to_string(),
-        target_entries,
-        source_entries,
+        base_commit_id: analysis.commits.base_commit_id.to_string(),
+        target_entries: analysis.target_diff.entries.len(),
+        source_entries: analysis.source_diff.entries.len(),
     })
 }
 
