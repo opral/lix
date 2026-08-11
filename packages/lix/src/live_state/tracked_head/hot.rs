@@ -2469,6 +2469,7 @@ fn stage_incremental_collection_controls(
                         branch_generation,
                         delta.schema_key,
                         delta.file_id,
+                        value.untracked,
                         value.commit_id,
                     )
             });
@@ -2477,6 +2478,7 @@ fn stage_incremental_collection_controls(
             branch_generation,
             delta.schema_key,
             delta.file_id,
+            delta.untracked,
             delta.commit_id,
         );
         let next_live = !delta.deleted && belongs_to_active_generation;
@@ -2578,11 +2580,38 @@ fn apply_incremental_collection_generation_deltas(
     Ok(())
 }
 
+/// A collection-generation fence is a commit-ordered statement about tracked
+/// members: a row survives it only by being newer than the retired generation.
+///
+/// An untracked row has no `commit_id` and is never a member of a collection
+/// generation, so the fence can neither retire it nor resurrect it. Tracked
+/// and untracked rows now share one serving generation, so this exemption is
+/// what keeps a tracked collection replacement from silently deleting the
+/// branch's history-free rows in the same schema scope.
+fn survives_collection_generation_fence(
+    untracked: bool,
+    commit_id: Option<CommitId>,
+    active_generation: CommitId,
+    inclusive: bool,
+) -> bool {
+    if untracked {
+        return true;
+    }
+    commit_id.is_some_and(|commit_id| {
+        if inclusive {
+            commit_id >= active_generation
+        } else {
+            commit_id > active_generation
+        }
+    })
+}
+
 fn row_belongs_to_active_collection_generation(
     controls: &BTreeMap<(String, Option<String>), HotCollectionControl>,
     branch_generation: CommitId,
     schema_key: &str,
     file_id: Option<&str>,
+    untracked: bool,
     commit_id: Option<CommitId>,
 ) -> bool {
     [
@@ -2596,7 +2625,12 @@ fn row_belongs_to_active_collection_generation(
             .get(&scope)
             .expect("row collection scope was loaded above");
         control.active_generation == branch_generation
-            || commit_id.is_some_and(|commit_id| commit_id > control.active_generation)
+            || survives_collection_generation_fence(
+                untracked,
+                commit_id,
+                control.active_generation,
+                false,
+            )
     })
 }
 
@@ -2660,9 +2694,12 @@ fn stage_complete_collection_controls(
             .get(&schema_scope)
             .expect("complete row schema control was initialized above");
         let visible_after_schema_generation = schema_control.active_generation == branch_generation
-            || value
-                .commit_id
-                .is_some_and(|commit_id| commit_id > schema_control.active_generation);
+            || survives_collection_generation_fence(
+                value.untracked,
+                value.commit_id,
+                schema_control.active_generation,
+                false,
+            );
         let file_scope = identity
             .file_id
             .as_ref()
@@ -2672,9 +2709,12 @@ fn stage_complete_collection_controls(
             .and_then(|scope| controls.get(scope))
             .is_none_or(|control| {
                 control.active_generation == branch_generation
-                    || value
-                        .commit_id
-                        .is_some_and(|commit_id| commit_id > control.active_generation)
+                    || survives_collection_generation_fence(
+                        value.untracked,
+                        value.commit_id,
+                        control.active_generation,
+                        false,
+                    )
             });
         if !visible_after_schema_generation || !visible_after_file_generation {
             continue;
@@ -5160,8 +5200,12 @@ where
         let rows = rows.filter(
             |row| {
                 replaced_generation.is_none_or(|control| {
-                    row.commit_id()
-                        .is_some_and(|commit_id| commit_id > control.active_generation)
+                    survives_collection_generation_fence(
+                        row.untracked(),
+                        row.commit_id(),
+                        control.active_generation,
+                        false,
+                    )
                 })
             },
             None,
@@ -5430,8 +5474,14 @@ where
                     .as_deref()
                     .map(decode_head_value)
                     .transpose()?
-                    .and_then(|value| value.commit_id)
-                    .is_some_and(|commit_id| commit_id > control.active_generation);
+                    .is_some_and(|value| {
+                        survives_collection_generation_fence(
+                            value.untracked,
+                            value.commit_id,
+                            control.active_generation,
+                            false,
+                        )
+                    });
                 if !visible {
                     *value = None;
                 }
@@ -5508,8 +5558,12 @@ where
             }
             resolved.push(row.filter(|row| {
                 replaced_generation.is_none_or(|control| {
-                    row.commit_id()
-                        .is_some_and(|commit_id| commit_id >= control.active_generation)
+                    survives_collection_generation_fence(
+                        row.untracked(),
+                        row.commit_id(),
+                        control.active_generation,
+                        true,
+                    )
                 })
             }));
         }
@@ -5598,8 +5652,12 @@ where
             };
             let row = row.filter(|row| {
                 replaced_generation.is_none_or(|control| {
-                    row.commit_id()
-                        .is_some_and(|commit_id| commit_id >= control.active_generation)
+                    survives_collection_generation_fence(
+                        row.untracked(),
+                        row.commit_id(),
+                        control.active_generation,
+                        true,
+                    )
                 })
             });
             combined_slots.push(
@@ -7204,6 +7262,7 @@ where
                         generation,
                         delta.schema_key,
                         delta.file_id,
+                        value.untracked,
                         value.commit_id,
                     )
                 });
@@ -9264,9 +9323,13 @@ fn filter_hot_scan_entries_by_collection_generation(
     control: HotCollectionControl,
 ) -> Result<(), LixError> {
     let visible = |bytes: &Bytes| -> Result<bool, LixError> {
-        Ok(decode_head_value(bytes)?
-            .commit_id
-            .is_some_and(|commit_id| commit_id > control.active_generation))
+        let value = decode_head_value(bytes)?;
+        Ok(survives_collection_generation_fence(
+            value.untracked,
+            value.commit_id,
+            control.active_generation,
+            false,
+        ))
     };
     match entries {
         HotScanEntries::Decoded(rows) => {
