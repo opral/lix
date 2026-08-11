@@ -83,18 +83,12 @@ The same approach extends to any other format your product cares about — **as 
 
 Lix is **change-first**: it stores semantic changes as queryable data, not snapshots.
 
-That means audit trails, rollbacks, and “blame” become simple queries:
-
-```sql
-SELECT *
-FROM state_history
-WHERE entity_pk = 'settings.theme'
-ORDER BY depth ASC;
-```
+That means audit trails, rollbacks, and “blame” are exposed through each
+registered entity schema's typed history surface.
 
 Lix uses existing SQL databases as both **query engine** and **persistence layer**.
 
-Plugins parse files (including binary formats) into "meaningful changes" e.g. cells, properties, whitespace, etc. Lix stores those changes as rows in virtual tables like `file`, `file_history`, and `state_history`.
+Plugins parse files (including binary formats) into "meaningful changes" e.g. cells, properties, whitespace, etc. Lix stores those changes as typed entity rows with corresponding history queries.
 
 Why this matters:
 

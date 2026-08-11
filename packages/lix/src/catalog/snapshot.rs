@@ -19,7 +19,6 @@ pub(crate) struct CatalogSnapshot {
     by_key: BTreeMap<SchemaCatalogKey, SchemaPlanId>,
     by_identity: BTreeMap<DomainSchemaIdentity, SchemaPlanId>,
     delete_references_by_target: BTreeMap<SchemaCatalogKey, Vec<DeleteReferencePlan>>,
-    state_delete_references: Vec<StateDeleteReferencePlan>,
     fingerprint: CatalogFingerprint,
 }
 
@@ -192,7 +191,6 @@ impl CatalogSnapshot {
     fn rebuild_delete_plans(&mut self) {
         let mut delete_references_by_target =
             BTreeMap::<SchemaCatalogKey, Vec<DeleteReferencePlan>>::new();
-        let mut state_delete_references = Vec::<StateDeleteReferencePlan>::new();
         for source_plan in &self.plans {
             for foreign_key in &source_plan.foreign_keys {
                 delete_references_by_target
@@ -203,15 +201,8 @@ impl CatalogSnapshot {
                         foreign_key: foreign_key.clone(),
                     });
             }
-            for foreign_key in &source_plan.state_foreign_keys {
-                state_delete_references.push(StateDeleteReferencePlan {
-                    source_key: source_plan.key.clone(),
-                    foreign_key: foreign_key.clone(),
-                });
-            }
         }
         self.delete_references_by_target = delete_references_by_target;
-        self.state_delete_references = state_delete_references;
     }
 
     fn compute_fingerprint(&self) -> Result<CatalogFingerprint, LixError> {
@@ -275,7 +266,6 @@ impl CatalogSnapshot {
                 .get(&key)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
-            state_foreign_key_references: self.state_delete_references.as_slice(),
         }
     }
 }
@@ -397,7 +387,6 @@ pub(crate) struct SchemaPlan {
     pub(crate) primary_key_component_types: Option<Vec<crate::entity_pk::EntityPkComponentType>>,
     pub(crate) uniques: Vec<PointerGroup>,
     pub(crate) foreign_keys: Vec<ForeignKeyPlan>,
-    pub(crate) state_foreign_keys: Vec<StateForeignKeyPlan>,
 }
 
 #[derive(Debug)]
@@ -706,7 +695,6 @@ impl SchemaPlan {
             && self.primary_key_component_types.is_some()
             && self.uniques.is_empty()
             && self.foreign_keys.is_empty()
-            && self.state_foreign_keys.is_empty()
     }
 
     fn compile(
@@ -740,7 +728,6 @@ impl SchemaPlan {
             key_index,
             schema_index,
         )?;
-        let state_foreign_keys = state_foreign_key_plans(&schema)?;
         Ok(Self {
             key,
             schema: Arc::new(schema),
@@ -752,7 +739,6 @@ impl SchemaPlan {
             primary_key_component_types,
             uniques,
             foreign_keys,
-            state_foreign_keys,
         })
     }
 }
@@ -2472,21 +2458,14 @@ pub(crate) struct DeleteReferencePlan {
     pub(crate) foreign_key: ForeignKeyPlan,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct StateDeleteReferencePlan {
-    pub(crate) source_key: SchemaCatalogKey,
-    pub(crate) foreign_key: StateForeignKeyPlan,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeleteValidationPlan<'a> {
     pub(crate) foreign_key_references: &'a [DeleteReferencePlan],
-    pub(crate) state_foreign_key_references: &'a [StateDeleteReferencePlan],
 }
 
 impl DeleteValidationPlan<'_> {
     pub(crate) fn has_committed_checks(self) -> bool {
-        !self.foreign_key_references.is_empty() || !self.state_foreign_key_references.is_empty()
+        !self.foreign_key_references.is_empty()
     }
 }
 
@@ -2495,26 +2474,6 @@ struct UnboundForeignKeyPlan {
     local_properties: PointerGroup,
     referenced_schema: SchemaCatalogKey,
     referenced_properties: PointerGroup,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct StateForeignKeyPlan {
-    /// Slot [0] in `x-lix-state-foreign-keys`: local pointer to the target entity_pk.
-    pub(crate) entity_pk_property: Vec<String>,
-    /// Slot [1] in `x-lix-state-foreign-keys`: local pointer to the target schema_key.
-    pub(crate) schema_key_property: Vec<String>,
-    /// Slot [2] in `x-lix-state-foreign-keys`: local pointer to the target file_id.
-    pub(crate) file_id_property: Vec<String>,
-}
-
-impl StateForeignKeyPlan {
-    pub(crate) fn local_properties(&self) -> PointerGroup {
-        vec![
-            self.entity_pk_property.clone(),
-            self.schema_key_property.clone(),
-            self.file_id_property.clone(),
-        ]
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2704,16 +2663,6 @@ fn bind_foreign_key_plans(
     unbound_foreign_keys
         .into_iter()
         .map(|foreign_key| {
-            if foreign_key.referenced_schema.schema_key == "lix_state" {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_pk, schema_key, file_id]",
-                        source_key.schema_key
-                    ),
-                ));
-            }
-
             let referenced_plan_id =
                 *key_index.get(&foreign_key.referenced_schema).ok_or_else(|| {
                     LixError::new(
@@ -2898,42 +2847,6 @@ fn schema_properties_are_keyed(
     Ok(pointer_groups(target_schema, "x-lix-unique")?
         .iter()
         .any(|unique_group| unique_group == referenced_properties))
-}
-
-fn state_foreign_key_plans(schema: &JsonValue) -> Result<Vec<StateForeignKeyPlan>, LixError> {
-    let Some(value) = schema.get("x-lix-state-foreign-keys") else {
-        return Ok(Vec::new());
-    };
-    let Some(foreign_keys) = value.as_array() else {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            "schema x-lix-state-foreign-keys must be an array",
-        ));
-    };
-
-    foreign_keys
-        .iter()
-        .enumerate()
-        .map(|(index, foreign_key)| {
-            let local_properties = pointer_array(
-                Some(foreign_key),
-                &format!("x-lix-state-foreign-keys[{index}]"),
-            )?;
-            if local_properties.len() != 3 {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_pk, schema_key, file_id]"
-                    ),
-                ));
-            }
-            Ok(StateForeignKeyPlan {
-                entity_pk_property: local_properties[0].clone(),
-                schema_key_property: local_properties[1].clone(),
-                file_id_property: local_properties[2].clone(),
-            })
-        })
-        .collect()
 }
 
 fn pointer_array(value: Option<&JsonValue>, context: &str) -> Result<PointerGroup, LixError> {
@@ -3781,7 +3694,6 @@ mod tests {
 
         assert!(!delete_plan.has_committed_checks());
         assert!(delete_plan.foreign_key_references.is_empty());
-        assert!(delete_plan.state_foreign_key_references.is_empty());
     }
 
     #[test]
@@ -3811,33 +3723,6 @@ mod tests {
             "child_schema"
         );
         assert!(!child_delete_plan.has_committed_checks());
-    }
-
-    #[test]
-    fn delete_plan_conservatively_applies_state_foreign_keys_to_every_schema() {
-        let target = SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
-            SchemaKey::new("target_schema"),
-            schema_json("target_schema"),
-        );
-        let source = SchemaCatalogFact::new(
-            Domain::schema_catalog("main", false),
-            SchemaKey::new("state_fk_schema"),
-            state_fk_schema_json("state_fk_schema"),
-        );
-        let catalog =
-            CatalogSnapshot::from_schema_facts(&[target, source]).expect("catalog should bind");
-
-        let target_delete_plan = catalog.delete_plan_for_key("target_schema");
-
-        assert!(target_delete_plan.has_committed_checks());
-        assert_eq!(target_delete_plan.state_foreign_key_references.len(), 1);
-        assert_eq!(
-            target_delete_plan.state_foreign_key_references[0]
-                .source_key
-                .schema_key,
-            "state_fk_schema"
-        );
     }
 
     fn schema_json(schema_key: &str) -> JsonValue {
@@ -3870,23 +3755,6 @@ mod tests {
                 "parent_id": { "type": "string" }
             },
             "required": ["id", "parent_id"],
-            "additionalProperties": false
-        })
-    }
-
-    fn state_fk_schema_json(schema_key: &str) -> JsonValue {
-        json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/id"],
-            "x-lix-state-foreign-keys": [["/target_id", "/target_schema", "/target_file"]],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "target_id": { "type": "string" },
-                "target_schema": { "type": "string" },
-                "target_file": { "type": ["string", "null"] }
-            },
-            "required": ["id", "target_id", "target_schema", "target_file"],
             "additionalProperties": false
         })
     }

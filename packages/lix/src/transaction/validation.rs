@@ -14,10 +14,7 @@ use tracing::Instrument as _;
 
 use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
-use crate::catalog::{
-    CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan, StateDeleteReferencePlan,
-    StateForeignKeyPlan,
-};
+use crate::catalog::{CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan};
 #[cfg(test)]
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::NullableKeyFilter;
@@ -25,9 +22,9 @@ use crate::common::format_json_pointer;
 #[cfg(test)]
 use crate::common::parse_json_pointer;
 use crate::common::{json_pointer_get, validate_row_metadata};
-use crate::domain::{
-    Domain, DomainFileScope, DomainRowIdentity, committed_row_ref_is_exact_branch_scoped,
-};
+#[cfg(test)]
+use crate::domain::DomainFileScope;
+use crate::domain::{Domain, DomainRowIdentity, committed_row_ref_is_exact_branch_scoped};
 use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
@@ -54,7 +51,6 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 
 /// Immutable view of the final transaction write set before persistence.
@@ -2190,17 +2186,6 @@ impl PendingConstraintIndexes {
                 });
         }
 
-        for foreign_key in &schema_plan.state_foreign_keys {
-            let target = PendingForeignKeyReferenceTarget::StateSurfaceIdentity(
-                state_surface_target_identity(row.domain(), foreign_key, snapshot)?,
-            );
-            self.fk_references
-                .entry(target)
-                .or_default()
-                .push(PendingForeignKeyReference {
-                    identity: row.domain_row_identity(),
-                });
-        }
         Ok(())
     }
 
@@ -2227,13 +2212,6 @@ impl PendingConstraintIndexes {
 
     fn has_identity_target(&self, identity: &DomainRowIdentity) -> bool {
         self.identity_targets.contains(identity)
-    }
-
-    fn has_reachable_identity_target(&self, identity: &DomainRowIdentity) -> bool {
-        identity
-            .reachable_target_identities()
-            .iter()
-            .any(|candidate| self.has_identity_target(candidate))
     }
 
     fn tombstones_target_identity(&self, identity: &DomainRowIdentity) -> bool {
@@ -2298,14 +2276,6 @@ impl PendingConstraintIndexes {
             value,
         });
         Ok(self.fk_references.contains_key(&key))
-    }
-
-    #[cfg(test)]
-    fn has_fk_reference_to_identity(&self, identity: DomainRowIdentity) -> bool {
-        self.fk_references
-            .contains_key(&PendingForeignKeyReferenceTarget::StateSurfaceIdentity(
-                identity,
-            ))
     }
 
     #[cfg(test)]
@@ -2382,7 +2352,6 @@ struct PendingForeignKeyTargetKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PendingForeignKeyReferenceTarget {
     Key(PendingForeignKeyTargetKey),
-    StateSurfaceIdentity(DomainRowIdentity),
 }
 
 fn validate_pending_delete_restrictions(
@@ -2394,18 +2363,6 @@ fn validate_pending_delete_restrictions(
     }
 
     for tombstone in &pending_constraints.tombstones {
-        let identity_targets = tombstone
-            .identity
-            .source_identities_that_can_reach()
-            .into_iter()
-            .map(PendingForeignKeyReferenceTarget::StateSurfaceIdentity)
-            .collect::<Vec<_>>();
-        reject_pending_delete_references(
-            &tombstone.identity,
-            &identity_targets,
-            pending_constraints.active_references_to_any(&identity_targets),
-        )?;
-
         let Some((_, schema_plan)) = schema_catalog.plan_for_key(tombstone.identity.schema_key())
         else {
             continue;
@@ -2471,11 +2428,6 @@ fn pending_foreign_key_reference_target_description(
             format_pointer_group(&target.pointer_group),
             target.value.display()
         )),
-        PendingForeignKeyReferenceTarget::StateSurfaceIdentity(target) => Ok(format!(
-            " through '{}:{}'",
-            target.schema_key(),
-            target.entity_pk().as_json_array_text()?
-        )),
     }
 }
 
@@ -2488,8 +2440,6 @@ async fn validate_committed_delete_restrictions(
         NormalDeleteRestrictionBatchKey,
         BTreeMap<UniqueConstraintValue, Vec<DomainRowIdentity>>,
     >::new();
-    let mut state_batches =
-        BTreeMap::<StateDeleteRestrictionBatchKey, Vec<DomainRowIdentity>>::new();
     for tombstone in &pending_constraints.tombstones {
         let delete_plan = schema_catalog.delete_plan_for_key(tombstone.identity.schema_key());
         if !delete_plan.has_committed_checks() {
@@ -2518,29 +2468,11 @@ async fn validate_committed_delete_restrictions(
                     .push(tombstone.identity.clone());
             }
         }
-        for reference in delete_plan.state_foreign_key_references {
-            for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
-                state_batches
-                    .entry(StateDeleteRestrictionBatchKey {
-                        source_key: reference.source_key.clone(),
-                        source_domain: source_domain.with_file_scope(DomainFileScope::Any),
-                        foreign_key: reference.clone(),
-                    })
-                    .or_default()
-                    .push(tombstone.identity.clone());
-            }
-        }
     }
     validate_committed_normal_delete_restriction_batches(
         input.live_state,
         pending_constraints,
         normal_batches,
-    )
-    .await?;
-    validate_committed_state_surface_delete_restriction_batches(
-        input.live_state,
-        pending_constraints,
-        state_batches,
     )
     .await?;
     Ok(())
@@ -2597,61 +2529,6 @@ async fn validate_committed_normal_delete_restriction_batches(
                 tombstone,
                 row,
                 &batch.local_properties,
-            )?);
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct StateDeleteRestrictionBatchKey {
-    source_key: SchemaCatalogKey,
-    source_domain: Domain,
-    foreign_key: StateDeleteReferencePlan,
-}
-
-async fn validate_committed_state_surface_delete_restriction_batches(
-    live_state: &dyn LiveStateReader,
-    pending_constraints: &PendingConstraintIndexes,
-    batches: BTreeMap<StateDeleteRestrictionBatchKey, Vec<DomainRowIdentity>>,
-) -> Result<(), LixError> {
-    for (batch, tombstones) in batches {
-        let rows = scan_committed_constraint_rows(
-            live_state,
-            &batch.source_domain,
-            vec![batch.source_key.schema_key.clone()],
-            Vec::new(),
-            false,
-        )
-        .await?;
-
-        for row in rows.iter() {
-            if pending_constraints.tombstones_identity(row)
-                || pending_constraints.replaces_committed_identity(row)
-            {
-                continue;
-            }
-            let Some(snapshot_content) = row.snapshot_content().map(|snapshot| snapshot.as_str())
-            else {
-                continue;
-            };
-            let snapshot = parse_committed_snapshot(row, snapshot_content)?;
-            let target_identity = state_surface_target_identity(
-                Domain::for_live_row_ref(row),
-                &batch.foreign_key.foreign_key,
-                &snapshot,
-            )?;
-            let Some(tombstone) = tombstones.iter().find(|tombstone| {
-                target_identity
-                    .reachable_target_identities()
-                    .contains(*tombstone)
-            }) else {
-                continue;
-            };
-            return Err(committed_delete_restriction_error(
-                tombstone,
-                row,
-                &batch.foreign_key.foreign_key.local_properties(),
             )?);
         }
     }
@@ -2722,13 +2599,7 @@ struct UnresolvedForeignKeyCheck {
     source_identity: DomainRowIdentity,
     source_schema_key: String,
     source_pointer_group: Vec<Vec<String>>,
-    target: UnresolvedForeignKeyTarget,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum UnresolvedForeignKeyTarget {
-    Key(PendingForeignKeyTargetKey),
-    StateSurfaceIdentity(DomainRowIdentity),
+    target: PendingForeignKeyTargetKey,
 }
 
 fn validate_pending_foreign_keys(
@@ -2748,16 +2619,6 @@ fn validate_pending_foreign_keys(
                 *row,
                 foreign_key,
                 local_value,
-                pending_constraints,
-            )? {
-                unresolved.push(check);
-            }
-        }
-        for foreign_key in &schema_plan.state_foreign_keys {
-            if let Some(check) = validate_pending_state_surface_foreign_key(
-                *row,
-                foreign_key,
-                snapshot,
                 pending_constraints,
             )? {
                 unresolved.push(check);
@@ -2786,7 +2647,7 @@ fn validate_pending_normal_foreign_key(
         source_identity: row.domain_row_identity(),
         source_schema_key: row.schema_key().to_string(),
         source_pointer_group: foreign_key.local_properties.clone(),
-        target: UnresolvedForeignKeyTarget::Key(key),
+        target: key,
     }))
 }
 
@@ -2803,25 +2664,6 @@ fn foreign_key_target_domain(
     }
 }
 
-fn validate_pending_state_surface_foreign_key(
-    row: PreparedValidationRow<'_>,
-    foreign_key: &StateForeignKeyPlan,
-    snapshot: &JsonValue,
-    pending_constraints: &PendingConstraintIndexes,
-) -> Result<Option<UnresolvedForeignKeyCheck>, LixError> {
-    let local_properties = foreign_key.local_properties();
-    let target_identity = state_surface_target_identity(row.domain(), foreign_key, snapshot)?;
-    if pending_constraints.has_reachable_identity_target(&target_identity) {
-        return Ok(None);
-    }
-    Ok(Some(UnresolvedForeignKeyCheck {
-        source_identity: row.domain_row_identity(),
-        source_schema_key: row.schema_key().to_string(),
-        source_pointer_group: local_properties,
-        target: UnresolvedForeignKeyTarget::StateSurfaceIdentity(target_identity),
-    }))
-}
-
 async fn validate_committed_foreign_keys(
     input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
@@ -2829,25 +2671,13 @@ async fn validate_committed_foreign_keys(
 ) -> Result<Vec<UnresolvedForeignKeyCheck>, LixError> {
     let mut still_unresolved = Vec::new();
     for check in unresolved_checks {
-        let resolved = match &check.target {
-            UnresolvedForeignKeyTarget::Key(target) => {
-                committed_normal_foreign_key_target_exists(
-                    input.live_state,
-                    input.schema_catalog,
-                    pending_constraints,
-                    target,
-                )
-                .await?
-            }
-            UnresolvedForeignKeyTarget::StateSurfaceIdentity(target_identity) => {
-                committed_state_surface_foreign_key_target_exists(
-                    input.live_state,
-                    pending_constraints,
-                    target_identity,
-                )
-                .await?
-            }
-        };
+        let resolved = committed_normal_foreign_key_target_exists(
+            input.live_state,
+            input.schema_catalog,
+            pending_constraints,
+            &check.target,
+        )
+        .await?;
         if !resolved {
             still_unresolved.push(check.clone());
         }
@@ -2875,21 +2705,14 @@ fn reject_unresolved_foreign_keys(
 }
 
 fn unresolved_foreign_key_target_description(
-    target: &UnresolvedForeignKeyTarget,
+    target: &PendingForeignKeyTargetKey,
 ) -> Result<String, LixError> {
-    match target {
-        UnresolvedForeignKeyTarget::Key(target) => Ok(format!(
-            " for target '{}.{}' value {}",
-            target.schema_key,
-            format_pointer_group(&target.pointer_group),
-            target.value.display()
-        )),
-        UnresolvedForeignKeyTarget::StateSurfaceIdentity(target) => Ok(format!(
-            " for target '{}:{}'",
-            target.schema_key(),
-            target.entity_pk().as_json_array_text()?
-        )),
-    }
+    Ok(format!(
+        " for target '{}.{}' value {}",
+        target.schema_key,
+        format_pointer_group(&target.pointer_group),
+        target.value.display()
+    ))
 }
 
 async fn committed_normal_foreign_key_target_exists(
@@ -2957,133 +2780,6 @@ fn primary_key_entity_pk_for_target(
         .map(|value| serde_json::from_str::<JsonValue>(value).ok())
         .collect::<Option<Vec<_>>>()?;
     EntityPk::from_json_values(&values, target_plan.primary_key_component_types.as_deref()?).ok()
-}
-
-async fn committed_state_surface_foreign_key_target_exists(
-    live_state: &dyn LiveStateReader,
-    pending_constraints: &PendingConstraintIndexes,
-    target_identity: &DomainRowIdentity,
-) -> Result<bool, LixError> {
-    for candidate in target_identity.reachable_target_identities() {
-        let rows = scan_committed_constraint_rows(
-            live_state,
-            candidate.domain(),
-            vec![candidate.schema_key_owned()],
-            vec![candidate.entity_pk_owned()],
-            false,
-        )
-        .await?;
-        for row in rows.iter() {
-            if pending_constraints.tombstones_identity(row) {
-                continue;
-            }
-            if candidate.matches_live_row_ref(row) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-fn state_surface_target_identity(
-    source_domain: Domain,
-    foreign_key: &StateForeignKeyPlan,
-    snapshot: &JsonValue,
-) -> Result<DomainRowIdentity, LixError> {
-    let entity_pk =
-        state_surface_local_json_value(snapshot, &foreign_key.entity_pk_property, "entity_pk")?;
-    let schema_key =
-        state_surface_local_value(snapshot, &foreign_key.schema_key_property, "schema_key")?;
-    let file_id =
-        state_surface_nullable_local_value(snapshot, &foreign_key.file_id_property, "file_id")?;
-    Ok(DomainRowIdentity::in_domain(
-        source_domain.with_exact_file_scope(file_id),
-        schema_key,
-        EntityPk::from_json_array_value(entity_pk).map_err(|error| {
-            LixError::new(
-                LixError::CODE_FOREIGN_KEY,
-                format!("state-surface foreign key entity_pk is invalid: {error}"),
-            )
-        })?,
-    ))
-}
-
-fn state_surface_local_json_value<'a>(
-    snapshot: &'a JsonValue,
-    local_pointer: &[String],
-    state_address_part: &str,
-) -> Result<&'a JsonValue, LixError> {
-    state_surface_optional_local_json_value(snapshot, local_pointer)?.ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_FOREIGN_KEY,
-            format!(
-                "state-surface foreign key {state_address_part} at '{}' is missing",
-                format_json_pointer(local_pointer)
-            ),
-        )
-    })
-}
-
-fn state_surface_local_value(
-    snapshot: &JsonValue,
-    local_pointer: &[String],
-    state_address_part: &str,
-) -> Result<String, LixError> {
-    state_surface_nullable_local_value(snapshot, local_pointer, state_address_part)?.ok_or_else(
-        || {
-            LixError::new(
-                LixError::CODE_FOREIGN_KEY,
-                format!(
-                    "state-surface foreign key {state_address_part} at '{}' is missing",
-                    format_json_pointer(local_pointer)
-                ),
-            )
-        },
-    )
-}
-
-fn state_surface_nullable_local_value(
-    snapshot: &JsonValue,
-    local_pointer: &[String],
-    state_address_part: &str,
-) -> Result<Option<String>, LixError> {
-    let Some(value) = json_pointer_get(snapshot, local_pointer) else {
-        return Err(LixError::new(
-            LixError::CODE_FOREIGN_KEY,
-            format!(
-                "state-surface foreign key {state_address_part} at '{}' is missing",
-                format_json_pointer(local_pointer)
-            ),
-        ));
-    };
-    if value.is_null() {
-        return Ok(None);
-    }
-    value
-        .as_str()
-        .map(|value| Some(value.to_string()))
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_FOREIGN_KEY,
-                format!(
-                    "state-surface foreign key {state_address_part} at '{}' must be a string or null",
-                    format_json_pointer(local_pointer)
-                ),
-            )
-        })
-}
-
-fn state_surface_optional_local_json_value<'a>(
-    snapshot: &'a JsonValue,
-    local_pointer: &[String],
-) -> Result<Option<&'a JsonValue>, LixError> {
-    let Some(value) = json_pointer_get(snapshot, local_pointer) else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(None);
-    }
-    Ok(Some(value))
 }
 
 async fn validate_committed_unique_constraints(
@@ -3381,16 +3077,6 @@ fn validate_foreign_key_definition(
         })?;
     }
 
-    if foreign_key.referenced_schema.schema_key == STATE_SURFACE_SCHEMA_KEY {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!(
-                "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_pk, schema_key, file_id]",
-                source_key.schema_key
-            ),
-        ));
-    }
-
     let target_plan = catalog
         .plan(foreign_key.referenced_plan_id)
         .ok_or_else(|| {
@@ -3444,27 +3130,6 @@ fn validate_foreign_key_definition(
     Ok(())
 }
 
-fn validate_state_foreign_key_definition(
-    source_key: &SchemaCatalogKey,
-    source_schema: &JsonValue,
-    foreign_key: &StateForeignKeyPlan,
-) -> Result<(), LixError> {
-    let local_properties = foreign_key.local_properties();
-    for pointer in &local_properties {
-        validate_schema_field_pointer(source_schema, pointer).map_err(|detail| {
-            LixError::new(
-                LixError::CODE_SCHEMA_DEFINITION,
-                format!(
-                    "state foreign key on schema '{}' references missing local property '{}': {detail}",
-                    source_key.schema_key,
-                    format_json_pointer(pointer)
-                ),
-            )
-        })?;
-    }
-    Ok(())
-}
-
 fn validate_schema_field_pointer(schema: &JsonValue, pointer: &[String]) -> Result<(), String> {
     if pointer.is_empty() {
         return Err("empty pointer does not name a field".to_string());
@@ -3501,9 +3166,6 @@ fn validate_foreign_key_definitions(catalog: &CatalogSnapshot) -> Result<(), Lix
     for plan in catalog.plans() {
         for foreign_key in &plan.foreign_keys {
             validate_foreign_key_definition(catalog, &plan.key, plan.schema.as_ref(), foreign_key)?;
-        }
-        for foreign_key in &plan.state_foreign_keys {
-            validate_state_foreign_key_definition(&plan.key, plan.schema.as_ref(), foreign_key)?;
         }
     }
     Ok(())
@@ -4785,67 +4447,6 @@ mod tests {
             .expect_err("FK target must be primary-key or unique");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-    }
-
-    #[test]
-    fn schema_catalog_allows_state_surface_foreign_key_target() {
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![pending_registered_schema_from_definition(
-                state_surface_ref_schema(),
-            )],
-            ..empty_staged_write_set()
-        };
-        let visible_schemas = vec![registered_schema()];
-        let input = validation_input(&staged_writes, &visible_schemas);
-
-        let catalog = catalog_from_transaction_input(&input)
-            .expect("x-lix-state-foreign-keys should validate as a state-surface FK target");
-
-        assert!(catalog.contains("state_surface_ref_schema"));
-    }
-
-    #[test]
-    fn schema_catalog_rejects_normal_foreign_key_to_lix_state() {
-        let mut schema = fk_child_schema();
-        schema["x-lix-foreign-keys"][0]["properties"] = json!(["/parent_id"]);
-        schema["x-lix-foreign-keys"][0]["references"] = json!({
-            "schemaKey": "lix_state",
-            "properties": ["/entity_pk"]
-        });
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![pending_registered_schema_from_definition(schema)],
-            ..empty_staged_write_set()
-        };
-        let visible_schemas = vec![registered_schema()];
-
-        let error = catalog_from_transaction_parts(&staged_writes, &visible_schemas)
-            .expect_err("normal FK must not use fake lix_state schema key");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error.message.contains("x-lix-state-foreign-keys"),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn schema_catalog_rejects_state_surface_foreign_key_without_full_address_tuple() {
-        let mut schema = state_surface_ref_schema();
-        schema["x-lix-state-foreign-keys"][0] = json!(["/target_entity_pk"]);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![pending_registered_schema_from_definition(schema)],
-            ..empty_staged_write_set()
-        };
-        let visible_schemas = vec![registered_schema()];
-
-        let error = catalog_from_transaction_parts_unchecked(&staged_writes, &visible_schemas)
-            .expect_err("state FK target must include entity_pk, schema_key, and file_id");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error.message.contains("[entity_pk, schema_key, file_id]"),
-            "unexpected error: {error:?}"
-        );
     }
 
     #[tokio::test]
@@ -6357,220 +5958,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_allows_state_surface_fk_target_committed_by_exact_identity() {
-        let visible_schemas = vec![fk_parent_schema(), state_surface_ref_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![state_surface_ref_row(
-                "ref-1",
-                "target-1",
-                "fk_parent_schema",
-                "01920000-0000-7000-8000-0000000000a2",
-            )],
-            ..empty_staged_write_set()
-        };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "target-1",
-                "01920000-0000-7000-8000-0000000000a1",
-            ))],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("state FK should resolve against exact committed identity");
-    }
-
-    #[tokio::test]
-    async fn validation_rejects_tracked_state_surface_fk_target_pending_only_as_untracked() {
-        let visible_schemas = vec![
-            fk_parent_schema(),
-            state_surface_ref_schema(),
-            file_descriptor_schema(),
-            directory_descriptor_schema(),
-        ];
-        let mut untracked_target =
-            fk_parent_row("target-1", "01920000-0000-7000-8000-0000000000a1");
-        mark_prepared_row_untracked(&mut untracked_target);
-        let mut untracked_file_descriptor = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                untracked_file_descriptor,
-                untracked_target,
-                state_surface_ref_row(
-                    "ref-1",
-                    "target-1",
-                    "fk_parent_schema",
-                    "01920000-0000-7000-8000-0000000000a2",
-                ),
-            ],
-            ..empty_staged_write_set()
-        };
-
-        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
-            .await
-            .expect_err(
-                "tracked state-surface FK must not resolve through a pending untracked target",
-            );
-
-        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-    }
-
-    #[tokio::test]
-    async fn validation_rejects_tracked_state_surface_fk_target_committed_only_as_untracked() {
-        let visible_schemas = vec![fk_parent_schema(), state_surface_ref_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![state_surface_ref_row(
-                "ref-1",
-                "target-1",
-                "fk_parent_schema",
-                "01920000-0000-7000-8000-0000000000a2",
-            )],
-            ..empty_staged_write_set()
-        };
-        let mut untracked_target = MaterializedLiveStateRow::from(fk_parent_row(
-            "target-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        mark_live_row_untracked(&mut untracked_target);
-        let live_state = StaticLiveStateReader {
-            rows: vec![untracked_target],
-        };
-
-        let error =
-            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ))
-            .await
-            .expect_err(
-                "tracked state-surface FK must not resolve through a committed untracked target",
-            );
-
-        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-    }
-
-    #[tokio::test]
-    async fn validation_allows_untracked_state_surface_fk_target_committed_as_tracked() {
-        let visible_schemas = vec![
-            fk_parent_schema(),
-            state_surface_ref_schema(),
-            file_descriptor_schema(),
-            directory_descriptor_schema(),
-        ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row(
-            "01920000-0000-7000-8000-0000000000a2",
-            "01920000-0000-7000-8000-0000000000a1",
-        );
-        mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let mut untracked_ref = state_surface_ref_row(
-            "ref-1",
-            "target-1",
-            "fk_parent_schema",
-            "01920000-0000-7000-8000-0000000000a2",
-        );
-        mark_prepared_row_untracked(&mut untracked_ref);
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![untracked_file_descriptor, untracked_ref],
-            ..empty_staged_write_set()
-        };
-        let live_state = StaticLiveStateReader {
-            rows: vec![
-                committed_file_descriptor_row(
-                    "01920000-0000-7000-8000-0000000000a2",
-                    "01920000-0000-7000-8000-0000000000a1",
-                ),
-                MaterializedLiveStateRow::from(fk_parent_row(
-                    "target-1",
-                    "01920000-0000-7000-8000-0000000000a1",
-                )),
-            ],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("untracked state-surface FK should reference committed tracked target");
-    }
-
-    #[tokio::test]
-    async fn validation_allows_tracked_state_surface_fk_target_committed_behind_untracked_overlay()
-    {
-        let visible_schemas = vec![fk_parent_schema(), state_surface_ref_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![state_surface_ref_row(
-                "ref-1",
-                "target-1",
-                "fk_parent_schema",
-                "01920000-0000-7000-8000-0000000000a2",
-            )],
-            ..empty_staged_write_set()
-        };
-        let tracked_target = MaterializedLiveStateRow::from(fk_parent_row(
-            "target-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        let mut untracked_overlay = MaterializedLiveStateRow::from(fk_parent_row(
-            "target-1",
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-        mark_live_row_untracked(&mut untracked_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
-            rows: vec![tracked_target, untracked_overlay],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect(
-            "tracked state-surface FK should resolve against tracked target behind untracked overlay",
-        );
-    }
-
-    #[tokio::test]
-    async fn validation_allows_state_surface_fk_target_with_composite_entity_pk() {
-        let visible_schemas = vec![composite_message_schema(), state_surface_ref_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![state_surface_ref_row_with_target_entity_pk(
-                "ref-1",
-                json!(["welcome.title", "en"]),
-                "composite_message_schema",
-                "01920000-0000-7000-8000-0000000000a2",
-            )],
-            ..empty_staged_write_set()
-        };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(composite_message_row(
-                "welcome.title",
-                "en",
-                "01920000-0000-7000-8000-0000000000a1",
-            ))],
-        };
-
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect("state FK should resolve composite JSON-array entity pks");
-    }
-
-    #[tokio::test]
     async fn validation_rejects_delete_when_same_branch_reference_exists() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
@@ -6892,46 +6279,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_indexes_record_state_surface_fk_references_by_exact_identity() {
-        let mut indexes = PendingConstraintIndexes::default();
-        let row = state_surface_ref_row(
-            "ref-1",
-            "target-1",
-            "fk_parent_schema",
-            "01920000-0000-7000-8000-0000000000a2",
-        );
-        let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.normalized())
-                .expect("fixture should have snapshot"),
-        )
-        .expect("fixture JSON should parse");
-        let visible_schemas = vec![state_surface_ref_schema()];
-        let staged_writes = empty_staged_write_set();
-        let input = validation_input(&staged_writes, &visible_schemas);
-        let _catalog = catalog_from_transaction_input(&input).expect("catalog should build");
-
-        indexes
-            .remember_foreign_key_references(
-                PreparedValidationRow::State(row.borrowed()),
-                test_plan_from_schema(state_surface_ref_schema()),
-                &snapshot,
-            )
-            .expect("state-surface row should index FK reference");
-
-        assert!(
-            indexes.has_fk_reference_to_identity(DomainRowIdentity::exact(
-                "01920000-0000-7000-8000-0000000000a1",
-                false,
-                Some("01920000-0000-7000-8000-0000000000a2".to_string()),
-                "fk_parent_schema",
-                EntityPk::single("target-1"),
-            ))
-        );
-    }
-
-    #[test]
     fn pending_indexes_match_tombstones_by_exact_committed_identity() {
         let mut indexes = PendingConstraintIndexes::default();
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
@@ -7001,44 +6348,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_delete_restrictions_reject_active_referencing_rows() {
-        let mut indexes = PendingConstraintIndexes::default();
-        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
-        parent_delete.snapshot = None;
-        indexes.remember_tombstone(PreparedValidationRow::State(parent_delete.borrowed()));
-
-        let reference = state_surface_ref_row(
-            "ref-1",
-            "parent-1",
-            "fk_parent_schema",
-            "01920000-0000-7000-8000-0000000000a2",
-        );
-        let reference_snapshot = serde_json::from_str::<JsonValue>(
-            reference
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.normalized())
-                .expect("fixture should have snapshot"),
-        )
-        .expect("fixture JSON should parse");
-        let visible_schemas = vec![fk_parent_schema(), state_surface_ref_schema()];
-        let staged_writes = empty_staged_write_set();
-        let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
-        indexes
-            .remember_foreign_key_references(
-                PreparedValidationRow::State(reference.borrowed()),
-                test_plan_from_schema(state_surface_ref_schema()),
-                &reference_snapshot,
-            )
-            .expect("state-surface row should index FK reference");
-
-        let error = validate_pending_delete_restrictions(&catalog, &indexes)
-            .expect_err("an active pending reference should block target deletion");
-        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-    }
-
-    #[test]
     fn pending_fk_validation_collects_unresolved_normal_fk_check() {
         let indexes = PendingConstraintIndexes::default();
         let row = fk_child_row(
@@ -7084,9 +6393,7 @@ mod tests {
             unresolved[0].source_pointer_group,
             vec![vec!["parent_id".to_string()]]
         );
-        let UnresolvedForeignKeyTarget::Key(target) = &unresolved[0].target else {
-            panic!("normal FK should produce key target");
-        };
+        let target = &unresolved[0].target;
         assert_eq!(target.schema_key, "fk_parent_schema");
         assert_eq!(
             target.domain.branch_id(),
@@ -7234,79 +6541,11 @@ mod tests {
         .expect("FK validation should inspect pending targets");
 
         assert_eq!(unresolved.len(), 1);
-        let UnresolvedForeignKeyTarget::Key(target) = &unresolved[0].target else {
-            panic!("normal FK should produce key target");
-        };
+        let target = &unresolved[0].target;
         assert_eq!(
             target.domain.branch_id(),
             "01920000-0000-7000-8000-0000000000a1",
             "FK checks are exact-branch scoped, not overlay scoped"
-        );
-    }
-
-    #[test]
-    fn pending_fk_validation_collects_unresolved_state_surface_check() {
-        let indexes = PendingConstraintIndexes::default();
-        let row = state_surface_ref_row(
-            "ref-1",
-            "target-1",
-            "fk_parent_schema",
-            "01920000-0000-7000-8000-0000000000a2",
-        );
-        let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.normalized())
-                .expect("fixture should have snapshot"),
-        )
-        .expect("fixture JSON should parse");
-        let visible_schemas = vec![state_surface_ref_schema()];
-        let staged_writes = empty_staged_write_set();
-        let input = validation_input(&staged_writes, &visible_schemas);
-        let _catalog = catalog_from_transaction_input(&input).expect("catalog should build");
-
-        let unresolved = validate_pending_foreign_keys(
-            &indexes,
-            &[(
-                PreparedValidationRow::State(row.borrowed()),
-                test_plan_from_schema(state_surface_ref_schema()),
-                &snapshot,
-            )],
-        )
-        .expect("FK validation should collect unresolved checks");
-
-        assert_eq!(unresolved.len(), 1);
-        assert_eq!(
-            unresolved[0].source_identity,
-            DomainRowIdentity::exact(
-                "01920000-0000-7000-8000-0000000000a1",
-                false,
-                Some("01920000-0000-7000-8000-0000000000a2".to_string()),
-                "state_surface_ref_schema",
-                EntityPk::single("ref-1"),
-            )
-        );
-        assert_eq!(unresolved[0].source_schema_key, "state_surface_ref_schema");
-        assert_eq!(
-            unresolved[0].source_pointer_group,
-            vec![
-                vec!["target_entity_pk".to_string()],
-                vec!["target_schema_key".to_string()],
-                vec!["target_file_id".to_string()],
-            ]
-        );
-        let UnresolvedForeignKeyTarget::StateSurfaceIdentity(target) = &unresolved[0].target else {
-            panic!("state FK should produce state-surface identity target");
-        };
-        assert_eq!(
-            target.domain().branch_id(),
-            "01920000-0000-7000-8000-0000000000a1"
-        );
-        assert_eq!(target.schema_key(), "fk_parent_schema");
-        assert_eq!(target.entity_pk(), &EntityPk::single("target-1"));
-        assert_eq!(
-            target.domain().file_scope(),
-            &DomainFileScope::Exact(Some("01920000-0000-7000-8000-0000000000a2".to_string()))
         );
     }
 
@@ -7416,60 +6655,6 @@ mod tests {
             still_unresolved.len(),
             1,
             "committed FK lookup is exact-branch scoped"
-        );
-    }
-
-    #[tokio::test]
-    async fn committed_fk_lookup_resolves_state_surface_fk_by_exact_identity() {
-        let indexes = PendingConstraintIndexes::default();
-        let row = state_surface_ref_row(
-            "ref-1",
-            "target-1",
-            "fk_parent_schema",
-            "01920000-0000-7000-8000-0000000000a2",
-        );
-        let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.normalized())
-                .expect("fixture should have snapshot"),
-        )
-        .expect("fixture JSON should parse");
-        let visible_schemas = vec![state_surface_ref_schema()];
-        let staged_writes = empty_staged_write_set();
-        let input = validation_input(&staged_writes, &visible_schemas);
-        let _catalog = catalog_from_transaction_input(&input).expect("catalog should build");
-        let unresolved = validate_pending_foreign_keys(
-            &indexes,
-            &[(
-                PreparedValidationRow::State(row.borrowed()),
-                test_plan_from_schema(state_surface_ref_schema()),
-                &snapshot,
-            )],
-        )
-        .expect("pending FK validation should collect unresolved check");
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "target-1",
-                "01920000-0000-7000-8000-0000000000a1",
-            ))],
-        };
-
-        let still_unresolved = validate_committed_foreign_keys(
-            &TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ),
-            &indexes,
-            &unresolved,
-        )
-        .await
-        .expect("committed FK lookup should load exact live-state row");
-
-        assert!(
-            still_unresolved.is_empty(),
-            "committed state-surface target should satisfy unresolved FK"
         );
     }
 
@@ -7649,21 +6834,6 @@ mod tests {
         })
     }
 
-    fn composite_message_schema() -> JsonValue {
-        json!({
-            "x-lix-key": "composite_message_schema",
-            "x-lix-primary-key": ["/key", "/locale"],
-            "type": "object",
-            "properties": {
-                "key": { "type": "string" },
-                "locale": { "type": "string" },
-                "text": { "type": "string" }
-            },
-            "required": ["key", "locale", "text"],
-            "additionalProperties": false
-        })
-    }
-
     fn fk_child_schema() -> JsonValue {
         json!({
             "x-lix-key": "fk_child_schema",
@@ -7681,29 +6851,6 @@ mod tests {
                 "parent_id": { "type": "string" }
             },
             "required": ["id", "parent_id"],
-            "additionalProperties": false
-        })
-    }
-
-    fn state_surface_ref_schema() -> JsonValue {
-        json!({
-            "x-lix-key": "state_surface_ref_schema",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-state-foreign-keys": [
-                ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
-            ],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "target_entity_pk": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "minItems": 1
-                },
-                "target_schema_key": { "type": "string" },
-                "target_file_id": { "type": ["string", "null"] }
-            },
-            "required": ["id", "target_entity_pk", "target_schema_key", "target_file_id"],
             "additionalProperties": false
         })
     }
@@ -7770,63 +6917,6 @@ mod tests {
         row.entity_pk = EntityPk::single(entity_pk);
         row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
         row.branch_id = branch_id.into();
-        row.global = false;
-        row
-    }
-
-    fn composite_message_row(key: &str, locale: &str, branch_id: &str) -> TestPreparedStateRow {
-        let snapshot = json!({
-            "key": key,
-            "locale": locale,
-            "text": "Welcome",
-        });
-        let mut row = staged_row("composite_message_schema", Some(snapshot.to_string()));
-        row.entity_pk = EntityPk::from_primary_key_paths(
-            &snapshot,
-            &[vec!["key".to_string()], vec!["locale".to_string()]],
-        )
-        .expect("composite message identity should derive");
-        row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
-        row.branch_id = branch_id.into();
-        row.global = false;
-        row
-    }
-
-    fn state_surface_ref_row(
-        entity_pk: &str,
-        target_entity_pk: &str,
-        target_schema_key: &str,
-        target_file_id: &str,
-    ) -> TestPreparedStateRow {
-        state_surface_ref_row_with_target_entity_pk(
-            entity_pk,
-            json!([target_entity_pk]),
-            target_schema_key,
-            target_file_id,
-        )
-    }
-
-    fn state_surface_ref_row_with_target_entity_pk(
-        entity_pk: &str,
-        target_entity_pk: JsonValue,
-        target_schema_key: &str,
-        target_file_id: &str,
-    ) -> TestPreparedStateRow {
-        let mut row = staged_row(
-            "state_surface_ref_schema",
-            Some(
-                json!({
-                    "id": entity_pk,
-                    "target_entity_pk": target_entity_pk,
-                    "target_schema_key": target_schema_key,
-                    "target_file_id": target_file_id,
-                })
-                .to_string(),
-            ),
-        );
-        row.entity_pk = EntityPk::single(entity_pk);
-        row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
-        row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         row.global = false;
         row
     }

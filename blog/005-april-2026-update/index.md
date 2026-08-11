@@ -133,7 +133,7 @@ DataFusion is an Apache Arrow SQL query engine. It gives Lix SQL parsing, planni
 
 The decision is not "SQLite bad, custom database good." Reusing a query engine is still the right idea. The mistake would be building one from scratch when DataFusion exists.
 
-That is the control Lix needs: from incoming query, through `lix_state`, versions, history, branch visibility, merge inputs, and file projections, down to the raw storage layer.
+That is the control Lix needs: from incoming query, through registered entity rows, versions, history, branch visibility, merge inputs, and file projections, down to the raw storage layer.
 
 SQLite does not go away. It can still provide physical storage. The change is that SQLite no longer defines the query and storage shape of Lix state.
 

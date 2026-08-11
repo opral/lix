@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn rejects_qualified_table_name_even_when_leaf_exists() {
         let catalog = catalog();
-        let error = bind_public_table(&catalog, &table_name("SELECT * FROM foo.lix_state"))
+        let error = bind_public_table(&catalog, &table_name("SELECT * FROM foo.unknown"))
             .expect_err("qualified table should be rejected");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -265,12 +265,6 @@ mod tests {
             "lix_key_value",
             "lix_key_value_by_branch",
             "lix_key_value_history",
-            "lix_label",
-            "lix_label_assignment",
-            "lix_label_assignment_by_branch",
-            "lix_label_assignment_history",
-            "lix_label_by_branch",
-            "lix_label_history",
             "lix_registered_schema",
             "lix_registered_schema_by_branch",
             "lix_registered_schema_history",
@@ -306,6 +300,12 @@ mod tests {
             "lix_state",
             "lix_state_by_branch",
             "lix_state_history",
+            "lix_label",
+            "lix_label_by_branch",
+            "lix_label_history",
+            "lix_label_assignment",
+            "lix_label_assignment_by_branch",
+            "lix_label_assignment_history",
             "lix_checkpoint_marker",
             "lix_undo_redo_marker",
             "lix_collection_generation",

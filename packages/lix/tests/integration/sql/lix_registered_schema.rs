@@ -322,8 +322,6 @@ simulation_test!(
             "lix",
             "lix_file",
             "lix_key_value_history",
-            "lix_state",
-            "lix_state_history",
             "lix_file_descriptor",
             "lix_file_descriptor_history",
             "lix_plugin_note",
@@ -422,8 +420,6 @@ simulation_test!(
             "lix_directory_descriptor",
             "lix_file_descriptor",
             "lix_key_value",
-            "lix_label",
-            "lix_label_assignment",
             "lix_registered_schema",
         ] {
             assert!(
@@ -483,9 +479,6 @@ simulation_test!(
             ],
         );
         for surface_name in [
-            "lix_state",
-            "lix_state_by_branch",
-            "lix_state_history",
             "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",

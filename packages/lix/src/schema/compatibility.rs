@@ -7,12 +7,7 @@ use crate::common::top_level_property_name;
 use crate::entity_pk::canonical_json_text;
 
 const DOC_ONLY_SCHEMA_FIELDS: &[&str] = &["$comment", "deprecated", "description", "title"];
-const CONSTRAINT_FIELDS: &[&str] = &[
-    "x-lix-primary-key",
-    "x-lix-unique",
-    "x-lix-foreign-keys",
-    "x-lix-state-foreign-keys",
-];
+const CONSTRAINT_FIELDS: &[&str] = &["x-lix-primary-key", "x-lix-unique", "x-lix-foreign-keys"];
 
 /// Validates that `next` is a compatible amendment of `previous`.
 ///
@@ -136,11 +131,7 @@ fn validate_constraints_unchanged(
         ));
     }
 
-    for field in [
-        "x-lix-unique",
-        "x-lix-foreign-keys",
-        "x-lix-state-foreign-keys",
-    ] {
+    for field in ["x-lix-unique", "x-lix-foreign-keys"] {
         if normalized_constraint_list(previous.get(field), field)?
             != normalized_constraint_list(next.get(field), field)?
         {
@@ -281,15 +272,6 @@ fn constrained_top_level_property_names(schema: &JsonValue) -> Result<BTreeSet<S
             collect_top_level_pointer_names(foreign_key.get("properties"), &mut names)?;
         }
     }
-    if let Some(foreign_keys) = schema
-        .get("x-lix-state-foreign-keys")
-        .and_then(JsonValue::as_array)
-    {
-        for foreign_key in foreign_keys {
-            collect_top_level_pointer_names(Some(foreign_key), &mut names)?;
-        }
-    }
-
     Ok(names)
 }
 
@@ -343,30 +325,13 @@ mod tests {
                     }
                 }
             ],
-            "x-lix-state-foreign-keys": [
-                ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
-            ],
             "properties": {
                 "id": { "type": "string", "description": "Stable id" },
                 "isbn": { "type": "string" },
                 "title": { "type": "string", "title": "Title" },
                 "author_id": { "type": "string" },
-                "target_entity_pk": {
-                    "type": "array",
-                    "items": { "type": "string" }
-                },
-                "target_schema_key": { "type": "string" },
-                "target_file_id": { "type": ["string", "null"] }
             },
-            "required": [
-                "id",
-                "isbn",
-                "title",
-                "author_id",
-                "target_entity_pk",
-                "target_schema_key",
-                "target_file_id"
-            ],
+            "required": ["id", "isbn", "title", "author_id"],
             "additionalProperties": false
         })
     }
@@ -441,10 +406,6 @@ mod tests {
                 }
             }
         ]);
-        previous["x-lix-state-foreign-keys"] = json!([
-            ["/target_entity_pk", "/target_schema_key", "/target_file_id"],
-            ["/other_entity_pk", "/other_schema_key", "/other_file_id"]
-        ]);
         let mut next = previous.clone();
         next["x-lix-unique"] = json!([["/title"], ["/isbn"]]);
         next["x-lix-foreign-keys"] = json!([
@@ -463,10 +424,6 @@ mod tests {
                 }
             }
         ]);
-        next["x-lix-state-foreign-keys"] = json!([
-            ["/other_entity_pk", "/other_schema_key", "/other_file_id"],
-            ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
-        ]);
 
         validate_schema_amendment(&previous, &next)
             .expect("cosmetic constraint list ordering should not matter");
@@ -476,14 +433,7 @@ mod tests {
     fn rejects_required_set_shrink() {
         let previous = base_schema();
         let mut next = base_schema();
-        next["required"] = json!([
-            "id",
-            "isbn",
-            "author_id",
-            "target_entity_pk",
-            "target_schema_key",
-            "target_file_id"
-        ]);
+        next["required"] = json!(["id", "isbn", "author_id"]);
 
         let error = validate_schema_amendment(&previous, &next)
             .expect_err("required properties must be frozen");
@@ -613,21 +563,6 @@ mod tests {
 
         assert!(
             error.message.contains("x-lix-foreign-keys"),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_state_foreign_key_change() {
-        let previous = base_schema();
-        let mut next = base_schema();
-        next["x-lix-state-foreign-keys"] = json!([]);
-
-        let error = validate_schema_amendment(&previous, &next)
-            .expect_err("state foreign-key changes are incompatible");
-
-        assert!(
-            error.message.contains("x-lix-state-foreign-keys"),
             "unexpected error: {error:?}"
         );
     }
