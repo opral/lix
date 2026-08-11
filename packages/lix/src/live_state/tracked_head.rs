@@ -13,8 +13,8 @@ pub(crate) use crate::live_state::LiveStateReadDomain;
 pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
-    DeferredFreshHotRowRef, DeferredFreshHotRows, EntityColumnarOverlayRow, HOT_DIFF_SPACE,
-    HOT_FILE_SPACE, HOT_ROW_SPACE, HotStateTransactionCache, HotTrackedSnapshot,
+    DeferredFreshHotRowRef, DeferredFreshHotRows, EntityColumnarOverlayRow,
+    HOT_COLLECTION_CONTROL_SPACE, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotStateTransactionCache, HotTrackedSnapshot,
     PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
     materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,

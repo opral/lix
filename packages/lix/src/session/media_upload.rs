@@ -15,9 +15,9 @@ use crate::{Blob, LixError};
 
 use super::SessionContext;
 
-const UPLOAD_STATE_SPACE: StorageSpace =
+pub(crate) const UPLOAD_STATE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0007_0006), "session.file_upload.v2");
-const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0007_0007),
     "session.file_upload_manifest_leaf.v2",
 );
