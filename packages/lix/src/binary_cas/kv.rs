@@ -2938,7 +2938,7 @@ mod tests {
     #[tokio::test]
     async fn every_publication_rewrites_the_publication_token() {
         let storage = StorageAdapter::new(Memory::new());
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for _ in 0..4 {
             let (writes, preconditions) = stage_publication_fence_only(&storage).await;
             storage
