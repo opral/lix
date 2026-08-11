@@ -3047,12 +3047,13 @@ mod tests {
                     .expect("test chunk count should fit in u32"),
             },
         );
-        for (index, chunk) in chunks.iter().enumerate() {
+        let mut chunk_offset = 0u64;
+        for chunk in chunks.iter() {
             let chunk_hash = ChunkHash::from_content(chunk);
             stage_manifest_chunk(
                 writes,
                 blob_hash,
-                index as u64,
+                chunk_offset,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_hash.into_bytes(),
                     chunk_size: chunk.len() as u64,
@@ -3065,6 +3066,7 @@ mod tests {
                 chunk.len() as u64,
                 chunk,
             );
+            chunk_offset += chunk.len() as u64;
         }
         (blob_hash, bytes)
     }
@@ -3151,16 +3153,18 @@ mod tests {
                 chunk_count: chunks.len() as u32,
             },
         );
-        for (index, (chunk_hash, chunk_size)) in chunks.iter().copied().enumerate() {
+        let mut chunk_offset = 0u64;
+        for (chunk_hash, chunk_size) in chunks.iter().copied() {
             stage_manifest_chunk(
                 writes,
                 blob_id,
-                index as u64,
+                chunk_offset,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_hash.into_bytes(),
                     chunk_size,
                 },
             );
+            chunk_offset += chunk_size;
         }
         blob_id
     }
@@ -3641,7 +3645,7 @@ mod tests {
             stage_manifest_chunk(
                 &mut writes,
                 blob_hash,
-                1,
+                6,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_b_hash,
                     chunk_size: 6,
@@ -3705,7 +3709,7 @@ mod tests {
             stage_manifest_chunk(
                 &mut writes,
                 fixture.0,
-                2,
+                fixture.1.len() as u64,
                 &KvBlobManifestChunk {
                     chunk_hash: ChunkHash::from_content(b"stale manifest suffix").into_bytes(),
                     chunk_size: 1,
@@ -3975,7 +3979,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_hash_keys_are_compact_and_manifest_chunks_sort_by_index() {
+    fn binary_hash_keys_are_compact_and_manifest_chunks_sort_by_offset() {
         let blob_hash = BlobId::from_content(b"blob");
         let manifest_key = manifest_key(blob_hash);
         let chunk_key = chunk_key(ChunkHash::from_content(b"chunk"));
@@ -4113,10 +4117,27 @@ mod tests {
             data[requested.start as usize..requested.end as usize]
         );
 
+        // Content-defined boundaries are not known statically, so locate the
+        // first manifest row that starts after the requested range and delete
+        // it: a ranged read must never need it.
+        let mut trailing_offset = 0u64;
+        for chunk in scan_manifest_chunks(&store, blob_hash)
+            .await
+            .expect("manifest rows should scan")
+        {
+            if trailing_offset >= requested.end {
+                break;
+            }
+            trailing_offset += chunk.chunk_size;
+        }
+        assert!(
+            trailing_offset < data.len() as u64,
+            "the fixture must have a manifest row past the requested range"
+        );
         let mut writes = storage.new_write_set();
         writes.delete(
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
-            manifest_chunk_key(blob_hash, 2),
+            key(manifest_chunk_key(blob_hash, trailing_offset)),
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
