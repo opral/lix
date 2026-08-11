@@ -3028,6 +3028,13 @@ fn finite_query_float(value: f64) -> Result<Value, LixError> {
 
 fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Value, LixError> {
     if field.is_some_and(field_is_json) {
+        // PROBE ONLY: measures the ceiling of removing the per-row serde_json
+        // DOM. Semantically wrong, reverted before the real candidate.
+        static PROBE: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("LIX_PROBE_SKIP_JSON_DOM").is_some());
+        if *PROBE {
+            return Ok(Value::Text(value));
+        }
         return serde_json::from_str::<serde_json::Value>(&value)
             .map(Value::Json)
             .map_err(|error| {
