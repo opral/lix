@@ -1070,70 +1070,33 @@ where
     .await
 }
 
-/// The canonical commit graph reachable from this sweep's authenticated roots.
+/// Derives this sweep's retirement candidates.
 ///
-/// This replaces the former `gc.reachability_delta.v1` publication ledger. The
-/// ledger stored one ~439 B row per branch-head publication recording a
-/// transition (`old_root -> new_root`) that the commit graph already states:
-/// `old_root` is simply the parent of `new_root`. Re-deriving it costs one
-/// commit-record read per reachable commit and removes an entire storage space
-/// plus the BLAKE3 verification of every historical row on every sweep.
-struct DerivedRetirementCandidates {
-    /// Reachable commits ordered parents-before-children.
-    ordered: Vec<CommitId>,
-    /// Canonical parent links, present for exactly the reachable commits.
-    parents: BTreeMap<CommitId, Vec<CommitId>>,
-}
-
-/// Walks refs → commits, which is the only reachability implementation this
-/// collector has.
+/// This replaces the `gc.reachability_delta.v1` publication ledger. That ledger
+/// stored one ~439 B row per branch-head publication recording an `old_root ->
+/// new_root` transition so a later sweep would know which commit had been
+/// superseded. The manifest plane already states the same thing and states it
+/// better: a commit owns a manifest exactly while it owns physical state, and
+/// [`crate::tracked_state::stage_retire_commit_physical_state`] deletes it. So
+/// the inventory *is* the outstanding-work list, it shrinks as work completes,
+/// and it needs no publication-time write at all.
 ///
-/// A commit whose canonical projection is gone bounds the walk: a projection is
-/// deleted only once that commit owns no physical state, so nothing reclaimable
-/// can hide beyond one.
-async fn derive_retirement_candidates<S>(
-    store: &S,
-    roots: &BTreeSet<CommitId>,
-) -> Result<DerivedRetirementCandidates, LixError>
+/// Deliberately not a walk from refs. A commit can stop being reachable from
+/// any ref while still owning physical state — every commit of a deleted branch
+/// is in that position — and a refs walk cannot name those at all. Liveness
+/// still comes only from refs: this list is filtered against the authenticated
+/// retention closure, and nothing here is ever treated as a root.
+///
+/// The list is unordered on purpose. The ledger consumed a queue in
+/// publication order and stopped at the first blocked row, so one permanently
+/// live root at the head — genesis always is one, because engine-bootstrap rows
+/// authored at init stay live and keep naming it — froze every younger
+/// candidate behind it forever. Here a pinned candidate holds back only itself.
+async fn derive_retirement_candidates<S>(store: &S) -> Result<Vec<CommitId>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
-    let mut graph = CommitGraphContext::new().reader(store);
-    let mut parents = BTreeMap::<CommitId, Vec<CommitId>>::new();
-    let mut pending = roots.iter().copied().collect::<Vec<_>>();
-    while let Some(commit_id) = pending.pop() {
-        if parents.contains_key(&commit_id) {
-            continue;
-        }
-        let Some(node) = graph.load_node(&commit_id).await? else {
-            continue;
-        };
-        let parent_ids = node.parent_commit_ids.clone();
-        pending.extend(parent_ids.iter().copied());
-        parents.insert(commit_id, parent_ids);
-    }
-    let mut ordered = Vec::with_capacity(parents.len());
-    let mut emitted = BTreeSet::new();
-    for start in parents.keys().copied().collect::<Vec<_>>() {
-        let mut stack = vec![(start, false)];
-        while let Some((commit_id, expanded)) = stack.pop() {
-            if emitted.contains(&commit_id) {
-                continue;
-            }
-            if expanded {
-                emitted.insert(commit_id);
-                ordered.push(commit_id);
-                continue;
-            }
-            stack.push((commit_id, true));
-            for parent in parents.get(&commit_id).into_iter().flatten() {
-                if !emitted.contains(parent) && parents.contains_key(parent) {
-                    stack.push((*parent, false));
-                }
-            }
-        }
-    }
-    Ok(DerivedRetirementCandidates { ordered, parents })
+    crate::tracked_state::scan_commit_state_manifest_commit_ids(store).await
 }
 
 /// Plans and stages logical repository GC against one pinned read.
@@ -1206,13 +1169,8 @@ where
         native_parts: active_current_parts,
     } = load_authenticated_repository_retention(&store, &controls).await?;
 
-    // Retirement candidates are derived here, not read from a ledger. Every
-    // commit reachable from an authenticated chronology root through canonical
-    // parent links is a candidate; the retained closure above decides which of
-    // them still owe physical or semantic state. The walk stops exactly where a
-    // canonical commit projection is already gone, so the frontier previous
-    // sweeps reclaimed is re-derived instead of being remembered.
-    let candidates = derive_retirement_candidates(&store, &active_roots).await?;
+    // Retirement candidates are derived here, not read from a ledger.
+    let candidates = derive_retirement_candidates(&store).await?;
 
     // Derive both physical retirement and logical CAS retention from the one
     // authenticated serving closure. In particular, do not perform a second
@@ -1222,7 +1180,7 @@ where
     // authority from racing semantic projection retirement.
     let mut blocked_physical_dependency_ids = BTreeSet::new();
     let mut blocked_history_dependency_ids = BTreeSet::new();
-    for commit_id in candidates.ordered.iter().copied() {
+    for commit_id in candidates.iter().copied() {
         if !retirement_is_proven(commit_id, &active_authority_ids, &active_dependency_ids) {
             blocked_physical_dependency_ids.insert(commit_id);
         }
@@ -1261,60 +1219,37 @@ where
     crate::binary_cas::stage_cas_reclamation_fence(&store, writes, &mut staged_preconditions)
         .await?;
 
-    // Retire the derived candidates. Nothing here is ordered: a candidate that
-    // is still pinned only holds back itself. That is the whole point of
-    // deriving instead of consuming a queue — the ledger froze at its head, so
-    // one permanently-live root (genesis is always one: engine-bootstrap rows
-    // authored at init stay live and keep naming it) stopped every younger
-    // candidate behind it forever.
+    // Retire the derived candidates. Nothing here is ordered and nothing is
+    // capped: a candidate that is still pinned holds back only itself.
     //
-    // The one coupling that must survive is between the two planes. Deleting a
-    // commit projection is what bounds the next derivation, so a projection may
-    // only go once that commit owns no physical state. Otherwise a commit could
-    // lose its record while keeping its delta segment, and the walk would stop
-    // short of state nothing can reach any more.
+    // The one coupling that must survive is between the two planes. A commit
+    // leaves the derived inventory the moment its manifest goes, so its
+    // canonical projection must go in the same pass or never — retiring the
+    // projection of a commit that still owns physical state would strand that
+    // state instead.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
-    let physical_candidates = candidates
-        .ordered
-        .iter()
-        .copied()
-        .filter(|commit_id| !blocked_physical_dependency_ids.contains(commit_id))
-        .collect::<Vec<_>>();
-    // Only proven candidates cost a manifest read. A commit whose manifest is
-    // already gone was retired by an earlier sweep and its projection is being
-    // kept alive by history alone.
-    let physical_manifests =
-        crate::tracked_state::load_commit_state_manifests(&store, &physical_candidates).await?;
-    let mut physically_empty = BTreeSet::new();
-    for (commit_id, manifest) in physical_candidates.iter().copied().zip(physical_manifests) {
-        if manifest.is_none() {
-            physically_empty.insert(commit_id);
+    for commit_id in candidates {
+        if blocked_physical_dependency_ids.contains(&commit_id) {
             continue;
         }
-        if reclaimed_commits.insert(commit_id) {
-            crate::tracked_state::stage_retire_commit_physical_state(
-                &store,
-                writes,
-                commit_id,
-                RetainedPhysicalState {
-                    mutation_nodes: &active_mutation_nodes,
-                    scoped_nodes: &active_scoped_nodes,
-                    native_parts: &active_current_parts,
-                },
-            )
-            .await?;
-            physically_empty.insert(commit_id);
-        }
-    }
-    for commit_id in candidates.ordered.iter().copied() {
-        if !physically_empty.contains(&commit_id) {
+        if !reclaimed_commits.insert(commit_id) {
             continue;
         }
-        if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
-            && reclaimed_semantic_commits.insert(commit_id)
-        {
+        crate::tracked_state::stage_retire_commit_physical_state(
+            &store,
+            writes,
+            commit_id,
+            RetainedPhysicalState {
+                mutation_nodes: &active_mutation_nodes,
+                scoped_nodes: &active_scoped_nodes,
+                native_parts: &active_current_parts,
+            },
+        )
+        .await?;
+        if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids) {
             crate::changelog::stage_delete_commit_projection(&store, writes, commit_id).await?;
+            reclaimed_semantic_commits.insert(commit_id);
         }
     }
     if !reclaimed_semantic_commits.is_empty() {
@@ -4182,32 +4117,31 @@ mod tests {
         assert_eq!(present, expected);
     }
 
-    /// The derivation replaces `gc.reachability_delta.v1`: it must recover the
-    /// same `old_root` candidates the ledger used to store, in parents-before-
-    /// children order, and it must stop where a canonical projection is gone.
+    /// The derivation replaces `gc.reachability_delta.v1`. It must name every
+    /// commit that still owns physical state — including one no ref can reach,
+    /// which is what a deleted branch leaves behind and what a walk from refs
+    /// structurally cannot find — and it must shrink as retirement succeeds.
     #[tokio::test]
-    async fn derived_candidates_walk_refs_and_stop_at_the_reclaimed_frontier() {
+    async fn derived_candidates_are_the_commits_that_still_own_physical_state() {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("derived candidate timestamp", "2026-01-01T00:00:00Z");
-        let root = replay_commit_record("derived-candidate-root", 0, None, timestamp);
-        let middle = replay_commit_record(
-            "derived-candidate-middle",
-            1,
-            Some(root.commit_id),
-            timestamp,
-        );
-        let head = replay_commit_record(
-            "derived-candidate-head",
-            2,
-            Some(middle.commit_id),
-            timestamp,
-        );
+        let head = replay_commit_record("derived-candidate-head", 1, None, timestamp);
+        // No commit record and no parent link binds this one to anything.
+        let orphan = replay_commit_record("derived-candidate-orphan", 0, None, timestamp);
+        let mut head_manifest =
+            test_commit_state_manifest(&head, CommitStateMutationInventory::default());
+        head_manifest.replay_debt = CommitStateReplayDebt::default();
+        head_manifest.snapshot_root = Some(Box::new(test_snapshot_root(head.commit_id)));
+        let mut orphan_manifest =
+            test_commit_state_manifest(&orphan, CommitStateMutationInventory::default());
+        orphan_manifest.replay_debt = CommitStateReplayDebt::default();
+        orphan_manifest.snapshot_root = Some(Box::new(test_snapshot_root(orphan.commit_id)));
         persist_replay_closure_fixture(
             &storage,
             storage.new_write_set(),
-            &[root.clone(), middle.clone(), head.clone()],
-            &[],
+            &[head.clone()],
+            &[head_manifest, orphan_manifest],
         )
         .await;
 
@@ -4217,51 +4151,53 @@ mod tests {
                 .await
                 .expect("derived candidate read should open"),
         );
-        let derived =
-            derive_retirement_candidates(&read, &BTreeSet::from([head.commit_id]))
-                .await
-                .expect("candidates should derive from the commit graph alone");
+        let derived = derive_retirement_candidates(&read)
+            .await
+            .expect("candidates should derive from the manifest plane alone");
         assert_eq!(
-            derived.ordered,
-            vec![root.commit_id, middle.commit_id, head.commit_id],
-            "candidates must be ordered parents before children"
-        );
-        assert_eq!(
-            derived.parents.get(&head.commit_id),
-            Some(&vec![middle.commit_id])
+            derived.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([head.commit_id, orphan.commit_id]),
+            "every commit owning physical state is a candidate, reachable or not"
         );
         drop(read);
 
-        // Deleting the middle projection is what a completed sweep does. The
-        // next derivation must stop there instead of re-proposing a commit
-        // whose canonical record is already gone.
+        // Retiring the physical state is what removes a candidate. Nothing is
+        // remembered about the retirement; the inventory simply gets shorter.
         let read = SharedStorageAdapterRead::new(
             storage
                 .begin_read(StorageReadOptions::default())
                 .await
-                .expect("frontier read should open"),
+                .expect("retirement read should open"),
         );
         let mut writes = storage.new_write_set();
-        crate::changelog::stage_delete_commit_projection(&read, &mut writes, middle.commit_id)
-            .await
-            .expect("middle projection should retire");
+        crate::tracked_state::stage_retire_commit_physical_state(
+            &read,
+            &mut writes,
+            orphan.commit_id,
+            RetainedPhysicalState {
+                mutation_nodes: &BTreeSet::new(),
+                scoped_nodes: &BTreeSet::new(),
+                native_parts: &BTreeSet::new(),
+            },
+        )
+        .await
+        .expect("orphan physical state should retire");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("frontier retirement should commit");
+            .expect("orphan retirement should commit");
 
         let read = SharedStorageAdapterRead::new(
             storage
                 .begin_read(StorageReadOptions::default())
                 .await
-                .expect("post-frontier read should open"),
+                .expect("post-retirement read should open"),
         );
-        let derived =
-            derive_retirement_candidates(&read, &BTreeSet::from([head.commit_id]))
-                .await
-                .expect("candidates should derive after the frontier moved");
-        assert_eq!(derived.ordered, vec![head.commit_id]);
+        let derived = derive_retirement_candidates(&read)
+            .await
+            .expect("candidates should derive after retirement");
+        assert_eq!(derived, vec![head.commit_id]);
     }
 
     #[test]
@@ -5912,7 +5848,7 @@ mod tests {
     /// select, so the ordinary pass must reclaim it — no second sweeper, no
     /// retention ledger.
     #[tokio::test]
-    async fn ordinary_gc_reclaims_the_serving_generation_of_a_deleted_branch() {
+    async fn branch_deletion_reclaims_its_serving_generation_without_a_sweep() {
         let backend = Memory::new();
         Engine::initialize(backend.clone())
             .await
@@ -6009,12 +5945,19 @@ mod tests {
             )
             .await
             .expect("generation fixture branch should delete");
+        // A serving generation is reachable from exactly one place: its branch
+        // control. Deleting that control retires the generation in the same
+        // atomic write set, so there is nothing left for a sweep to find and
+        // nothing for a publication ledger to remember on its behalf.
+        assert_eq!(
+            hot_generation_rows(&storage, &branch.id, generation).await,
+            0,
+            "branch deletion must retire its own serving generation ({seeded} rows)"
+        );
         let plan = run_ordinary_repository_gc(&storage).await;
-
-        assert!(
-            plan.sweep.reclaimed_generation_rows >= seeded as u64,
-            "ordinary GC reclaimed {} of {seeded} stranded serving rows",
-            plan.sweep.reclaimed_generation_rows
+        assert_eq!(
+            plan.sweep.reclaimed_generation_rows, 0,
+            "the sweep has no generation debt left to collect"
         );
         assert_eq!(
             hot_generation_rows(&storage, &branch.id, generation).await,
