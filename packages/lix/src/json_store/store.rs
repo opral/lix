@@ -494,7 +494,7 @@ fn encode_stored_json_payload(encoded_json: &TestStoredJson) -> Vec<u8> {
 ///
 /// The audit tooling needs this to recompute the row's content address from
 /// the bytes on disk, independently of any in-memory ref.
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(feature = "storage-benches")]
 pub(crate) fn decode_stored_json(bytes: &[u8]) -> Result<Bytes, LixError> {
     let stored_payload = decode_stored_json_payload(Bytes::copy_from_slice(bytes))?;
     match stored_payload.codec {
