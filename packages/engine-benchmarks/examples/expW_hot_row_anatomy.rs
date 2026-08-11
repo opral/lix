@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use lix::integration::{Engine, SessionContext};
-use lix::storage::{ReadOptions, Storage};
+use lix::storage::ReadOptions;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{layout_accounting, space_inventory};
 use lix::{CreateBranchOptions, Value};
@@ -209,6 +209,10 @@ struct Anatomy {
     slot_ref: u64,
     slot_inline: u64,
     slot_inline_fingerprinted: u64,
+    meta_slot_none: u64,
+    meta_slot_ref: u64,
+    meta_slot_inline: u64,
+    meta_slot_inline_fingerprinted: u64,
 }
 
 fn analyze(rows: usize, scenario: &str, new_rows: &[(Vec<u8>, Vec<u8>)], changed_rows: usize) {
@@ -261,6 +265,13 @@ fn analyze(rows: usize, scenario: &str, new_rows: &[(Vec<u8>, Vec<u8>)], changed
             HEAD_SLOT_INLINE_FINGERPRINTED => a.slot_inline_fingerprinted += 1,
             _ => {}
         }
+        match parsed.metadata_kind {
+            HEAD_SLOT_NONE => a.meta_slot_none += 1,
+            HEAD_SLOT_REF => a.meta_slot_ref += 1,
+            HEAD_SLOT_INLINE => a.meta_slot_inline += 1,
+            HEAD_SLOT_INLINE_FINGERPRINTED => a.meta_slot_inline_fingerprinted += 1,
+            _ => {}
+        }
 
         *exact_values.entry(blake3::hash(value)).or_insert(0) += 1;
         let n1 = normalize_identity(value, &parsed);
@@ -304,7 +315,8 @@ v_working_diff_per_row={:.2},v_columnar_per_row={:.2}",
     println!(
         "expW_anatomy_tags,rows={rows},scenario={scenario},\
 wd_disabled={},wd_clean={},wd_before_absent={},wd_before_present={},\
-snapshot_none={},snapshot_ref={},snapshot_inline={},snapshot_inline_fingerprinted={}",
+snapshot_none={},snapshot_ref={},snapshot_inline={},snapshot_inline_fingerprinted={},\
+metadata_none={},metadata_ref={},metadata_inline={},metadata_inline_fingerprinted={}",
         a.wd_disabled,
         a.wd_clean,
         a.wd_before_absent,
@@ -313,6 +325,10 @@ snapshot_none={},snapshot_ref={},snapshot_inline={},snapshot_inline_fingerprinte
         a.slot_ref,
         a.slot_inline,
         a.slot_inline_fingerprinted,
+        a.meta_slot_none,
+        a.meta_slot_ref,
+        a.meta_slot_inline,
+        a.meta_slot_inline_fingerprinted,
     );
 
     // Sharing oracles over the new HOT rows.
