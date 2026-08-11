@@ -11,7 +11,7 @@
 //! duplicate_audit audit <dir>            # audit a settled SlateDB directory
 //! duplicate_audit run   <corpus> <dir>   # build, settle, then audit
 //! ```
-//! Corpora: `plain`, `bigjson`, `edits`, `branches`, `media`, `gc`.
+//! Corpora: `plain`, `bigjson`, `edits`, `branches`, `media`, `gc_pre`, `gc`.
 //!
 //! Every corpus is seeded through `SessionContext` SQL so the audit observes
 //! exactly what an ordinary commit stages. Nothing here reaches into a
@@ -143,11 +143,12 @@ async fn build(corpus: &str, dir: &Path) {
             seed_media(&session, env_usize("LIX_AUDIT_FILES", 40)).await;
             edit_media(&session, env_usize("LIX_AUDIT_FILES", 40), 3).await;
         }
-        "gc" => {
+        // `gc_pre` and `gc` are a matched pair: identical construction, the
+        // second one additionally releases the disposable branch and sweeps.
+        // Diffing their audits is what proves superseded content is reclaimed
+        // rather than merely unreferenced.
+        "gc_pre" | "gc" => {
             seed_rows(&session, shape, rows / 2, commit_rows).await;
-            edit_rows(&session, shape, 10, 100, rows / 2).await;
-            seed_media(&session, env_usize("LIX_AUDIT_FILES", 20)).await;
-            edit_media(&session, env_usize("LIX_AUDIT_FILES", 20), 3).await;
             let branch = session
                 .create_branch(CreateBranchOptions {
                     id: Some("01990000-0000-7000-8000-0000000000ff".to_owned()),
@@ -160,20 +161,24 @@ async fn build(corpus: &str, dir: &Path) {
                 .open_session(branch.id.clone())
                 .await
                 .expect("open GC-disposable branch");
-            edit_rows(&branch_session, shape, 5, 200, rows / 2).await;
+            edit_rows(&branch_session, shape, 10, 200, rows / 2).await;
+            seed_media(&branch_session, env_usize("LIX_AUDIT_FILES", 20)).await;
+            edit_media(&branch_session, env_usize("LIX_AUDIT_FILES", 20), 3).await;
             drop(branch_session);
-            session
-                .execute(
-                    "DELETE FROM lix_branch WHERE id = $1",
-                    &[Value::Text(branch.id)],
-                )
-                .await
-                .expect("delete GC-disposable branch");
-            let adapter = StorageAdapter::new(storage.clone());
-            let sweep = collect_repository_gc_for_bench(&adapter)
-                .await
-                .expect("collect repository GC");
-            println!("GC\tsweep={sweep:?}");
+            if corpus == "gc" {
+                session
+                    .execute(
+                        "DELETE FROM lix_branch WHERE id = $1",
+                        &[Value::Text(branch.id)],
+                    )
+                    .await
+                    .expect("delete GC-disposable branch");
+                let adapter = StorageAdapter::new(storage.clone());
+                let sweep = collect_repository_gc_for_bench(&adapter)
+                    .await
+                    .expect("collect repository GC");
+                println!("GC\tsweep={sweep:?}");
+            }
         }
         other => panic!("unknown corpus '{other}'"),
     }
