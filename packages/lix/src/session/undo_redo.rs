@@ -89,7 +89,7 @@ where
     } else {
         load_commit_delta(transaction, target).await?
     };
-    let outcome = apply_state_diff(transaction, head, parent, target, false, &target_delta).await?;
+    let outcome = apply_state_diff(transaction, head, parent, false, &target_delta).await?;
     let inverse_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -149,7 +149,7 @@ where
     only_parent(&target_record.parent_commit_ids, target, "redo")?;
 
     let target_delta = load_commit_delta(transaction, target).await?;
-    let outcome = apply_state_diff(transaction, head, target, target, true, &target_delta).await?;
+    let outcome = apply_state_diff(transaction, head, target, true, &target_delta).await?;
     let replay_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -449,19 +449,26 @@ fn only_parent(
     }
 }
 
+/// Applies the tracked-state transition that reverses (or replays) a commit.
+///
+/// Undo/redo operates on the commit graph, so it moves tracked rows only.
+/// Untracked rows carry no `commit_id`, never appear in a commit delta, and
+/// are absent from diffs, merges, checkpoints and history — there is nothing
+/// in a commit to restore them from. When the transition removes a file or
+/// directory descriptor, the ordinary delete cascade drops the untracked rows
+/// that file scoped, exactly as a plain `DELETE FROM lix_file` would. That is
+/// the documented meaning of untracked: no durability guarantee across
+/// version-control operations.
 async fn apply_state_diff<S>(
     transaction: &mut Transaction<S>,
     current: CommitId,
     desired: CommitId,
-    target: CommitId,
     desired_is_target: bool,
     target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
 ) -> Result<crate::sql2::DiffCommandOutcome, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    reject_untracked_descriptor_cascade(transaction, target_delta, desired_is_target, target)
-        .await?;
     let cascade_file_ids = descriptor_dependency_cascade_file_ids(target_delta)?;
     let keys = if cascade_file_ids.is_empty() {
         target_delta
@@ -492,56 +499,6 @@ where
     transaction
         .execute_tracked_state_transition(current, desired, keys)
         .await
-}
-
-async fn reject_untracked_descriptor_cascade<S>(
-    transaction: &mut Transaction<S>,
-    target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
-    desired_is_target: bool,
-    target: CommitId,
-) -> Result<(), LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let removes_descriptor = |value: &TrackedStateIndexValue| {
-        if desired_is_target {
-            value.deleted
-        } else {
-            !value.deleted
-        }
-    };
-    let mut file_ids = Vec::new();
-    let mut removes_directory = false;
-    for (key, value) in target_delta {
-        if !removes_descriptor(value) {
-            continue;
-        }
-        match key.schema_key.as_str() {
-            "lix_file_descriptor" => {
-                file_ids.push(key.entity_pk.as_single_string_owned().map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("undo/redo file descriptor identity is invalid: {error}"),
-                    )
-                })?)
-            }
-            "lix_directory_descriptor" => removes_directory = true,
-            _ => {}
-        }
-    }
-    let has_dependency = transaction
-        .has_untracked_file_scoped_rows(&file_ids)
-        .await?
-        || (removes_directory && transaction.has_untracked_rows().await?);
-    if has_dependency {
-        return Err(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "cannot undo/redo commit '{target}' because removing its file or directory would delete untracked state"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 async fn stage_marker<S>(
@@ -1054,8 +1011,11 @@ mod tests {
         );
     }
 
+    /// Undo/redo operates on the commit graph. Untracked rows are not in it,
+    /// so they neither block the operation nor survive a descriptor cascade
+    /// that removes the file scoping them.
     #[tokio::test]
-    async fn undo_file_creation_rejects_deleting_untracked_file_state() {
+    async fn undo_file_creation_removes_untracked_file_state() {
         let session = setup().await;
         session
             .upsert_file_content("/owned.txt".into(), Blob::from("tracked".as_bytes()))
@@ -1078,21 +1038,77 @@ mod tests {
             .await
             .expect("untracked file state writes");
 
-        let error = session
+        assert_eq!(value(&session, "file-ui").await.as_deref(), Some("open"));
+
+        session
             .undo()
             .await
-            .expect_err("undo must not cascade untracked state");
-        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert_eq!(value(&session, "file-ui").await.as_deref(), Some("open"));
+            .expect("undo ignores untracked rows in the descriptor cascade");
+
         assert_eq!(
             session
                 .read_file_content("/owned.txt".into(), None)
                 .await
-                .expect("file reads")
-                .expect("file remains")
-                .content()
-                .as_ref(),
-            b"tracked"
+                .expect("file reads"),
+            None,
+            "undo must remove the file the target commit created"
+        );
+        assert_eq!(
+            value(&session, "file-ui").await,
+            None,
+            "untracked rows scoped to the removed file are cascaded away"
+        );
+    }
+
+    /// The mirror direction: redoing a commit that deletes a file also
+    /// cascades away untracked rows written after the undo.
+    #[tokio::test]
+    async fn redo_file_deletion_removes_untracked_file_state() {
+        let session = setup().await;
+        session
+            .upsert_file_content("/owned.txt".into(), Blob::from("tracked".as_bytes()))
+            .await
+            .expect("file creates");
+        let file = session
+            .execute("SELECT id FROM lix_file WHERE path = '/owned.txt'", &[])
+            .await
+            .expect("file id reads");
+        let file_id = match file.rows()[0].get::<Value>("id").expect("id projects") {
+            Value::Text(value) => value,
+            value => panic!("expected text file id, got {value:?}"),
+        };
+        session
+            .execute("DELETE FROM lix_file WHERE path = '/owned.txt'", &[])
+            .await
+            .expect("file deletes");
+        session.undo().await.expect("undo restores the file");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_file_id, lixcol_untracked) \
+                 VALUES ('file-ui', 'open', $1, true)",
+                &[Value::Text(file_id)],
+            )
+            .await
+            .expect("untracked file state writes");
+        assert_eq!(value(&session, "file-ui").await.as_deref(), Some("open"));
+
+        session
+            .redo()
+            .await
+            .expect("redo ignores untracked rows in the descriptor cascade");
+
+        assert_eq!(
+            session
+                .read_file_content("/owned.txt".into(), None)
+                .await
+                .expect("file reads"),
+            None,
+            "redo must re-delete the file"
+        );
+        assert_eq!(
+            value(&session, "file-ui").await,
+            None,
+            "untracked rows scoped to the removed file are cascaded away"
         );
     }
 
