@@ -60,6 +60,11 @@ uuid = { version = "1", features = ["std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [[example]]
+name = "space_growth"
+path = "examples/space_growth.rs"
+required-features = ["storage-benches"]
+
+[[example]]
 name = "storage_layout"
 path = "examples/storage_layout.rs"
 required-features = ["storage-benches", "slatedb"]

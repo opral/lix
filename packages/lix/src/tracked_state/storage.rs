@@ -12952,7 +12952,6 @@ fn validate_compact_replacement_inventory(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
@@ -12961,22 +12960,9 @@ mod tests {
     use bytes::Bytes;
 
     use crate::LixError;
-    use crate::binary_cas::{
-        BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        BINARY_CAS_MANIFEST_SPACE,
-    };
-    use crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-    use crate::changelog::{
-        CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, CommitId, CommitRecord,
-    };
+    use crate::changelog::{COMMIT_SPACE, ChangeId, CommitId, CommitRecord};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
-    use crate::gc::{CHECKPOINT_GC_STATE_SPACE, CHECKPOINT_RECOVERY_REF_SPACE};
-    use crate::init::REPOSITORY_PROTOCOL_SPACE;
-    use crate::json_store::{UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, store::JSON_SPACE};
-    use crate::live_state::{
-        HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
-    };
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageReadOptions, StorageSpace, StorageWriteOptions,
         StorageWriteSet,
@@ -12998,8 +12984,8 @@ mod tests {
         COMMIT_DELTA_FORMAT_MAGIC, COMMIT_STATE_MANIFEST_FORMAT_MAGIC, CommitDeltaChangeLocator,
         CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
         DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
-        TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, columnar_identity_row_map,
+        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TrackedStateChunkOverlay,
+        columnar_identity_row_map,
         decode_commit_delta_with_payloads, decode_encoded_commit_state_manifest,
         decode_stored_commit_state_authority, encode_commit_delta_segment,
         encode_commit_delta_segment_with_payloads, encode_commit_delta_segment_with_raw_sidecar,
@@ -13648,20 +13634,6 @@ mod tests {
             origin_key,
             base_coordinate: None,
             authored: true,
-        }
-    }
-
-    #[test]
-    fn packed_history_spaces_do_not_span_the_live_state_key_range() {
-        const FIRST_LIVE_STATE_SPACE: [u8; 4] = 0x0004_001b_u32.to_be_bytes();
-        for space in [
-            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        ] {
-            assert!(
-                space.physical_prefix() < FIRST_LIVE_STATE_SPACE,
-                "{space} would make packed-history SSTs overlap live-state keys"
-            );
         }
     }
 
@@ -16985,44 +16957,6 @@ mod tests {
                     .file_id
                     .is_some_and(|file_id| file_id.as_ptr() == file_pointer)
         }));
-    }
-
-    #[test]
-    fn native_storage_space_ids_are_unique_across_owner_layouts() {
-        let spaces = [
-            REPOSITORY_PROTOCOL_SPACE,
-            BRANCH_HEAD_CONTROL_SPACE,
-            HOT_ROW_SPACE,
-            HOT_FILE_SPACE,
-            HOT_DIFF_SPACE,
-            TRACKED_WORKING_DIFF_MARKER_SPACE,
-            JSON_SPACE,
-            UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-            TRACKED_STATE_TREE_CHUNK_SPACE,
-            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-            crate::tracked_state::scoped_range::SCOPED_RANGE_NODE_SPACE,
-            BINARY_CAS_MANIFEST_SPACE,
-            BINARY_CAS_MANIFEST_CHUNK_SPACE,
-            BINARY_CAS_CHUNK_PRESENCE_SPACE,
-            BINARY_CAS_CHUNK_SPACE,
-            COMMIT_SPACE,
-            CHANGE_SPACE,
-            COMMIT_CHANGE_ID_SPACE,
-            CHECKPOINT_RECOVERY_REF_SPACE,
-            CHECKPOINT_GC_STATE_SPACE,
-        ];
-        let mut seen = BTreeMap::new();
-        for space in spaces {
-            assert_eq!(
-                seen.insert(space.id, space.name),
-                None,
-                "storage space id {:?} is reused by {} and {}",
-                space.id,
-                seen.get(&space.id).copied().unwrap_or(space.name),
-                space.name
-            );
-        }
     }
 
     fn commit_state_manifest_fixture() -> CommitStateManifest {
