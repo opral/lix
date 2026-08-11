@@ -3827,15 +3827,35 @@ async fn drain_write_queue(
                     }
                 }
             }
-            db.write_with_options(
-                batch,
-                &SlateDBWriteOptions {
-                    await_durable,
-                    ..SlateDBWriteOptions::default()
-                },
-            )
+            // SlateDB's own `await_durable` write option does not ask for a WAL
+            // flush; it only parks on the WAL buffer's durability watcher, which
+            // fires either when the buffer exceeds `l0_sst_size_bytes` (64 MiB)
+            // or when the periodic `flush_interval` ticker (100 ms) elapses.
+            // Every durable commit under that ceiling therefore paid up to a
+            // full 100 ms tick of pure idle latency for a WAL write that costs
+            // microseconds. Enqueue the batch without waiting, then ask the
+            // batch writer to flush now. The flush message is ordered behind
+            // this batch on the same writer channel, so it carries exactly the
+            // same durability guarantee — the WAL SST is in the object store
+            // before the commit is acknowledged — and one flush covers every
+            // durable write in the drained group, amortizing the barrier
+            // across a concurrent window instead of serializing on the ticker.
+            async {
+                let handle = db
+                    .write_with_options(
+                        batch,
+                        &SlateDBWriteOptions {
+                            await_durable: false,
+                            ..SlateDBWriteOptions::default()
+                        },
+                    )
+                    .await?;
+                if await_durable {
+                    db.flush().await?;
+                }
+                Ok::<_, slatedb::Error>(handle.seqnum())
+            }
             .await
-            .map(|handle| handle.seqnum())
             .map_err(slatedb_error)
             .map_err(commit_outcome_unknown)
         };

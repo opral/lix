@@ -209,12 +209,11 @@ async fn run<StorageImpl>(
                      WHERE schema_key = $1 AND entity_pk = lix_json($2) AND file_id = $3";
     // Live-state read of the same file. HOT_ROW is keyed
     // `schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` owns a
-    // file-first prefix route, but the entity surface never pushes
-    // `lixcol_file_id` into `TrackedStateFilter::file_ids` (its
-    // `filter_pushdown` only recognizes branch-id and primary-key analyzers),
-    // so this measures a full schema scan with a residual filter. Reported to
-    // keep that gap visible: `entity_scan_rows` stays fixed at `rows_per_file`
-    // while the latency tracks the whole schema.
+    // file-first prefix route; the entity surface pushes `lixcol_file_id` into
+    // `LiveStateFilter::file_ids`, so this reaches that prefix seek and costs
+    // O(rows in the file). `entity_scan_rows` is fixed at `rows_per_file`, so
+    // a flat latency across dirty-set sizes is the pass condition and a rising
+    // one means the pushdown stopped reaching the seek.
     let entity_scan_sql = format!("SELECT id FROM {SCHEMA_KEY} WHERE lixcol_file_id = $1");
     let file_params = vec![Value::Text(probe_file.clone())];
     let file_schema_params = vec![

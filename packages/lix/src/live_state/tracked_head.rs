@@ -11,6 +11,8 @@ mod hot;
 
 pub(crate) use crate::live_state::LiveStateReadDomain;
 #[cfg(test)]
+pub(crate) use hot::WORKING_DIFF_PATH_HITS;
+#[cfg(test)]
 pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,

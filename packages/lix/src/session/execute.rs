@@ -1779,7 +1779,7 @@ where
                 if let IdempotencyReceiptResolution::Replay(receipt) =
                     self.resolve_idempotency_receipt(&idempotency).await?
                 {
-                    return Ok(receipt.into_results());
+                    return receipt.into_results();
                 }
                 let result = self
                     .execute_transaction_batch(
@@ -1807,7 +1807,7 @@ where
                                 // callback was bypassed by an ambiguous error.
                                 self.observe_invalidation.bump();
                                 self.file_views.clear();
-                                Ok(receipt.into_results())
+                                receipt.into_results()
                             }
                             Ok(IdempotencyReceiptResolution::Absent) => Err(error),
                             Err(recovery_error) => Err(recovery_error),
