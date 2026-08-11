@@ -334,6 +334,26 @@ where
     );
 
     let started = tokio::time::Instant::now();
+    // Independent runtime watchdog: an empty task that only sleeps. Any gap it
+    // records is executor-level, because it touches neither storage nor a lock.
+    let watchdog_worst = Arc::new(AtomicU64::new(0));
+    let watchdog = std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE")
+        .is_some()
+        .then(|| {
+            let worst = watchdog_worst.clone();
+            tokio::spawn(async move {
+                let tick = Duration::from_millis(5);
+                let mut next = started + tick;
+                loop {
+                    tokio::time::sleep_until(next).await;
+                    let gap = (tokio::time::Instant::now() - next).as_micros() as u64;
+                    let elapsed_ms = (next - started).as_millis() as u64;
+                    let packed = (gap << 20) | elapsed_ms.min((1 << 20) - 1);
+                    worst.fetch_max(packed, Ordering::Relaxed);
+                    next += tick;
+                }
+            })
+        });
     let ingest_started = Instant::now();
     let ingest_future = async {
         if run_ingest {
@@ -356,6 +376,15 @@ where
     let (ingest_elapsed, mut save_latencies, first_late, second_late) =
         tokio::join!(ingest_future, save_future, first_playback, second_playback);
 
+    if let Some(watchdog) = watchdog {
+        watchdog.abort();
+        let packed = watchdog_worst.load(Ordering::Relaxed);
+        println!(
+            "movie_runtime_watchdog,worst_gap_ms={:.3},at_ms={}",
+            (packed >> 20) as f64 / 1000.0,
+            packed & ((1 << 20) - 1),
+        );
+    }
     save_latencies.sort_unstable();
     let save_p95 = save_latencies[save_latencies.len() * 95 / 100];
     let ingest_mib_s = INGEST_BYTES as f64 / (1024.0 * 1024.0) / ingest_elapsed.as_secs_f64();
@@ -517,9 +546,14 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let trace = std::env::var_os("LIX_MOVIE_PLAYBACK_TRACE").is_some();
+    let samples = std::env::var("LIX_MOVIE_STREAM_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(STREAM_SAMPLES);
     let mut late = 0;
-    let mut read_latencies = Vec::with_capacity(STREAM_SAMPLES);
-    for sample in 0..STREAM_SAMPLES {
+    let mut read_latencies = Vec::with_capacity(samples);
+    for sample in 0..samples {
         let deadline = schedule_start + PLAYBACK_READ_AHEAD + STREAM_PERIOD * (sample as u32 + 1);
         let offset = (initial_offset + sample as u64 * STREAM_READ_BYTES)
             % (PROXY_BYTES as u64 - STREAM_READ_BYTES);
