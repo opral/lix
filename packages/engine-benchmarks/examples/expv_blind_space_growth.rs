@@ -93,6 +93,12 @@ async fn main() {
             let samples = parse_samples(arguments.get(1));
             idempotency_scenario(&samples).await;
         }
+        "idempotency_payload" => {
+            let samples = parse_samples(arguments.get(1));
+            let bytes = parse_usize(arguments.get(2), 65536);
+            let returning = arguments.get(3).map(String::as_str) != Some("plain");
+            idempotency_payload_scenario(&samples, bytes, returning).await;
+        }
         "uploads" => {
             let samples = parse_samples(arguments.get(1));
             let bytes = parse_usize(arguments.get(2), 4096);
@@ -369,6 +375,64 @@ async fn idempotency_scenario(samples: &[usize]) {
     );
 }
 
+/// The same replay ledger, measured for the request shape its 8 MiB cap exists
+/// for: a mutation whose `RETURNING` clause projects blob content.
+///
+/// A receipt stores the complete `ExecuteResult` — columns, every returned row
+/// value, `rows_affected` and notices — as `serde_json`. `plain` runs the same
+/// file write without `RETURNING`, so the difference between the two arms is
+/// exactly the cost of retaining a second copy of the response payload.
+async fn idempotency_payload_scenario(samples: &[usize], blob_bytes: usize, returning: bool) {
+    let fixture = Fixture::open().await;
+    let sql = if returning {
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) RETURNING id, path, content"
+    } else {
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)"
+    };
+    let mut issued = 0usize;
+    for &target in samples {
+        while issued < target {
+            let mut fingerprint = [0u8; 32];
+            fingerprint[..8].copy_from_slice(&(issued as u64).to_be_bytes());
+            fingerprint[8] = u8::from(returning);
+            let identity = ExecuteIdempotency::new(
+                Some("expv-principal".to_owned()),
+                format!("expv-key-{issued:012}"),
+                fingerprint,
+            );
+            // Incompressible, per-request distinct content. A repeated byte
+            // would let the backend compress both the file and its receipt to
+            // almost nothing and would make the physical arm meaningless.
+            let content = pseudo_random_bytes(issued as u64, blob_bytes);
+            Arc::clone(&fixture.session)
+                .execute_with_idempotency_and_options_and_metadata(
+                    sql.to_owned(),
+                    vec![
+                        Value::Text(format!("/expv/payload-{issued:012}.bin")),
+                        Value::Blob(Blob::from(content)),
+                    ],
+                    ExecuteOptions::default(),
+                    ExecuteStatementMetadata::default(),
+                    Some(identity),
+                )
+                .await
+                .expect("idempotent execute");
+            issued += 1;
+        }
+        report(
+            if returning {
+                "idempotency_payload_returning"
+            } else {
+                "idempotency_payload_plain"
+            },
+            "live",
+            target as u64,
+            &usage(&fixture.storage).await,
+        );
+    }
+    fixture.flush();
+}
+
 /// Resumable-upload receipts. `keep` leaves every uploaded file live; `delete`
 /// removes each file again, which is the shape that tells retained-receipt
 /// bytes apart from live-file bytes.
@@ -421,13 +485,24 @@ async fn uploads_scenario(samples: &[usize], bytes_per_upload: usize, delete: bo
 struct Fixture {
     storage: RocksDB,
     session: Arc<SessionContext<RocksDB>>,
-    _directory: tempfile::TempDir,
+    _directory: Option<tempfile::TempDir>,
 }
 
 impl Fixture {
+    /// Logical accounting is the default answer, so the fixture normally lives
+    /// in a temporary directory. Setting `LIX_EXPV_DIR` keeps the backend files
+    /// at a fixed path instead, which is what turns a logical byte curve into a
+    /// physical one (`flush`, then measure the directory).
     async fn open() -> Self {
-        let directory = tempfile::tempdir().expect("create RocksDB directory");
-        let storage = RocksDB::open(directory.path()).expect("open RocksDB");
+        let (directory, path) = match std::env::var_os("LIX_EXPV_DIR") {
+            Some(path) => (None, std::path::PathBuf::from(path)),
+            None => {
+                let directory = tempfile::tempdir().expect("create RocksDB directory");
+                let path = directory.path().to_path_buf();
+                (Some(directory), path)
+            }
+        };
+        let storage = RocksDB::open(&path).expect("open RocksDB");
         Engine::initialize(storage.clone())
             .await
             .expect("initialize repository");
@@ -442,6 +517,27 @@ impl Fixture {
             _directory: directory,
         }
     }
+
+    fn flush(&self) {
+        self.storage.flush().expect("flush RocksDB");
+    }
+}
+
+/// splitmix64 fill. Deterministic per seed, and statistically incompressible,
+/// which is what a physical byte measurement of a payload plane requires.
+fn pseudo_random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let take = (len - out.len()).min(8);
+        out.extend_from_slice(&z.to_le_bytes()[..take]);
+    }
+    out
 }
 
 fn report(scenario: &str, phase: &str, axis: u64, usage: &Usage) {
