@@ -70,6 +70,11 @@ path = "examples/revision_pack_oracle.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
+name = "cas_sharing"
+path = "examples/cas_sharing.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
 name = "cas_gc_qualification"
 path = "examples/cas_gc_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
