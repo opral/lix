@@ -464,7 +464,25 @@ async fn audit(dir: &Path) {
     print_content_address_verdict(&audits);
     print_cross_space(&global, &audits);
     print_binary_cas_reuse(&manifest_chunk_refs, &chunk_sizes);
-    print_headline(&audits, &global);
+    print_headline(&audits, &global, directory_bytes(dir));
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                entry.metadata().map_or(0, |metadata| {
+                    if metadata.is_dir() {
+                        directory_bytes(&path)
+                    } else {
+                        metadata.len()
+                    }
+                })
+            })
+            .sum()
+    })
 }
 
 /// Near-duplicate index. Two rows land in the same bucket when they agree on
@@ -642,6 +660,7 @@ fn print_binary_cas_reuse(refs: &[[u8; 32]], sizes: &HashMap<[u8; 32], u64>) {
 fn print_headline(
     audits: &[(u32, &'static str, SpaceAudit)],
     global: &HashMap<[u8; 32], (usize, Vec<u32>, u64)>,
+    physical_bytes: u64,
 ) {
     let rows = audits.iter().map(|(_, _, audit)| audit.rows).sum::<u64>();
     let key_bytes = audits
@@ -662,7 +681,7 @@ fn print_headline(
         .map(|(length, spaces, _)| (spaces.len() as u64 - 1) * *length as u64)
         .sum::<u64>();
     println!(
-        "TOTAL\trows={rows}\tkey_bytes={key_bytes}\tvalue_bytes={value_bytes}\twithin_space_duplicate_bytes={within}\tcross_space_redundant_bytes={cross}\tduplicate_pct={:.3}",
+        "TOTAL\trows={rows}\tkey_bytes={key_bytes}\tvalue_bytes={value_bytes}\tphysical_bytes={physical_bytes}\twithin_space_duplicate_bytes={within}\tcross_space_redundant_bytes={cross}\tduplicate_pct={:.3}",
         percent(within + cross, value_bytes),
     );
 }
