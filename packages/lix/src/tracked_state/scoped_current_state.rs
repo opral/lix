@@ -2354,6 +2354,10 @@ mod ownership_census_fixture {
             .await
             .expect("census session should open");
         let storage = StorageAdapter::new(backend.clone());
+        let initial = head(&storage).await;
+        if pre == 24 {
+            println!("CENSUS-INITIAL initial_head={initial}");
+        }
         let schema = serde_json::json!({
             "x-lix-key": "census_fixture",
             "x-lix-primary-key": ["/path"],
@@ -2374,7 +2378,11 @@ mod ownership_census_fixture {
             .expect("census schema should register");
 
         let mut pre_checkpoint = BTreeSet::new();
-        pre_checkpoint.insert(head(&storage).await);
+        let bootstrap = head(&storage).await;
+        pre_checkpoint.insert(bootstrap);
+        if pre == 24 {
+            println!("CENSUS-BOOTSTRAP bootstrap_head={bootstrap}");
+        }
         for row in 0..pre {
             session
                 .execute(
@@ -2471,6 +2479,15 @@ mod ownership_census_fixture {
             report.serving_dependencies.len(),
             pre_checkpoint.len(),
         );
+        if depth == 24 {
+            println!(
+                "CENSUS-IDS depth={depth} phase={phase} serving={:?} snapshot_parents={:?} selected={:?} replay={:?}",
+                report.serving_dependencies,
+                report.snapshot_parents,
+                report.selected_source_chain,
+                report.replay_chain,
+            );
+        }
         let count_pre = |set: &BTreeSet<CommitId>| set.intersection(pre_checkpoint).count();
         println!(
             "CENSUS-MANIFEST depth={depth} phase={phase} head_replay_depth={} selected_source_chain={}/{} replay_chain={}/{} snapshot_parents={}/{} (pre_checkpoint/total)",
