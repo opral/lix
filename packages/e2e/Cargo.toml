@@ -453,6 +453,11 @@ path = "tests/history_scaling_probe.rs"
 required-features = ["sdk-tests", "storage-benches", "slatedb"]
 
 [[test]]
+name = "expfr_depth_probe"
+path = "tests/expfr_depth_probe.rs"
+required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
 name = "markdown_git_benchmark"
 path = "tests/markdown_git_benchmark.rs"
 required-features = ["sdk-tests", "storage-benches", "slatedb"]
