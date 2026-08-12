@@ -89,7 +89,7 @@ where
     } else {
         load_commit_delta(transaction, target).await?
     };
-    let outcome = apply_state_diff(transaction, head, parent, target, false, &target_delta).await?;
+    let outcome = apply_state_diff(transaction, head, parent, false, &target_delta).await?;
     let inverse_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -149,7 +149,7 @@ where
     only_parent(&target_record.parent_commit_ids, target, "redo")?;
 
     let target_delta = load_commit_delta(transaction, target).await?;
-    let outcome = apply_state_diff(transaction, head, target, target, true, &target_delta).await?;
+    let outcome = apply_state_diff(transaction, head, target, true, &target_delta).await?;
     let replay_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -453,7 +453,6 @@ async fn apply_state_diff<S>(
     transaction: &mut Transaction<S>,
     current: CommitId,
     desired: CommitId,
-    target: CommitId,
     desired_is_target: bool,
     target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
 ) -> Result<crate::sql2::DiffCommandOutcome, LixError>
