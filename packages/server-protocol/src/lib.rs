@@ -7600,7 +7600,7 @@ mod tests {
         // admission batching artifact of the commit coordinator and depends only
         // on arrival timing. The durable guarantee is that every contender is
         // resolved once, all sessions converge on one value, and the history
-        // never forks — assert those, not the commit count.
+        // never forks: assert those, not the commit count.
         let forks = root
             .execute(
                 "SELECT parent_id, COUNT(*) AS children FROM lix_commit_edge \

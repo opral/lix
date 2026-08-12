@@ -323,7 +323,7 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                     // How many commits the coordinator published is an admission
                     // batching artifact, not a guarantee: whether the wave lands in
                     // one cohort or several depends only on arrival timing. Assert
-                    // the guarantee instead — every contender resolved once, one
+                    // the guarantee instead: every contender resolved once, one
                     // converged value, and a history that never forked.
                     let counters = lix.plugin_transition_counters();
                     assert_eq!(counters.conflict_resolution_calls, 2);
