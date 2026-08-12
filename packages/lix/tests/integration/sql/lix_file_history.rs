@@ -124,6 +124,104 @@ impl StorageScanSource for CountingScanSource<'_> {
     }
 }
 
+/// E15 measurement: how many storage rows does a point-routed file history read
+/// touch as the number of entities written by a single commit grows?
+///
+/// `change_history_from_commit` builds its commit-delta key range from the
+/// schema key alone, so the claim under test is that a point lookup decodes
+/// every entity of that schema in each visited commit's delta. If that is true,
+/// `scanned_rows` grows with the size of the bulk commit even though the answer
+/// is fixed. If it is flat, the range is already tight enough in practice and
+/// there is nothing to win.
+///
+/// Commit count and answer size are pinned; only entities-per-commit varies.
+#[tokio::test]
+#[ignore = "manual e15 entities-per-schema measurement"]
+async fn probe_file_history_entities_decoded_per_schema() {
+    const EDIT_COMMITS: usize = 20;
+    const TARGET_ID: &str = "3faa577b-02e3-7c30-8b7d-30a9698cba93";
+
+    for bulk_entities in [50usize, 500, 5000] {
+        let storage = CountingStorage::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+
+        // One commit carrying `bulk_entities` descriptors and blob refs.
+        let bulk = (0..bulk_entities)
+            .map(|index| {
+                format!("('01940000-0000-7000-8000-{index:012x}', '/bulk-{index:05}.txt', CAST('x' AS BYTEA))")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("INSERT INTO lix_file (id, path, content) VALUES {bulk}"),
+                &[],
+            )
+            .await
+            .expect("bulk files should insert in one commit");
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ('{TARGET_ID}', '/target.txt', CAST('v' AS BYTEA))"
+                ),
+                &[],
+            )
+            .await
+            .expect("target file should insert");
+        // Pin the answer at EDIT_COMMITS + 1 rows and the commit count with it.
+        for revision in 0..EDIT_COMMITS {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('v{revision}' AS BYTEA) \
+                         WHERE id = '{TARGET_ID}'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("target revision should commit");
+        }
+
+        let commit_id_rows = session
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .expect("head should load");
+        let [Value::Text(commit_id)] = commit_id_rows.rows()[0].values() else {
+            panic!("expected a text commit id");
+        };
+
+        storage.reset_counters();
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT id, lixcol_depth FROM lix_file_history('{commit_id}') \
+                       WHERE id = '{TARGET_ID}' ORDER BY lixcol_depth"
+                ),
+                &[],
+            )
+            .await
+            .expect("point-routed history should load");
+        let answer_rows = result.rows().len();
+        let (requested_keys, scan_calls, scanned_rows) = storage.counters();
+        eprintln!(
+            "e15probe bulk_entities={bulk_entities} commits={} answer_rows={answer_rows} \
+             requested_keys={requested_keys} scan_calls={scan_calls} scanned_rows={scanned_rows}"
+        , bulk_entities.min(1) + EDIT_COMMITS + 1);
+
+        session.close().await.expect("session should close");
+    }
+}
+
 #[tokio::test]
 async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state() {
     const UNRELATED_FILE_COUNT: usize = 64;
