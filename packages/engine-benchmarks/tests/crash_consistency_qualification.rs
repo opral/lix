@@ -746,7 +746,34 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
         .events
         .expect("calibration child must report its storage event count");
     assert!(events > 0, "publication window contained no storage events");
-    let labels = calibration.labels;
+    let labels = calibration.labels.clone();
+
+    // Null control: the same invariant battery against a store that was closed
+    // cleanly and never killed. If this does not pass, nothing the sweep reports
+    // afterwards is attributable to the crash.
+    let control_database = root.path().join("calibration").join("database");
+    let control_acked = calibration.acked;
+    let control = block_on(move || {
+        verify_after_crash(
+            control_database,
+            control_acked,
+            workload.commits as i64,
+            workload.rows,
+            true,
+        )
+    });
+    let control = control.unwrap_or_else(|error| {
+        panic!(
+            "clean-close control failed before any kill was issued — the harness, not the crash, \
+             is the problem: {error}"
+        )
+    });
+    assert_eq!(
+        control.generation,
+        Some(workload.commits as i64),
+        "clean-close control did not reach the last attempted generation"
+    );
+    let _ = fs::remove_dir_all(root.path().join("calibration"));
 
     let max_points = env_usize("LIX_CRASH_CONSISTENCY_MAX_POINTS", 512);
     let swept: Vec<u64> = if events as usize <= max_points {
