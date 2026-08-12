@@ -889,32 +889,29 @@ simulation_test!(
             .await
             .expect("untracked file insert under a tracked directory should succeed");
 
-        let delete_outcome = session
+        // The declared foreign key
+        // `lix_file_descriptor./directory_id -> lix_directory_descriptor./id`
+        // does not reject this delete: the untracked file descriptor is
+        // invisible to the committed delete-restriction scan.
+        session
             .execute("DELETE FROM lix_directory WHERE path = '/docs'", &[])
-            .await;
+            .await
+            .expect("directory delete is accepted even though a file still references it");
 
-        let remaining_files = session
+        // The branch's file read surface is now permanently unreadable.
+        let error = session
             .execute(
                 "SELECT id, path FROM lix_file \
                  WHERE id = '66696c65-7072-8f62-8500-000000000001'",
                 &[],
             )
             .await
-            .expect("file read after directory delete should succeed");
-        let remaining_directories = session
-            .execute(
-                "SELECT id FROM lix_directory WHERE id = '6469722d-7072-8f62-8500-000000000001'",
-                &[],
-            )
-            .await
-            .expect("directory read after delete should succeed");
-
-        panic!(
-            "PROBE delete={:?} files_after={} dirs_after={} rows={:?}",
-            delete_outcome.as_ref().map(|result| result.rows_affected()),
-            remaining_files.len(),
-            remaining_directories.len(),
-            remaining_files
+            .expect_err("orphaned file descriptor bricks the file read surface");
+        assert_eq!(error.code, "LIX_ERROR_FOREIGN_KEY");
+        assert!(
+            error.message.contains("references missing directory_id"),
+            "unexpected orphan error: {}",
+            error.message
         );
     }
 );
