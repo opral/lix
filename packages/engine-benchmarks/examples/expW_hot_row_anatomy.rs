@@ -29,11 +29,11 @@ use std::path::{Path, PathBuf};
 use lix::integration::{Engine, SessionContext};
 use lix::storage::ReadOptions;
 use lix::storage_adapter::StorageAdapter;
+use lix::registered_spaces::HOT_ROW_SPACE;
 use lix::storage_bench::{layout_accounting, space_inventory};
 use lix::{CreateBranchOptions, Value};
 use lix_storage_slatedb::SlateDB;
 
-const HOT_ROW_SPACE: &str = "live_state.hot_row.v21";
 const SEED_BATCH_ROWS: usize = 5_000;
 const PAD_UNIT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -626,7 +626,7 @@ async fn hot_inventory(storage: &SlateDB) -> Vec<(Vec<u8>, Vec<u8>)> {
         .begin_read(ReadOptions::default())
         .await
         .expect("open anatomy inventory read");
-    let inventory = space_inventory(&read, HOT_ROW_SPACE).await;
+    let inventory = space_inventory(&read, HOT_ROW_SPACE.name).await;
     drop(read);
     inventory
 }
