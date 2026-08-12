@@ -1597,21 +1597,18 @@ pub(crate) fn directory_path_resolvers_for_write_paths<'a>(
     for path in paths {
         let segments = path.segments().collect::<Vec<_>>();
         let mut prefix = String::new();
-        for (depth, segment) in segments.iter().enumerate() {
+        for segment in &segments {
             prefix.push('/');
             prefix.push_str(segment);
-            // Ancestors are probed in directory form; the leaf is probed both
-            // ways because either kind can occupy that name.
-            let is_leaf = depth + 1 == segments.len();
-            let mut lookups = vec![format!("{prefix}/")];
-            if is_leaf {
-                lookups.push(prefix.clone());
-            }
-            for lookup in lookups {
-                if !probed.insert(lookup.clone()) {
-                    continue;
-                }
-                for entry in index.exact_entries(&lookup) {
+            // `compose_directory_path` and `compose_file_path` both render a
+            // segment as `/parent/name`, so a directory and a file at the same
+            // position share one indexed path form. One probe per position
+            // therefore finds either kind, and `entry.kind` distinguishes them.
+            //
+            // A position already probed for an earlier write is skipped, but
+            // the walk continues into deeper segments of *this* path.
+            if probed.insert(prefix.clone()) {
+                for entry in index.exact_entries(&prefix) {
                     let storage_branch_id = if entry.key.global() {
                         GLOBAL_BRANCH_ID
                     } else {
