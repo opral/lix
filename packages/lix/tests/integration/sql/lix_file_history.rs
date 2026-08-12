@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use lix::Value;
@@ -21,6 +22,7 @@ struct CountingStorage {
     get_many_requested_keys: Arc<AtomicU64>,
     scan_calls: Arc<AtomicU64>,
     scanned_rows: Arc<AtomicU64>,
+    keys_by_space: Arc<Mutex<BTreeMap<&'static str, u64>>>,
 }
 
 struct CountingRead {
@@ -28,6 +30,7 @@ struct CountingRead {
     get_many_requested_keys: Arc<AtomicU64>,
     scan_calls: Arc<AtomicU64>,
     scanned_rows: Arc<AtomicU64>,
+    keys_by_space: Arc<Mutex<BTreeMap<&'static str, u64>>>,
 }
 
 impl CountingStorage {
@@ -35,6 +38,7 @@ impl CountingStorage {
         self.get_many_requested_keys.store(0, Ordering::Relaxed);
         self.scan_calls.store(0, Ordering::Relaxed);
         self.scanned_rows.store(0, Ordering::Relaxed);
+        self.keys_by_space.lock().expect("counter lock").clear();
     }
 
     fn counters(&self) -> (u64, u64, u64) {
@@ -43,6 +47,10 @@ impl CountingStorage {
             self.scan_calls.load(Ordering::Relaxed),
             self.scanned_rows.load(Ordering::Relaxed),
         )
+    }
+
+    fn keys_by_space(&self) -> BTreeMap<&'static str, u64> {
+        self.keys_by_space.lock().expect("counter lock").clone()
     }
 }
 
@@ -62,6 +70,7 @@ impl Storage for CountingStorage {
             get_many_requested_keys: Arc::clone(&self.get_many_requested_keys),
             scan_calls: Arc::clone(&self.scan_calls),
             scanned_rows: Arc::clone(&self.scanned_rows),
+            keys_by_space: Arc::clone(&self.keys_by_space),
         })
     }
 
@@ -82,6 +91,12 @@ impl StorageRead for CountingRead {
                 .sum(),
             Ordering::Relaxed,
         );
+        {
+            let mut by_space = self.keys_by_space.lock().expect("counter lock");
+            for request in requests {
+                *by_space.entry(request.space.name).or_default() += request.keys.len() as u64;
+            }
+        }
         self.inner.get_many(requests).await
     }
 
@@ -217,6 +232,9 @@ async fn probe_file_history_entities_decoded_per_schema() {
             "e15probe bulk_entities={bulk_entities} commits={} answer_rows={answer_rows} \
              requested_keys={requested_keys} scan_calls={scan_calls} scanned_rows={scanned_rows}"
         , bulk_entities.min(1) + EDIT_COMMITS + 1);
+        for (space, keys) in storage.keys_by_space() {
+            eprintln!("e15space bulk_entities={bulk_entities} space={space} keys={keys}");
+        }
 
         session.close().await.expect("session should close");
     }
