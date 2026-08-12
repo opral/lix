@@ -21,7 +21,6 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use lix::storage::Storage;
 use lix::{Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
